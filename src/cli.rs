@@ -4,7 +4,8 @@
 //! and delegates to the existing `EnvConfig` / mode dispatch pipeline. No
 //! config resolution logic lives here — that stays in `env_config.rs`.
 //!
-//! **Ordering contract**: `apply_cli_overrides()` must run before any call to
+//! **Ordering contract**: `apply_run_overrides()` / `apply_validate_overrides()`
+//! / `apply_ambient_udp_preflight_overrides()` must run before any call to
 //! `resolve_ferrum_var()` or `ConfFile::load()`, because the `CONF_FILE_CACHE`
 //! `OnceLock` captures `FERRUM_CONF_PATH` on first access and never re-reads it.
 
@@ -269,9 +270,9 @@ fn externally_sourced(base_key: &str) -> bool {
 /// smart discovery would find `./ferrum.conf` and `set_var` over it, and the
 /// operator's invalid value would be gone before anything could complain about
 /// it. That matters because the overwrite happens *first*: these checks run in
-/// `apply_run_overrides`/`apply_validate_overrides` (`main.rs`, before logging
-/// init), while the fail-closed rejection lives in
-/// `secrets::resolve_all_env_secrets` further down `main()`. Overwriting turns
+/// `apply_run_overrides`/`apply_validate_overrides` (`run_gateway_cli()` in
+/// `gateway_entry.rs`, before logging init), while the fail-closed rejection
+/// lives in `secrets::resolve_all_env_secrets` further down that function. Overwriting turns
 /// a command that must fail with `Ferrum configuration values must be valid
 /// Unicode` into one that silently starts on a settings file the operator
 /// never chose — exactly the silent-misconfiguration hazard
@@ -305,8 +306,8 @@ fn resolve_path(p: &Path) -> PathBuf {
 ///
 /// # Safety
 /// Uses `std::env::set_var` which is unsafe in Rust 2024 edition. This is safe
-/// here because it runs in `main()` before any multi-threaded runtime starts,
-/// identical to the existing secret resolution code in `main.rs`.
+/// here because it runs in `run_gateway_cli()` before any multi-threaded
+/// runtime starts, like `resolve_startup_secrets()` in `gateway_entry.rs`.
 pub fn apply_run_overrides(args: &RunArgs) {
     apply_common_overrides(args.settings.as_deref(), args.spec.as_deref());
 
@@ -336,7 +337,8 @@ pub fn apply_run_overrides(args: &RunArgs) {
     }
 }
 
-/// Apply settings/spec/mode/verbose overrides shared between `run` and `validate`.
+/// Apply settings/spec/mode/verbose overrides for `validate` (the twin of
+/// [`apply_run_overrides`]).
 pub fn apply_validate_overrides(args: &ValidateArgs) {
     apply_common_overrides(args.settings.as_deref(), args.spec.as_deref());
 
@@ -434,45 +436,29 @@ pub fn infer_file_mode() {
     let Ok(conf) = ConfFile::load() else {
         return;
     };
-    if conf.get("FERRUM_FILE_CONFIG_PATH").is_none()
+    infer_file_mode_from_conf(conf.get("FERRUM_MODE"), conf.get("FERRUM_FILE_CONFIG_PATH"));
+}
+
+/// The file-mode smart default, given the `FERRUM_MODE` and
+/// `FERRUM_FILE_CONFIG_PATH` values of the already-loaded settings snapshot.
+///
+/// [`infer_file_mode`] is the only production caller. It is public so tests
+/// can drive the precedence rules with several settings values without
+/// replacing the process-wide `OnceLock` snapshot.
+#[doc(hidden)]
+pub fn infer_file_mode_from_conf(conf_mode: Option<&str>, conf_spec_path: Option<&str>) {
+    if conf_spec_path.is_none()
         && let Some(path) = resolve_spec_path(None)
     {
         // SAFETY: startup only, before logging workers or the serving runtime.
         unsafe { std::env::set_var("FERRUM_FILE_CONFIG_PATH", path) };
     }
-    if direct_env_var_is_set("FERRUM_MODE")
-        || conf
-            .get("FERRUM_MODE")
-            .is_some_and(|mode| !mode.trim().is_empty())
+    if direct_env_var_is_set("FERRUM_MODE") || conf_mode.is_some_and(|mode| !mode.trim().is_empty())
     {
         return;
     }
-    if direct_env_var_is_set("FERRUM_FILE_CONFIG_PATH")
-        || conf.get("FERRUM_FILE_CONFIG_PATH").is_some()
-    {
+    if direct_env_var_is_set("FERRUM_FILE_CONFIG_PATH") || conf_spec_path.is_some() {
         // SAFETY: startup only, before logging workers or the serving runtime.
-        unsafe { std::env::set_var("FERRUM_MODE", "file") };
-    }
-}
-
-/// Apply the file-mode smart default after the immutable settings snapshot has
-/// already been resolved.
-///
-/// Kept as a small public seam because process-level callers may already hold
-/// the accepted `ferrum.conf` value, and tests must not attempt to replace the
-/// process-wide `OnceLock` snapshot with several different files.
-#[doc(hidden)]
-pub fn infer_file_mode_from_conf_mode(conf_mode: Option<&str>) {
-    // Preserve CLI/direct-env precedence even for callers that already loaded
-    // the settings snapshot.
-    if direct_env_var_is_set("FERRUM_MODE") {
-        return;
-    }
-    if conf_mode.is_some_and(|mode| !mode.trim().is_empty()) {
-        return;
-    }
-    if direct_env_var_is_set("FERRUM_FILE_CONFIG_PATH") {
-        // SAFETY: single-threaded context, before the multi-threaded runtime.
         unsafe { std::env::set_var("FERRUM_MODE", "file") };
     }
 }
@@ -643,9 +629,10 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
     })?;
     let explicit_node_uid =
         parse_explicit_k8s_node_uid(resolve_ferrum_var("FERRUM_K8S_NODE_UID").as_deref())?;
-    let node_name = resolve_ferrum_var("FERRUM_K8S_NODE_NAME")
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    // Environment only, shared with the NodeWaypoint UDP listeners: the node
+    // name always comes from the downward API, and a `ferrum.conf` copy could
+    // name another machine.
+    let node_name = crate::modes::mesh::k8s_node_name_from_env();
     let target_proc_root = args
         .host_proc_root
         .as_deref()
@@ -799,7 +786,7 @@ async fn fetch_this_node_uid(
          supply FERRUM_K8S_NODE_UID or run this command inside a Kubernetes pod"
             .to_string()
     })?;
-    let client = kube::Client::try_from(config).map_err(|_| {
+    let client = crate::k8s_controller::build_kube_client_from_config(config).map_err(|_| {
         "could not build an in-cluster Kubernetes client to resolve this node's UID; \
          supply FERRUM_K8S_NODE_UID or run this command inside a Kubernetes pod"
             .to_string()
@@ -982,15 +969,10 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
             )
         })?;
 
-        // File-mode run still loads existing `"*"` rows (warn-only). Validate
-        // is the operator admission gate and must reject the CORS footgun.
-        let ws_origin_errors = config.allowed_ws_origins_admission_errors();
-        if !ws_origin_errors.is_empty() {
-            return Err(format!(
-                "Spec validation failed: {}",
-                ws_origin_errors.join("; ")
-            ));
-        }
+        // The CORS-style `allowed_ws_origins: ["*"]` footgun and non-origin
+        // entries are refused by `load_config_from_file` above (file mode is
+        // fatal on them, issue #7218), so `validate` reports them as a spec
+        // validation failure with no separate check here.
 
         // Validate stream proxy port conflicts
         let reserved_ports = env_config.reserved_gateway_ports();
@@ -1212,8 +1194,15 @@ impl ValidateNamespaceFilter {
         self.count_fields.iter().map(|(_, count)| *count).sum()
     }
 
-    /// Operator-facing diagnostic naming the active namespace, the namespaces
-    /// present in the document, and the post-filter counts.
+    /// Operator-facing diagnostic: the post-filter counts and how many
+    /// namespaces the document resources use.
+    ///
+    /// Namespace names are supplied values, so they appear only as
+    /// Debug-quoted spans that the startup renderer withholds
+    /// (`.claude/rules/validation-diagnostics.md`); the counts stay visible.
+    /// The active namespace is also printed on the report `Namespace:` line.
+    /// The text must not contain an apostrophe: the renderer would read it as
+    /// an opening quote and withhold the rest of the cause.
     pub fn diagnostic(&self) -> String {
         let counts = self
             .count_fields
@@ -1221,14 +1210,16 @@ impl ValidateNamespaceFilter {
             .map(|(name, count)| format!("{name}={count}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let namespaces = if self.document_namespaces.is_empty() {
-            "(none)".to_string()
-        } else {
-            self.document_namespaces.join(", ")
+        let namespaces = match self.document_namespaces.len() {
+            0 => String::new(),
+            count => format!(
+                "; the document resources use {count} namespace(s): {:?}",
+                self.document_namespaces.join(", ")
+            ),
         };
         format!(
             "namespace filter mismatch: active namespace {:?} left 0 surviving resources \
-             ({counts}); document namespaces: {namespaces:?}",
+             ({counts}){namespaces}",
             report_field("FERRUM_NAMESPACE", &self.active_namespace)
         )
     }
@@ -1251,8 +1242,9 @@ fn report_empty_namespace_filter(
         Ok(())
     } else {
         Err(format!(
-            "{diagnostic}. Set FERRUM_NAMESPACE to a namespace present in the document, \
-             or pass --allow-empty-namespace to accept an empty filtered document."
+            "{diagnostic}. Set FERRUM_NAMESPACE to the namespace in the `namespace` fields \
+             of the document resources, or pass --allow-empty-namespace to accept an empty \
+             filtered document."
         ))
     }
 }
@@ -1263,7 +1255,6 @@ const HEALTH_MAX_INFORMATIONAL_RESPONSES: usize = 8;
 
 struct HealthResponse {
     status_code: u16,
-    status_line: String,
 }
 
 /// A TCP stream that reapplies the remaining absolute deadline before every
@@ -1456,7 +1447,10 @@ pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
     if response.status_code == 200 {
         Ok(())
     } else {
-        Err(format!("Unhealthy: {:?}", response.status_line))
+        // Report only the parsed numeric status. The reason phrase is
+        // peer-controlled text that the startup renderer withholds, so
+        // quoting it would leave the operator with no status at all.
+        Err(format!("Unhealthy: HTTP status {}", response.status_code))
     }
 }
 
@@ -1564,10 +1558,7 @@ fn parse_response_head_section(section: &[u8]) -> Result<HealthResponse, String>
         validate_response_header_line(header)?;
     }
 
-    Ok(HealthResponse {
-        status_code,
-        status_line: status_line.to_string(),
-    })
+    Ok(HealthResponse { status_code })
 }
 
 fn parse_response_status_line(status_line: &str) -> Result<u16, String> {
@@ -1667,6 +1658,10 @@ fn health_request_tls(
     // before the global `CryptoProvider::install_default()` call. Build the
     // ClientConfig with an explicit provider so we don't depend on (or panic
     // on) a globally installed one.
+    //
+    // No bootstrap also means no record-layer selection: this is the build's
+    // baseline provider (`ring` on the ordinary build), and
+    // `FERRUM_TLS_AEAD_BACKEND` is deliberately not read here, as documented.
     let provider = Arc::new(crate::fips::base_crypto_provider());
 
     let mut root_store = rustls::RootCertStore::empty();
@@ -1680,7 +1675,7 @@ fn health_request_tls(
     if no_verify {
         tls_config
             .dangerous()
-            .set_certificate_verifier(Arc::new(NoVerifier));
+            .set_certificate_verifier(Arc::new(crate::tls::NoVerifier));
     }
 
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
@@ -1698,47 +1693,6 @@ fn health_request_tls(
         "Failed to send TLS request; check endpoint and certificate trust".to_string()
     })?;
     read_health_response_head(&mut tls_stream, deadline, "TLS")
-}
-
-/// Certificate verifier that accepts any certificate (testing / self-signed).
-#[derive(Debug)]
-struct NoVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for NoVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        crate::fips::base_crypto_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

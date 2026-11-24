@@ -64,7 +64,7 @@ fn token_with_role(role: &str) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()).unwrap(),
     )
     .expect("token encodes")
 }
@@ -90,7 +90,7 @@ fn admin_token_with_ns(ns: Value) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()).unwrap(),
     )
     .expect("token encodes")
 }
@@ -328,7 +328,7 @@ async fn seed_upstream(store: &DatabaseStore, namespace: &str, id: &str) {
         .unwrap();
 }
 
-async fn count_rows(store: &DatabaseStore, sql: &str, namespace: &str) -> i64 {
+async fn count_rows(store: &DatabaseStore, sql: &'static str, namespace: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(sql)
         .bind(namespace)
         .fetch_one(&store.pool())

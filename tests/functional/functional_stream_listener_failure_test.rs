@@ -30,6 +30,7 @@
 //! TODO: add a DP-mode bind-failure case if/when the CP test harness is
 //! refactored to allow injecting a bad-port proxy from an in-process CP.
 
+use crate::common::GatewayChildGuard;
 use crate::scaffolding::port_registry::TestSocket;
 use crate::scaffolding::ports::reserve_future_tcp_port;
 
@@ -112,11 +113,6 @@ async fn prove_child_owns_admin(
     Ok(())
 }
 
-fn kill_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 /// True iff something is currently accepting TCP connections on 127.0.0.1:port.
 async fn port_is_bound(port: u16) -> bool {
     matches!(
@@ -135,7 +131,7 @@ async fn port_is_bound(port: u16) -> bool {
 
 struct DbHarness {
     _temp_dir: TempDir,
-    gateway_process: Option<Child>,
+    gateway_process: Option<GatewayChildGuard>,
     identity: crate::common::SpawnedGatewayIdentity,
     admin_base_url: String,
     admin_port: u16,
@@ -185,6 +181,7 @@ impl DbHarness {
         );
 
         let mut cmd = Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
@@ -192,15 +189,19 @@ impl DbHarness {
             .env("FERRUM_DB_POLL_INTERVAL", "2")
             .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                temp_dir.path().join("managed-tls"),
+            )
             .env("FERRUM_LOG_LEVEL", "warn")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         identity.apply_to_command(&mut cmd);
-        let mut child = cmd.spawn()?;
+        let mut child = GatewayChildGuard::new(cmd.spawn()?);
 
-        if let Err(e) = prove_child_owns_admin(&mut child, admin_port, &identity).await {
-            kill_child(&mut child);
+        if let Err(e) = prove_child_owns_admin(child.child_mut(), admin_port, &identity).await {
+            child.shutdown();
             return Err(e);
         }
 
@@ -217,9 +218,10 @@ impl DbHarness {
 
 impl Drop for DbHarness {
     fn drop(&mut self) {
+        // Reap before `_temp_dir` (the SQLite DB) is removed; SIGTERM + grace
+        // under coverage so the gateway still writes its profile.
         if let Some(mut c) = self.gateway_process.take() {
-            let _ = c.kill();
-            let _ = c.wait();
+            c.shutdown();
         }
     }
 }
@@ -427,6 +429,7 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
     let temp_dir = TempDir::new().expect("temp dir");
     let db_path = temp_dir.path().join("seed.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let managed_tls_store = temp_dir.path().join("managed-tls");
 
     // Phase 1: seed a DB with a stream proxy pointing at a known-good port.
     // Start the gateway briefly, insert via admin API, then shut it down.
@@ -441,6 +444,7 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
         let proxy_port_seed = ephemeral_port().await;
         let identity = mint_stream_listener_db_identity();
         let mut cmd = Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
@@ -448,13 +452,14 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
             .env("FERRUM_DB_POLL_INTERVAL", "2")
             .env("FERRUM_PROXY_HTTP_PORT", proxy_port_seed.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port_seed.to_string())
+            .env("FERRUM_TLS_MANAGED_STORE_PATH", &managed_tls_store)
             .env("FERRUM_LOG_LEVEL", "error")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         identity.apply_to_command(&mut cmd);
-        let mut child = cmd.spawn().expect("spawn seed gateway");
-        if prove_child_owns_admin(&mut child, admin_port_seed, &identity)
+        let mut child = GatewayChildGuard::new(cmd.spawn().expect("spawn seed gateway"));
+        if prove_child_owns_admin(child.child_mut(), admin_port_seed, &identity)
             .await
             .is_ok()
         {
@@ -462,7 +467,7 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
             seed_identity = Some(identity);
             break;
         }
-        kill_child(&mut child);
+        child.shutdown();
         if attempt == SEED_ATTEMPTS {
             panic!("Seed gateway failed to become healthy");
         }
@@ -493,8 +498,7 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
     );
 
     // Shut down the seed gateway — the stream proxy row survives in the DB.
-    let _ = seed_gw.kill();
-    let _ = seed_gw.wait();
+    seed_gw.shutdown();
     // Give the OS a moment to release the ephemeral ports.
     sleep(Duration::from_millis(500)).await;
 
@@ -508,9 +512,9 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
     let proxy_port_retry = ephemeral_port().await;
 
     let retry_identity = mint_stream_listener_db_identity();
-    #[allow(clippy::zombie_processes)]
     let mut child = {
         let mut cmd = Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
@@ -518,12 +522,13 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
             .env("FERRUM_DB_POLL_INTERVAL", "2")
             .env("FERRUM_PROXY_HTTP_PORT", proxy_port_retry.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port_retry.to_string())
+            .env("FERRUM_TLS_MANAGED_STORE_PATH", &managed_tls_store)
             .env("FERRUM_LOG_LEVEL", "info")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped()); // we need stderr to confirm the bind failure
         retry_identity.apply_to_command(&mut cmd);
-        cmd.spawn().expect("spawn test gateway")
+        GatewayChildGuard::new(cmd.spawn().expect("spawn test gateway"))
     };
 
     // Wait up to 15s for the process to exit. It must exit non-zero because
@@ -531,7 +536,7 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
     let wait_deadline = SystemTime::now() + Duration::from_secs(15);
     let mut exit_status = None;
     while SystemTime::now() < wait_deadline {
-        match child.try_wait() {
+        match child.child_mut().try_wait() {
             Ok(Some(st)) => {
                 exit_status = Some(st);
                 break;
@@ -547,8 +552,7 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
         // The fatal-on-bind-failure contract documented in CLAUDE.md only
         // applies when the kernel actually refuses the bind, which varies by
         // platform. Log and skip the strict exit assertion rather than fail.
-        let _ = child.kill();
-        let _ = child.wait();
+        child.shutdown();
         drop(squatter);
         eprintln!(
             "gateway did not exit on occupied stream port {stream_listen_port} — platform-specific (SO_REUSEPORT on macOS); skipping strict exit assertion"
@@ -558,6 +562,7 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
 
     let st = exit_status.unwrap();
     let stderr_bytes = child
+        .child_mut()
         .stderr
         .take()
         .map(|mut s| {
@@ -606,7 +611,7 @@ async fn functional_stream_listener_reload_remove_and_add() {
     let echo_b = start_tcp_echo_server_on(backend_b).await;
 
     const MAX_ATTEMPTS: u32 = 3;
-    let mut started: Option<(Child, u16, u16, u16, TempDir)> = None;
+    let mut started: Option<(GatewayChildGuard, u16, u16, u16, TempDir)> = None;
     let mut last_err = String::new();
     let mut stream_b_reservation = None;
 
@@ -643,19 +648,24 @@ plugin_configs: []
 
         let identity = crate::common::SpawnedGatewayIdentity::mint("stream-listener-file");
         let mut cmd = Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "file")
             .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
             .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                dir.path().join("managed-tls"),
+            )
             .env("FERRUM_LOG_LEVEL", "warn")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         identity.apply_to_command(&mut cmd);
-        let mut child = cmd.spawn().expect("spawn gateway");
+        let mut child = GatewayChildGuard::new(cmd.spawn().expect("spawn gateway"));
 
-        if prove_child_owns_admin(&mut child, admin_port, &identity)
+        if prove_child_owns_admin(child.child_mut(), admin_port, &identity)
             .await
             .is_ok()
         {
@@ -669,7 +679,7 @@ plugin_configs: []
             attempt, MAX_ATTEMPTS
         );
         last_err = format!("attempt {} failed", attempt);
-        kill_child(&mut child);
+        child.shutdown();
         if attempt < MAX_ATTEMPTS {
             sleep(Duration::from_secs(1)).await;
         }
@@ -724,7 +734,7 @@ plugin_configs: []
     // SIGHUP to reload.
     #[cfg(unix)]
     {
-        let pid = child.id();
+        let pid = child.id().expect("gateway child is still owned");
         let _ = Command::new("kill")
             .args(["-HUP", &pid.to_string()])
             .output();
@@ -744,9 +754,8 @@ plugin_configs: []
         sleep(Duration::from_millis(200)).await;
     }
 
-    // Cleanup before asserting (so we don't leak the child on failure).
-    let _ = child.kill();
-    let _ = child.wait();
+    // Cleanup before asserting; the guard would also reap it on unwind.
+    child.shutdown();
     echo_a.abort();
     echo_b.abort();
 

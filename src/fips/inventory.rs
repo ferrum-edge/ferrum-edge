@@ -44,7 +44,8 @@ pub enum Disposition {
     ModuleRoutable,
     /// Security-relevant, and *not* yet routed through the seam. Each of these
     /// must be moved onto the module or explicitly rejected before a FIPS
-    /// deployment claim is possible. See `docs/fips.md` §"Residual work".
+    /// deployment claim is possible. The register is asserted empty (see
+    /// `docs/fips.md` §"Source-level crypto inventory").
     PendingClassification,
     /// Cannot reach the module, and FIPS mode refuses the configuration that
     /// would perform it.
@@ -175,11 +176,12 @@ pub const INVENTORY: &[CryptoOperation] = &[
     CryptoOperation {
         operation: "CP/DP gRPC bearer-token HS256 signing and verification",
         location: "src/grpc/auth.rs",
-        implementation: "jsonwebtoken (aws_lc_rs backend on a fips build)",
+        implementation: "jsonwebtoken (aws_lc_rs backend; the validated module on a fips build)",
         disposition: Disposition::ModuleRoutable,
-        rationale: "the `fips` cargo feature selects jsonwebtoken/aws_lc_rs and excludes \
-                    jsonwebtoken/rust_crypto, so HS256 runs in the module. Key length is floored \
-                    by fips::policy::check_env_config",
+        rationale: "jsonwebtoken selects aws_lc_rs inline on both profiles and rust_crypto is \
+                    never compiled; the `fips` feature routes that aws-lc-rs onto the module \
+                    (aws-lc-rs/fips), so HS256 runs in the module. Key length is floored by \
+                    fips::policy::check_env_config",
     },
     // ── DTLS ────────────────────────────────────────────────────────────
     CryptoOperation {
@@ -190,10 +192,11 @@ pub const INVENTORY: &[CryptoOperation] = &[
         rationale: "dimpl selects the aws-lc-rs backend for key agreement, signing, hashing, and \
                     record AEAD, so cargo feature unification does route those primitives onto \
                     the module — but its *random* values come from the `rand` crate's thread RNG \
-                    (src/rng.rs `SeededRng`), not the module DRBG that its own \
-                    crypto/aws_lc_rs/random.rs exposes. The DTLS handshake `Random` (src/types.rs, \
-                    both engines), the DTLS 1.2 HelloVerifyRequest cookie secret, and the DTLS 1.2 \
-                    explicit AES-GCM record nonce are all drawn that way, and docs/fips.md places \
+                    (dimpl's src/rng.rs `SeededRng`), not the module DRBG that its own \
+                    crypto/aws_lc_rs/random.rs exposes. The DTLS handshake `Random` (dimpl's \
+                    src/types.rs, both engines), the DTLS 1.2 HelloVerifyRequest cookie secret, \
+                    and the DTLS 1.2 explicit AES-GCM record nonce are all drawn that way, and \
+                    docs/fips.md places \
                     the DRBG inside the module boundary. Rather than claim a coverage this build \
                     cannot back, fips::policy refuses every DTLS surface — frontend \
                     FERRUM_DTLS_CERT_PATH/KEY_PATH, `backend_scheme: dtls` stream proxies, and \
@@ -232,17 +235,35 @@ pub const INVENTORY: &[CryptoOperation] = &[
     CryptoOperation {
         operation: "Admin API JWT verification",
         location: "src/admin/jwt_auth.rs",
-        implementation: "jsonwebtoken (aws_lc_rs backend on a fips build)",
+        implementation: "jsonwebtoken (aws_lc_rs backend; the validated module on a fips build)",
         disposition: Disposition::ModuleRoutable,
-        rationale: "the `fips` cargo feature selects jsonwebtoken/aws_lc_rs",
+        rationale: "jsonwebtoken selects aws_lc_rs inline on both profiles and the `fips` \
+                    feature routes it onto the module (aws-lc-rs/fips)",
     },
     CryptoOperation {
         operation: "Request-path and CP/DP trust-bundle JWT/JWKS verification",
         location: "src/plugins/jwt_auth.rs, src/plugins/jwks_auth.rs, src/grpc/cp_trust.rs",
-        implementation: "jsonwebtoken (aws_lc_rs backend on a fips build)",
+        implementation: "jsonwebtoken (aws_lc_rs backend; the validated module on a fips build)",
         disposition: Disposition::ModuleRoutable,
         rationale: "algorithms are screened against fips::policy::APPROVED_JWT_ALGORITHMS at \
-                    config admission and the implementation is selected by the `fips` feature",
+                    config admission, and the `fips` feature routes jsonwebtoken's inline \
+                    aws_lc_rs backend onto the module",
+    },
+    CryptoOperation {
+        operation: "JWT-SVID minting (ES256) and JWT-SVID verification against local and \
+                    federated JWT authorities",
+        location: "src/identity/jwt_svid/authority.rs, src/identity/jwt_svid/validate.rs, \
+                   src/identity/jwt_svid/jwks.rs",
+        implementation: "jsonwebtoken (aws_lc_rs backend; the validated module on a fips build), \
+                         rcgen",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "minting signs ES256 only and verification admits only the algorithms the \
+                    authority's own key can produce; jsonwebtoken selects aws_lc_rs inline on \
+                    both profiles and the `fips` feature routes it onto the module \
+                    (aws-lc-rs/fips). The dev-only ephemeral signing key is generated by rcgen, \
+                    which the `fips` feature routes to rcgen/fips. While FIPS mode is enforced \
+                    every authority key is also admitted through fips::keys (RSA exponent odd \
+                    and greater than 65536, EC curve P-256/P-384)",
     },
     CryptoOperation {
         operation: "JWT-SVID authority EC public-key point validation (P-256 / P-384)",
@@ -289,6 +310,15 @@ pub const INVENTORY: &[CryptoOperation] = &[
         implementation: "ring / aws-lc-rs via crate::fips::backend",
         disposition: Disposition::ModuleRoutable,
         rationale: "routed through the backend alias",
+    },
+    CryptoOperation {
+        operation: "HMAC-SHA256 log-field pseudonymization (log-schema `hash` transform)",
+        location: "src/plugins/utils/log_schema/transform.rs",
+        implementation: "crate::fips::approved (module-backed HMAC-SHA-256)",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "the keyed pseudonym is computed through fips::approved::HmacSha256Key, so it \
+                    reaches the selected module; the key is a FERRUM_PLUGIN_SECRET_* value of at \
+                    least 32 bytes, matching the FIPS HMAC key floor",
     },
     CryptoOperation {
         operation: "AI semantic-cache Redis envelope authentication",
@@ -488,7 +518,7 @@ pub const INVENTORY: &[CryptoOperation] = &[
     },
     CryptoOperation {
         operation: "WebSocket Sec-WebSocket-Accept SHA-1 digest",
-        location: "vendor/tungstenite (RFC 6455 handshake)",
+        location: "vendor/tungstenite-0.29.0-ferrum-patched (RFC 6455 handshake)",
         implementation: "sha1",
         disposition: Disposition::OutsideBoundary,
         rationale: "RFC 6455 defines this as a cache-poisoning guard over a fixed public GUID, \

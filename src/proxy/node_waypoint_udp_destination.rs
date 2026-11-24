@@ -101,27 +101,22 @@ pub struct NodeWaypointUdpDestinationRoute {
     /// namespaced identity into `UdpSessionKey` without allocating or
     /// cloning namespace/id Strings per datagram. Hash/equality of the
     /// session key compare the inner `(namespace, id)`, not this pointer.
+    ///
+    /// The frontend posture (plain UDP or terminating DTLS) is not carried
+    /// here: one bound socket speaks one protocol, so mesh materialization
+    /// refuses every claimant of a port whose services disagree on it
+    /// (`mixed_frontend_posture`) before any route is built.
     pub proxy: Arc<NamespacedResourceId>,
-    /// Frontend posture of the owning route. Every route sharing one listener
-    /// must agree (a shared socket is built from one posture before any route
-    /// can be selected), which materialization enforces fail-closed.
-    pub terminates_dtls: bool,
 }
 
 impl NodeWaypointUdpDestinationRoute {
     /// Build a route whose owner identity is already `Arc`-backed for the
     /// receive hot path.
-    pub fn new(
-        destination: IpAddr,
-        listen_port: u16,
-        proxy: NamespacedResourceId,
-        terminates_dtls: bool,
-    ) -> Self {
+    pub fn new(destination: IpAddr, listen_port: u16, proxy: NamespacedResourceId) -> Self {
         Self {
             destination: canonical_destination_ip(destination),
             listen_port,
             proxy: Arc::new(proxy),
-            terminates_dtls,
         }
     }
 
@@ -174,32 +169,27 @@ pub struct NodeWaypointUdpDestinationTable {
 }
 
 impl NodeWaypointUdpDestinationTable {
-    #[allow(dead_code)] // External unit tests / diagnostics.
     #[inline]
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    #[allow(dead_code)] // External unit tests / diagnostics.
     #[inline]
     pub fn listen_port(&self) -> u16 {
         self.listen_port
     }
 
-    #[allow(dead_code)] // External unit tests / diagnostics.
     #[inline]
     pub fn len(&self) -> usize {
         self.routes.len()
     }
 
-    #[allow(dead_code)] // External unit tests / diagnostics.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.routes.is_empty()
     }
 
     /// Sorted owning proxy identities, for diagnostics and tests.
-    #[allow(dead_code)] // External unit tests / diagnostics.
     pub fn owners(&self) -> Vec<NamespacedResourceId> {
         let mut owners: Vec<NamespacedResourceId> = self
             .routes
@@ -212,7 +202,6 @@ impl NodeWaypointUdpDestinationTable {
     }
 
     /// Sorted canonical destinations, for diagnostics and tests.
-    #[allow(dead_code)] // External unit tests / diagnostics.
     pub fn destinations(&self) -> Vec<IpAddr> {
         let mut destinations: Vec<IpAddr> = self.routes.keys().copied().collect();
         destinations.sort();
@@ -305,14 +294,12 @@ impl NodeWaypointUdpDestinationRouter {
     }
 
     /// Current accepted table snapshot.
-    #[allow(dead_code)] // External unit tests / diagnostics.
     #[inline]
     pub fn snapshot(&self) -> Arc<NodeWaypointUdpDestinationTable> {
         self.table.load_full()
     }
 
     /// Total refusals observed by this router (bounded counter, no labels).
-    #[allow(dead_code)] // External unit tests / diagnostics.
     #[inline]
     pub fn refusals(&self) -> u64 {
         self.refusals.load(Ordering::Relaxed)

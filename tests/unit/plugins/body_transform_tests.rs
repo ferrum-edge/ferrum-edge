@@ -1,109 +1,206 @@
 use ferrum_edge::plugins::utils::body_transform::{
-    get_nested_value, is_event_stream_content_type, is_json_content_type, parse_body_rules,
-    remove_nested_value, rename_nested_field, set_nested_value,
+    RequestBodyRulesOutcome, apply_request_body_rules, is_event_stream_content_type,
+    is_json_content_type, parse_body_rules,
 };
-use serde_json::json;
+use serde_json::{Value, json};
+
+/// Run body `rules` against `document` through the production request path:
+/// rule admission ([`parse_body_rules`]) then [`apply_request_body_rules`].
+/// `Some(rewritten)` when a rule changed the document, `None` when it was left
+/// unchanged.
+fn apply(document: &Value, rules: Value) -> Option<Value> {
+    let rules = parse_body_rules(&json!({ "rules": rules })).expect("valid body rules");
+    let body = serde_json::to_vec(document).expect("serialize document");
+    match apply_request_body_rules(&body, &rules) {
+        RequestBodyRulesOutcome::Replaced(bytes) => {
+            Some(serde_json::from_slice(&bytes).expect("rewritten document is JSON"))
+        }
+        RequestBodyRulesOutcome::Skipped(_) | RequestBodyRulesOutcome::Unchanged => None,
+        RequestBodyRulesOutcome::Ambiguous(reason) => {
+            panic!("a serialized `Value` is never ambiguous: {reason}")
+        }
+    }
+}
+
+fn update(document: &Value, key: &str, value: Value) -> Option<Value> {
+    apply(
+        document,
+        json!([{"operation": "update", "target": "body", "key": key, "value": value}]),
+    )
+}
+
+fn add(document: &Value, key: &str, value: Value) -> Option<Value> {
+    apply(
+        document,
+        json!([{"operation": "add", "target": "body", "key": key, "value": value}]),
+    )
+}
+
+fn remove(document: &Value, key: &str) -> Option<Value> {
+    apply(
+        document,
+        json!([{"operation": "remove", "target": "body", "key": key}]),
+    )
+}
+
+fn rename(document: &Value, key: &str, new_key: &str) -> Option<Value> {
+    apply(
+        document,
+        json!([{"operation": "rename", "target": "body", "key": key, "new_key": new_key}]),
+    )
+}
+
+// ── Path navigation ───────────────────────────────────────────────────────
 
 #[test]
-fn test_get_nested_value_simple() {
+fn test_path_reaches_nested_field() {
     let root = json!({"user": {"name": "Alice"}});
-    assert_eq!(get_nested_value(&root, "user.name"), Some(&json!("Alice")));
+    assert_eq!(remove(&root, "user.name"), Some(json!({"user": {}})));
 }
 
 #[test]
-fn test_get_nested_value_missing() {
+fn test_path_to_missing_field_changes_nothing() {
     let root = json!({"user": {"name": "Alice"}});
-    assert_eq!(get_nested_value(&root, "user.age"), None);
+    assert_eq!(remove(&root, "user.age"), None);
+    assert_eq!(update(&root, "user.name.first", json!("A")), None);
 }
 
 #[test]
-fn test_get_nested_value_top_level() {
+fn test_path_reaches_top_level_field() {
     let root = json!({"name": "Alice"});
-    assert_eq!(get_nested_value(&root, "name"), Some(&json!("Alice")));
+    assert_eq!(remove(&root, "name"), Some(json!({})));
 }
 
 #[test]
-fn test_set_nested_value_creates_intermediate_objects() {
-    let mut root = json!({});
-    assert!(set_nested_value(&mut root, "a.b.c", json!("deep")));
-    assert_eq!(root, json!({"a": {"b": {"c": "deep"}}}));
+fn test_path_reaches_deep_field() {
+    let root = json!({"user": {"address": {"city": "NYC"}}});
+    assert_eq!(
+        update(&root, "user.address.city", json!("LA")),
+        Some(json!({"user": {"address": {"city": "LA"}}}))
+    );
 }
 
 #[test]
-fn test_set_nested_value_overwrites_existing() {
-    let mut root = json!({"user": {"name": "Alice"}});
-    assert!(set_nested_value(&mut root, "user.name", json!("Bob")));
-    assert_eq!(root, json!({"user": {"name": "Bob"}}));
+fn test_update_creates_intermediate_objects() {
+    assert_eq!(
+        update(&json!({}), "a.b.c", json!("deep")),
+        Some(json!({"a": {"b": {"c": "deep"}}}))
+    );
 }
 
 #[test]
-fn test_set_nested_value_returns_false_for_non_object_intermediate() {
-    let mut root = json!({"user": "not_an_object"});
-    assert!(!set_nested_value(&mut root, "user.name", json!("Alice")));
+fn test_update_overwrites_existing() {
+    let root = json!({"user": {"name": "Alice"}});
+    assert_eq!(
+        update(&root, "user.name", json!("Bob")),
+        Some(json!({"user": {"name": "Bob"}}))
+    );
 }
 
 #[test]
-fn test_set_nested_value_top_level() {
-    let mut root = json!({});
-    assert!(set_nested_value(&mut root, "key", json!(42)));
-    assert_eq!(root, json!({"key": 42}));
+fn test_update_through_non_object_intermediate_changes_nothing() {
+    let root = json!({"user": "not_an_object"});
+    assert_eq!(update(&root, "user.name", json!("Alice")), None);
 }
 
 #[test]
-fn test_set_nested_value_returns_false_for_non_object_root() {
-    let mut root = json!("string");
-    assert!(!set_nested_value(&mut root, "key", json!(42)));
+fn test_update_top_level() {
+    assert_eq!(
+        update(&json!({}), "key", json!(42)),
+        Some(json!({"key": 42}))
+    );
 }
 
 #[test]
-fn test_remove_nested_value() {
-    let mut root = json!({"user": {"name": "Alice", "age": 30}});
-    let removed = remove_nested_value(&mut root, "user.age");
-    assert_eq!(removed, Some(json!(30)));
-    assert_eq!(root, json!({"user": {"name": "Alice"}}));
+fn test_update_on_non_object_root_changes_nothing() {
+    assert_eq!(update(&json!("string"), "key", json!(42)), None);
 }
 
 #[test]
-fn test_remove_nested_value_missing() {
-    let mut root = json!({"user": {"name": "Alice"}});
-    assert_eq!(remove_nested_value(&mut root, "user.age"), None);
+fn test_add_only_when_absent() {
+    let root = json!({"user": {"name": "Alice"}});
+    assert_eq!(add(&root, "user.name", json!("Bob")), None);
+    assert_eq!(
+        add(&root, "user.age", json!(30)),
+        Some(json!({"user": {"name": "Alice", "age": 30}}))
+    );
+}
+
+/// Removing a member keeps the remaining members in their original order.
+/// serde_json's `preserve_order` map (enabled in this build) swap-removes,
+/// which moved the last member into the removed slot. The kept keys are
+/// already sorted, so the expected bytes hold for a sorted map too.
+#[test]
+fn test_remove_preserves_member_order() {
+    for (body, key, expected) in [
+        (
+            r#"{"debug":true,"id":1,"name":"a","price":2}"#,
+            "debug",
+            r#"{"id":1,"name":"a","price":2}"#,
+        ),
+        (
+            r#"{"id":1,"internal":true,"name":"a","price":2}"#,
+            "internal",
+            r#"{"id":1,"name":"a","price":2}"#,
+        ),
+        (
+            r#"{"outer":{"a":1,"drop":0,"b":2,"c":3},"z":0}"#,
+            "outer.drop",
+            r#"{"outer":{"a":1,"b":2,"c":3},"z":0}"#,
+        ),
+    ] {
+        let rules = parse_body_rules(
+            &json!({ "rules": [{"operation": "remove", "target": "body", "key": key}] }),
+        )
+        .expect("valid body rules");
+        match apply_request_body_rules(body.as_bytes(), &rules) {
+            RequestBodyRulesOutcome::Replaced(bytes) => assert_eq!(
+                String::from_utf8(bytes).expect("UTF-8 body"),
+                expected,
+                "removing {key:?} must not reorder the remaining members"
+            ),
+            RequestBodyRulesOutcome::Skipped(_)
+            | RequestBodyRulesOutcome::Unchanged
+            | RequestBodyRulesOutcome::Ambiguous(_) => {
+                panic!("removing {key:?} must rewrite the body")
+            }
+        }
+    }
+}
+
+#[test]
+fn test_remove_nested_field() {
+    let root = json!({"user": {"name": "Alice", "age": 30}});
+    assert_eq!(
+        remove(&root, "user.age"),
+        Some(json!({"user": {"name": "Alice"}}))
+    );
 }
 
 #[test]
 fn test_rename_nested_field() {
-    let mut root = json!({"user": {"first_name": "Alice"}});
-    assert!(rename_nested_field(
-        &mut root,
-        "user.first_name",
-        "user.given_name"
-    ));
-    assert_eq!(root, json!({"user": {"given_name": "Alice"}}));
-}
-
-#[test]
-fn test_rename_nested_field_missing_source() {
-    let mut root = json!({"user": {}});
-    assert!(!rename_nested_field(
-        &mut root,
-        "user.missing",
-        "user.new_key"
-    ));
-}
-
-#[test]
-fn test_get_nested_value_deep() {
-    let root = json!({"user": {"address": {"city": "NYC"}}});
+    let root = json!({"user": {"first_name": "Alice"}});
     assert_eq!(
-        get_nested_value(&root, "user.address.city"),
-        Some(&json!("NYC"))
+        rename(&root, "user.first_name", "user.given_name"),
+        Some(json!({"user": {"given_name": "Alice"}}))
+    );
+}
+
+#[test]
+fn test_rename_missing_source_changes_nothing() {
+    assert_eq!(
+        rename(&json!({"user": {}}), "user.missing", "user.new_key"),
+        None
     );
 }
 
 #[test]
 fn test_rename_across_levels() {
-    let mut root = json!({"old": {"nested": {"key": "val"}}});
-    assert!(rename_nested_field(&mut root, "old.nested.key", "flat_key"));
-    assert_eq!(root, json!({"old": {"nested": {}}, "flat_key": "val"}));
+    let root = json!({"old": {"nested": {"key": "val"}}});
+    assert_eq!(
+        rename(&root, "old.nested.key", "flat_key"),
+        Some(json!({"old": {"nested": {}}, "flat_key": "val"}))
+    );
 }
 
 #[test]
@@ -153,169 +250,135 @@ fn test_is_json_content_type_case_insensitive() {
 // ── Array indexing ────────────────────────────────────────────────────────
 
 #[test]
-fn test_get_nested_value_array_index() {
+fn test_path_indexes_into_arrays() {
     let root = json!({"items": [{"name": "a"}, {"name": "b"}]});
-    assert_eq!(get_nested_value(&root, "items.0.name"), Some(&json!("a")));
-    assert_eq!(get_nested_value(&root, "items.1.name"), Some(&json!("b")));
+    assert_eq!(
+        remove(&root, "items.0.name"),
+        Some(json!({"items": [{}, {"name": "b"}]}))
+    );
+    assert_eq!(
+        remove(&root, "items.1.name"),
+        Some(json!({"items": [{"name": "a"}, {}]}))
+    );
 }
 
 #[test]
-fn test_get_nested_value_array_index_out_of_bounds() {
+fn test_path_array_index_out_of_bounds_changes_nothing() {
     let root = json!({"items": [{"name": "a"}]});
-    assert_eq!(get_nested_value(&root, "items.5.name"), None);
+    assert_eq!(remove(&root, "items.5.name"), None);
 }
 
 #[test]
-fn test_set_nested_value_replaces_array_element() {
-    let mut root = json!({"items": [1, 2, 3]});
-    assert!(set_nested_value(&mut root, "items.1", json!(99)));
-    assert_eq!(root, json!({"items": [1, 99, 3]}));
+fn test_update_replaces_array_element() {
+    assert_eq!(
+        update(&json!({"items": [1, 2, 3]}), "items.1", json!(99)),
+        Some(json!({"items": [1, 99, 3]}))
+    );
 }
 
 #[test]
-fn test_set_nested_value_array_index_out_of_bounds_fails() {
-    let mut root = json!({"items": [1, 2]});
+fn test_update_array_index_out_of_bounds_changes_nothing() {
     // Cannot auto-grow arrays — out-of-bounds index fails.
-    assert!(!set_nested_value(&mut root, "items.5", json!(9)));
-    assert_eq!(root, json!({"items": [1, 2]}));
+    assert_eq!(update(&json!({"items": [1, 2]}), "items.5", json!(9)), None);
 }
 
 #[test]
-fn test_remove_nested_value_array_element() {
-    let mut root = json!({"items": [1, 2, 3]});
-    assert_eq!(remove_nested_value(&mut root, "items.1"), Some(json!(2)));
-    assert_eq!(root, json!({"items": [1, 3]}));
+fn test_remove_array_element() {
+    assert_eq!(
+        remove(&json!({"items": [1, 2, 3]}), "items.1"),
+        Some(json!({"items": [1, 3]}))
+    );
 }
 
 // ── Dot escape ────────────────────────────────────────────────────────────
 
 #[test]
-fn test_get_nested_value_with_dot_escape() {
+fn test_path_with_dot_escape() {
     let root = json!({"weird.key": "v", "a": {"b.c": "nested"}});
-    assert_eq!(get_nested_value(&root, "weird\\.key"), Some(&json!("v")));
-    assert_eq!(get_nested_value(&root, "a.b\\.c"), Some(&json!("nested")));
+    assert_eq!(
+        remove(&root, "weird\\.key"),
+        Some(json!({"a": {"b.c": "nested"}}))
+    );
+    assert_eq!(
+        remove(&root, "a.b\\.c"),
+        Some(json!({"weird.key": "v", "a": {}}))
+    );
 }
 
 #[test]
-fn test_set_nested_value_with_dot_escape() {
-    let mut root = json!({});
-    assert!(set_nested_value(&mut root, "weird\\.key", json!(42)));
-    assert_eq!(root, json!({"weird.key": 42}));
+fn test_update_with_dot_escape() {
+    assert_eq!(
+        update(&json!({}), "weird\\.key", json!(42)),
+        Some(json!({"weird.key": 42}))
+    );
 }
 
 // ── Rename rollback ───────────────────────────────────────────────────────
 
 #[test]
-fn test_rename_nested_field_rollback_on_set_failure() {
-    // new_path traverses through a non-object ⇒ set_nested_value fails.
-    // The old value must be restored so data isn't lost.
-    let mut root = json!({"user": {"name": "Alice"}, "count": 7});
-    // "count" is a number — navigating through "count.x" fails.
-    assert!(!rename_nested_field(&mut root, "user.name", "count.x"));
-    // Alice must still be at user.name after rollback.
-    assert_eq!(get_nested_value(&root, "user.name"), Some(&json!("Alice")));
+fn test_rename_rolls_back_when_destination_is_unreachable() {
+    // new_key traverses through a non-object, so the insert fails. The old
+    // value must be restored so data isn't lost, and the document is left
+    // unchanged.
+    let root = json!({"user": {"name": "Alice"}, "count": 7});
+    assert_eq!(rename(&root, "user.name", "count.x"), None);
+    assert_eq!(
+        apply(
+            &root,
+            json!([
+                {"operation": "rename", "target": "body", "key": "user.name", "new_key": "count.x"},
+                {"operation": "add", "target": "body", "key": "marker", "value": true}
+            ])
+        ),
+        Some(json!({"user": {"name": "Alice"}, "count": 7, "marker": true})),
+        "a failed rename must restore the source before later rules run"
+    );
 }
 
 #[test]
-fn test_rename_nested_field_array_rollback_preserves_ordering() {
-    // Regression: `remove_nested_value` calls `Vec::remove(idx)` which shifts
-    // elements leftward. The rollback must use `Vec::insert(idx, value)` to
-    // reverse that shift — restoring via `set_nested_value` would OVERWRITE
-    // the element that got shifted into the vacated slot, losing data.
-    //
-    // Setup: rename items.0 -> count.x. `count` is a number so the set fails,
-    // triggering rollback. Before this fix, A would overwrite B (the
-    // previously-shifted neighbor) and the array would become [A, C] instead
-    // of the original [A, B, C].
-    let mut root = json!({"items": ["A", "B", "C"], "count": 7});
-    assert!(!rename_nested_field(&mut root, "items.0", "count.x"));
-    // The array must be byte-for-byte identical to the pre-rename state.
-    assert_eq!(root["items"], json!(["A", "B", "C"]));
-    assert_eq!(root["count"], json!(7));
+fn test_rename_new_key_is_prefix_of_old_key() {
+    // After removing the deepest leaf, the higher-level value is set by
+    // overwriting the parent object. This must not panic or corrupt the tree.
+    assert_eq!(
+        rename(&json!({"a": {"b": "val"}}), "a.b", "a"),
+        Some(json!({"a": "val"}))
+    );
 }
 
 #[test]
-fn test_rename_nested_field_array_rollback_middle_index() {
-    // Same regression but removing from the middle of the array to catch
-    // off-by-one bugs in the rollback insert index.
-    let mut root = json!({"nums": [10, 20, 30, 40]});
-    assert!(!rename_nested_field(&mut root, "nums.2", "nums.0.never"));
-    assert_eq!(root["nums"], json!([10, 20, 30, 40]));
-}
-
-#[test]
-fn test_rename_nested_field_object_rollback_preserves_value() {
-    // Explicit coverage of the object-key rollback path (counterpart to the
-    // array rollback above).
-    let mut root = json!({"user": {"name": "Alice"}, "count": 7});
-    assert!(!rename_nested_field(&mut root, "user.name", "count.x"));
-    assert_eq!(root["user"]["name"], json!("Alice"));
-}
-
-#[test]
-fn test_rename_nested_field_prefix_overlap_new_path_is_prefix_of_old() {
-    // Case where new_path is a prefix of old_path. After removing the deepest
-    // leaf, we set the higher-level value, which succeeds by overwriting the
-    // parent object. This must not panic or corrupt the tree.
-    let mut root = json!({"a": {"b": "val"}});
-    // Rename "a.b" -> "a". After removing "a.b", root is {"a": {}}. Then set
-    // "a" = "val" succeeds (overwrites the empty object).
-    assert!(rename_nested_field(&mut root, "a.b", "a"));
-    assert_eq!(root, json!({"a": "val"}));
-}
-
-#[test]
-fn test_rename_nested_field_escaped_dot_in_path() {
-    // Rename a key that contains a literal dot (escaped with backslash). The
-    // rollback logic must correctly re-escape the segment when reconstructing
-    // the parent path for potential array rollback.
-    let mut root = json!({"weird.key": "val"});
-    assert!(rename_nested_field(&mut root, "weird\\.key", "renamed"));
-    assert_eq!(root, json!({"renamed": "val"}));
+fn test_rename_escaped_dot_in_path() {
+    assert_eq!(
+        rename(&json!({"weird.key": "val"}), "weird\\.key", "renamed"),
+        Some(json!({"renamed": "val"}))
+    );
 }
 
 // ── Literal-backslash preservation ─────────────────────────────────────────
 
 #[test]
 fn test_path_preserves_literal_backslash_in_key() {
-    // Regression: only `\.` and `\\` should be recognized as escapes. Any
-    // other `\X` sequence must preserve the backslash literally, matching the
-    // pre-dot-escape `split('.')` behavior. Keys like `device\serial` are
-    // valid JSON and appear in real payloads — they must continue to work.
+    // Only `\.` and `\\` are escapes. Any other `\X` sequence keeps the
+    // backslash literally: keys like `device\serial` are valid JSON and
+    // appear in real payloads.
     let root = json!({"device\\serial": "abc-123"});
+    assert_eq!(remove(&root, "device\\serial"), Some(json!({})));
 
-    // `path\name` style (backslash not followed by `.` or `\`): the parser
-    // must keep the literal `\` and return the stored value.
+    let written =
+        update(&json!({}), "device\\serial", json!("XYZ")).expect("update writes the literal key");
+    assert_eq!(written, json!({"device\\serial": "XYZ"}));
     assert_eq!(
-        get_nested_value(&root, "device\\serial"),
-        Some(&json!("abc-123"))
+        update(&written, "device\\serial", json!("ABC")),
+        Some(json!({"device\\serial": "ABC"}))
     );
-
-    // Round-trip via set_nested_value — setting and then reading back the
-    // same path must yield the value we wrote.
-    let mut root = json!({});
-    assert!(set_nested_value(&mut root, "device\\serial", json!("XYZ")));
-    assert_eq!(
-        get_nested_value(&root, "device\\serial"),
-        Some(&json!("XYZ"))
-    );
-    // The key stored in the JSON must be the literal `device\serial`.
-    assert_eq!(root, json!({"device\\serial": "XYZ"}));
 }
 
 #[test]
 fn test_path_double_backslash_escapes_to_single_backslash() {
-    // `\\\\` (two escaped backslashes in a Rust string literal — i.e. two
-    // actual backslashes in the path) collapses to a single literal
-    // backslash segment character. This is the documented `\\` escape.
-    let mut root = json!({});
     // Path `a\\b` in the raw path string (written `a\\\\b` in Rust source)
-    // should produce the key `a\b` after escape collapse.
-    assert!(set_nested_value(&mut root, "a\\\\b", json!(42)));
-    assert_eq!(root, json!({"a\\b": 42}));
-
-    // And reading with the same escaped path returns the value.
-    assert_eq!(get_nested_value(&root, "a\\\\b"), Some(&json!(42)));
+    // produces the key `a\b` after escape collapse.
+    let written = update(&json!({}), "a\\\\b", json!(42)).expect("update writes the key");
+    assert_eq!(written, json!({"a\\b": 42}));
+    assert_eq!(remove(&written, "a\\\\b"), Some(json!({})));
 }
 
 // ── parse_body_rules strict validation ────────────────────────────────────
@@ -455,4 +518,198 @@ fn test_rename_rejects_deep_array_index() {
     let err = parse_body_rules(&config)
         .expect_err("expected rejection for numeric segment anywhere in the path");
     assert!(err.contains("does not support array indices"), "got: {err}");
+}
+
+#[test]
+fn parse_body_rules_rejects_empty_path_segments() {
+    // Shared by request_transformer and response_transformer: an empty
+    // dot-segment would silently read or write a `""` member.
+    for key in ["", "a.", ".a", "a..b"] {
+        for rule in [
+            json!({"operation": "remove", "target": "body", "key": key}),
+            json!({"operation": "rename", "target": "body", "key": "a", "new_key": key}),
+        ] {
+            let error = parse_body_rules(&json!({"rules": [rule]}))
+                .expect_err("an empty path segment must be rejected");
+            assert!(error.contains("empty path segment"), "{key:?}: {error}");
+        }
+    }
+    assert!(
+        parse_body_rules(&json!({"rules": [
+            {"operation": "remove", "target": "body", "key": "a\\.b"}
+        ]}))
+        .is_ok(),
+        "an escaped dot is part of one non-empty segment"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GHSA-pq95-952r-2x32: BOM-prefixed and duplicate-member JSON bodies.
+// ---------------------------------------------------------------------------
+
+fn remove_and_rename_rules() -> Vec<ferrum_edge::plugins::utils::body_transform::BodyRule> {
+    parse_body_rules(&json!({ "rules": [
+        {"operation": "remove", "target": "body", "key": "user.role"},
+        {"operation": "rename", "target": "body", "key": "user.token", "new_key": "user.redacted"}
+    ]}))
+    .expect("valid body rules")
+}
+
+/// One leading UTF-8 BOM is stripped before parsing, so `remove` and `rename`
+/// apply to a BOM-prefixed document, and the rewrite carries no BOM.
+#[test]
+fn bom_prefixed_body_has_remove_and_rename_applied_without_the_bom() {
+    let mut body = b"\xEF\xBB\xBF".to_vec();
+    body.extend_from_slice(br#"{"user":{"role":"admin","token":"t0k","name":"a"}}"#);
+    match apply_request_body_rules(&body, &remove_and_rename_rules()) {
+        RequestBodyRulesOutcome::Replaced(bytes) => {
+            assert!(
+                !bytes.starts_with(b"\xEF\xBB\xBF"),
+                "the rewrite must not carry the BOM"
+            );
+            let rewritten: Value = serde_json::from_slice(&bytes).expect("rewrite is JSON");
+            assert_eq!(rewritten, json!({"user": {"name": "a", "redacted": "t0k"}}));
+        }
+        other => panic!("a BOM-prefixed document must be rewritten, got {other:?}"),
+    }
+}
+
+/// Only ONE BOM is stripped; a second one is document content no JSON parser
+/// accepts, so it keeps the ordinary parse-error handling.
+#[test]
+fn a_second_bom_keeps_parse_error_handling() {
+    let mut body = b"\xEF\xBB\xBF\xEF\xBB\xBF".to_vec();
+    body.extend_from_slice(br#"{"user":{"role":"admin"}}"#);
+    assert!(matches!(
+        apply_request_body_rules(&body, &remove_and_rename_rules()),
+        RequestBodyRulesOutcome::Skipped(
+            ferrum_edge::plugins::utils::body_transform::BodyRulesSkipReason::ParseError
+        )
+    ));
+}
+
+/// A duplicated ANCESTOR key whose earlier occurrence holds the targeted leaf
+/// must never come back as "unchanged" (which forwards the original bytes) or
+/// as a rewrite of the last-wins collapse: it is ambiguous, with or without a
+/// BOM, at any depth.
+#[test]
+fn duplicate_ancestor_key_is_ambiguous_not_unchanged() {
+    for body in [
+        br#"{"user":{"role":"admin","token":"t0k"},"user":{"name":"a"}}"#.to_vec(),
+        [
+            b"\xEF\xBB\xBF".as_slice(),
+            br#"{"user":{"role":"admin"},"user":{"name":"a"}}"#.as_slice(),
+        ]
+        .concat(),
+        br#"{"items":[{"user":{"role":"admin"},"user":{}}]}"#.to_vec(),
+        // A sibling duplicate elsewhere in the document is just as ambiguous.
+        br#"{"user":{"role":"admin"},"a":1,"a":2}"#.to_vec(),
+    ] {
+        match apply_request_body_rules(&body, &remove_and_rename_rules()) {
+            RequestBodyRulesOutcome::Ambiguous(reason) => assert_eq!(
+                reason, "JSON body contains duplicate object member names",
+                "the reason is the fixed scanner reason"
+            ),
+            other => panic!(
+                "{:?} must be refused as ambiguous, got {other:?}",
+                String::from_utf8_lossy(&body)
+            ),
+        }
+    }
+}
+
+/// Member names are compared after escape decoding: a literal name and a
+/// `\u`-escaped spelling of the same name collide.
+#[test]
+fn escaped_name_duplicates_collide() {
+    for body in [
+        br#"{"user":{"role":"admin"},"\u0075ser":{"name":"a"}}"#.as_slice(),
+        br#"{"user":{"role":"admin","\u0072ole":"viewer"}}"#.as_slice(),
+    ] {
+        assert!(
+            matches!(
+                apply_request_body_rules(body, &remove_and_rename_rules()),
+                RequestBodyRulesOutcome::Ambiguous(_)
+            ),
+            "{:?} must be ambiguous",
+            String::from_utf8_lossy(body)
+        );
+    }
+}
+
+/// A lone surrogate escape is accepted by some downstream parsers while
+/// `serde_json` rejects it, so it is refused rather than skipped as a parse
+/// error that would forward the original bytes.
+#[test]
+fn invalid_surrogate_escape_is_ambiguous() {
+    assert!(matches!(
+        apply_request_body_rules(br#"{"user":{"role":"\ud800"}}"#, &remove_and_rename_rules()),
+        RequestBodyRulesOutcome::Ambiguous(_)
+    ));
+}
+
+/// Bytes that are not JSON at all keep their existing parse-error handling.
+#[test]
+fn non_json_bodies_keep_parse_error_handling() {
+    for body in [
+        b"role=admin&role=viewer".as_slice(),
+        b"<user><role>admin</role></user>".as_slice(),
+        br#"{"user":{"role":"admin"},"user":"#.as_slice(),
+    ] {
+        assert!(
+            matches!(
+                apply_request_body_rules(body, &remove_and_rename_rules()),
+                RequestBodyRulesOutcome::Skipped(
+                    ferrum_edge::plugins::utils::body_transform::BodyRulesSkipReason::ParseError
+                )
+            ),
+            "{:?} must keep parse-error handling",
+            String::from_utf8_lossy(body)
+        );
+    }
+}
+
+/// An unambiguous document is still rewritten exactly as before.
+#[test]
+fn unambiguous_document_is_still_rewritten() {
+    match apply_request_body_rules(
+        br#"{"user":{"role":"admin","token":"t0k"},"users":[{"role":1},{"role":2}]}"#,
+        &remove_and_rename_rules(),
+    ) {
+        RequestBodyRulesOutcome::Replaced(bytes) => {
+            let rewritten: Value = serde_json::from_slice(&bytes).expect("rewrite is JSON");
+            assert_eq!(
+                rewritten,
+                json!({"user": {"redacted": "t0k"}, "users": [{"role": 1}, {"role": 2}]})
+            );
+        }
+        other => panic!("an unambiguous document must be rewritten, got {other:?}"),
+    }
+}
+
+/// A unique-member document nested between `serde_json`'s 128-level recursion
+/// limit and the duplicate-key screen's 256-level budget is well-formed JSON a
+/// downstream parser may accept, so it must be refused rather than skipped as a
+/// parse error that forwards the original bytes — with or without a BOM.
+#[test]
+fn well_formed_document_serde_cannot_materialize_is_refused() {
+    use ferrum_edge::plugins::utils::body_transform::UNMATERIALIZABLE_JSON_REASON;
+
+    let deep = [
+        br#"{"user":{"role":"admin"},"deep":"#.as_slice(),
+        "[".repeat(200).as_bytes(),
+        "]".repeat(200).as_bytes(),
+        b"}".as_slice(),
+    ]
+    .concat();
+    for body in [deep.clone(), [b"\xEF\xBB\xBF".as_slice(), &deep].concat()] {
+        match apply_request_body_rules(&body, &remove_and_rename_rules()) {
+            RequestBodyRulesOutcome::Ambiguous(reason) => {
+                assert_eq!(reason, UNMATERIALIZABLE_JSON_REASON)
+            }
+            other => {
+                panic!("a well-formed unmaterializable document must be refused, got {other:?}")
+            }
+        }
+    }
 }

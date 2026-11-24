@@ -4,7 +4,7 @@ In-process micro-benches for Ferrum Edge mesh and core policy hot paths. This
 standalone crate (not a workspace member of the root `ferrum-edge` crate)
 depends on the root crate by path so benches exercise the production public API.
 
-Driven by [criterion](https://bheisler.github.io/criterion.rs/book/) — most benches parameterise over input size, while some vary decision shape, instance count, or pooling strategy instead. Each bench emits an HTML report under the default report root `target/criterion/`; `rr_selection` relocates its root when `FERRUM_RR_CRITERION_ROOT` is set.
+Driven by [criterion](https://bheisler.github.io/criterion.rs/book/) — most benches parameterise over input size, while some vary decision shape, instance count, or pooling strategy instead. Each bench emits an HTML report under the default report root `target/criterion/`; `rr_selection` relocates its root when `FERRUM_RR_CRITERION_ROOT` is set, and `plugin_request_view` when `FERRUM_REQUEST_VIEW_CRITERION_ROOT` is set.
 
 ## Quick start
 
@@ -26,6 +26,7 @@ cargo bench --bench slice_apply -- "workloads/1000"
 ./run.sh authz_match # one bench
 ./run.sh ip_restriction # large IP-policy lookup bench
 ./run.sh unix_backend_pool # sidecar-ingress Unix dial vs. pooled checkout (#3731)
+./run.sh plugin_request_view # per-request plugin-cache view resolution (#7207)
 ./run.sh --skip-build authz_match  # reuse prior build artefacts
 ```
 
@@ -38,6 +39,7 @@ cargo bench --bench slice_apply -- "workloads/1000"
 | `slice_apply` | `MeshSlice::from_gateway_config(&GatewayConfig, MeshSliceRequest)` over N workloads | Slice build cost dominates the latency budget when an xDS / native CP pushes a fresh slice; this is the cold-path that runs under the ArcSwap apply. |
 | `xds_translation` | `xds::translator::translate_mesh_slice_to_snapshot(&MeshSlice)` over N workloads | Control-plane translation cost shared by every connected DP; the snapshot cache dedupes by content fingerprint downstream of this call. |
 | `unix_backend_pool` | `UnixBackendConnectionPool::checkout_h1` with and without check-in | Issue #3731. Prices one sidecar-ingress Unix dial — path admission, `connect(2)`, inode re-check, peer-UID check, HTTP/1.1 handshake, one spawned driver task — against a pooled keep-alive checkout. Also prints physical connections, pool hits/misses, and the backend's accept count, which are the FD / task / accept side of the same comparison. Unix-only; no budget gate. |
+| `plugin_request_view` | `PluginCache::request_view` + drop for a five-plugin route and a global-only route, on 1 and 8 threads resolving the same route | Every HTTP-family request resolves its plugin chain through this view before any plugin runs; its reference-count writes land on cache lines every worker serving that route shares (issue #7207). Hosted CI compares it against a baseline revision on one runner (`plugin-request-view-comparison.yml`); no budget gate. |
 
 Most benches parameterise over input size: typically `[10, 100, 1_000, 10_000]`
 for in-process traversals and `[100, 1_000, 5_000]` for slice / translation

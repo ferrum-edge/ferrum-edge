@@ -18,9 +18,13 @@
 //! per-DTLS-client setup task (`on_stream_connect`). Per-datagram delays and
 //! aborts run in `on_udp_datagram` on the established-session hook-ingress
 //! worker (and the first-datagram setup path), never inside the shared listener
-//! recv loop, so a delay for peer A cannot stall peer B. UDP/DTLS stream connect
-//! deliberately skips delay so the first-datagram path cannot stack two waits;
-//! TCP keeps delay+abort on connect. Within one session the worker preserves
+//! recv loop, so a delay for peer A cannot stall peer B. Each fault side is
+//! decided exactly once per first contact: UDP/DTLS stream connect decides only
+//! the abort side, and the session's first client→backend datagram (the
+//! plain-UDP packet that opened the session, or the first DTLS application
+//! datagram after the admitted handshake) decides only the delay side, so
+//! neither a second abort roll nor a second wait applies to it. TCP keeps
+//! delay+abort on connect. Within one session the worker preserves
 //! client→backend ordering: a delayed datagram parks that session's worker under
 //! the shared delayed-work budget while later datagrams remain in the bounded
 //! hook-ingress queue (or drop fail-closed when that queue is full). Abort is a
@@ -41,7 +45,9 @@
 //!     "duration_ms": 2000,
 //!     "percentage": 25.0
 //!   },
-//!   "runtime_overlay_scope": "checkout"
+//!   "runtime_overlay_scope": "checkout",
+//!   "match": { "headers": { "x-chaos-test": "1" } },
+//!   "expires_at": "2026-11-01T12:30:00Z"
 //! }
 //! ```
 //!
@@ -52,6 +58,18 @@
 //! `abort.body` may be omitted or null for an empty body. Non-gRPC abort
 //! responses are labeled `application/json` only when the body parses as JSON;
 //! otherwise they are `text/plain`.
+//!
+//! ## Blast-radius bounds
+//!
+//! `match.headers` (optional) limits an HTTP-family experiment to requests
+//! whose client-sent header field lines carry every configured name with an
+//! exactly equal value; unmatched requests are never faulted and consume no
+//! roll. Raw TCP connections and UDP/DTLS datagrams carry no request headers,
+//! so an instance with `match` never faults stream or datagram traffic.
+//! `expires_at` (optional, RFC 3339) ends the experiment: from that wall-clock
+//! instant every hook is a no-op until the config is changed. A timestamp
+//! already in the past is accepted and leaves the instance inert, so a stored
+//! config that outlives its experiment never blocks a restart or reload.
 //!
 //! ## RTDS overlay
 //!
@@ -84,6 +102,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::utils::fault_delay::{FaultDelayOutcome, run_fault_delay};
 use super::utils::fault_roll::{FaultRoller, MAX_FAULT_DELAY_MS};
@@ -115,7 +134,10 @@ pub(crate) enum FaultDelayDisposition {
 
 /// Record a non-completing delay outcome. Values are compiled-in labels from a
 /// closed enum, never request-, peer-, or credential-derived.
-fn record_delay_outcome(metadata: &mut HashMap<String, String>, outcome: FaultDelayOutcome) {
+fn record_delay_outcome<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+    outcome: FaultDelayOutcome,
+) {
     let key = FAULT_DELAY_OUTCOME_METADATA_KEY.to_string();
     let label = outcome.metadata_label().to_string();
     metadata.insert(key, label);
@@ -178,10 +200,37 @@ struct DelayFault {
     percentage: f64,
 }
 
+/// Most header conditions one `match.headers` block may carry. Every request
+/// on a matched proxy evaluates each one, so the per-request cost is bounded.
+pub const MAX_MATCH_HEADERS: usize = 16;
+
+/// Optional request targeting. Every configured header must be present on the
+/// client's request with a field line exactly equal to the configured value.
+struct RequestMatch {
+    /// Lowercased header name and exact expected value.
+    headers: Vec<(String, String)>,
+}
+
+impl RequestMatch {
+    /// Allocation-free: borrows the client's pristine field lines in place.
+    fn matches(&self, ctx: &RequestContext) -> bool {
+        self.headers.iter().all(|(name, value)| {
+            ctx.header_field_lines(name.as_str())
+                .any(|line| line == value.as_bytes())
+        })
+    }
+}
+
 pub struct FaultInjectionPlugin {
     abort: Option<AbortFault>,
     delay: Option<DelayFault>,
     roller: FaultRoller,
+    request_match: Option<RequestMatch>,
+    /// Experiment end as Unix epoch milliseconds (`expires_at`).
+    expires_at_unix_ms: Option<i64>,
+    /// Latched once `expires_at` has been observed, so an expired instance
+    /// stops reading the clock and a backward wall-clock step cannot revive it.
+    expired: AtomicBool,
 }
 
 impl FaultInjectionPlugin {
@@ -189,18 +238,26 @@ impl FaultInjectionPlugin {
         let obj = config
             .as_object()
             .ok_or("fault_injection: config must be an object")?;
-        reject_unknown_keys(
-            obj.keys(),
-            &["abort", "delay", "runtime_overlay_scope"],
+        crate::util::unknown_keys::reject_unknown_keys(
+            obj,
             "config",
+            &[
+                "abort",
+                "delay",
+                "runtime_overlay_scope",
+                "match",
+                "expires_at",
+            ],
+            "fault_injection: `config`: ",
         )?;
 
         let abort = match obj.get("abort") {
             Some(Value::Object(abort_obj)) => {
-                reject_unknown_keys(
-                    abort_obj.keys(),
-                    &["status_code", "percentage", "grpc_status", "body"],
+                crate::util::unknown_keys::reject_unknown_keys(
+                    abort_obj,
                     "abort",
+                    &["status_code", "percentage", "grpc_status", "body"],
+                    "fault_injection: `abort`: ",
                 )?;
                 let status_code = abort_obj.get("status_code").and_then(json_u64).ok_or(
                     "fault_injection: `abort.status_code` is required and must be an integer",
@@ -250,7 +307,12 @@ impl FaultInjectionPlugin {
 
         let delay = match obj.get("delay") {
             Some(Value::Object(delay_obj)) => {
-                reject_unknown_keys(delay_obj.keys(), &["duration_ms", "percentage"], "delay")?;
+                crate::util::unknown_keys::reject_unknown_keys(
+                    delay_obj,
+                    "delay",
+                    &["duration_ms", "percentage"],
+                    "fault_injection: `delay`: ",
+                )?;
                 let duration_ms = delay_obj.get("duration_ms").and_then(json_u64).ok_or(
                     "fault_injection: `delay.duration_ms` is required and must be a positive integer",
                 )?;
@@ -300,25 +362,85 @@ impl FaultInjectionPlugin {
             }
         }
 
+        let request_match = parse_request_match(obj.get("match"))?;
+        let expires_at_unix_ms = parse_expires_at(obj.get("expires_at"))?;
+
         Ok(Self {
             abort,
             delay,
             roller: FaultRoller::new(),
+            request_match,
+            expires_at_unix_ms,
+            expired: AtomicBool::new(false),
         })
     }
 }
 
-fn reject_unknown_keys<'a>(
-    keys: impl Iterator<Item = &'a String>,
-    allowed: &[&str],
-    scope: &str,
-) -> Result<(), String> {
-    for key in keys {
-        if !allowed.contains(&key.as_str()) {
-            return Err(format!("fault_injection: unknown `{scope}` field {key:?}"));
-        }
+fn parse_request_match(val: Option<&Value>) -> Result<Option<RequestMatch>, String> {
+    let match_obj = match val {
+        Some(Value::Object(match_obj)) => match_obj,
+        Some(Value::Null) | None => return Ok(None),
+        Some(_) => return Err("fault_injection: `match` must be an object".to_string()),
+    };
+    crate::util::unknown_keys::reject_unknown_keys(
+        match_obj,
+        "match",
+        &["headers"],
+        "fault_injection: `match`: ",
+    )?;
+    let Some(Value::Object(headers_obj)) = match_obj.get("headers") else {
+        return Err(
+            "fault_injection: `match.headers` is required and must be an object".to_string(),
+        );
+    };
+    if headers_obj.is_empty() {
+        return Err("fault_injection: `match.headers` must name at least one header".to_string());
     }
-    Ok(())
+    if headers_obj.len() > MAX_MATCH_HEADERS {
+        return Err(format!(
+            "fault_injection: `match.headers` must name at most {MAX_MATCH_HEADERS} headers"
+        ));
+    }
+    let mut headers: Vec<(String, String)> = Vec::with_capacity(headers_obj.len());
+    for (raw_name, raw_value) in headers_obj {
+        // Normalizes to lowercase, the form every stored field line uses.
+        let name = http::HeaderName::from_bytes(raw_name.as_bytes()).map_err(|_| {
+            "fault_injection: `match.headers` names must be valid HTTP header names".to_string()
+        })?;
+        let name = name.as_str();
+        if RequestContext::is_reserved_gateway_assertion_header(name) {
+            return Err(
+                "fault_injection: `match.headers` must not name gateway-asserted headers"
+                    .to_string(),
+            );
+        }
+        if headers.iter().any(|(existing, _)| existing == name) {
+            return Err(
+                "fault_injection: `match.headers` names must be unique ignoring case".to_string(),
+            );
+        }
+        let Value::String(value) = raw_value else {
+            return Err("fault_injection: `match.headers` values must be strings".to_string());
+        };
+        if http::HeaderValue::from_str(value).is_err() {
+            return Err(
+                "fault_injection: `match.headers` values must be valid HTTP header values"
+                    .to_string(),
+            );
+        }
+        headers.push((name.to_string(), value.clone()));
+    }
+    Ok(Some(RequestMatch { headers }))
+}
+
+fn parse_expires_at(val: Option<&Value>) -> Result<Option<i64>, String> {
+    match val {
+        Some(Value::String(s)) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|parsed| Some(parsed.timestamp_millis()))
+            .map_err(|_| "fault_injection: `expires_at` must be an RFC 3339 timestamp".to_string()),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err("fault_injection: `expires_at` must be an RFC 3339 timestamp".to_string()),
+    }
 }
 
 /// Accept JSON integers and mathematically integral numbers (`503.0`, `5.03e2`).
@@ -371,11 +493,47 @@ fn parse_percentage(val: Option<&Value>, field_name: &str) -> Result<f64, String
 
 impl FaultInjectionPlugin {
     fn decide_faults(&self) -> (bool, bool) {
-        let outcome = self.roller.roll_pair(
-            self.delay.as_ref().map(|delay| delay.percentage),
-            self.abort.as_ref().map(|abort| abort.percentage),
-        );
+        self.decide_fault_sides(true, true)
+    }
+
+    /// Roll only the requested sides. A side that is excluded (because another
+    /// hook already decided it for the same packet) or unconfigured never
+    /// triggers.
+    fn decide_fault_sides(&self, roll_delay: bool, roll_abort: bool) -> (bool, bool) {
+        let delay_percentage = self
+            .delay
+            .as_ref()
+            .filter(|_| roll_delay)
+            .map(|delay| delay.percentage);
+        let abort_percentage = self
+            .abort
+            .as_ref()
+            .filter(|_| roll_abort)
+            .map(|abort| abort.percentage);
+        let outcome = self.roller.roll_pair(delay_percentage, abort_percentage);
         (outcome.delay_triggered, outcome.abort_triggered)
+    }
+
+    /// Whether the configured `expires_at` instant has passed. Instances
+    /// without an expiry never read the clock.
+    fn experiment_expired(&self) -> bool {
+        let Some(expires_at_unix_ms) = self.expires_at_unix_ms else {
+            return false;
+        };
+        if self.expired.load(Ordering::Relaxed) {
+            return true;
+        }
+        if chrono::Utc::now().timestamp_millis() >= expires_at_unix_ms {
+            self.expired.store(true, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// Raw stream and datagram traffic carry no request headers, so a
+    /// header-targeted or expired experiment never faults them.
+    fn stream_faults_disabled(&self) -> bool {
+        self.request_match.is_some() || self.experiment_expired()
     }
 
     fn reject_for_abort(&self, abort: &AbortFault, is_grpc_request: bool) -> PluginResult {
@@ -435,8 +593,16 @@ impl Plugin for FaultInjectionPlugin {
         "fault_injection"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::FAULT_INJECTION
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -444,7 +610,7 @@ impl Plugin for FaultInjectionPlugin {
     }
 
     fn requires_udp_datagram_hooks(&self) -> bool {
-        true
+        self.request_match.is_none()
     }
 
     fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
@@ -457,6 +623,14 @@ impl Plugin for FaultInjectionPlugin {
         _headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if ctx.metadata.contains_key(ROUTE_FAULT_INJECTED_METADATA_KEY) {
+            return PluginResult::Continue;
+        }
+        if self.experiment_expired() {
+            return PluginResult::Continue;
+        }
+        if let Some(request_match) = self.request_match.as_ref()
+            && !request_match.matches(ctx)
+        {
             return PluginResult::Continue;
         }
 
@@ -509,17 +683,22 @@ impl Plugin for FaultInjectionPlugin {
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
-        let (delay_triggered, abort_triggered) = self.decide_faults();
+        if self.stream_faults_disabled() {
+            return PluginResult::Continue;
+        }
 
-        // UDP/DTLS application latency is owned by `on_udp_datagram` so the
-        // first-datagram setup path (datagram hook, then stream connect) cannot
-        // stack two delays for one packet. Session abort still refuses admission
-        // here, matching TCP stream rejects. TCP keeps delay+abort on connect.
+        // UDP/DTLS application latency is owned by `on_udp_datagram`: the
+        // plain-UDP first-datagram setup path runs stream connect and then the
+        // datagram hook on the same packet, so deciding delay here too would
+        // stack two waits. First-contact abort is decided only here (the
+        // datagram hook skips its abort roll for the session's first datagram,
+        // plain UDP or DTLS), refusing admission like a TCP stream reject. TCP
+        // keeps delay+abort on connect.
         let udp_family = matches!(
             ctx.backend_scheme,
             crate::config::types::BackendScheme::Udp | crate::config::types::BackendScheme::Dtls
         );
-        let delay_triggered = delay_triggered && !udp_family;
+        let (delay_triggered, abort_triggered) = self.decide_fault_sides(!udp_family, true);
 
         if !delay_triggered && !abort_triggered {
             return PluginResult::Continue;
@@ -568,8 +747,16 @@ impl Plugin for FaultInjectionPlugin {
         if ctx.direction != UdpDatagramDirection::ClientToBackend {
             return UdpDatagramVerdict::Forward;
         }
+        if self.stream_faults_disabled() {
+            return UdpDatagramVerdict::Forward;
+        }
 
-        let (delay_triggered, abort_triggered) = self.decide_faults();
+        // The session's first datagram (plain-UDP opening packet, or first DTLS
+        // application datagram) already had its abort decided by
+        // `on_stream_connect`; rolling abort again here would make the
+        // effective first-contact failure rate `1-(1-p)^2` instead of `p`.
+        let (delay_triggered, abort_triggered) =
+            self.decide_fault_sides(true, !ctx.admission_datagram);
         if !delay_triggered && !abort_triggered {
             return UdpDatagramVerdict::Forward;
         }

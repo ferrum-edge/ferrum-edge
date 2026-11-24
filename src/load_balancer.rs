@@ -1188,27 +1188,6 @@ fn build_srv_priorities(upstream_id: &str, targets: &[UpstreamTarget]) -> Vec<u3
     priorities
 }
 
-/// Warm-up bias subtracted from `min_known_ewma` for unsampled (late-joiner)
-/// targets during the mixed warm-up phase.
-///
-/// Used only when comparing among **unwarmed** candidates (bounded
-/// exploration). Warmed targets are never displaced by an unconditional
-/// biased-best preference for an unsampled peer — see
-/// `LATENCY_WARMUP_EXPLORE_PERMILLE`.
-///
-/// **Behavioral note:** any nonzero bias value (including `1`) produces the
-/// same selection outcome among unwarmed peers because `saturating_sub(N)`
-/// for any `N >= 1` makes the unsampled target strictly less than the
-/// minimum warmed EWMA when `min_known_ewma > 0`, and saturates to `0` (a tie
-/// broken by iteration order) when `min_known_ewma == 0`.
-///
-/// The constant exists as a named policy anchor: 1 ms (1 000 us) documents
-/// the intended preference gap in human-readable latency units and makes the
-/// warm-up strategy greppable and self-documenting, replacing a bare magic
-/// literal.
-#[allow(dead_code)] // policy-anchor constant; mixed warm-up now uses bounded exploration
-const LATENCY_WARMUP_BIAS_US: u64 = 1_000;
-
 /// Permille (‰) of mixed-warm-up selections that explore sub-threshold
 /// (unwarmed) targets via round-robin among them.
 ///
@@ -1241,7 +1220,7 @@ fn unwarmed_explore_slot(ticket: u64, unwarmed_count: usize) -> Option<usize> {
 /// Synthetic EWMA sample (microseconds) recorded for a failed dispatch
 /// attempt. Counts toward the warm-up threshold and penalizes the target so
 /// a target that fails every request exits warm-up with a poor score instead
-/// of remaining biased-best forever. 1 second is deliberately worse than
+/// of staying in warm-up forever. 1 second is deliberately worse than
 /// typical healthy TTFB while still finite for EWMA math.
 const LATENCY_FAILURE_PENALTY_US: u64 = 1_000_000;
 
@@ -1299,19 +1278,7 @@ pub(crate) fn lookup_namespaced_upstream<'a>(
 }
 
 impl LoadBalancerCacheInner {
-    /// Access the balancers map for custom code that needs direct HashMap access.
-    ///
-    /// Prefer the typed accessors [`LoadBalancerCache::get_hash_on_strategy_from`]
-    /// and [`LoadBalancerCache::select_target_from`] when possible — they cover
-    /// the standard hot-path use cases without exposing internal structure.
-    #[allow(dead_code)] // Public API used by custom plugins
-    #[inline]
-    pub fn balancers(&self) -> &HashMap<String, Arc<LoadBalancer>> {
-        &self.balancers
-    }
-
     /// Access the upstream index for custom code that needs direct lookup.
-    #[allow(dead_code)] // Public API used by custom plugins
     #[inline]
     pub fn upstreams(&self) -> &HashMap<String, Arc<Upstream>> {
         &self.upstreams
@@ -1657,37 +1624,11 @@ impl LoadBalancerCache {
         })
     }
 
-    /// Get the pre-parsed hash-on strategy for an upstream.
-    /// Returns `HashOnStrategy::Ip` if the upstream is not found.
-    pub fn get_hash_on_strategy(&self, namespace: &str, upstream_id: &str) -> HashOnStrategy {
-        let inner = self.inner.load();
-        Self::get_hash_on_strategy_from(&inner, namespace, upstream_id)
-    }
-
-    /// Select a target from the upstream, filtering out unhealthy targets.
-    ///
-    /// Returns a [`TargetSelection`] indicating whether the target came from
-    /// the healthy pool or is a degraded-mode fallback (all targets unhealthy).
-    ///
-    /// When `health` is provided, targets appearing in either the active
-    /// unhealthy map (upstream-wide probe failures) or the passive unhealthy
-    /// map (per-proxy traffic failures) are filtered out.
-    pub fn select_target(
-        &self,
-        namespace: &str,
-        upstream_id: &str,
-        ctx_key: &str,
-        health: Option<&HealthContext<'_>>,
-    ) -> Option<TargetSelection> {
-        let inner = self.inner.load();
-        Self::select_target_from(&inner, namespace, upstream_id, ctx_key, health)
-    }
-
     /// Load the balancers map once and return a guard for multiple lookups.
     ///
-    /// Use this when you need both `get_hash_on_strategy()` and `select_target()`
-    /// for the same upstream -- saves one `ArcSwap::load()` atomic operation per
-    /// request by loading the balancers map once and reusing the guard.
+    /// Pass the guard to the `*_from` accessors (for example
+    /// [`Self::get_hash_on_strategy_from`] and [`Self::select_target_from`]) so
+    /// one request pays for one `ArcSwap::load()`.
     #[inline]
     pub fn load(&self) -> arc_swap::Guard<Arc<LoadBalancerCacheInner>> {
         self.inner.load()
@@ -1703,20 +1644,6 @@ impl LoadBalancerCache {
         snapshot
             .balancer(namespace, upstream_id)
             .map(|b| b.hash_on_strategy.clone())
-            .unwrap_or(HashOnStrategy::Ip)
-    }
-
-    /// Get the pre-parsed hash-on strategy for a per-port override.
-    #[inline]
-    pub fn get_hash_on_strategy_for_port_from(
-        snapshot: &LoadBalancerCacheInner,
-        namespace: &str,
-        upstream_id: &str,
-        port: u16,
-    ) -> HashOnStrategy {
-        snapshot
-            .balancer(namespace, upstream_id)
-            .map(|b| b.hash_on_strategy_for_port(port))
             .unwrap_or(HashOnStrategy::Ip)
     }
 
@@ -1963,19 +1890,6 @@ impl LoadBalancerCache {
         }
     }
 
-    /// Select next target, excluding a previously tried target (for retries).
-    pub fn select_next_target(
-        &self,
-        namespace: &str,
-        upstream_id: &str,
-        ctx_key: &str,
-        exclude: &UpstreamTarget,
-        health: Option<&HealthContext<'_>>,
-    ) -> Option<Arc<UpstreamTarget>> {
-        let inner = self.inner.load();
-        Self::select_next_target_from(&inner, namespace, upstream_id, ctx_key, exclude, health)
-    }
-
     pub fn select_next_target_from(
         snapshot: &LoadBalancerCacheInner,
         namespace: &str,
@@ -2196,27 +2110,6 @@ impl LoadBalancerCache {
             .and_then(|u| u.health_checks.as_ref())
             .and_then(|hc| hc.passive.as_ref())
             .and_then(|p| p.max_ejection_percent)
-    }
-
-    #[inline]
-    pub fn max_ejection_percent_for_port_from(
-        snapshot: &LoadBalancerCacheInner,
-        namespace: &str,
-        upstream_id: &str,
-        proxy: &Proxy,
-        port: u16,
-    ) -> Option<u8> {
-        if Self::has_port_override_state_from(snapshot, namespace, upstream_id, port)
-            && let Some(port_passive) = proxy
-                .dispatch_port_overrides
-                .as_ref()
-                .and_then(|overrides| overrides.get(&port))
-                .and_then(|override_config| override_config.passive_health_check.as_ref())
-        {
-            return port_passive.max_ejection_percent;
-        }
-
-        Self::max_ejection_percent_from(snapshot, namespace, upstream_id)
     }
 
     /// Resolve the passive-health `maxEjectionPercent` cap for a dispatch using
@@ -4244,10 +4137,7 @@ impl LoadBalancer {
     ///
     /// Crate-private test seam (routed through `_test_support`): lets coverage
     /// assert distinct construction-time phases without depending on OS thread →
-    /// shard assignment. The library target exposes this through `_test_support`;
-    /// the binary target compiles this module without that bridge, so the helper
-    /// is intentionally unused there.
-    #[allow(dead_code)]
+    /// shard assignment.
     pub(crate) fn selection_counter_phases_for_test(&self) -> [u64; 16] {
         std::array::from_fn(|i| self.rr_counter[i].load(Ordering::Relaxed))
     }
@@ -6081,12 +5971,6 @@ impl LoadBalancer {
         })
     }
 
-    /// Return the pre-computed subset indices for a given subset name, if any.
-    #[inline]
-    pub fn subset_indices(&self, subset_name: &str) -> Option<&[usize]> {
-        self.subset_indices.get(subset_name).map(|v| v.as_slice())
-    }
-
     #[inline]
     fn subset_algorithm(&self, subset_name: &str) -> LoadBalancerAlgorithm {
         self.subset_algorithms
@@ -6236,14 +6120,6 @@ impl LoadBalancer {
     #[inline]
     fn has_port_override_state(&self, port: u16) -> bool {
         self.port_overrides.contains_key(&port)
-    }
-
-    #[inline]
-    fn hash_on_strategy_for_port(&self, port: u16) -> HashOnStrategy {
-        self.port_overrides
-            .get(&port)
-            .map(|state| state.hash_on_strategy.clone())
-            .unwrap_or_else(|| self.hash_on_strategy.clone())
     }
 
     /// Dispatch to the algorithm-specific selector using a pre-computed bitset.
@@ -6797,17 +6673,6 @@ impl LoadBalancer {
         self.select_with_bitset(ctx_key, &healthy)
     }
 
-    pub fn select_excluding_for_port(
-        &self,
-        ctx_key: &str,
-        port: u16,
-        exclude: &UpstreamTarget,
-        health: Option<&HealthContext<'_>>,
-    ) -> Option<Arc<UpstreamTarget>> {
-        let filter = RetryCandidateFilter::excluding(exclude);
-        self.select_filtered_for_port(ctx_key, port, filter, health)
-    }
-
     /// Retry-only eligibility-aware selection on a live per-port override lane.
     pub fn select_filtered_for_port(
         &self,
@@ -6894,21 +6759,6 @@ impl LoadBalancer {
             &port_state.wrr_state,
             &port_state.hash_ring,
             port_locality,
-        )
-    }
-
-    pub fn select_excluding_from_subset(
-        &self,
-        ctx_key: &str,
-        subset_name: &str,
-        exclude: &UpstreamTarget,
-        health: Option<&HealthContext<'_>>,
-    ) -> Option<Arc<UpstreamTarget>> {
-        self.select_filtered_from_subset(
-            ctx_key,
-            subset_name,
-            RetryCandidateFilter::excluding(exclude),
-            health,
         )
     }
 
@@ -7014,23 +6864,6 @@ impl LoadBalancer {
         )
     }
 
-    pub fn select_excluding_for_port_from_subset(
-        &self,
-        ctx_key: &str,
-        port: u16,
-        subset_name: &str,
-        exclude: &UpstreamTarget,
-        health: Option<&HealthContext<'_>>,
-    ) -> Option<Arc<UpstreamTarget>> {
-        self.select_filtered_for_port_from_subset(
-            ctx_key,
-            port,
-            subset_name,
-            RetryCandidateFilter::excluding(exclude),
-            health,
-        )
-    }
-
     /// Retry-only eligibility-aware selection on a live per-port × subset lane.
     pub fn select_filtered_for_port_from_subset(
         &self,
@@ -7112,7 +6945,7 @@ impl LoadBalancer {
         // drop excluded (previously tried) target(s) from it BEFORE sizing the
         // ejection cap, so the cap's denominator and readmission budget evaluate
         // over the actual retry candidates rather than spending the budget on
-        // an excluded target (see `select_excluding_from_subset`).
+        // an excluded target (see `select_filtered_from_subset`).
         let strict_scope = self.subset_port_mask(subset_target_indices, &port_state.target_indices);
         let (candidate_mask, locality_scope) = split_retry_candidate_and_locality_scope_bitset(
             &self.targets,
@@ -7694,11 +7527,16 @@ impl LoadBalancer {
         let mut best_idx = 0;
         let mut found = false;
 
-        for i in 0..self.targets.len() {
+        for (i, state) in self
+            .target_state
+            .iter()
+            .enumerate()
+            .take(self.targets.len())
+        {
             if !healthy.contains(i) {
                 continue;
             }
-            let conns = self.target_state[i].active_connections();
+            let conns = state.active_connections();
             if !found || conns < min_conns {
                 min_conns = conns;
                 best_idx = i;
@@ -7732,11 +7570,16 @@ impl LoadBalancer {
         let mut any_has_data = false;
         let mut unwarmed_count = 0usize;
 
-        for i in 0..self.targets.len() {
+        for (i, state) in self
+            .target_state
+            .iter()
+            .enumerate()
+            .take(self.targets.len())
+        {
             if !healthy.contains(i) {
                 continue;
             }
-            let samples = self.target_state[i].latency_sample_count();
+            let samples = state.latency_sample_count();
             if samples >= LATENCY_WARMUP_THRESHOLD {
                 warmed_count += 1;
             } else {
@@ -7783,11 +7626,15 @@ impl LoadBalancer {
             let mut best_latency = u64::MAX;
             let mut best_idx = 0;
             let mut found = false;
-            for i in 0..self.targets.len() {
+            for (i, state) in self
+                .target_state
+                .iter()
+                .enumerate()
+                .take(self.targets.len())
+            {
                 if !healthy.contains(i) {
                     continue;
                 }
-                let state = &self.target_state[i];
                 if state.latency_sample_count() < LATENCY_WARMUP_THRESHOLD {
                     continue;
                 }
@@ -7812,11 +7659,16 @@ impl LoadBalancer {
         let mut best_idx = 0;
         let mut found = false;
 
-        for i in 0..self.targets.len() {
+        for (i, state) in self
+            .target_state
+            .iter()
+            .enumerate()
+            .take(self.targets.len())
+        {
             if !healthy.contains(i) {
                 continue;
             }
-            let latency = self.target_state[i].latency_ewma_raw();
+            let latency = state.latency_ewma_raw();
             if !found || latency < best_latency {
                 best_latency = latency;
                 best_idx = i;
@@ -8003,8 +7855,10 @@ impl LoadBalancer {
         Some(Arc::clone(best.1))
     }
 
-    /// Consistent hash — Vec fallback. Uses bitset for O(1) candidate
-    /// membership check instead of the previous O(candidates) linear scan.
+    /// Consistent hash — Vec fallback (more than 128 targets). Candidate
+    /// membership during the ring walk is a binary search on the
+    /// ascending-original-index candidate slice (see
+    /// [`resolve_wrr_vec_candidate`]), so selection allocates nothing.
     #[cfg(test)]
     fn select_consistent_hash_vec(
         &self,
@@ -8026,11 +7880,9 @@ impl LoadBalancer {
 
         let hash = fx_hash_str(ctx_key);
 
-        // Build a membership set for O(1) candidate check during ring walk.
-        // For the >128-target Vec fallback, use a HashSet.
-        let candidate_set: std::collections::HashSet<usize> =
-            candidates.iter().map(|(i, _)| *i).collect();
-
+        // Vec candidates keep ascending original-index order, so membership is
+        // an allocation-free binary search instead of a per-selection HashSet
+        // (issue #7207). A hit always names a real candidate.
         let pos = match hash_ring.binary_search_by_key(&hash, |&(h, _)| h) {
             Ok(p) => p,
             Err(p) => p % hash_ring.len(),
@@ -8039,8 +7891,8 @@ impl LoadBalancer {
         for i in 0..hash_ring.len() {
             let ring_idx = (pos + i) % hash_ring.len();
             let target_idx = hash_ring[ring_idx].1;
-            if candidate_set.contains(&target_idx) {
-                return Some(Arc::clone(&self.targets[target_idx]));
+            if let Some(target) = resolve_wrr_vec_candidate(candidates, target_idx) {
+                return Some(Arc::clone(target));
             }
         }
 
@@ -8421,6 +8273,47 @@ mod tests {
         let empty_candidates: Vec<(usize, &Arc<UpstreamTarget>)> = vec![];
         let result = lb.select_consistent_hash_vec("key", &empty_candidates);
         assert!(result.is_none());
+    }
+
+    /// Issue #7207: the Vec fallback's binary-search membership walk selects
+    /// exactly the first ring entry that is a candidate, as the previous
+    /// HashSet walk did.
+    #[test]
+    fn consistent_hash_vec_selects_first_candidate_on_ring() {
+        let targets: Vec<UpstreamTarget> = (0..200)
+            .map(|i| make_target(&format!("10.0.{}.{}", i / 250, i % 250), 8080))
+            .collect();
+        let lb = LoadBalancer::new(
+            "upstream-ch-vec",
+            LoadBalancerAlgorithm::ConsistentHashing,
+            &targets,
+            None,
+        );
+        // Every third target, ascending original indices.
+        let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = lb
+            .targets
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| idx % 3 == 0)
+            .collect();
+        for key in ["a", "client-1", "client-2", "198.51.100.7", "session-xyz"] {
+            let selected = lb
+                .select_consistent_hash_vec(key, &candidates)
+                .expect("candidates are non-empty");
+            let hash = fx_hash_str(key);
+            let pos = match lb.hash_ring.binary_search_by_key(&hash, |&(h, _)| h) {
+                Ok(p) => p,
+                Err(p) => p % lb.hash_ring.len(),
+            };
+            let expected = (0..lb.hash_ring.len())
+                .map(|i| lb.hash_ring[(pos + i) % lb.hash_ring.len()].1)
+                .find(|target_idx| target_idx % 3 == 0)
+                .expect("ring contains candidate targets");
+            assert!(
+                Arc::ptr_eq(&selected, &lb.targets[expected]),
+                "key {key} must select the first candidate clockwise on the ring"
+            );
+        }
     }
 
     /// Non-consistent-hash algorithms have an empty hash_ring by construction.

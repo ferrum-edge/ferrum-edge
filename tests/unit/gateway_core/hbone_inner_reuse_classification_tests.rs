@@ -85,7 +85,9 @@ fn classification_bodies(source: &str, signature: &str) -> Vec<String> {
 ///   so a bound executor refuses.
 /// * `mesh/spiffe_identity` — (b), and the ONLY credential-bearing plugin that
 ///   qualifies: the credential it reads is the mTLS leaf, which is exactly what
-///   the fence's credential gate re-verifies and expires.
+///   the fence's credential gate re-verifies and expires. Only while it carries
+///   no operator admission policy: a `require_identity` / `allowed_trust_domains`
+///   verdict is a per-CONNECT decision no sweep re-issues.
 /// * `mesh/workload_metrics`, `otel_tracing`, `prometheus_metrics`,
 ///   `proxy_alerts`, `stdout_logging` — (a). Pure observability: no admission
 ///   decision, no per-request budget, no rejection. Reuse costs record
@@ -126,7 +128,10 @@ const EXPECTED_CLASSIFICATION: &[(&str, &str)] = &[
         "!self.outbound_listen_ports.is_empty() && !self.should_enforce_for_request_facts( \
          admission.mesh_direction, admission.frontend_listen_port, )",
     ),
-    ("mesh/spiffe_identity.rs", "true"),
+    (
+        "mesh/spiffe_identity.rs",
+        "!self.require_identity && self.allowed_trust_domains.is_none()",
+    ),
     ("mesh/workload_metrics.rs", "true"),
     ("otel_tracing.rs", "true"),
     ("prometheus_metrics.rs", "true"),

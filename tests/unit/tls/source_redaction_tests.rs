@@ -189,7 +189,11 @@ fn tls_policy_rendering_keeps_fields_and_suggestions_without_values() {
         };
         assert_rendered(
             TlsPolicy::from_env_config(&config).unwrap_err(),
-            &["`FERRUM_TLS_CURVES`", "Unknown curve/group", "`secp256r1`"],
+            &[
+                "`FERRUM_TLS_KEY_EXCHANGE_GROUPS`",
+                "Unknown curve/group",
+                "`secp256r1`",
+            ],
         );
         let config = EnvConfig {
             tls_min_version: value.to_string(),

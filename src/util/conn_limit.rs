@@ -107,10 +107,7 @@ pub struct ConnLimiterSnapshot {
 }
 
 impl ConnLimiterSnapshot {
-    /// Total rejections across both caps ("limit hits"). `#[allow(dead_code)]`
-    /// because the binary target compiles this module tree separately from the
-    /// library and only the external test crates call it.
-    #[allow(dead_code)]
+    /// Total rejections across both caps ("limit hits").
     pub fn rejected_total(&self) -> u64 {
         self.rejected_max_connections
             .saturating_add(self.rejected_max_connections_per_ip)
@@ -235,9 +232,7 @@ impl ConnLimiter {
     }
 
     /// Convenience constructor for an uncapped limiter. Used by the external
-    /// test crates; `#[allow(dead_code)]` because the binary target compiles
-    /// the module tree separately (alongside the library) and never calls it.
-    #[allow(dead_code)]
+    /// test crates.
     pub fn unlimited() -> Arc<Self> {
         Arc::new(Self::new(0, 0))
     }
@@ -308,7 +303,6 @@ impl ConnLimiter {
     /// of live permits (see the module docs); exposed for diagnostics and
     /// regression coverage, never as a metric label. `#[allow(dead_code)]` for
     /// the same binary-target reason as [`ConnLimiter::unlimited`].
-    #[allow(dead_code)]
     pub fn tracked_source_ips(&self) -> usize {
         self.per_ip_active.len()
     }

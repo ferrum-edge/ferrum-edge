@@ -106,28 +106,6 @@ const LOG_LEVELS: [LogLevel; 5] = [
     LogLevel::Error,
 ];
 
-const ERROR_CLASSES: [&str; 19] = [
-    "connection_timeout",
-    "connection_refused",
-    "connection_reset",
-    "connection_closed",
-    "dns_lookup_error",
-    "tls_error",
-    "read_write_timeout",
-    "client_disconnect",
-    "protocol_error",
-    "response_body_too_large",
-    "gateway_buffer_capacity",
-    "request_body_too_large",
-    "connection_pool_error",
-    "port_exhaustion",
-    "graceful_remote_close",
-    "dispatch_policy_rejected",
-    "backend_connection_limit",
-    "trust_withdrawn",
-    "request_error",
-];
-
 pub struct RuntimeMetrics {
     pub http_errors_by_class: ErrorCounterMap,
     pub grpc_errors_by_class: ErrorCounterMap,
@@ -152,7 +130,6 @@ pub struct RuntimeMetrics {
 
     pub status_window_1m: DashMap<u16, AtomicU64>,
     pub status_window_5m: DashMap<u16, AtomicU64>,
-    pub status_window_rotated_at: AtomicU64,
 
     pub system: ArcSwap<SystemSnapshot>,
     pub started_at: Instant,
@@ -202,7 +179,6 @@ impl RuntimeMetrics {
             log_counts_by_category: DashMap::new(),
             status_window_1m: DashMap::new(),
             status_window_5m: DashMap::new(),
-            status_window_rotated_at: AtomicU64::new(0),
             system: ArcSwap::from_pointee(SystemSnapshot::empty()),
             started_at: Instant::now(),
             max_error_entries: AtomicUsize::new(200),
@@ -259,6 +235,11 @@ impl RuntimeMetrics {
 
     pub fn reqwest_active_backend_requests(&self) -> u64 {
         self.reqwest_active_backend_requests.load(Ordering::Relaxed)
+    }
+
+    /// Requests recorded as client disconnects so far.
+    pub fn client_disconnects(&self) -> u64 {
+        self.client_disconnects.load(Ordering::Relaxed)
     }
 
     pub fn record_transaction(&self, summary: &TransactionSummary) {
@@ -346,6 +327,29 @@ impl RuntimeMetrics {
         }
     }
 
+    /// The stream-error and TCP RST counters for one ended raw-TCP stream
+    /// that builds no `StreamTransactionSummary` (a relay with no stream
+    /// plugin chain). Counts exactly what [`Self::record_stream_transaction`]
+    /// plus the caller-side RST record count for a summary with the same
+    /// class and direction, so the counters do not depend on whether a stream
+    /// plugin is configured (issue #7183).
+    pub fn record_stream_end(
+        &self,
+        proxy_id: &str,
+        error_class: Option<ErrorClass>,
+        direction: Option<Direction>,
+    ) {
+        let Some(class) = error_class else {
+            return;
+        };
+        self.increment_error_map(&self.stream_errors_by_class, proxy_id, class.as_str());
+        if class == ErrorClass::ConnectionReset
+            && let Some(direction) = direction
+        {
+            self.record_tcp_rst(proxy_id, direction);
+        }
+    }
+
     pub fn record_dns_hit(&self) {
         self.dns_lookups_total.fetch_add(1, Ordering::Relaxed);
         self.dns_cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -408,6 +412,12 @@ impl RuntimeMetrics {
 
     pub fn record_log(&self, level: LogLevel, category: &'static str) {
         self.log_counts[level.index()].fetch_add(1, Ordering::Relaxed);
+        // Existing keys take the shard read lock only; `entry` would take the
+        // write lock on every counted event (issue #7207).
+        if let Some(counter) = self.log_counts_by_category.get(&(level, category)) {
+            counter.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         self.log_counts_by_category
             .entry((level, category))
             .or_insert_with(|| CachePadded::new(AtomicU64::new(0)))
@@ -530,9 +540,6 @@ impl RuntimeMetrics {
                 .or_insert_with(|| AtomicU64::new(0))
                 .store(delta, Ordering::Relaxed);
         }
-
-        self.status_window_rotated_at
-            .store(unix_seconds(), Ordering::Relaxed);
     }
 }
 
@@ -857,10 +864,9 @@ fn percent_map(values: &BTreeMap<String, u64>, total: u64) -> BTreeMap<String, f
 }
 
 fn build_errors_snapshot(metrics: &RuntimeMetrics) -> ErrorsSnapshot {
-    let mut by_class: BTreeMap<&'static str, ErrorClassCounts> = ERROR_CLASSES
+    let mut by_class: BTreeMap<&'static str, ErrorClassCounts> = ErrorClass::ALL
         .iter()
-        .copied()
-        .map(|class| (class, ErrorClassCounts::default()))
+        .map(|class| (class.as_str(), ErrorClassCounts::default()))
         .collect();
     let mut by_proxy: BTreeMap<String, BTreeMap<&'static str, u64>> = BTreeMap::new();
 
@@ -1030,6 +1036,8 @@ fn build_overload_snapshot(proxy_state: Option<&crate::proxy::ProxyState>) -> Va
                 "dtls_demux_sessions": [],
                 "frontend_dtls_reload":
                     crate::proxy::stream_listener::FrontendDtlsReloadStatus::default(),
+                "mesh_node_waypoint_dtls_reload":
+                    crate::proxy::stream_listener::FrontendDtlsReloadStatus::default(),
                 "bind_failures_total": 0,
                 "bind_failures": []
             })
@@ -1059,13 +1067,6 @@ fn rounding_div(numerator: u64, denominator: u64) -> u64 {
     (numerator + denominator / 2) / denominator
 }
 
-fn unix_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 fn is_grpc_summary(summary: &TransactionSummary) -> bool {
     terminal_metadata_is_grpc(&summary.metadata)
 }
@@ -1073,7 +1074,9 @@ fn is_grpc_summary(summary: &TransactionSummary) -> bool {
 /// The metadata reading that files a terminal error under the gRPC counters
 /// rather than the HTTP ones. Shared with the summary-free terminal path so
 /// both classify identically.
-pub fn terminal_metadata_is_grpc(metadata: &HashMap<String, String>) -> bool {
+pub fn terminal_metadata_is_grpc<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> bool {
     metadata
         .get("request_protocol")
         .or_else(|| metadata.get("mesh.request_protocol"))
@@ -1509,6 +1512,7 @@ mod tests {
             proxy_name: None,
             client_ip: "127.0.0.1".to_string(),
             consumer_username: None,
+            principal_origin: None,
             auth_method: None,
             backend_target: "tcp://127.0.0.1:9001".to_string(),
             backend_resolved_ip: None,

@@ -59,7 +59,6 @@ fn create_test_proxy() -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -91,7 +90,7 @@ fn create_test_proxy() -> Proxy {
 #[test]
 fn test_default_config() {
     let config = PoolConfig::default();
-    assert_eq!(config.max_idle_per_host, 64);
+    assert_eq!(config.max_idle_per_host, 256);
     assert_eq!(config.idle_timeout_seconds, 90);
     assert_eq!(config.tcp_keepalive_seconds, 60);
     assert_eq!(config.http2_keep_alive_interval_seconds, 30);
@@ -214,7 +213,7 @@ fn test_proxy_overrides() {
     proxy.pool_http2_keep_alive_timeout_seconds = Some(45);
 
     let config = global.for_proxy(&proxy);
-    assert_eq!(config.max_idle_per_host, 64); // unchanged (global-only)
+    assert_eq!(config.max_idle_per_host, 256); // unchanged (global-only)
     assert_eq!(config.idle_timeout_seconds, 90); // unchanged
     assert_eq!(config.tcp_keepalive_seconds, 30); // overridden
     assert_eq!(config.http2_keep_alive_interval_seconds, 15); // overridden
@@ -416,36 +415,6 @@ fn test_effective_http2_max_concurrent_streams_matches_for_proxy() {
 }
 
 #[test]
-fn test_validate_clamps_too_low() {
-    let result = PoolConfig::validate_max_idle_per_host(1, "test");
-    assert_eq!(result, MIN_IDLE_PER_HOST);
-}
-
-#[test]
-fn test_validate_clamps_too_high() {
-    let result = PoolConfig::validate_max_idle_per_host(5000, "test");
-    assert_eq!(result, MAX_IDLE_PER_HOST);
-}
-
-#[test]
-fn test_validate_accepts_valid_value() {
-    let result = PoolConfig::validate_max_idle_per_host(100, "test");
-    assert_eq!(result, 100);
-}
-
-#[test]
-fn test_validate_accepts_boundary_values() {
-    assert_eq!(
-        PoolConfig::validate_max_idle_per_host(MIN_IDLE_PER_HOST, "test"),
-        MIN_IDLE_PER_HOST
-    );
-    assert_eq!(
-        PoolConfig::validate_max_idle_per_host(MAX_IDLE_PER_HOST, "test"),
-        MAX_IDLE_PER_HOST
-    );
-}
-
-#[test]
 fn test_append_reqwest_client_behavior_pool_key_adaptive_precedence() {
     let global = PoolConfig::default();
     let mut adaptive = create_test_proxy();
@@ -581,7 +550,7 @@ fn test_from_env_explicit_defaults_match_today() {
     // default is host-dependent (CPU cores clamped to 2-8).
     with_env_vars(
         &[
-            ("FERRUM_POOL_MAX_IDLE_PER_HOST", "64"),
+            ("FERRUM_POOL_MAX_IDLE_PER_HOST", "256"),
             ("FERRUM_POOL_IDLE_TIMEOUT_SECONDS", "90"),
             ("FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE", "true"),
             ("FERRUM_POOL_ENABLE_HTTP2", "true"),

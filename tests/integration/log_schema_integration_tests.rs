@@ -284,7 +284,7 @@ fn prospective_graph_is_namespace_scoped_across_multiple_instances() {
     .expect_err("a referrer must not resolve a definition from another namespace");
     assert!(
         errors.iter().any(|error| {
-            error.contains("namespace=\"tenant-b\"") && error.contains("unknown schema")
+            error.contains("`namespace`=\"tenant-b\"") && error.contains("unknown schema")
         }),
         "unexpected cross-namespace errors: {errors:?}"
     );
@@ -304,11 +304,13 @@ fn runtime_load_preserves_optional_logger_fail_open_but_not_dangling_refs() {
                 "transaction_log_schema",
                 json!({"schemas": {"audit": {}}}),
             ),
+            // `transaction_debugger` is `OptionalFailOpen`; `stdout_logging`
+            // is `KeepLastKnownGood` and its constructor failures reject.
             graph_plugin(
                 "logger",
                 "ferrum",
-                "stdout_logging",
-                json!({"schema_ref": "audit", "filter": "not-an-object"}),
+                "transaction_debugger",
+                json!({"schema_ref": "audit", "unknown_key": true}),
             ),
         ],
         ..GatewayConfig::default()
@@ -367,11 +369,13 @@ fn shared_runtime_rejecting_contract_rejects_dangling_graphs_only() {
                 "transaction_log_schema",
                 json!({"schemas": {"audit": {}}}),
             ),
+            // `transaction_debugger` is `OptionalFailOpen`; `stdout_logging`
+            // is `KeepLastKnownGood` and its constructor failures reject.
             graph_plugin(
                 "logger",
                 "ferrum",
-                "stdout_logging",
-                json!({"schema_ref": "audit", "filter": "not-an-object"}),
+                "transaction_debugger",
+                json!({"schema_ref": "audit", "unknown_key": true}),
             ),
         ],
         ..GatewayConfig::default()

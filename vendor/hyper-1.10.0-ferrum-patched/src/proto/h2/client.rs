@@ -190,7 +190,7 @@ where
     };
 
     exec.execute_h2_future(H2ClientFuture::Task {
-        task: ConnTask::new(conn, conn_drop_rx, cancel_tx),
+        task: Box::pin(ConnTask::new(conn, conn_drop_rx, cancel_tx)),
     });
 
     Ok(ClientTask {
@@ -383,8 +383,11 @@ pin_project! {
             send_when: SendWhen<B, E>,
         },
         Task {
-            #[pin]
-            task: ConnTask<T, B>,
+            // FERRUM PATCH 009: boxed. One connection task is spawned per
+            // connection, but inline it set the size of this enum, so every
+            // per-request `Pipe` and `Send` task was allocated and copied at
+            // the size of the whole h2 connection.
+            task: Pin<Box<ConnTask<T, B>>>,
         },
     }
 }
@@ -404,7 +407,7 @@ where
         match this {
             H2ClientFutureProject::Pipe { pipe } => pipe.poll(cx),
             H2ClientFutureProject::Send { send_when } => send_when.poll(cx),
-            H2ClientFutureProject::Task { task } => task.poll(cx),
+            H2ClientFutureProject::Task { task } => task.as_mut().poll(cx),
         }
     }
 }
@@ -421,6 +424,8 @@ where
     cb: Callback<Request<B>, Response<IncomingBody>>,
     // FERRUM PATCH 004: the request's `Http2BodyWriteTimeout`, if any.
     write_timeout: Option<crate::ext::Http2BodyWriteTimeout>,
+    // FERRUM PATCH 007: the request's `Http2BodyDeadline`, if any.
+    body_deadline: Option<crate::ext::Http2BodyDeadline>,
 }
 
 impl<B: Body> Unpin for FutCtx<B> {}
@@ -473,6 +478,8 @@ pin_project! {
         #[pin]
         ping: Option<Recorder>,
         cancel_rx: Option<oneshot::Receiver<()>>,
+        // FERRUM PATCH 007: the request's absolute body deadline, if any.
+        deadline: Option<Pin<Box<dyn crate::rt::Sleep>>>,
     }
 }
 
@@ -504,6 +511,19 @@ where
                 *this.cancel_rx = None;
             }
             Some(Poll::Pending) | None => {}
+        }
+
+        // FERRUM PATCH 007: the request's absolute body deadline. Polled here,
+        // ahead of the pipe, so it fires whatever the pipe is parked on: the
+        // body, or peer flow control with a chunk it cannot yet send.
+        if let Some(deadline) = this.deadline.as_mut() {
+            if deadline.as_mut().poll(cx).is_ready() {
+                debug!("client request body deadline elapsed, resetting stream");
+                this.pipe.as_mut().send_reset(h2::Reason::CANCEL);
+                drop(this.conn_drop_ref.take().expect("Future polled twice"));
+                drop(this.ping.take().expect("Future polled twice"));
+                return Poll::Ready(());
+            }
         }
 
         match Pin::new(&mut this.pipe).poll(cx) {
@@ -560,11 +580,23 @@ where
                         // still sending...
                         let ping = ping.clone();
 
+                        // FERRUM PATCH 007: arm the body deadline from the
+                        // connection's timer. Extraction already dropped it on
+                        // a connection without one.
+                        let deadline = f.body_deadline.map(|deadline| {
+                            self.timer.sleep(
+                                deadline
+                                    .deadline()
+                                    .saturating_duration_since(self.timer.now()),
+                            )
+                        });
+
                         let pipe = PipeMap {
                             pipe,
                             conn_drop_ref: Some(conn_drop_ref),
                             ping: Some(ping),
                             cancel_rx: Some(cancel_rx),
+                            deadline,
                         };
                         // Clear send task
                         self.executor
@@ -764,6 +796,13 @@ where
                         continue;
                     }
 
+                    // FERRUM PATCH 007: an absolute body deadline is armed from
+                    // the connection's timer; without one it is ignored.
+                    let body_deadline = req
+                        .extensions_mut()
+                        .remove::<crate::ext::Http2BodyDeadline>()
+                        .filter(|_| !matches!(self.timer, Time::Empty));
+
                     let (fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos) {
                         Ok(ok) => ok,
                         Err(err) => {
@@ -784,6 +823,7 @@ where
                         body,
                         cb,
                         write_timeout,
+                        body_deadline,
                     };
 
                     // Check poll_ready() again.
@@ -825,5 +865,73 @@ where
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ferrum_client_conn_task_box_tests {
+    //! FERRUM PATCH 009 regression: the per-request client tasks (`Pipe`,
+    //! `Send`) must not be sized by the per-connection task (`Task`).
+    use std::io;
+    use std::mem::size_of;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use bytes::Bytes;
+    use http_body_util::Full;
+
+    use super::{ConnTask, H2ClientFuture, PipeMap, SendWhen};
+
+    /// An I/O type that only has to satisfy the bounds of the types measured.
+    struct NoIo;
+
+    impl crate::rt::Read for NoIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: crate::rt::ReadBufCursor<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl crate::rt::Write for NoIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[test]
+    fn per_request_tasks_are_not_sized_by_the_connection_task() {
+        type Body = Full<Bytes>;
+
+        let spawned = size_of::<H2ClientFuture<Body, NoIo, ()>>();
+        let connection = size_of::<ConnTask<NoIo, Body>>();
+        let per_request = size_of::<PipeMap<Body>>().max(size_of::<SendWhen<Body, ()>>());
+
+        // Stored inline, the connection task is a lower bound on the size of
+        // the enum, so this fails if it is ever held inline again.
+        assert!(
+            spawned < connection,
+            "spawned future {spawned} bytes must not hold the {connection}-byte connection task inline"
+        );
+        // What the executor allocates and copies for every request is the
+        // largest per-request variant plus the enum tag.
+        assert!(
+            spawned <= per_request + 2 * size_of::<usize>(),
+            "spawned future {spawned} bytes, per-request tasks {per_request} bytes"
+        );
     }
 }

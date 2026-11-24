@@ -238,10 +238,22 @@ app.kubernetes.io/managed-by: {{ $ctx.Release.Service }}
 
 {{/* Source address the admin listener observes for the computed exec probe.
      Linux selects 127.0.0.1 when connecting to any concrete 127/8 destination;
-     other concrete/wildcard probe hosts use the same local address they dial. */}}
+     other concrete/wildcard probe hosts use the same local address they dial.
+     IPv4-mapped IPv6 destinations are canonicalized to IPv4 first (matching the
+     runtime), so `::ffff:127.0.0.2` is a 127/8 dial and the observed source is
+     `127.0.0.1`, not the mapped destination text. Ordinary IPv6 is unchanged.
+     Input is the root context: the probe host comes from the chart-wide
+     `.Values.admin` through `ferrum-gateway.probeHost`, unlike the mesh copy,
+     which takes an already-resolved per-component host. */}}
 {{- define "ferrum-gateway.probeSource" -}}
 {{- $host := include "ferrum-gateway.probeHost" . -}}
-{{- if regexMatch "^127\\." $host -}}127.0.0.1
+{{- $v4 := include "ferrum-gateway.ipv4ToInt" $host -}}
+{{- if eq $v4 "" -}}{{- $v4 = include "ferrum-gateway.ipv4MappedToInt" $host -}}{{- end -}}
+{{- if ne $v4 "" -}}
+{{- $int := $v4 | int64 -}}
+{{- if eq (div $int 16777216 | int) 127 -}}127.0.0.1
+{{- else -}}{{ include "ferrum-gateway.ipv4IntToDotted" $int }}
+{{- end -}}
 {{- else -}}{{ $host }}
 {{- end -}}
 {{- end -}}
@@ -258,6 +270,23 @@ app.kubernetes.io/managed-by: {{ $ctx.Release.Service }}
 {{- end -}}
 {{- end -}}
 
+{{/* "true" when a bind address is loopback: empty (the runtime's loopback
+     default), any 127/8 IPv4 literal, or any spelling of IPv6 ::1
+     (0:0:0:0:0:0:0:1, [::1], ...). The address is parsed, not prefix-matched,
+     so an expanded IPv6 loopback is not mistaken for a routable bind. Same rule
+     as ferrum-mesh.isLoopbackBind. */}}
+{{- define "ferrum-gateway.isLoopbackBind" -}}
+{{- $bind := . | toString | trim | trimPrefix "[" | trimSuffix "]" -}}
+{{- $v4 := include "ferrum-gateway.ipv4ToInt" $bind -}}
+{{- if eq $bind "" -}}
+true
+{{- else if ne $v4 "" -}}
+{{- if eq (div ($v4 | int64) 16777216 | int) 127 -}}true{{- end -}}
+{{- else if eq (include "ferrum-gateway.ipv6Hextets" $bind) "0,0,0,0,0,0,0,1" -}}
+true
+{{- end -}}
+{{- end -}}
+
 {{/* Convert a validated IPv4 literal to its unsigned 32-bit integer value. */}}
 {{- define "ferrum-gateway.ipv4ToInt" -}}
 {{- $v := . | toString -}}
@@ -265,6 +294,12 @@ app.kubernetes.io/managed-by: {{ $ctx.Release.Service }}
 {{- $parts := splitList "." $v -}}
 {{- add (mul (index $parts 0 | int64) 16777216) (mul (index $parts 1 | int64) 65536) (mul (index $parts 2 | int64) 256) (index $parts 3 | int64) -}}
 {{- end -}}
+{{- end -}}
+
+{{/* Convert an unsigned 32-bit IPv4 integer back to dotted-decimal. */}}
+{{- define "ferrum-gateway.ipv4IntToDotted" -}}
+{{- $v := . | int64 -}}
+{{- printf "%d.%d.%d.%d" (div $v 16777216) (mod (div $v 65536) 256) (mod (div $v 256) 256) (mod $v 256) -}}
 {{- end -}}
 
 {{/* Convert one validated IPv6 hextet to an integer. Helm has no base-16 atoi. */}}
@@ -397,8 +432,14 @@ app.kubernetes.io/managed-by: {{ $ctx.Release.Service }}
 {{- if and (eq $networkV4 "") (ne $mappedV4 "") -}}{{- $networkV4 = $mappedV4 -}}{{- end -}}
 {{- if ne $networkV4 "" -}}
 {{- $prefix := 32 -}}
-{{- if eq (len $parts) 2 -}}{{- $prefix = atoi (trim (index $parts 1)) -}}{{- end -}}
+{{- if eq (len $parts) 2 -}}
+{{- $prefix = atoi (trim (index $parts 1)) -}}
+{{- /* Mapped CIDRs are stored as IPv4 after subtracting the 96-bit prefix.
+     Bare mapped addresses have no prefix to subtract: they are already a
+     single IPv4 host (/32). Subtracting 96 from that default 32 produced a
+     negative length and could collapse the family to "permits all". */ -}}
 {{- if ne $mappedV4 "" -}}{{- $prefix = sub $prefix 96 | int -}}{{- end -}}
+{{- end -}}
 {{- $bits := include "ferrum-gateway.ipv4Bits" $networkV4 -}}
 {{- $_ := set $coverage (printf "4:%s" (substr 0 $prefix $bits)) true -}}
 {{- else -}}
@@ -718,6 +759,26 @@ Validation: fail render on missing/unsafe configuration.
 {{- if (.Values.k8sController | default dict).enabled -}}
 {{- fail "k8sController.enabled=true is not supported on the ferrum-gateway chart: this chart does not render the ClusterRole the in-cluster Kubernetes CRD controller needs (core namespace/service/secret/configmap/endpointslice watches 403-retry for the life of the process without it). Use the ferrum-mesh chart (charts/ferrum-mesh, controlPlane.rbac) instead. Leave k8sController.enabled=false (the default) so mode=cp renders FERRUM_K8S_CONTROLLER_ENABLED=false and FERRUM_K8S_POD_DISCOVERY_ENABLED=false." -}}
 {{- end -}}
+{{/* Issue #7426: Kubernetes refuses an autoscaling/v2 HPA whose maxReplicas
+     is below minReplicas, and allows minReplicas=0 only with an Object or
+     External metric. hpa.yaml emits only Resource (cpu/memory) metrics, so an
+     enabled HPA needs 1 <= minReplicas <= maxReplicas. A cleared minimum
+     (minReplicas: null) is omitted from the HPA, and Kubernetes defaults it to
+     1, so it is checked as 1 (not with `default`, which would also replace an
+     explicit 0). */}}
+{{- if .Values.autoscaling.enabled -}}
+{{- $minReplicas := 1 -}}
+{{- if not (kindIs "invalid" .Values.autoscaling.minReplicas) -}}
+{{- $minReplicas = .Values.autoscaling.minReplicas | int -}}
+{{- end -}}
+{{- $maxReplicas := .Values.autoscaling.maxReplicas | int -}}
+{{- if lt $minReplicas 1 -}}
+{{- fail (printf "autoscaling.minReplicas=%d is invalid with autoscaling.enabled=true: the chart's HorizontalPodAutoscaler uses only Resource (cpu/memory) metrics, and Kubernetes allows scale-to-zero only with Object or External metrics. Set autoscaling.minReplicas to at least 1." $minReplicas) -}}
+{{- end -}}
+{{- if lt $maxReplicas $minReplicas -}}
+{{- fail (printf "autoscaling.maxReplicas=%d is below autoscaling.minReplicas=%d; Kubernetes rejects a HorizontalPodAutoscaler whose maxReplicas is less than minReplicas. Set autoscaling.maxReplicas >= autoscaling.minReplicas." $maxReplicas $minReplicas) -}}
+{{- end -}}
+{{- end -}}
 {{/* A generic secretFileMount emits <name>_FILE. Most chart-managed variables
      are also rendered directly, which gives the external-secret resolver two
      providers for the same base and aborts startup. Only the three first-class
@@ -788,7 +849,7 @@ Validation: fail render on missing/unsafe configuration.
 {{- fail (printf "cp.grpcBindAddress=%q is not an IP literal: the runtime parses FERRUM_CP_GRPC_LISTEN_ADDR as an IP:port socket address and rejects hostnames (localhost, ferrum-cp, ...) at boot. Use an IP literal — 0.0.0.0 or :: to expose the CP gRPC listener, or 127.0.0.1/::1 for a loopback bind." $cpBind) -}}
 {{- end -}}
 {{- $cpGrpcPort := include "ferrum-gateway.cpGrpcPort" . -}}
-{{- $cpLoopback := or (hasPrefix "127." $cpBindHost) (eq $cpBindHost "::1") -}}
+{{- $cpLoopback := include "ferrum-gateway.isLoopbackBind" $cpBindHost -}}
 {{- $cpGrpcTls := $tlsAll.cpGrpc | default dict -}}
 {{- $cpGrpcTlsSet := include "ferrum-gateway.serverTlsConfigured" (dict "root" . "surface" $cpGrpcTls "certSource" "FERRUM_CP_GRPC_TLS_CERT_SOURCE" "keySource" "FERRUM_CP_GRPC_TLS_KEY_SOURCE") -}}
 {{- if and (ne ($cpGrpcPort | toString) "0") (not $cpLoopback) (not $cpGrpcTlsSet) (not $grpc.allowPlaintext) -}}
@@ -803,14 +864,10 @@ Validation: fail render on missing/unsafe configuration.
 {{- end -}}
 {{- end -}}
 {{- if eq $mode "dp" -}}
-{{/* A DP presenting an externally issued token (dp.cpGrpcTokenFile) holds no
-     signing key at all — the preferred posture under GHSA-3f2j-wwqw-grmg — so
-     the shared secret is optional there. */}}
-{{- if (.Values.dp | default dict).cpGrpcTokenFile -}}
-{{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" ($grpc.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_CP_DP_GRPC_JWT_SECRET" "optional" true) -}}
-{{- else -}}
+{{/* A stock DP always self-mints: the binary refuses FERRUM_DP_CP_GRPC_TOKEN_FILE
+     in dp mode (its random per-process node_id can never match an external
+     token's sub, issue #7273), so the shared secret is always required. */}}
 {{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" ($grpc.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_CP_DP_GRPC_JWT_SECRET") -}}
-{{- end -}}
 {{- if not .Values.dp.cpGrpcUrls -}}
 {{- fail "dp.cpGrpcUrls is required for mode=dp (comma-separated CP gRPC URLs, e.g. https://ferrum-cp:50051)" -}}
 {{- end -}}
@@ -885,8 +942,7 @@ Validation: fail render on missing/unsafe configuration.
 {{- if and $bind (not (include "ferrum-gateway.isIpLiteral" $bind)) -}}
 {{- fail (printf "admin.bindAddress=%q is not an IP literal: the binary requires FERRUM_ADMIN_BIND_ADDRESS to parse as an IP address (e.g. 127.0.0.1, ::1, 0.0.0.0, ::) and exits otherwise. Use an IP literal, not a hostname." $bind) -}}
 {{- end -}}
-{{- $normalizedBind := $bind | trimPrefix "[" | trimSuffix "]" -}}
-{{- $loopback := or (eq $normalizedBind "") (eq $normalizedBind "::1") (regexMatch "^127\\." $normalizedBind) -}}
+{{- $loopback := include "ferrum-gateway.isLoopbackBind" $bind -}}
 {{- $adminHttpPort := include "ferrum-gateway.adminHttpPort" . -}}
 {{- $adminSvc := $admin.service | default dict -}}
 {{- if and $adminSvc.enabled $loopback -}}
@@ -945,14 +1001,23 @@ Validation: fail render on missing/unsafe configuration.
 {{- $probeHost := include "ferrum-gateway.probeHost" . -}}
 {{- $probeSource := include "ferrum-gateway.probeSource" . -}}
 {{- $probeIsV6 := contains ":" $probeSource -}}
-{{- $hasProbeSource := include "ferrum-gateway.adminAllowlistContainsIp" (dict "ip" $probeSource "allowedCidrs" $adminAllowedCidrs) -}}
+{{- /* A mapped bind is served by an IPv6 socket, so the listener sees the probe
+     as the mapped peer (`::ffff:127.0.0.1`) and the runtime matches it against
+     IPv4 rules and ordinary IPv6 rules alike. Check that form; the dotted
+     source stays the diagnostic. */ -}}
+{{- $probePeer := $probeSource -}}
+{{- if include "ferrum-gateway.ipv4MappedToInt" $probeHost -}}{{- $probePeer = printf "::ffff:%s" $probeSource -}}{{- end -}}
+{{- $hasProbeSource := include "ferrum-gateway.adminAllowlistContainsIp" (dict "ip" $probePeer "allowedCidrs" $adminAllowedCidrs) -}}
 {{- if not $hasProbeSource -}}
 {{- $probeCidr := ternary (printf "%s/128" $probeSource) (printf "%s/32" $probeSource) $probeIsV6 -}}
 {{- fail (printf "admin.allowedCidrs must include %s (or bare %s) while the default exec probes are enabled; the computed exec probes dial admin host %s from source %s and the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source (or a covering CIDR) or override/disable every computed probe handler." $probeCidr $probeSource $probeHost $probeSource) -}}
 {{- end -}}
 {{- end -}}
 {{/* Graceful shutdown budget (database/cp proxy path, src/modes/database.rs):
-     FERRUM_SHUTDOWN_DRAIN_SECONDS wait (default 30; 0 skips the wait)
+     FERRUM_SHUTDOWN_DRAIN_SECONDS wait (default 30; 0 skips the wait). The
+       HTTP/3 listener drain/close and the global drain run one after the
+       other but share the absolute deadline published by ShutdownSender with
+       the shutdown broadcast, so the drain budget is counted once.
      + unix transport-pool tail (DRIVER_DRAIN 5s + REAP 1s in unix_backend_pool.rs)
      + background task join (5s)
      + audit flush (clamp(drain, 5, 60)s; database/cp only)
@@ -981,7 +1046,15 @@ Validation: fail render on missing/unsafe configuration.
      too. Both default the pod's grace period upward rather than silently
      truncating the shutdown. */}}
 {{- $preStop := int (.Values.shutdownPreStopSeconds | default 0) -}}
-{{- if and (gt $preStop 0) (semverCompare "<1.29.0-0" .Capabilities.KubeVersion.Version) -}}
+{{- $kubeMajor := atoi (regexReplaceAll "[^0-9].*$" (.Capabilities.KubeVersion.Major | toString) "") -}}
+{{- $kubeMinor := atoi (regexReplaceAll "[^0-9].*$" (.Capabilities.KubeVersion.Minor | toString) "") -}}
+{{/* helm template without --kube-version advertises 1.20.0. That sentinel is
+     not a real cluster; skip it so GitOps/client renders still emit the 1.29+
+     SleepAction default. --kube-version 1.28.0 and real <1.29 clusters fail.
+     Same rule as ferrum-mesh.validateSleepActionSupported. */}}
+{{- $helmTemplateDefaultKube := and (eq $kubeMajor 1) (eq $kubeMinor 20) -}}
+{{- $sleepUnsupported := and (not $helmTemplateDefaultKube) (or (lt $kubeMajor 1) (and (eq $kubeMajor 1) (lt $kubeMinor 29))) -}}
+{{- if and (gt $preStop 0) $sleepUnsupported -}}
 {{- $probes := .Values.probes | default dict -}}
 {{- $readiness := $probes.readiness | default dict -}}
 {{- $failureThreshold := int ($readiness.failureThreshold | default 3) -}}
@@ -992,7 +1065,13 @@ Validation: fail render on missing/unsafe configuration.
 {{- $preDrain := int (.Values.shutdownPreDrainSeconds | default 0) -}}
 {{- $minGrace := add $preStop (add $preDrain $shutdownBudget) -}}
 {{- $grace := .Values.terminationGracePeriodSeconds -}}
-{{- if and (not (kindIs "invalid" $grace)) (lt (int $grace) $minGrace) -}}
+{{/* A null grace period renders an empty terminationGracePeriodSeconds, so the
+     pod gets Kubernetes' 30s default, below every possible minimum. Same rule as
+     ferrum-mesh.validateShutdown. */}}
+{{- if kindIs "invalid" $grace -}}
+{{- fail (printf "terminationGracePeriodSeconds is required (minimum %d = preStop %ds + preDrain %ds + shutdown budget %ds)" $minGrace $preStop $preDrain $shutdownBudget) -}}
+{{- end -}}
+{{- if lt (int $grace) $minGrace -}}
 {{- fail (printf "terminationGracePeriodSeconds (%d) must be at least %d (preStop %ds + preDrain %ds + shutdown budget %ds, where the shutdown budget is drain %ds + transport pool 6s + background 5s + audit %ds + observability 2s + finalizer slack 5s); a null shutdownDrainSeconds uses the binary's 30s default" (int $grace) $minGrace $preStop $preDrain $shutdownBudget $effectiveDrain $auditBudget) -}}
 {{- end -}}
 {{- include "ferrum-gateway.validateMetrics" . -}}
@@ -1006,7 +1085,7 @@ Env assembly.
      probes, Services, ports, or Secret wiring from the running process, so both
      env passthroughs reject them. Keep this list the single source of truth. */}}
 {{- define "ferrum-gateway.reservedEnv" -}}
-FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT FERRUM_DP_CP_GRPC_URLS FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS FERRUM_DP_CONFIG_MAX_STALE_SECONDS FERRUM_DP_CONFIG_STALE_ACTION FERRUM_CP_GRPC_LISTEN_ADDR FERRUM_CP_NAMESPACES FERRUM_CP_REQUIRE_NAMESPACE_CLAIM FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH FERRUM_CP_DP_GRPC_JWT_KEY_ID FERRUM_DP_CP_GRPC_TOKEN_FILE FERRUM_FILE_CONFIG_PATH FERRUM_PROXY_HTTP_PORT FERRUM_PROXY_HTTPS_PORT FERRUM_ADMIN_HTTP_PORT FERRUM_ADMIN_HTTPS_PORT FERRUM_ADMIN_BIND_ADDRESS FERRUM_ADMIN_ALLOWED_CIDRS FERRUM_ALLOW_INSECURE_ADMIN_HTTP FERRUM_METRICS_BEARER_TOKEN FERRUM_METRICS_ALLOWED_CIDRS FERRUM_SHUTDOWN_DRAIN_SECONDS FERRUM_SHUTDOWN_PREDRAIN_SECONDS FERRUM_FRONTEND_TLS_CERT_PATH FERRUM_FRONTEND_TLS_KEY_PATH FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_ADMIN_TLS_CERT_PATH FERRUM_ADMIN_TLS_KEY_PATH FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_BACKEND_TLS_CLIENT_CERT_PATH FERRUM_BACKEND_TLS_CLIENT_KEY_PATH FERRUM_CP_GRPC_TLS_CERT_PATH FERRUM_CP_GRPC_TLS_KEY_PATH FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH FERRUM_DP_GRPC_TLS_CA_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH FERRUM_K8S_CONTROLLER_ENABLED FERRUM_K8S_POD_DISCOVERY_ENABLED FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM
+FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT FERRUM_DP_CP_GRPC_URLS FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS FERRUM_DP_CONFIG_MAX_STALE_SECONDS FERRUM_DP_CONFIG_STALE_ACTION FERRUM_CP_GRPC_LISTEN_ADDR FERRUM_CP_NAMESPACES FERRUM_CP_REQUIRE_NAMESPACE_CLAIM FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH FERRUM_CP_DP_GRPC_JWT_KEY_ID FERRUM_FILE_CONFIG_PATH FERRUM_PROXY_HTTP_PORT FERRUM_PROXY_HTTPS_PORT FERRUM_ADMIN_HTTP_PORT FERRUM_ADMIN_HTTPS_PORT FERRUM_ADMIN_BIND_ADDRESS FERRUM_ADMIN_ALLOWED_CIDRS FERRUM_ALLOW_INSECURE_ADMIN_HTTP FERRUM_METRICS_BEARER_TOKEN FERRUM_METRICS_ALLOWED_CIDRS FERRUM_SHUTDOWN_DRAIN_SECONDS FERRUM_SHUTDOWN_PREDRAIN_SECONDS FERRUM_FRONTEND_TLS_CERT_PATH FERRUM_FRONTEND_TLS_KEY_PATH FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_ADMIN_TLS_CERT_PATH FERRUM_ADMIN_TLS_KEY_PATH FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_BACKEND_TLS_CLIENT_CERT_PATH FERRUM_BACKEND_TLS_CLIENT_KEY_PATH FERRUM_CP_GRPC_TLS_CERT_PATH FERRUM_CP_GRPC_TLS_KEY_PATH FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH FERRUM_DP_GRPC_TLS_CA_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH FERRUM_K8S_CONTROLLER_ENABLED FERRUM_K8S_POD_DISCOVERY_ENABLED FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM
 {{- end -}}
 
 {{- define "ferrum-gateway.modeEnv" -}}
@@ -1080,10 +1159,6 @@ FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRE
 {{- if and (not (kindIs "invalid" .Values.dp.configStaleAction)) (ne (.Values.dp.configStaleAction | toString) "") }}
 - name: FERRUM_DP_CONFIG_STALE_ACTION
   value: {{ .Values.dp.configStaleAction | quote }}
-{{- end }}
-{{- if .Values.dp.cpGrpcTokenFile }}
-- name: FERRUM_DP_CP_GRPC_TOKEN_FILE
-  value: {{ .Values.dp.cpGrpcTokenFile | quote }}
 {{- end }}
 {{- end }}
 {{- if and (eq $mode "dp") (.Values.grpc | default dict).jwtKeyId }}
@@ -1228,8 +1303,7 @@ fail_closed
 {{- if $sm.enabled -}}
 {{- $admin := .Values.admin | default dict -}}
 {{- $bind := $admin.bindAddress | default "" -}}
-{{- $normalizedBind := $bind | trimPrefix "[" | trimSuffix "]" -}}
-{{- $loopback := or (eq $normalizedBind "") (eq $normalizedBind "::1") (regexMatch "^127\\." $normalizedBind) -}}
+{{- $loopback := include "ferrum-gateway.isLoopbackBind" $bind -}}
 {{- $adminSvc := $admin.service | default dict -}}
 {{- if not $adminSvc.enabled -}}
 {{- fail "metrics.serviceMonitor.enabled=true requires admin.service.enabled=true so Prometheus can reach /metrics through the admin ClusterIP Service; the chart does not auto-expose admin on the pod IP" -}}

@@ -91,8 +91,13 @@ fn assert_not_destination_shed(body: &str, what: &str) {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_destination_active_requests_http1_sheds_before_dispatch_and_releases_on_eof() {
+#[test]
+fn functional_destination_active_requests_http1_sheds_before_dispatch_and_releases_on_eof() {
+    crate::common::in_process_gateway_runtime(4).block_on(functional_destination_active_requests_http1_sheds_before_dispatch_and_releases_on_eof_inner());
+}
+
+async fn functional_destination_active_requests_http1_sheds_before_dispatch_and_releases_on_eof_inner()
+ {
     let backend = HoldingHttp1Backend::spawn(HoldBehavior::RespondOk).await;
     let config = two_destination_config(backend.port, None);
 
@@ -162,8 +167,13 @@ async fn functional_destination_active_requests_http1_sheds_before_dispatch_and_
 // ───────────────────────────────────────────────────────────────────────────
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_destination_active_requests_release_on_client_disconnect() {
+#[test]
+fn functional_destination_active_requests_release_on_client_disconnect() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_destination_active_requests_release_on_client_disconnect_inner());
+}
+
+async fn functional_destination_active_requests_release_on_client_disconnect_inner() {
     let backend = HoldingHttp1Backend::spawn(HoldBehavior::RespondOk).await;
     let gateway = start_gateway(two_destination_config(backend.port, None), false)
         .await
@@ -225,8 +235,13 @@ async fn functional_destination_active_requests_release_on_client_disconnect() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_destination_active_requests_release_on_backend_error() {
+#[test]
+fn functional_destination_active_requests_release_on_backend_error() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_destination_active_requests_release_on_backend_error_inner());
+}
+
+async fn functional_destination_active_requests_release_on_backend_error_inner() {
     let behavior = HoldBehavior::DropConnection;
     let backend = HoldingHttp1Backend::spawn(behavior).await;
     // Every exchange fails at the backend immediately, so a leaked permit would
@@ -260,8 +275,13 @@ async fn functional_destination_active_requests_release_on_backend_error() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_destination_active_requests_release_on_backend_timeout() {
+#[test]
+fn functional_destination_active_requests_release_on_backend_timeout() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_destination_active_requests_release_on_backend_timeout_inner());
+}
+
+async fn functional_destination_active_requests_release_on_backend_timeout_inner() {
     // The fixture NEVER releases, so every exchange ends at the gateway's own
     // read timeout — the deadline terminal path.
     let backend = HoldingHttp1Backend::spawn(HoldBehavior::RespondOk).await;
@@ -294,8 +314,14 @@ async fn functional_destination_active_requests_release_on_backend_timeout() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_destination_active_requests_sequential_retry_reacquires_the_permit() {
+#[test]
+fn functional_destination_active_requests_sequential_retry_reacquires_the_permit() {
+    crate::common::in_process_gateway_runtime(4).block_on(
+        functional_destination_active_requests_sequential_retry_reacquires_the_permit_inner(),
+    );
+}
+
+async fn functional_destination_active_requests_sequential_retry_reacquires_the_permit_inner() {
     // First attempt 503 (retryable), second attempt 200. With a cap of one, a
     // retry that failed to release the previous attempt's permit would be shed
     // by its own predecessor and the client would see the overflow body.
@@ -339,8 +365,13 @@ async fn functional_destination_active_requests_sequential_retry_reacquires_the_
 // ───────────────────────────────────────────────────────────────────────────
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_destination_active_requests_shed_is_backend_neutral() {
+#[test]
+fn functional_destination_active_requests_shed_is_backend_neutral() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_destination_active_requests_shed_is_backend_neutral_inner());
+}
+
+async fn functional_destination_active_requests_shed_is_backend_neutral_inner() {
     let backend = HoldingHttp1Backend::spawn(HoldBehavior::RespondOk).await;
     // A breaker that trips on ONE 503 and passive health that ejects on ONE
     // 503: if the shed were recorded as a backend outcome, the follow-up
@@ -398,8 +429,14 @@ async fn functional_destination_active_requests_shed_is_backend_neutral() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_destination_active_requests_http2_shares_one_destination_budget() {
+#[test]
+fn functional_destination_active_requests_http2_shares_one_destination_budget() {
+    crate::common::in_process_gateway_runtime(4).block_on(
+        functional_destination_active_requests_http2_shares_one_destination_budget_inner(),
+    );
+}
+
+async fn functional_destination_active_requests_http2_shares_one_destination_budget_inner() {
     let ca = TestCa::new("destination-active-h2").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
     let reservation = reserve_port().await.expect("h2 backend port");
@@ -494,8 +531,14 @@ async fn functional_destination_active_requests_http2_shares_one_destination_bud
 // ───────────────────────────────────────────────────────────────────────────
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_destination_active_requests_reqwest_alpn_http2_consumes_the_budget() {
+#[test]
+fn functional_destination_active_requests_reqwest_alpn_http2_consumes_the_budget() {
+    crate::common::in_process_gateway_runtime(4).block_on(
+        functional_destination_active_requests_reqwest_alpn_http2_consumes_the_budget_inner(),
+    );
+}
+
+async fn functional_destination_active_requests_reqwest_alpn_http2_consumes_the_budget_inner() {
     let ca = TestCa::new("destination-active-reqwest-h2").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
     let reservation = reserve_port().await.expect("h2 backend port");

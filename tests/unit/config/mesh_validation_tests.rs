@@ -195,8 +195,9 @@ fn mesh_ports_reject_zero_on_core_resources() {
     let mut peer_auth = PeerAuthentication {
         name: "pa".into(),
         namespace: "default".into(),
-        scope: None,
-        selector: None,
+        scope: PolicyScope::Namespace {
+            namespace: "default".into(),
+        },
         mtls_mode: MtlsMode::Strict,
         port_overrides: HashMap::from([(0, MtlsMode::Permissive)]),
     };
@@ -984,8 +985,9 @@ fn peer_authentication_requires_namespace() {
     let pa = PeerAuthentication {
         name: "pa".into(),
         namespace: String::new(),
-        scope: None,
-        selector: None,
+        scope: PolicyScope::Namespace {
+            namespace: String::new(),
+        },
         mtls_mode: ferrum_edge::modes::mesh::config::MtlsMode::Strict,
         port_overrides: HashMap::new(),
     };
@@ -1002,8 +1004,9 @@ fn peer_authentication_rejects_client_side_mtls_mode() {
     let pa = PeerAuthentication {
         name: "pa".into(),
         namespace: "default".into(),
-        scope: None,
-        selector: None,
+        scope: PolicyScope::Namespace {
+            namespace: "default".into(),
+        },
         mtls_mode: ferrum_edge::modes::mesh::config::MtlsMode::Simple,
         port_overrides: HashMap::new(),
     };
@@ -1017,6 +1020,26 @@ fn peer_authentication_rejects_client_side_mtls_mode() {
     );
 }
 
+/// `unset` (Istio `UNSET`: inherit from the next-higher tier) is a valid
+/// server-side PeerAuthentication mode on the policy and on a port override.
+#[test]
+fn peer_authentication_accepts_unset_inherit_mode() {
+    let pa = PeerAuthentication {
+        name: "pa".into(),
+        namespace: "default".into(),
+        scope: PolicyScope::Namespace {
+            namespace: "default".into(),
+        },
+        mtls_mode: MtlsMode::Unset,
+        port_overrides: HashMap::from([(8080, MtlsMode::Unset)]),
+    };
+    let errors = validate_mesh_config(&[], &[], &[], &[pa], &[], &[], None);
+    assert!(
+        errors.is_empty(),
+        "unset is a valid PeerAuthentication mode: {errors:?}"
+    );
+}
+
 #[test]
 fn peer_authentication_rejects_client_side_port_override_mtls_mode() {
     let mut port_overrides = HashMap::new();
@@ -1027,8 +1050,9 @@ fn peer_authentication_rejects_client_side_port_override_mtls_mode() {
     let pa = PeerAuthentication {
         name: "pa".into(),
         namespace: "default".into(),
-        scope: None,
-        selector: None,
+        scope: PolicyScope::Namespace {
+            namespace: "default".into(),
+        },
         mtls_mode: ferrum_edge::modes::mesh::config::MtlsMode::Strict,
         port_overrides,
     };
@@ -1046,6 +1070,7 @@ fn peer_authentication_rejects_client_side_port_override_mtls_mode() {
 #[test]
 fn request_authentication_accepts_inline_jwks_multi_audience_and_custom_locations() {
     let ra = MeshRequestAuthentication {
+        refused: false,
         name: "jwt".into(),
         namespace: "default".into(),
         scope: PolicyScope::MeshWide,
@@ -1086,6 +1111,28 @@ fn service_entry_requires_hosts() {
     };
     let errors = validate_mesh_config(&[], &[], &[], &[], &[se], &[], None);
     assert!(errors.iter().any(|e| e.contains("hosts must not be empty")));
+}
+
+#[test]
+fn service_entry_rejects_empty_namespace() {
+    let se = ServiceEntry {
+        name: "se".into(),
+        namespace: " ".into(),
+        hosts: vec!["api.example.com".into()],
+        endpoints: Vec::new(),
+        resolution: Resolution::Dns,
+        location: ServiceEntryLocation::MeshExternal,
+        ports: Vec::new(),
+        export_to: Vec::new(),
+        workload_selector: None,
+    };
+    let errors = validate_mesh_config(&[], &[], &[], &[], &[se], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("ServiceEntry \"se\".namespace") && e.contains("must not be empty")),
+        "expected an empty-namespace error, got: {errors:?}"
+    );
 }
 
 #[test]
@@ -2056,7 +2103,7 @@ fn ingress_resolve_rejects_unknown_protocol() {
     // `unknown → HTTP` convention (a separate predicate).
     assert_eq!(
         ingress_entry(8443, AppProtocol::Unknown, "127.0.0.1:8080").resolve(),
-        Err(IngressListenerUnsupported::NonHttpProtocol),
+        Err(IngressListenerUnsupported::UnmodeledProtocol),
         "an Unknown-protocol ingress listener must defer, never route as HTTP"
     );
 }
@@ -2081,7 +2128,7 @@ fn ingress_omitted_protocol_deserializes_to_unknown_then_defers() {
     );
     assert_eq!(
         entry.resolve(),
-        Err(IngressListenerUnsupported::NonHttpProtocol),
+        Err(IngressListenerUnsupported::UnmodeledProtocol),
         "an omitted (Unknown) protocol defers fail-closed, it does not route"
     );
 
@@ -2095,7 +2142,7 @@ fn ingress_omitted_protocol_deserializes_to_unknown_then_defers() {
     assert_eq!(explicit.protocol, AppProtocol::Unknown);
     assert_eq!(
         explicit.resolve(),
-        Err(IngressListenerUnsupported::NonHttpProtocol)
+        Err(IngressListenerUnsupported::UnmodeledProtocol)
     );
 }
 
@@ -2356,7 +2403,7 @@ fn ingress_carrier_revalidates_unix_socket_shape() {
 #[test]
 fn ingress_resolve_accepts_stream_protocols() {
     // Issue #3260: recognized stream-family protocols resolve to a routable
-    // listener (raw-TCP inbound relay), not NonHttpProtocol.
+    // listener (raw-TCP inbound relay), not UnmodeledProtocol.
     for protocol in [
         AppProtocol::Tcp,
         AppProtocol::Tls,
@@ -2381,11 +2428,11 @@ fn ingress_resolve_accepts_stream_protocols() {
 fn ingress_resolve_rejects_unrecognized_or_udp_protocol() {
     assert_eq!(
         ingress_entry(8443, AppProtocol::Unknown, "127.0.0.1:8080").resolve(),
-        Err(IngressListenerUnsupported::NonHttpProtocol)
+        Err(IngressListenerUnsupported::UnmodeledProtocol)
     );
     assert_eq!(
         ingress_entry(8443, AppProtocol::Udp, "127.0.0.1:8080").resolve(),
-        Err(IngressListenerUnsupported::NonHttpProtocol)
+        Err(IngressListenerUnsupported::UnmodeledProtocol)
     );
 }
 
@@ -3056,6 +3103,7 @@ fn mesh_config_validate_rejects_tracing_percentage_bounds() {
                     custom_tags: HashMap::new(),
                     custom_header_tags: HashMap::new(),
                     custom_env_tags: HashMap::new(),
+                    safe_tag_sources: Vec::new(),
                     providers: Vec::new(),
                 }),
                 ..MeshTelemetryConfig::default()
@@ -3185,6 +3233,32 @@ mod virtual_service_cors {
         let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Prefix(
             "https://app.".into(),
         )])]);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn credentialed_public_suffix_regex_is_rejected() {
+        for regex in [
+            "^https://[a-z]{2,}\\.com$",
+            "^https://[a-z]+\\.com:8443$",
+            "https://[a-z]+\\.biz",
+            "^https://[0-9.]+\\.1\\.1$",
+        ] {
+            let mut credentialed = policy(vec![MeshCorsOriginMatch::Regex(regex.into())]);
+            credentialed.cors.allow_credentials = Some(true);
+            let errors = validate(vec![credentialed]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("cors.allow_credentials must not be true")),
+                "{regex}: {errors:?}"
+            );
+        }
+        let mut constrained = policy(vec![MeshCorsOriginMatch::Regex(
+            "^https://[a-z]+\\.example\\.com$".into(),
+        )]);
+        constrained.cors.allow_credentials = Some(true);
+        let errors = validate(vec![constrained]);
         assert!(errors.is_empty(), "{errors:?}");
     }
 
@@ -3344,6 +3418,29 @@ mod virtual_service_cors {
             "{errors:?}"
         );
 
+        // The shared per-list entry and per-token byte bounds apply at this
+        // boundary too, so an over-budget list cannot fail plugin
+        // construction on the data plane.
+        let mut too_many = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+        too_many.cors.exposed_headers = (0..129).map(|i| format!("x-h{i}")).collect();
+        let errors = validate(vec![too_many]);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("exposed_headers") && error.contains("at most 128")),
+            "{errors:?}"
+        );
+
+        let mut too_long = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+        too_long.cors.allowed_headers = vec!["x".repeat(257)];
+        let errors = validate(vec![too_long]);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("at most 256 bytes")),
+            "{errors:?}"
+        );
+
         // Valid token lists pass unchanged through the shared plugin
         // admission gate.
         let mut ok = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
@@ -3357,7 +3454,7 @@ mod virtual_service_cors {
     #[test]
     fn normalize_trims_and_lowercases_carried_host() {
         // Synthesis matches `policy.host` against service FQDNs with
-        // `destination_rule_host_matches` (no trimming there); a padded or
+        // `destination_rule_host_specificity`; a padded or
         // mixed-case native/file host must be normalized like DR hosts or the
         // policy silently attaches no plugin.
         let mut config = MeshConfig {

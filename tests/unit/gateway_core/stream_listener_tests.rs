@@ -88,7 +88,6 @@ fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -2062,6 +2061,116 @@ async fn test_in_place_backend_tls_rotation_to_invalid_keeps_old_listener_servin
     manager.shutdown_all().await;
 }
 
+/// A confined tenant TLS file that is swapped for a symlink escaping its
+/// tenant root takes the TCP+TLS keep-last-good path, not the fail-closed one.
+/// The outside file holds a VALID CA, so the reported refusal proves the
+/// reload never admitted outside material: an unconfined load would have
+/// restarted the listener cleanly. The previous listener keeps serving fresh
+/// connections with the identity admitted before the swap, and returning the
+/// link inside the root restarts it.
+///
+/// Tenant TLS file roots are a process-global snapshot, so the body runs in its
+/// own child process.
+#[cfg(unix)]
+#[tokio::test]
+async fn tenant_tls_file_swapped_to_escaping_symlink_keeps_previous_tcp_tls_listener() {
+    const CHILD_ENV: &str = "UNIT_TEST_TENANT_TLS_KEEP_LAST_GOOD_CHILD";
+    const TEST_NAME: &str = "unit::gateway_core::stream_listener_tests::\
+         tenant_tls_file_swapped_to_escaping_symlink_keeps_previous_tcp_tls_listener";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve unit test executable"),
+        )
+        .env(CHILD_ENV, "1")
+        .args(["--exact", TEST_NAME, "--nocapture"])
+        .output()
+        .expect("run isolated tenant TLS keep-last-good test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated tenant TLS keep-last-good test failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        return;
+    }
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path().join("tenant");
+    let outside = work.path().join("outside");
+    std::fs::create_dir(&root).expect("create tenant root");
+    std::fs::create_dir(&outside).expect("create outside dir");
+    ferrum_edge::tls::source::install_mesh_tenant_tls_file_roots(vec![root.clone()])
+        .expect("install tenant roots in the isolated child");
+
+    let replace_link = |link: &std::path::Path, target: &std::path::Path| {
+        let next = link.with_extension("link-next");
+        let _ = std::fs::remove_file(&next);
+        std::os::unix::fs::symlink(target, &next).expect("create replacement link");
+        std::fs::rename(&next, link).expect("swap link atomically");
+    };
+    let inside_a = root.join("ca-a.pem");
+    std::fs::write(&inside_a, generate_test_ca_pem("Tenant CA A")).expect("write tenant CA A");
+    let outside_ca = outside.join("ca.pem");
+    std::fs::write(&outside_ca, generate_test_ca_pem("Outside CA")).expect("write outside CA");
+    let link = root.join("ca.pem");
+    replace_link(&link, &inside_a);
+    let reference = ferrum_edge::_test_support::bind_tenant_tls_file_for_test(
+        link.to_str().expect("utf-8 temp path"),
+        ferrum_edge::tls::source::MaterialKind::CaBundle,
+    )
+    .expect("bind tenant reference")
+    .expect("a file reference binds to a confined reference");
+
+    let (manager, port) = start_manager_on_fresh_tcp_port(|port| {
+        let mut proxy = create_stream_proxy("tcp-tls-tenant", BackendScheme::Tcps, port);
+        proxy.backend_tls_verify_server_cert = true;
+        proxy.backend_tls_server_ca_cert_path = Some(reference.clone());
+        proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
+        GatewayConfig {
+            proxies: vec![proxy],
+            ..empty_config()
+        }
+    })
+    .await;
+
+    replace_link(&link, &outside_ca);
+    let failures = manager.reconcile().await;
+    assert_eq!(
+        failures.len(),
+        1,
+        "an escaping tenant file must be refused, not loaded: {failures:?}"
+    );
+    assert_eq!(failures[0].0, "tcp-tls-tenant");
+    assert_eq!(failures[0].1, port);
+    assert!(
+        failures[0].2.contains("kept previous listener running"),
+        "the refusal takes the keep-last-good path: {}",
+        failures[0].2
+    );
+    let conn = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await;
+    assert!(
+        conn.is_ok(),
+        "the previous listener keeps accepting fresh connections on port {port}"
+    );
+    drop(conn);
+
+    let inside_b = root.join("ca-b.pem");
+    std::fs::write(&inside_b, generate_test_ca_pem("Tenant CA B")).expect("write tenant CA B");
+    replace_link(&link, &inside_b);
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "a link back inside the tenant root restarts the listener: {failures:?}"
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("restarted TCP TLS listener should bind");
+
+    manager.shutdown_all().await;
+}
+
 /// A backend TLS reload that publishes a new CRL while the listener's own
 /// material rotated to invalid content must NOT keep the old listener: its
 /// cached verifier has the previous revocation list compiled in. The listener
@@ -2758,6 +2867,40 @@ async fn frontend_dtls_publish_records_generation_without_listeners() {
     assert_eq!(overload.frontend_dtls_reload.last_outcome, "accepted");
 }
 
+/// A rejected owner-scoped NodeWaypoint DTLS candidate is visible on
+/// `/overload` in its own slot and leaves the ordinary operator slot untouched
+/// (issue #7186).
+#[tokio::test]
+async fn rejected_mesh_node_waypoint_dtls_candidate_is_reported_on_overload() {
+    let manager = create_manager(empty_config());
+    let overload = manager.overload_snapshot();
+    assert_eq!(overload.mesh_node_waypoint_dtls_reload.last_outcome, "none");
+    assert_eq!(overload.mesh_node_waypoint_dtls_reload.generation, 0);
+
+    manager.record_mesh_node_waypoint_dtls_candidate_failure();
+
+    let overload = manager.overload_snapshot();
+    assert_eq!(
+        overload.mesh_node_waypoint_dtls_reload.last_outcome,
+        "rejected"
+    );
+    assert!(
+        overload
+            .mesh_node_waypoint_dtls_reload
+            .last_failure_unix
+            .is_some()
+    );
+    assert_eq!(overload.mesh_node_waypoint_dtls_reload.generation, 0);
+    assert_eq!(overload.frontend_dtls_reload.last_outcome, "none");
+    assert_eq!(overload.frontend_dtls_reload.last_failure_unix, None);
+
+    let json = serde_json::to_value(&overload).expect("overload snapshot serializes");
+    assert_eq!(
+        json["mesh_node_waypoint_dtls_reload"]["last_outcome"],
+        "rejected"
+    );
+}
+
 /// Mesh PeerAuthentication live reload still swaps the shared TCP+TLS slot, but
 /// that path must not seed the ordinary `FERRUM_DTLS_*` generation when no DTLS
 /// listener exists.
@@ -3266,7 +3409,6 @@ fn nw_udp_destination_route(ip: &str, port: u16, service: &str) -> NodeWaypointU
             ferrum_edge::modes::mesh::node_waypoint_udp_proxy_id(&namespace, service, port)
                 .expect("test service names are admitted Kubernetes identities"),
         ),
-        false,
     )
 }
 
@@ -4264,6 +4406,99 @@ async fn udp_amplification_policy_reload_retires_sessions_with_stale_budget() {
     );
 
     manager.shutdown_all().await;
+}
+
+/// Regression test: a connected UDP backend socket receiving ICMP Port
+/// Unreachable (`EPOLLERR` / `ECONNREFUSED` with an empty receive queue) must
+/// clear `Interest::ERROR`, observe the socket error, and tear down cleanly
+/// instead of spinning forever and starving a single-threaded Tokio worker.
+#[tokio::test(flavor = "current_thread")]
+async fn udp_reply_task_tears_down_promptly_on_icmp_port_unreachable_without_spinning() {
+    // Reserve and immediately release a loopback UDP port so the backend is
+    // guaranteed closed (eliciting ICMP Port Unreachable on datagram send).
+    let closed_backend = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind temp backend");
+    let closed_backend_port = closed_backend.local_addr().expect("backend addr").port();
+    drop(closed_backend);
+
+    // Pick a free listener port.
+    let free_frontend = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind temp frontend");
+    let frontend_port = free_frontend.local_addr().expect("frontend addr").port();
+    drop(free_frontend);
+
+    let mut proxy = create_stream_proxy(DIRECT_UDP_LISTENER_ID, BackendScheme::Udp, frontend_port);
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = closed_backend_port;
+    proxy.udp_idle_timeout_seconds = 60;
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    let runtime = create_manager_runtime(Arc::new(ArcSwap::from_pointee(config.clone())), &config);
+
+    let started = Arc::new(AtomicBool::new(false));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut cfg = direct_udp_listener_config(&runtime, frontend_port, shutdown_rx, started.clone());
+    cfg.udp_pktinfo_enabled = true;
+    cfg.cleanup_interval_seconds = 60;
+    let metrics = Arc::clone(&cfg.metrics);
+
+    let listener = tokio::spawn(start_udp_listener_holding_port(cfg, None));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !started.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("UDP listener should bind promptly");
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind client socket");
+    let gateway_addr = SocketAddr::from(([127, 0, 0, 1], frontend_port));
+    client
+        .send_to(b"probe-closed-backend", gateway_addr)
+        .await
+        .expect("send datagram to gateway");
+
+    // Wait for session creation, then verify the single-threaded runtime stays
+    // responsive (no worker spin) and tears down the session on ECONNREFUSED.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while metrics.total_sessions.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // On Linux (and macOS loopback), ICMP Port Unreachable surfaces
+        // ECONNREFUSED immediately on the connected backend socket. Send one
+        // follow-up if needed, then verify active_sessions drains to 0 well
+        // before the 60s idle timeout while sibling timer polls stay responsive.
+        let mut ticks = 0u32;
+        while metrics.active_sessions.load(Ordering::Acquire) > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ticks += 1;
+            if ticks == 5 {
+                let _ = client.send_to(b"probe-2", gateway_addr).await;
+            }
+            // Even if a host suppresses loopback ICMP, 20 responsive ticks on
+            // a current_thread runtime prove the reply task is NOT spinning.
+            if cfg!(not(target_os = "linux")) && ticks >= 20 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("reply task must not spin or starve current_thread runtime on ICMP error");
+
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            metrics.active_sessions.load(Ordering::Acquire),
+            0,
+            "Linux reply task must tear down session promptly on ECONNREFUSED"
+        );
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), listener)
+        .await
+        .expect("listener should shut down promptly");
 }
 
 #[path = "stream_runtime_tests.rs"]

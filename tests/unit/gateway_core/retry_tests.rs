@@ -379,8 +379,20 @@ fn http_retry_re_resolves_mesh_transport_before_each_dispatch() {
         "candidate maxRetries must be re-resolved after select_next_retry_target"
     );
     let intermediate_record = retry_body
-        .find("permits.record_backend_outcome(BackendAdmissionOutcome {")
+        .find("record_backend_admission_retry_outcome(")
         .expect("HTTP retry intermediate outcome recording must remain present");
+    let intermediate_helper = src
+        .split_once("pub(crate) fn record_backend_admission_retry_outcome(")
+        .expect("HTTP retry intermediate outcome helper must remain present")
+        .1
+        .split_once("\n}\n")
+        .expect("HTTP retry intermediate outcome helper end not found")
+        .0;
+    assert!(
+        intermediate_helper.contains("if let Some(permits) = permits.take()")
+            && intermediate_helper.contains("permits.record_backend_outcome(outcome);"),
+        "the retry outcome helper must consume and settle the replaced attempt's permit"
+    );
     assert!(
         retry_cap_gate < intermediate_record
             && retry_body[retry_cap_gate..intermediate_record].contains("break;"),
@@ -402,6 +414,10 @@ fn http_retry_re_resolves_mesh_transport_before_each_dispatch() {
         .find("proxy_to_backend_retry(")
         .expect("plain retry dispatch not found");
 
+    assert!(
+        intermediate_record < admission,
+        "the replaced attempt must be settled before admission and dispatch of each retry"
+    );
     assert!(selection < hbone && selection < mesh_mtls);
     assert!(hbone < admission && mesh_mtls < admission);
     assert!(admission < mesh_dispatch && mesh_dispatch < plain_dispatch);
@@ -791,13 +807,22 @@ fn test_grpc_response_too_large_classified_as_backend_failure() {
 
 // --- classify_boxed_error tests (WebSocket / generic errors) ---
 
+// The substring fallback is phase-gated like the typed walk (issues #4536,
+// #7213): the error TEXT is not phase evidence, so the pre-wire verdicts are
+// issued only through the setup-phase entry point and the post-connect entry
+// point maps them to their post-wire twins.
+
 #[test]
 fn test_boxed_error_connect_timeout() {
     let err: Box<dyn std::error::Error + Send + Sync> =
         "WebSocket backend connect timeout (5000ms) for proxy ws-1".into();
     assert_eq!(
-        classify_boxed_error(err.as_ref()),
+        classify_boxed_setup_error(err.as_ref()),
         ErrorClass::ConnectionTimeout
+    );
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::ReadWriteTimeout
     );
 }
 
@@ -805,25 +830,43 @@ fn test_boxed_error_connect_timeout() {
 fn test_boxed_error_timed_out() {
     let err: Box<dyn std::error::Error + Send + Sync> = "operation timed out".into();
     assert_eq!(
-        classify_boxed_error(err.as_ref()),
+        classify_boxed_setup_error(err.as_ref()),
         ErrorClass::ConnectionTimeout
     );
+    let post = classify_boxed_error(err.as_ref());
+    assert_eq!(post, ErrorClass::ReadWriteTimeout);
+    assert!(ferrum_edge::retry::request_reached_wire(post));
 }
 
 #[test]
 fn test_boxed_error_connection_refused() {
     let err: Box<dyn std::error::Error + Send + Sync> = "Connection refused (os error 111)".into();
     assert_eq!(
-        classify_boxed_error(err.as_ref()),
+        classify_boxed_setup_error(err.as_ref()),
         ErrorClass::ConnectionRefused
     );
+    let post = classify_boxed_error(err.as_ref());
+    assert_eq!(
+        post,
+        ErrorClass::ConnectionReset,
+        "a stringified ECONNREFUSED after the connect phase (an ICMP port-unreachable \
+         on a connected UDP socket) must not read as a pre-wire refusal"
+    );
+    assert!(ferrum_edge::retry::request_reached_wire(post));
 }
 
 #[test]
 fn test_boxed_error_tls() {
     let err: Box<dyn std::error::Error + Send + Sync> =
         "TLS handshake failed: certificate verify failed".into();
-    assert_eq!(classify_boxed_error(err.as_ref()), ErrorClass::TlsError);
+    assert_eq!(
+        classify_boxed_setup_error(err.as_ref()),
+        ErrorClass::TlsError
+    );
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::ConnectionReset
+    );
 }
 
 #[test]
@@ -951,9 +994,14 @@ fn test_boxed_error_port_exhaustion_linux() {
     let err: Box<dyn std::error::Error + Send + Sync> =
         "Backend connect failed: Can't assign requested address (os error 99)".into();
     assert_eq!(
-        classify_boxed_error(err.as_ref()),
+        classify_boxed_setup_error(err.as_ref()),
         ErrorClass::PortExhaustion
     );
+    // Only a dial can exhaust ephemeral ports: the same text after the
+    // connect phase is not claimed as the pre-wire class.
+    let post = classify_boxed_error(err.as_ref());
+    assert_ne!(post, ErrorClass::PortExhaustion);
+    assert!(ferrum_edge::retry::request_reached_wire(post));
 }
 
 #[test]
@@ -961,9 +1009,12 @@ fn test_boxed_error_port_exhaustion_macos() {
     let err: Box<dyn std::error::Error + Send + Sync> =
         "Backend connect failed: Can't assign requested address (os error 49)".into();
     assert_eq!(
-        classify_boxed_error(err.as_ref()),
+        classify_boxed_setup_error(err.as_ref()),
         ErrorClass::PortExhaustion
     );
+    let post = classify_boxed_error(err.as_ref());
+    assert_ne!(post, ErrorClass::PortExhaustion);
+    assert!(ferrum_edge::retry::request_reached_wire(post));
 }
 
 #[test]
@@ -1851,6 +1902,51 @@ fn test_classify_boxed_setup_error_ws_io_econnrefused_stays_pre_wire() {
 }
 
 #[test]
+fn test_classify_boxed_error_ws_session_io_errno_stays_post_wire() {
+    // Issue #7213: the `WsError::Io` ECONNREFUSED / EADDRNOTAVAIL exceptions
+    // are pre-wire only when the CALLER is dialing. On an established
+    // WebSocket session (`classify_boxed_error`) the same errno proves
+    // nothing about the request and must keep the post-wire twin.
+    let refused: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(tokio_tungstenite::tungstenite::Error::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+        ));
+    let post = classify_boxed_error(&*refused);
+    assert_eq!(post, ErrorClass::ConnectionReset);
+    assert!(ferrum_edge::retry::request_reached_wire(post));
+
+    for raw in [99, 49, 10049] {
+        let exhausted: Box<dyn std::error::Error + Send + Sync> = Box::new(
+            tokio_tungstenite::tungstenite::Error::Io(std::io::Error::from_raw_os_error(raw)),
+        );
+        assert_eq!(
+            classify_boxed_setup_error(&*exhausted),
+            ErrorClass::PortExhaustion,
+            "raw_os_error({raw}) during the WebSocket dial is port exhaustion"
+        );
+        let post = classify_boxed_error(&*exhausted);
+        assert_ne!(post, ErrorClass::PortExhaustion);
+        assert!(
+            ferrum_edge::retry::request_reached_wire(post),
+            "raw_os_error({raw}) on a live WebSocket session must be post-wire (got {post:?})"
+        );
+    }
+}
+
+#[test]
+fn test_classify_body_error_eaddrnotavail_is_post_wire_backend_failure() {
+    // Issue #7213: a body error is post-headers, so EADDRNOTAVAIL there is
+    // never a dial's port exhaustion; it is charged as a post-wire reset.
+    for raw in [99, 49, 10049] {
+        let io_err = std::io::Error::from_raw_os_error(raw);
+        let (class, disconnected) = classify_body_error(&io_err);
+        assert_eq!(class, ErrorClass::ConnectionReset, "raw_os_error({raw})");
+        assert!(!disconnected);
+        assert!(ferrum_edge::retry::request_reached_wire(class));
+    }
+}
+
+#[test]
 fn h3_mesh_websocket_invalid_request_target_is_policy_rejection() {
     let err: Box<dyn std::error::Error + Send + Sync> =
         WS_MESH_BACKEND_REQUEST_TARGET_INVALID.into();
@@ -2349,8 +2445,8 @@ fn test_classify_body_error_unexpected_eof_is_connection_closed() {
 
 #[test]
 fn test_substring_fallback_matches_capitalized_os_wording() {
-    // Several stream paths stringify io::Error before classifying (TCP
-    // fast-path copy errors, UDP backend recv/send errors). The OS wording
+    // Some stream paths stringify io::Error before classifying (TCP
+    // fast-path copy errors). The OS wording
     // from `io::Error::Display` is capitalized — `Connection reset by peer`,
     // `Broken pipe`, `Connection aborted`. The substring fallback must
     // recognize both lowercase application wording AND the capitalized
@@ -2475,7 +2571,9 @@ fn test_substring_fallback_anchored_tls_handshake() {
     // bare `"tls"` was the false-positive risk, not full phrases.
     let err: Box<dyn std::error::Error + Send + Sync> =
         "outbound request failed: tls handshake aborted by peer".into();
-    assert_eq!(classify_boxed_error(&*err), ErrorClass::TlsError);
+    assert_eq!(classify_boxed_setup_error(&*err), ErrorClass::TlsError);
+    // Post-connect, the TLS token is not phase evidence (issue #7213).
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::ConnectionReset);
 }
 
 #[test]
@@ -2495,6 +2593,7 @@ fn test_direct_h2_send_request_error_response_maintains_wire_boundary() {
         ErrorClass::TlsError,
         ErrorClass::DnsLookupError,
         ErrorClass::RequestError,
+        ErrorClass::BackendConnectionLimit,
     ] {
         let resp = direct_h2_send_request_error_response_for_class_for_test(
             class,
@@ -2506,14 +2605,17 @@ fn test_direct_h2_send_request_error_response_maintains_wire_boundary() {
             !ferrum_edge::retry::request_reached_wire(class),
             "{class:?}: connection_error must equal !request_reached_wire"
         );
-        let expected_status = if class == ErrorClass::ReadWriteTimeout {
-            504
-        } else {
-            502
+        let expected_status = match class {
+            // #6770: connect and read/write timeouts are both "the upstream did
+            // not answer in time".
+            ErrorClass::ReadWriteTimeout | ErrorClass::ConnectionTimeout => 504,
+            // #6771: local maxConnections refusal before any dial.
+            ErrorClass::BackendConnectionLimit => 503,
+            _ => 502,
         };
         assert_eq!(
             resp.status_code, expected_status,
-            "{class:?}: HTTP-family dispatch must map read/write timeout to 504 and everything else to 502"
+            "{class:?}: HTTP-family dispatch must map timeouts to 504, a local connection-limit refusal to 503 and everything else to 502"
         );
     }
 }
@@ -2753,15 +2855,15 @@ fn test_http_backend_dispatch_maps_read_write_timeout_to_504_timeout_body() {
 
 #[test]
 fn test_http_backend_dispatch_keeps_connect_refused_as_502_unavailable() {
-    // Connection-refused / connect-timeout / DNS / TLS stay 502 with the
-    // generic unavailable body and `connection_error=true` so retry and
+    // Connection-refused / DNS / TLS stay 502 with the generic unavailable
+    // body and `connection_error=true` so retry and
     // `X-Gateway-Error: connection_failure` keep their pre-wire meaning.
+    // A connect TIMEOUT is 504 (#6770); see the dedicated test below.
     use ferrum_edge::_test_support::http_backend_dispatch_error_response_for_test as map;
     use ferrum_edge::retry::request_reached_wire;
 
     for class in [
         ErrorClass::ConnectionRefused,
-        ErrorClass::ConnectionTimeout,
         ErrorClass::DnsLookupError,
         ErrorClass::TlsError,
         ErrorClass::ConnectionPoolError,
@@ -2781,6 +2883,235 @@ fn test_http_backend_dispatch_keeps_connect_refused_as_502_unavailable() {
         assert_eq!(resp.error_class, Some(class));
         assert!(!request_reached_wire(class), "{class:?} is pre-wire");
     }
+}
+
+#[test]
+fn test_http_backend_dispatch_maps_connect_timeout_to_504_but_keeps_connect_retry() {
+    // #6770: a backend connect timeout is an upstream that did not answer in
+    // time (RFC 9110 §15.6.5), so the client sees 504 with the timeout body —
+    // but ONLY the status changes. It stays a pre-wire connection failure, so
+    // `retry_on_connect_failure` (method-independent), target rotation, the
+    // circuit-breaker connect path and `X-Gateway-Error: connection_failure`
+    // keep their established meaning.
+    use ferrum_edge::_test_support::http_backend_dispatch_error_response_for_test as map;
+    use ferrum_edge::_test_support::http_backend_failure_status_and_body_for_test as status_body;
+    use ferrum_edge::retry::{
+        OBS_CONNECTION_FAILURE, http_observability_error_class, request_reached_wire,
+    };
+
+    assert_eq!(
+        status_body(ErrorClass::ConnectionTimeout),
+        (504, r#"{"error":"Backend timeout"}"#)
+    );
+    let resp = map(ErrorClass::ConnectionTimeout, None);
+    assert_eq!(resp.status_code, 504);
+    assert_eq!(resp.body_bytes(), br#"{"error":"Backend timeout"}"#);
+    assert_eq!(resp.error_class, Some(ErrorClass::ConnectionTimeout));
+    assert!(!request_reached_wire(ErrorClass::ConnectionTimeout));
+    assert!(
+        resp.connection_error,
+        "a connect timeout must stay a pre-wire connection_error"
+    );
+    assert!(!resp.request_on_wire);
+    assert_eq!(
+        http_observability_error_class(resp.connection_error, resp.status_code),
+        Some(OBS_CONNECTION_FAILURE),
+        "X-Gateway-Error must keep reading connection_failure, not backend_timeout"
+    );
+
+    // Retry eligibility is decided by `connection_error`, never the 504:
+    // a POST is still replayed under retry_on_connect_failure, and is still
+    // NOT replayed when only status retries are configured for GET.
+    let connect_retry = RetryConfig {
+        max_retries: 2,
+        retry_on_connect_failure: true,
+        retryable_status_codes: vec![],
+        ..RetryConfig::default()
+    };
+    assert!(should_retry(&connect_retry, "POST", &resp, 0));
+    let status_only = RetryConfig {
+        max_retries: 2,
+        retry_on_connect_failure: false,
+        retryable_status_codes: vec![504],
+        retryable_methods: vec!["GET".to_string()],
+        ..RetryConfig::default()
+    };
+    assert!(
+        !should_retry(&status_only, "GET", &resp, 0),
+        "a connect failure must not become status-retryable just because it is now 504"
+    );
+}
+
+#[test]
+fn test_http_backend_dispatch_maps_connection_limit_to_503_health_neutral() {
+    // #6771: a DestinationRule `maxConnections` refusal is the gateway's own
+    // local capacity decision before any dial, so every pooled transport
+    // (direct H2, native H3, HBONE, sidecar mTLS) answers 503 with the same
+    // body as the reqwest / Unix-socket / raw-TCP over-cap refusals instead of
+    // a 502 that reads as an upstream failure. The class keeps its pre-wire,
+    // rotate-to-another-target and health-neutral semantics.
+    use ferrum_edge::_test_support::http_backend_dispatch_error_response_for_test as map;
+    use ferrum_edge::_test_support::http_backend_failure_status_and_body_for_test as status_body;
+    use ferrum_edge::_test_support::{
+        error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
+    };
+    use ferrum_edge::retry::request_reached_wire;
+
+    let body = r#"{"error":"Backend connection limit exceeded"}"#;
+    assert_eq!(status_body(ErrorClass::BackendConnectionLimit), (503, body));
+    let resp = map(ErrorClass::BackendConnectionLimit, None);
+    assert_eq!(resp.status_code, 503);
+    assert_eq!(resp.body_bytes(), body.as_bytes());
+    assert_eq!(resp.error_class, Some(ErrorClass::BackendConnectionLimit));
+    assert!(!request_reached_wire(ErrorClass::BackendConnectionLimit));
+    assert!(resp.connection_error);
+    assert!(error_class_is_health_neutral_for_test(
+        ErrorClass::BackendConnectionLimit
+    ));
+    assert!(!error_class_is_backend_failure_for_test(
+        ErrorClass::BackendConnectionLimit
+    ));
+    let connect_retry = RetryConfig {
+        max_retries: 1,
+        retry_on_connect_failure: true,
+        ..RetryConfig::default()
+    };
+    assert!(
+        should_retry(&connect_retry, "POST", &resp, 0),
+        "an over-cap refusal stays replayable on another target"
+    );
+
+    // The reqwest admission refusal answers with the same shared body.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert_eq!(
+        proxy
+            .matches("BACKEND_CONNECTION_LIMIT_ERROR_BODY.as_bytes().to_vec()")
+            .count(),
+        2,
+        "initial and retry reqwest maxConnections refusals must share the 503 body"
+    );
+}
+
+#[test]
+fn test_h1_h2_frontend_to_native_h3_failures_follow_shared_mapper() {
+    // Review of #6770/#6771: the H1/H2-frontend → native-H3 arms hard-coded
+    // 502. They now take the shared status (and its body for 503/504) while
+    // keeping the pool's typed `connection_error` / `request_on_wire`.
+    use ferrum_edge::_test_support::h3_pool_failure_backend_response_for_test as h3;
+
+    let timeout = h3(ErrorClass::ConnectionTimeout, true, false);
+    assert_eq!(timeout.status_code, 504);
+    assert_eq!(timeout.body_bytes(), br#"{"error":"Backend timeout"}"#);
+    assert!(timeout.connection_error && !timeout.request_on_wire);
+
+    let capped = h3(ErrorClass::BackendConnectionLimit, true, false);
+    assert_eq!(capped.status_code, 503);
+    assert_eq!(
+        capped.body_bytes(),
+        br#"{"error":"Backend connection limit exceeded"}"#
+    );
+
+    let reset = h3(ErrorClass::ConnectionReset, false, true);
+    assert_eq!(reset.status_code, 502);
+    assert_eq!(
+        reset.body_bytes(),
+        br#"{"error":"HTTP/3 backend request failed"}"#
+    );
+    assert!(!reset.connection_error && reset.request_on_wire);
+
+    // A post-wire QUIC idle timeout reads 504 but stays post-wire, so only an
+    // explicit status-retry policy for an idempotent method replays it.
+    let idle = h3(ErrorClass::ConnectionTimeout, false, true);
+    assert_eq!(idle.status_code, 504);
+    assert!(!idle.connection_error);
+    let status_retry = RetryConfig {
+        max_retries: 1,
+        retry_on_connect_failure: true,
+        retryable_status_codes: vec![504],
+        retryable_methods: vec!["GET".to_string()],
+        ..RetryConfig::default()
+    };
+    assert!(should_retry(&status_retry, "GET", &idle, 0));
+    assert!(!should_retry(&status_retry, "POST", &idle, 0));
+
+    // The HTTP/3 wording now lives only in the shared helper.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert_eq!(
+        proxy
+            .matches(r##"r#"{"error":"HTTP/3 backend request failed"}"#"##)
+            .count(),
+        1,
+        "no H1/H2 → H3 arm may hard-code the 502 any more"
+    );
+}
+
+#[test]
+fn test_websocket_backend_failure_status_follows_shared_mapper() {
+    use ferrum_edge::_test_support::websocket_backend_failure_status_and_body_for_test as ws;
+    assert_eq!(
+        ws(ErrorClass::ConnectionTimeout),
+        (
+            hyper::StatusCode::GATEWAY_TIMEOUT,
+            r#"{"error":"Backend timeout"}"#
+        )
+    );
+    assert_eq!(
+        ws(ErrorClass::ConnectionRefused),
+        (
+            hyper::StatusCode::BAD_GATEWAY,
+            r#"{"error":"Backend WebSocket connection failed"}"#
+        )
+    );
+    // Both WebSocket frontends feed the one class-derived status into the
+    // wire response, metrics, the summary and the breaker.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert!(proxy.contains("websocket_backend_failure_status_and_body(ws_error_class)"));
+    assert!(!proxy.contains("cb.record_failure(502, ws_is_pre_wire"));
+    let h3_ws = include_str!("../../../src/http3/websocket.rs");
+    assert!(h3_ws.contains("websocket_backend_failure_status_and_body(ws_error_class)"));
+    assert!(!h3_ws.contains("cb.record_failure(502, ws_is_pre_wire"));
+    // ...and both stamp the authoritative X-Gateway-Error for the failure.
+    assert_eq!(
+        proxy
+            .matches("Ok(build_websocket_backend_failure_response(")
+            .count(),
+        2
+    );
+    assert!(h3_ws.contains("send_h3_backend_failure_body(\n"));
+    // An inbound HBONE kernel ETIMEDOUT is the same cause as the gateway's own
+    // connect timer, so it is 504 too.
+    let hbone = include_str!("../../../src/proxy/hbone_proxy.rs");
+    assert!(hbone.contains("if class == retry::ErrorClass::ConnectionTimeout {"));
+}
+
+#[test]
+fn test_mesh_transport_pool_failures_follow_shared_mapper() {
+    // HBONE and sidecar-mTLS pool failures (connect timeout, maxConnections)
+    // go through the shared mapper; only the generic 502 keeps the transport
+    // wording.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let start = proxy
+        .find("fn mesh_transport_pool_error_response(")
+        .expect("mesh transport pool mapper present");
+    let end = start
+        + proxy[start..]
+            .find("\n}\n")
+            .expect("mesh transport pool mapper body ends");
+    let body = &proxy[start..end];
+    assert!(body.contains("http_backend_failure_status_and_body(error_class)"));
+    assert!(!body.contains("status_code: 502,"));
+}
+
+#[test]
+fn test_native_h3_failure_status_follows_shared_mapper() {
+    // The native-H3 dispatch mapper used to coerce every non-504 status from
+    // the shared mapper to 502, which would silently turn the 503
+    // `maxConnections` refusal back into 502 on HTTP/3 only.
+    let h3 = include_str!("../../../src/http3/server.rs");
+    assert!(
+        h3.contains("StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY)"),
+        "native-H3 must keep the shared mapper's status, not collapse it to 502"
+    );
 }
 
 #[test]
@@ -2988,7 +3319,7 @@ fn retry_loop_settles_health_neutral_intermediate_attempts_neutrally() {
 
     assert!(
         loop_body.contains("client_side_no_backend_signal(result.error_class)")
-            && loop_body.contains("cb.record_neutral(retry_probe_slot)"),
+            && loop_body.contains("cb.settle(retry_probe_slot, BreakerOutcome::Neutral)"),
         "an intermediate attempt whose class carries no backend signal must \
          settle the breaker neutrally rather than as a failure"
     );
@@ -3069,4 +3400,199 @@ fn backend_loop_detected_is_never_retried_even_when_listed() {
             "attempt {attempt}: a backend 508 must not be retried"
         );
     }
+}
+
+/// Issue #7160: a native-H3 retry attempt screens the effective `dns_override`
+/// exactly as the first attempt does, refusing a denied override before any
+/// pool call with the health-neutral egress-policy `502`, instead of relying
+/// on the DNS layer's later error.
+#[tokio::test]
+async fn native_h3_retry_screens_a_denied_dns_override_before_dialing() {
+    use ferrum_edge::config::types::{GatewayConfig, Proxy};
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, EnvConfig};
+    use ferrum_edge::proxy::ProxyState;
+
+    let proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "h3-retry-dns-override",
+        "listen_path": "/retry",
+        "backend_scheme": "https",
+        "backend_host": "backend.example.test",
+        "backend_port": 443,
+        "dns_override": "169.254.169.254",
+    }))
+    .expect("proxy fixture");
+    let mut config = GatewayConfig {
+        proxies: vec![proxy],
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+    let proxy = config.proxies[0].clone();
+    assert_eq!(proxy.dns_override.as_deref(), Some("169.254.169.254"));
+
+    let env_config = EnvConfig {
+        backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+        ..EnvConfig::default()
+    };
+    let dns_cache = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
+    let (state, _) = ProxyState::new(GatewayConfig::default(), dns_cache, env_config, None, None)
+        .expect("test proxy state should build");
+
+    let response = ferrum_edge::_test_support::proxy_to_backend_http3_retry_for_test(
+        &state,
+        &proxy,
+        "https://backend.example.test/retry",
+    )
+    .await;
+
+    assert_eq!(response.status_code, 502);
+    assert_eq!(
+        response.error_class,
+        Some(ErrorClass::DispatchPolicyRejected),
+        "a denied dns_override is a dispatch-policy refusal, not a backend failure"
+    );
+    assert!(!response.connection_error);
+    assert!(!response.request_on_wire);
+    let ResponseBody::Buffered(body) = &response.body else {
+        panic!("the egress refusal is a buffered gateway body");
+    };
+    assert_eq!(
+        String::from_utf8_lossy(body),
+        r#"{"error":"backend address blocked by egress policy"}"#
+    );
+}
+
+/// Issue #7158: the open-breaker rejection phase has one spelling on every
+/// frontend (`circuit_breaker_open`, as `docs/error_classification.md`
+/// documents), so the metrics token interner accepts only that spelling.
+#[test]
+fn open_breaker_rejection_phase_has_one_spelling() {
+    use ferrum_edge::retry::{OBS_CIRCUIT_BREAKER_OPEN, token_for_rejection_phase};
+
+    assert_eq!(
+        token_for_rejection_phase("circuit_breaker_open"),
+        Some(OBS_CIRCUIT_BREAKER_OPEN)
+    );
+    assert_eq!(token_for_rejection_phase("circuit_breaker"), None);
+}
+
+/// Issue #7159: a transaction summary logs the address of the LB-selected
+/// target that served the request, never the route's template `backend_host`
+/// (a placeholder when `upstream_id` is set). A cross-cluster HBONE target's
+/// synthetic host is not resolvable and is skipped.
+#[tokio::test]
+async fn summary_backend_ip_resolves_the_target_that_served_the_request() {
+    use ferrum_edge::config::EnvConfig;
+    use ferrum_edge::config::types::{GatewayConfig, Proxy, UpstreamTarget};
+    use ferrum_edge::proxy::ProxyState;
+
+    let proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "summary-ip",
+        "listen_path": "/summary",
+        "backend_scheme": "http",
+        "backend_host": "203.0.113.7",
+        "backend_port": 8080,
+    }))
+    .expect("proxy fixture");
+    let target = |host: &str| -> UpstreamTarget {
+        serde_json::from_value(serde_json::json!({"host": host, "port": 9090}))
+            .expect("target fixture")
+    };
+    let dns_cache = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
+    let (state, _) = ProxyState::new(
+        GatewayConfig::default(),
+        dns_cache,
+        EnvConfig::default(),
+        None,
+        None,
+    )
+    .expect("test proxy state should build");
+
+    let selected = target("198.51.100.4");
+    assert_eq!(
+        ferrum_edge::_test_support::resolve_summary_backend_ip_for_test(
+            &state,
+            &proxy,
+            Some(&selected),
+        )
+        .await
+        .as_deref(),
+        Some("198.51.100.4"),
+        "the selected target's address, not the template host"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::resolve_summary_backend_ip_for_test(&state, &proxy, None)
+            .await
+            .as_deref(),
+        Some("203.0.113.7"),
+        "a route without an upstream logs its own backend host"
+    );
+    let synthetic = target(&format!(
+        "{}east|reviews",
+        ferrum_edge::proxy::hbone_pool::HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX
+    ));
+    assert_eq!(
+        ferrum_edge::_test_support::resolve_summary_backend_ip_for_test(
+            &state,
+            &proxy,
+            Some(&synthetic),
+        )
+        .await,
+        None
+    );
+}
+
+/// Issue #7159: after a retry rotates targets, every attribution the summary
+/// carries follows the attempt that answered. H1/H2 stamps mesh metadata from
+/// the final target and the final attempt's transport; the H3 buffered loop
+/// carries its final URL out (restored with the target when an open breaker
+/// refuses the rotation) and logs it, with the final target's address.
+#[test]
+fn retry_rotation_attributes_mesh_metadata_and_h3_summary_to_the_final_attempt() {
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let squeeze = |text: &str| -> String { text.split_whitespace().collect() };
+    let proxy_squeezed = squeeze(proxy);
+    assert!(
+        proxy_squeezed.contains(
+            "annotate_gateway_mesh_metadata(&mutctx,final_upstream_target.as_deref(),final_dispatch_transport.unwrap_or("
+        ),
+        "mesh metadata must name the final target and transport"
+    );
+    let loop_start = proxy
+        .find("while retry::should_retry(retry_config, &method, &result, attempt)")
+        .expect("HTTP retry loop");
+    let loop_tail = &proxy[loop_start..];
+    let loop_body = &loop_tail[..loop_tail
+        .find("(result, current_cb_target_key, final_upstream_target)")
+        .expect("HTTP retry loop end")];
+    assert_eq!(
+        loop_body
+            .matches("final_dispatch_transport = Some(")
+            .count(),
+        1,
+        "only an attempt that was dispatched updates the final transport"
+    );
+    let dispatched = loop_body
+        .rfind("final_backend_url = Some(current_url.clone());")
+        .expect("dispatched attempt attribution");
+    let transport = loop_body
+        .find("final_dispatch_transport = Some(")
+        .expect("final transport update");
+    assert!(dispatched < transport);
+
+    let server = include_str!("../../../src/http3/server.rs");
+    let server_squeezed = squeeze(server);
+    assert!(
+        server_squeezed
+            .contains("pre_rotation_url=Some(std::mem::replace(&mutcurrent_url,next_url));")
+    );
+    assert!(server_squeezed.contains(
+        "current_target=pre_rotation_target;current_cb_target_key=pre_rotation_cb_target_key;ifletSome(url)=pre_rotation_url{current_url=url;}break;"
+    ));
+    assert!(server_squeezed.contains("current_cb_target_key,current_target,Some(current_url),)"));
+    assert!(server_squeezed.contains("letfinal_backend_url=final_url.unwrap_or(backend_url);"));
+    assert!(
+        server_squeezed
+            .contains("backend_target:Some(strip_query_params(&final_backend_url).to_string()),")
+    );
+    assert!(server_squeezed.contains("crate::proxy::boxed_resolve_summary_backend_ip("));
 }

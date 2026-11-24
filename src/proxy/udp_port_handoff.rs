@@ -473,6 +473,13 @@ impl UdpPortHandoffBackoff {
         }
     }
 
+    /// Replace the deadline while keeping the current pacing. For a caller
+    /// that re-classifies a collision after each failed attempt and may move
+    /// it to a different budget (issue #7178).
+    pub fn set_deadline(&mut self, deadline: tokio::time::Instant) {
+        self.deadline = deadline;
+    }
+
     /// Sleep before the next attempt and return `true`, or return `false`
     /// without sleeping when the next attempt would not start before the
     /// deadline.

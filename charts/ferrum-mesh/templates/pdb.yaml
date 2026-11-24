@@ -41,17 +41,3 @@
 {{- $first = false -}}
 {{- end }}
 {{- end }}
-{{- if .Values.ca.enabled }}
-{{- $doc := include "ferrum-mesh.renderPodDisruptionBudget" (dict
-  "root" .
-  "componentEnabled" true
-  "replicas" 1
-  "name" "ferrum-mesh-ca"
-  "selectorName" "ferrum-mesh-ca") -}}
-{{- if $doc }}
-{{- if not $first }}
----
-{{- end }}
-{{- $doc }}
-{{- end }}
-{{- end }}

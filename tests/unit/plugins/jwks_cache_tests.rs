@@ -3,13 +3,13 @@
 //! tasks must serialize on `jwks_remote_global_cache` so a parallel reset
 //! cannot abort another test's background fetch.
 
+use super::jwks_auth_support::cache_test_lock;
 use ferrum_edge::_test_support::jwks_discovery_candidate_for_test;
 use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::plugins::utils::jwks_cache::{
     JwksRefreshRequirement, cached_reaper_generation, cached_refresh_state, cached_requirement,
     clear_jwks_cache, get_or_create_jwks_store as get_or_create_jwks_store_with_requirement,
-    render_prometheus, retain_active_requirements, retain_active_uris,
-    retire_jwks_store_if_unreferenced,
+    render_prometheus, retain_active_requirements, retire_jwks_store_if_unreferenced,
 };
 use ferrum_edge::plugins::utils::jwks_store::{
     DEFAULT_JWKS_MAX_STALE_SECONDS, JwksFailureClass, JwksKeyStore, JwksTrustState,
@@ -17,7 +17,6 @@ use ferrum_edge::plugins::utils::jwks_store::{
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::Duration;
 use wiremock::matchers::method;
 use wiremock::{Mock, ResponseTemplate};
@@ -41,6 +40,14 @@ fn get_or_create_jwks_store_with_policy(
     )
 }
 
+/// The requirement [`get_or_create_jwks_store`] registers.
+fn default_requirement() -> JwksRefreshRequirement {
+    JwksRefreshRequirement::new(
+        Duration::from_secs(300),
+        Duration::from_secs(DEFAULT_JWKS_MAX_STALE_SECONDS),
+    )
+}
+
 fn get_or_create_jwks_store(
     uri: &str,
     http_client: &PluginHttpClient,
@@ -52,11 +59,6 @@ fn get_or_create_jwks_store(
         refresh_interval,
         Duration::from_secs(DEFAULT_JWKS_MAX_STALE_SECONDS),
     )
-}
-
-pub(super) fn cache_test_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 #[serial_test::serial(jwks_remote_global_cache)]
@@ -323,7 +325,7 @@ async fn test_clear_jwks_cache_forces_store_recreation() {
 
 #[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
-async fn test_retain_active_uris_removes_stale_entries() {
+async fn test_retain_active_requirements_removes_stale_entries() {
     let server = wiremock::MockServer::start().await;
     let uri_a = format!("{}/issuer-a/jwks.json", server.uri());
     let uri_b = format!("{}/issuer-b/jwks.json", server.uri());
@@ -337,8 +339,10 @@ async fn test_retain_active_uris_removes_stale_entries() {
     let weak_b = Arc::downgrade(&store_b);
 
     // Keep only A and C — B should be evicted
-    let active: HashSet<String> = [uri_a.clone(), uri_c.clone()].into();
-    retain_active_uris(&active);
+    retain_active_requirements(&HashMap::from([
+        (uri_a.clone(), default_requirement()),
+        (uri_c.clone(), default_requirement()),
+    ]));
 
     // A and C should still return the same store instances (cache hit)
     let store_a2 = get_or_create_jwks_store(&uri_a, &client(), Duration::from_secs(300));
@@ -347,7 +351,7 @@ async fn test_retain_active_uris_removes_stale_entries() {
     assert!(Arc::ptr_eq(&store_c, &store_c2));
 
     // B stays refreshable while an old generation still owns it, then is
-    // reaped without requiring another retain_active_uris call.
+    // reaped without requiring another reconciliation.
     drop(store_b);
     for _ in 0..20 {
         if weak_b.upgrade().is_none() {
@@ -364,7 +368,7 @@ async fn test_retain_active_uris_removes_stale_entries() {
 
 #[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
-async fn test_retain_active_uris_empty_set_clears_all() {
+async fn test_retain_active_requirements_empty_set_clears_all() {
     let server = wiremock::MockServer::start().await;
     let uri = format!("{}/.well-known/jwks.json", server.uri());
     let _guard = cache_test_lock().lock().await;
@@ -374,7 +378,7 @@ async fn test_retain_active_uris_empty_set_clears_all() {
 
     // Empty active set retires the store, but the external owner keeps its
     // refresh worker alive until that generation drops.
-    retain_active_uris(&HashSet::new());
+    retain_active_requirements(&HashMap::new());
     drop(original);
     for _ in 0..20 {
         if weak.upgrade().is_none() {
@@ -399,7 +403,7 @@ async fn test_retired_store_revival_cancels_pending_reaper() {
     clear_jwks_cache();
     let old_generation = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
 
-    retain_active_uris(&HashSet::new());
+    retain_active_requirements(&HashMap::new());
     let revived = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
     assert!(Arc::ptr_eq(&old_generation, &revived));
     drop(old_generation);

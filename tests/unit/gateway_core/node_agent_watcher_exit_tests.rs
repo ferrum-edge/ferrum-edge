@@ -66,7 +66,9 @@ async fn shutdown_requested_cleans_up_and_returns_ok() {
     let mut backend = MockEbpfBackend::default();
     let metrics = Arc::new(NodeAgentMetrics::default());
     // Already requested: the loop breaks before selecting on the pending stream.
-    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(true);
+    let (shutdown_tx, _shutdown_rx) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::ZERO);
+    shutdown_tx.shutdown();
     let pending = stream::pending::<WatchItem>();
 
     let result = run_with_pod_stream_for_test(
@@ -105,7 +107,8 @@ async fn shutdown_signalled_while_parked_returns_ok() {
     // path out of the loop is the shutdown arm waking on the watch notification.
     let mut backend = MockEbpfBackend::default();
     let metrics = Arc::new(NodeAgentMetrics::default());
-    let (tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    let (tx, _shutdown_rx) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
     let shutdown_tx = Arc::new(tx);
 
     let stream_tx = Arc::clone(&shutdown_tx);
@@ -114,7 +117,7 @@ async fn shutdown_signalled_while_parked_returns_ok() {
     // waker; the stream itself never becomes ready, so the only way out is the
     // `changed()` arm. Re-sending on a hypothetical second poll is idempotent.
     let parked = stream::poll_fn(move |_cx| {
-        let _ = stream_tx.send(true);
+        stream_tx.shutdown();
         Poll::<Option<WatchItem>>::Pending
     });
 
@@ -147,12 +150,13 @@ async fn shutdown_requested_wins_over_a_racing_exhausted_stream() {
     // and exit nonzero.
     let mut backend = MockEbpfBackend::default();
     let metrics = Arc::new(NodeAgentMetrics::default());
-    let (tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    let (tx, _shutdown_rx) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
     let shutdown_tx = Arc::new(tx);
 
     let stream_tx = Arc::clone(&shutdown_tx);
     let racing = stream::poll_fn(move |_cx| {
-        let _ = stream_tx.send(true);
+        stream_tx.shutdown();
         Poll::Ready(None::<WatchItem>)
     });
 
@@ -180,7 +184,8 @@ async fn shutdown_requested_wins_over_a_racing_exhausted_stream() {
 async fn watcher_exhaustion_cleans_up_and_returns_err() {
     let mut backend = MockEbpfBackend::default();
     let metrics = Arc::new(NodeAgentMetrics::default());
-    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _shutdown_rx) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
     // Finite empty stream: first poll yields None → unexpected exhaustion.
     let empty = stream::empty::<WatchItem>();
 
@@ -223,7 +228,8 @@ async fn transient_watcher_errors_do_not_exit_the_loop() {
     let mut backend = MockEbpfBackend::default();
     let metrics = Arc::new(NodeAgentMetrics::default());
     let metrics_view = Arc::clone(&metrics);
-    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _shutdown_rx) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
     let items: Vec<WatchItem> = vec![
         Err(WatcherError::NoResourceVersion),
         Err(WatcherError::NoResourceVersion),

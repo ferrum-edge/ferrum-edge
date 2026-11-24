@@ -1,0 +1,393 @@
+//! Static ferrum-mesh chart contracts for values that must reach the rendered
+//! workload exactly once (issues #7297 and #7299), without requiring a local
+//! `helm` binary.
+
+use std::path::PathBuf;
+
+fn read_chart(rel: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("charts/ferrum-mesh")
+        .join(rel);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read charts/ferrum-mesh/{rel}: {e}"))
+}
+
+/// `controlPlane.grpcPort` must move the listener, not only the declared
+/// container and Service ports, or the Service targets a port nothing serves.
+#[test]
+fn control_plane_grpc_port_renders_the_listen_address() {
+    let template = read_chart("templates/control-plane-deployment.yaml");
+    assert!(
+        template.contains("containerPort: {{ .Values.controlPlane.grpcPort }}")
+            && template.contains("port: {{ .Values.controlPlane.grpcPort }}"),
+        "the container port and the Service port must come from controlPlane.grpcPort"
+    );
+    assert!(
+        template.contains(
+            "{{- if not (hasKey .Values.controlPlane.env \"FERRUM_CP_GRPC_LISTEN_ADDR\") }}"
+        ) && template.contains("- name: FERRUM_CP_GRPC_LISTEN_ADDR")
+            && template.contains(
+                "value: {{ printf \"0.0.0.0:%v\" .Values.controlPlane.grpcPort | quote }}"
+            ),
+        "the chart must render FERRUM_CP_GRPC_LISTEN_ADDR from controlPlane.grpcPort \
+         unless controlPlane.env sets it"
+    );
+}
+
+/// `-ebpf-tools` is a strict superset of `-ebpf`; appending `-ebpf` to it names
+/// a tag the release pipeline never publishes. Every capture consumer must use
+/// the one shared selector.
+#[test]
+fn ebpf_image_tag_selection_never_double_suffixes() {
+    let helpers = read_chart("templates/_helpers.tpl");
+    let start = helpers
+        .find("{{- define \"ferrum-mesh.ebpfImageTag\" -}}")
+        .expect("ferrum-mesh.ebpfImageTag helper must exist");
+    let helper = &helpers[start..];
+    let helper = &helper[..helper
+        .find("{{- end -}}\n{{- end -}}")
+        .expect("ebpfImageTag helper must be closed")];
+    assert!(
+        helper.contains("(hasSuffix \"-ebpf\" .) (hasSuffix \"-ebpf-tools\" .)"),
+        "the helper must leave both -ebpf and -ebpf-tools tags unchanged"
+    );
+
+    for (rel, var) in [
+        ("templates/node-agent-daemonset.yaml", "$nodeAgentImageTag"),
+        ("templates/cni-uninstall-hook.yaml", "$imageTag"),
+        ("templates/ambient-daemonset.yaml", "$ambientImageTag"),
+    ] {
+        let template = read_chart(rel);
+        assert!(
+            template.contains(&format!("include \"ferrum-mesh.ebpfImageTag\" {var}")),
+            "{rel} must select the eBPF tag through ferrum-mesh.ebpfImageTag"
+        );
+        assert!(
+            !template.contains(&format!("printf \"%s-ebpf\" {var}")),
+            "{rel} must not append -ebpf itself"
+        );
+    }
+}
+
+/// Env names the chart renders from first-class values must be rejected in the
+/// matching workload env map, or the container gets the name twice.
+#[test]
+fn chart_rendered_env_names_are_reserved() {
+    let validation = read_chart("templates/validation.yaml");
+    let injector = validation
+        .lines()
+        .find(|line| line.contains("\"label\" \"injector.env\""))
+        .expect("validation.yaml must reserve injector.env names");
+    for name in [
+        "FERRUM_INJECTOR_LISTEN_ADDR",
+        "FERRUM_INJECTOR_REQUIRE_ANNOTATION",
+        "FERRUM_INJECTOR_TLS_CERT_PATH",
+        "FERRUM_INJECTOR_TLS_KEY_PATH",
+    ] {
+        assert!(
+            injector.contains(&format!("\"{name}\"")),
+            "injector.env.{name} must be reserved: the injector Deployment renders it"
+        );
+    }
+    let ambient = validation
+        .lines()
+        .find(|line| line.contains("\"label\" \"ambient.env\""))
+        .expect("validation.yaml must reserve ambient.env names");
+    assert!(
+        ambient.contains("\"FERRUM_MESH_CAPTURE_MODE\""),
+        "ambient.env.FERRUM_MESH_CAPTURE_MODE must be reserved: it renders from ambient.captureMode"
+    );
+
+    let helpers = read_chart("templates/_helpers.tpl");
+    assert!(
+        helpers.contains(
+            "{{- if and $tlsClientCaKey (hasKey $env \"FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH\") -}}"
+        ),
+        "admin.tls.clientCaKey and an env client CA path must not both render"
+    );
+    assert!(
+        helpers.contains("{{- if and $tlsCrlKey (hasKey $env \"FERRUM_TLS_CRL_FILE_PATH\") -}}"),
+        "admin.tls.crlKey and an env CRL path must not both render"
+    );
+}
+
+/// Templates render into the release namespace; a top-level `namespace` value
+/// would be a no-op that `--set namespace=...` silently accepts.
+#[test]
+fn chart_has_no_unused_namespace_value() {
+    let values = read_chart("values.yaml");
+    assert!(
+        !values.lines().any(|line| line.starts_with("namespace:")),
+        "values.yaml must not declare a top-level namespace value no template reads"
+    );
+    let schema = read_chart("values.schema.json");
+    assert!(
+        !schema.contains("release namespace hint"),
+        "values.schema.json must not admit a top-level namespace value"
+    );
+}
+
+/// The ambient container ports must follow the listen addresses the proxy
+/// binds (issue #7297). The listeners are configured only through
+/// `ambient.env`, so separate port values would be decorative and could
+/// disagree with the real listeners (NodeWaypoint discovery reads
+/// `FERRUM_MESH_HBONE_LISTEN_ADDR`, then the named `hbone` port).
+#[test]
+fn ambient_container_ports_follow_the_listen_addresses() {
+    let values = read_chart("values.yaml");
+    let schema = read_chart("values.schema.json");
+    for key in ["inboundPort", "outboundPort", "hbonePort"] {
+        assert!(
+            !values.contains(&format!("  {key}:")),
+            "values.yaml must not declare ambient.{key}; the port comes from ambient.env"
+        );
+        assert!(
+            !schema.contains(&format!("\"{key}\"")),
+            "values.schema.json must not admit ambient.{key}"
+        );
+    }
+
+    let template = read_chart("templates/ambient-daemonset.yaml");
+    assert!(
+        !template.contains(".Values.ambient.outboundPort")
+            && !template.contains(".Values.ambient.inboundPort")
+            && !template.contains(".Values.ambient.hbonePort"),
+        "the ambient DaemonSet must not read the removed port values"
+    );
+    // Defaults must match the binary's DEFAULT_*_LISTEN_ADDR constants.
+    for listener in [
+        "(list \"outbound\" \"FERRUM_MESH_OUTBOUND_LISTEN_ADDR\" \"127.0.0.1:15001\")",
+        "(list \"inbound\" \"FERRUM_MESH_INBOUND_LISTEN_ADDR\" \"0.0.0.0:15006\")",
+        "(list \"hbone\" \"FERRUM_MESH_HBONE_LISTEN_ADDR\" \"0.0.0.0:15008\")",
+    ] {
+        assert!(
+            template.contains(listener),
+            "the ambient DaemonSet must derive a container port from {listener}"
+        );
+    }
+    assert!(
+        template.contains("include \"ferrum-mesh.ambientListenPort\""),
+        "container ports must come from the shared ambientListenPort helper"
+    );
+
+    let mesh_mode = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/modes/mesh/mod.rs"),
+    )
+    .expect("read src/modes/mesh/mod.rs");
+    for constant in [
+        "const DEFAULT_INBOUND_LISTEN_ADDR: &str = \"0.0.0.0:15006\";",
+        "const DEFAULT_OUTBOUND_LISTEN_ADDR: &str = \"127.0.0.1:15001\";",
+        "const DEFAULT_HBONE_LISTEN_ADDR: &str = \"0.0.0.0:15008\";",
+    ] {
+        assert!(
+            mesh_mode.contains(constant),
+            "chart ambient listener defaults drifted from the binary: {constant}"
+        );
+    }
+
+    let helpers = read_chart("templates/_helpers.tpl");
+    let start = helpers
+        .find("{{- define \"ferrum-mesh.ambientListenPort\" -}}")
+        .expect("ferrum-mesh.ambientListenPort helper must exist");
+    let helper = &helpers[start..];
+    assert!(
+        helper.contains("index .env .name | default .default")
+            && helper.contains("{{- if ne ($port | int) 0 -}}"),
+        "an ambient.env address must win over the default, and port 0 must omit the port"
+    );
+}
+
+/// The control plane refuses a non-loopback plaintext CP gRPC bind at boot
+/// (`EnvConfig::validate_cp_dp_grpc_transport_security`), so the chart fails the
+/// render instead, accepting the same three escapes the runtime accepts
+/// (issue #7298). The guard reads the listen address the chart renders from
+/// `controlPlane.grpcPort`.
+#[test]
+fn control_plane_plaintext_cp_grpc_bind_fails_the_render() {
+    let validation = read_chart("templates/validation.yaml");
+    let cp_block = &validation[validation
+        .find("{{- if .Values.controlPlane.enabled -}}")
+        .expect("validation.yaml must validate the control plane")..];
+    let cp_block = &cp_block[..cp_block.find("{{- end -}}").expect("closed CP block")];
+    assert!(
+        cp_block.contains(
+            "{{- include \"ferrum-mesh.validateCpGrpcTransport\" (dict \"label\" \"controlPlane.env\" \"env\" .Values.controlPlane.env \"defaultListenAddr\" (printf \"0.0.0.0:%v\" .Values.controlPlane.grpcPort)) -}}"
+        ),
+        "the control plane must run the CP gRPC transport guard over controlPlane.env"
+    );
+
+    let helpers = read_chart("templates/_helpers.tpl");
+    let start = helpers
+        .find("{{- define \"ferrum-mesh.validateCpGrpcTransport\" -}}")
+        .expect("ferrum-mesh.validateCpGrpcTransport helper must exist");
+    let helper = &helpers[start..];
+    let helper = &helper[..helper
+        .find("{{- end -}}\n{{- end -}}")
+        .expect("closed helper")];
+    for needle in [
+        "\"FERRUM_CP_GRPC_LISTEN_ADDR\" | default (.defaultListenAddr | default \"0.0.0.0:50051\")",
+        "\"FERRUM_CP_GRPC_TLS_CERT_PATH\"",
+        "\"FERRUM_CP_GRPC_TLS_KEY_PATH\"",
+        "\"FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT\"",
+        "(list \"true\" \"1\" \"yes\")",
+        "include \"ferrum-mesh.isLoopbackBind\" $host",
+        "(ne ($port | int) 0)",
+    ] {
+        assert!(
+            helper.contains(needle),
+            "validateCpGrpcTransport must mirror the runtime check: missing {needle}"
+        );
+    }
+
+    // The remedy text must point the control plane at TLS or the explicit
+    // dev/test opt-in, never at a loopback bind: the control-plane Service
+    // targets the pod address, so a loopback listener would serve nothing.
+    let message = &helper[helper.find("{{- fail").expect("guard fails the render")..];
+    assert!(
+        message.contains("FERRUM_CP_GRPC_TLS_CERT_PATH")
+            && message.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT")
+            && message.contains("development and test only"),
+        "the guard must name the TLS pair and the plaintext opt-in as the remedies"
+    );
+    assert!(
+        !message.contains("bind a loopback") && !message.contains("(127.0.0.1:50051)"),
+        "the guard must not suggest a loopback CP gRPC bind for the control plane"
+    );
+
+    let runtime = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/config/env_config.rs"),
+    )
+    .expect("read src/config/env_config.rs");
+    assert!(
+        runtime.contains("fn validate_cp_dp_grpc_transport_security"),
+        "the chart guard mirrors EnvConfig::validate_cp_dp_grpc_transport_security"
+    );
+
+    let dev = read_chart("examples/development-values.yaml");
+    assert!(
+        dev.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: \"true\""),
+        "the development example must opt the control plane into plaintext CP gRPC \
+         so `-f development-values.yaml` still renders"
+    );
+}
+
+/// The standalone `ca` component was removed (issue #7298): it ran a second
+/// `FERRUM_MODE=cp` process and issued no certificates. No template, value,
+/// schema entry or example may bring it back half-wired.
+#[test]
+fn standalone_mesh_ca_component_is_gone() {
+    let chart = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("charts/ferrum-mesh");
+    assert!(
+        !chart.join("templates/ca-deployment.yaml").exists(),
+        "templates/ca-deployment.yaml must stay deleted"
+    );
+    let values = read_chart("values.yaml");
+    assert!(
+        !values.contains("\nca:\n"),
+        "values.yaml must not declare a top-level ca block"
+    );
+    let schema = read_chart("values.schema.json");
+    assert!(
+        !schema.contains("\n    \"ca\": {"),
+        "values.schema.json must not accept a top-level ca block"
+    );
+    for rel in [
+        "templates/_helpers.tpl",
+        "templates/validation.yaml",
+        "templates/serviceaccount.yaml",
+        "templates/pdb.yaml",
+        "templates/metrics-servicemonitor.yaml",
+        "examples/development-values.yaml",
+        "examples/production-existing-secrets-values.yaml",
+    ] {
+        let text = read_chart(rel);
+        assert!(
+            !text.contains(".Values.ca.")
+                && !text.contains("ferrum-mesh-ca\"")
+                && !text.contains("\nca:\n"),
+            "{rel} must not reference the removed standalone CA"
+        );
+    }
+}
+
+/// Every shipped example must render under the control-plane CP gRPC guard
+/// (issue #7298 review, sol F1): the CI chart runtime lint renders each example
+/// with no extra flags. The production example therefore carries a complete
+/// CP gRPC TLS setup (cert, key, data-plane client CA, and the Secret mount
+/// behind those paths) instead of relying on the plaintext opt-in.
+#[test]
+fn production_example_serves_cp_grpc_over_tls() {
+    let prod = read_chart("examples/production-existing-secrets-values.yaml");
+    for needle in [
+        "FERRUM_CP_GRPC_TLS_CERT_PATH: /etc/ferrum/cp-grpc-tls/tls.crt",
+        "FERRUM_CP_GRPC_TLS_KEY_PATH: /etc/ferrum/cp-grpc-tls/tls.key",
+        "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH: /etc/ferrum/cp-grpc-tls/ca.crt",
+        "secretName: ferrum-mesh-production-cp-grpc-tls",
+        "mountPath: /etc/ferrum/cp-grpc-tls",
+    ] {
+        assert!(
+            prod.contains(needle),
+            "the production example must serve CP gRPC over TLS: missing {needle}"
+        );
+    }
+    assert!(
+        !prod.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT"),
+        "the production example must not opt into plaintext CP gRPC"
+    );
+}
+
+/// Every chart invocation in the live suites and lab scripts that enables the
+/// control plane must satisfy the CP gRPC guard, or the suite dies at its
+/// preflight render (issue #7298 review, sol F2 / dsf F1).
+#[test]
+fn scripted_control_plane_renders_satisfy_the_cp_grpc_guard() {
+    fn collect(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "sh") {
+                out.push(path);
+            }
+        }
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut scripts = Vec::new();
+    collect(&root.join("tests/k8s"), &mut scripts);
+    collect(&root.join("scripts"), &mut scripts);
+    let escapes = [
+        "FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true",
+        "FERRUM_CP_GRPC_TLS_CERT_PATH",
+        "FERRUM_CP_GRPC_LISTEN_ADDR=127.0.0.1",
+        "examples/development-values.yaml",
+        "examples/production-existing-secrets-values.yaml",
+    ];
+    let mut checked = 0usize;
+    for script in &scripts {
+        let text = std::fs::read_to_string(script)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", script.display()));
+        let logical = text.replace("\\\n", " ");
+        for line in logical.lines() {
+            let is_helm = ["helm template", "helm install", "helm upgrade"]
+                .iter()
+                .any(|cmd| line.contains(cmd));
+            if !is_helm || !line.contains("controlPlane.enabled=true") {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                escapes.iter().any(|escape| line.contains(escape)),
+                "{} renders the control plane without CP gRPC TLS, a loopback bind, or the \
+                 plaintext opt-in, so the chart guard fails it",
+                script.display()
+            );
+        }
+    }
+    assert!(
+        checked >= 3,
+        "expected the NodeWaypoint live suite and the Gateway API scripts to render the control plane"
+    );
+}

@@ -18,7 +18,8 @@ use ferrum_edge::_test_support::await_dp_listener_handles;
 #[cfg(panic = "unwind")]
 #[tokio::test]
 async fn await_dp_listener_handles_observes_later_panic_while_earlier_listener_pending() {
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
     // Bridge stand-in: lives until shared shutdown. Must NOT be in the
     // supervised listener set — sequential join of [bridge, ..., panicker]
@@ -73,7 +74,8 @@ async fn await_dp_listener_handles_observes_later_panic_while_earlier_listener_p
 
 #[tokio::test]
 async fn await_dp_listener_handles_drains_siblings_on_clean_external_shutdown() {
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
     let mut listener_a_rx = shutdown_tx.subscribe();
     let listener_a = tokio::spawn(async move {
@@ -87,7 +89,7 @@ async fn await_dp_listener_handles_drains_siblings_on_clean_external_shutdown() 
     let trigger = shutdown_tx.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let _ = trigger.send(true);
+        trigger.shutdown();
     });
 
     let started = Instant::now();
@@ -103,11 +105,12 @@ async fn await_dp_listener_handles_drains_siblings_on_clean_external_shutdown() 
 
 #[tokio::test]
 async fn await_dp_listener_handles_waits_on_shutdown_when_no_listeners() {
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
     let trigger = shutdown_tx.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let _ = trigger.send(true);
+        trigger.shutdown();
     });
 
     let started = Instant::now();

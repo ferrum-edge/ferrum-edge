@@ -84,3 +84,68 @@ fn every_builtin_plugin_rejects_an_unknown_root_config_key() {
         );
     }
 }
+
+/// Wordings of the private unknown-key checkers that issue #7151 replaced with
+/// `crate::util::unknown_keys::reject_unknown_keys`. A plugin that rebuilds its
+/// own checker tends to reuse one of them (or retype the shared helper's own
+/// wording), and its operators then lose the shared diagnostic: every unknown
+/// key reported, sorted, path-qualified, with a "did you mean" suggestion.
+const PRIVATE_CHECKER_WORDINGS: &[&str] = &[
+    "unknown configuration key(s)",
+    "unknown config key",
+    "unknown config field",
+    "unknown configuration field",
+    "unknown configuration property",
+    "unknown configuration keys",
+    "unsupported configuration key",
+    "unsupported issuer field",
+    "contains unknown field",
+    "unknown property in",
+];
+
+#[test]
+fn plugin_sources_use_the_shared_unknown_key_helper() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugins");
+    let mut pending = vec![root];
+    let mut offenders = Vec::new();
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src/plugins") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read plugin source");
+            // Inline test modules may quote the wording in assertions.
+            let production = source
+                .split_once("#[cfg(test)]\nmod tests")
+                .map_or(source.as_str(), |(production, _)| production);
+            for (index, line) in production.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                if let Some(wording) = PRIVATE_CHECKER_WORDINGS
+                    .iter()
+                    .find(|wording| line.contains(**wording))
+                {
+                    offenders.push(format!(
+                        "{}:{}: {wording:?}",
+                        path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                            .unwrap_or(&path)
+                            .display(),
+                        index + 1
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "plugin config objects must reject unknown keys through \
+         `crate::util::unknown_keys::reject_unknown_keys`, not a private checker: {offenders:#?}"
+    );
+}

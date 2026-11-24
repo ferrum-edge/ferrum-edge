@@ -25,88 +25,33 @@ suite is observational, but a GA feature that regresses breaks its own test, so
 a promised feature cannot be silently downgraded. See
 `tests/conformance/ga_scope.rs` for the gate.
 
-The GA contract **grows incrementally** — a feature is enrolled only once we
-are prepared to fail CI on its regression. The source of truth is
-`tests/conformance/ga_contract.yaml`. The **Stable sidecar traffic surface is
-enrolled vertically** (semantic assertion → contract row → required live
-assertion): PeerAuthentication STRICT, AuthorizationPolicy ALLOW/DENY,
-RequestAuthentication JWT, DestinationRule `connectTimeout`/`maxConnections`,
-and VirtualService CORS, each backed by a `sidecar.*` live assertion the
-`mesh-e2e-sidecar` suite must emit and pass. DestinationRule `exportTo`
-visibility and lookup-namespace resolution are also GA-enrolled and live
-blocking: the sidecar fixture drives those behaviors on the captured client
-egress datapath against a multi-namespace DestinationRule model and requires
-both emitted assertion IDs to pass. For VS CORS, the mesh slice carries
-`virtual_service_cors_policies` and the client sidecar synthesizes the `cors`
-plugin onto its materialized outbound routes (issue #1973). **SPIFFE identity
-plumbing (SPIRE Agent CA) is enrolled too** (`mesh.identity.spire_svid_issuance`):
-semantics pinned by the `mesh_spiffe_identity` conformance module (SPIFFE ID
-parse + Istio `ns/sa` convention, URI-SAN SVID extraction, the inbound
-peer-SVID verification decision, the fail-closed SVID slot, and `spire_agent`
-backend selection), live-gated by the required `sidecar.spire.workload_entries`
-and `sidecar.peer_auth.strict_mtls_authenticated` assertions. **Native
-`MeshSubscribe` config transport is enrolled as well**
-(`mesh.config_transport.native_subscribe`, issue #2002 / #3855): semantics pinned by
-the `mesh_config_transport` conformance module (the namespace-scoped
-`MeshSlice` snapshot build MeshSubscribe serves from, `content_eq`
-update dedupe that ignores the transport version stamp, and the DP-side
-slice apply that fails closed on malformed payloads), live-gated by the
-required `sidecar.config.native_subscribe_*` assertions — the
-`mesh-e2e-sidecar` fixture deploys a Ferrum CP (`cp` mode, sqlite, K8s
-pod discovery building the mesh model from the cluster's real Services and
-pods) and a sidecar DP on `FERRUM_MESH_CONFIG_PROTOCOL=native` whose captured
-inbound datapath only serves traffic if the CP-delivered slice materialized
-over production mTLS + JWT (`https://ferrum-cp.<ns>.svc.cluster.local:50051`
-with SAN verification, CP client-CA, and DP client cert/key). Dedicated
-probes prove omit-client / foreign-client / untrusted-server-CA / wrong-SAN /
-invalid-JWT fail closed, and a projected Secret generation swap proves watched
-CP/DP gRPC TLS rotation reconnects without a pod restart, with the replacement
-leaf serial observed over mTLS from the running CP listener. `GET /mesh/config-drift`
-attributes the accepted slice to the native transport. `coverage.md` lists the currently enrolled rows and required live
-assertion IDs, which are the authoritative answer to "what regression fails
-CI today."
+The GA contract **grows incrementally**: a feature is enrolled only once we are
+prepared to fail CI on its regression. Enrolled rows live in
+`tests/conformance/ga_contract.yaml`; the generated
+`target/conformance/coverage.md` (emitted by the conformance suite) lists the
+enrolled rows and required live assertion IDs; fixture detail is in the
+`tests/k8s/*/README.md` of each live suite.
 
 ## Current headline state
 
 - **GA track — Ferrum-native sidecar mesh.** `Sidecar` topology + native
   `MeshSubscribe` + SPIRE/SPIFFE mTLS + `AuthorizationPolicy`/`RequestAuthentication`
-  + `VirtualService` routing + `DestinationRule` LB/timeout/outlier **plus `exportTo`
-  namespace visibility and the client → target-service → root-namespace lookup
-  hierarchy** (issues #2465 / #2469). Lookup resolution is per destination HOST at both
-  layers, the mesh root namespace rides the slice so the data plane can refuse
-  a rule outside all three lookup namespaces (missing/blank root provenance
-  fails closed rather than restoring permissive Unscoped bucketing), host-owner
-  evidence is authoritative over a conflicting upstream container namespace, and
-  VirtualService-derived CORS
-  policy narrows through the SAME shared `exportTo` evaluator at the same
-  enforcement points a DestinationRule does. These DestinationRule semantics are
-  pinned by Rust conformance/integration gates **and** by live
-  `sidecar.destination_rule.export_to_namespace_visibility` /
-  `sidecar.destination_rule.lookup_tier_client_wins` assertions from the
-  `mesh-e2e-sidecar` suite. The existing sidecar traffic surface **and the native
-  config transport** remain **live-verified
-  and blocking**: the `mesh-e2e-sidecar` kind+SPIRE suite drives the real
-  captured datapath (STRICT mTLS positive + plaintext-rejected negative,
-  destination-side authz 403, JWT valid/missing/invalid, DR exportTo visibility
-  + lookup hierarchy, DR connectTimeout
-  two-phase timing, DR maxConnections=1 WebSocket hold/reject/release, and a
-  CP + native-subscribe leg proving CP-delivered `MeshSubscribe` config over
-  production mTLS + JWT with Service-DNS SAN verification, fail-closed
-  omit-client / foreign-client / untrusted-server-CA / wrong-SAN / invalid-JWT
-  negatives, and watched projected-Secret rotation) on every relevant PR and every main push, the artifact is
-  contract-validated, and both the required CI aggregate and `release.yml`
-  gate on it.
-  An identity-less mesh — no file-based gateway SVID material **and** no CA
-  backend (`FERRUM_MESH_CA_BACKEND=spire_agent|internal` + `FERRUM_MESH_WORKLOAD_SPIFFE_ID`) supplying a runtime SVID — **fails startup closed** (no mTLS ⇒ PERMISSIVE would accept plaintext)
-  unless `FERRUM_MESH_ALLOW_NO_CA=true`, and `FERRUM_MESH_PRODUCTION_MODE=true`
-  refuses it unconditionally — so the GA path cannot silently degrade to
-  unauthenticated plaintext. This is enforced at **both** config-validation time
-  (presence check) and **runtime** (`enforce_mesh_inbound_fail_closed`, at startup
-  and on PeerAuthentication live reload): the gateway SVID also backs the inbound
-  listener's server cert, a resolved inbound listener that would serve plaintext
-  (PeerAuthentication DISABLE, or no usable server identity) is refused in
-  production, and a configured-but-unloadable SVID verifier (TLS without
-  trust-domain verification) is fatal regardless of mode.
+  + `VirtualService` host-level `corsPolicy` + `DestinationRule` LB/timeout/outlier, `exportTo`
+  namespace visibility, and the client → target-service → root-namespace lookup
+  hierarchy (issues #2465 / #2469), live-verified and blocking through the
+  `mesh-e2e-sidecar` suite on every relevant PR, main push, and `release.yml`
+  (required assertion IDs: `target/conformance/coverage.md`).
+  VirtualService `http[]` routing (weighted splits, match dispatch, rewrites,
+  retries, timeouts, faults, mirrors) is **not** part of the sidecar GA track:
+  Sidecar data planes apply a mesh-bound VirtualService's `http[]` routes
+  (Experimental, issue #7423), but no live weighted-split assertion gates them
+  yet (see *VirtualService on mesh data planes* below).
+  An identity-less mesh (no gateway SVID material and no CA backend) **fails
+  startup closed** unless `FERRUM_MESH_ALLOW_NO_CA=true`, and
+  `FERRUM_MESH_PRODUCTION_MODE=true` refuses it unconditionally; at runtime a
+  listener that would serve plaintext in production, or a configured-but-unloadable
+  SVID verifier, is refused (see [mesh.md → Internal Dev CA and Production
+  Guardrails](mesh.md#internal-dev-ca-and-production-guardrails)).
 - **GA track — cross-cluster east-west federation.** `EastWestGateway` SNI
   passthrough + SPIRE trust-bundle federation are enrolled vertically as well
   (issue #2459): `mesh.multicluster.spire_trust_federation`,
@@ -157,6 +102,37 @@ CI today."
   the Ambient UDP lifecycle, which shells out -- and non-eBPF builds cannot
   report Ready),
   stream-family egress.
+- **VirtualService on mesh data planes.** Every mesh data plane is built from
+  its mesh slice. Slices carry VirtualService `tcp[]`/`tls[]` routes and
+  host-level `corsPolicy` (applied by client Sidecars). A mesh-bound
+  VirtualService's `http[]` routes (with their `mesh_route_dispatch` rules and
+  weighted-split upstreams) ride **NodeWaypoint** (issue #7233, Experimental
+  with the topology) and **Sidecar** (issue #7423, Experimental) slices. On a
+  NodeWaypoint, route-scoped destination `AuthorizationPolicy` and
+  `RequestAuthentication` apply per VirtualService route; a Sidecar applies the
+  routes client-side on its outbound capture listener, and destination policy
+  stays with the destination's own Sidecar, as in Istio. A merged route's `mesh_route_dispatch` branches are each
+  authorized against their own destination's policy (issue #7383), and a
+  weighted split naming a DestinationRule-governed Service or external host
+  (exact or wildcard rule) is dispatched leg by leg, each leg through its own
+  rule-bearing upstream and authorized on its own policy; an external leg whose
+  rule originates TLS is dialed over TLS, and a direct external backend whose
+  rule originates TLS, or that any wildcard rule names, is refused (issues
+  #7387, #7395).
+
+  | Topology | Mesh-bound VirtualService `http[]` routes |
+  |---|---|
+  | NodeWaypoint | Applied (Experimental). |
+  | Sidecar | Applied (Experimental), client-side on the outbound capture listener, over SVID-mTLS to each destination workload. Never served on the inbound `:15006` listener. Deterministic integration coverage only: no live weighted-split assertion in `mesh-e2e-sidecar` yet. |
+  | ServiceWaypoint (GAMMA) | **Not applied** — follow-up: projection for the bound Services, where Istio applies waypoint L7 routing. |
+  | Ambient | **Not applied** — as in Istio, the L4 ambient data plane does not do L7 routing; bind a waypoint. |
+  | Ingress gateways (`spec.gateways` naming a Gateway) | Applied as gateway routes; unrelated to the mesh slice. |
+
+  The Kubernetes status of a mesh-bound VirtualService with `http[]` routes
+  says so: `status.ferrum.translation.mesh_http_routes: sidecar_and_node_waypoint`
+  and a `FerrumAccepted` message note naming the data planes that ignore them
+  (issues #7390, #7423). See [mesh.md → Mesh data planes: NodeWaypoint route
+  carriage](mesh.md#mesh-data-planes-nodewaypoint-route-carriage).
 
 ## Wildcard-host egress ServiceEntries
 
@@ -177,348 +153,176 @@ authority before it can reach DNS or connection setup. A refused stream-family
 entry does **not** claim its listen port, so a following exact-host
 `ServiceEntry` on the same port still materializes.
 
-**`resolution: NONE` is currently handled identically to `DNS`.** Istio's
+**`resolution: NONE` is currently handled identically to `DNS`**, and so is
+`DNS_ROUND_ROBIN`. Istio's
 original-destination semantics for raw streams are not implemented; stream
 entries must declare exact hosts or use `resolution: STATIC` with `endpoints[]`.
 
-## Acceptable residual / out-of-scope (the long tail)
+## EgressGateway backend scheme per ServiceEntry port
 
-These are deliberately **not** on the GA path because <~10% of mesh deployments
-need them, or because they are blocked upstream / architecturally:
+The `EgressGateway` decides how it reaches an external `MESH_EXTERNAL`
+`ServiceEntry` port from the port protocol and the `DestinationRule` for the
+host, as Istio does (issue #7236). The effective `tls.mode` is a
+`portLevelSettings` entry for the ServiceEntry port, else the top-level
+`trafficPolicy.tls`.
+
+| ServiceEntry port `protocol` | No `DestinationRule` `tls`, or `tls.mode: DISABLE` | `tls.mode: SIMPLE` / `MUTUAL` / `ISTIO_MUTUAL` |
+|---|---|---|
+| `HTTP` | Plaintext HTTP/1.1 | TLS origination with the rule's CA, client certificate, SNI and SANs |
+| `HTTP2` | Plaintext (HTTP/1.1 for ordinary requests; gRPC requests over h2c) | TLS origination |
+| `GRPC` | Plaintext h2c | TLS origination |
+| `TLS` | TLS origination (verified); `DISABLE` does not downgrade it | TLS origination |
+
+`ISTIO_MUTUAL` presents the file-based gateway SVID
+(`FERRUM_GATEWAY_SVID_CERT_PATH` / `FERRUM_GATEWAY_SVID_KEY_PATH`) as the
+client certificate. Without those files — a CA-backed SVID only
+(`FERRUM_MESH_CA_BACKEND`), or no SVID at all — an `ISTIO_MUTUAL` rule on an
+external `ServiceEntry` upstream fails slice apply closed, because generic
+backend TLS cannot present a dynamic SVID. Use `MUTUAL` with an explicit
+`clientCertificate` / `privateKey`, or `SIMPLE`, for those ports.
+
+## Support boundaries, deferrals, and non-goals (the long tail)
+
+These items are off the GA path. Each is a **non-goal**, **deferred** (a field
+that is parsed, surfaced in `deferred_fields`, and not applied, or a capability
+not yet targeted for GA), a **rejected** shape, or a feature **supported within
+a stated boundary**. The linked `docs/mesh.md`
+section is canonical for the detail.
+
+**Non-goals**
 
 - **Stock Envoy / third-party Istio xDS interop, full data-plane parity** —
   Ferrum's `xds` protocol is Ferrum-to-Ferrum (security/policy fields ride
   Ferrum ECDS carriers), so Ferrum is not a drop-in Envoy replacement in an
   existing xDS fleet. The separate `stock_xds` protocol (issue #3317, **Beta**)
-  does consume standard v3 CDS/EDS/LDS/RDS from a third-party control plane, but
-  for **discovery only**: enforcement policy always comes from the mandatory
-  local `FERRUM_MESH_FILE_CONFIG_PATH` document, and traffic shaping, subsets,
-  external DNS clusters, SDS, ECDS/RTDS, and delta xDS stay out of scope. That
-  discovery half — including update, deletion, NACK, and capability-refusal
-  behaviour — is proven on the live data path against a scripted third-party ADS
-  server in `tests/functional/functional_mesh_stock_xds_test.rs` (unpinned-peer
-  and subset refusals as reachability transitions; foreign-namespace narrowing
-  and RBAC / weighted-route capability refusals as exact ACK + diagnostic +
-  accepted-service continuity, with semantic unit/integration coverage that
-  those constructs contribute no route). See
-  `docs/mesh.md` → "Stock Envoy / third-party Istio xDS interoperability".
+  consumes standard v3 CDS/EDS/LDS/RDS from a third-party control plane for
+  **discovery only**: enforcement policy always comes from the mandatory local
+  `FERRUM_MESH_FILE_CONFIG_PATH` document, and traffic shaping, subsets,
+  external DNS clusters, SDS, ECDS/RTDS, and delta xDS stay out of scope. See
+  [Stock Envoy / third-party Istio xDS interoperability](mesh.md#stock-envoy--third-party-istio-xds-interoperability).
 - **`EnvoyFilter` / `WasmPlugin`** — use Ferrum custom plugins (`custom_plugins/`).
-- **`AuthorizationPolicy` `when: experimental.envoy.filters.*`** — the key is
-  accepted and the surrounding policy installs (rejecting it would drop the whole
-  policy, which is fail-OPEN for a DENY), but Ferrum has no Envoy filter chain to
-  source the dynamic metadata from, so the condition is permanently
-  **unsourceable**: a DENY rule ignores the field and still matches, while an
-  ALLOW/AUDIT rule can never match. Every other documented Istio condition key is
-  evaluated — see [`docs/mesh.md` → Condition
-  keys](mesh.md#condition-keys) for the per-protocol matrix.
-- **`when: destination.ip` on UDP / DTLS** — capturing an original
-  destination is not the same as supplying trusted `destination.ip`
-  evidence to authorization. The ordinary Linux mesh UDP capture path does
-  record one (`IP_RECVORIGDSTADDR`/`IPV6_RECVORIGDSTADDR` cmsgs, carried
-  through the receive batch to the capture handler), but that capture
-  metadata does not by itself make `destination.ip` sourceable on the
-  UDP/DTLS authorization path. The condition is unsourceable there and fails closed the same
-  way (DENY still applies, ALLOW/AUDIT cannot match). HTTP-family, raw TCP, TLS
-  passthrough, and captured mesh inbound all carry it.
-- **IPv6 ambient / node-waypoint capture** — sidecar serves IPv6 fully, and the
-  NodeWaypoint eBPF live gate admits captured IPv6 Service traffic through a
-  pod-netns `[::1]` listener with `.ready6` evidence. The mesh slice has a
-  `Workload.node_waypoint` destination endpoint contract. Kubernetes pod
-  discovery populates it from trusted ready host-network NodeWaypoint proxy
-  Pods in `FERRUM_K8S_CONTROLLER_NAMESPACE`, preferring the proxy pod's
-  configured HBONE listen address and requiring an explicit waypoint SPIFFE ID
-  (`FERRUM_MESH_WORKLOAD_SPIFFE_ID` or `FERRUM_GATEWAY_SPIFFE_ID`) before
-  publishing secured metadata. Captured Service targets consume that metadata
-  when present by dialing the destination NodeWaypoint over SPIFFE-mTLS HBONE
-  while preserving the selected workload as the inner CONNECT authority.
-  Identity-backed source NodeWaypoint runtimes skip metadata-absent service
-  targets so they cannot become plaintext backends, and destination-side
-  `mesh_authz` trusts HBONE baggage only from exact NodeWaypoint SPIFFE IDs in
-  the CP-derived `node_waypoint_assertors` inventory, which is built from
-  destination-visible, CP-scope-authorized, and bearer-`ns`-authorized
-  workloads before namespace/service slice narrowing.
-  Explicit no-CA/no-identity development runs retain the temporary plaintext
-  fallback and built-in assertor defaults. The pod-veth tc guard drops
-  unmanaged direct Pod-IP attempts to enrolled destination pods unless the
-  destination HBONE relay set the authorized socket mark. The live gate also
-  forces source workload IPv4 reuse in the disposable kind CNI and proves the
-  replacement UID/identity is admitted while stale registry state is gone, then
-  restarts the SPIRE Agent and NodeWaypoint DaemonSets and proves SVID-backed
-  traffic, policy, and HBONE authentication recover.
-- **UDP/DTLS per-pod authz scoping on NodeWaypoint — supported on Linux**
-  (issue #3286). The socket-cookie channel stays TCP-only, so UDP/DTLS resolves
-  its source workload from a separate exact channel: the kernel-reported ingress
-  interface of each datagram (`IP_PKTINFO`/`IPV6_PKTINFO`) joined against the
-  node-agent registry's published pod addresses and attested SPIFFE identity. The
-  resolved pod's `PolicyScopeCache` is stamped before `mesh_authz`, so
-  namespace/selector-scoped `AuthorizationPolicy` enforces per source workload and
-  UDP/DTLS service ports and proxies stay routable. A session is unattributable
-  when there is no ingress-interface cmsg, when the interface is one no enrolled
-  pod owns (all off-node traffic), when two enrolled pods claim it, when the
-  source address is not one the interface's pod owns, when the registry entry
-  carries no attested identity or address, or when the pod's workload has left
-  the live slice. Such a session carries no per-pod scope, and `mesh_authz`
-  then applies **exactly the same rule as the TCP stream path**: it is denied
-  whenever any enforcing namespace/selector-scoped `AuthorizationPolicy` is
-  loaded, and it falls through to mesh-wide evaluation in a mesh that carries
-  only mesh-wide policies (which are fully evaluable without a per-pod scope).
-  So an unattributable session is refused only when scoped policy is loaded, not
-  unconditionally at the session boundary. Admitted sessions are re-authorized per datagram, so pod churn, veth reuse,
-  and registry removal terminate them; a datagram that merely names an
-  established session's (forgeable) source tuple from a different ingress
-  interface is refused on its own without ending that session. A scoped
-  listener whose socket cannot report ingress interfaces at all does not start:
-  the bind is reported as failed rather than serving a listener that could only
-  deny. The blanket config-preparation suppression of NodeWaypoint UDP/DTLS
-  remains only on builds where the channel cannot exist (non-Linux). Mesh-wide
-  UDP/DTLS policy is unchanged.
-- **NodeWaypoint UDP/DTLS Service-path reachability — supported on Linux**
-  (issue #3286 root review). Materializing a listener does not make it
-  reachable: a workload addressing its Service ClusterIP has that datagram
-  DNAT-ed by kube-proxy to a backing pod and then DROPPED by the pod-veth guard,
-  so without steering only a direct dial to a trusted node address works.
-  Transparent steering (`raw` `--notrack` + `mangle` mark +
-  Ferrum-owned `fwmark`/`local` route, scoped `-i <pod veth> -d <ClusterIP>
-  --dport <port>`) delivers that datagram to the materialized listener
-  **without rewriting it**, so the source address, the ingress interface, and
-  the original destination all survive and the reply is sourced back from the
-  ClusterIP through a transparent socket. What is and is not covered:
-  - **Proven live** (`node-waypoint-ebpf-live`,
-    `node_waypoint.udp.service_path_allow_attributed_source`): an enrolled pod
-    sending to a `protocol: UDP` Service's ClusterIP reaches the production
-    listener, the backend logs the datagram, and the echo returns — under
-    kube-proxy **iptables** mode, IPv4, on kind.
-  - **Proven live for DTLS too**
-    (`node_waypoint.dtls.service_path_allow_attributed_source`,
-    `node_waypoint.dtls.service_path_deny_scoped_policy`, and
-    `node_waypoint.dtls.service_path_deny_unattributed_source`): an enrolled pod
-    resolves the `dtls-echo` Service DNS name, completes a real
-    `openssl s_client -dtls1_2` handshake against its ClusterIP through the
-    production listener, its decrypted datagram reaches the backend (which logs
-    it) and the echo returns; a namespace-scoped-denied source and an unenrolled
-    source both get no application data with the backend proving it saw nothing.
-    A steered DTLS session works because the `DtlsServer` PINS the captured
-    local destination per peer and sources every encrypted record from it —
-    initial handshake flight, ordinary output drain, retransmits, application
-    replies, and the final shutdown flush — over a transparent socket. A
-    datagram whose capture does not match the pinned one, or that carries no
-    capture at all on a scoped listener, is dropped before any session state is
-    allocated or delivered. The direct-node-address probes
-    (`node_waypoint.dtls.listener_bound`,
-    `node_waypoint.dtls.listener_allow_attributed_source`,
-    `node_waypoint.dtls.listener_deny_scoped_policy`) are retained as a
-    **distinct boundary**, not as substitute evidence for the Service path.
-  - **Not exercised, not claimed**: IPv6 Service steering, kube-proxy `ipvs` and
-    `nftables` modes, and headless (ClusterIP-less) services, which have no
-    address to steer and remain direct-address only.
-  - **Requires** `iptables` and `ip` in the NodeWaypoint image (the
-    `-ebpf-tools` image) plus `NET_ADMIN`; a `dtls` listener additionally needs
-    `NET_ADMIN` (or `NET_RAW` on newer kernels) for its transparent socket, and
-    refuses to start without it. Every PUBLISHED address family must be
-    installable in full: a node missing `ip6tables` while an IPv6 destination is
-    published fails the WHOLE apply, tears every Ferrum-owned object down, and
-    retries on the next reconcile — there is no per-family best-effort arm,
-    because a published-but-uninstalled family is a silent black hole that
-    would never be retried. A node that cannot install the plan leaves the
-    Service path unsteered, which is a lost service, never an unauthorized one.
-  - **Stale-rule reaping**: the chains, `ip rule`, and route survive the process
-    that installed them, so the FIRST reconcile of every process runs the
-    exact-name teardown even when it steers nothing; later unchanged polls run
-    no command. A generation change empties the `mangle` mark chain BEFORE the
-    `raw` notrack chain is repopulated, so no datagram is ever marked under a
-    destination generation whose notrack / local-delivery prerequisites do not
-    match it. The resulting window is unsteered (fail-closed at the pod-veth
-    guard), never cross-generation admission.
-  - **Steered interfaces are the PUBLISHED ones.** The steering interface set is
-    taken from the source-attribution index's published generation, after its
-    own refusals — a contested ingress interface (refused for both claimants), a
-    malformed or UID-mismatched binding, a duplicate, and an over-bound
-    generation all contribute nothing to steering.
-  - **Serving-generation ownership.** Mesh preparation may carry desired
-    destinations as candidate metadata; it must not publish the live datapath.
-    `StreamListenerManager` publishes only destinations whose UDP/DTLS listeners
-    are actually bound on the accepted serving generation, and retracts them
-    before those sockets go away (bind failure, deferred DTLS, withdrawal, task
-    failure, shutdown). A rejected or merely inspected candidate cannot change
-    steering, and a destination is never marked without a serving socket.
+- **`AuthorizationPolicy` `when: experimental.envoy.filters.*`** — permanently
+  **unsourceable** (Ferrum has no Envoy filter chain). The key is accepted so the
+  policy still installs (rejecting it would drop a DENY, which fails open): a
+  DENY rule ignores the field and still matches, while an ALLOW/AUDIT rule can
+  never match. Every other documented Istio condition key is evaluated; see
+  [Condition keys](mesh.md#condition-keys).
+- **`when: destination.ip` on UDP / DTLS** — unsourceable on the UDP/DTLS
+  authorization path even though Linux UDP capture records an original
+  destination, and it fails closed the same way (DENY applies, ALLOW/AUDIT
+  cannot match). HTTP-family, raw TCP, TLS passthrough, and captured mesh
+  inbound carry it. See [Condition keys](mesh.md#condition-keys).
 
+**Deferred or rejected**
 
-  **The listener configuration surface.** The attribution channel is reachable
-  because a NodeWaypoint materializes real UDP/DTLS **service listeners** from
-  the mesh service inventory (`materialize_node_waypoint_udp_listeners`, opt-in
-  via `FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED`). Each in-mesh
-  `MeshService` port whose protocol is `udp` (opaque datagram relay) or `dtls`
-  (frontend DTLS termination — the same L4 transport, selected by an
-  `appProtocol: dtls` / port-name hint on a `protocol: UDP` Service port, or by
-  a `dtls` Istio `ServiceEntry`/port protocol) materializes ONE datagram
-  listener on that port number, forwarding only to the service's backing pods
-  whose `node_waypoint.node_name` exactly matches the current
-  `FERRUM_K8S_NODE_NAME`, at their resolved `targetPort`. The backend socket's
-  authorization mark is node-local metadata and cannot cross nodes; enabling
-  the listener surface without that node name therefore fails serving startup
-  closed. Materialization runs DP-side in
-  `prepare_normalized_gateway_config_for_mesh`, exactly like the east-west and
-  egress-gateway stream listeners, so it needs neither a `stream_match` (which
-  `Proxy::validate` rejects on `udp`/`dtls`) nor a CP-side carrier. It is
-  default-OFF because a NodeWaypoint runs on the host network and enabling it
-  claims node-wide port numbers. Fail-closed refusals, each with a
-  field-specific log line and no inert leftovers: a port already claimed by a
-  mesh runtime listener or another stream proxy, incompatible same-port
-  frontend postures (mixed `udp`/`dtls` or multiple `dtls` claimants), an
-  ambiguous duplicate `(ClusterIP, port)` owner, a service port with no
-  reachable same-node endpoint, and port `0`. Compatible plain-`udp` Services
-  with distinct ClusterIPs share one listener and are demultiplexed by exact
-  destination. A
-  `dtls` port with no usable frontend DTLS material, or a scoped listener whose
-  socket cannot report ingress interfaces, fails the BIND and is reported as a
-  `StreamBindFailure` in readiness/status rather than starting a black-hole
-  listener. A `dtls` port stays unrepresentable at the EgressGateway
-  (terminate-and-re-originate has no DTLS origination path) and is refused
-  there with its own diagnostic.
-
-  **What is and is not proven, precisely.** The `node-waypoint-ebpf-live` gate
-  sends REAL datagrams through this production listener on a multi-pod kind
-  cluster (`tests/k8s/node_waypoint_ebpf_live/run.sh`,
-  `run_node_waypoint_udp_datapath_checks`): an admitted enrolled source reaches
-  the backend and gets its echo, a source denied by a scoped
-  `AuthorizationPolicy` gets nothing, an unenrolled source (and the same pod
-  FORGING an enrolled pod's source address over a raw socket) is refused
-  because attribution is the kernel-reported ingress interface, and a policy
-  change then withdrawal denies and restores that datapath with the ambient
-  DaemonSet's pod/container identity set and restart counters unchanged. The relay itself is authorized past the pod-veth tc guard the same way the TCP
-  inbound relay is: the scoped listener's frontend socket and its per-session
-  backend socket carry `NODE_WAYPOINT_INBOUND_AUTH_MARK`, and `tc_inbound`'s
-  UDP arms (IPv4 and IPv6) admit a node-sourced datagram carrying that mark
-  before falling through to the existing DNS-response carve-out; unmarked UDP
-  to an enrolled pod stays dropped. A scoped listener that cannot set that
-  mark does not start.
-
-  The spoof probe needs a raw socket, so the `udp-unmanaged` pod is granted
-  `NET_RAW` explicitly and the probe prints its `SPOOF-SENT:` marker only after
-  `sendto` returns. `node_waypoint.udp.listener_deny_spoofed_source` passes
-  only when the forged datagram was ACTUALLY emitted and the backend log proves
-  it never arrived; a sandbox that cannot forge fails the required gate closed
-  rather than recording a refusal nothing attempted. The unenrolled-source
-  refusal remains an independent attribution proof.
-
-  **DTLS carries the same live gate.** The `dtls-echo` Service declares
-  `appProtocol: dtls` on a `protocol: UDP` port, so the NodeWaypoint
-  materializes a `frontend_tls: true` listener that TERMINATES DTLS on the
-  host-netns socket and forwards plaintext datagrams to the backing pod.
-  `run_node_waypoint_dtls_datapath_checks` drives a real
-  `openssl s_client -dtls1_2` handshake through it from a prebuilt
-  `ferrum-live-dtls-client` image (openssl cannot be `apk add`'d from a
-  mesh-enrolled pod: `connect4` rewrites that TCP `connect()` to the capture
-  listener; UDP `connect()` is left unrewritten so the DTLS client keeps the
-  host-netns destination) and records
-  `node_waypoint.dtls.listener_bound` (the handshake completes and the listener
-  presents the operator DTLS material — proof it bound, not that it was
-  configured), `node_waypoint.dtls.listener_allow_attributed_source` (the
-  admitted enrolled source's decrypted datagram reaches the backend, which logs
-  it, and the echo comes back), and
-  `node_waypoint.dtls.listener_deny_scoped_policy` (a source the
-  namespace-scoped `AuthorizationPolicy` denies gets no application data AND the
-  backend logs nothing from it). Those three are the DIRECT-NODE-ADDRESS
-  boundary; the ordinary user path — the Service DNS name / ClusterIP — is
-  proven separately by the three `node_waypoint.dtls.service_path_*` assertions
-  and neither substitutes for the other.
-
-  Because a `DtlsServer` owns the socket every encrypted record leaves from,
-  three socket options are stamped on it BEFORE the server object exists:
-  `DtlsServerLimits::socket_mark` (`NODE_WAYPOINT_INBOUND_AUTH_MARK`),
-  `DtlsServerLimits::transparent_reply_source` (`IP_TRANSPARENT` /
-  `IPV6_TRANSPARENT`, so a steered session can source records from the Service
-  ClusterIP), and `DtlsServerLimits::capture_ingress_ifindex` (the
-  `IP_PKTINFO` / `IPV6_PKTINFO` capture). A scoped DTLS listener that cannot
-  apply any of them fails construction and is reported as a bind failure. The
-  allow assertions above are what prove the mark and the pinned reply source are
-  really applied end to end.
-
-  The DTLS material itself comes from the DTLS-specific
-  `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` (+ optional
-  `FERRUM_DTLS_CLIENT_CA_CERT_PATH`), which mesh mode loads at startup and
-  the PeerAuthentication live-reload path rebuilds from. `FERRUM_FRONTEND_TLS_*`
-  is deliberately NOT reused: on a mesh proxy that pair is the inbound TCP
-  listener's server identity, and sharing it would let configuring a DTLS
-  listener replace a SPIRE-issued inbound identity. Ordinary (non-generated)
-  DTLS without material stays visibly deferred (`FrontendDtlsDeferred`) rather
-  than binding. When generated NodeWaypoint DTLS listeners are required, a
-  missing dedicated cert/key or a Strict route without
-  `FERRUM_DTLS_CLIENT_CA_CERT_PATH` rejects the complete candidate before apply
-  and retains last-good.
-
-  Still **not** proven live: IPv6 DTLS, kube-proxy `ipvs`/`nftables` DTLS
-  steering, headless UDP/DTLS Services, multiple terminating-DTLS
-  claimants on one port, and a bound ordinary operator DTLS listener in the
-  same process (that stronger isolation remains unit/integration). Generated
-  DTLS client-certificate (mTLS) frontend verification and PeerAuthentication
-  PERMISSIVE → STRICT live-reload are proven by the
-  `node-waypoint-ebpf-live` assertions `node_waypoint.dtls.reload_*`.
-  Ordinary `FERRUM_DTLS_*` slot isolation is proven live only as unchanged
-  captured authenticated `/overload` `frontend_dtls_reload.generation` across
-  that publication (`node_waypoint.dtls.operator_isolated_across_reload`).
-  Same-port plain-UDP Service demultiplexing is proven by
-  `node_waypoint.udp.same_port_demux_*`.
-- **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated
-  but **Deferred** in status; backend close-after-N-requests is unsupported, so
-  it is not projected as effective policy. Use `maxConcurrentStreams` for
-  per-connection HTTP/2 stream concurrency, or `http2MaxRequests` for the
-  destination-wide active-request budget.
-  (`http1MaxPendingRequests` IS enforced through Ferrum's documented honest
-  reinterpretation — a 503-on-overflow concurrent in-flight-request gate on the
-  HTTP/1.1 dispatch path, keyed by logical destination
-  `(namespace, stable logical upstream/Service identity, optional K8s Service
-  UID when stamped, policy port, selected subset)` rather than selected
-  endpoint host; mesh VIP/service-host and direct-pod routes for one Service
-  share its FQDN identity, while native upstreams retain their resource ids;
-  see the DR table in `docs/mesh.md` and issue #3778.)
-- **DR `subsets[].trafficPolicy.portLevelSettings`** — detected and listed in
-  `deferred_fields` with a translate-time warning, but not applied. Ferrum
-  honors only top-level `trafficPolicy.portLevelSettings` (Istio's
-  highest-precedence subset port-level tier is unsupported). Express per-port
-  policy at top-level or via subset `connectionPool` fields; see `docs/mesh.md`.
+- **LB `MAGLEV`** — **Rejected**: `loadBalancer.simple = MAGLEV` is a hard
+  reject at translation.
+- **Active-active multi-cluster endpoint discovery at scale** — **Deferred**: a
+  minority need that targets verified-Beta, not GA. See [Multi-Cluster](mesh.md#multi-cluster).
+- **DR `connectionPool.http.maxRequestsPerConnection`** — **Deferred**: backend
+  close-after-N-requests is unsupported. Use `maxConcurrentStreams` for
+  per-connection HTTP/2 stream concurrency or `http2MaxRequests` for the
+  destination-wide active-request budget. (`http1MaxPendingRequests` IS
+  enforced as a reinterpreted 503-on-overflow in-flight HTTP/1.1 request gate
+  keyed by logical destination; issue #3778.) See
+  [DestinationRule limitations](mesh.md#destinationrule-limitations--approximations--deferred-fields).
+- **DR `subsets[].trafficPolicy.portLevelSettings`** — **Deferred** with a
+  translate-time warning; only top-level `trafficPolicy.portLevelSettings` is
+  honored. Express per-port policy at top level or via subset `connectionPool`
+  fields.
 - **DR `outlierDetection.consecutiveGatewayErrors` /
-  `consecutiveLocalOriginFailures` / `minHealthPercent`** — parsed past and
-  listed in `deferred_fields` with a translate-time warning (issue #4292), but
-  not applied: Ferrum's passive health keeps one failure bucket
-  (`unhealthy_status_codes` + connection errors) and bounds ejection with
-  `maxEjectionPercent` alone. `consecutive5xxErrors` IS applied with Istio's
-  consecutive-streak semantics; a translated `outlierDetection` that omits both
-  `consecutive5xxErrors` and `consecutiveErrors` inherits Istio's default of 5
-  (not Ferrum's native threshold of 3), explicit `0` disables the consecutive-5xx
-  detector (HTTP 5xx and locally originated connection failures; split mode is
-  deferred), and
-  a translated block that omits `maxEjectionPercent` inherits Istio's own 10%
-  default rather than Ferrum's uncapped native default.
-- **`RequestAuthentication` / `Telemetry` `targetRef` / `targetRefs`** — rejected
-  (`FerrumAccepted=False` / `Invalid`) rather than translated (issue #4305).
-  Only `AuthorizationPolicy` implements end-to-end attachment for either form;
-  admitting one on these kinds would read as "no selector" and WIDEN the
-  resource to namespace scope — or to the whole mesh in the Istio root
-  namespace. Scope these with a workload selector. Structural diagnostics
-  (unknown kind, cross-namespace `Service`, missing target, `selector` +
-  `targetRefs` conflict) come from the shared AuthorizationPolicy resolver.
+  `consecutiveLocalOriginFailures` / `minHealthPercent`** — **Deferred** with a
+  translate-time warning (issue #4292): passive health keeps one failure bucket
+  and bounds ejection with `maxEjectionPercent` alone. `consecutive5xxErrors`
+  IS applied with Istio's consecutive-streak semantics. Omitting both
+  `consecutive5xxErrors` and `consecutiveErrors` inherits Istio's default of 5,
+  and omitting `maxEjectionPercent` inherits Istio's 10%, only when no
+  lower-precedence outlier tier supplied that value; explicit `0` disables the
+  consecutive-5xx detector. See the
+  [DestinationRule support matrix](mesh.md#meshdestinationrule).
+- **`RequestAuthentication` / `Telemetry` `targetRef` / `targetRefs`** —
+  **Rejected** (`FerrumAccepted=False` / `Invalid`, issue #4305): admitting
+  either would read as "no selector" and widen the resource to namespace scope,
+  or to the whole mesh in the Istio root namespace. Scope these with a workload
+  selector. See [RequestAuthentication](mesh.md#requestauthentication) and
+  [Telemetry API](mesh.md#telemetry-api).
 - **`RequestAuthentication` `jwtRules[].outputPayloadToHeader` / `fromCookies`**
-  — recognized and listed in `deferred_fields` (field name only, never the
-  cookie name or header value), but not enforced (issue #4277).
+  — **Deferred** (issue #4277), reported by field name only.
   `outputClaimToHeaders` IS applied: every declared header is stripped from the
-  inbound request before validation and re-asserted only from a validated
-  claim.
+  inbound request and re-asserted only from a validated claim. See
+  [RequestAuthentication](mesh.md#requestauthentication).
 - **VS `http[].route[].headers` on a weighted multi-destination route** —
-  listed in `deferred_fields` (issue #4304). A weighted split materializes one
-  upstream with weighted targets, so there is no per-destination rule to bind
-  the transform to. Single-destination routes DO apply it before the route-level
-  `http[].headers` block, matching Envoy's weighted-cluster then route mutation
-  order; a route-level `set` wins when both blocks write the same header.
-- **LB `MAGLEV`** — niche; `loadBalancer.simple = MAGLEV` is a hard reject at
-  translation.
-- **Active-active multi-cluster endpoint discovery at scale** — minority need;
-  targets verified-Beta, not GA.
+  **Deferred** (issue #4304): a weighted split has no per-destination rule to
+  bind the transform to. Single-destination routes apply it before the
+  route-level `http[].headers` block, and a route-level `set` wins. See
+  [Header Transforms](mesh.md#header-transforms).
+- **VS `http[].retries` `perTryTimeout` / `retryRemoteLocalities` and `retryOn`
+  policies outside Ferrum's retry model** (`retriable-4xx`, `retriable-headers`,
+  `envoy-ratelimited`, `reset-before-request`, `http3-post-connect-failure`,
+  gRPC status policies) — **Deferred**, reported in `deferred_fields`; the
+  enforced tokens still apply. A `retryOn` token that is neither an Istio policy
+  nor an HTTP status code refuses the VirtualService. See
+  [Retries](mesh.md#retries).
+- **`Telemetry` `metrics[]` / `accessLogging[]` entries after the first** —
+  **Deferred**, reported in `deferred_fields`: one metrics and one access-log
+  pipeline per workload, so only the first entry of each is translated (every
+  `tracing[]` entry is merged).
+- **`ServiceEntry` `endpoints[]` with no `address` but a `network`** (reached
+  through that network's gateway) — **Deferred**, skipped and reported in
+  `deferred_fields`. An endpoint with neither, a non-integer endpoint port, a
+  `ports[]` entry without an integer `number`, and an unknown `location` or
+  `resolution` refuse the ServiceEntry. `DNS_ROUND_ROBIN` resolves like `DNS`.
+
+**Supported within a stated boundary (Linux NodeWaypoint, Experimental)**
+
+- **IPv6 ambient / NodeWaypoint capture** — sidecar serves IPv6 fully, and the
+  NodeWaypoint eBPF live gate admits captured IPv6 Service traffic. Captured
+  Service targets dial the destination NodeWaypoint over SPIFFE-mTLS HBONE from
+  `Workload.node_waypoint` metadata, which is published only with an explicit
+  waypoint SPIFFE ID. Identity-backed source runtimes skip metadata-absent
+  targets instead of dialing them in plaintext, and destination `mesh_authz`
+  trusts HBONE baggage only from the `node_waypoint_assertors` inventory (see
+  [Trusted HBONE Assertors](mesh.md#trusted-hbone-assertors)); only
+  explicit no-CA/no-identity development runs keep the plaintext fallback. The
+  pod-veth tc guard drops unmanaged direct Pod-IP attempts to enrolled pods.
+  See [Destination metadata](mesh.md#destination-metadata-workloadnode_waypoint).
+- **UDP/DTLS per-pod authz scoping** (issue #3286) — the source pod is resolved
+  from each datagram's kernel-reported ingress interface
+  (`IP_PKTINFO`/`IPV6_PKTINFO`) joined against the node-agent registry. An
+  unattributable session follows the TCP stream rule: denied whenever an
+  enforcing namespace/selector-scoped `AuthorizationPolicy` is loaded, otherwise
+  evaluated mesh-wide. Admitted sessions are re-authorized per datagram, and a
+  scoped listener whose socket cannot report ingress interfaces does not start.
+  Non-Linux builds keep the blanket suppression of NodeWaypoint UDP/DTLS. See
+  [Stream and UDP/DTLS scoping summary](mesh.md#stream-and-udpdtls-scoping-summary).
+- **UDP/DTLS service listeners and Service-path reachability** — **opt-in** via
+  `FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED` (default off, because a
+  host-network NodeWaypoint claims node-wide ports) and requires
+  `FERRUM_K8S_NODE_NAME`. Transparent steering delivers Service ClusterIP
+  datagrams to the listener without rewriting them. It requires the
+  `-ebpf-tools` image (`iptables`, `ip`) plus `NET_ADMIN`; a `dtls` listener
+  also needs `NET_ADMIN` (or `NET_RAW` on newer kernels) for its transparent
+  socket and the dedicated `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH`
+  material (never `FERRUM_FRONTEND_TLS_*`). Port conflicts, incompatible
+  same-port postures, missing DTLS material, a `Strict` route without
+  `FERRUM_DTLS_CLIENT_CA_CERT_PATH`, and a published address family that
+  cannot be installed in full all fail closed: a node that cannot steer loses
+  the Service path, never authorizes it. A `dtls` port stays unrepresentable at
+  the EgressGateway. `node-waypoint-ebpf-live` proves the UDP and DTLS Service
+  paths, same-port UDP demultiplexing, and DTLS PeerAuthentication reload under
+  kube-proxy iptables mode, IPv4, on kind; the direct-node-address lane is a
+  separate boundary, not substitute evidence. **Not exercised and not
+  claimed:** IPv6 Service steering and IPv6 DTLS, kube-proxy `ipvs` and
+  `nftables` modes, headless (ClusterIP-less) Services (direct-address only),
+  multiple terminating-DTLS claimants on one port, and a bound ordinary
+  operator DTLS listener in the same process (unit/integration evidence only).
+  See [Node Waypoint](mesh.md#node-waypoint).
 
 ## Product deferral index (owed work — issue-tracked)
 
-Distinct from the out-of-scope list above: out-of-scope items are **documented
-non-goals** and deliberately carry no issues. The table below is the canonical
+Distinct from the long-tail list above: those items are **documented
+boundaries and non-goals**, not owed product work, and deliberately carry no
+row here. The table below is the canonical
 tally of **product/operator support deferrals** called out by the mesh support
 matrix and residual-gap inventory; each row has an open tracking issue and an
 in-place doc anchor. When one of these deferrals lands, close the issue and

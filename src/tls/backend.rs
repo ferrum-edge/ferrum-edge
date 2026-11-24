@@ -283,7 +283,9 @@ impl OwnedBackendTlsConfigInputs {
 ///
 /// Reusing the same `Arc<ClientConfig>` lets protocol pools share rustls'
 /// in-memory session resumption state across new backend connections instead
-/// of resetting it on every reconnect.
+/// of resetting it on every reconnect, unless the verifier enforces CRLs. Those
+/// configs disable resumption so each reconnect checks CRL expiration even when
+/// the cached config and CRL source bytes have not changed.
 ///
 /// Cache keys MUST be tagged with the backend SVID generation marker (or the
 /// `static` sentinel for operator-supplied certs) via
@@ -560,7 +562,6 @@ struct NumericSvidRetirement {
 }
 
 impl BackendTlsConfigCache {
-    #[allow(dead_code)] // Used by focused tests with default shard sizing.
     pub fn new() -> Self {
         Self::default()
     }
@@ -623,17 +624,14 @@ impl BackendTlsConfigCache {
         self.prebuild_failures.retain(|key, _| live.contains(key));
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn len(&self) -> usize {
         self.configs.len()
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn is_empty(&self) -> bool {
         self.configs.is_empty()
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn contains_key(&self, key: &str) -> bool {
         self.configs.contains_key(key)
     }
@@ -809,7 +807,6 @@ impl BackendTlsConfigCache {
     }
 
     /// Number of single-flight builds currently in flight.
-    #[allow(dead_code)] // exercised from unit tests
     pub fn pending_builds(&self) -> usize {
         self.pending.len()
     }
@@ -823,7 +820,6 @@ impl BackendTlsConfigCache {
 
     /// Whether the last prebuild of `key` failed, so config publications skip
     /// it until a build succeeds or a [`Self::clear`].
-    #[allow(dead_code)] // exercised from unit tests
     pub fn is_prebuild_skipped(&self, key: &str) -> bool {
         self.prebuild_failures.contains_key(key)
     }
@@ -1075,7 +1071,6 @@ pub fn backend_tls_pool_key_has_svid_field(key: &str) -> bool {
 /// (tests and ad-hoc inspection). Production hot paths build a single
 /// `SvidGenerationMatcher::new(generation)` and pass it into
 /// `pool.invalidate_matching` to avoid per-key segment allocation.
-#[allow(dead_code)]
 pub fn backend_tls_pool_key_has_svid_generation(key: &str, svid_generation: u64) -> bool {
     SvidGenerationMatcher::new(svid_generation).matches(key)
 }
@@ -1196,6 +1191,14 @@ pub fn append_backend_tls_pool_key_fields(
     if tls.tls_refused {
         buf.push_str("|tlsrefused");
     }
+    // A provider-isolated destination resolves to no client identity even when
+    // a gateway-global pair exists. Its effective cert/key fields already say
+    // so, but the explicit segment keeps the isolation decision inspectable and
+    // independent of how a caller resolved those fields. Appended only when
+    // set, so every other key is unchanged.
+    if tls.suppress_global_client_identity {
+        buf.push_str("|noglobalid");
+    }
     append_backend_svid_generation_key_field(buf, svid_generation);
 }
 
@@ -1247,7 +1250,7 @@ pub fn pool_key_host_port_prefix(key: &str) -> Option<&str> {
 /// certificate-name verification while the TCP/QUIC dial target remains the
 /// selected backend host.
 ///
-/// GAP-1B wires this helper into H2, gRPC, and native H3 backend dispatch.
+/// This helper is used by H2, gRPC, and native H3 backend dispatch.
 /// TCP+TLS, backend WebSocket, DTLS, and active health probes still use their
 /// protocol-specific server-name plumbing and should route through this helper
 /// when those paths grow backend SNI override support.
@@ -1474,7 +1477,8 @@ fn general_name_matches_allowed(name: &GeneralName<'_>, allowed: &SanAllowListEn
     }
 }
 
-/// Build the backend trust store using the CA chain resolution from CLAUDE.md:
+/// Build the backend trust store using the CA chain resolution in
+/// `.claude/rules/tls-security.md` (Backend Trust):
 /// proxy CA, else global CA, else webpki roots. Custom CAs are exclusive.
 pub fn build_root_cert_store(
     proxy_ca: Option<&Path>,
@@ -1601,7 +1605,12 @@ impl<'a> BackendTlsConfigBuilder<'a> {
             }
         }?;
 
-        crate::tls::apply_client_session_resumption(&mut client_config, self.policy);
+        let enforced_crls = if self.skip_verification() {
+            &[][..]
+        } else {
+            self.crls
+        };
+        crate::tls::apply_client_session_resumption(&mut client_config, self.policy, enforced_crls);
         Ok(client_config)
     }
 
@@ -1692,7 +1701,7 @@ impl<'a> BackendTlsConfigBuilder<'a> {
         let root_store = if self.uses_system_trust_roots() {
             build_root_cert_store(None, None)?
         } else {
-            build_root_cert_store(self.custom_ca_path(), self.global_ca)?
+            build_root_cert_store(self.proxy_ca_path(), self.global_ca)?
         };
         let inner = build_server_verifier_with_crls(root_store, self.crls)
             .map_err(|e| TlsError::Rustls(format!("Failed to build server verifier: {}", e)))?;
@@ -1720,7 +1729,9 @@ impl<'a> BackendTlsConfigBuilder<'a> {
             || (self.global_no_verify && self.proxy.resolved_tls.allows_global_no_verify())
     }
 
-    fn custom_ca_path(&self) -> Option<&Path> {
+    /// The proxy's own CA bundle. The global-CA fallback is applied once, by
+    /// [`build_root_cert_store`].
+    fn proxy_ca_path(&self) -> Option<&Path> {
         if self.uses_system_trust_roots() {
             return None;
         }
@@ -1729,24 +1740,33 @@ impl<'a> BackendTlsConfigBuilder<'a> {
             .server_ca_cert_path
             .as_deref()
             .map(Path::new)
-            .or(self.global_ca)
     }
 
     fn load_client_auth(&self) -> Result<BackendClientAuth, TlsError> {
+        // A provider-isolated destination never inherits the gateway-global
+        // backend client identity: an unset per-route cert/key means "present
+        // no client certificate", not "present Ferrum's internal one" (see
+        // `BackendTlsConfig::suppress_global_client_identity`).
+        let (global_client_cert, global_client_key) =
+            if self.proxy.resolved_tls.suppress_global_client_identity {
+                (None, None)
+            } else {
+                (self.global_client_cert, self.global_client_key)
+            };
         let cert_path = self
             .proxy
             .resolved_tls
             .client_cert_path
             .as_deref()
             .map(Path::new)
-            .or(self.global_client_cert);
+            .or(global_client_cert);
         let key_path = self
             .proxy
             .resolved_tls
             .client_key_path
             .as_deref()
             .map(Path::new)
-            .or(self.global_client_key);
+            .or(global_client_key);
 
         match (cert_path, key_path) {
             (Some(cert_path), None) => Err(TlsError::Pem {
@@ -2036,7 +2056,6 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
-            pool_max_requests_per_connection: None,
             pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,

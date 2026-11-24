@@ -44,7 +44,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 const TEST_NAMESPACE: &str = "ferrum";
@@ -348,7 +347,7 @@ enum LaterWriter {
 struct Fixture {
     http_port: u16,
     https_port: u16,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: ferrum_edge::overload::ShutdownSender,
     join: JoinHandle<()>,
     tasks: Vec<JoinHandle<()>>,
     captures: Captures,
@@ -420,7 +419,9 @@ impl Fixture {
         drop(https_udp);
 
         let config = config(upstream_port, function_port);
-        let (shutdown_tx, _) = watch::channel(false);
+        let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+            std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+        );
         let handles =
             ferrum_edge::modes::file::serve(env_config, config, options, shutdown_tx.clone())
                 .await
@@ -582,7 +583,7 @@ impl Fixture {
     }
 
     async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.shutdown();
         let _ = tokio::time::timeout(Duration::from_secs(10), self.join).await;
         for task in self.tasks {
             task.abort();
@@ -795,7 +796,7 @@ fn bridge_config(backend_port: u16) -> GatewayConfig {
 }
 
 /// API key of the one agent Consumer in [`governed_bridge_config`].
-const AGENT_KEY: &str = "agent-alice-key";
+const AGENT_KEY: &str = "agent-alice-key-0123456789";
 
 /// [`bridge_config`]'s OpenAPI bridge behind the AI governance stack:
 /// `key_auth`, `ai_transcript_audit` exporting to the collector on
@@ -948,8 +949,15 @@ fn bridge_call_body(id: i64, name: &str, arguments: Value) -> Value {
 /// A later request-header rule that swaps the mediated upstream session is
 /// refused before any backend request is admitted, on every frontend.
 #[ignore]
-#[tokio::test]
-async fn functional_mcp_gateway_admission_refuses_a_later_session_header_rewrite_on_h1_h2_h3() {
+#[test]
+fn functional_mcp_gateway_admission_refuses_a_later_session_header_rewrite_on_h1_h2_h3() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_mcp_gateway_admission_refuses_a_later_session_header_rewrite_on_h1_h2_h3_inner,
+    );
+}
+
+async fn functional_mcp_gateway_admission_refuses_a_later_session_header_rewrite_on_h1_h2_h3_inner()
+{
     let fixture = Fixture::start(LaterWriter::RequestTransformer).await;
     for protocol in ["HTTP/1.1", "HTTP/2", "HTTP/3"] {
         fixture.clear();
@@ -973,8 +981,14 @@ async fn functional_mcp_gateway_admission_refuses_a_later_session_header_rewrite
 /// cannot replace the mediated upstream session: the upstream sees exactly the
 /// session it minted, once, on every frontend.
 #[ignore]
-#[tokio::test]
-async fn functional_mcp_gateway_admission_reasserts_session_over_a_function_overlay() {
+#[test]
+fn functional_mcp_gateway_admission_reasserts_session_over_a_function_overlay() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_mcp_gateway_admission_reasserts_session_over_a_function_overlay_inner,
+    );
+}
+
+async fn functional_mcp_gateway_admission_reasserts_session_over_a_function_overlay_inner() {
     let fixture = Fixture::start(LaterWriter::FunctionOverlay).await;
     for protocol in ["HTTP/1.1", "HTTP/2", "HTTP/3"] {
         fixture.clear();
@@ -1004,8 +1018,14 @@ async fn functional_mcp_gateway_admission_reasserts_session_over_a_function_over
 /// headers), and the client gets the converted JSON-RPC result on HTTP 200,
 /// also when the backend answers with a chunked body of unknown length.
 #[ignore]
-#[tokio::test]
-async fn functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3() {
+#[test]
+fn functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3_inner,
+    );
+}
+
+async fn functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3_inner() {
     let config = |backend_port: u16, _: u16| bridge_config(backend_port);
     let fixture = Fixture::start_with(Backend::Rest, config).await;
     for protocol in ["HTTP/1.1", "HTTP/2", "HTTP/3"] {

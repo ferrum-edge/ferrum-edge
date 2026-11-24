@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
@@ -80,7 +80,6 @@ const SIDECAR_ENV_KEYS: &[&str] = &[
     "FERRUM_DP_GRPC_TLS_CA_CERT_PATH",
     "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH",
     "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH",
-    "FERRUM_DP_GRPC_TLS_NO_VERIFY",
     "FERRUM_MESH_CONFIG_PROTOCOL",
 ];
 const SIDECAR_CONTAINER_NAME: &str = "ferrum-edge";
@@ -161,11 +160,12 @@ pub struct InjectorConfig {
     pub exclude_outbound_cidrs: Vec<String>,
     pub ip6tables_mode: Ip6TablesMode,
     /// Whether the injected init container emits UDP TPROXY capture rules
-    /// (F3 §3.3 Stage 2). Default `false`: the consuming UDP listener arrives in
-    /// Stage 3, so an upgraded injector must not redirect UDP into a void.
+    /// (F3 §3.3). Default `false`; when on (iptables capture mode only) the
+    /// Sidecar also binds the transparent UDP capture listener on
+    /// `udp_outbound_port`.
     pub udp_capture_enabled: bool,
-    /// UDP TPROXY listener port (Stage 3 consumer); distinct from the TCP
-    /// outbound REDIRECT port.
+    /// UDP TPROXY capture listener port; distinct from the TCP outbound
+    /// REDIRECT port.
     pub udp_outbound_port: u16,
     /// Firewall mark stamped on TPROXY'd UDP datagrams.
     pub tproxy_mark: u32,
@@ -200,9 +200,7 @@ impl InjectorConfig {
         )?;
         let init_resources =
             container_resources_from_runtime("FERRUM_INJECTOR_INIT", default_init_resources())?;
-        let require_annotation = resolve_ferrum_var("FERRUM_INJECTOR_REQUIRE_ANNOTATION")
-            .and_then(|value| value.parse::<bool>().ok())
-            .unwrap_or(true);
+        let require_annotation = injector_bool_env("FERRUM_INJECTOR_REQUIRE_ANNOTATION", true)?;
         let capture_mode = CaptureMode::parse(
             &resolve_ferrum_var("FERRUM_MESH_CAPTURE_MODE")
                 .unwrap_or_else(|| "explicit".to_string()),
@@ -249,9 +247,7 @@ impl InjectorConfig {
             )?;
         let tls_cert_path = resolve_ferrum_var("FERRUM_INJECTOR_TLS_CERT_PATH");
         let tls_key_path = resolve_ferrum_var("FERRUM_INJECTOR_TLS_KEY_PATH");
-        let allow_plaintext = resolve_ferrum_var("FERRUM_INJECTOR_ALLOW_PLAINTEXT")
-            .and_then(|value| value.trim().parse::<bool>().ok())
-            .unwrap_or(false);
+        let allow_plaintext = injector_bool_env("FERRUM_INJECTOR_ALLOW_PLAINTEXT", false)?;
         validate_injector_tls_serving(
             tls_cert_path.as_deref(),
             tls_key_path.as_deref(),
@@ -285,6 +281,19 @@ impl InjectorConfig {
             http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
             admission_review_max_body_bytes,
         })
+    }
+}
+
+/// An injector boolean setting: unset or blank keeps `default`; anything else
+/// must be one of the repo-wide boolean spellings (`true`/`false`/`1`/`0`,
+/// case-insensitive, trimmed), so a typo fails startup instead of silently
+/// falling back to the default (issue #7237).
+fn injector_bool_env(key: &str, default: bool) -> Result<bool, String> {
+    use crate::config::env_config::EnvValue;
+    match resolve_ferrum_var(key) {
+        None => Ok(default),
+        Some(raw) if raw.trim().is_empty() => Ok(default),
+        Some(raw) => bool::parse_env(raw.trim(), key),
     }
 }
 
@@ -729,7 +738,7 @@ pub(crate) fn load_startup_config(
 
 pub async fn run(
     env_config: EnvConfig,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<(), anyhow::Error> {
     let (config, tls_acceptor) = load_startup_config(&env_config)?;
     let max_connections = env_config.max_connections;
@@ -1522,8 +1531,8 @@ fn workload_spiffe_id(config: &InjectorConfig, pod: &Value, namespace: &str) -> 
 /// **Enabled (#1808).** The Sidecar mesh-mTLS datagram relay
 /// (`MeshMtlsConnectionPool::open_datagram_tunnel`) makes Sidecar the FIRST
 /// topology with a working end-to-end UDP path: the mesh runtime binds the UDP
-/// capture listener for Sidecar (`MeshRuntime::udp_capture_listener` is gated to
-/// Ambient OR Sidecar), the egress datapath relays each captured datagram over a
+/// capture listener for Sidecar (`MeshRuntimeConfig::udp_capture_listener` is
+/// Sidecar-only), the egress datapath relays each captured datagram over a
 /// `udp`-marked mesh-mTLS CONNECT (`:15006`), and the destination unframes it
 /// into a local `UdpSocket`. The injector only ever produces **Sidecar** pods
 /// (`FERRUM_MESH_TOPOLOGY=sidecar`), so this central switch ENABLES the three
@@ -1535,8 +1544,8 @@ fn workload_spiffe_id(config: &InjectorConfig, pod: &Value, namespace: &str) -> 
 /// behind the operator's `udp_capture_enabled` flag (default-off). (The
 /// node-agent / ambient host-netns path installs no UDP TPROXY rules — see
 /// `capture::udp_tproxy_commands_for_family`'s `host_netns` short-circuit — and
-/// ambient's UDP producer is still deferred (F4.3 / #1803), so this gate does NOT
-/// touch that path.)
+/// Ambient uses the per-pod-netns producer (#2013), so this gate does NOT touch
+/// that path.)
 const fn sidecar_udp_capture_supported() -> bool {
     true
 }
@@ -2348,6 +2357,15 @@ mod tests {
     use tokio::net::TcpStream;
     use tokio::task::JoinHandle;
     use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn sidecar_env_keys_skip_rejected_dp_tls_no_verify() {
+        // `EnvConfig` rejects `FERRUM_DP_GRPC_TLS_NO_VERIFY=true` in every
+        // mode, so forwarding it into sidecars could only be a no-op or break
+        // every injected pod (#7252).
+        assert!(!SIDECAR_ENV_KEYS.contains(&"FERRUM_DP_GRPC_TLS_NO_VERIFY"));
+        assert!(SIDECAR_ENV_KEYS.contains(&"FERRUM_DP_GRPC_TLS_CA_CERT_PATH"));
+    }
 
     fn test_resources(
         cpu_request: &str,

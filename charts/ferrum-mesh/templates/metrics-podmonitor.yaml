@@ -77,9 +77,9 @@ spec:
       {{- end }}
 {{- end }}
 {{- end }}
-{{- if and .Values.nodeAgent.enabled (.Values.nodeAgent.admin.enabled | default true) }}
+{{- if and .Values.nodeAgent.enabled .Values.nodeAgent.admin.enabled }}
 {{- $naBind := .Values.nodeAgent.admin.bindAddress | default "127.0.0.1" -}}
-{{- $naPort := toString (.Values.nodeAgent.admin.port | default "19090") -}}
+{{- $naPort := toString .Values.nodeAgent.admin.port -}}
 {{- $naHttpsPort := toString (.Values.nodeAgent.admin.httpsPort | default "0") -}}
 {{- $naTls := include "ferrum-mesh.nodeAgentAdminTlsConfigured" (.Values.nodeAgent.admin.tls | default dict) -}}
 {{- $naHttps := and (ne $naHttpsPort "0") $naTls -}}

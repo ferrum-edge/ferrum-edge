@@ -117,7 +117,7 @@ fn generate_admin_token(config: &TestConfig) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(config.jwt_secret.as_bytes()),
+        &EncodingKey::from_secret(config.jwt_secret.as_bytes()).unwrap(),
     )
     .expect("encode token")
 }
@@ -283,8 +283,29 @@ fn material_fixtures() -> MaterialFixtures {
         // fixture must be a real signed response rather than a placeholder.
         ocsp_der_base64: base64::engine::general_purpose::STANDARD
             .encode(crate::unit::tls::signed_ocsp_response_fixture()),
-        jwks_json: r#"{"keys":[{"kty":"oct","k":"dGVzdA","kid":"fixture"}]}"#.to_string(),
+        // Issue #7277: JWKS admission requires a key a consumer can verify
+        // with, so the fixture is a real P-256 signing key.
+        jwks_json: {
+            let point = leaf_key_jwk_point();
+            json!({"keys": [{
+                "kty": "EC",
+                "crv": "P-256",
+                "use": "sig",
+                "kid": "fixture",
+                "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&point[1..33]),
+                "y": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&point[33..]),
+            }]})
+            .to_string()
+        },
     }
+}
+
+/// Uncompressed public point of a fresh P-256 key, for the JWKS fixture.
+fn leaf_key_jwk_point() -> Vec<u8> {
+    KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .expect("jwks key")
+        .public_key_raw()
+        .to_vec()
 }
 
 fn create_body(collection: Collection, id: &str, fixtures: &MaterialFixtures) -> String {
@@ -411,7 +432,6 @@ fn https_proxy_referencing_ca(id: &str, ca_id: &str) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,

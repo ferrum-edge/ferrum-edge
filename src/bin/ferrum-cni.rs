@@ -16,13 +16,14 @@
 //! - The CNI binary needs the same `cni::spec` / `cni::rpc` /
 //!   `cni::client` modules as the node-agent server, so sharing the
 //!   library crate avoids code duplication.
-//! - Both binaries live in the same docker image. Helm's install
-//!   init-container copies `ferrum-cni` out of `/usr/local/bin/`
-//!   on the node-agent image into the host's `/opt/cni/bin/`.
+//! - Both binaries live in the same docker image: the node-agent image
+//!   ships it at `/app/ferrum-cni`, and the chart's init container runs
+//!   `/app/ferrum-cni install`, which publishes the binary into the host's
+//!   `/opt/cni/bin/`.
 //! - cargo's `[[bin]]` targets compile against the parent crate's
 //!   `lib.rs`, so this file is intentionally tiny.
 //!
-//! Stub on non-Linux: CNI is a Linux concept. macOS/Windows builds
+//! Stub on non-Unix: CNI is a Linux concept. Non-Unix (Windows) builds
 //! print an error and exit 1 so the binary target compiles in the CI
 //! matrix without requiring conditional compilation in `Cargo.toml`.
 
@@ -43,7 +44,8 @@ mod cni_main {
         MAX_CNI_ATTACHMENT_FIELD_BYTES, MAX_CNI_STDIN_BYTES, SUPPORTED_CNI_VERSIONS,
         build_error_result, cni_version_supports_gc, cni_version_supports_status, ingest_cni_args,
         ingest_valid_attachments, is_safe_cni_container_id, is_safe_cni_netns_path,
-        is_safe_cni_network_name, is_supported_cni_version, read_stdin_bounded,
+        is_safe_cni_network_name, is_supported_cni_version, prev_result_pod_ips,
+        read_stdin_bounded,
     };
 
     /// Default socket path the binary connects to when the chained CNI
@@ -59,11 +61,23 @@ mod cni_main {
         // argv to a CNI plugin, so an argument-bearing invocation is
         // unambiguously the lifecycle CLI and never a plugin call.
         match std::env::args().nth(1).as_deref() {
-            Some("install") => return run_install(),
-            Some("uninstall") => return run_uninstall(),
+            Some("install") => {
+                init_lifecycle_logging();
+                return run_install();
+            }
+            Some("uninstall") => {
+                init_lifecycle_logging();
+                return run_uninstall();
+            }
             Some("uninstall-status") => return run_uninstall_status(),
-            Some("await-cleanup") => return run_await_cleanup(),
-            Some("rollback-watch") => return run_rollback_watch(),
+            Some("await-cleanup") => {
+                init_lifecycle_logging();
+                return run_await_cleanup();
+            }
+            Some("rollback-watch") => {
+                init_lifecycle_logging();
+                return run_rollback_watch();
+            }
             Some(_) => {
                 // The argument is not echoed: it is untrusted process input
                 // and the accepted set is fixed and short.
@@ -137,6 +151,23 @@ mod cni_main {
                 handle_verb(verb, &net_config, &invocation)
             }
         }
+    }
+
+    /// Route the shared `cni::install` / `cni::lifecycle` diagnostics (ignored
+    /// ownership manifests, skipped neighbour configs) to stderr for the
+    /// lifecycle verbs. Those modules log through `tracing` because the
+    /// node-agent, which has a subscriber, calls them too; without one here the
+    /// init container and hooks would drop them. Plugin invocations never
+    /// install it: their stdout is the CNI result and stays untouched either
+    /// way. `RUST_LOG` overrides the default `info` level.
+    fn init_lifecycle_logging() {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init();
     }
 
     /// `ferrum-cni install` — copy the binary and write the chained conflist.
@@ -428,8 +459,8 @@ mod cni_main {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: Default::default(),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
 
         if let Err(reason) = request.validate() {
@@ -503,8 +534,8 @@ mod cni_main {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: Default::default(),
             valid_attachments,
+            pod_ips: Vec::new(),
         };
 
         if let Err(reason) = request.validate() {
@@ -570,8 +601,14 @@ mod cni_main {
             container_id: invocation.container_id.clone(),
             ifname: invocation.ifname.clone(),
             netns_path: invocation.netns.clone(),
-            args: args_map,
             valid_attachments: Vec::new(),
+            // ADD forwards the primary CNI's allocation so the node-agent can
+            // enroll the pod before kubelet starts it (GHSA-7x6j-vmqm-xx2v).
+            pod_ips: if verb == RpcVerb::Add {
+                prev_result_pod_ips(net_config.prev_result.as_ref())
+            } else {
+                Vec::new()
+            },
         };
 
         if let Err(reason) = request.validate() {

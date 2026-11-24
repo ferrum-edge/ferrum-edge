@@ -66,6 +66,16 @@ pub const MAX_HOSTS_PER_PROXY: usize = 100;
 /// literal origins; `*` is not a wildcard.
 pub const ALLOWED_WS_ORIGINS_STAR_GUIDANCE: &str =
     "empty list = allow all origins; entries are literal origins; `*` is not a wildcard";
+
+/// Why an `allowed_ws_origins` entry is refused at admission and warned about
+/// on database/CP/DP loads (issues #5454, #7218).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyAllowedWsOrigin {
+    /// CORS-style `"*"`, which is not a wildcard here.
+    Star,
+    /// Anything that is not a literal `scheme://host[:port]` origin.
+    NotLiteralOrigin,
+}
 /// Maximum number of targets per upstream.
 pub const MAX_TARGETS_PER_UPSTREAM: usize = 1000;
 /// Maximum number of tags per upstream target.
@@ -124,6 +134,13 @@ pub const MAX_CREDENTIAL_VALUE_LENGTH: usize = 4096;
 pub const MIN_JWT_SECRET_LENGTH: usize = 32;
 /// Minimum length for hmac_auth shared secrets.
 pub const MIN_HMAC_SECRET_LENGTH: usize = 32;
+/// Minimum non-whitespace length for keyauth API keys.
+///
+/// Lower than the HMAC/JWT secret floor on purpose: those secrets can be
+/// brute-forced offline from one captured signature or token, while an API key
+/// can only be guessed online against the gateway. Sixteen characters rules out
+/// trivially guessable keys; generate keys from a CSPRNG for real entropy.
+pub const MIN_KEYAUTH_KEY_LENGTH: usize = 16;
 /// Placeholder substituted for secret credential values in ordinary Consumer
 /// responses and audit diffs.
 pub const CREDENTIAL_REDACTION_PLACEHOLDER: &str = "[REDACTED]";
@@ -304,11 +321,216 @@ pub(crate) const SUPPORTED_GEO_COUNTRY_CODES: &[u8] = concat!(
 )
 .as_bytes();
 
-/// Effective strength of an hmac_auth secret: whitespace does not count
-/// toward [`MIN_HMAC_SECRET_LENGTH`]. Shared by admission-time field
-/// validation and the full-load quarantine so the two policies cannot drift.
+/// Effective strength of an hmac_auth secret, a Consumer `jwt` secret, or a
+/// keyauth key: whitespace does not count toward the type's minimum. Shared
+/// by admission-time field validation, the full-load quarantines, and the
+/// `jwt_auth` verifier so the policies cannot drift.
 pub(crate) fn hmac_secret_strength(secret: &str) -> usize {
     secret.chars().filter(|ch| !ch.is_whitespace()).count()
+}
+
+/// Whether a Consumer `jwt` secret carries at least [`MIN_JWT_SECRET_LENGTH`]
+/// non-whitespace characters. The single predicate behind JWT credential
+/// admission, the full-load/swap quarantine, and the `jwt_auth` verifier's
+/// refusal to sign-check against a weaker stored key.
+pub(crate) fn jwt_secret_meets_minimum_strength(secret: &str) -> bool {
+    hmac_secret_strength(secret) >= MIN_JWT_SECRET_LENGTH
+}
+
+/// Every `secret` string a stored Consumer `jwt` credential value carries,
+/// whatever its shape: each array element's `secret` (malformed or weak
+/// entries included) or a legacy single object's `secret`. Ownership checks
+/// use this rather than the verifier-eligible entries, because a holder knows
+/// a secret whether or not its own entry is usable.
+pub(crate) fn jwt_credential_secret_values(value: &serde_json::Value) -> Vec<&str> {
+    match value {
+        serde_json::Value::Array(entries) => entries
+            .iter()
+            .filter_map(|entry| entry.get("secret").and_then(serde_json::Value::as_str))
+            .collect(),
+        serde_json::Value::Object(object) => object
+            .get("secret")
+            .and_then(serde_json::Value::as_str)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a stored Consumer `jwt` credential value is a non-empty array of
+/// objects whose every `secret` is a string meeting the strength floor.
+fn jwt_credential_value_is_admissible(value: &serde_json::Value) -> bool {
+    match value.as_array() {
+        Some(entries) if !entries.is_empty() => entries.iter().all(|entry| {
+            entry
+                .as_object()
+                .and_then(|obj| obj.get("secret"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(jwt_secret_meets_minimum_strength)
+        }),
+        _ => false,
+    }
+}
+
+/// Why [`GatewayConfig::quarantine_invalid_jwt_credentials_against`]
+/// strips a Consumer's `jwt` credential.
+enum JwtQuarantineReason {
+    /// Another Consumer in the namespace holds one of its secrets.
+    Shared(String),
+    /// One of its secrets belonged to a credential quarantined for sharing.
+    PreviouslyShared,
+    /// Malformed, or a secret below the strength floor.
+    Weak,
+}
+
+/// Upper bound on the shared-secret digests [`JwtSharedSecretHistory`] keeps
+/// per namespace. Past it the oldest digest is evicted (and the caller warns),
+/// so a config source that keeps presenting new shared secrets cannot grow the
+/// process without bound.
+pub const JWT_SHARED_SECRET_HISTORY_MAX_PER_NAMESPACE: usize = 4096;
+
+/// Namespace-bound SHA-256 digest identifying a Consumer `jwt` secret without
+/// retaining it.
+fn jwt_shared_secret_digest(namespace: &str, secret: &str) -> [u8; 32] {
+    let mut hasher = crate::fips::approved::Sha256::new();
+    hasher.update(b"ferrum-edge/jwt-shared-secret/v1\0");
+    hasher.update((namespace.len() as u64).to_be_bytes());
+    hasher.update(namespace.as_bytes());
+    hasher.update(secret.as_bytes());
+    hasher.finalize()
+}
+
+/// Consumer `jwt` secrets removed from credentials quarantined for sharing,
+/// including their other rotation keys, as namespace-bound digests (never the
+/// secret).
+///
+/// The quarantine only *reports* these; the owner of a
+/// [`JwtSharedSecretHistory`] merges them once the candidate they came from
+/// is accepted, so a rejected candidate never records anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JwtSharedSecretRecords {
+    entries: Vec<(String, [u8; 32])>,
+}
+
+impl JwtSharedSecretRecords {
+    fn push(&mut self, namespace: &str, secret: &str) {
+        let digest = jwt_shared_secret_digest(namespace, secret);
+        if !self
+            .entries
+            .iter()
+            .any(|(ns, existing)| ns == namespace && *existing == digest)
+        {
+            self.entries.push((namespace.to_string(), digest));
+        }
+    }
+
+    /// Append `other`'s records, skipping duplicates.
+    pub fn extend(&mut self, other: JwtSharedSecretRecords) {
+        for (namespace, digest) in other.entries {
+            if !self
+                .entries
+                .iter()
+                .any(|(ns, existing)| *ns == namespace && *existing == digest)
+            {
+                self.entries.push((namespace, digest));
+            }
+        }
+    }
+
+    /// Number of distinct recorded quarantined secrets.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing was recorded.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Result of [`GatewayConfig::quarantine_invalid_jwt_credentials_against`].
+#[derive(Debug, Default)]
+pub struct JwtQuarantineOutcome {
+    /// One human-readable message per quarantined credential (never the
+    /// secret); callers log these at `error!` severity.
+    pub messages: Vec<String>,
+    /// Secrets removed from credentials quarantined for sharing, for the caller
+    /// to merge into its history once the snapshot is accepted.
+    pub shared: JwtSharedSecretRecords,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NamespaceJwtSharedSecrets {
+    digests: HashSet<[u8; 32]>,
+    /// Insertion order, oldest first, for bounded eviction.
+    order: std::collections::VecDeque<[u8; 32]>,
+}
+
+/// Process-local record of Consumer `jwt` secrets removed from credentials
+/// quarantined for sharing within a namespace, including other rotation keys.
+///
+/// A removed key is still known to its former holder, so it must not be
+/// reactivated by a later incremental swap that no longer shows that holder
+/// (the live snapshot it patches is already quarantined). Entries are
+/// SHA-256 digests bound to the namespace; the secret itself is never kept.
+/// Each namespace keeps at most
+/// [`JWT_SHARED_SECRET_HISTORY_MAX_PER_NAMESPACE`] digests, evicting the
+/// oldest. The record is process-local: a restart starts empty and judges
+/// only the fresh authoritative snapshot, which is why a shared secret must be
+/// replaced on every Consumer that held it.
+#[derive(Debug, Clone, Default)]
+pub struct JwtSharedSecretHistory {
+    namespaces: HashMap<String, NamespaceJwtSharedSecrets>,
+}
+
+impl JwtSharedSecretHistory {
+    pub(crate) fn contains(&self, namespace: &str, secret: &str) -> bool {
+        self.namespaces.get(namespace).is_some_and(|recorded| {
+            recorded
+                .digests
+                .contains(&jwt_shared_secret_digest(namespace, secret))
+        })
+    }
+
+    /// Merge `records` with the default per-namespace bound. Returns how many
+    /// older digests were evicted to stay within it.
+    pub fn merge(&mut self, records: &JwtSharedSecretRecords) -> usize {
+        self.merge_with_limit(records, JWT_SHARED_SECRET_HISTORY_MAX_PER_NAMESPACE)
+    }
+
+    /// [`Self::merge`] with an explicit per-namespace bound (at least 1).
+    pub fn merge_with_limit(&mut self, records: &JwtSharedSecretRecords, limit: usize) -> usize {
+        let limit = limit.max(1);
+        let mut evicted = 0;
+        for (namespace, digest) in &records.entries {
+            let recorded = self.namespaces.entry(namespace.clone()).or_default();
+            if recorded.digests.insert(*digest) {
+                recorded.order.push_back(*digest);
+                while recorded.order.len() > limit {
+                    if let Some(oldest) = recorded.order.pop_front() {
+                        recorded.digests.remove(&oldest);
+                        evicted += 1;
+                    }
+                }
+            }
+        }
+        evicted
+    }
+
+    /// Number of recorded quarantined secrets across namespaces.
+    pub fn len(&self) -> usize {
+        self.namespaces
+            .values()
+            .map(|recorded| recorded.digests.len())
+            .sum()
+    }
+
+    /// Whether no shared secret has been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.namespaces
+            .values()
+            .all(|recorded| recorded.digests.is_empty())
+    }
 }
 /// Minimum byte length for the server-side Basic-auth HMAC secret.
 pub const MIN_BASIC_AUTH_HMAC_SECRET_LENGTH: usize = 32;
@@ -316,17 +538,43 @@ pub const MIN_BASIC_AUTH_HMAC_SECRET_LENGTH: usize = 32;
 /// Overridable at runtime via `FERRUM_MAX_CREDENTIALS_PER_TYPE` env var / conf file.
 pub const DEFAULT_MAX_CREDENTIALS_PER_TYPE: usize = 2;
 
-/// Resolve the runtime max credentials per type from env var / conf file, falling
-/// back to `DEFAULT_MAX_CREDENTIALS_PER_TYPE` if unset or unparsable.
+/// Environment variable / conf-file key for the credential rotation ceiling.
+pub const MAX_CREDENTIALS_PER_TYPE_ENV: &str = "FERRUM_MAX_CREDENTIALS_PER_TYPE";
+
+/// Resolve the runtime max credentials per type from env var / conf file.
 ///
-/// Parses exactly like `EnvConfig` (surrounding whitespace trimmed) so a value
-/// startup validated is the value enforced here; `EnvConfig::validate` rejects
-/// unparsable and zero values before serving.
-pub fn max_credentials_per_type() -> usize {
-    crate::config::conf_file::resolve_ferrum_var("FERRUM_MAX_CREDENTIALS_PER_TYPE")
-        .and_then(|v| v.trim().parse().ok())
-        .filter(|limit: &usize| *limit >= 1)
-        .unwrap_or(DEFAULT_MAX_CREDENTIALS_PER_TYPE)
+/// Parses through the same typed parser `EnvConfig` uses (surrounding
+/// whitespace trimmed), so a value startup accepted is the value enforced
+/// here. An unset value resolves to [`DEFAULT_MAX_CREDENTIALS_PER_TYPE`]; a
+/// configured but unparsable or zero value is refused with an error naming the
+/// variable instead of silently falling back to the default (issue #6754,
+/// follow-up to #6742 / #6651 item 3).
+pub fn max_credentials_per_type() -> Result<usize, String> {
+    // Resolve through the cached conf snapshot directly: `ConfFile::load()`
+    // would clone the whole defaults map, and this runs per consumer during
+    // batch validation and per plugin construction. The checked resolver also
+    // propagates a sticky conf-load failure instead of silently becoming the
+    // default here while `EnvConfig::from_env` refuses the same file.
+    let raw = crate::config::conf_file::resolve_ferrum_var_checked(MAX_CREDENTIALS_PER_TYPE_ENV)?;
+    max_credentials_per_type_from_resolved(raw.as_deref())
+}
+
+/// Build the runtime ceiling from an already-resolved value (`None` = unset),
+/// through the same `EnvValue` parser `EnvConfig` uses.
+pub fn max_credentials_per_type_from_resolved(raw: Option<&str>) -> Result<usize, String> {
+    use crate::config::env_config::EnvValue;
+
+    let limit = match raw {
+        Some(raw) => <usize as EnvValue>::parse_env(raw, MAX_CREDENTIALS_PER_TYPE_ENV)?,
+        None => DEFAULT_MAX_CREDENTIALS_PER_TYPE,
+    };
+    if limit == 0 {
+        return Err(format!(
+            "{MAX_CREDENTIALS_PER_TYPE_ENV} must be at least 1; 0 would reject every consumer \
+             credential"
+        ));
+    }
+    Ok(limit)
 }
 
 /// Validate the shared Basic-auth HMAC secret without exposing its value.
@@ -787,16 +1035,6 @@ pub struct UpstreamPortOverride {
     /// `http_idle_timeout_ms` (HTTP pool idle; 0 is rejected).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_idle_timeout_seconds: Option<u64>,
-    /// Legacy carrier for DestinationRule
-    /// `connectionPool.http.maxRequestsPerConnection`.
-    ///
-    /// New translation does not populate this field, and
-    /// `resolve_effective_proxy_for_target` intentionally ignores any legacy
-    /// carried value because Ferrum has no backend close-after-N-requests
-    /// runtime behavior. K8s status reports the DR field as deferred instead of
-    /// presenting this as effective policy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub http_max_requests_per_connection: Option<u32>,
     /// Per-port HTTP idle-timeout mapped from DestinationRule
     /// `connectionPool.http.idleTimeout` (milliseconds). Projected onto the
     /// per-target effective proxy's `pool_idle_timeout_seconds` (whole
@@ -825,12 +1063,12 @@ pub struct UpstreamPortOverride {
     /// Per-port PER-CONNECTION HTTP/2 stream cap mapped from DestinationRule
     /// `connectionPool.http.maxConcurrentStreams`. Projected onto the per-target
     /// effective proxy's `pool_http2_max_concurrent_streams` and threaded
-    /// into the H2/gRPC backend builders via
-    /// `http2::Builder::max_concurrent_streams` (peer SETTINGS) and
-    /// `initial_max_send_streams` (local outbound-stream initial cap).
-    /// Applies to direct-H2 and gRPC pool entries; those pools include the
-    /// effective value in their base keys (`none` when unset) so update/delete
-    /// cannot reuse a connection built under a prior limit. Reqwest's H2 path
+    /// into every hyper H2 backend builder (direct H2, gRPC, mesh mTLS, and the
+    /// nested-HBONE gRPC dial) via `http2::Builder::max_concurrent_streams`
+    /// (peer SETTINGS) and `initial_max_send_streams` (local outbound-stream
+    /// initial cap). Those pools include the effective value in their keys
+    /// (`none` when unset) so update/delete cannot reuse a connection built
+    /// under a prior limit. Reqwest's H2 path
     /// does not expose the same builder knob today and therefore does not
     /// key on it. This is one connection's transport state and is deliberately
     /// NOT the destination request budget (`http2_max_requests`): a peer's
@@ -937,7 +1175,6 @@ pub struct ResolvedPortOverride {
     pub max_connections: Option<u32>,
     pub tcp_keepalive: Option<TcpKeepaliveCfg>,
     pub tcp_idle_timeout_seconds: Option<u64>,
-    pub http_max_requests_per_connection: Option<u32>,
     pub http_idle_timeout_ms: Option<u64>,
     /// Destination-wide active-request cap (`http2MaxRequests`).
     pub http2_max_requests: Option<u32>,
@@ -979,7 +1216,6 @@ impl ResolvedPortOverride {
             max_connections: value.max_connections,
             tcp_keepalive: value.tcp_keepalive.clone(),
             tcp_idle_timeout_seconds: value.tcp_idle_timeout_seconds,
-            http_max_requests_per_connection: value.http_max_requests_per_connection,
             http_idle_timeout_ms: value.http_idle_timeout_ms,
             http2_max_requests: value.http2_max_requests,
             h2_max_concurrent_streams: value.h2_max_concurrent_streams,
@@ -1003,7 +1239,6 @@ impl ResolvedPortOverride {
             && self.max_connections.is_none()
             && self.tcp_keepalive.is_none()
             && self.tcp_idle_timeout_seconds.is_none()
-            && self.http_max_requests_per_connection.is_none()
             && self.http_idle_timeout_ms.is_none()
             && self.http2_max_requests.is_none()
             && self.h2_max_concurrent_streams.is_none()
@@ -1011,39 +1246,6 @@ impl ResolvedPortOverride {
             && self.h2_upgrade_policy.is_none()
             && self.max_retries.is_none()
             && self.http1_max_pending_requests.is_none()
-    }
-
-    /// Field-by-field materialization of inherited `connectionPool.http`
-    /// fields from a proxy fallback onto an explicit per-port entry.
-    ///
-    /// For each supported `connectionPool.http` field, the per-port value wins
-    /// when set; otherwise the fallback's value is inherited. This mirrors
-    /// Ferrum's documented field-level merge. Inherited top-level/subset values
-    /// are carried separately on `Proxy.dispatch_port_override_fallback`.
-    /// Runtime dispatch resolves the same field precedence directly through
-    /// borrowed references so it does not clone this structure per request; an
-    /// unrelated per-port field (e.g. `connectTimeout`/`tls`) therefore does not
-    /// wipe an inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`.
-    ///
-    /// Only `connectionPool.http` fields are merged; the fallback only ever
-    /// carries those (it is built solely from the DR top-level
-    /// `connectionPool.http` block), so non-`connectionPool.http` fields
-    /// (`connect_timeout_ms`/`algorithm`/`tls`/`max_connections`/… ) are left as
-    /// this per-port entry already has them.
-    pub fn seed_connection_pool_http_from_fallback(&mut self, fallback: &ResolvedPortOverride) {
-        self.http_max_requests_per_connection = self
-            .http_max_requests_per_connection
-            .or(fallback.http_max_requests_per_connection);
-        self.http_idle_timeout_ms = self.http_idle_timeout_ms.or(fallback.http_idle_timeout_ms);
-        self.http2_max_requests = self.http2_max_requests.or(fallback.http2_max_requests);
-        self.h2_max_concurrent_streams = self
-            .h2_max_concurrent_streams
-            .or(fallback.h2_max_concurrent_streams);
-        self.h2_upgrade_policy = self.h2_upgrade_policy.or(fallback.h2_upgrade_policy);
-        self.max_retries = self.max_retries.or(fallback.max_retries);
-        self.http1_max_pending_requests = self
-            .http1_max_pending_requests
-            .or(fallback.http1_max_pending_requests);
     }
 
     /// Overlay the subset-inheritable HTTP connection-pool fields onto this
@@ -1543,7 +1745,7 @@ pub struct ActiveHealthCheck {
     /// Use HTTPS for health check probes instead of HTTP.
     #[serde(default)]
     pub use_tls: bool,
-    /// Probe type: `http` (default), `tcp`, or `udp`.
+    /// Probe type: `http` (default), `tcp`, `udp`, or `grpc`.
     #[serde(default)]
     pub probe_type: HealthProbeType,
     /// Hex-encoded probe payload for UDP health checks.
@@ -1804,6 +2006,26 @@ pub struct BackendTlsConfig {
     /// mesh slice apply, like `Upstream::resolved_subset_tls`.
     #[serde(skip)]
     pub tls_refused: bool,
+    /// Runtime-only provider-isolation marker. `true` when this resolved
+    /// configuration must NOT inherit the gateway-global backend client
+    /// identity (`FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` /
+    /// `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH`) when its own client cert/key are
+    /// unset.
+    ///
+    /// Set only by [`Self::isolated_public_verify`], which `ai_stream_router`
+    /// commits for a third-party HTTPS provider that does not opt into
+    /// `inherit_backend_tls`: an unset per-route client identity must mean "no
+    /// client certificate", never "present the gateway's internal backend
+    /// identity to the provider". Every backend TLS builder and every pool /
+    /// TLS-config-cache key resolves the effective client identity through
+    /// [`Self::effective_client_cert_path`] /
+    /// [`Self::effective_client_key_path`], and the pool key carries an explicit
+    /// `|noglobalid` segment, so an isolated client is never shared with one
+    /// built from the global pair.
+    ///
+    /// Never accepted from or emitted to config.
+    #[serde(skip)]
+    pub suppress_global_client_identity: bool,
 }
 
 impl BackendTlsConfig {
@@ -1818,7 +2040,52 @@ impl BackendTlsConfig {
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
             tls_refused: false,
+            suppress_global_client_identity: false,
         }
+    }
+
+    /// Verification against the built-in public trust roots ONLY, isolated
+    /// from every gateway-global backend TLS fallback.
+    ///
+    /// [`Self::default_verify`] leaves the CA and client identity unset, and
+    /// the backend TLS builder fills unset fields from gateway-wide settings: a
+    /// private `FERRUM_TLS_CA_BUNDLE_PATH` replaces the public roots,
+    /// `FERRUM_TLS_NO_VERIFY` disables verification, and the global backend
+    /// client certificate is offered to the peer. For a third-party provider
+    /// none of that is acceptable, so this selects `system://` trust (which
+    /// already bypasses the global bundle and `FERRUM_TLS_NO_VERIFY`) and sets
+    /// [`Self::suppress_global_client_identity`] so no gateway client
+    /// certificate is ever presented.
+    pub fn isolated_public_verify() -> Self {
+        Self {
+            server_ca_cert_path: Some(crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE.to_string()),
+            suppress_global_client_identity: true,
+            ..Self::default_verify()
+        }
+    }
+
+    /// The client certificate source a backend TLS client actually presents:
+    /// this config's own, else the gateway-global one unless
+    /// [`Self::suppress_global_client_identity`] is set.
+    pub fn effective_client_cert_path<'a>(
+        &'a self,
+        global_client_cert_path: Option<&'a str>,
+    ) -> Option<&'a str> {
+        if self.suppress_global_client_identity {
+            return self.client_cert_path.as_deref();
+        }
+        self.client_cert_path.as_deref().or(global_client_cert_path)
+    }
+
+    /// The client key source paired with [`Self::effective_client_cert_path`].
+    pub fn effective_client_key_path<'a>(
+        &'a self,
+        global_client_key_path: Option<&'a str>,
+    ) -> Option<&'a str> {
+        if self.suppress_global_client_identity {
+            return self.client_key_path.as_deref();
+        }
+        self.client_key_path.as_deref().or(global_client_key_path)
     }
 
     /// A destination whose backend TLS was refused on this node: no material,
@@ -1842,6 +2109,7 @@ impl BackendTlsConfig {
             san_allow_list: upstream.backend_tls_san_allow_list.clone(),
             san_allow_list_key_digest: digest,
             tls_refused: upstream.backend_tls_refused,
+            suppress_global_client_identity: false,
         }
     }
 
@@ -1856,6 +2124,7 @@ impl BackendTlsConfig {
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
             tls_refused: false,
+            suppress_global_client_identity: false,
         }
     }
 
@@ -2102,6 +2371,18 @@ pub struct Upstream {
     #[serde(skip)]
     pub pending_limit_scope:
         Option<std::sync::Arc<crate::backend_pending_limit::BackendPendingScopeBase>>,
+    /// Canonical admission identity of a route-scoped upstream clone (issue
+    /// #7423): the id of the upstream (same namespace) it copies. A Sidecar
+    /// dials carried VirtualService destinations through such clones
+    /// (`modes::mesh::clone_sidecar_carried_destination_upstreams`), which
+    /// keep their own routing and load-balancer identity but must share the
+    /// destination's admission lanes (`http2MaxRequests`,
+    /// `http1MaxPendingRequests`) with the upstream they copy.
+    /// [`GatewayConfig::resolve_pending_limit_scopes`] folds it into the
+    /// precomputed scopes. `#[serde(skip)]` — set only by mesh
+    /// materialization; never an operator input field.
+    #[serde(skip)]
+    pub admission_upstream_id: Option<String>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
@@ -2511,12 +2792,9 @@ pub enum BackendScheme {
 impl BackendScheme {
     /// True when this is a raw L4 stream proxy (TCP/UDP/TLS/DTLS).
     ///
-    /// Kept public (and annotated `#[allow(dead_code)]`) because
-    /// `BackendScheme` is re-exported from `lib.rs` for downstream consumers
-    /// (tests, future plugins) even when the gateway itself prefers the
-    /// pre-computed `DispatchKind::is_stream()` on the hot path.
+    /// Request-path dispatch prefers the pre-computed
+    /// `DispatchKind::is_stream()`.
     #[inline]
-    #[allow(dead_code)]
     pub fn is_stream(&self) -> bool {
         matches!(self, Self::Tcp | Self::Tcps | Self::Udp | Self::Dtls)
     }
@@ -2524,7 +2802,6 @@ impl BackendScheme {
     /// True when this uses HTTP-family transport (HTTP/1.1, HTTP/2, HTTP/3,
     /// gRPC, WebSocket — determined per-request from `HttpFlavor`).
     #[inline]
-    #[allow(dead_code)]
     pub fn is_http_family(&self) -> bool {
         matches!(self, Self::Http | Self::Https)
     }
@@ -2537,7 +2814,6 @@ impl BackendScheme {
 
     /// True when the backend connection uses TLS/DTLS.
     #[inline]
-    #[allow(dead_code)]
     pub fn is_tls_backend(&self) -> bool {
         matches!(self, Self::Https | Self::Tcps | Self::Dtls)
     }
@@ -2637,7 +2913,6 @@ impl DispatchKind {
     }
 
     #[inline]
-    #[allow(dead_code)] // part of public API, exercised via re-export + tests
     pub fn is_tls_backend(&self) -> bool {
         matches!(self, Self::HttpsPool | Self::TcpTls | Self::UdpDtls)
     }
@@ -2807,7 +3082,7 @@ pub enum PluginScope {
 ///
 /// HTTP-family proxies route on `hosts` + `listen_path`. At least one of the two
 /// must be set; if both are empty/absent the config is rejected. Stream-family
-/// proxies (`tcp`/`tcp_tls`/`udp`/`dtls`) route on `listen_port` and MUST NOT
+/// proxies (`tcp`/`tcps`/`udp`/`dtls`) route on `listen_port` and MUST NOT
 /// set `listen_path`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3004,16 +3279,6 @@ pub struct Proxy {
     /// (always H2) or HBONE/mesh-mTLS transport selection.
     #[serde(skip)]
     pub h2_upgrade_policy: Option<H2UpgradePolicy>,
-    /// Deprecated proxy-level `maxRequestsPerConnection` carrier.
-    /// Reqwest/hyper do not expose a stable close-after-N-requests builder knob
-    /// for the shared backend client pool, so this direct proxy field is
-    /// admitted for backward compatibility but has no live runtime effect.
-    /// DestinationRule translation no longer projects into this field; K8s
-    /// status reports DR `connectionPool.http.maxRequestsPerConnection` as
-    /// deferred instead.
-    /// `None` (default) = no configured cap.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pool_max_requests_per_connection: Option<u64>,
     /// Istio DestinationRule `connectionPool.http.http1MaxPendingRequests`. The
     /// honestly reinterpreted cap on concurrent in-flight requests on the
     /// reqwest/HTTP-1.1 backend-dispatch path. Consulted by `proxy_to_backend`
@@ -3098,7 +3363,7 @@ pub struct Proxy {
     /// When true, forward encrypted client bytes directly to the backend without
     /// terminating TLS (TCP) or DTLS (UDP). The proxy peeks at the TLS/DTLS
     /// ClientHello to extract SNI for routing and logging but never decrypts
-    /// application data. Only valid for stream proxies (tcp, tcp_tls, udp, dtls).
+    /// application data. Only valid for stream proxies (tcp, tcps, udp, dtls).
     /// Mutually exclusive with `frontend_tls`.
     #[serde(default)]
     pub passthrough: bool,
@@ -3135,7 +3400,7 @@ pub struct Proxy {
     /// Enable inbound PROXY protocol on this stream proxy listener. The
     /// framing depends on the scheme:
     ///
-    /// - `tcp` / `tcp_tls`: PROXY protocol v1 text or v2 binary (auto-detected),
+    /// - `tcp` / `tcps`: PROXY protocol v1 text or v2 binary (auto-detected),
     ///   read once at the head of each accepted connection. A connection that
     ///   does not begin with a valid header is closed immediately (fail closed).
     /// - `udp` / `dtls`: the PROXY protocol v2 DGRAM envelope, present on
@@ -3167,7 +3432,7 @@ pub struct Proxy {
     /// still the raw socket peer (the LB's own IP). This mirrors how
     /// `FERRUM_TRUSTED_PROXIES` + XFF work on the HTTP path.
     ///
-    /// Only valid for `tcp` / `tcp_tls` / `udp` / `dtls` stream proxies.
+    /// Only valid for `tcp` / `tcps` / `udp` / `dtls` stream proxies.
     /// Setting it on an HTTP-family proxy produces a validation error (use
     /// X-Forwarded-For there).
     ///
@@ -3496,7 +3761,7 @@ pub struct GatewayConfig {
     /// authoritative configuration store (issue #3727).
     ///
     /// DERIVED, CONTROL-PLANE-IN-MEMORY ONLY: `#[serde(skip)]`, exactly like
-    /// `mesh_config_revision`. It must never ride the ConfigSync `config_json`
+    /// `mesh_revision`. It must never ride the ConfigSync `config_json`
     /// wire — both peers are `deny_unknown_fields`, and more importantly a
     /// multi-namespace CP holds EVERY served namespace's trust material here.
     /// Publication is per-subscriber through the `trust_bundles_json` side
@@ -3523,6 +3788,17 @@ pub struct GatewayConfig {
     /// a rejected `POST /plugins`, prefixed with the plugin name and config id.
     #[serde(skip)]
     pub quarantined_plugin_configs: Vec<String>,
+    /// Consumer `jwt` secrets a full load stripped from credentials quarantined
+    /// for sharing, including other rotation keys
+    /// (namespace-bound digests, never the secret).
+    ///
+    /// DERIVED, PROCESS-LOCAL ONLY: `#[serde(skip)]`, never persisted and
+    /// never on the ConfigSync wire. The SQL/Mongo full loaders fill it so the
+    /// serving `ProxyState` can seed its shared-secret history from a snapshot
+    /// that reaches it already stripped; `ProxyState` takes it on construction
+    /// and on every accepted swap.
+    #[serde(skip)]
+    pub quarantined_jwt_shared_secrets: JwtSharedSecretRecords,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
@@ -3770,8 +4046,6 @@ pub fn validate_namespace(ns: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Auto-anchor a regex listen_path pattern for full-path matching.
-///
 /// Parse a backend host as a literal IP, stripping URI brackets first.
 ///
 /// `build_backend_url_with_target` preserves bracketed IPv6 literals
@@ -3884,6 +4158,8 @@ pub(crate) fn stream_literal_ip(host: &str) -> Option<std::net::IpAddr> {
         .ok()
 }
 
+/// Auto-anchor a regex listen_path pattern for full-path matching.
+///
 /// Wraps the operator pattern in a non-capturing group and anchors the group,
 /// ensuring alternation and other top-level regex operators still apply to the
 /// full request path. Operators who need prefix-style matching can end their
@@ -3986,6 +4262,18 @@ const LISTEN_PATH_PARAMETER_ERROR: &str = "listen_path with `;` requires `allow_
 /// the same Service FQDN in `name`; using that FQDN prevents endpoint fan-out
 /// from multiplying the Service's cap. The optional Kubernetes UID remains an
 /// additive recreate fence, and the policy port is appended at acquire time.
+/// The upstream a route-scoped clone is admitted as
+/// (`Upstream::admission_upstream_id`, same namespace), if it resolves.
+fn admission_source_upstream<'a>(
+    upstream: &Upstream,
+    upstreams: &HashMap<(&str, &str), &'a Upstream>,
+) -> Option<&'a Upstream> {
+    let source = upstream.admission_upstream_id.as_deref()?;
+    upstreams
+        .get(&(upstream.namespace.as_str(), source))
+        .copied()
+}
+
 fn pending_limit_logical_id(upstream: &Upstream) -> &str {
     let is_mesh_http_egress = upstream
         .id
@@ -4166,8 +4454,9 @@ impl GatewayConfig {
         }
     }
 
-    /// Validate that every effective `mtls_auth` instance can receive a verified
-    /// client certificate on the proxy transport where it will execute.
+    /// Validate that every effective `mtls_auth` instance, and every
+    /// proxy/proxy-group-scoped `spiffe_identity` instance, can receive a
+    /// verified client certificate on the proxy transport where it will execute.
     pub fn validate_mtls_auth_compatibility(&self) -> Result<(), Vec<String>> {
         let errors = self.mtls_auth_compatibility_errors();
         if errors.is_empty() {
@@ -4181,14 +4470,6 @@ impl GatewayConfig {
     /// would install for each proxy. Any local proxy/proxy-group instance
     /// shadows all global instances of the same plugin type on that proxy.
     fn effective_mtls_auth_plugins_by_proxy(&self) -> Vec<(&Proxy, Vec<&PluginConfig>)> {
-        // Association plugin_config_id values are namespace-local to the
-        // proxy. A bare-id index would bind a proxy to another tenant's
-        // same-id mtls_auth config.
-        let plugin_by_key: HashMap<(&str, &str), &PluginConfig> = self
-            .plugin_configs
-            .iter()
-            .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
-            .collect();
         let global_mtls: Vec<&PluginConfig> = self
             .plugin_configs
             .iter()
@@ -4199,10 +4480,40 @@ impl GatewayConfig {
             })
             .collect();
 
+        self.local_plugins_by_proxy("mtls_auth")
+            .into_iter()
+            .map(|(proxy, local_mtls)| {
+                let effective = if local_mtls.is_empty() {
+                    // Globals are gateway-wide at runtime (`PluginCache` merges
+                    // the single global list into every proxy in every
+                    // namespace), so this must NOT be namespace-filtered —
+                    // only the association lookup in `local_plugins_by_proxy`
+                    // is namespace-local.
+                    global_mtls.clone()
+                } else {
+                    local_mtls
+                };
+                (proxy, effective)
+            })
+            .collect()
+    }
+
+    /// The enabled proxy/proxy-group-scoped `plugin_name` configurations each
+    /// proxy's associations attach to it. Globals are never included.
+    fn local_plugins_by_proxy(&self, plugin_name: &str) -> Vec<(&Proxy, Vec<&PluginConfig>)> {
+        // Association plugin_config_id values are namespace-local to the
+        // proxy. A bare-id index would bind a proxy to another tenant's
+        // same-id config.
+        let plugin_by_key: HashMap<(&str, &str), &PluginConfig> = self
+            .plugin_configs
+            .iter()
+            .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
+            .collect();
+
         self.proxies
             .iter()
             .map(|proxy| {
-                let local_mtls: Vec<&PluginConfig> = proxy
+                let local: Vec<&PluginConfig> = proxy
                     .plugins
                     .iter()
                     .filter_map(|association| {
@@ -4220,22 +4531,23 @@ impl GatewayConfig {
                             }
                             PluginScope::Global => false,
                         };
-                        (plugin.enabled && plugin.plugin_name == "mtls_auth" && scope_applies)
+                        (plugin.enabled && plugin.plugin_name == plugin_name && scope_applies)
                             .then_some(plugin)
                     })
                     .collect();
-                let effective = if local_mtls.is_empty() {
-                    // Globals are gateway-wide at runtime (`PluginCache` merges
-                    // the single global list into every proxy in every
-                    // namespace), so this must NOT be namespace-filtered —
-                    // only the association lookup above is namespace-local.
-                    global_mtls.clone()
-                } else {
-                    local_mtls
-                };
-                (proxy, effective)
+                (proxy, local)
             })
             .collect()
+    }
+
+    /// Whether the named proxy has an enabled proxy/proxy-group-scoped
+    /// `spiffe_identity` instance attached. Globals are deliberately not
+    /// counted: a global instance legitimately no-ops on plaintext listeners
+    /// (the mesh-injected `__mesh_spiffe_identity` among them).
+    pub(crate) fn has_scoped_spiffe_identity_for_proxy(&self, proxy_id: &str) -> bool {
+        self.local_plugins_by_proxy("spiffe_identity")
+            .into_iter()
+            .any(|(proxy, plugins)| proxy.id == proxy_id && !plugins.is_empty())
     }
 
     /// Whether the named proxy has at least one enabled `mtls_auth` instance
@@ -4264,6 +4576,48 @@ impl GatewayConfig {
                         proxy.id, plugin.id
                     ));
                 }
+            }
+        }
+
+        errors.extend(self.scoped_spiffe_identity_stream_compatibility_errors());
+
+        errors
+    }
+
+    /// Validate that no proxy/proxy-group-scoped `spiffe_identity` instance is
+    /// attached to a stream proxy that terminates no TLS/DTLS.
+    ///
+    /// Already part of [`Self::validate_mtls_auth_compatibility`]; exposed on
+    /// its own for admission paths that judge a merged plugin-graph candidate
+    /// (API-spec create/replace, plugin-graph writes) without the namespace's
+    /// `mtls_auth` posture.
+    pub fn validate_scoped_spiffe_identity_stream_compatibility(&self) -> Result<(), Vec<String>> {
+        let errors = self.scoped_spiffe_identity_stream_compatibility_errors();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    fn scoped_spiffe_identity_stream_compatibility_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        // A deliberately attached `spiffe_identity` on a stream proxy that
+        // terminates no TLS/DTLS can never see a peer certificate, so it would
+        // accept the config and then silently publish no principal for every
+        // connection — leaving a principal-keyed `mesh_authz` DENY unmatched.
+        // Globals stay exempt: they legitimately no-op on plaintext listeners.
+        for (proxy, scoped_plugins) in self.local_plugins_by_proxy("spiffe_identity") {
+            if !proxy.effective_scheme().is_stream() || (proxy.frontend_tls && !proxy.passthrough) {
+                continue;
+            }
+            for plugin in scoped_plugins {
+                errors.push(format!(
+                    "Proxy {:?} cannot use `spiffe_identity` PluginConfig {:?}: stream SPIFFE \
+                     identity extraction requires `frontend_tls=true` with TLS/DTLS termination \
+                     (`passthrough=false`)",
+                    proxy.id, plugin.id
+                ));
             }
         }
 
@@ -4703,60 +5057,82 @@ impl GatewayConfig {
     /// stamps `Upstream.k8s_service_uid`). Invoked from `normalize_fields`
     /// beside `resolve_dispatch_port_overrides`.
     pub fn resolve_pending_limit_scopes(&mut self) {
-        for upstream in &mut self.upstreams {
-            let scope = {
-                let logical_id = pending_limit_logical_id(upstream);
-                std::sync::Arc::new(crate::backend_pending_limit::BackendPendingScopeBase::new(
-                    upstream.namespace.as_str(),
-                    logical_id,
-                    upstream.k8s_service_uid.as_deref(),
-                    // Top-level only: route overrides clear `upstream_subset`
-                    // when the effective upstream changes.
-                    None,
-                ))
-            };
-            upstream.pending_limit_scope = Some(scope);
-        }
-
         let upstream_by_key: HashMap<(&str, &str), &Upstream> = self
             .upstreams
             .iter()
             .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
             .collect();
-
-        for proxy in &mut self.proxies {
-            let (logical_id, uid) = if let Some(ref upstream_id) = proxy.upstream_id {
-                match upstream_by_key.get(&(proxy.namespace.as_str(), upstream_id.as_str())) {
-                    Some(upstream) => (
-                        pending_limit_logical_id(upstream),
-                        upstream.k8s_service_uid.as_deref(),
+        // A route-scoped clone (issue #7423) is admitted as the upstream it
+        // copies (`Upstream::admission_upstream_id`), so every route dialing
+        // one Service port shares that destination's lanes. An unresolvable
+        // admission id keeps the clone's own identity.
+        let scope_for = |upstream: &Upstream, subset: Option<&str>| {
+            let source = admission_source_upstream(upstream, &upstream_by_key);
+            let admitted = source.unwrap_or(upstream);
+            let scope = crate::backend_pending_limit::BackendPendingScopeBase::new(
+                upstream.namespace.as_str(),
+                pending_limit_logical_id(admitted),
+                admitted.k8s_service_uid.as_deref(),
+                subset,
+            );
+            match source {
+                Some(source) => scope.with_admission_destination(source.id.as_str()),
+                None => scope,
+            }
+        };
+        let upstream_scopes: Vec<_> = self
+            .upstreams
+            .iter()
+            // Top-level only: route overrides clear `upstream_subset` when the
+            // effective upstream changes.
+            .map(|upstream| std::sync::Arc::new(scope_for(upstream, None)))
+            .collect();
+        let proxy_scopes: Vec<_> = self
+            .proxies
+            .iter()
+            .map(|proxy| {
+                let scope = match proxy.upstream_id.as_deref() {
+                    Some(upstream_id) => {
+                        match upstream_by_key.get(&(proxy.namespace.as_str(), upstream_id)) {
+                            Some(&upstream) => {
+                                scope_for(upstream, proxy.upstream_subset.as_deref())
+                            }
+                            None => crate::backend_pending_limit::BackendPendingScopeBase::new(
+                                proxy.namespace.as_str(),
+                                upstream_id,
+                                None,
+                                proxy.upstream_subset.as_deref(),
+                            ),
+                        }
+                    }
+                    // Direct-backend proxy: the proxy itself is the logical
+                    // destination. Distinct proxies do not share a lane unless
+                    // they intentionally share an upstream_id.
+                    None => crate::backend_pending_limit::BackendPendingScopeBase::new(
+                        proxy.namespace.as_str(),
+                        proxy.id.as_str(),
+                        None,
+                        proxy.upstream_subset.as_deref(),
                     ),
-                    None => (upstream_id.as_str(), None),
-                }
-            } else {
-                // Direct-backend proxy: the proxy itself is the logical
-                // destination. Distinct proxies do not share a lane unless
-                // they intentionally share an upstream_id.
-                (proxy.id.as_str(), None)
-            };
-            proxy.pending_limit_scope = Some(std::sync::Arc::new(
-                crate::backend_pending_limit::BackendPendingScopeBase::new(
-                    proxy.namespace.as_str(),
-                    logical_id,
-                    uid,
-                    proxy.upstream_subset.as_deref(),
-                ),
-            ));
+                };
+                std::sync::Arc::new(scope)
+            })
+            .collect();
+        for (upstream, scope) in self.upstreams.iter_mut().zip(upstream_scopes) {
+            upstream.pending_limit_scope = Some(scope);
+        }
+        for (proxy, scope) in self.proxies.iter_mut().zip(proxy_scopes) {
+            proxy.pending_limit_scope = Some(scope);
         }
     }
 
     /// Validate that consumer ids, usernames, and custom_ids share one identity
     /// namespace.
     ///
-    /// In database mode the DB enforces this via UNIQUE constraints. In file
-    /// mode there's no DB, so this catches duplicates at config load time
-    /// and prevents the gateway from starting with ambiguous identity mappings
-    /// that would cause incorrect JWKS/JWT authentication.
+    /// In database mode the `consumer_identity_index` table/collection
+    /// enforces this. In file mode there's no DB, so this catches duplicates at
+    /// config load time and prevents the gateway from starting with ambiguous
+    /// identity mappings that would cause incorrect JWKS/JWT authentication.
     pub fn validate_unique_consumer_identities(&self) -> Result<(), Vec<String>> {
         let mut seen_identities: HashMap<&str, (&str, &'static str)> = HashMap::new();
         let mut duplicates = Vec::new();
@@ -4998,6 +5374,296 @@ impl GatewayConfig {
         messages
     }
 
+    /// Cross-Consumer `jwt` secret collisions within each namespace, as
+    /// `(consumer id, conflicting consumer id, namespace)` triples, each pair
+    /// reported once.
+    ///
+    /// `jwt_auth` selects the verifying Consumer from the token's unverified,
+    /// signer-chosen identity claim, so anyone who can sign with a secret two
+    /// Consumers share can sign as either of them. Reuse across namespaces and
+    /// within one Consumer (rotation entries sharing a secret) is allowed.
+    fn jwt_credential_collisions(&self) -> Vec<(&str, &str, &str)> {
+        let mut owners: HashMap<(&str, &str), &str> = HashMap::new();
+        let mut collisions: Vec<(&str, &str, &str)> = Vec::new();
+
+        for consumer in &self.consumers {
+            let namespace = consumer.namespace.as_str();
+            let id = consumer.id.as_str();
+            let Some(value) = consumer.credentials.get("jwt") else {
+                continue;
+            };
+            for secret in jwt_credential_secret_values(value) {
+                match owners.entry((namespace, secret)) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(id);
+                    }
+                    std::collections::hash_map::Entry::Occupied(slot) => {
+                        let owner = *slot.get();
+                        let collision = (id, owner, namespace);
+                        if owner != id && !collisions.contains(&collision) {
+                            collisions.push(collision);
+                        }
+                    }
+                }
+            }
+        }
+
+        collisions
+    }
+
+    /// Error text for one cross-Consumer JWT secret collision. Names only
+    /// consumer ids and the namespace, never the secret.
+    fn jwt_collision_message(consumer_id: &str, other_id: &str, namespace: &str) -> String {
+        format!(
+            "Duplicate jwt secret in consumer {:?} (conflicts with consumer {:?} in namespace {:?}); \
+             each Consumer needs its own JWT signing secret",
+            consumer_id, other_id, namespace
+        )
+    }
+
+    fn jwt_credential_uniqueness_errors(&self) -> Vec<String> {
+        self.jwt_credential_collisions()
+            .into_iter()
+            .map(|(id, other, namespace)| Self::jwt_collision_message(id, other, namespace))
+            .collect()
+    }
+
+    /// Validate the cross-Consumer `jwt` secret constraint for collisions that
+    /// involve one of `consumer_ids`. Admin candidate checks use this narrower
+    /// surface so a pre-existing duplicate between two other Consumers (which
+    /// the full-load quarantine already strips) does not block an unrelated
+    /// write or the repair of one side.
+    pub fn validate_unique_jwt_credentials_for_consumers(
+        &self,
+        consumer_ids: &[&str],
+    ) -> Result<(), Vec<String>> {
+        let duplicates: Vec<String> = self
+            .jwt_credential_collisions()
+            .into_iter()
+            .filter(|collision| {
+                consumer_ids.contains(&collision.0) || consumer_ids.contains(&collision.1)
+            })
+            .map(|(id, other, namespace)| Self::jwt_collision_message(id, other, namespace))
+            .collect();
+
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(duplicates)
+        }
+    }
+
+    /// Fail-closed handling of Consumer `jwt` credential policy at full-load
+    /// and runtime-swap time.
+    ///
+    /// Ownership is decided first, from the untouched snapshot: every secret
+    /// string a consumer stores counts, including one in an entry that is
+    /// itself malformed or weak, because removing a credential from
+    /// verification does not remove its holder's knowledge of the secret.
+    /// Then the `jwt` credential is stripped from every consumer that:
+    ///
+    /// - holds a secret that another consumer in the same namespace also
+    ///   holds. There is no first-loaded winner (unlike
+    ///   [`Self::quarantine_invalid_hmac_credentials`]): whoever holds a
+    ///   shared JWT secret can sign a token naming any Consumer that accepts
+    ///   it, so no holder is a trustworthy owner;
+    /// - holds a secret that `history` records as shared in an earlier
+    ///   generation. An incremental swap patches the already-quarantined live
+    ///   snapshot, which no longer shows the other holder, so the history is
+    ///   what keeps a still-shared (or once-shared, hence known to another
+    ///   Consumer) key from being reactivated by a later point delta;
+    /// - stores anything other than a non-empty array of objects each
+    ///   carrying a string `secret` with at least [`MIN_JWT_SECRET_LENGTH`]
+    ///   non-whitespace characters.
+    ///
+    /// All secrets in a credential quarantined for current or historical
+    /// sharing are returned in
+    /// [`JwtQuarantineOutcome::shared`] (as namespace-bound digests, never the
+    /// secret); `history` itself is only read, so the caller decides whether
+    /// the candidate was accepted before recording them. The same secret may be
+    /// reused in a different namespace. Extra legacy fields beside `secret`
+    /// (for example a historical `algorithm: HS256` selector) are left to
+    /// admission-time validation; the verifier only ever reads `secret`.
+    ///
+    /// Admin write-time validation rejects NEW violations; this guard covers
+    /// pre-existing and out-of-band rows and snapshots from sources that
+    /// bypass the SQL/Mongo loaders. A stripped credential fails closed: the
+    /// `jwt_auth` plugin returns 401 for a consumer with no `jwt` entries.
+    /// Messages never contain the secret; callers log them at `error!`.
+    pub fn quarantine_invalid_jwt_credentials_against(
+        &mut self,
+        history: &JwtSharedSecretHistory,
+    ) -> JwtQuarantineOutcome {
+        let mut shared = JwtSharedSecretRecords::default();
+        let decisions: Vec<Option<JwtQuarantineReason>> = {
+            let mut holders: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+            for consumer in &self.consumers {
+                let Some(value) = consumer.credentials.get("jwt") else {
+                    continue;
+                };
+                for secret in jwt_credential_secret_values(value) {
+                    let ids = holders
+                        .entry((consumer.namespace.as_str(), secret))
+                        .or_default();
+                    if !ids.contains(&consumer.id.as_str()) {
+                        ids.push(consumer.id.as_str());
+                    }
+                }
+            }
+            for ((namespace, secret), ids) in &holders {
+                if ids.len() > 1 {
+                    shared.push(namespace, secret);
+                }
+            }
+
+            self.consumers
+                .iter()
+                .map(|consumer| {
+                    let value = consumer.credentials.get("jwt")?;
+                    let namespace = consumer.namespace.as_str();
+                    let secrets = jwt_credential_secret_values(value);
+                    let other_holder = secrets.iter().find_map(|secret| {
+                        holders
+                            .get(&(namespace, *secret))
+                            .and_then(|ids| ids.iter().find(|id| **id != consumer.id.as_str()))
+                            .map(|id| (*id).to_string())
+                    });
+                    if let Some(other_id) = other_holder {
+                        return Some(JwtQuarantineReason::Shared(other_id));
+                    }
+                    if !history.namespaces.is_empty()
+                        && secrets
+                            .iter()
+                            .any(|secret| history.contains(namespace, secret))
+                    {
+                        return Some(JwtQuarantineReason::PreviouslyShared);
+                    }
+                    if !jwt_credential_value_is_admissible(value) {
+                        return Some(JwtQuarantineReason::Weak);
+                    }
+                    None
+                })
+                .collect()
+        };
+
+        let mut messages = Vec::new();
+        for (consumer, decision) in self.consumers.iter_mut().zip(decisions) {
+            let Some(reason) = decision else {
+                continue;
+            };
+            if let Some(value) = consumer.credentials.remove("jwt")
+                && matches!(
+                    &reason,
+                    JwtQuarantineReason::Shared(_) | JwtQuarantineReason::PreviouslyShared
+                )
+            {
+                // The whole rotation array disappears from the live snapshot.
+                // Keep every key so a later delta cannot assign an omitted key
+                // to another Consumer while its former holder still knows it.
+                for secret in jwt_credential_secret_values(&value) {
+                    shared.push(&consumer.namespace, secret);
+                }
+            }
+            messages.push(match reason {
+                JwtQuarantineReason::Shared(other_id) => format!(
+                    "Quarantined jwt credential of consumer {:?}: one of its secrets is also \
+                     configured on consumer {:?} in namespace {:?} — whoever holds a shared \
+                     secret can sign tokens as either Consumer, so the credential is excluded \
+                     on every Consumer that shares it. Give each of them a new, distinct \
+                     secret to restore it, before any restart: a restarted process no longer \
+                     knows which secrets were shared.",
+                    consumer.id, other_id, consumer.namespace
+                ),
+                JwtQuarantineReason::PreviouslyShared => format!(
+                    "Quarantined jwt credential of consumer {:?}: one of its secrets belonged \
+                     to a credential quarantined for sharing in namespace {:?} in an earlier \
+                     configuration generation of this process, so a former holder may still \
+                     know it. Replace the entire credential with new, distinct secrets to \
+                     restore it.",
+                    consumer.id, consumer.namespace
+                ),
+                JwtQuarantineReason::Weak => format!(
+                    "Quarantined jwt credential of consumer {:?}: a stored entry is \
+                     malformed or its secret has fewer than {} non-whitespace characters \
+                     — the credential is excluded from this config load so the weak \
+                     secret cannot authenticate. Repair the stored credential to restore it.",
+                    consumer.id, MIN_JWT_SECRET_LENGTH
+                ),
+            });
+        }
+
+        JwtQuarantineOutcome { messages, shared }
+    }
+
+    /// Reject a runtime snapshot in which one keyauth key, basicauth username,
+    /// or exact mTLS identity belongs to two Consumers of the same namespace
+    /// (issue #6572).
+    ///
+    /// `ConsumerIndex` maps each of these to exactly one Consumer, last
+    /// inserted wins, so publishing such a snapshot would authenticate the
+    /// shared credential as whichever Consumer happened to be indexed last.
+    /// File mode already refuses these configs; this check makes database
+    /// full loads, CP snapshots and deltas, and every runtime swap refuse them
+    /// too, the same way the case-folded DNS check
+    /// ([`Self::validate_unique_mtls_dns_identities`]) does. Persistence
+    /// (`consumer_credential_index`, `consumer_identity_index`) and admin
+    /// write-time validation block new collisions; this covers pre-existing
+    /// or out-of-band rows. Repeated values inside one Consumer (rotation
+    /// entries) are allowed, and the same value may be reused in another
+    /// namespace. Messages name only consumer ids and the namespace, never
+    /// the key, username, or identity value.
+    pub fn validate_unique_consumer_auth_credentials(&self) -> Result<(), Vec<String>> {
+        let mut keyauth: HashMap<(&str, &str), &str> = HashMap::new();
+        let mut basicauth: HashMap<(&str, &str), &str> = HashMap::new();
+        let mut mtls: HashMap<(&str, &str), &str> = HashMap::new();
+        let mut errors = Vec::new();
+
+        for consumer in &self.consumers {
+            let namespace = consumer.namespace.as_str();
+            let id = consumer.id.as_str();
+            for entry in consumer.credential_entries("keyauth") {
+                if let Some(key) = entry.get("key").and_then(|value| value.as_str())
+                    && let Some(owner) = keyauth.insert((namespace, key), id)
+                    && owner != id
+                {
+                    errors.push(format!(
+                        "Consumer {:?} shares a keyauth API key with consumer {:?} in namespace \
+                         {:?}; rotate one of the keys",
+                        id, owner, namespace
+                    ));
+                }
+            }
+            if consumer.has_credential("basicauth")
+                && let Some(owner) = basicauth.insert((namespace, consumer.username.as_str()), id)
+                && owner != id
+            {
+                errors.push(format!(
+                    "Consumer {:?} shares its basicauth username with consumer {:?} in \
+                     namespace {:?}",
+                    id, owner, namespace
+                ));
+            }
+            for entry in consumer.credential_entries("mtls_auth") {
+                if let Some(identity) = entry.get("identity").and_then(|value| value.as_str())
+                    && let Some(owner) = mtls.insert((namespace, identity), id)
+                    && owner != id
+                {
+                    errors.push(format!(
+                        "Consumer {:?} shares an mtls_auth identity with consumer {:?} in \
+                         namespace {:?}",
+                        id, owner, namespace
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     /// Validate only the exact and effective-DNS mTLS identity constraints.
     /// Admin candidate checks use this narrower surface so unrelated legacy
     /// keyauth/basicauth collisions do not block mTLS configuration repairs.
@@ -5013,8 +5679,8 @@ impl GatewayConfig {
 
     /// Validate that consumer credentials are unique across all consumers.
     ///
-    /// Checks keyauth API keys, basicauth usernames, HMAC shared secrets, and
-    /// mTLS identities.
+    /// Checks keyauth API keys, basicauth usernames, HMAC shared secrets,
+    /// Consumer JWT secrets (per namespace), and mTLS identities.
     /// mTLS identities are exact by default and additionally ASCII-case-folded
     /// when an effective `san_dns` mTLS policy can consume the DNS lookup index.
     /// If two consumers share the same credential, the ConsumerIndex silently
@@ -5050,6 +5716,7 @@ impl GatewayConfig {
         }
 
         duplicates.extend(self.hmac_credential_uniqueness_errors());
+        duplicates.extend(self.jwt_credential_uniqueness_errors());
         duplicates.extend(self.mtls_credential_uniqueness_errors());
 
         if duplicates.is_empty() {
@@ -5363,6 +6030,17 @@ impl GatewayConfig {
                     plugin.id
                 ));
             }
+            // `openapi_validator`'s operation table describes ONE proxy's API.
+            // A global or proxy-group instance would apply it to every proxy it
+            // reaches and, with `fail_on_unknown_operation`, refuse every
+            // unrelated route. The Admin API already requires proxy scope; the
+            // same rule holds for file-mode and every other full-config load.
+            if plugin.plugin_name == "openapi_validator" && plugin.scope != PluginScope::Proxy {
+                errors.push(format!(
+                    "PluginConfig {:?} (openapi_validator) must have scope `proxy`",
+                    plugin.id
+                ));
+            }
             // Compile the declarative execution trigger here so a malformed
             // regex/CIDR/field shape is a config-load error, not a per-request
             // surprise. Plugin-cache publication compiles it again (and adds the
@@ -5566,7 +6244,7 @@ impl GatewayConfig {
 
     /// Validate stream proxy (TCP/UDP) configuration.
     ///
-    /// - Stream proxies must have a `listen_port` in range 1024-65535.
+    /// - Stream proxies must have a `listen_port` in range 1-65535.
     /// - `listen_port` must be unique across all stream proxies, **unless** the
     ///   proxies sharing the port form one shared listener: an opaque-TLS SNI
     ///   group (all `passthrough: true`, or all ordinary `tcp` listeners with at
@@ -5631,7 +6309,7 @@ impl GatewayConfig {
             }
             // `stream_proxy_protocol` is valid on every stream family, with two
             // different framings: the connection-borne PROXY header on
-            // tcp/tcp_tls, and the per-datagram PROXY v2 DGRAM envelope on
+            // tcp/tcps, and the per-datagram PROXY v2 DGRAM envelope on
             // udp/dtls (issue #3289). HTTP-family proxies share the global
             // HTTP/HTTPS listeners, so one proxy cannot decide how a listener
             // reads its first bytes: inbound PROXY protocol for those is the
@@ -5640,7 +6318,7 @@ impl GatewayConfig {
             if proxy.stream_proxy_protocol == Some(true) && !proxy.dispatch_kind.is_stream() {
                 errors.push(format!(
                     "Proxy {:?} (scheme {}) sets stream_proxy_protocol but that field is only \
-                     valid for tcp/tcp_tls/udp/dtls stream proxies — for HTTP-family proxies \
+                     valid for tcp/tcps/udp/dtls stream proxies — for HTTP-family proxies \
                      enable inbound PROXY protocol on the listener with \
                      FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP / FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS",
                     proxy.id,
@@ -6153,8 +6831,6 @@ fn ambiguous_path_host_overlap(a: &[String], b: &[String]) -> bool {
 
 // ---- Field-level validation ----
 
-/// Check if a string contains ASCII control characters (excluding common whitespace).
-/// Rejects null bytes, backspace, escape, etc. that could cause log injection.
 /// Human-readable JSON value type name for error messages.
 fn elem_type_name(v: &serde_json::Value) -> &'static str {
     match v {
@@ -6167,6 +6843,8 @@ fn elem_type_name(v: &serde_json::Value) -> &'static str {
     }
 }
 
+/// Check if a string contains ASCII control characters (excluding common whitespace).
+/// Rejects null bytes, backspace, escape, etc. that could cause log injection.
 fn contains_control_chars(s: &str) -> bool {
     s.bytes()
         .any(|b| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r')
@@ -6307,6 +6985,14 @@ pub(crate) fn validate_tls_material_source_field(
         validate_pkcs11_key_source(field_name, uri)?;
     }
     validate_tls_source_field_kind(field_name, value, kind)?;
+    if let Some(path) = crate::tls::source::tenant_file_reference_path(value)
+        .map_err(|error| format!("{field_name}: {error}"))?
+    {
+        // The runtime constraint encodes the original path and options; it
+        // must not shrink the existing admission limit for Unicode/reserved bytes.
+        validate_string_field(field_name, value, MAX_FILE_PATH_LENGTH * 3 + 256)?;
+        return validate_string_field(field_name, &path.to_string_lossy(), MAX_FILE_PATH_LENGTH);
+    }
     match source {
         crate::tls::source::CertSource::InlinePem(_) => {
             validate_string_field(field_name, value, MAX_TLS_INLINE_PEM_LENGTH)
@@ -7556,11 +8242,11 @@ fn load_validated_country_mmdb_inner(
         ))
     })?;
 
-    if !is_supported_country_mmdb_type(&reader.metadata.database_type) {
+    if !is_supported_country_mmdb_type(&reader.metadata().database_type) {
         return Err(CountryMmdbLoadError::Invalid(format!(
             "MaxMind database file {path:?} has unsupported database type {:?}; expected a \
              GeoIP2/GeoLite2 Country or City database, or GeoIP2 Enterprise",
-            reader.metadata.database_type
+            reader.metadata().database_type
         )));
     }
 
@@ -8107,29 +8793,45 @@ impl Proxy {
     /// Admission-only errors for `allowed_ws_origins` beyond empty-string
     /// checks: CORS-style `"*"` and entries that are not a literal origin.
     ///
-    /// Load paths (file/database/CP/DP `validate_all_fields`) must not treat
-    /// these as rejecting errors — existing rows keep loading with a warning
-    /// from [`Self::warn_legacy_allowed_ws_origins`].
+    /// Admin API writes, restore, and file-mode load/reload (issue #7218)
+    /// reject these. Database/CP/DP loads (`validate_all_fields`) must not
+    /// treat them as rejecting errors: stored rows keep loading with a warning
+    /// from [`Self::warn_legacy_allowed_ws_origins`] (#5454).
     pub fn allowed_ws_origins_admission_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
         for (i, origin) in self.allowed_ws_origins.iter().enumerate() {
-            if origin.trim().is_empty() {
-                continue;
-            }
-            if origin.trim() == "*" {
-                errors.push(format!(
+            match Self::legacy_allowed_ws_origin(origin) {
+                None => {}
+                Some(LegacyAllowedWsOrigin::Star) => errors.push(format!(
                     "allowed_ws_origins[{}] is '*': {}",
                     i, ALLOWED_WS_ORIGINS_STAR_GUIDANCE
-                ));
-            } else if !Self::is_literal_websocket_origin(origin) {
-                errors.push(format!(
+                )),
+                Some(LegacyAllowedWsOrigin::NotLiteralOrigin) => errors.push(format!(
                     "allowed_ws_origins[{}] must be a literal origin \
                      (scheme://host[:port]); {}",
                     i, ALLOWED_WS_ORIGINS_STAR_GUIDANCE
-                ));
+                )),
             }
         }
         errors
+    }
+
+    /// The one predicate behind both [`Self::allowed_ws_origins_admission_errors`]
+    /// (admission refuses) and [`Self::warn_legacy_allowed_ws_origins`] (loads
+    /// warn). Admin API restore skips the warning because it refuses exactly
+    /// these entries, so the two must never classify an entry differently.
+    /// Empty entries are left to the field validators.
+    fn legacy_allowed_ws_origin(origin: &str) -> Option<LegacyAllowedWsOrigin> {
+        let trimmed = origin.trim();
+        if trimmed.is_empty() {
+            None
+        } else if trimmed == "*" {
+            Some(LegacyAllowedWsOrigin::Star)
+        } else if !Self::is_literal_websocket_origin(origin) {
+            Some(LegacyAllowedWsOrigin::NotLiteralOrigin)
+        } else {
+            None
+        }
     }
 
     /// Warn when a `~regex` `listen_path` mentions `;` on a proxy without
@@ -8155,12 +8857,17 @@ impl Proxy {
     }
 
     /// Warn once when a loaded proxy still carries the CORS-style `"*"`
-    /// footgun or a non-origin `allowed_ws_origins` entry. Never fails the load.
+    /// footgun or a non-origin `allowed_ws_origins` entry. Never fails the load
+    /// by itself. File mode refuses such a document in `file_loader` before
+    /// the validation pipeline runs (issue #7218), and Admin API restore
+    /// validates through
+    /// [`GatewayConfig::validate_all_fields_for_admission_with_ip_policy`], so
+    /// neither a file-mode load nor a refused restore emits this warning.
     pub fn warn_legacy_allowed_ws_origins(&self) {
-        let has_legacy_entry = self.allowed_ws_origins.iter().any(|origin| {
-            let trimmed = origin.trim();
-            !trimmed.is_empty() && (trimmed == "*" || !Self::is_literal_websocket_origin(origin))
-        });
+        let has_legacy_entry = self
+            .allowed_ws_origins
+            .iter()
+            .any(|origin| Self::legacy_allowed_ws_origin(origin).is_some());
         if !has_legacy_entry {
             return;
         }
@@ -8171,8 +8878,8 @@ impl Proxy {
             crate::startup::sanitize_startup_cause(
                 format!(
                     "Proxy {:?} `allowed_ws_origins` contains `*` or a non-origin entry; {}; \
-                     existing config is still loaded. Admin API writes and `ferrum-edge validate` \
-                     reject this value.",
+                     stored database/control-plane config is still loaded. Admin API writes, \
+                     file-mode loads, and `ferrum-edge validate` reject this value.",
                     self.id, ALLOWED_WS_ORIGINS_STAR_GUIDANCE
                 ),
                 &[]
@@ -8532,14 +9239,6 @@ impl Proxy {
                 MAX_POOL_SQL_INTEGER_VALUE, v
             ));
         }
-        if let Some(v) = self.pool_max_requests_per_connection
-            && v > MAX_POOL_SQL_INTEGER_VALUE
-        {
-            errors.push(format!(
-                "`pool_max_requests_per_connection` must be between 0 and {} (got \"{}\")",
-                MAX_POOL_SQL_INTEGER_VALUE, v
-            ));
-        }
 
         // HTTP/3 connections per backend
         if let Some(v) = self.pool_http3_connections_per_backend
@@ -8808,9 +9507,9 @@ impl Proxy {
 
         // Allowed WebSocket origins validation. Empty strings are a hard
         // error on every path. CORS-style `"*"` and non-origin entries are
-        // admission-only (`validate_fields` / Admin / `ferrum-edge validate`);
-        // load snapshots warn via `warn_legacy_allowed_ws_origins` instead of
-        // failing startup.
+        // admission-only (`validate_fields` / Admin / file-mode load and
+        // `ferrum-edge validate`); database/CP/DP load snapshots warn via
+        // `warn_legacy_allowed_ws_origins` instead of failing startup.
         for (i, origin) in self.allowed_ws_origins.iter().enumerate() {
             if origin.trim().is_empty() {
                 errors.push(format!("allowed_ws_origins[{}] must not be empty", i));
@@ -9016,18 +9715,34 @@ impl Consumer {
             ));
         }
 
+        // Credential array ceiling. Resolve once so a parse failure is reported
+        // exactly once, and never judge an array against a silently-defaulted
+        // limit (issue #6754).
+        let credential_limit = match max_credentials_per_type() {
+            Ok(limit) => Some(limit),
+            Err(error) => {
+                errors.push(error);
+                None
+            }
+        };
+
         // Validate individual credential values.
         for (cred_type, cred_value) in &self.credentials {
             if let Err(e) = validate_credential_type_name(cred_type) {
                 errors.push(e);
+                // The per-entry checks below render the key bare inside a
+                // `credentials.<type>[<n>]` path. Only a path-safe key (ASCII
+                // letters, digits, `_`, `-`) may reach them (issue #7217).
+                continue;
             }
             // Collect array entries to validate. Non-object elements are
             // rejected so operators cannot accidentally configure unusable
             // credentials.
             let objects: Vec<&serde_json::Map<String, serde_json::Value>> =
                 if let Some(arr) = cred_value.as_array() {
-                    let limit = max_credentials_per_type();
-                    if arr.len() > limit {
+                    if let Some(limit) = credential_limit
+                        && arr.len() > limit
+                    {
                         errors.push(format!(
                             "credentials.{} array must not exceed {} entries (got {})",
                             cred_type,
@@ -9112,15 +9827,17 @@ impl Consumer {
                         ));
                     }
                     match obj.get("secret") {
-                        Some(serde_json::Value::String(secret))
-                            if secret.chars().count() >= MIN_JWT_SECRET_LENGTH => {}
                         Some(serde_json::Value::String(secret)) => {
-                            errors.push(format!(
-                                "{}.secret must be at least {} characters (got {})",
-                                prefix,
-                                MIN_JWT_SECRET_LENGTH,
-                                secret.chars().count()
-                            ));
+                            // Whitespace does not count toward the floor, the
+                            // same rule as hmac_auth secrets: an HS256 key is
+                            // brute-forceable offline from one captured token.
+                            let strength = hmac_secret_strength(secret);
+                            if strength < MIN_JWT_SECRET_LENGTH {
+                                errors.push(format!(
+                                    "{}.secret must be at least {} non-whitespace characters (got {})",
+                                    prefix, MIN_JWT_SECRET_LENGTH, strength
+                                ));
+                            }
                         }
                         Some(_) => errors.push(format!("{}.secret must be a string", prefix)),
                         None => {}
@@ -9128,9 +9845,19 @@ impl Consumer {
                 }
                 if cred_type == "keyauth" {
                     match obj.get("key") {
-                        Some(serde_json::Value::String(key)) if !key.trim().is_empty() => {}
-                        Some(serde_json::Value::String(_)) => {
+                        Some(serde_json::Value::String(key)) if key.trim().is_empty() => {
                             errors.push(format!("{}.key must not be empty", prefix));
+                        }
+                        Some(serde_json::Value::String(key)) => {
+                            // Whitespace does not count toward the floor, the
+                            // same rule as hmac_auth secrets.
+                            let strength = hmac_secret_strength(key);
+                            if strength < MIN_KEYAUTH_KEY_LENGTH {
+                                errors.push(format!(
+                                    "{}.key must be at least {} non-whitespace characters (got {})",
+                                    prefix, MIN_KEYAUTH_KEY_LENGTH, strength
+                                ));
+                            }
                         }
                         Some(_) => errors.push(format!("{}.key must be a string", prefix)),
                         None => errors.push(format!("{}.key is required", prefix)),
@@ -9622,21 +10349,6 @@ impl Upstream {
                 tls.normalize_fields();
             }
         }
-    }
-
-    /// Resolve the effective backend connect timeout for a request destined to
-    /// `port`. Per-port `port_overrides[port].connect_timeout_ms` wins over
-    /// `proxy_default_ms` (the Proxy's own `backend_connect_timeout_ms`).
-    ///
-    /// Used by the dispatch hot path so DestinationRule per-port settings
-    /// translated by the Istio config source actually take effect at request
-    /// time. `0` from either source means "disabled".
-    #[inline]
-    pub fn effective_connect_timeout_ms(&self, port: u16, proxy_default_ms: u64) -> u64 {
-        self.port_overrides
-            .get(&port)
-            .and_then(|ovr| ovr.connect_timeout_ms)
-            .unwrap_or(proxy_default_ms)
     }
 
     /// Validate all fields of an upstream for correctness and safe lengths.
@@ -10385,6 +11097,12 @@ impl PluginConfig {
                     .to_string(),
             );
         }
+        if self.plugin_name == "openapi_validator" && self.scope != PluginScope::Proxy {
+            errors.push(
+                "openapi_validator must have scope `proxy` (its operation table describes one proxy's API)"
+                    .to_string(),
+            );
+        }
 
         // Config JSON size. Generated OpenAPI configs embed resolved operation
         // schemas: the validator's operation table, and an `mcp_gateway` that
@@ -10898,8 +11616,9 @@ impl ServiceDiscoveryConfig {
 
 impl GatewayConfig {
     /// Admission-only `allowed_ws_origins` errors across every proxy (`*` and
-    /// non-origin entries). Load snapshots must not use this as a rejecting
-    /// gate; they warn via [`Proxy::warn_legacy_allowed_ws_origins`] instead.
+    /// non-origin entries). Restore and file-mode load/reload reject on it;
+    /// database/CP/DP load snapshots must not use this as a rejecting gate and
+    /// warn via [`Proxy::warn_legacy_allowed_ws_origins`] instead.
     pub fn allowed_ws_origins_admission_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
         for proxy in &self.proxies {
@@ -10926,10 +11645,45 @@ impl GatewayConfig {
     }
 
     /// Validate all fields with backend IP policy enforcement.
+    ///
+    /// Database, CP and DP loads use this. A proxy whose `allowed_ws_origins`
+    /// still carries `*` or a non-origin entry keeps loading with the #5454
+    /// grandfathering warning from [`Proxy::warn_legacy_allowed_ws_origins`].
     pub fn validate_all_fields_with_ip_policy(
         &self,
         cert_expiry_warning_days: u64,
         backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Result<(), Vec<String>> {
+        self.validate_all_fields_with_ip_policy_inner(
+            cert_expiry_warning_days,
+            backend_allow_ips,
+            true,
+        )
+    }
+
+    /// The same field checks as [`Self::validate_all_fields_with_ip_policy`],
+    /// for operator admission paths that refuse `*` / non-origin
+    /// `allowed_ws_origins` through [`Self::allowed_ws_origins_admission_errors`]
+    /// (Admin API restore). It returns the same errors but does not emit the
+    /// #5454 grandfathering warning: that warning says the config "is still
+    /// loaded", which is false for a candidate admission refuses.
+    pub fn validate_all_fields_for_admission_with_ip_policy(
+        &self,
+        cert_expiry_warning_days: u64,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Result<(), Vec<String>> {
+        self.validate_all_fields_with_ip_policy_inner(
+            cert_expiry_warning_days,
+            backend_allow_ips,
+            false,
+        )
+    }
+
+    fn validate_all_fields_with_ip_policy_inner(
+        &self,
+        cert_expiry_warning_days: u64,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+        warn_legacy_allowed_ws_origins: bool,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
@@ -10992,9 +11746,14 @@ impl GatewayConfig {
                 }
             }
             // Grandfather existing `"*"` / non-origin rows: never fail a
-            // file/database/CP/DP load for this (issue #5454). Admission
-            // rejects the same values through `validate_fields`.
-            proxy.warn_legacy_allowed_ws_origins();
+            // database/CP/DP load for this (issue #5454). Admission rejects
+            // the same values through `validate_fields`, file mode refuses
+            // them in `file_loader` before this runs (issue #7218), and
+            // restore validates through the admission variant, which skips
+            // the warning because it refuses the same values.
+            if warn_legacy_allowed_ws_origins {
+                proxy.warn_legacy_allowed_ws_origins();
+            }
             proxy.warn_unreachable_regex_path_parameters();
         }
         for consumer in &self.consumers {
@@ -11095,7 +11854,7 @@ impl GatewayConfig {
         }
     }
 
-    /// Validate the mesh portion of the config (Layer 2 — Phase A).
+    /// Validate the mesh portion of the config (Layer 2).
     ///
     /// Returns a flat `Vec<String>` of error messages so each mode can
     /// dispatch the result per its own policy:
@@ -11107,7 +11866,6 @@ impl GatewayConfig {
     /// mesh fields can fail independently — operators may want to
     /// experiment with mesh resources in dev without bricking their
     /// existing proxy config.
-    #[allow(dead_code)] // Phase A scaffolding — wired into modes in Phase B/C.
     pub fn validate_mesh_fields(&self) -> Vec<String> {
         match &self.mesh {
             Some(m) => m.validate(),
@@ -11116,7 +11874,6 @@ impl GatewayConfig {
     }
 
     /// Normalise hostname-bearing mesh fields (lower-case ASCII). Idempotent.
-    #[allow(dead_code)] // Phase A scaffolding — wired into loaders in Phase B/C.
     pub fn normalize_mesh_fields(&mut self) {
         if let Some(m) = &mut self.mesh {
             m.normalize();
@@ -11311,6 +12068,15 @@ impl GatewayConfig {
                         errors.push(format!("PluginConfig {:?}: {}", pc.id, error));
                     }
                 }
+            }
+            // A managed JWKS record is node-local material like the files
+            // above (issue #7277): file mode refuses startup without it,
+            // database mode warns, and the runtime store fails closed.
+            for error in crate::plugins::utils::jwks_store::plugin_managed_jwks_source_errors(
+                &pc.plugin_name,
+                &pc.config,
+            ) {
+                errors.push(format!("PluginConfig {:?}: {}", pc.id, error));
             }
             if pc.plugin_name == "mesh_route_dispatch"
                 && let Some(rules) = pc.config.get("rules").and_then(serde_json::Value::as_array)

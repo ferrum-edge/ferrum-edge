@@ -29,6 +29,7 @@
 use super::super::RequestContext;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::hash::Hash;
 
 /// Returns `true` when the request's `Accept` header indicates Server-Sent
 /// Events (i.e., contains `text/event-stream`). Matches the WHATWG EventSource
@@ -106,21 +107,59 @@ pub struct SseParse {
     pub fully_parsed: bool,
 }
 
+/// Whether one SSE event's joined `data:` payload is a JSON document with
+/// duplicate object members. Mirrors `parse_sse_data_frames_checked`: lines
+/// joined with `\n`, trimmed, empty and `[DONE]` payloads skipped.
+pub fn sse_event_data_is_ambiguous(data: &[&str]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let joined = data.join("\n");
+    let trimmed = joined.trim();
+    !trimmed.is_empty()
+        && trimmed != "[DONE]"
+        && crate::util::json_dup_keys::str_ambiguity(trimmed).is_some()
+}
+
+/// Whether any `data:` payload of a buffered SSE body is a duplicate-member
+/// JSON document (GHSA-c78j-5w9p-cpq6, GHSA-49cr-v28q-9hgp): the frame parser
+/// keeps the LAST duplicate while a first-key-wins client reads the FIRST.
+/// Events and fields are split exactly as
+/// `parse_sse_data_frames_checked` splits them (leading BOMs ignored, CRLF /
+/// LF / CR line ends, `:` comments, one optional space after the colon).
+pub fn sse_data_payloads_are_ambiguous(body: &str) -> bool {
+    let mut data: Vec<&str> = Vec::new();
+    for line in sse_lines(strip_sse_boms(body)) {
+        if line.is_empty() {
+            if sse_event_data_is_ambiguous(&data) {
+                return true;
+            }
+            data.clear();
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line, ""),
+        };
+        if field == "data" {
+            data.push(value);
+        }
+    }
+    sse_event_data_is_ambiguous(&data)
+}
+
 /// Parse SSE `data:` frames from a buffered SSE response body into JSON values.
 ///
 /// Consumes leading UTF-8 BOMs, splits lines on CRLF, LF, or CR, skips
 /// comments, strips the `data: ` (or `data:`) prefix, skips empty data,
-/// the `[DONE]` sentinel, and frames that are not valid JSON. Returns the
-/// parsed frames in order. Returns an empty `Vec` if the body is not valid
-/// UTF-8 — callers receive no JSON frames but no error either. Use
-/// [`parse_sse_data_frames_checked`] when "had unparseable data" must be
-/// distinguished from "had no data".
-pub fn parse_sse_data_frames(body: &[u8]) -> Vec<Value> {
-    parse_sse_data_frames_checked(body).frames
-}
-
-/// Like [`parse_sse_data_frames`], but also reports whether the entire body was
-/// inspectable (see [`SseParse::fully_parsed`]).
+/// the `[DONE]` sentinel, and frames that are not valid JSON, returning the
+/// parsed frames in order. [`SseParse::fully_parsed`] reports whether the
+/// entire body was inspectable, so "had unparseable data" (including a body
+/// that is not valid UTF-8, which yields no frames) is distinguished from "had
+/// no data".
 pub fn parse_sse_data_frames_checked(body: &[u8]) -> SseParse {
     let body_str = match std::str::from_utf8(body) {
         Ok(s) => s,
@@ -632,6 +671,67 @@ pub enum SseTextKind {
     /// the `token.text` fragments of one stream into the same field the
     /// buffered document carries (`$[*].generated_text`).
     TgiGeneratedText,
+    /// Legacy Chat Completions streamed `delta.function_call.name`
+    /// (`$.choices[*].delta.function_call.name`). Only produced by a
+    /// reassembler built with
+    /// [`with_extended_provider_shapes`](SseReassembler::with_extended_provider_shapes).
+    ChatFunctionCallName,
+    /// Legacy Chat Completions streamed `delta.function_call.arguments`
+    /// (`$.choices[*].delta.function_call.arguments`). Extended shapes only.
+    ChatFunctionCallArguments,
+    /// Cohere v2 `/v2/chat` assistant text, reassembled from the
+    /// `content-start` / `content-delta` events of one content index into the
+    /// buffered document's `$.message.content[*].text`. Extended shapes only.
+    CohereText,
+    /// Cohere v2 `tool-plan-delta` prose (`$.message.tool_plan`). Extended
+    /// shapes only.
+    CohereToolPlan,
+    /// Cohere v2 streamed tool-call name
+    /// (`$.message.tool_calls[*].function.name`). Extended shapes only.
+    CohereToolName,
+    /// Cohere v2 streamed tool-call arguments
+    /// (`$.message.tool_calls[*].function.arguments`). Extended shapes only.
+    CohereToolArguments,
+    /// One Cohere v2 citation source (`citation-start`
+    /// `delta.message.citations.sources[]`): a tool output or document the
+    /// client receives beside the completion, serialized compactly and kept
+    /// separate from it (`$.message.citations[*].sources`). Extended shapes
+    /// only.
+    CohereCitationSource,
+}
+
+/// Cohere v2 `/v2/chat` streaming event types this reassembler models. Every
+/// Cohere v2 SSE frame carries its event name in the JSON `type` field (and
+/// usually on the `event:` line too); the hyphenated spelling cannot collide
+/// with the underscore-separated Anthropic names or the dotted Responses-API
+/// names.
+const COHERE_V2_STREAM_EVENTS: &[&str] = &[
+    "message-start",
+    "content-start",
+    "content-delta",
+    "content-end",
+    "tool-plan-delta",
+    "tool-call-start",
+    "tool-call-delta",
+    "tool-call-end",
+    "citation-start",
+    "citation-end",
+    "message-end",
+    "debug",
+];
+
+/// Whether one parsed SSE `data:` frame is a Cohere v2 `/v2/chat` streaming
+/// event that a reassembler built with
+/// [`SseReassembler::with_extended_provider_shapes`] folds.
+///
+/// Callers that decide whether an otherwise segment-less window is a governed
+/// provider stream this build cannot map use this to exclude the frames that
+/// ARE mapped.
+pub fn is_cohere_v2_stream_frame(frame: &Value) -> bool {
+    frame
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| COHERE_V2_STREAM_EVENTS.contains(&event_type))
 }
 
 /// Ceiling on the number of distinct Anthropic content blocks one stream may
@@ -669,6 +769,53 @@ pub const MAX_ANTHROPIC_CONTENT_BLOCKS: usize = 64;
 /// outside the protocol rather than allowing on merged candidates. Real Gemini
 /// responses cap `candidateCount` in the single digits.
 pub const MAX_GEMINI_CANDIDATES: usize = 64;
+
+/// Ceiling on the distinct live accumulators in EACH OpenAI-style family the
+/// reassembler keys by provider-supplied indexes: legacy Completions text and
+/// chat `delta.content` per choice, chat tool calls per `(choice, tool)`,
+/// Responses-API output text per `(output, content)`, and Responses-API
+/// function-call arguments per output.
+///
+/// Every index arrives on the wire, so an unbounded keying map would let a
+/// stream of one-byte deltas at ever-new indexes grow per-accumulator overhead
+/// without growing the text the callers' byte budgets account for. The bound is
+/// on the number of live keys, not on the index value, so a two-dimensional
+/// key cannot multiply it. A key that would exceed it is folded into one shared
+/// overflow accumulator per family. Its content is still reassembled and
+/// inspected, never dropped, and the stream is marked uninspectable (see
+/// [`provider_stream_uninspectable`](SseReassembler::provider_stream_uninspectable)),
+/// because interleaving deltas of different choices or calls in one
+/// accumulator could split a phrase that a single choice carried intact.
+/// OpenAI documents `n` up to 128, so legitimate streams stay below it.
+pub const MAX_OPENAI_STREAM_ACCUMULATORS: usize = 128;
+
+/// Find or create the accumulator for `key`, folding a key beyond
+/// [`MAX_OPENAI_STREAM_ACCUMULATORS`] live entries into `overflow` and marking
+/// the stream uninspectable.
+fn bounded_slot<'a, K: Copy + Eq + Hash, V: Default>(
+    entries: &'a mut Vec<(K, V)>,
+    positions: &mut HashMap<K, usize>,
+    key: K,
+    overflow: K,
+    uninspectable: &mut bool,
+) -> &'a mut V {
+    let key = if positions.contains_key(&key) || entries.len() < MAX_OPENAI_STREAM_ACCUMULATORS {
+        key
+    } else {
+        *uninspectable = true;
+        overflow
+    };
+    let pos = match positions.get(&key).copied() {
+        Some(pos) => pos,
+        None => {
+            let pos = entries.len();
+            entries.push((key, V::default()));
+            positions.insert(key, pos);
+            pos
+        }
+    };
+    &mut entries[pos].1
+}
 
 /// A coherent text fragment reassembled from many streaming-SSE delta frames.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -801,11 +948,62 @@ pub struct SseReassembler {
     /// could not be reassembled into the paths this type exposes. Sticky for
     /// the rest of the stream.
     provider_uninspectable: bool,
+    /// Opt-in for the shapes
+    /// [`with_extended_provider_shapes`](Self::with_extended_provider_shapes)
+    /// adds. Off by default so a caller
+    /// that keeps its own side accumulators for them (`ai_response_guard`
+    /// tracks legacy `function_call` itself) does not read them twice.
+    extended_provider_shapes: bool,
+    /// `choice_index -> legacy Chat Completions function_call name + arguments`.
+    function_calls: Vec<(usize, ToolCallAccumulator)>,
+    /// Lookup table for `function_calls`, avoiding linear scans over untrusted indexes.
+    function_call_positions: HashMap<usize, usize>,
+    /// Cohere v2 assistant text keyed by the event `index`.
+    cohere_text: Vec<(usize, String)>,
+    /// Lookup table for `cohere_text`, avoiding linear scans over untrusted indexes.
+    cohere_text_positions: HashMap<usize, usize>,
+    /// Cohere v2 `tool-plan-delta` prose. One plan per message, so no index.
+    cohere_tool_plan: String,
+    /// Cohere v2 tool calls keyed by the event `index`.
+    cohere_tool_calls: Vec<(usize, ToolCallAccumulator)>,
+    /// Lookup table for `cohere_tool_calls`, avoiding linear scans over untrusted indexes.
+    cohere_tool_call_positions: HashMap<usize, usize>,
+    /// Set once a Cohere v2 event has been folded, so a later frame carrying
+    /// an unmodelled hyphenated event type is recognized as out-of-protocol.
+    cohere_stream: bool,
+    /// Cohere v2 citation sources keyed by `(citation index, source position)`.
+    cohere_citation_sources: Vec<((usize, usize), String)>,
+    /// Lookup table for `cohere_citation_sources`.
+    cohere_citation_source_positions: HashMap<(usize, usize), usize>,
 }
 
 impl SseReassembler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A reassembler that additionally folds two shapes the default one
+    /// leaves to its callers:
+    ///
+    /// * legacy Chat Completions `choices[].delta.function_call.{name,
+    ///   arguments}` fragments, per choice index; and
+    /// * Cohere v2 `/v2/chat` streaming events (`content-start` /
+    ///   `content-delta` text per content index, `tool-plan-delta` prose,
+    ///   `tool-call-start` / `tool-call-delta` name and arguments per tool
+    ///   index, and each `citation-start` source as its own fragment; a
+    ///   `debug` event with a payload marks the stream uninspectable). An unmodelled hyphenated event, a modelled event carrying a
+    ///   non-string text/name/arguments, or a non-text content part inside an
+    ///   identified Cohere v2 stream marks it uninspectable.
+    ///
+    /// Both families are bounded like the OpenAI-style families: at most
+    /// [`MAX_OPENAI_STREAM_ACCUMULATORS`] live keys each, with the excess
+    /// folded into one overflow accumulator and the stream marked
+    /// uninspectable.
+    pub fn with_extended_provider_shapes() -> Self {
+        Self {
+            extended_provider_shapes: true,
+            ..Self::default()
+        }
     }
 
     /// The assistant prose reassembled so far — legacy Completions `text`,
@@ -833,6 +1031,10 @@ impl SseReassembler {
         }
         combined.push_str(&self.tgi_text);
         combined.push_str(&self.anthropic_error_text);
+        for (_index, text) in &self.cohere_text {
+            combined.push_str(text);
+        }
+        combined.push_str(&self.cohere_tool_plan);
         combined
     }
 
@@ -854,6 +1056,7 @@ impl SseReassembler {
             .iter()
             .map(|(_, candidate)| candidate.text.len())
             .sum();
+        let cohere: usize = self.cohere_text.iter().map(|(_, t)| t.len()).sum();
         completion_text
             .saturating_add(content)
             .saturating_add(responses)
@@ -861,12 +1064,22 @@ impl SseReassembler {
             .saturating_add(gemini)
             .saturating_add(self.tgi_text.len())
             .saturating_add(self.anthropic_error_text.len())
+            .saturating_add(cohere)
+            .saturating_add(self.cohere_tool_plan.len())
     }
 
     /// Total bytes retained across every reassembled text accumulator (assistant
     /// prose, tool names/arguments, and Responses API text/arguments), without
     /// allocating a snapshot. Windowed policy inspectors use this for their
     /// aggregate retained-state budget.
+    ///
+    /// This is a text measure: the per-accumulator bookkeeping (keyed `Vec`
+    /// entry plus lookup-table entry) is not included. It cannot grow with the
+    /// stream, because every keyed family is capped
+    /// ([`MAX_OPENAI_STREAM_ACCUMULATORS`] per OpenAI-style family,
+    /// [`MAX_ANTHROPIC_CONTENT_BLOCKS`] + 1 and [`MAX_GEMINI_CANDIDATES`] + 1),
+    /// so it is bounded by [`accumulator_count`](Self::accumulator_count) times
+    /// a fixed per-entry size, independent of input.
     pub fn retained_text_len(&self) -> usize {
         let completion_text = self
             .completion_text
@@ -915,6 +1128,26 @@ impl SseReassembler {
                     .saturating_add(candidate.args_json.len())
             })
             .sum::<usize>();
+        let function_calls = self
+            .function_calls
+            .iter()
+            .map(|(_, call)| call.name.len().saturating_add(call.arguments.len()))
+            .sum::<usize>();
+        let cohere_text = self
+            .cohere_text
+            .iter()
+            .map(|(_, text)| text.len())
+            .sum::<usize>();
+        let cohere_tool_calls = self
+            .cohere_tool_calls
+            .iter()
+            .map(|(_, call)| call.name.len().saturating_add(call.arguments.len()))
+            .sum::<usize>();
+        let cohere_citation_sources = self
+            .cohere_citation_sources
+            .iter()
+            .map(|(_, source)| source.len())
+            .sum::<usize>();
         completion_text
             .saturating_add(content)
             .saturating_add(tool_calls)
@@ -924,6 +1157,27 @@ impl SseReassembler {
             .saturating_add(gemini)
             .saturating_add(self.tgi_text.len())
             .saturating_add(self.anthropic_error_text.len())
+            .saturating_add(function_calls)
+            .saturating_add(cohere_text)
+            .saturating_add(self.cohere_tool_plan.len())
+            .saturating_add(cohere_tool_calls)
+            .saturating_add(cohere_citation_sources)
+    }
+
+    /// Number of live keyed accumulators across every family.
+    pub fn accumulator_count(&self) -> usize {
+        self.completion_text
+            .len()
+            .saturating_add(self.content.len())
+            .saturating_add(self.tool_calls.len())
+            .saturating_add(self.responses_text.len())
+            .saturating_add(self.responses_args.len())
+            .saturating_add(self.anthropic_blocks.len())
+            .saturating_add(self.gemini_candidates.len())
+            .saturating_add(self.function_calls.len())
+            .saturating_add(self.cohere_text.len())
+            .saturating_add(self.cohere_tool_calls.len())
+            .saturating_add(self.cohere_citation_sources.len())
     }
 
     /// `true` when a stream identified as a provider protocol this reassembler
@@ -952,6 +1206,10 @@ impl SseReassembler {
     /// `token.text` deltas reconstruct, so folding them into that prose would
     /// corrupt it.
     ///
+    /// OpenAI-style chat / Completions / Responses streams: more than
+    /// [`MAX_OPENAI_STREAM_ACCUMULATORS`] live choices, tool calls, output
+    /// texts, or output arguments in one family (the excess is folded).
+    ///
     /// Such a frame may carry client-visible text on a path nothing here reads,
     /// so a caller that promised inspection must treat the whole stream as
     /// uninspectable and fail closed rather than deliver a clean verdict over
@@ -974,8 +1232,148 @@ impl SseReassembler {
     /// the streamed `inspect` path inspects the current window repeatedly as the
     /// stream grows, so it cannot move the strings out the way
     /// [`into_texts`](Self::into_texts) does for the one-shot buffered path.
+    ///
+    /// Only the non-empty fragment strings are copied; the keyed accumulators,
+    /// their lookup tables and empty entries are not cloned per call.
     pub fn texts(&self) -> Vec<SseText> {
-        self.clone().into_texts()
+        let mut out = Vec::new();
+        let mut push = |kind: SseTextKind, json_path: String, text: &str| {
+            if !text.is_empty() {
+                out.push(SseText {
+                    kind,
+                    json_path,
+                    text: text.to_string(),
+                });
+            }
+        };
+        for (choice, text) in &self.completion_text {
+            push(
+                SseTextKind::CompletionText,
+                format!("$.choices[{choice}].text"),
+                text,
+            );
+        }
+        for (choice, text) in &self.content {
+            push(
+                SseTextKind::ChatContent,
+                format!("$.choices[{choice}].delta.content"),
+                text,
+            );
+        }
+        for ((choice, tool), accum) in &self.tool_calls {
+            push(
+                SseTextKind::ChatToolName,
+                format!("$.choices[{choice}].delta.tool_calls[{tool}].function.name"),
+                &accum.name,
+            );
+            push(
+                SseTextKind::ChatToolArguments,
+                format!("$.choices[{choice}].delta.tool_calls[{tool}].function.arguments"),
+                &accum.arguments,
+            );
+        }
+        for ((output, content), text) in &self.responses_text {
+            push(
+                SseTextKind::ResponsesText,
+                format!("$.output[{output}].content[{content}].text"),
+                text,
+            );
+        }
+        for (output, text) in &self.responses_args {
+            push(
+                SseTextKind::ResponsesArguments,
+                format!("$.output[{output}].arguments"),
+                text,
+            );
+        }
+        for (index, block) in &self.anthropic_blocks {
+            push(
+                SseTextKind::AnthropicText,
+                format!("$.content[{index}].text"),
+                &block.text,
+            );
+            push(
+                SseTextKind::AnthropicToolName,
+                format!("$.content[{index}].name"),
+                &block.name,
+            );
+            push(
+                SseTextKind::AnthropicToolInput,
+                format!("$.content[{index}].input"),
+                &block.input_json,
+            );
+        }
+        for (index, candidate) in &self.gemini_candidates {
+            push(
+                SseTextKind::GeminiText,
+                format!("$.candidates[{index}].content.parts[*].text"),
+                &candidate.text,
+            );
+            push(
+                SseTextKind::GeminiFunctionCallName,
+                format!("$.candidates[{index}].content.parts[*].functionCall.name"),
+                &candidate.name,
+            );
+            push(
+                SseTextKind::GeminiFunctionCallArgs,
+                format!("$.candidates[{index}].content.parts[*].functionCall.args"),
+                &candidate.args_json,
+            );
+        }
+        push(
+            SseTextKind::TgiGeneratedText,
+            "$[0].generated_text".to_string(),
+            &self.tgi_text,
+        );
+        push(
+            SseTextKind::AnthropicText,
+            "$.error.message".to_string(),
+            &self.anthropic_error_text,
+        );
+        for (choice, accum) in &self.function_calls {
+            push(
+                SseTextKind::ChatFunctionCallName,
+                format!("$.choices[{choice}].delta.function_call.name"),
+                &accum.name,
+            );
+            push(
+                SseTextKind::ChatFunctionCallArguments,
+                format!("$.choices[{choice}].delta.function_call.arguments"),
+                &accum.arguments,
+            );
+        }
+        for (index, text) in &self.cohere_text {
+            push(
+                SseTextKind::CohereText,
+                format!("$.message.content[{index}].text"),
+                text,
+            );
+        }
+        push(
+            SseTextKind::CohereToolPlan,
+            "$.message.tool_plan".to_string(),
+            &self.cohere_tool_plan,
+        );
+        for (index, accum) in &self.cohere_tool_calls {
+            push(
+                SseTextKind::CohereToolName,
+                format!("$.message.tool_calls[{index}].function.name"),
+                &accum.name,
+            );
+            push(
+                SseTextKind::CohereToolArguments,
+                format!("$.message.tool_calls[{index}].function.arguments"),
+                &accum.arguments,
+            );
+        }
+        for ((citation, source), text) in &self.cohere_citation_sources {
+            push(
+                SseTextKind::CohereCitationSource,
+                format!("$.message.citations[{citation}].sources[{source}]"),
+                text,
+            );
+        }
+        out
     }
 
     /// Trim streamed tool-call names/arguments and Responses-API function-call
@@ -1018,7 +1416,15 @@ impl SseReassembler {
             || self
                 .gemini_candidates
                 .iter()
-                .any(|(_index, candidate)| !candidate.name.is_empty());
+                .any(|(_index, candidate)| !candidate.name.is_empty())
+            || self
+                .function_calls
+                .iter()
+                .any(|(_choice, accum)| !accum.name.is_empty())
+            || self
+                .cohere_tool_calls
+                .iter()
+                .any(|(_index, accum)| !accum.name.is_empty());
         let has_arguments = self
             .tool_calls
             .iter()
@@ -1034,7 +1440,19 @@ impl SseReassembler {
             || self
                 .gemini_candidates
                 .iter()
-                .any(|(_index, candidate)| !candidate.args_json.is_empty());
+                .any(|(_index, candidate)| !candidate.args_json.is_empty())
+            || self
+                .function_calls
+                .iter()
+                .any(|(_choice, accum)| !accum.arguments.is_empty())
+            || self
+                .cohere_tool_calls
+                .iter()
+                .any(|(_index, accum)| !accum.arguments.is_empty())
+            || self
+                .cohere_citation_sources
+                .iter()
+                .any(|(_key, source)| !source.is_empty());
         let argument_budget = if has_names && has_arguments {
             keep_total.div_ceil(2)
         } else if has_arguments {
@@ -1060,6 +1478,15 @@ impl SseReassembler {
         for (_index, candidate) in self.gemini_candidates.iter_mut().rev() {
             retain_tail_within_budget(&mut candidate.args_json, &mut argument_remaining);
         }
+        for (_choice, accum) in self.function_calls.iter_mut().rev() {
+            retain_tail_within_budget(&mut accum.arguments, &mut argument_remaining);
+        }
+        for (_index, accum) in self.cohere_tool_calls.iter_mut().rev() {
+            retain_tail_within_budget(&mut accum.arguments, &mut argument_remaining);
+        }
+        for (_key, source) in self.cohere_citation_sources.iter_mut().rev() {
+            retain_tail_within_budget(source, &mut argument_remaining);
+        }
         let mut name_remaining = name_budget;
         for (_key, accum) in self.tool_calls.iter_mut().rev() {
             retain_tail_within_budget(&mut accum.name, &mut name_remaining);
@@ -1070,12 +1497,36 @@ impl SseReassembler {
         for (_index, candidate) in self.gemini_candidates.iter_mut().rev() {
             retain_tail_within_budget(&mut candidate.name, &mut name_remaining);
         }
+        for (_choice, accum) in self.function_calls.iter_mut().rev() {
+            retain_tail_within_budget(&mut accum.name, &mut name_remaining);
+        }
+        for (_index, accum) in self.cohere_tool_calls.iter_mut().rev() {
+            retain_tail_within_budget(&mut accum.name, &mut name_remaining);
+        }
 
         self.tool_calls
             .retain(|(_key, accum)| !accum.name.is_empty() || !accum.arguments.is_empty());
         self.tool_call_positions.clear();
         for (position, (key, _accum)) in self.tool_calls.iter().enumerate() {
             self.tool_call_positions.insert(*key, position);
+        }
+        self.function_calls
+            .retain(|(_choice, accum)| !accum.name.is_empty() || !accum.arguments.is_empty());
+        self.function_call_positions.clear();
+        for (position, (choice, _accum)) in self.function_calls.iter().enumerate() {
+            self.function_call_positions.insert(*choice, position);
+        }
+        self.cohere_tool_calls
+            .retain(|(_index, accum)| !accum.name.is_empty() || !accum.arguments.is_empty());
+        self.cohere_tool_call_positions.clear();
+        for (position, (index, _accum)) in self.cohere_tool_calls.iter().enumerate() {
+            self.cohere_tool_call_positions.insert(*index, position);
+        }
+        self.cohere_citation_sources
+            .retain(|(_key, source)| !source.is_empty());
+        self.cohere_citation_source_positions.clear();
+        for (position, (key, _source)) in self.cohere_citation_sources.iter().enumerate() {
+            self.cohere_citation_source_positions.insert(*key, position);
         }
         self.responses_args
             .retain(|(_output, text)| !text.is_empty());
@@ -1158,7 +1609,16 @@ impl SseReassembler {
         }
         drain_one(&mut self.tgi_text, &mut remaining);
         drain_one(&mut self.anthropic_error_text, &mut remaining);
+        for (_index, text) in &mut self.cohere_text {
+            drain_one(text, &mut remaining);
+        }
+        drain_one(&mut self.cohere_tool_plan, &mut remaining);
 
+        self.cohere_text.retain(|(_index, text)| !text.is_empty());
+        self.cohere_text_positions.clear();
+        for (position, (index, _text)) in self.cohere_text.iter().enumerate() {
+            self.cohere_text_positions.insert(*index, position);
+        }
         self.completion_text
             .retain(|(_choice, text)| !text.is_empty());
         self.completion_text_positions.clear();
@@ -1194,6 +1654,273 @@ impl SseReassembler {
         self.push_anthropic_events(event, frame);
         self.push_gemini_frame(frame);
         self.push_tgi_frame(frame);
+        if self.extended_provider_shapes {
+            self.push_legacy_function_call_deltas(frame);
+            self.push_cohere_v2_event(frame);
+        }
+    }
+
+    /// Accumulate legacy Chat Completions `choices[].delta.function_call`
+    /// fragments (the pre-`tool_calls` shape), keyed by choice index. Name and
+    /// arguments stay in separate accumulators so neither can hide a
+    /// cross-frame match in the other.
+    fn push_legacy_function_call_deltas(&mut self, frame: &Value) {
+        let Some(choices) = frame.get("choices").and_then(Value::as_array) else {
+            return;
+        };
+        for (positional, choice) in choices.iter().enumerate() {
+            let Some(function_call) = choice
+                .get("delta")
+                .and_then(|delta| delta.get("function_call"))
+            else {
+                continue;
+            };
+            let choice_index = index_field(choice, "index").unwrap_or(positional);
+            let Some(object) = function_call.as_object() else {
+                // `function_call` present but not an object: outside the
+                // protocol and possibly carrying text nothing here reads.
+                self.provider_uninspectable = true;
+                continue;
+            };
+            for (field, value) in object {
+                let Some(text) = value.as_str() else {
+                    if !value.is_null() {
+                        self.provider_uninspectable = true;
+                    }
+                    continue;
+                };
+                match field.as_str() {
+                    "name" => self.function_call_mut(choice_index).name.push_str(text),
+                    "arguments" => self
+                        .function_call_mut(choice_index)
+                        .arguments
+                        .push_str(text),
+                    // An unmodelled member may carry client-visible text.
+                    _ => self.provider_uninspectable = true,
+                }
+            }
+        }
+    }
+
+    /// Accumulate one Cohere v2 `/v2/chat` streaming event.
+    ///
+    /// Coverage: `content-start` / `content-delta` (`delta.message.content.text`
+    /// per event `index`), `tool-plan-delta` (`delta.message.tool_plan`),
+    /// `tool-call-start` / `tool-call-delta`
+    /// (`delta.message.tool_calls.function.{name, arguments}` per `index`), a
+    /// `message-start` envelope (an empty one carries nothing; a populated
+    /// `tool_plan` is folded, populated `content` / `tool_calls` arrays are
+    /// out of the modelled protocol), `citation-start` sources (each a
+    /// separate fragment; the cited `text` span is already in the content),
+    /// a `debug` event (any payload fails the stream closed), and the
+    /// no-content `content-end`, `tool-call-end`, `citation-end`, and
+    /// `message-end` events.
+    ///
+    /// Once a Cohere v2 event has been seen, a later unmodelled hyphenated
+    /// event, a non-text content part, or a non-string text/name/arguments
+    /// marks the stream uninspectable rather than being skipped.
+    fn push_cohere_v2_event(&mut self, frame: &Value) {
+        let Some(event_type) = frame.get("type").and_then(Value::as_str) else {
+            return;
+        };
+        if !COHERE_V2_STREAM_EVENTS.contains(&event_type) {
+            // A hyphenated event name the protocol may have added later, on a
+            // stream that already identified itself as Cohere v2.
+            if self.cohere_stream && event_type.contains('-') {
+                self.provider_uninspectable = true;
+            }
+            return;
+        }
+        self.cohere_stream = true;
+        let message = frame.get("delta").and_then(|delta| delta.get("message"));
+        match event_type {
+            "content-start" | "content-delta" => {
+                let Some(content) = message.and_then(|message| message.get("content")) else {
+                    return;
+                };
+                let Some(object) = content.as_object() else {
+                    self.provider_uninspectable = true;
+                    return;
+                };
+                let index = index_field(frame, "index").unwrap_or(0);
+                if object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|part_type| part_type != "text")
+                {
+                    // A `thinking` part or a part type added later: absorb any
+                    // plain text so it is still scanned, but the stream carries
+                    // content outside the modelled document.
+                    self.provider_uninspectable = true;
+                }
+                for (field, value) in object {
+                    match field.as_str() {
+                        "type" => {}
+                        "text" => match value.as_str() {
+                            Some(text) => self.cohere_text_mut(index).push_str(text),
+                            None => self.provider_uninspectable = true,
+                        },
+                        _ => {
+                            if let Some(text) = value.as_str() {
+                                self.cohere_text_mut(index).push_str(text);
+                            }
+                            self.provider_uninspectable = true;
+                        }
+                    }
+                }
+            }
+            "tool-plan-delta" => match message.and_then(|message| message.get("tool_plan")) {
+                None => {}
+                Some(Value::String(plan)) => self.cohere_tool_plan.push_str(plan),
+                Some(_) => self.provider_uninspectable = true,
+            },
+            "tool-call-start" | "tool-call-delta" => {
+                let Some(call) = message.and_then(|message| message.get("tool_calls")) else {
+                    return;
+                };
+                let Some(call) = call.as_object() else {
+                    self.provider_uninspectable = true;
+                    return;
+                };
+                let Some(function) = call.get("function") else {
+                    return;
+                };
+                let Some(function) = function.as_object() else {
+                    self.provider_uninspectable = true;
+                    return;
+                };
+                let index = index_field(frame, "index").unwrap_or(0);
+                for (field, value) in function {
+                    let Some(text) = value.as_str() else {
+                        if !value.is_null() {
+                            self.provider_uninspectable = true;
+                        }
+                        continue;
+                    };
+                    match field.as_str() {
+                        "name" => self.cohere_tool_call_mut(index).name.push_str(text),
+                        "arguments" => self.cohere_tool_call_mut(index).arguments.push_str(text),
+                        _ => self.provider_uninspectable = true,
+                    }
+                }
+            }
+            "message-start" => {
+                let Some(message) = message else {
+                    return;
+                };
+                match message.get("tool_plan") {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(plan)) => self.cohere_tool_plan.push_str(plan),
+                    Some(_) => self.provider_uninspectable = true,
+                }
+                for field in ["content", "tool_calls"] {
+                    match message.get(field) {
+                        None | Some(Value::Null) => {}
+                        Some(Value::Array(items)) if items.is_empty() => {}
+                        // A populated envelope is outside the modelled stream:
+                        // its parts arrive as their own events.
+                        Some(_) => self.provider_uninspectable = true,
+                    }
+                }
+            }
+            // A citation's `text` is a span of content already reassembled
+            // from `content-delta`, but its `sources[]` carry whole tool
+            // outputs / documents the client receives too: each source is
+            // kept as its own fragment, never folded into the completion.
+            "citation-start" => {
+                let Some(citations) = message.and_then(|message| message.get("citations")) else {
+                    return;
+                };
+                let Some(citation) = citations.as_object() else {
+                    self.provider_uninspectable = true;
+                    return;
+                };
+                let citation_index = index_field(frame, "index").unwrap_or(0);
+                match citation.get("sources") {
+                    None | Some(Value::Null) => {}
+                    Some(Value::Array(sources)) => {
+                        for (position, source) in sources.iter().enumerate() {
+                            let payload = source
+                                .get("tool_output")
+                                .or_else(|| source.get("document"))
+                                .unwrap_or(source);
+                            let rendered = match payload {
+                                Value::String(text) => text.clone(),
+                                Value::Null => continue,
+                                other => match serde_json::to_string(other) {
+                                    Ok(rendered) => rendered,
+                                    Err(_) => {
+                                        self.provider_uninspectable = true;
+                                        continue;
+                                    }
+                                },
+                            };
+                            self.cohere_citation_source_mut(citation_index, position)
+                                .push_str(&rendered);
+                        }
+                    }
+                    Some(_) => self.provider_uninspectable = true,
+                }
+            }
+            // A `debug` event echoes provider-side state such as the rendered
+            // `prompt` (system prompt included). No response path models it,
+            // so a debug event carrying anything beyond its discriminator is
+            // outside the inspected document and fails the stream closed.
+            "debug" => {
+                let carries_payload = frame.as_object().is_some_and(|object| {
+                    object
+                        .iter()
+                        .any(|(field, value)| field != "type" && !value.is_null())
+                });
+                if carries_payload {
+                    self.provider_uninspectable = true;
+                }
+            }
+            // `content-end`, `tool-call-end`, `citation-end`, `message-end`:
+            // no model text that is not already reassembled from the delta
+            // events.
+            _ => {}
+        }
+    }
+
+    fn cohere_citation_source_mut(&mut self, citation: usize, source: usize) -> &mut String {
+        bounded_slot(
+            &mut self.cohere_citation_sources,
+            &mut self.cohere_citation_source_positions,
+            (citation, source),
+            (usize::MAX, usize::MAX),
+            &mut self.provider_uninspectable,
+        )
+    }
+
+    fn function_call_mut(&mut self, choice: usize) -> &mut ToolCallAccumulator {
+        bounded_slot(
+            &mut self.function_calls,
+            &mut self.function_call_positions,
+            choice,
+            usize::MAX,
+            &mut self.provider_uninspectable,
+        )
+    }
+
+    fn cohere_text_mut(&mut self, index: usize) -> &mut String {
+        bounded_slot(
+            &mut self.cohere_text,
+            &mut self.cohere_text_positions,
+            index,
+            usize::MAX,
+            &mut self.provider_uninspectable,
+        )
+    }
+
+    fn cohere_tool_call_mut(&mut self, index: usize) -> &mut ToolCallAccumulator {
+        bounded_slot(
+            &mut self.cohere_tool_calls,
+            &mut self.cohere_tool_call_positions,
+            index,
+            usize::MAX,
+            &mut self.provider_uninspectable,
+        )
     }
 
     /// Consume the accumulator and return the reassembled fragments, dropping any
@@ -1336,6 +2063,66 @@ impl SseReassembler {
                 json_path: "$.error.message".to_string(),
                 text: self.anthropic_error_text,
             });
+        }
+        for (choice, accum) in self.function_calls {
+            if !accum.name.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::ChatFunctionCallName,
+                    json_path: format!("$.choices[{choice}].delta.function_call.name"),
+                    text: accum.name,
+                });
+            }
+            if !accum.arguments.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::ChatFunctionCallArguments,
+                    json_path: format!("$.choices[{choice}].delta.function_call.arguments"),
+                    text: accum.arguments,
+                });
+            }
+        }
+        // Cohere v2 reassembles into the buffered `/v2/chat` document shape:
+        // `message.content[].text`, `message.tool_plan`, and
+        // `message.tool_calls[].function.{name, arguments}`.
+        for (index, text) in self.cohere_text {
+            if !text.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::CohereText,
+                    json_path: format!("$.message.content[{index}].text"),
+                    text,
+                });
+            }
+        }
+        if !self.cohere_tool_plan.is_empty() {
+            out.push(SseText {
+                kind: SseTextKind::CohereToolPlan,
+                json_path: "$.message.tool_plan".to_string(),
+                text: self.cohere_tool_plan,
+            });
+        }
+        for (index, accum) in self.cohere_tool_calls {
+            if !accum.name.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::CohereToolName,
+                    json_path: format!("$.message.tool_calls[{index}].function.name"),
+                    text: accum.name,
+                });
+            }
+            if !accum.arguments.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::CohereToolArguments,
+                    json_path: format!("$.message.tool_calls[{index}].function.arguments"),
+                    text: accum.arguments,
+                });
+            }
+        }
+        for ((citation, source), text) in self.cohere_citation_sources {
+            if !text.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::CohereCitationSource,
+                    json_path: format!("$.message.citations[{citation}].sources[{source}]"),
+                    text,
+                });
+            }
         }
         out
     }
@@ -1920,70 +2707,53 @@ impl SseReassembler {
     }
 
     fn completion_text_mut(&mut self, choice: usize) -> &mut String {
-        let pos = match self.completion_text_positions.get(&choice).copied() {
-            Some(pos) => pos,
-            None => {
-                let pos = self.completion_text.len();
-                self.completion_text.push((choice, String::new()));
-                self.completion_text_positions.insert(choice, pos);
-                pos
-            }
-        };
-        &mut self.completion_text[pos].1
+        bounded_slot(
+            &mut self.completion_text,
+            &mut self.completion_text_positions,
+            choice,
+            usize::MAX,
+            &mut self.provider_uninspectable,
+        )
     }
 
     fn content_mut(&mut self, choice: usize) -> &mut String {
-        let pos = match self.content_positions.get(&choice).copied() {
-            Some(pos) => pos,
-            None => {
-                let pos = self.content.len();
-                self.content.push((choice, String::new()));
-                self.content_positions.insert(choice, pos);
-                pos
-            }
-        };
-        &mut self.content[pos].1
+        bounded_slot(
+            &mut self.content,
+            &mut self.content_positions,
+            choice,
+            usize::MAX,
+            &mut self.provider_uninspectable,
+        )
     }
 
     fn tool_call_mut(&mut self, choice: usize, tool: usize) -> &mut ToolCallAccumulator {
-        let key = (choice, tool);
-        let pos = match self.tool_call_positions.get(&key).copied() {
-            Some(pos) => pos,
-            None => {
-                let pos = self.tool_calls.len();
-                self.tool_calls.push((key, ToolCallAccumulator::default()));
-                self.tool_call_positions.insert(key, pos);
-                pos
-            }
-        };
-        &mut self.tool_calls[pos].1
+        bounded_slot(
+            &mut self.tool_calls,
+            &mut self.tool_call_positions,
+            (choice, tool),
+            (usize::MAX, usize::MAX),
+            &mut self.provider_uninspectable,
+        )
     }
 
     fn responses_text_mut(&mut self, output: usize, content: usize) -> &mut String {
-        let key = (output, content);
-        let pos = match self.responses_text_positions.get(&key).copied() {
-            Some(pos) => pos,
-            None => {
-                let pos = self.responses_text.len();
-                self.responses_text.push((key, String::new()));
-                self.responses_text_positions.insert(key, pos);
-                pos
-            }
-        };
-        &mut self.responses_text[pos].1
+        bounded_slot(
+            &mut self.responses_text,
+            &mut self.responses_text_positions,
+            (output, content),
+            (usize::MAX, usize::MAX),
+            &mut self.provider_uninspectable,
+        )
     }
 
     fn responses_args_mut(&mut self, output: usize) -> &mut String {
-        let pos = match self.responses_args_positions.get(&output).copied() {
-            Some(pos) => pos,
-            None => {
-                let pos = self.responses_args.len();
-                self.responses_args.push((output, String::new()));
-                self.responses_args_positions.insert(output, pos);
-                pos
-            }
-        };
-        &mut self.responses_args[pos].1
+        bounded_slot(
+            &mut self.responses_args,
+            &mut self.responses_args_positions,
+            output,
+            usize::MAX,
+            &mut self.provider_uninspectable,
+        )
     }
 }
 
@@ -2259,7 +3029,7 @@ mod tests {
     #[test]
     fn parse_sse_frames_basic() {
         let body = b"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"id\":\"2\",\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\ndata: [DONE]\n\n";
-        let frames = parse_sse_data_frames(body);
+        let frames = parse_sse_data_frames_checked(body).frames;
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0]["id"], "1");
         assert_eq!(frames[1]["id"], "2");
@@ -2267,13 +3037,13 @@ mod tests {
 
     #[test]
     fn parse_sse_frames_empty_body() {
-        assert!(parse_sse_data_frames(b"").is_empty());
+        assert!(parse_sse_data_frames_checked(b"").frames.is_empty());
     }
 
     #[test]
     fn parse_sse_frames_skips_done_and_comments() {
         let body = b": comment\ndata: [DONE]\n\ndata: {\"ok\":true}\n";
-        let frames = parse_sse_data_frames(body);
+        let frames = parse_sse_data_frames_checked(body).frames;
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["ok"], true);
     }
@@ -2281,7 +3051,7 @@ mod tests {
     #[test]
     fn parse_sse_frames_no_space_after_colon() {
         let body = b"data:{\"v\":1}\n";
-        let frames = parse_sse_data_frames(body);
+        let frames = parse_sse_data_frames_checked(body).frames;
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["v"], 1);
     }
@@ -2289,7 +3059,7 @@ mod tests {
     #[test]
     fn parse_sse_frames_multiline_data_event() {
         let body = b"data: {\"id\":\"1\",\ndata: \"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"id\":\"2\"}\n\n";
-        let frames = parse_sse_data_frames(body);
+        let frames = parse_sse_data_frames_checked(body).frames;
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0]["id"], "1");
         assert_eq!(frames[0]["choices"][0]["delta"]["content"], "Hello");
@@ -2299,14 +3069,14 @@ mod tests {
     #[test]
     fn parse_sse_frames_skips_invalid_json() {
         let body = b"data: not-json\n\ndata: {\"ok\":true}\n";
-        let frames = parse_sse_data_frames(body);
+        let frames = parse_sse_data_frames_checked(body).frames;
         assert_eq!(frames.len(), 1);
     }
 
     #[test]
     fn parse_sse_frames_invalid_utf8() {
         let body: &[u8] = &[0xff, 0xfe, 0xfd];
-        assert!(parse_sse_data_frames(body).is_empty());
+        assert!(parse_sse_data_frames_checked(body).frames.is_empty());
     }
 
     #[test]
@@ -2350,7 +3120,7 @@ mod tests {
         assert!(text.starts_with("event: error\ndata: {"));
         assert!(text.ends_with("\n\ndata: [DONE]\n\n"));
         // The data payload round-trips through the parser as one JSON frame.
-        let frames = parse_sse_data_frames(&bytes);
+        let frames = parse_sse_data_frames_checked(&bytes).frames;
         assert_eq!(frames.len(), 1);
         assert_eq!(
             frames[0]["error"]["code"],
@@ -2363,7 +3133,7 @@ mod tests {
     fn encode_sse_error_event_escapes_payload() {
         // Embedded quotes / newlines must not break out of the single data line.
         let bytes = encode_sse_error_event("c", "line1\nline2 \"q\"");
-        let frames = parse_sse_data_frames(&bytes);
+        let frames = parse_sse_data_frames_checked(&bytes).frames;
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["error"]["message"], "line1\nline2 \"q\"");
     }
@@ -2371,10 +3141,12 @@ mod tests {
     #[test]
     fn assistant_content_concatenates_choice_and_responses_text() {
         let mut r = SseReassembler::new();
-        for frame in parse_sse_data_frames(
+        for frame in parse_sse_data_frames_checked(
             b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello \"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
-        ) {
+        )
+        .frames
+        {
             r.push_frame(&frame);
         }
         assert_eq!(r.assistant_content(), "Hello world.");
@@ -2387,9 +3159,11 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
     #[test]
     fn drain_assistant_prefix_keeps_tail_and_snaps_boundaries() {
         let mut r = SseReassembler::new();
-        for frame in parse_sse_data_frames(
+        for frame in parse_sse_data_frames_checked(
             b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello world.\"}}]}\n\n",
-        ) {
+        )
+        .frames
+        {
             r.push_frame(&frame);
         }
         // Drop the first sentence, keep the tail.
@@ -2400,9 +3174,11 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
         // A prefix landing mid-multibyte-char snaps down (retains a few extra
         // bytes) rather than panicking or dropping a partial char.
         let mut m = SseReassembler::new();
-        for frame in parse_sse_data_frames(
+        for frame in parse_sse_data_frames_checked(
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"aé\"}}]}\n\n".as_bytes(),
-        ) {
+        )
+        .frames
+        {
             m.push_frame(&frame);
         }
         m.drain_assistant_prefix(2); // index 2 is mid-'é' → floors to 1
@@ -2410,9 +3186,11 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
 
         // Tool-call accumulators are NOT drained by a prose-prefix drain.
         let mut t = SseReassembler::new();
-        for frame in parse_sse_data_frames(
+        for frame in parse_sse_data_frames_checked(
             b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"exec\",\"arguments\":\"{}\"}}]}}]}\n\n",
-        ) {
+        )
+        .frames
+        {
             t.push_frame(&frame);
         }
         t.drain_assistant_prefix(100);
@@ -2470,7 +3248,7 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
         let frame = format!(
             "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"name\":\"run\",\"arguments\":\"{big}\"}}}}]}}}}]}}\n\n"
         );
-        for f in parse_sse_data_frames(frame.as_bytes()) {
+        for f in parse_sse_data_frames_checked(frame.as_bytes()).frames {
             r.push_frame(&f);
         }
         r.truncate_streamed_tool_state(64);
@@ -2499,7 +3277,7 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
         let frame = format!(
             "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"name\":\"{name}\",\"arguments\":\"{arguments}\"}}}},{{\"index\":1,\"function\":{{\"name\":\"{name}\",\"arguments\":\"{arguments}\"}}}}]}}}}]}}\n\n"
         );
-        for parsed in parse_sse_data_frames(frame.as_bytes()) {
+        for parsed in parse_sse_data_frames_checked(frame.as_bytes()).frames {
             r.push_frame(&parsed);
         }
         assert!(r.retained_text_len() > 64);
@@ -2544,7 +3322,7 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
 
     fn reassemble(body: &[u8]) -> Vec<SseText> {
         let mut reassembler = SseReassembler::new();
-        for frame in parse_sse_data_frames(body) {
+        for frame in parse_sse_data_frames_checked(body).frames {
             reassembler.push_frame(&frame);
         }
         reassembler.into_texts()
@@ -2601,10 +3379,21 @@ data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"baz\"}}]}\n\n";
             }));
         }
 
+        // Issue #6624: distinct choice keys are capped; the excess folds into
+        // one overflow accumulator whose bytes are kept, and the stream is
+        // flagged so enforcing callers fail closed.
+        assert!(reassembler.provider_stream_uninspectable());
         let texts = reassembler.into_texts();
-        assert_eq!(texts.len(), 4096);
+        assert_eq!(texts.len(), MAX_OPENAI_STREAM_ACCUMULATORS + 1);
         assert_eq!(texts[0].json_path, "$.choices[0].delta.content");
-        assert_eq!(texts[4095].json_path, "$.choices[4095].delta.content");
+        let overflow = texts.last().expect("overflow accumulator");
+        assert_eq!(
+            overflow.json_path,
+            format!("$.choices[{}].delta.content", usize::MAX)
+        );
+        assert_eq!(overflow.text.len(), 4096 - MAX_OPENAI_STREAM_ACCUMULATORS);
+        let retained: usize = texts.iter().map(|text| text.text.len()).sum();
+        assert_eq!(retained, 4096);
     }
 
     #[test]

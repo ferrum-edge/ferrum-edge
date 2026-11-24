@@ -49,7 +49,7 @@ fn token(subject: &str, role: Option<&str>) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()).unwrap(),
     )
     .unwrap()
 }
@@ -71,7 +71,7 @@ fn token_with_ns(subject: &str, role: Option<&str>, ns: Value) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()).unwrap(),
     )
     .unwrap()
 }
@@ -876,7 +876,9 @@ async fn malformed_persisted_serverless_url_is_wholly_redacted_from_views_and_au
     assert!(!viewer_body.to_string().contains(nested_secret));
 
     let response = reqwest::Client::new()
-        .delete(format!("{base}/plugins/config/{plugin_id}"))
+        .delete(format!(
+            "{base}/plugins/config/{plugin_id}?expected_proxy_ids="
+        ))
         .bearer_auth(&admin)
         .send()
         .await
@@ -1081,6 +1083,84 @@ async fn otel_tracing_config_projections_redact_endpoint_auth_and_headers() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn request_transformer_rule_values_are_redacted_for_non_admins_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("ops", Some("operator"));
+
+    let header_secret = "rt-upstream-header-canary";
+    let query_secret = "rt-upstream-query-canary";
+    let plugin = json!({
+        "id": "rt-redaction-config",
+        "plugin_name": "request_transformer",
+        "scope": "global",
+        "config": {
+            "rules": [
+                {"operation": "update", "target": "header", "key": "X-Upstream-Token",
+                 "value": format!("Bearer {header_secret}")},
+                {"operation": "add", "target": "query", "key": "token",
+                 "value": query_secret}
+            ]
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "request_transformer create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=rt-redaction-config",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_config =
+        audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"].clone();
+
+    let mut projections = vec![audit_config];
+    for bearer in [&viewer, &operator] {
+        let (status, projected) =
+            get_json(&base, "/plugins/config/rt-redaction-config", bearer).await;
+        assert_eq!(status, 200, "non-admin config read failed: {projected:?}");
+        projections.push(projected["config"].clone());
+
+        let (status, list) = get_json(&base, "/plugins/config", bearer).await;
+        assert_eq!(status, 200, "non-admin config list failed: {list:?}");
+        let listed = list["data"]
+            .as_array()
+            .expect("plugin list data")
+            .iter()
+            .find(|item| item["id"] == "rt-redaction-config")
+            .expect("listed request_transformer config");
+        projections.push(listed["config"].clone());
+    }
+    for projection in &projections {
+        assert_eq!(projection["rules"][0]["value"], "[REDACTED]");
+        assert_eq!(projection["rules"][1]["value"], "[REDACTED]");
+        assert_eq!(projection["rules"][1]["target"], "query");
+        let serialized = projection.to_string();
+        for secret in [header_secret, query_secret] {
+            assert!(
+                !serialized.contains(secret),
+                "request_transformer projection leaked {secret}: {serialized}"
+            );
+        }
+    }
+
+    // Admin reads stay raw for read-modify-write.
+    let (status, raw) = get_json(&base, "/plugins/config/rt-redaction-config", &admin).await;
+    assert_eq!(status, 200, "admin config read failed: {raw:?}");
+    assert_eq!(
+        raw["config"]["rules"][0]["value"],
+        format!("Bearer {header_secret}")
+    );
+    assert_eq!(raw["config"]["rules"][1]["value"], query_secret);
 }
 
 fn assert_otel_config_projection_redacted(config: &Value) {
@@ -1756,7 +1836,9 @@ async fn kafka_producer_config_properties_are_projected_by_allow_list() {
     let operator = token("mesh-operator", Some("operator"));
 
     let keypw_secret = "kafka-keypw-canary";
-    let oauth_secret = "kafka-keytab-canary";
+    // `sasl.kerberos.keytab` is a native key refused at admission (#6539);
+    // `sasl.kerberos.principal` likewise matches no redaction name heuristic.
+    let oauth_secret = "kafka-principal-canary";
     let plugin = json!({
         "id": "kafka-producer-redaction",
         "plugin_name": "kafka_logging",
@@ -1771,7 +1853,7 @@ async fn kafka_producer_config_properties_are_projected_by_allow_list() {
             "security_protocol": "sasl_ssl",
             "producer_config": {
                 "ssl.key.password": keypw_secret,
-                "sasl.kerberos.keytab": oauth_secret,
+                "sasl.kerberos.principal": oauth_secret,
                 "linger.ms": "20",
                 "compression.type": "lz4"
             }
@@ -1804,7 +1886,7 @@ async fn kafka_producer_config_properties_are_projected_by_allow_list() {
     let (status, raw) = get_json(&base, "/plugins/config/kafka-producer-redaction", &admin).await;
     assert_eq!(status, 200, "admin read failed: {raw:?}");
     assert_eq!(
-        raw["config"]["producer_config"]["sasl.kerberos.keytab"],
+        raw["config"]["producer_config"]["sasl.kerberos.principal"],
         oauth_secret
     );
 
@@ -1823,7 +1905,7 @@ fn assert_kafka_projection_redacted(config: &Value) {
     let props = &config["producer_config"];
     assert_eq!(props["ssl.key.password"], "[REDACTED]");
     // No name heuristic matches this property; only the allow-list saves it.
-    assert_eq!(props["sasl.kerberos.keytab"], "[REDACTED]");
+    assert_eq!(props["sasl.kerberos.principal"], "[REDACTED]");
     // Safe-value controls: allow-listed tuning knobs stay visible.
     assert_eq!(props["linger.ms"], "20");
     assert_eq!(props["compression.type"], "lz4");
@@ -2502,6 +2584,7 @@ async fn operator_round_trip_of_masked_plugin_secrets_is_refused() {
     let admin = token("security-admin", Some("admin"));
     let operator = token("mesh-operator", Some("operator"));
     let path = "/plugins/config/roundtrip-http-logging";
+    let write_path = "/plugins/config/roundtrip-http-logging?expected_proxy_ids=";
 
     let endpoint = "https://collector.example.com/roundtrip-path-canary/ingest?api_key=canary";
     let header_secret = "roundtrip-honeycomb-canary";
@@ -2536,7 +2619,7 @@ async fn operator_round_trip_of_masked_plugin_secrets_is_refused() {
     let (status, _, refused) = send_json(
         reqwest::Method::PUT,
         &base,
-        path,
+        write_path,
         &operator,
         Some(&etag),
         Some(&masked),
@@ -2564,7 +2647,7 @@ async fn operator_round_trip_of_masked_plugin_secrets_is_refused() {
     let (status, _, body) = send_json(
         reqwest::Method::PUT,
         &base,
-        path,
+        write_path,
         &operator,
         Some(&etag),
         Some(&masked),
@@ -2582,7 +2665,7 @@ async fn operator_round_trip_of_masked_plugin_secrets_is_refused() {
     let (status, _, body) = send_json(
         reqwest::Method::PUT,
         &base,
-        path,
+        write_path,
         &admin,
         etag.as_deref(),
         Some(&raw),
@@ -2596,4 +2679,1071 @@ async fn operator_round_trip_of_masked_plugin_secrets_is_refused() {
         header_secret
     );
     assert_eq!(stored["config"]["batch_size"], 100);
+}
+
+fn assert_trigger_projection_redacted(trigger: &Value, secrets: &[&str]) {
+    let all = &trigger["when"]["all"];
+    assert_eq!(all[0]["match"]["method"], json!(["POST"]));
+    let header = &all[1]["not"]["match"]["header"];
+    assert_eq!(header["name"], "x-skip-transform");
+    assert_eq!(header["value"], json!({"exact": ["[REDACTED]"]}));
+    let query = &all[2]["any"][0]["match"]["query"];
+    assert_eq!(query["name"], "debug");
+    assert_eq!(query["value"], json!({"prefix": ["[REDACTED]"]}));
+    let cookie = &all[2]["any"][1]["match"]["cookie"];
+    assert_eq!(cookie["name"], "tier");
+    assert_eq!(
+        cookie["value"],
+        json!({"regex": "[REDACTED]", "case_insensitive": true})
+    );
+    let serialized = trigger.to_string();
+    for secret in secrets {
+        assert!(
+            !serialized.contains(secret),
+            "trigger projection leaked {secret}: {serialized}"
+        );
+    }
+}
+
+/// A plugin `trigger` is a sibling of `config`. Its header, query, and cookie
+/// operands are values a client presents to switch the instance on or off: a
+/// negated header trigger skips the instance for anyone who knows the value.
+/// Viewer and operator reads (single and list) and the audit diff withhold them
+/// anywhere in the tree while keeping field names, match kinds, flags, and the
+/// tree structure; admin reads stay raw; an operator write that echoes the
+/// placeholder is refused and leaves the stored operands untouched.
+#[tokio::test]
+async fn plugin_trigger_operands_are_projected_for_non_admins_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("ops", Some("operator"));
+    let path = "/plugins/config/trigger-redaction";
+    let write_path = "/plugins/config/trigger-redaction?expected_proxy_ids=";
+
+    let header_secret = "trigger-skip-header-canary";
+    let query_secret = "trigger-query-prefix-canary";
+    let cookie_secret = "trigger-cookie-regex-canary";
+    let secrets = [header_secret, query_secret, cookie_secret];
+    let plugin = json!({
+        "id": "trigger-redaction",
+        "plugin_name": "request_transformer",
+        "scope": "global",
+        "enabled": true,
+        "config": {
+            "rules": [{"operation": "add", "target": "header", "key": "x-env", "value": "edge"}]
+        },
+        "trigger": {"when": {"all": [
+            {"match": {"method": ["POST"]}},
+            {"not": {"match": {"header": {
+                "name": "x-skip-transform",
+                "value": {"exact": [header_secret]}
+            }}}},
+            {"any": [
+                {"match": {"query": {"name": "debug", "value": {"prefix": [query_secret]}}}},
+                {"match": {"cookie": {
+                    "name": "tier",
+                    "value": {"regex": cookie_secret, "case_insensitive": true}
+                }}}
+            ]}
+        ]}}
+    });
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "triggered plugin create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=trigger-redaction",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_items = audit_body["items"].as_array().expect("audit items");
+    let mut projections = vec![audit_items[0]["diff"]["after"]["trigger"].clone()];
+    for bearer in [&viewer, &operator] {
+        let (status, projected) = get_json(&base, path, bearer).await;
+        assert_eq!(status, 200, "non-admin config read failed: {projected:?}");
+        projections.push(projected["trigger"].clone());
+
+        let (status, list) = get_json(&base, "/plugins/config", bearer).await;
+        assert_eq!(status, 200, "non-admin config list failed: {list:?}");
+        let listed = list["data"]
+            .as_array()
+            .expect("plugin list data")
+            .iter()
+            .find(|item| item["id"] == "trigger-redaction")
+            .expect("listed triggered config");
+        projections.push(listed["trigger"].clone());
+    }
+    for projection in &projections {
+        assert_trigger_projection_redacted(projection, &secrets);
+    }
+
+    // Admin reads stay raw for read-modify-write.
+    let (status, raw) = get_json(&base, path, &admin).await;
+    assert_eq!(status, 200, "admin config read failed: {raw:?}");
+    let all = &raw["trigger"]["when"]["all"];
+    assert_eq!(
+        all[1]["not"]["match"]["header"]["value"]["exact"][0],
+        header_secret
+    );
+    assert_eq!(
+        all[2]["any"][0]["match"]["query"]["value"]["prefix"][0],
+        query_secret
+    );
+    assert_eq!(
+        all[2]["any"][1]["match"]["cookie"]["value"]["regex"],
+        cookie_secret
+    );
+
+    // An operator write that echoes the masked trigger is refused. The config
+    // is restored to its real values so only the trigger carries placeholders.
+    let (status, etag, mut masked) =
+        send_json(reqwest::Method::GET, &base, path, &operator, None, None).await;
+    assert_eq!(status, 200, "operator plugin get failed: {masked:?}");
+    let etag = etag.expect("plugin config GET carries an ETag");
+    masked["config"] = raw["config"].clone();
+    let (status, _, refused) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        write_path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(status, 400, "masked trigger was accepted: {refused:?}");
+    let error = refused["error"].as_str().expect("error message");
+    for pointer in [
+        "/trigger/when/all/1/not/match/header/value/exact/0",
+        "/trigger/when/all/2/any/0/match/query/value/prefix/0",
+        "/trigger/when/all/2/any/1/match/cookie/value/regex",
+    ] {
+        assert!(error.contains(pointer), "missing {pointer}: {error}");
+    }
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    let header = &stored["trigger"]["when"]["all"][1]["not"]["match"]["header"];
+    assert_eq!(header["value"]["exact"][0], header_secret);
+}
+
+/// A `mesh_authz` external-authorization provider's check-URL `path_prefix` is
+/// a shared secret on some check services. Viewer and operator reads (single
+/// and list) and the audit diff withhold it while the provider's name,
+/// service, and port stay visible; admin reads stay raw; an operator write
+/// that echoes the placeholder is refused and leaves the stored value intact.
+#[tokio::test]
+async fn mesh_authz_ext_authz_path_prefix_is_projected_for_non_admins_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("ops", Some("operator"));
+    let path = "/plugins/config/mesh-authz-ext";
+    let write_path = "/plugins/config/mesh-authz-ext?expected_proxy_ids=";
+
+    let prefix_secret = "/check/ext-authz-prefix-canary";
+    // Disabled configs are stored without plugin construction, so the slice
+    // needs only the fields under test.
+    let plugin = json!({
+        "id": "mesh-authz-ext",
+        "plugin_name": "mesh_authz",
+        "scope": "global",
+        "enabled": false,
+        "config": {"mesh_slice": {"ext_authz_providers": [{
+            "name": "ext-check",
+            "service": "authz.shop.svc.cluster.local",
+            "port": 9000,
+            "path_prefix": prefix_secret,
+            "timeout_ms": 500,
+            "status_on_error": 403
+        }]}}
+    });
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "mesh_authz create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=mesh-authz-ext",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_items = audit_body["items"].as_array().expect("audit items");
+    let mut projections = vec![audit_items[0]["diff"]["after"]["config"].clone()];
+    for bearer in [&viewer, &operator] {
+        let (status, projected) = get_json(&base, path, bearer).await;
+        assert_eq!(status, 200, "non-admin config read failed: {projected:?}");
+        projections.push(projected["config"].clone());
+
+        let (status, list) = get_json(&base, "/plugins/config", bearer).await;
+        assert_eq!(status, 200, "non-admin config list failed: {list:?}");
+        let listed = list["data"]
+            .as_array()
+            .expect("plugin list data")
+            .iter()
+            .find(|item| item["id"] == "mesh-authz-ext")
+            .expect("listed mesh_authz config");
+        projections.push(listed["config"].clone());
+    }
+    for projection in &projections {
+        let provider = &projection["mesh_slice"]["ext_authz_providers"][0];
+        assert_eq!(provider["path_prefix"], "[REDACTED]", "{projection}");
+        assert_eq!(provider["service"], "authz.shop.svc.cluster.local");
+        assert_eq!(provider["port"], 9000);
+        assert_eq!(provider["name"], "ext-check");
+        assert!(
+            !projection.to_string().contains(prefix_secret),
+            "path_prefix leaked: {projection}"
+        );
+    }
+
+    // Admin reads stay raw for read-modify-write.
+    let (status, raw) = get_json(&base, path, &admin).await;
+    assert_eq!(status, 200, "admin config read failed: {raw:?}");
+    let raw_provider = &raw["config"]["mesh_slice"]["ext_authz_providers"][0];
+    assert_eq!(raw_provider["path_prefix"], prefix_secret);
+
+    // An operator write that echoes the masked prefix is refused.
+    let (status, etag, masked) =
+        send_json(reqwest::Method::GET, &base, path, &operator, None, None).await;
+    assert_eq!(status, 200, "operator plugin get failed: {masked:?}");
+    let etag = etag.expect("plugin config GET carries an ETag");
+    let (status, _, refused) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        write_path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(status, 400, "masked path_prefix was accepted: {refused:?}");
+    let error = refused["error"].as_str().expect("error message");
+    assert!(
+        error.contains("/config/mesh_slice/ext_authz_providers/0/path_prefix"),
+        "unexpected refusal: {error}"
+    );
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    assert_eq!(
+        stored["config"]["mesh_slice"]["ext_authz_providers"][0]["path_prefix"],
+        prefix_secret
+    );
+}
+
+/// A self-signed backend mTLS client certificate and its PKCS#8 private key,
+/// both PEM, so admission (which parses inline material) accepts them.
+fn backend_client_cert_and_key_pem() -> (String, String) {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("client key");
+    let params =
+        rcgen::CertificateParams::new(vec!["client.test".to_string()]).expect("client params");
+    let cert = params.self_signed(&key).expect("self-signed client cert");
+    (cert.pem(), key.serialize_pem())
+}
+
+fn backend_tls_proxy(id: &str, cert: &str, key: &str) -> Value {
+    json!({
+        "id": id,
+        "name": id,
+        "listen_path": format!("/{id}"),
+        "backend_scheme": "https",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8443,
+        "backend_tls_client_cert_path": cert,
+        "backend_tls_client_key_path": key
+    })
+}
+
+fn backend_tls_upstream(id: &str, cert: &str, key: &str) -> Value {
+    json!({
+        "id": id,
+        "name": id,
+        "targets": [{"host": "127.0.0.1", "port": 8443, "weight": 100}],
+        "algorithm": "round_robin",
+        "backend_tls_client_cert_path": cert,
+        "backend_tls_client_key_path": key
+    })
+}
+
+/// The item with `id` in a paginated list response.
+fn list_item<'a>(list: &'a Value, id: &str) -> &'a Value {
+    list["data"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["id"] == id))
+        .unwrap_or_else(|| panic!("{id} must be listed: {list}"))
+}
+
+/// An inline PEM private key stored in `backend_tls_client_key_path` is never
+/// returned by `viewer` or `operator` reads (single or list) or in audit
+/// diffs. A key reference and the public certificate stay visible, and
+/// `admin` reads stay raw.
+#[tokio::test]
+async fn non_admin_reads_withhold_inline_backend_tls_private_keys() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let (cert_pem, key_pem) = backend_client_cert_and_key_pem();
+    let key_body = key_pem.lines().nth(1).expect("key body line").to_string();
+    let cert_file = tmp.path().join("client.crt");
+    let key_file = tmp.path().join("client.key");
+    std::fs::write(&cert_file, &cert_pem).expect("write client cert");
+    std::fs::write(&key_file, &key_pem).expect("write client key");
+    let cert_path = cert_file.to_str().expect("utf-8 temp path").to_string();
+    let key_path = key_file.to_str().expect("utf-8 temp path").to_string();
+
+    for (route, inline, by_path) in [
+        (
+            "/proxies",
+            backend_tls_proxy("pem-proxy", &cert_pem, &key_pem),
+            backend_tls_proxy("path-proxy", &cert_path, &key_path),
+        ),
+        (
+            "/upstreams",
+            backend_tls_upstream("pem-upstream", &cert_pem, &key_pem),
+            backend_tls_upstream("path-upstream", &cert_path, &key_path),
+        ),
+    ] {
+        for body in [&inline, &by_path] {
+            let (status, response) = post_json(&base, route, &admin, body).await;
+            assert_eq!(status, 201, "{route} create failed: {response:?}");
+        }
+        let inline_id = inline["id"].as_str().expect("inline id");
+        let path_id = by_path["id"].as_str().expect("path id");
+
+        for (role, bearer) in [("viewer", &viewer), ("operator", &operator)] {
+            let (status, single) = get_json(&base, &format!("{route}/{inline_id}"), bearer).await;
+            assert_eq!(status, 200, "{role} {route} get failed: {single:?}");
+            let (status, list) = get_json(&base, route, bearer).await;
+            assert_eq!(status, 200, "{role} {route} list failed: {list:?}");
+            for body in [&single, list_item(&list, inline_id)] {
+                assert_eq!(
+                    body["backend_tls_client_key_path"], "[REDACTED]",
+                    "{role} {route} read returned the inline key: {body}"
+                );
+                assert_eq!(body["backend_tls_client_cert_path"], cert_pem.as_str());
+                assert_eq!(body["name"], inline_id);
+                let text = body.to_string();
+                assert!(
+                    !text.contains("PRIVATE KEY") && !text.contains(&key_body),
+                    "{role} {route} read leaked private-key material: {body}"
+                );
+            }
+
+            // A reference names the key without disclosing it.
+            let (status, single) = get_json(&base, &format!("{route}/{path_id}"), bearer).await;
+            assert_eq!(status, 200, "{role} {route} get failed: {single:?}");
+            assert_eq!(single["backend_tls_client_key_path"], key_path.as_str());
+            assert_eq!(single["backend_tls_client_cert_path"], cert_path.as_str());
+        }
+
+        let (status, raw) = get_json(&base, &format!("{route}/{inline_id}"), &admin).await;
+        assert_eq!(status, 200, "admin {route} get failed: {raw:?}");
+        assert_eq!(raw["backend_tls_client_key_path"], key_pem.as_str());
+    }
+
+    for (resource_type, id) in [("proxy", "pem-proxy"), ("upstream", "pem-upstream")] {
+        let audit_body = wait_for_audit_total(
+            &base,
+            &format!("/audit?resource_type={resource_type}&resource_id={id}"),
+            &admin,
+            1,
+        )
+        .await;
+        let event = &audit_body["items"].as_array().expect("audit items")[0];
+        assert_eq!(
+            event["diff"]["after"]["backend_tls_client_key_path"], "[REDACTED]",
+            "{resource_type} audit diff kept the inline key: {event:?}"
+        );
+        let serialized = event["diff"].to_string();
+        assert!(
+            !serialized.contains("PRIVATE KEY") && !serialized.contains(&key_body),
+            "{resource_type} audit diff leaked private-key material: {event:?}"
+        );
+    }
+}
+
+/// Issue #5925 semantics for the masked backend TLS key: an operator that
+/// writes back the `[REDACTED]` it was shown is refused with `400` and the
+/// stored key survives; resending the real key is an ordinary write.
+#[tokio::test]
+async fn operator_round_trip_of_masked_backend_tls_private_key_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let operator = token("mesh-operator", Some("operator"));
+    let (cert_pem, key_pem) = backend_client_cert_and_key_pem();
+
+    for (route, body) in [
+        (
+            "/proxies",
+            backend_tls_proxy("roundtrip-pem-proxy", &cert_pem, &key_pem),
+        ),
+        (
+            "/upstreams",
+            backend_tls_upstream("roundtrip-pem-upstream", &cert_pem, &key_pem),
+        ),
+    ] {
+        let (status, response) = post_json(&base, route, &admin, &body).await;
+        assert_eq!(status, 201, "{route} create failed: {response:?}");
+        let path = format!("{route}/{}", body["id"].as_str().expect("id"));
+
+        let (status, etag, mut masked) =
+            send_json(reqwest::Method::GET, &base, &path, &operator, None, None).await;
+        assert_eq!(status, 200, "operator {route} get failed: {masked:?}");
+        assert_eq!(masked["backend_tls_client_key_path"], "[REDACTED]");
+        let etag = etag.expect("GET carries an ETag");
+
+        // An unrelated edit, written back with the masked key and a fresh tag.
+        masked["name"] = json!("renamed-by-operator");
+        let (status, _, refused) = send_json(
+            reqwest::Method::PUT,
+            &base,
+            &path,
+            &operator,
+            Some(&etag),
+            Some(&masked),
+        )
+        .await;
+        assert_eq!(status, 400, "{route} masked write accepted: {refused:?}");
+        let error = refused["error"].as_str().expect("error message");
+        assert!(
+            error.contains("/backend_tls_client_key_path") && error.contains("real value"),
+            "unexpected refusal: {error}"
+        );
+        assert!(!error.contains("PRIVATE KEY"), "{error}");
+
+        let (_, _, stored) =
+            send_json(reqwest::Method::GET, &base, &path, &admin, None, None).await;
+        assert_eq!(stored["backend_tls_client_key_path"], key_pem.as_str());
+        assert_ne!(stored["name"], "renamed-by-operator", "write mutated");
+
+        // Sending the real key is an ordinary operator write.
+        masked["backend_tls_client_key_path"] = json!(key_pem);
+        let (status, _, response) = send_json(
+            reqwest::Method::PUT,
+            &base,
+            &path,
+            &operator,
+            Some(&etag),
+            Some(&masked),
+        )
+        .await;
+        assert_eq!(status, 200, "{route} operator write failed: {response:?}");
+        assert_eq!(response["backend_tls_client_key_path"], "[REDACTED]");
+        let (_, _, stored) =
+            send_json(reqwest::Method::GET, &base, &path, &admin, None, None).await;
+        assert_eq!(stored["backend_tls_client_key_path"], key_pem.as_str());
+        assert_eq!(stored["name"], "renamed-by-operator");
+    }
+}
+
+/// A read-only admin plane (file, DP or mesh mode) serving `config` from its
+/// cached snapshot, with no database.
+async fn cached_admin(tmp: &TempDir, config: Value) -> (String, tokio::sync::watch::Sender<bool>) {
+    let config: ferrum_edge::config::types::GatewayConfig =
+        serde_json::from_value(config).expect("cached config deserializes");
+    let mut state = admin_state_with_audit(make_store(tmp).await, false);
+    state.db = None;
+    state.read_only = true;
+    state.mode = "file".to_string();
+    state.cached_config = Some(Arc::new(ArcSwap::new(Arc::new(config))));
+    start_admin(state).await
+}
+
+/// A JSON-pointer lookup that names the missing pointer on failure.
+fn at<'a>(body: &'a Value, pointer: &str) -> &'a Value {
+    match body.pointer(pointer) {
+        Some(value) => value,
+        None => panic!("{pointer} missing from {body}"),
+    }
+}
+
+/// Mesh DestinationRule `MUTUAL` TLS can put inline PEM keys into an
+/// upstream's subset (`subsets[].traffic_policy.tls`) and per-port
+/// (`port_overrides.<port>.tls`) slots, and a read-only plane serves that
+/// upstream from its cached config. Every nested key slot, and a CA or
+/// certificate field carrying a private-key block, is withheld from `viewer`
+/// and `operator` reads and fingerprinted in the export; references and
+/// certificates stay visible, and `admin` reads stay raw.
+#[tokio::test]
+async fn cached_reads_withhold_nested_inline_tls_private_keys() {
+    let tmp = TempDir::new().unwrap();
+    let (cert_pem, key_pem) = backend_client_cert_and_key_pem();
+    let key_body = key_pem.lines().nth(1).expect("key body line").to_string();
+    let bundle = format!("{cert_pem}{key_pem}");
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "bundle-proxy",
+            "listen_path": "/bundle",
+            "backend_scheme": "https",
+            "backend_host": "backend.internal",
+            "backend_port": 8443,
+            "backend_tls_client_cert_path": "/etc/ferrum/client.crt",
+            "backend_tls_client_key_path": "/etc/ferrum/client.key",
+            "backend_tls_server_ca_cert_path": bundle
+        }],
+        "plugin_configs": [],
+        "upstreams": [{
+            "id": "mesh-upstream",
+            "name": "mesh-upstream",
+            "targets": [{"host": "10.0.0.10", "port": 443, "weight": 100}],
+            "subsets": [
+                {
+                    "name": "v1",
+                    "labels": {"version": "v1"},
+                    "traffic_policy": {"tls": {
+                        "mode": "mutual",
+                        "client_certificate": cert_pem,
+                        "private_key": key_pem,
+                        "ca_certificates": bundle
+                    }}
+                },
+                {
+                    "name": "v2",
+                    "labels": {"version": "v2"},
+                    "traffic_policy": {"tls": {
+                        "mode": "mutual",
+                        "client_certificate": "k8s://ferrum/v2-mtls#tls.crt",
+                        "private_key": "k8s://ferrum/v2-mtls#tls.key"
+                    }}
+                }
+            ],
+            "port_overrides": {
+                "443": {"tls": {
+                    "client_cert_path": cert_pem,
+                    "client_key_path": key_pem,
+                    "server_ca_cert_path": "/etc/ferrum/ca.pem"
+                }},
+                "8443": {"tls": {
+                    "client_cert_path": "/etc/ferrum/client.crt",
+                    "client_key_path": "/etc/ferrum/client.key"
+                }}
+            }
+        }]
+    });
+    let (base, _shutdown) = cached_admin(&tmp, config).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    const SUBSET_KEY: &str = "/subsets/0/traffic_policy/tls/private_key";
+    const SUBSET_CA: &str = "/subsets/0/traffic_policy/tls/ca_certificates";
+    const SUBSET_CERT: &str = "/subsets/0/traffic_policy/tls/client_certificate";
+    const SUBSET_KEY_REF: &str = "/subsets/1/traffic_policy/tls/private_key";
+    const PORT_KEY: &str = "/port_overrides/443/tls/client_key_path";
+    const PORT_CERT: &str = "/port_overrides/443/tls/client_cert_path";
+    const PORT_CA: &str = "/port_overrides/443/tls/server_ca_cert_path";
+    const PORT_KEY_REF: &str = "/port_overrides/8443/tls/client_key_path";
+    const PROXY_CA: &str = "/backend_tls_server_ca_cert_path";
+    const PROXY_KEY_REF: &str = "/backend_tls_client_key_path";
+    const V2_KEY_REF: &str = "k8s://ferrum/v2-mtls#tls.key";
+
+    for (role, bearer) in [("viewer", &viewer), ("operator", &operator)] {
+        let (status, single) = get_json(&base, "/upstreams/mesh-upstream", bearer).await;
+        assert_eq!(status, 200, "{role} upstream get failed: {single:?}");
+        let (status, list) = get_json(&base, "/upstreams", bearer).await;
+        assert_eq!(status, 200, "{role} upstream list failed: {list:?}");
+        for body in [&single, list_item(&list, "mesh-upstream")] {
+            for withheld in [SUBSET_KEY, SUBSET_CA, PORT_KEY] {
+                assert_eq!(at(body, withheld), "[REDACTED]", "{role} {withheld}");
+            }
+            assert_eq!(at(body, SUBSET_CERT), cert_pem.as_str());
+            assert_eq!(at(body, PORT_CERT), cert_pem.as_str());
+            assert_eq!(at(body, PORT_CA), "/etc/ferrum/ca.pem");
+            assert_eq!(at(body, SUBSET_KEY_REF), V2_KEY_REF);
+            assert_eq!(at(body, PORT_KEY_REF), "/etc/ferrum/client.key");
+            let text = body.to_string();
+            assert!(
+                !text.contains("PRIVATE KEY") && !text.contains(&key_body),
+                "{role} upstream read leaked private-key material: {body}"
+            );
+        }
+
+        let (status, proxy) = get_json(&base, "/proxies/bundle-proxy", bearer).await;
+        assert_eq!(status, 200, "{role} proxy get failed: {proxy:?}");
+        assert_eq!(at(&proxy, PROXY_CA), "[REDACTED]", "{role} CA bundle");
+        assert_eq!(at(&proxy, PROXY_KEY_REF), "/etc/ferrum/client.key");
+        assert_eq!(proxy["backend_host"], "backend.internal");
+        assert!(!proxy.to_string().contains(&key_body), "{role}: {proxy}");
+    }
+
+    let (status, export) = get_json(&base, "/config/export", &viewer).await;
+    assert_eq!(status, 200, "viewer export failed: {export:?}");
+    let text = export.to_string();
+    assert!(
+        !text.contains("PRIVATE KEY") && !text.contains(&key_body),
+        "export leaked private-key material"
+    );
+    let upstream = &export["upstreams"][0];
+    for withheld in [SUBSET_KEY, SUBSET_CA, PORT_KEY] {
+        let rendered = at(upstream, withheld).as_str().unwrap_or_default();
+        assert!(rendered.starts_with("hmac-sha256:"), "{withheld}");
+    }
+    assert_eq!(at(upstream, SUBSET_KEY_REF), V2_KEY_REF);
+    assert_eq!(at(upstream, PORT_CERT), cert_pem.as_str());
+    let proxy = &export["proxies"][0];
+    let rendered = at(proxy, PROXY_CA).as_str().unwrap_or_default();
+    assert!(rendered.starts_with("hmac-sha256:"), "{rendered}");
+
+    let (status, raw) = get_json(&base, "/upstreams/mesh-upstream", &admin).await;
+    assert_eq!(status, 200, "admin upstream get failed: {raw:?}");
+    assert_eq!(at(&raw, SUBSET_KEY), key_pem.as_str());
+    assert_eq!(at(&raw, PORT_KEY), key_pem.as_str());
+    assert_eq!(at(&raw, SUBSET_CA), bundle.as_str());
+}
+
+const PLUGIN_TLS_CERT_PEM: &str =
+    "-----BEGIN CERTIFICATE-----\nplugin-cert-only-visible\n-----END CERTIFICATE-----\n";
+const PLUGIN_TLS_KEY_PEM: &str =
+    "-----BEGIN PRIVATE KEY-----\nplugin-cert-bundle-key-canary\n-----END PRIVATE KEY-----\n";
+const PLUGIN_TLS_BUNDLE_KEY: &str = "plugin-cert-bundle-key-canary";
+
+fn plugin_tls_bundle_pem() -> String {
+    format!("{PLUGIN_TLS_CERT_PEM}{PLUGIN_TLS_KEY_PEM}")
+}
+
+/// A plugin certificate source that carries a pasted certificate-plus-key
+/// bundle (`udp_logging` `dtls_cert_path`, a `mesh_route_dispatch` route-local
+/// `client_cert_path`) is withheld from viewer and operator reads (single and
+/// list) and the audit diff, exactly as the Proxy and Upstream projections
+/// withhold it. Certificate-only PEM and key references stay visible, admin
+/// reads stay raw, and an operator write that echoes the placeholder is refused
+/// and leaves the stored bundle intact.
+#[tokio::test]
+async fn plugin_tls_certificate_bundles_are_projected_for_non_admins_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("ops", Some("operator"));
+    let bundle = plugin_tls_bundle_pem();
+
+    // Disabled configs are stored without plugin construction, so the PEM
+    // blocks need not parse.
+    let cases = [
+        (
+            json!({
+                "id": "tls-bundle-udp",
+                "plugin_name": "udp_logging",
+                "scope": "global",
+                "enabled": false,
+                "config": {
+                    "host": "logs.internal",
+                    "port": 5514,
+                    "dtls": true,
+                    "dtls_cert_path": bundle,
+                    "dtls_key_path": "k8s://ferrum/udp-client#tls.key",
+                    "dtls_ca_cert_path": PLUGIN_TLS_CERT_PEM
+                }
+            }),
+            "/config/dtls_cert_path",
+            "/config/dtls_ca_cert_path",
+            "/config/dtls_key_path",
+        ),
+        (
+            json!({
+                "id": "tls-bundle-route",
+                "plugin_name": "mesh_route_dispatch",
+                "scope": "global",
+                "enabled": false,
+                "config": {"rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_host": "db.internal",
+                        "backend_port": 5432,
+                        "backend_tls": {
+                            "client_cert_path": bundle,
+                            "client_key_path": "k8s://ferrum/db-client#tls.key",
+                            "server_ca_cert_path": PLUGIN_TLS_CERT_PEM
+                        }
+                    }
+                }]}
+            }),
+            "/config/rules/0/destination/backend_tls/client_cert_path",
+            "/config/rules/0/destination/backend_tls/server_ca_cert_path",
+            "/config/rules/0/destination/backend_tls/client_key_path",
+        ),
+    ];
+
+    for (plugin, bundle_pointer, cert_pointer, reference_pointer) in &cases {
+        let id = plugin["id"].as_str().expect("case id");
+        let (status, body) = post_json(&base, "/plugins/config", &admin, plugin).await;
+        assert_eq!(status, 201, "{id} create failed: {body:?}");
+
+        let audit_body = wait_for_audit_total(
+            &base,
+            &format!("/audit?resource_type=plugin_config&resource_id={id}"),
+            &admin,
+            1,
+        )
+        .await;
+        let audit_items = audit_body["items"].as_array().expect("audit items");
+        let mut projections = vec![audit_items[0]["diff"]["after"].clone()];
+        let path = format!("/plugins/config/{id}");
+        for bearer in [&viewer, &operator] {
+            let (status, projected) = get_json(&base, &path, bearer).await;
+            assert_eq!(status, 200, "{id} non-admin read failed: {projected:?}");
+            projections.push(projected);
+
+            let (status, list) = get_json(&base, "/plugins/config", bearer).await;
+            assert_eq!(status, 200, "non-admin config list failed: {list:?}");
+            let listed = list["data"]
+                .as_array()
+                .expect("plugin list data")
+                .iter()
+                .find(|item| item["id"] == id)
+                .expect("listed config")
+                .clone();
+            projections.push(listed);
+        }
+        for projection in &projections {
+            assert_eq!(
+                projection.pointer(bundle_pointer),
+                Some(&json!("[REDACTED]")),
+                "{id}: {projection}"
+            );
+            assert_eq!(
+                projection.pointer(cert_pointer),
+                plugin.pointer(cert_pointer),
+                "{id}: {projection}"
+            );
+            assert_eq!(
+                projection.pointer(reference_pointer),
+                plugin.pointer(reference_pointer),
+                "{id}: {projection}"
+            );
+            assert!(
+                !projection.to_string().contains(PLUGIN_TLS_BUNDLE_KEY),
+                "{id} leaked the bundled key: {projection}"
+            );
+        }
+
+        // Admin reads stay raw for read-modify-write.
+        let (status, raw) = get_json(&base, &path, &admin).await;
+        assert_eq!(status, 200, "{id} admin read failed: {raw:?}");
+        assert_eq!(raw.pointer(bundle_pointer), Some(&json!(bundle)), "{id}");
+
+        // An operator write that echoes the masked bundle is refused.
+        let (status, etag, masked) =
+            send_json(reqwest::Method::GET, &base, &path, &operator, None, None).await;
+        assert_eq!(status, 200, "{id} operator read failed: {masked:?}");
+        let etag = etag.expect("plugin config GET carries an ETag");
+        let write_path = format!("{path}?expected_proxy_ids=");
+        let (status, _, refused) = send_json(
+            reqwest::Method::PUT,
+            &base,
+            &write_path,
+            &operator,
+            Some(&etag),
+            Some(&masked),
+        )
+        .await;
+        assert_eq!(status, 400, "{id} echo accepted: {refused:?}");
+        let error = refused["error"].as_str().expect("error message");
+        assert!(error.contains(bundle_pointer), "{id} refusal: {error}");
+        let (_, _, stored) =
+            send_json(reqwest::Method::GET, &base, &path, &admin, None, None).await;
+        assert_eq!(stored.pointer(bundle_pointer), Some(&json!(bundle)));
+    }
+}
+
+/// A PEM private-key block in a plugin-config field with no TLS name is
+/// withheld by its content alone. An operator that echoes the resulting
+/// `[REDACTED]` back must be refused: once echoed the marker carries no PEM to
+/// classify, so the exact placeholder is reserved at every string field.
+#[tokio::test]
+async fn unclassified_private_key_echo_is_refused_for_operators() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let operator = token("ops", Some("operator"));
+    let path = "/plugins/config/unclassified-pem";
+    let write_path = "/plugins/config/unclassified-pem?expected_proxy_ids=";
+    let bundle = plugin_tls_bundle_pem();
+
+    // Disabled configs are stored without plugin construction, so an
+    // arbitrary nested field is accepted.
+    let plugin = json!({
+        "id": "unclassified-pem",
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "enabled": false,
+        "config": {"note": {"nested": [bundle, "kept-visible"]}}
+    });
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "stdout_logging create failed: {body:?}");
+
+    let (status, etag, masked) =
+        send_json(reqwest::Method::GET, &base, path, &operator, None, None).await;
+    assert_eq!(status, 200, "operator plugin get failed: {masked:?}");
+    assert_eq!(masked["config"]["note"]["nested"][0], "[REDACTED]");
+    assert_eq!(masked["config"]["note"]["nested"][1], "kept-visible");
+    assert!(
+        !masked.to_string().contains(PLUGIN_TLS_BUNDLE_KEY),
+        "operator read leaked the key: {masked}"
+    );
+    let etag = etag.expect("plugin config GET carries an ETag");
+
+    let (status, _, refused) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        write_path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(status, 400, "masked key echo was accepted: {refused:?}");
+    let error = refused["error"].as_str().expect("error message");
+    assert!(
+        error.contains("/config/note/nested/0"),
+        "unexpected refusal: {error}"
+    );
+
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    assert_eq!(stored["config"]["note"]["nested"][0], json!(bundle));
+}
+
+/// An `opa_host` base path is kept in every OPA decision URL, so non-admin
+/// reads and the audit diff project it structurally (origin visible, path
+/// withheld), admin reads stay raw, and an operator write that echoes the
+/// projected URL is refused.
+#[tokio::test]
+async fn opa_host_base_path_is_projected_for_non_admins_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("ops", Some("operator"));
+    let path = "/plugins/config/opa-base-path";
+    let write_path = "/plugins/config/opa-base-path?expected_proxy_ids=";
+    let opa_host = "https://opa.example.com/opa-base-path-canary";
+    let projected_host = "https://opa.example.com/[REDACTED_PATH]";
+
+    // Disabled configs are stored without plugin construction.
+    let plugin = json!({
+        "id": "opa-base-path",
+        "plugin_name": "opa",
+        "scope": "global",
+        "enabled": false,
+        "config": {"opa_host": opa_host, "policy_path": "/v1/data/authz/allow"}
+    });
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "opa create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=opa-base-path",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_items = audit_body["items"].as_array().expect("audit items");
+    let mut projections = vec![audit_items[0]["diff"]["after"]["config"].clone()];
+    for bearer in [&viewer, &operator] {
+        let (status, projected) = get_json(&base, path, bearer).await;
+        assert_eq!(status, 200, "non-admin config read failed: {projected:?}");
+        projections.push(projected["config"].clone());
+    }
+    for projection in &projections {
+        assert_eq!(projection["opa_host"], projected_host, "{projection}");
+        assert_eq!(projection["policy_path"], "/v1/data/authz/allow");
+    }
+
+    let (status, raw) = get_json(&base, path, &admin).await;
+    assert_eq!(status, 200, "admin config read failed: {raw:?}");
+    assert_eq!(raw["config"]["opa_host"], opa_host);
+
+    let (status, etag, masked) =
+        send_json(reqwest::Method::GET, &base, path, &operator, None, None).await;
+    assert_eq!(status, 200, "operator plugin get failed: {masked:?}");
+    let etag = etag.expect("plugin config GET carries an ETag");
+    let (status, _, refused) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        write_path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(status, 400, "masked opa_host was accepted: {refused:?}");
+    let error = refused["error"].as_str().expect("error message");
+    assert!(
+        error.contains("/config/opa_host"),
+        "unexpected refusal: {error}"
+    );
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    assert_eq!(stored["config"]["opa_host"], opa_host);
+}
+
+/// A custom plugin has no built-in sensitivity schema, so its config cannot be
+/// classified and fails closed: viewer and operator reads withhold every scalar
+/// leaf (keys, array shapes, and `null` stay visible), admin reads stay raw,
+/// and an operator write that echoes the read back is refused before the
+/// stored values could be overwritten.
+#[tokio::test]
+async fn custom_plugin_configs_fail_closed_for_non_admins() {
+    let tmp = TempDir::new().unwrap();
+    let store = make_store(&tmp).await;
+    let plugin_id = "custom-plugin-fail-closed";
+    let stored_config = json!({
+        "auth_headers": [{"name": "X-Vendor-Token", "value": "custom-pair-canary"}],
+        "account": {"id": 987654321, "enabled": true},
+        "note": null
+    });
+    store
+        .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
+            id: plugin_id.to_string(),
+            plugin_name: "third_party_custom_plugin".to_string(),
+            namespace: "ferrum".to_string(),
+            config: stored_config.clone(),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: false,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("persist custom plugin config");
+
+    let state = admin_state(store);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("ops", Some("operator"));
+    let path = format!("/plugins/config/{plugin_id}");
+
+    let expected = json!({
+        "auth_headers": [{"name": "[REDACTED]", "value": "[REDACTED]"}],
+        "account": {"id": "[REDACTED]", "enabled": "[REDACTED]"},
+        "note": null
+    });
+    for bearer in [&viewer, &operator] {
+        let (status, projected) = get_json(&base, &path, bearer).await;
+        assert_eq!(status, 200, "non-admin config read failed: {projected:?}");
+        assert_eq!(projected["config"], expected);
+    }
+
+    let (status, raw) = get_json(&base, &path, &admin).await;
+    assert_eq!(status, 200, "admin config read failed: {raw:?}");
+    assert_eq!(raw["config"], stored_config);
+
+    let (status, etag, masked) =
+        send_json(reqwest::Method::GET, &base, &path, &operator, None, None).await;
+    assert_eq!(status, 200, "operator plugin get failed: {masked:?}");
+    let etag = etag.expect("plugin config GET carries an ETag");
+    let write_path = format!("{path}?expected_proxy_ids=");
+    let (status, _, refused) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        &write_path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(status, 400, "custom echo accepted: {refused:?}");
+    let error = refused["error"].as_str().expect("error message");
+    assert!(
+        error.contains("/config/account/id") && error.contains("/config/auth_headers/0/value"),
+        "unexpected refusal: {error}"
+    );
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, &path, &admin, None, None).await;
+    assert_eq!(stored["config"], stored_config);
+}
+
+/// A `request_mirror` shadow path may carry an ingest token like any endpoint
+/// URL path: viewer and operator reads and the audit diff withhold it while
+/// the host, port, and protocol stay visible; admin reads stay raw; an
+/// operator write that echoes the placeholder is refused.
+#[tokio::test]
+async fn request_mirror_path_is_projected_for_non_admins_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("ops", Some("operator"));
+    let path = "/plugins/config/mirror-path";
+    let write_path = "/plugins/config/mirror-path?expected_proxy_ids=";
+    let mirror_path = "/ingest/mirror-path-token-canary";
+
+    // Disabled configs are stored without plugin construction.
+    let plugin = json!({
+        "id": "mirror-path",
+        "plugin_name": "request_mirror",
+        "scope": "global",
+        "enabled": false,
+        "config": {
+            "mirror_host": "shadow.internal",
+            "mirror_port": 8443,
+            "mirror_protocol": "https",
+            "mirror_path": mirror_path
+        }
+    });
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "request_mirror create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=mirror-path",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_items = audit_body["items"].as_array().expect("audit items");
+    let mut projections = vec![audit_items[0]["diff"]["after"]["config"].clone()];
+    for bearer in [&viewer, &operator] {
+        let (status, projected) = get_json(&base, path, bearer).await;
+        assert_eq!(status, 200, "non-admin config read failed: {projected:?}");
+        projections.push(projected["config"].clone());
+    }
+    for projection in &projections {
+        assert_eq!(projection["mirror_path"], "[REDACTED]", "{projection}");
+        assert_eq!(projection["mirror_host"], "shadow.internal");
+        assert_eq!(projection["mirror_port"], 8443);
+        assert_eq!(projection["mirror_protocol"], "https");
+    }
+
+    let (status, raw) = get_json(&base, path, &admin).await;
+    assert_eq!(status, 200, "admin config read failed: {raw:?}");
+    assert_eq!(raw["config"]["mirror_path"], mirror_path);
+
+    let (status, etag, masked) =
+        send_json(reqwest::Method::GET, &base, path, &operator, None, None).await;
+    assert_eq!(status, 200, "operator plugin get failed: {masked:?}");
+    let etag = etag.expect("plugin config GET carries an ETag");
+    let (status, _, refused) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        write_path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(status, 400, "mirror_path echo accepted: {refused:?}");
+    let error = refused["error"].as_str().expect("error message");
+    assert!(
+        error.contains("/config/mirror_path"),
+        "unexpected refusal: {error}"
+    );
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    assert_eq!(stored["config"]["mirror_path"], mirror_path);
 }

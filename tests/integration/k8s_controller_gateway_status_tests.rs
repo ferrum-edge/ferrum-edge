@@ -242,6 +242,54 @@ async fn route_status_conflict_refetches_and_preserves_concurrent_foreign_parent
     assert!(has_parent(retried, FERRUM_GATEWAY_CONTROLLER_NAME));
 }
 
+/// The route/policy merge-patch path refuses an unguarded write the same way
+/// the SSA path does: a live read with an empty or absent `resourceVersion`
+/// sends no PATCH and fails the batch, so the object stays in the status plan.
+#[tokio::test]
+async fn route_status_without_live_resource_version_is_refused_not_skipped() {
+    for live_resource_version in [Some(""), None] {
+        let patches = Arc::new(Mutex::new(0usize));
+        let patch_counter = patches.clone();
+        let service = service_fn(move |request: Request<Body>| {
+            let patch_counter = patch_counter.clone();
+            async move {
+                let response = if request.method() == Method::GET {
+                    let mut live = live_route("unused", "example.com/initial-controller");
+                    match live_resource_version {
+                        Some(value) => live["metadata"]["resourceVersion"] = json!(value),
+                        None => {
+                            live["metadata"]
+                                .as_object_mut()
+                                .expect("live metadata object")
+                                .remove("resourceVersion");
+                        }
+                    }
+                    json_response(StatusCode::OK, live)
+                } else {
+                    *patch_counter.lock().expect("lock patch counter") += 1;
+                    json_response(StatusCode::OK, json!({}))
+                };
+                Ok::<_, Infallible>(response)
+            }
+        });
+        let writer = GatewayApiStatusWriter::new(Client::new(service, "default"));
+
+        let error = writer
+            .patch_updates(vec![route_status_update()])
+            .await
+            .expect_err("a route status write without a resourceVersion must fail the batch");
+        assert!(
+            error.to_string().contains("had no resourceVersion"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            *patches.lock().expect("lock patch counter"),
+            0,
+            "no unguarded merge patch may be sent"
+        );
+    }
+}
+
 fn has_parent(patch: &Value, controller_name: &str) -> bool {
     patch["status"]["parents"]
         .as_array()

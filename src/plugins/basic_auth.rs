@@ -14,7 +14,11 @@
 //! losing Basic credential would otherwise still ride along. Only the `Basic`
 //! scheme is removed; a `Bearer` or other scheme another policy needs is left
 //! untouched. `hide_credentials: false` is the explicit legacy opt-out and
-//! mirrors `key_auth`'s convention.
+//! mirrors `key_auth`'s convention. A request presenting more than one
+//! `Authorization` credential (repeated field lines, or a second credential
+//! after a top-level comma) never reaches this plugin: the ingress protocol
+//! guard rejects it with `400`, so the field this plugin hides is always the
+//! request's only credential.
 
 use crate::fips::approved::HmacSha256;
 use async_trait::async_trait;
@@ -115,22 +119,15 @@ impl BasicAuth {
             hmac_secret: hmac_secret.as_bytes().to_vec(),
             dummy_password_hash,
             verification_rounds: bounded_verification_rounds(
-                crate::config::types::max_credentials_per_type(),
+                crate::config::types::max_credentials_per_type()
+                    .map_err(|error| format!("basic_auth: {error}"))?,
             ),
             hide_credentials,
         })
     }
 
-    /// Verify a password against a stored hash.
-    ///
-    /// Supports `hmac_sha256:<hex>` — HMAC-SHA256 with the server secret.
-    fn verify_password(&self, password: &str, stored_hash: &str) -> bool {
-        let Ok(mut mac) = HmacSha256::new_from_slice(&self.hmac_secret) else {
-            warn!("basic_auth: failed to create HMAC instance");
-            return false;
-        };
-        mac.update(password.as_bytes());
-        let computed = mac.finalize().into_bytes();
+    /// Verify a precomputed password HMAC against a stored `hmac_sha256:<hex>` hash.
+    fn verify_computed_hash(computed: &[u8], stored_hash: &str) -> bool {
         let Some(hex_hash) = stored_hash.strip_prefix("hmac_sha256:") else {
             return false;
         };
@@ -139,7 +136,7 @@ impl BasicAuth {
             return false;
         }
 
-        constant_time_eq(&computed, &expected)
+        constant_time_eq(computed, &expected)
     }
 
     fn verify_credential_with_round_observer<F>(
@@ -156,24 +153,31 @@ impl BasicAuth {
         };
 
         let consumer = consumer_index.find_by_username(&username);
+        let basicauth_entries = consumer
+            .as_ref()
+            .and_then(|consumer| consumer.credentials.get("basicauth"))
+            .and_then(Value::as_array);
+        let Ok(mut mac) = HmacSha256::new_from_slice(&self.hmac_secret) else {
+            warn!("basic_auth: failed to create HMAC instance");
+            return VerifyOutcome::VerificationFailed(r#"{"error":"Invalid credentials"}"#.into());
+        };
+        mac.update(password.as_bytes());
+        let computed = mac.finalize().into_bytes();
         let mut password_matched = false;
 
         for round in 0..self.verification_rounds {
             observe_round();
             // Fixed indexed access avoids collecting a username-dependent
             // number of entries before the padded verification work begins.
-            let configured_hash = consumer
-                .as_ref()
-                .and_then(|consumer| consumer.credentials.get("basicauth"))
-                .and_then(Value::as_array)
+            let configured_hash = basicauth_entries
                 .and_then(|entries| entries.get(round))
                 .and_then(|entry| entry.get("password_hash"))
                 .and_then(Value::as_str);
-            let round_matched = self.verify_password(
-                &password,
+            let round_matched = Self::verify_computed_hash(
+                &computed,
                 configured_hash.unwrap_or(&self.dummy_password_hash),
             );
-            // Always execute the padded HMAC round, but only a configured
+            // Always execute the padded comparison round, but only a configured
             // credential is allowed to establish identity. The random dummy
             // material is timing padding, never a process-local master password.
             password_matched |= configured_hash.is_some() & round_matched;
@@ -186,10 +190,6 @@ impl BasicAuth {
         VerifyOutcome::VerificationFailed(r#"{"error":"Invalid credentials"}"#.into())
     }
 
-    // The library target exposes this through `_test_support` to external unit
-    // tests. The binary test target compiles this module separately without
-    // that bridge, so the helper is intentionally unused there.
-    #[allow(dead_code)]
     pub(crate) fn verify_with_test_material(
         dummy_password_hash: String,
         verification_rounds: usize,
@@ -222,8 +222,8 @@ impl AuthMechanism for BasicAuth {
         "basic_auth"
     }
 
-    fn authentication_challenge(&self) -> Option<&'static str> {
-        Some(r#"Basic realm="ferrum-edge", charset="UTF-8""#)
+    fn authentication_challenge(&self) -> &'static str {
+        auth_flow::BASIC_AUTHENTICATION_CHALLENGE
     }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
@@ -297,6 +297,14 @@ impl AuthMechanism for BasicAuth {
 /// [`BasicAuth::extract`] parses, so it is exactly the one this plugin is
 /// responsible for keeping off the backend. Any other scheme belongs to another
 /// policy and is left in place.
+///
+/// Inspecting only the first token is sound because the ingress protocol guard
+/// (`crate::proxy::check_protocol_headers`, check 6) rejects every request
+/// whose `Authorization` arrives as more than one field line, or whose single
+/// value carries a second credential after a top-level comma, on HTTP/1.1,
+/// HTTP/2, HTTP/3 and WebSocket alike. Without it, `Bearer x` followed by a
+/// second `Basic <password>` line folds to `Bearer x, Basic <password>`, which
+/// this predicate would leave in place for the backend.
 fn authorization_value_is_basic(value: &str) -> bool {
     value
         .split(|c: char| c.is_ascii_whitespace())
@@ -353,5 +361,17 @@ auth_flow::impl_auth_plugin!(
             strip_basic_authorization(headers);
         }
         crate::plugins::PluginResult::Continue
+    }
+
+    fn supports_request_header_passthrough(&self) -> bool {
+        !self.hide_credentials
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        if self.hide_credentials {
+            crate::plugins::PluginHooks::BEFORE_PROXY
+        } else {
+            crate::plugins::PluginHooks::NONE
+        }
     }
 );

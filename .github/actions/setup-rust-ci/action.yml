@@ -25,10 +25,6 @@ description: >-
   any extra rustup components, and an optional rust-cache `workspaces` list.
 
 inputs:
-  cache:
-    description: Use GitHub Rust cache; false selects BoringCache with a GitHub fallback when OIDC is unavailable
-    required: false
-    default: "true"
   shared-key:
     description: >-
       rust-cache shared key. Set per logical job (e.g. `ci-test`,
@@ -242,14 +238,9 @@ runs:
       with:
         install-linux-packages: "false"
 
-    - name: BoringCache Cargo
-      if: inputs.cache == 'false'
-      uses: ./.github/actions/setup-boringcache
-
     - name: Cache Rust dependencies
-      if: inputs.cache == 'true' || env.CI_BORINGCACHE_ENABLED != 'true'
       id: rust-cache
-      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       with:
         shared-key: ${{ inputs.shared-key }}
         workspaces: ${{ inputs.workspaces }}

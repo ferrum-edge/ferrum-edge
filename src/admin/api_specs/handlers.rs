@@ -376,24 +376,14 @@ async fn late_api_spec_create_compensation_safe(
         .iter()
         .map(|plugin| plugin.id.as_str())
         .collect::<HashSet<_>>();
-    let mut offset = 0_i64;
-    const PAGE_SIZE: i64 = 1_000;
-    loop {
-        let page = db
-            .list_plugin_configs_paginated(&spec.namespace, None, PAGE_SIZE, offset)
-            .await?;
-        let items_len = page.items.len() as i64;
-        if page.items.iter().any(|plugin| {
-            plugin.proxy_id.as_deref() == Some(bundle.proxy.id.as_str())
-                && !expected_plugin_ids.contains(plugin.id.as_str())
-        }) {
-            return Ok(false);
-        }
-        if items_len == 0 || offset + items_len >= page.total {
-            return Ok(true);
-        }
-        offset += items_len;
-    }
+    // Authoritative id-only read: a lagging replica must not wave through
+    // compensation over an intervening scoped plugin (forge-ops #569).
+    let scoped = db
+        .list_proxy_scoped_plugin_config_ids(&spec.namespace, &bundle.proxy.id)
+        .await?;
+    Ok(scoped
+        .iter()
+        .all(|plugin_id| expected_plugin_ids.contains(plugin_id.as_str())))
 }
 
 async fn compensate_late_api_spec_replace(
@@ -509,7 +499,8 @@ async fn compensate_late_api_spec_delete(
             anyhow::bail!("late API-spec delete compensation validation returned an HTTP response")
         }
     }
-    let validation_http_client = crate::admin::plugin_validation_http_client(state);
+    let validation_http_client =
+        crate::admin::plugin_validation_http_client(state).map_err(anyhow::Error::msg)?;
     db.restore_api_spec_bundle(
         &previous_bundle,
         &previous_spec,
@@ -646,6 +637,7 @@ fn extract_error_code(e: &ExtractError) -> &'static str {
         ExtractError::SchemaTooDeep { .. } => "SchemaTooDeep",
         ExtractError::SchemaReferenceCycle { .. } => "SchemaReferenceCycle",
         ExtractError::SchemaTooLarge { .. } => "SchemaTooLarge",
+        ExtractError::UnsupportedOperationField { .. } => "UnsupportedOperationField",
     }
 }
 
@@ -676,7 +668,8 @@ fn extract_error_status(e: &ExtractError) -> StatusCode {
         | ExtractError::SchemaReference(_)
         | ExtractError::SchemaTooDeep { .. }
         | ExtractError::SchemaReferenceCycle { .. }
-        | ExtractError::SchemaTooLarge { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        | ExtractError::SchemaTooLarge { .. }
+        | ExtractError::UnsupportedOperationField { .. } => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
 
@@ -715,16 +708,6 @@ pub(super) fn parse_content_type(headers: &hyper::HeaderMap) -> Option<SpecForma
 // Helper: Accept header negotiation for GET responses
 // ---------------------------------------------------------------------------
 
-/// Resolve the response format from an `Accept` header vs the stored format.
-///
-/// Returns the `SpecFormat` the caller should use to serialise the body.
-///
-/// Rules:
-/// - Missing, `*/*`, or matching stored format → stored format
-/// - `application/json` and stored is YAML     → Json (convert)
-/// - `application/yaml` / `text/yaml` etc. and stored is JSON → Yaml (convert)
-/// - Unknown accept types                       → stored format (best-effort)
-///
 /// Quality weight for a media range, parsed from `;q=N.NNN`.
 /// Returns a value in `[0, 1000]` (1000 = q=1.0, default).
 ///
@@ -743,6 +726,16 @@ fn parse_accept_quality(params: &str) -> u32 {
     1000 // default q=1.0
 }
 
+/// Resolve the response format from an `Accept` header vs the stored format.
+///
+/// Returns the `SpecFormat` the caller should use to serialise the body.
+///
+/// Rules:
+/// - Missing, `*/*`, or matching stored format → stored format
+/// - `application/json` and stored is YAML     → Json (convert)
+/// - `application/yaml` / `text/yaml` etc. and stored is JSON → Yaml (convert)
+/// - Unknown accept types                       → stored format (best-effort)
+///
 /// Uses a small media-range parser: splits on `,`, strips `q=` quality
 /// parameters, trims whitespace, and compares exact tokens.  Wildcards
 /// (`*/*`, `application/*`) accept the stored format.  Highest-quality
@@ -760,7 +753,6 @@ pub(super) fn negotiate_accept(headers: &hyper::HeaderMap, stored: SpecFormat) -
     let mut best_json: Option<u32> = None;
     let mut best_yaml: Option<u32> = None;
     let mut best_wildcard: Option<u32> = None;
-    let mut best_stored: Option<u32> = None;
 
     for entry in accept.split(',') {
         // Split type/subtype from parameters.
@@ -786,16 +778,9 @@ pub(super) fn negotiate_accept(headers: &hyper::HeaderMap, stored: SpecFormat) -
             {
                 best_yaml = Some(q);
             }
-            m if m
-                == match stored {
-                    SpecFormat::Json => "application/json",
-                    SpecFormat::Yaml => "application/yaml",
-                }
-                && best_stored.is_none_or(|prev| q > prev) =>
-            {
-                best_stored = Some(q);
-            }
-            _ => {} // unknown media type — ignored
+            // Unknown media types, and lower-quality repeats of a listed
+            // one, are ignored.
+            _ => {}
         }
     }
 
@@ -803,32 +788,16 @@ pub(super) fn negotiate_accept(headers: &hyper::HeaderMap, stored: SpecFormat) -
     //   - An explicit `q=0` for a media range means the client refuses that
     //     representation; the wildcard fallback does NOT override it.
     //   - An absent media range falls back to the wildcard quality if any.
-    //   - The exact-stored bucket is treated like an explicit listing of the
-    //     stored format.
     let wildcard_q = best_wildcard.unwrap_or(0);
 
     // For each format: explicit value (incl. q=0) wins; otherwise inherit wildcard.
-    let json_explicit = best_json.or(if stored == SpecFormat::Json {
-        best_stored
-    } else {
-        None
-    });
-    let yaml_explicit = best_yaml.or(if stored == SpecFormat::Yaml {
-        best_stored
-    } else {
-        None
-    });
+    let json_q = best_json.unwrap_or(wildcard_q);
+    let yaml_q = best_yaml.unwrap_or(wildcard_q);
 
-    let json_q = json_explicit.unwrap_or(wildcard_q);
-    let yaml_q = yaml_explicit.unwrap_or(wildcard_q);
-
-    // Did the client mention any of OUR buckets at all? (json/yaml/wildcard
-    // /exact-stored). If not, we default to stored as before — RFC permits
-    // serving any representation when no Accept rules match.
-    let saw_relevant = best_json.is_some()
-        || best_yaml.is_some()
-        || best_wildcard.is_some()
-        || best_stored.is_some();
+    // Did the client mention any of OUR buckets at all? (json/yaml/wildcard).
+    // If not, we default to stored as before — RFC permits serving any
+    // representation when no Accept rules match.
+    let saw_relevant = best_json.is_some() || best_yaml.is_some() || best_wildcard.is_some();
     if !saw_relevant {
         return stored;
     }
@@ -1287,12 +1256,16 @@ fn assign_ids_for_post(bundle: &mut ExtractedBundle) {
 /// After ID assignment, re-links: `proxy.upstream_id = upstream.id` (if
 /// present); `plugin.proxy_id = proxy.id`; rebuilds `proxy.plugins`
 /// association list to reference the final plugin IDs.
-async fn assign_ids_for_put(
+///
+/// `existing_proxy` and `existing_spec_plugins` are the stored proxy row and
+/// spec-owned plugins the PUT handler already loaded for the replacement
+/// bundle; they are passed in so one PUT reads each only once (issue #7209).
+fn assign_ids_for_put(
     bundle: &mut ExtractedBundle,
-    db: &Arc<dyn DatabaseBackend>,
-    namespace: &str,
     existing_spec: &ApiSpec,
     existing_spec_upstream: Option<&Upstream>,
+    existing_proxy: Option<&crate::config::types::Proxy>,
+    existing_spec_plugins: &[crate::config::types::PluginConfig],
     spec_version: &str,
 ) -> Result<(), ApiSpecError> {
     // If proxy.id is empty (operator did not supply one), fill it in from
@@ -1302,16 +1275,6 @@ async fn assign_ids_for_put(
     if bundle.proxy.id.is_empty() {
         bundle.proxy.id = existing_spec.proxy_id.clone();
     }
-
-    // Load the existing proxy to get upstream_id and created_at.
-    let existing_proxy = match db
-        .get_proxy_for_write(namespace, &existing_spec.proxy_id)
-        .await
-    {
-        Ok(Some(p)) => Some(p),
-        Ok(None) => None,
-        Err(e) => return Err(classify_db_error(e)),
-    };
 
     // Upstream ID: reuse the existing spec-owned upstream if empty. Do not use
     // the current proxy.upstream_id here; direct admin CRUD can drift that
@@ -1326,15 +1289,10 @@ async fn assign_ids_for_put(
         u.id = reuse_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     }
 
-    // Load existing spec-owned plugins for canonical-tuple matching (Fix 5).
-    let mut existing_plugins = match db
-        .list_spec_owned_plugin_configs(namespace, &existing_spec.id)
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => return Err(classify_db_error(e)),
-    };
-    if let Some(existing_proxy) = existing_proxy.as_ref() {
+    // Existing spec-owned plugins for canonical-tuple matching (Fix 5).
+    let mut existing_plugins: Vec<&crate::config::types::PluginConfig> =
+        existing_spec_plugins.iter().collect();
+    if let Some(existing_proxy) = existing_proxy {
         let assoc_order: std::collections::HashMap<String, usize> = existing_proxy
             .plugins
             .iter()
@@ -1358,7 +1316,7 @@ async fn assign_ids_for_put(
         (String, String, Option<u16>),
         std::collections::VecDeque<&crate::config::types::PluginConfig>,
     > = std::collections::HashMap::new();
-    for ep in &existing_plugins {
+    for ep in existing_plugins.iter().copied() {
         let key = plugin_canonical_key(ep)?;
         canonical_to_existing.entry(key).or_default().push_back(ep);
     }
@@ -1453,7 +1411,7 @@ async fn assign_ids_for_put(
 
     // Proxy: preserve stored created_at, refresh updated_at.
     bundle.proxy.updated_at = now;
-    bundle.proxy.created_at = existing_proxy.as_ref().map(|p| p.created_at).unwrap_or(now);
+    bundle.proxy.created_at = existing_proxy.map(|p| p.created_at).unwrap_or(now);
 
     // Upstream: preserve existing created_at if the same ID is being reused.
     if let Some(ref mut u) = bundle.upstream {
@@ -1472,7 +1430,7 @@ async fn assign_ids_for_put(
     let existing_plugin_map: std::collections::HashMap<&str, &crate::config::types::PluginConfig> =
         existing_plugins
             .iter()
-            .map(|ep| (ep.id.as_str(), ep))
+            .map(|ep| (ep.id.as_str(), *ep))
             .collect();
     for pc in &mut bundle.plugins {
         pc.updated_at = now;
@@ -1747,6 +1705,13 @@ async fn validate_bundle(
 
     // Plugins
     let known_plugins = crate::plugins::available_plugins();
+    // The same validation client direct admin plugin writes use, so a node
+    // that serves traffic applies its node-local plugin checks (load_testing
+    // `gateway_port`) here too, while a control plane checks shape only.
+    // Built once; a construction failure (only possible without a
+    // `ProxyState`, from the process compression policy) is reported on each
+    // enabled plugin, as the per-plugin client this replaced reported it.
+    let plugin_http_client = crate::admin::plugin_validation_http_client(state);
     for plugin in &bundle.plugins {
         let mut plugin_errors: Vec<String> = Vec::new();
 
@@ -1774,6 +1739,14 @@ async fn validate_bundle(
                 "Unknown plugin name '{}'. Available plugins: {:?}",
                 plugin.plugin_name, known_plugins
             ));
+        } else if let Some(error) =
+            crate::plugins::kafka_logging::disabled_config_native_key_refusal(
+                &plugin.plugin_name,
+                &plugin.config,
+            )
+        {
+            // Refused even while disabled (issue #6539).
+            plugin_errors.push(error);
         } else if plugin.enabled {
             let validation =
                 if crate::plugins::transaction_log_schema::participates_in_config_graph(plugin) {
@@ -1786,14 +1759,26 @@ async fn validate_bundle(
                         &state.backend_allow_ips,
                     )
                 } else {
-                    crate::plugins::validate_plugin_config_with_policy(
-                        &plugin.plugin_name,
-                        &plugin.config,
-                        &state.backend_allow_ips,
-                    )
+                    match &plugin_http_client {
+                        Ok(http_client) => {
+                            crate::plugins::validate_plugin_config_with_policy_and_client(
+                                &plugin.plugin_name,
+                                &plugin.config,
+                                &state.backend_allow_ips,
+                                http_client.clone(),
+                            )
+                        }
+                        Err(error) => Err(error.clone()),
+                    }
                 };
-            if let Err(error) = validation {
-                plugin_errors.push(error);
+            match validation {
+                Err(error) => plugin_errors.push(error),
+                // A managed JWKS reference (`managed://jwks/<id>#jwks`) must
+                // name an existing, usable record in this node's managed TLS
+                // store, exactly as a direct `POST /plugins/config`,
+                // `POST /batch`, or `POST /restore` requires (issue #7277).
+                Ok(()) => plugin_errors
+                    .extend(crate::admin::managed_jwks_source_admission_errors(plugin).await),
             }
         }
 
@@ -2360,13 +2345,12 @@ fn spec_content_response(
                 })
         });
     if etag_matches {
-        return Response::builder()
+        return crate::admin::with_admin_security_headers(Response::builder())
             .status(StatusCode::NOT_MODIFIED)
             .header("ETag", &etag)
-            .header("Cache-Control", "no-store")
             .header("Vary", "Accept")
             .body(Full::new(Bytes::new()))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
+            .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
     }
 
     // Decompress with an output cap.  A corrupted or bomb-ratio row from the
@@ -2419,22 +2403,14 @@ fn spec_content_response(
     };
 
     let len = body_bytes.len();
-    Response::builder()
+    crate::admin::with_admin_security_headers(Response::builder())
         .status(StatusCode::OK)
         .header("Content-Type", ct)
         .header("Content-Length", len.to_string())
         .header("ETag", &etag)
-        .header("Cache-Control", "no-store")
         .header("Vary", "Accept")
-        .header("X-Content-Type-Options", "nosniff")
         .body(Full::new(Bytes::from(body_bytes)))
-        .unwrap_or_else(|_| {
-            let mut resp = Response::new(Full::new(Bytes::from_static(
-                b"{\"error\":\"Internal server error\"}",
-            )));
-            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-            resp
-        })
+        .unwrap_or_else(|_| crate::admin::admin_builder_failure_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -3073,19 +3049,33 @@ pub async fn handle_put_api_spec(
         Err(error) => return Ok(error_response(classify_db_error(error))),
     };
 
+    // Fetch the existing proxy row once so we can:
+    //   1. Reuse stored IDs/created_at in `assign_ids_for_put`.
+    //   2. Exclude the spec's own upstream from the name-uniqueness check
+    //      (PUT with unchanged name must not self-collide).
+    //   3. Detect listen_port / transport changes for the port-probe
+    //      skip-on-unchanged logic (Fix 2).
+    // Use the *stored* upstream_id — NOT the bundle's post-assignment
+    // upstream.id, which can be operator-changed.
+    let existing_proxy_row: Option<crate::config::types::Proxy> = match db
+        .get_proxy_for_write(namespace, &existing_spec.proxy_id)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return Ok(error_response(classify_db_error(e))),
+    };
+
     // Assign IDs for PUT: reuse existing stored IDs for empty-id resources so
     // re-submitting the same ID-less spec is idempotent (Fix 1). This must
     // happen BEFORE the proxy-id immutability check and hash comparison.
     if let Err(e) = assign_ids_for_put(
         &mut bundle,
-        db,
-        namespace,
         &existing_spec,
         existing_spec_upstream.as_ref(),
+        existing_proxy_row.as_ref(),
+        &existing_spec_plugins,
         &metadata.version,
-    )
-    .await
-    {
+    ) {
         return Ok(error_response(e));
     }
 
@@ -3105,20 +3095,6 @@ pub async fn handle_put_api_spec(
         }));
     }
 
-    // Fetch the existing proxy row once so we can:
-    //   1. Exclude the spec's own upstream from the name-uniqueness check
-    //      (PUT with unchanged name must not self-collide).
-    //   2. Detect listen_port / transport changes for the port-probe
-    //      skip-on-unchanged logic (Fix 2).
-    // Use the *stored* upstream_id — NOT the bundle's post-assignment
-    // upstream.id, which can be operator-changed.
-    let existing_proxy_row: Option<crate::config::types::Proxy> = match db
-        .get_proxy_for_write(namespace, &existing_spec.proxy_id)
-        .await
-    {
-        Ok(p) => p,
-        Err(e) => return Ok(error_response(classify_db_error(e))),
-    };
     let previous_bundle = match existing_proxy_row.as_ref() {
         Some(proxy) => ExtractedBundle {
             proxy: proxy.clone(),
@@ -3780,11 +3756,10 @@ pub async fn handle_delete_api_spec(
         Err(error) => return Ok(error_response(error)),
     };
     if persistence {
-        let response = Response::builder()
+        let response = crate::admin::with_admin_security_headers(Response::builder())
             .status(StatusCode::NO_CONTENT)
-            .header("Cache-Control", "no-store")
             .body(Full::new(Bytes::new()))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
+            .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
         Ok(state
             .complete_live_config_mutation_after_commit_boxed(
                 namespace,
@@ -3943,32 +3918,6 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("accept", accept.parse().unwrap());
         h
-    }
-
-    #[test]
-    fn negotiate_accept_wildcard_returns_stored() {
-        let h = headers_with_accept("*/*");
-        assert_eq!(negotiate_accept(&h, SpecFormat::Yaml), SpecFormat::Yaml);
-        assert_eq!(negotiate_accept(&h, SpecFormat::Json), SpecFormat::Json);
-    }
-
-    #[test]
-    fn negotiate_accept_missing_returns_stored() {
-        let h = HeaderMap::new();
-        assert_eq!(negotiate_accept(&h, SpecFormat::Yaml), SpecFormat::Yaml);
-    }
-
-    #[test]
-    fn negotiate_accept_json_with_yaml_stored_requests_json() {
-        // Client wants JSON, stored is YAML → must convert
-        let h = headers_with_accept("application/json");
-        assert_eq!(negotiate_accept(&h, SpecFormat::Yaml), SpecFormat::Json);
-    }
-
-    #[test]
-    fn negotiate_accept_yaml_with_json_stored_requests_yaml() {
-        let h = headers_with_accept("application/yaml");
-        assert_eq!(negotiate_accept(&h, SpecFormat::Json), SpecFormat::Yaml);
     }
 
     #[test]

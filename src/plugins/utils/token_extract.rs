@@ -4,6 +4,7 @@ use crate::plugins::RequestContext;
 use super::auth_attempt::AuthenticationAttempt;
 use super::auth_flow::ExtractedCredential;
 use super::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
+use super::query::query_has_semicolon_credential_alias;
 
 /// Metadata-key prefix marking a query parameter that carried the auth token and
 /// must be stripped from the URL forwarded upstream. It is shared by every auth
@@ -34,17 +35,76 @@ pub(crate) fn mark_query_credential_metadata(ctx: &mut RequestContext, name: &st
     ctx.metadata.insert(key, String::from("true"));
 }
 
+/// Rejection body for a query token location whose name also rides behind a
+/// `;` sub-parameter (issue #6579, GHSA-c259-vchc-3vgr): Ferrum's `&`-only
+/// parser and a `;`-splitting backend disagree about which value is the token.
+pub(crate) const AMBIGUOUS_QUERY_TOKEN_BODY: &str =
+    r#"{"error":"Ambiguous token query parameter"}"#;
+
+/// Mark every configured query token location present in the request — in the
+/// decoded map or behind a `;` sub-parameter — for policy redaction
+/// (`auth.query_credential_param.<name>`). Never changes the forwarded query.
 pub fn mark_present_query_credential_locations(
     ctx: &mut RequestContext,
     token_locations: &[TokenLocation],
 ) {
+    mark_provider_query_credential_locations(ctx, token_locations, true);
+}
+
+/// [`mark_present_query_credential_locations`] for one provider, which also
+/// marks a `;`-aliased query token (issue #6579, GHSA-c259-vchc-3vgr) for
+/// removal from the forwarded query when the provider does not forward the
+/// original token. Extraction refuses the alias, so it is never a token this
+/// provider accepted; the discovery hook runs for every auth instance before
+/// multi-auth can stop at another mechanism's success, so the alias is hidden
+/// whichever mechanism authenticates — the same contract `key_auth` and
+/// `jwt_auth` apply under `hide_credentials`.
+pub fn mark_provider_query_credential_locations(
+    ctx: &mut RequestContext,
+    token_locations: &[TokenLocation],
+    forward_original_token: bool,
+) {
     for location in token_locations {
-        if let TokenLocation::QueryParam(name) = location
-            && ctx.query_params.contains_key(name)
-        {
-            mark_query_credential_metadata(ctx, name);
+        let TokenLocation::QueryParam(name) = location else {
+            continue;
+        };
+        let sub_pair_alias = query_has_semicolon_credential_alias(ctx.raw_query_string(), name);
+        if !sub_pair_alias && !ctx.query_params.contains_key(name) {
+            continue;
+        }
+        mark_query_credential_metadata(ctx, name);
+        if sub_pair_alias && !forward_original_token {
+            let mut key =
+                String::with_capacity(STRIP_QUERY_PARAM_METADATA_PREFIX.len() + name.len());
+            key.push_str(STRIP_QUERY_PARAM_METADATA_PREFIX);
+            key.push_str(name);
+            ctx.metadata.insert(key, String::from("true"));
         }
     }
+}
+
+/// Whether any configured query token location in `token_locations` also
+/// rides behind a `;` sub-parameter (issue #6579, GHSA-c259-vchc-3vgr).
+///
+/// Multi-location plugins (`jwks_auth`, `oauth2_introspection`) treat such an
+/// alias as terminal for the whole instance — checked before any header,
+/// `Authorization`, or fallback extraction, across every provider — exactly
+/// as `key_auth` refuses a request whose query key is ambiguous whatever its
+/// other locations carry. Free unless the raw query holds a `;`.
+pub fn query_locations_have_semicolon_alias<'a>(
+    ctx: &RequestContext,
+    token_locations: impl IntoIterator<Item = &'a TokenLocation>,
+) -> bool {
+    let Some(raw_query) = ctx.raw_query_string().filter(|raw| raw.contains(';')) else {
+        return false;
+    };
+    token_locations.into_iter().any(|location| {
+        matches!(
+            location,
+            TokenLocation::QueryParam(name)
+                if query_has_semicolon_credential_alias(Some(raw_query), name)
+        )
+    })
 }
 
 #[derive(Clone)]
@@ -156,10 +216,17 @@ pub fn extract_from_location(
                 extract_location_value(&value, header.prefix.as_deref())
             }
         },
-        TokenLocation::QueryParam(name) => match ctx.query_params.get(name) {
-            Some(value) => extract_location_value(value, None),
-            None => TokenLocationExtract::Missing,
-        },
+        TokenLocation::QueryParam(name) => {
+            if query_has_semicolon_credential_alias(ctx.raw_query_string(), name) {
+                return TokenLocationExtract::Credential(ExtractedCredential::InvalidFormat(
+                    AMBIGUOUS_QUERY_TOKEN_BODY.to_string(),
+                ));
+            }
+            match ctx.query_params.get(name) {
+                Some(value) => extract_location_value(value, None),
+                None => TokenLocationExtract::Missing,
+            }
+        }
     }
 }
 

@@ -56,7 +56,8 @@ pub fn spiffe_id_to_san(id: &SpiffeId) -> Result<SanType, UriSanError> {
     Ok(SanType::URI(ia5))
 }
 
-/// Extract the FIRST SPIFFE URI SAN from a DER-encoded peer certificate.
+/// Extract the single SPIFFE URI SAN from a DER-encoded peer certificate
+/// (a certificate carrying more than one URI SAN is rejected).
 ///
 /// Returns the parsed [`SpiffeId`], or one of:
 /// - [`UriSanError::ParseFailure`] if the DER does not parse as X.509.

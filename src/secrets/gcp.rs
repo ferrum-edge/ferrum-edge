@@ -7,13 +7,6 @@
 
 use std::env;
 
-/// Check if the `{key}_GCP` env var is set and non-empty.
-/// Returns the GCP resource name (e.g. `projects/P/secrets/S/versions/V`) if so.
-pub fn resolve_ref(key: &str) -> Option<String> {
-    let gcp_key = format!("{}_GCP", key);
-    env::var(&gcp_key).ok().filter(|s| !s.is_empty())
-}
-
 /// Optional override for the Secret Manager service endpoint.
 ///
 /// When `FERRUM_GCP_SECRET_MANAGER_ENDPOINT` is set, the client is built against
@@ -28,7 +21,7 @@ pub fn resolve_ref(key: &str) -> Option<String> {
 /// resolution runs before `EnvConfig` is parsed, so this cannot read it from
 /// `EnvConfig`.
 ///
-/// **Only for the runtime single-key path.** See [`endpoint_override_from_env`].
+/// **Only for the runtime direct-reference path.** See [`endpoint_override_from_env`].
 fn endpoint_override() -> Option<String> {
     crate::config::conf_file::resolve_ferrum_var("FERRUM_GCP_SECRET_MANAGER_ENDPOINT")
         .filter(|s| !s.is_empty())

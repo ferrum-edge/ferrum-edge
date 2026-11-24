@@ -418,6 +418,96 @@ mod tests {
         task.abort();
     }
 
+    /// A refused rebuild never reaches the HTTP/3 accepted slot or the revision
+    /// watch. The data-plane H3 pairing bridge only republishes on a revision
+    /// bump and reads the accepted slot when it does, so a refused operator
+    /// candidate leaves the paired last-good config and trust in place.
+    #[tokio::test]
+    async fn refused_rebuild_keeps_accepted_slot_and_revision() {
+        use crate::fips::base_crypto_provider as default_provider;
+        use crate::tls::source::{CertSource, MaterialKind};
+        let _ = default_provider().install_default();
+
+        let startup = Arc::new(AcceptedFrontendTls {
+            config: build_dummy_server_config(),
+            client_trust: crate::tls::AcceptedClientTrust {
+                verifier: None,
+                material: crate::tls::ClientTrustMaterial::from_test_digest([7; 32]),
+                crls_enforced: false,
+            },
+        });
+        let accepted_slot = accepted_frontend_tls_slot_with(startup.clone());
+        let slot = frontend_tls_slot_with(startup.config.clone());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client_ca = dir.path().join("client-ca.pem");
+        std::fs::write(&client_ca, b"startup client ca").expect("write client ca");
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        let rebuild: FrontendTlsRebuildFn = Box::new(move || {
+            attempts_clone.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("simulated malformed client CA bundle"))
+        });
+
+        let (revision_tx, revision_rx) = watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = spawn_frontend_tls_reload_task(
+            FrontendTlsReloadConfig {
+                surface: "test_frontend_reload_refused_accepted_slot",
+                max_material_bytes: crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
+                sources: vec![WatchedMaterialSource::new(
+                    "client_ca",
+                    CertSource::parse(
+                        client_ca.to_string_lossy().into_owned(),
+                        MaterialKind::CaBundle,
+                    ),
+                    MaterialKind::CaBundle,
+                )],
+                slot: slot.clone(),
+                interval: Duration::from_millis(50),
+                revision_tx,
+                rebuild,
+                client_trust_scope: None,
+                accepted_slot: Some(accepted_slot.clone()),
+            },
+            Some(shutdown_rx),
+        );
+
+        // Let the watcher take its baseline fingerprint, then rotate the
+        // watched source to a candidate the rebuild refuses.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::write(&client_ca, b"malformed client ca rotation").expect("rewrite client ca");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while attempts.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the watcher must attempt the rotated candidate");
+
+        assert_eq!(
+            *revision_rx.borrow(),
+            0,
+            "a refused candidate must not wake the H3 pairing bridge"
+        );
+        let retained = accepted_slot
+            .load_full()
+            .as_ref()
+            .clone()
+            .expect("accepted slot intact");
+        assert!(
+            Arc::ptr_eq(&retained, &startup),
+            "a refused candidate must leave the last-good accepted pair in place"
+        );
+        let served = slot.load_full().as_ref().clone().expect("slot intact");
+        assert!(Arc::ptr_eq(&served, &startup.config));
+
+        task.abort();
+    }
+
     fn build_dummy_server_config() -> Arc<ServerConfig> {
         let key_pair =
             rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");

@@ -47,8 +47,6 @@
 //! pattern (warn enter, info recover, no per-event spam). This is the
 //! "silent drops would be a regression" guard from the GAP-SC3 plan.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -426,15 +424,6 @@ pub struct BpfMetricsSnapshot {
 }
 
 impl BpfMetricsSnapshot {
-    pub fn drop_by_reason(&self, reason: BpfDropReason) -> u64 {
-        match reason {
-            BpfDropReason::BypassUidHit => self.drop_bypass_uid_hit,
-            BpfDropReason::ExcludeCidrHit => self.drop_exclude_cidr_hit,
-            BpfDropReason::NotInIncludeCidr => self.drop_not_in_include_cidr,
-            BpfDropReason::ExcludePortHit => self.drop_exclude_port_hit,
-        }
-    }
-
     pub fn drop_reasons(&self) -> [(BpfDropReason, u64); 4] {
         [
             (BpfDropReason::BypassUidHit, self.drop_bypass_uid_hit),

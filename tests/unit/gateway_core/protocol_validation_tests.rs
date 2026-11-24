@@ -1535,49 +1535,204 @@ fn hyper_headermap_normalizes_header_names() {
 }
 
 // ============================================================================
-// HTTP/1 parse-error JSON envelopes (issue #4393)
+// One Authorization credential per request (basic_auth hide_credentials)
 // ============================================================================
+//
+// `Authorization` is a single `credentials` production (RFC 9110 §11.6.2).
+// Ferrum folds repeated field lines into one `", "`-joined value before
+// authentication, and `basic_auth` / `ldap_auth` hide only a value whose FIRST
+// scheme is `Basic`, so `Bearer x` + `Basic <password>` used to forward the
+// password whenever another mechanism authenticated the request. The guard
+// refuses every such shape before routing, on every HTTP version.
+
+const ALICE_BASIC: &str = "Basic YWxpY2U6c2VjcmV0";
+const MULTIPLE_AUTHORIZATION: &str =
+    r#"{"error":"Request contains multiple Authorization headers"}"#;
+const FOLDED_AUTHORIZATION: &str =
+    r#"{"error":"Authorization header contains more than one credential"}"#;
+
+fn headers_with_authorization(values: &[&str]) -> hyper::HeaderMap {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
+    for value in values {
+        headers.append(
+            hyper::header::AUTHORIZATION,
+            HeaderValue::from_str(value).expect("authorization value"),
+        );
+    }
+    headers
+}
+
+const ALL_VERSIONS: [hyper::Version; 4] = [
+    hyper::Version::HTTP_10,
+    hyper::Version::HTTP_11,
+    hyper::Version::HTTP_2,
+    hyper::Version::HTTP_3,
+];
 
 #[test]
-fn h1_parse_envelope_bytes_match_check_protocol_headers_messages() {
-    use ferrum_edge::proxy::{
-        PARSE_HINT_CONFLICTING_CONTENT_LENGTH_FOR_TEST,
-        PARSE_HINT_HTTP10_TRANSFER_ENCODING_FOR_TEST,
-        PARSE_HINT_INVALID_REQUEST_TARGET_UTF8_FOR_TEST, envelope_for_hint_for_test,
-    };
-
-    fn envelope_body(envelope: &[u8]) -> &[u8] {
-        let idx = envelope
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("envelope must include a body");
-        &envelope[idx + 4..]
+fn repeated_authorization_field_lines_are_refused_on_every_version() {
+    for version in ALL_VERSIONS {
+        for values in [
+            ["Bearer unused", ALICE_BASIC],
+            [ALICE_BASIC, "Bearer unused"],
+            [ALICE_BASIC, ALICE_BASIC],
+            ["Bearer a", "Bearer b"],
+        ] {
+            let headers = headers_with_authorization(&values);
+            assert_eq!(
+                check_protocol(&headers, version),
+                Some(MULTIPLE_AUTHORIZATION),
+                "{version:?} {values:?}"
+            );
+        }
     }
+}
 
-    let conflicting = envelope_for_hint_for_test(PARSE_HINT_CONFLICTING_CONTENT_LENGTH_FOR_TEST);
-    assert_eq!(
-        std::str::from_utf8(envelope_body(conflicting)).expect("json body"),
-        r#"{"error":"Multiple Content-Length headers with conflicting values"}"#
-    );
+#[test]
+fn folded_second_credential_in_one_authorization_line_is_refused() {
+    for version in ALL_VERSIONS {
+        for value in [
+            "Bearer unused, Basic YWxpY2U6c2VjcmV0",
+            "Bearer unused,Basic YWxpY2U6c2VjcmV0",
+            "Bearer unused ,  basic YWxpY2U6c2VjcmV0",
+            "Basic YWxpY2U6c2VjcmV0, Bearer unused",
+            // A credential whose auth-param list is followed by another scheme.
+            r#"Digest username="a", realm="r", Basic YWxpY2U6c2VjcmV0"#,
+            // A bare trailing scheme token is a new credential too.
+            "Bearer unused, Basic",
+        ] {
+            let headers = headers_with_authorization(&[value]);
+            assert_eq!(
+                check_protocol(&headers, version),
+                Some(FOLDED_AUTHORIZATION),
+                "{version:?} {value:?}"
+            );
+        }
+    }
+}
 
-    let http10_te = envelope_for_hint_for_test(PARSE_HINT_HTTP10_TRANSFER_ENCODING_FOR_TEST);
-    assert_eq!(
-        std::str::from_utf8(envelope_body(http10_te)).expect("json body"),
-        r#"{"error":"HTTP/1.0 does not support Transfer-Encoding"}"#
-    );
+#[test]
+fn single_authorization_credentials_are_still_accepted() {
+    for version in ALL_VERSIONS {
+        for value in [
+            ALICE_BASIC,
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJib2IifQ.c2lnbmF0dXJl",
+            // auth-param lists: every comma-separated element is `name=value`.
+            r#"Digest username="bob", realm="r", nonce="n", uri="/", response="x""#,
+            "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;x-amz-date, Signature=abcdef",
+            // BWS around `=` is still an auth-param (RFC 9110 §11.2).
+            "Custom a = 1, b =2",
+            // A comma inside a quoted string separates nothing.
+            r#"Digest username="a, Basic YWxpY2U6c2VjcmV0", realm="r""#,
+            r#"Digest username="esc \" , Basic x", realm="r""#,
+            // Empty list elements are not credentials.
+            "Custom a=1, , b=2",
+            "Bearer unused,",
+        ] {
+            let headers = headers_with_authorization(&[value]);
+            assert_eq!(
+                check_protocol(&headers, version),
+                None,
+                "{version:?} {value:?}"
+            );
+        }
+    }
+}
 
-    let malformed = envelope_for_hint_for_test(PARSE_HINT_INVALID_REQUEST_TARGET_UTF8_FOR_TEST);
-    assert_eq!(
-        std::str::from_utf8(envelope_body(malformed)).expect("json body"),
-        r#"{"error":"Malformed HTTP request"}"#
-    );
-    // Issue #4543: the parse-reject envelope carries no `X-Gateway-Error` — that
-    // header is a closed eight-token backend-attempt vocabulary, and a
-    // client-caused 400 names none of them (matches the handler-layer 400s).
-    assert!(
-        !std::str::from_utf8(conflicting)
-            .expect("utf-8 envelope")
-            .to_ascii_lowercase()
-            .contains("x-gateway-error")
-    );
+#[test]
+fn a_request_without_authorization_is_unaffected() {
+    for version in ALL_VERSIONS {
+        let headers = headers_with_authorization(&[]);
+        assert_eq!(check_protocol(&headers, version), None, "{version:?}");
+    }
+}
+
+// ============================================================================
+// One Content-Type media type per request (gRPC-Web reinterpretation)
+// ============================================================================
+//
+// `Content-Type` is a singleton field (RFC 9110 §8.3). The gateway classifies
+// the first field line, while a backend may resolve to the last: two lines
+// `application/json` + `application/grpc-web+proto` let a backend parse a body
+// the gateway forwarded as JSON as gRPC-Web, body-embedded trailer frame
+// included. The guard refuses every such shape before routing, on every HTTP
+// version.
+
+const MULTIPLE_CONTENT_TYPE: &str = r#"{"error":"Request contains multiple Content-Type headers"}"#;
+const LISTED_CONTENT_TYPE: &str =
+    r#"{"error":"Content-Type header contains more than one media type"}"#;
+
+fn headers_with_content_type(values: &[&str]) -> hyper::HeaderMap {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
+    for value in values {
+        headers.append(
+            hyper::header::CONTENT_TYPE,
+            HeaderValue::from_str(value).expect("content-type value"),
+        );
+    }
+    headers
+}
+
+#[test]
+fn repeated_content_type_field_lines_are_refused_on_every_version() {
+    for version in ALL_VERSIONS {
+        for values in [
+            ["application/json", "application/grpc-web+proto"],
+            ["application/grpc-web+proto", "application/json"],
+            ["application/json", "application/json"],
+        ] {
+            let headers = headers_with_content_type(&values);
+            assert_eq!(
+                check_protocol(&headers, version),
+                Some(MULTIPLE_CONTENT_TYPE),
+                "{version:?} {values:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn listed_content_type_media_types_are_refused() {
+    for version in ALL_VERSIONS {
+        for value in [
+            "application/json, application/grpc-web+proto",
+            "application/json,application/grpc-web-text",
+            r#"text/plain; a="x", application/grpc-web"#,
+            // An unterminated quoted string that swallowed a comma.
+            r#"text/plain; a="x, application/grpc-web"#,
+        ] {
+            let headers = headers_with_content_type(&[value]);
+            assert_eq!(
+                check_protocol(&headers, version),
+                Some(LISTED_CONTENT_TYPE),
+                "{version:?} {value:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn single_content_type_media_types_are_still_accepted() {
+    for version in ALL_VERSIONS {
+        for value in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "application/grpc-web+proto",
+            "application/grpc",
+            // A comma inside a quoted parameter value separates nothing.
+            r#"multipart/form-data; boundary="a,b""#,
+            r#"multipart/form-data; boundary="a,application/grpc-web,b""#,
+            r#"text/plain; a="esc \" , b""#,
+        ] {
+            let headers = headers_with_content_type(&[value]);
+            assert_eq!(
+                check_protocol(&headers, version),
+                None,
+                "{version:?} {value:?}"
+            );
+        }
+    }
 }

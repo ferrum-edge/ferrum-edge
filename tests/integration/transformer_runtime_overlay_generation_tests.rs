@@ -102,7 +102,6 @@ fn test_proxy(id: &str, plugin_ids: &[&str]) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -186,6 +185,7 @@ fn generation(
 ) -> GatewayConfig {
     let mut config = GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "1".to_string(),
         proxies: vec![test_proxy("gated", &["gate"])],
         consumers: vec![],

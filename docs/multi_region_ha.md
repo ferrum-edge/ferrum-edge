@@ -257,7 +257,7 @@ SQLite is a single-file embedded database with no built-in replication. It is id
 
 - No network protocol — all access is via local filesystem
 - No replication — a single file on one machine
-- `FERRUM_DB_FAILOVER_URLS` has no effect (all URLs would point to the same file)
+- `FERRUM_DB_FAILOVER_URLS` can list other, distinct SQLite files, and the gateway fails over to one when the primary is unavailable with a transient error. This is a local fallback between independent files, not replication: nothing copies data between them. Admin writes are refused while a failover file is active unless `FERRUM_DB_FAILOVER_ALLOW_WRITES=true` (see [configuration.md](configuration.md)), so the fallback file is not silently diverged from the primary
 
 **Use SQLite for**: development, testing, and single-instance database-mode deployments.
 
@@ -447,6 +447,12 @@ Observability endpoints are tiered. Unauthenticated `/health` and `/status` retu
 - Each CP's authenticated `/health` detail shows database connectivity and pool stats — monitor these to detect DB issues
 - Authenticated `/health` also reports `database.failover_topology` and
   `admin_writes_enabled` while on a failover URL (see [admin_api.md](admin_api.md))
+- On MongoDB, an uncertain protected mTLS DNS admission mutation retains a
+  per-namespace admission fence instead of pinning the connection generation,
+  so failover/reconnect stay available; authenticated `/health` reports
+  `database.mtls_dns_admission_fence` and `/metrics` exports
+  `ferrum_database_mtls_dns_admission_fences_retained` (see
+  [mongodb.md](mongodb.md#retained-mtls-dns-admission-fences))
 - Each DP's authenticated `/health` detail shows `cached_config` with `loaded_at` and a `dp_config` object (`cp_authority`, `snapshot_age_seconds`, `stale`) — see [cp_dp_mode.md](cp_dp_mode.md#bounded-last-known-good-configuration-age)
 - Authenticated `/overload` detail shows resource pressure — useful for capacity planning
 

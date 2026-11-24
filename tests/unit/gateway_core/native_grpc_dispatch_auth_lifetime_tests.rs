@@ -1232,7 +1232,8 @@ async fn late_sidecar_readiness_wake_preserves_connect_before_client_winner() {
     );
     assert_eq!(
         sidecar_readiness_connect_terminal_for_test(),
-        (200, Some("14".into()), false)
+        // A sidecar connect timeout is a backend deadline (#6770 review).
+        (200, Some("4".into()), false)
     );
     assert_eq!(plan.2.observed(), None, "later authorization did not win");
 }
@@ -2298,8 +2299,13 @@ fn native_h3_cold_connect_bound_keeps_dns_outside_and_quic_h3_readiness_inside()
         "async fn create_or_get_target_sender_with_connect_deadline(",
     ] {
         let body = source_region(client, creator, "\n    }\n");
-        assert!(body.contains("boxed_h3_future(|| {"));
-        assert!(body.contains("self.create_or_get_sender(key, connect_at, create).await"));
+        // Whitespace-insensitive: rustfmt puts a short creation closure on
+        // one line (`boxed_h3_future(|| self.create_connection(..))`).
+        assert!(compact_code(body).contains("boxed_h3_future(||"));
+        assert!(
+            compact_code(body)
+                .contains("self.create_or_get_sender(key,drain_epoch,connect_at,create).await")
+        );
     }
     assert_eq!(
         client

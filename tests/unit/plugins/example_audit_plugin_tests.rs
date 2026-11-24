@@ -14,7 +14,6 @@ use ferrum_edge::plugins::{
     TransactionSummary,
 };
 use serde_json::json;
-use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 use std::time::Duration;
@@ -573,7 +572,7 @@ fn test_metadata_selection_is_deterministic_with_collision_and_omission_markers(
         "entry-bound overflow must emit an omission marker"
     );
     assert!(
-        source.contains("is_sensitive_metadata_key(key)")
+        source.contains("metadata_value_is_redacted(key)")
             && source.contains("REDACTED_PLACEHOLDER"),
         "redaction must run before persistence"
     );
@@ -651,7 +650,10 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
         request_path: "/audit".to_string(),
         response_status_code: 200,
         latency_total_ms: 12.5,
-        metadata: HashMap::from([("authorization".to_string(), "secret".to_string())]),
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([(
+            "authorization".to_string(),
+            "secret".to_string(),
+        )]),
         ..Default::default()
     };
     plugin.log(&http).await;
@@ -664,6 +666,7 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
         proxy_name: None,
         client_ip: "10.0.0.1".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: "10.0.0.2:443".to_string(),
         backend_resolved_ip: None,
@@ -679,7 +682,7 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
         timestamp_connected: "2026-01-01T00:00:00Z".to_string(),
         timestamp_disconnected: "2026-01-01T00:00:01Z".to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     };
     plugin.on_stream_disconnect(&stream).await;
 }
@@ -758,7 +761,10 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     let cutoff = rfc3339_millis(now - chrono::Duration::days(30));
     let live_ts = |offset_ms: i64| rfc3339_millis(now + chrono::Duration::milliseconds(offset_ms));
 
-    let metadata_prefix = "k".repeat(128);
+    // An allowlisted per-instance key family (`correlation_id.instance.<id>`),
+    // so the values survive the fail-closed metadata gate and the
+    // truncation-collision rule stays observable.
+    let metadata_prefix = format!("correlation_id.instance.{}", "k".repeat(104));
     plugin
         .log(&TransactionSummary {
             timestamp_received: live_ts(0),
@@ -769,7 +775,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
             latency_total_ms: 3.25,
             consumer_username: Some("U".repeat(300)),
             proxy_id: Some("proxy-1".to_string()),
-            metadata: HashMap::from([
+            metadata: ferrum_edge::plugins::MetadataMap::from_iter([
                 ("cookie".to_string(), "session=1".to_string()),
                 ("note".to_string(), "x".repeat(10_000)),
                 ("zebra".to_string(), "z".to_string()),
@@ -792,7 +798,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
             request_path: "/example.Audit/Write".to_string(),
             response_status_code: 200,
             latency_total_ms: 4.0,
-            metadata: HashMap::from([
+            metadata: ferrum_edge::plugins::MetadataMap::from_iter([
                 ("request_protocol".to_string(), "grpc".to_string()),
                 ("grpc_status".to_string(), "13".to_string()),
             ]),
@@ -808,7 +814,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
             request_path: "/example.Audit/Web".to_string(),
             response_status_code: 200,
             latency_total_ms: 4.5,
-            metadata: HashMap::from([
+            metadata: ferrum_edge::plugins::MetadataMap::from_iter([
                 ("request_protocol".to_string(), "grpc".to_string()),
                 ("mesh.request_protocol".to_string(), "grpc-web".to_string()),
                 ("grpc_status".to_string(), "0".to_string()),
@@ -849,7 +855,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
             request_path: "/unknown-protocol-metadata".to_string(),
             response_status_code: 200,
             latency_total_ms: 1.0,
-            metadata: HashMap::from([(
+            metadata: ferrum_edge::plugins::MetadataMap::from_iter([(
                 "request_protocol".to_string(),
                 "attacker-shaped-unknown-protocol".repeat(64),
             )]),
@@ -893,6 +899,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
                     client_ip.to_string()
                 },
                 consumer_username: None,
+                principal_origin: None,
                 auth_method: None,
                 backend_target: "192.0.2.20:5432".to_string(),
                 backend_resolved_ip: None,
@@ -912,7 +919,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
                 timestamp_connected: live_ts(0),
                 timestamp_disconnected: live_ts(1_000),
                 sni_hostname: None,
-                metadata: HashMap::new(),
+                metadata: ferrum_edge::plugins::MetadataMap::default(),
             })
             .await;
     }

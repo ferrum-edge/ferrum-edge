@@ -2,13 +2,34 @@
 //!
 //! Standalone IP-based access control plugin, independent of consumer
 //! authentication. Supports exact IPs, CIDR notation, and IPv6.
-//! Operates in either allow-first or deny-first mode.
+//!
+//! The decision is fixed: a deny match always rejects, and a non-empty allow
+//! list rejects every address outside it. An address that is both outside the
+//! allow list and on the deny list is reported as `not_in_allow_list` (issue
+//! #6610). The retired `mode` key is refused like any other unknown key
+//! (issue #7114).
 //!
 //! Rules are compiled on the cold path into sorted, merged numeric intervals.
 //! Request matching is allocation-free, lock-free, and O(log n) in the number
 //! of non-overlapping intervals. The authoritative client IP is parsed and
 //! canonicalized once by the request/stream context and reused by every
 //! `ip_restriction` instance.
+//!
+//! Rule spellings are canonical-only so the runtime and the published
+//! `IpRestrictionRule` OpenAPI grammar admit exactly the same strings: IPv4
+//! octets and CIDR prefixes are canonical unsigned decimal, and an IPv6 rule
+//! zone must be non-empty and free of whitespace, `/`, and `]`. Client-IP
+//! parsing (`crate::util::client_identity`) stays lenient about zones; this
+//! grammar applies to configured rules only.
+//!
+//! Enforcement is admission-time. HTTP-family requests are checked per
+//! request, but an established TCP/TLS, UDP/DTLS, or upgraded WebSocket
+//! session is checked once when it is admitted and is not re-evaluated when a
+//! reload changes the policy.
+//!
+//! Every rejection stamps the fixed-cardinality
+//! [`REJECTION_REASON_METADATA_KEY`] metadata value so transaction logs can
+//! tell the three rejection reasons apart per proxy.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
 
@@ -20,19 +41,67 @@ use tracing::debug;
 
 use super::{Plugin, PluginResult, RequestContext};
 
-const CONFIG_KEYS: &[&str] = &["allow", "deny", "mode"];
+const CONFIG_KEYS: &[&str] = &["allow", "deny"];
 
+/// Metadata key stamped on every `ip_restriction` rejection, carrying one of
+/// `unparseable_client_ip`, `not_in_allow_list`, or `ip_denied`.
+///
+/// The value set is fixed, so it is allowlisted for log sinks in
+/// `crate::plugins::utils::metadata_redaction::BUILTIN_SAFE_METADATA_KEYS`.
+pub const REJECTION_REASON_METADATA_KEY: &str = "ip_restriction.reason";
+
+/// Why a client address failed the compiled policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    AllowFirst,
-    DenyFirst,
+enum Rejection {
+    UnparseableClientIp,
+    NotInAllowList,
+    IpDenied,
 }
 
-impl Mode {
-    fn as_str(self) -> &'static str {
+impl Rejection {
+    fn reason(self) -> &'static str {
         match self {
-            Self::AllowFirst => "allow_first",
-            Self::DenyFirst => "deny_first",
+            Self::UnparseableClientIp => "unparseable_client_ip",
+            Self::NotInAllowList => "not_in_allow_list",
+            Self::IpDenied => "ip_denied",
+        }
+    }
+
+    /// Emit the sampled warning for this rejection and build its response.
+    fn into_result(self, client_ip: &str) -> PluginResult {
+        let body = match self {
+            Self::UnparseableClientIp => {
+                warn_sampled!(
+                    client_ip = %client_ip,
+                    plugin = "ip_restriction",
+                    reason = "unparseable_client_ip",
+                    "client IP could not be parsed; denying"
+                );
+                r#"{"error":"client IP could not be determined"}"#
+            }
+            Self::NotInAllowList => {
+                warn_sampled!(
+                    client_ip = %client_ip,
+                    plugin = "ip_restriction",
+                    reason = "not_in_allow_list",
+                    "IP address not in allow list"
+                );
+                r#"{"error":"IP address not allowed"}"#
+            }
+            Self::IpDenied => {
+                warn_sampled!(
+                    client_ip = %client_ip,
+                    plugin = "ip_restriction",
+                    reason = "ip_denied",
+                    "IP address denied"
+                );
+                r#"{"error":"IP address denied"}"#
+            }
+        };
+        PluginResult::Reject {
+            status_code: 403,
+            body: body.to_string(),
+            headers: HashMap::new(),
         }
     }
 }
@@ -49,13 +118,6 @@ struct ParsedRule {
     family: IpFamily,
     start: u128,
     end: u128,
-}
-
-impl ParsedRule {
-    fn matches(self, client_ip: IpAddr) -> bool {
-        let (family, value) = ip_key(client_ip);
-        self.family == family && self.start <= value && value <= self.end
-    }
 }
 
 /// Immutable lookup index built at plugin construction/reload.
@@ -102,7 +164,6 @@ impl IpRangeSet {
 pub struct IpRestriction {
     allow: IpRangeSet,
     deny: IpRangeSet,
-    mode: Mode,
 }
 
 impl IpRestriction {
@@ -110,14 +171,12 @@ impl IpRestriction {
         let object = config
             .as_object()
             .ok_or_else(|| "ip_restriction: config must be an object".to_string())?;
-        if let Some(unknown) = object
-            .keys()
-            .find(|key| !CONFIG_KEYS.contains(&key.as_str()))
-        {
-            return Err(format!(
-                "ip_restriction: unknown configuration field {unknown:?}; allowed fields: `allow`, `deny`, `mode`"
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            CONFIG_KEYS,
+            "ip_restriction: `config`: ",
+        )?;
 
         let allow = IpRangeSet::compile(Self::parse_rule_list(object, "allow")?);
         let deny = IpRangeSet::compile(Self::parse_rule_list(object, "deny")?);
@@ -127,21 +186,8 @@ impl IpRestriction {
             );
         }
 
-        let mode = match object.get("mode") {
-            None => Mode::AllowFirst,
-            Some(Value::String(mode)) if mode == "allow_first" => Mode::AllowFirst,
-            Some(Value::String(mode)) if mode == "deny_first" => Mode::DenyFirst,
-            Some(other) => {
-                return Err(format!(
-                    "ip_restriction: `mode` must be `allow_first` or `deny_first`, got: {other:?}",
-                    other = other.to_string()
-                ));
-            }
-        };
-
         debug!(
             plugin = "ip_restriction",
-            mode = mode.as_str(),
             allow_intervals = allow.v4.len() + allow.v6.len(),
             allow_ipv4_intervals = allow.v4.len(),
             allow_ipv6_intervals = allow.v6.len(),
@@ -151,44 +197,24 @@ impl IpRestriction {
             "compiled IP restriction policy"
         );
 
-        Ok(Self { allow, deny, mode })
+        Ok(Self { allow, deny })
     }
 
     /// Check a context-cached, canonical client IP against the compiled policy.
-    fn check_ip(&self, client_ip: Option<IpAddr>, client_ip_label: &str) -> PluginResult {
+    fn check_ip(&self, client_ip: Option<IpAddr>) -> Option<Rejection> {
         let Some(client_ip) = client_ip else {
-            warn_sampled!(
-                client_ip = %client_ip_label,
-                plugin = "ip_restriction",
-                reason = "unparseable_client_ip",
-                "client IP could not be parsed; denying"
-            );
-            return PluginResult::Reject {
-                status_code: 403,
-                body: r#"{"error":"client IP could not be determined"}"#.to_string(),
-                headers: HashMap::new(),
-            };
+            return Some(Rejection::UnparseableClientIp);
         };
 
-        match self.mode {
-            Mode::AllowFirst => {
-                if !self.allow.is_empty() && !self.allow.contains(client_ip) {
-                    return reject_not_allowed(client_ip_label);
-                }
-                if self.deny.contains(client_ip) {
-                    return reject_denied(client_ip_label);
-                }
-            }
-            Mode::DenyFirst => {
-                if self.deny.contains(client_ip) {
-                    return reject_denied(client_ip_label);
-                }
-                if !self.allow.is_empty() && !self.allow.contains(client_ip) {
-                    return reject_not_allowed(client_ip_label);
-                }
-            }
+        // An address outside a non-empty allow list is reported as such even
+        // when the deny list also names it; either way it is rejected.
+        if !self.allow.is_empty() && !self.allow.contains(client_ip) {
+            return Some(Rejection::NotInAllowList);
         }
-        PluginResult::Continue
+        if self.deny.contains(client_ip) {
+            return Some(Rejection::IpDenied);
+        }
+        None
     }
 
     /// Parse one rule array on the cold configuration path.
@@ -227,8 +253,20 @@ impl Plugin for IpRestriction {
         "ip_restriction"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::IP_RESTRICTION
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+    }
+
+    fn supports_request_header_passthrough(&self) -> bool {
+        true
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -239,39 +277,29 @@ impl Plugin for IpRestriction {
         &self,
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
-        self.check_ip(ctx.canonical_client_ip(), &ctx.client_ip)
+        match self.check_ip(ctx.canonical_client_ip()) {
+            None => PluginResult::Continue,
+            Some(rejection) => {
+                ctx.insert_metadata(
+                    REJECTION_REASON_METADATA_KEY.to_string(),
+                    rejection.reason().to_string(),
+                );
+                rejection.into_result(&ctx.client_ip)
+            }
+        }
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        self.check_ip(ctx.canonical_client_ip(), &ctx.client_ip)
-    }
-}
-
-fn reject_not_allowed(client_ip: &str) -> PluginResult {
-    warn_sampled!(
-        client_ip = %client_ip,
-        plugin = "ip_restriction",
-        reason = "not_in_allow_list",
-        "IP address not in allow list"
-    );
-    PluginResult::Reject {
-        status_code: 403,
-        body: r#"{"error":"IP address not allowed"}"#.to_string(),
-        headers: HashMap::new(),
-    }
-}
-
-fn reject_denied(client_ip: &str) -> PluginResult {
-    warn_sampled!(
-        client_ip = %client_ip,
-        plugin = "ip_restriction",
-        reason = "ip_denied",
-        "IP address denied"
-    );
-    PluginResult::Reject {
-        status_code: 403,
-        body: r#"{"error":"IP address denied"}"#.to_string(),
-        headers: HashMap::new(),
+        match self.check_ip(ctx.canonical_client_ip()) {
+            None => PluginResult::Continue,
+            Some(rejection) => {
+                ctx.metadata.insert(
+                    REJECTION_REASON_METADATA_KEY.to_string(),
+                    rejection.reason().to_string(),
+                );
+                rejection.into_result(&ctx.client_ip)
+            }
+        }
     }
 }
 
@@ -314,8 +342,7 @@ fn ip_key(client_ip: IpAddr) -> (IpFamily, u128) {
 /// Parse one exact-IP/CIDR rule into an inclusive numeric interval.
 fn parse_rule(rule: &str) -> Option<ParsedRule> {
     if let Some((network, prefix)) = rule.split_once('/') {
-        let prefix: u8 = prefix.parse().ok()?;
-        return parse_cidr_rule(network, prefix);
+        return parse_cidr_rule(network, parse_canonical_prefix(prefix)?);
     }
 
     match parse_rule_ip(rule)? {
@@ -373,6 +400,22 @@ fn parse_cidr_rule(network: &str, prefix: u8) -> Option<ParsedRule> {
     }
 }
 
+/// Parse a CIDR prefix length written in canonical unsigned decimal.
+///
+/// `str::parse::<u8>` also accepts a leading `+` and leading zeros (`/+8`,
+/// `/08`, `/096`). Those denote the same numeric prefix, but the published
+/// rule grammar does not admit them, so they are refused here too — the same
+/// stance [`is_canonical_ipv4_literal`] takes for IPv4 octets.
+fn parse_canonical_prefix(prefix: &str) -> Option<u8> {
+    let canonical = !prefix.is_empty()
+        && prefix.bytes().all(|byte| byte.is_ascii_digit())
+        && (prefix.len() == 1 || !prefix.starts_with('0'));
+    if !canonical {
+        return None;
+    }
+    prefix.parse().ok()
+}
+
 fn v4_range(value: u32, prefix: u8) -> Option<ParsedRule> {
     if prefix > 32 {
         return None;
@@ -394,7 +437,31 @@ fn parse_rule_ip(ip: &str) -> Option<IpAddr> {
     match crate::util::client_identity::parse_client_ip_literal(ip)? {
         IpAddr::V4(ipv4) if is_canonical_ipv4_literal(ip, ipv4) => Some(IpAddr::V4(ipv4)),
         IpAddr::V4(_) => None,
-        IpAddr::V6(ipv6) => Some(IpAddr::V6(ipv6)),
+        IpAddr::V6(ipv6) if has_valid_rule_zone(ip) => Some(IpAddr::V6(ipv6)),
+        IpAddr::V6(_) => None,
+    }
+}
+
+/// Whether an IPv6 rule literal's zone identifier, if any, is well formed.
+///
+/// The shared client-IP parser cuts everything after the first `%` without
+/// inspecting it, so it also accepts `fe80::1%` and zones containing
+/// whitespace or `]`. Configured rules are held to the published grammar
+/// instead: a zone must be non-empty and contain no whitespace, `/`, or `]`.
+/// The zone is still stripped before matching.
+fn has_valid_rule_zone(literal: &str) -> bool {
+    let unbracketed = literal
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(literal);
+    match unbracketed.split_once('%') {
+        None => true,
+        Some((_, zone)) => {
+            !zone.is_empty()
+                && !zone
+                    .chars()
+                    .any(|ch| ch == '/' || ch == ']' || ch.is_whitespace())
+        }
     }
 }
 
@@ -413,17 +480,4 @@ fn is_canonical_ipv4_literal(literal: &str, ipv4: std::net::Ipv4Addr) -> bool {
         }
     }
     parts.next().is_none()
-}
-
-/// Check if an IP address matches one exact-IP/CIDR rule.
-///
-/// This string-based API is preserved for external callers and tests. Runtime
-/// plugin hooks use the context-cached typed client IP and compiled range set.
-#[allow(dead_code)]
-pub fn ip_matches(client_ip: &str, rule: &str) -> bool {
-    let client_ip = crate::util::client_identity::parse_canonical_client_ip(client_ip);
-    match (client_ip, parse_rule(rule)) {
-        (Some(client_ip), Some(rule)) => rule.matches(client_ip),
-        _ => false,
-    }
 }

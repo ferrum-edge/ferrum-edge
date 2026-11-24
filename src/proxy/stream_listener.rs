@@ -53,7 +53,6 @@ pub struct NodeWaypointUdpSteerHold {
 }
 
 impl NodeWaypointUdpSteerHold {
-    #[allow(dead_code)] // External unit tests sequence publication vs failure/shutdown.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             entered: tokio::sync::Barrier::new(2),
@@ -62,13 +61,11 @@ impl NodeWaypointUdpSteerHold {
     }
 
     /// Wait until the production waiter has reached this fence.
-    #[allow(dead_code)] // External unit tests.
     pub async fn wait_entered(&self) {
         self.entered.wait().await;
     }
 
     /// Let the production waiter continue past this fence.
-    #[allow(dead_code)] // External unit tests.
     pub async fn wait_release(&self) {
         self.release.wait().await;
     }
@@ -91,7 +88,6 @@ pub struct UdpListenerTaskHold {
 }
 
 impl UdpListenerTaskHold {
-    #[allow(dead_code)] // External unit tests sequence a port release vs the task.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             entered: tokio::sync::Barrier::new(2),
@@ -100,13 +96,11 @@ impl UdpListenerTaskHold {
     }
 
     /// Wait until the listener task has reached this fence.
-    #[allow(dead_code)] // External unit tests.
     pub async fn wait_entered(&self) {
         self.entered.wait().await;
     }
 
     /// Let the listener task continue past this fence.
-    #[allow(dead_code)] // External unit tests.
     pub async fn wait_release(&self) {
         self.release.wait().await;
     }
@@ -232,7 +226,6 @@ pub struct MeshNodeWaypointDtlsGeneration {
 }
 
 impl MeshNodeWaypointDtlsGeneration {
-    #[allow(dead_code)] // External unit tests / diagnostics.
     #[inline]
     pub fn generation(&self) -> u64 {
         self.generation
@@ -244,7 +237,6 @@ impl MeshNodeWaypointDtlsGeneration {
     }
 
     /// Sorted listener keys covered by this generation (diagnostics / tests).
-    #[allow(dead_code)] // Test / introspection surface.
     pub fn covered_listener_keys(&self) -> Vec<String> {
         self.configs.keys().cloned().collect()
     }
@@ -339,7 +331,7 @@ struct ListenerHandle {
 ///
 /// Must cover every input the builder bakes into the cached config: the
 /// verify flag, the effective CA (proxy-resolved or global fallback — same
-/// precedence as `BackendTlsConfigBuilder::custom_ca_path`), client cert/key,
+/// precedence as `crate::tls::backend::build_root_cert_store`), client cert/key,
 /// and the SAN allow-list (baked into the verifier). Fields are fingerprinted
 /// by *content* so in-place rotation (cert-manager rewriting the same path,
 /// or a secret backend serving new bytes under a stable URI) restarts the
@@ -602,6 +594,11 @@ pub struct StreamListenerOverloadSnapshot {
     pub dtls_demux_sessions: Vec<DtlsDemuxSessionSnapshot>,
     /// Bounded frontend-DTLS material generation and convergence status.
     pub frontend_dtls_reload: FrontendDtlsReloadStatus,
+    /// The same bounded status for the owner-scoped mesh NodeWaypoint DTLS
+    /// slot (issue #7186). Kept separate from `frontend_dtls_reload`, which is
+    /// the ordinary operator slot a mesh generation never touches, so a
+    /// rejected mesh candidate is visible without blurring the two owners.
+    pub mesh_node_waypoint_dtls_reload: FrontendDtlsReloadStatus,
     /// Number of configured stream-listener resources that are not serving
     /// after the most recent `reconcile()` — hard bind failures PLUS listeners
     /// deferred/degraded for a config reason (e.g. waiting on frontend TLS
@@ -1415,8 +1412,7 @@ pub struct StreamListenerManager {
     node_waypoint_udp_listener_generation: AtomicU64,
     /// Serving-owner fence: shutdown clears this under the listener-map lock
     /// before retracting so a bind-success watcher cannot republish after
-    /// teardown. Lock order is listener map, then the steering mutex; a
-    /// listener task joined under the map lock must not await that map.
+    /// teardown. Lock order is listener map, then the steering mutex.
     node_waypoint_udp_steering_open: Arc<AtomicBool>,
     /// Test fence: bind-watch after `started`, before the listener-map lock.
     node_waypoint_udp_steer_before_map_hold:
@@ -1497,73 +1493,6 @@ pub struct StreamListenerManager {
 impl StreamListenerManager {
     #[allow(dead_code, clippy::too_many_arguments)]
     pub fn new(
-        bind_addr: IpAddr,
-        config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
-        dns_cache: DnsCache,
-        request_epoch: Arc<RequestEpochStore>,
-        circuit_breaker_cache: Arc<CircuitBreakerCache>,
-        frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
-        tls_no_verify: bool,
-        tls_ca_bundle_path: Option<String>,
-        tcp_idle_timeout_seconds: u64,
-        tcp_half_close_max_wait_seconds: u64,
-        frontend_tls_handshake_timeout_seconds: u64,
-        udp_max_sessions: usize,
-        udp_cleanup_interval_seconds: u64,
-        tls_policy: Option<Arc<TlsPolicy>>,
-        crls: crate::tls::CrlList,
-        adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
-        udp_recvmmsg_batch_size: usize,
-        tcp_fastopen_enabled: bool,
-        tcp_listen_backlog: u32,
-        accept_threads: usize,
-        tcp_fastopen_queue_len: u16,
-        overload: Arc<crate::overload::OverloadState>,
-        ktls_enabled: bool,
-        io_uring_splice_enabled: bool,
-        record_mesh_mtls_metric: bool,
-        so_busy_poll_us: u32,
-        udp_gro_enabled: bool,
-        udp_gso_enabled: bool,
-        udp_pktinfo_enabled: bool,
-        trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
-    ) -> Self {
-        Self::new_with_epoch(
-            bind_addr,
-            config,
-            dns_cache,
-            request_epoch,
-            circuit_breaker_cache,
-            frontend_tls_config,
-            tls_no_verify,
-            tls_ca_bundle_path,
-            tcp_idle_timeout_seconds,
-            tcp_half_close_max_wait_seconds,
-            frontend_tls_handshake_timeout_seconds,
-            udp_max_sessions,
-            udp_cleanup_interval_seconds,
-            tls_policy,
-            crls,
-            adaptive_buffer,
-            udp_recvmmsg_batch_size,
-            tcp_fastopen_enabled,
-            tcp_listen_backlog,
-            accept_threads,
-            tcp_fastopen_queue_len,
-            overload,
-            ktls_enabled,
-            io_uring_splice_enabled,
-            record_mesh_mtls_metric,
-            so_busy_poll_us,
-            udp_gro_enabled,
-            udp_gso_enabled,
-            udp_pktinfo_enabled,
-            trusted_proxies,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_epoch(
         bind_addr: IpAddr,
         config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
         dns_cache: DnsCache,
@@ -1952,7 +1881,6 @@ impl StreamListenerManager {
     /// Test seam: pause bind-watch after `started` (before the map lock) and/or
     /// pause plan installation after eligibility so a concurrent failure or
     /// shutdown can be sequenced deterministically.
-    #[allow(dead_code)] // External unit tests.
     pub fn set_node_waypoint_udp_steer_holds_for_test(
         &self,
         before_map: Option<Arc<NodeWaypointUdpSteerHold>>,
@@ -1967,7 +1895,6 @@ impl StreamListenerManager {
     /// Test seam: pause UDP/DTLS listener tasks spawned from now on before
     /// their bind and/or before they report a failed listener, so a test can
     /// take or release the port in between (issue #5855).
-    #[allow(dead_code)] // External unit tests.
     pub fn set_udp_listener_task_holds_for_test(
         &self,
         before_bind: Option<Arc<UdpListenerTaskHold>>,
@@ -1981,7 +1908,6 @@ impl StreamListenerManager {
 
     /// Test seam: `(runtime key, generation, started flag)` for each NodeWaypoint
     /// UDP owner currently in the listener map.
-    #[allow(dead_code)] // External unit tests.
     pub async fn node_waypoint_udp_listener_owners_for_test(
         &self,
     ) -> Vec<(String, u64, Arc<AtomicBool>)> {
@@ -1996,7 +1922,6 @@ impl StreamListenerManager {
     /// Test seam: accepted destination-table generation, destinations, and
     /// owners for one shared `__nwudp_{port}` router. `None` when that port is
     /// not currently a shared destination group.
-    #[allow(dead_code)] // External unit tests.
     pub fn node_waypoint_udp_destination_snapshot_for_test(
         &self,
         port: u16,
@@ -2022,7 +1947,6 @@ impl StreamListenerManager {
     /// Test seam: run the production listener-exit retraction for `generation`
     /// of `key`. A mismatched generation is a no-op so a failed predecessor
     /// cannot retract a replacement.
-    #[allow(dead_code)] // External unit tests.
     pub async fn retract_node_waypoint_udp_listener_generation_for_test(
         &self,
         key: &str,
@@ -2144,13 +2068,11 @@ impl StreamListenerManager {
     /// [`Self::swap_frontend_tls_config`] replaced the slot rather than
     /// mutated in place; non-test callers may also use this to observe the
     /// startup-set frontend TLS config.
-    #[allow(dead_code)] // Test / introspection surface.
     pub fn snapshot_frontend_tls_config(&self) -> Option<Arc<rustls::ServerConfig>> {
         self.frontend_tls_config.load().as_ref().clone()
     }
 
     /// Snapshot of the last accepted frontend DTLS generation (if any).
-    #[allow(dead_code)] // Test / introspection surface.
     pub fn snapshot_frontend_dtls_generation(
         &self,
     ) -> Option<Arc<crate::dtls::FrontendDtlsGeneration>> {
@@ -2161,7 +2083,6 @@ impl StreamListenerManager {
     /// generation publish. Production collectors use the same lock through
     /// [`with_current_frontend_dtls_generation`].
     #[doc(hidden)]
-    #[allow(dead_code)] // External integration-test seam is unused by the bin test target.
     pub fn frontend_dtls_publish_lock_for_test(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.frontend_dtls_publish)
     }
@@ -2169,7 +2090,6 @@ impl StreamListenerManager {
     /// Test seam that observes the generation exactly as a newly collected
     /// DTLS server does, under the shared publication fence.
     #[doc(hidden)]
-    #[allow(dead_code)] // External integration-test seam is unused by the bin test target.
     pub async fn collected_frontend_dtls_generation_for_test(&self) -> Option<u64> {
         with_current_frontend_dtls_generation(
             &self.frontend_dtls_publish,
@@ -2186,7 +2106,6 @@ impl StreamListenerManager {
     /// replaced; the boolean is the client-CA policy bit. Established off the
     /// request/datagram hot path under the listener map lock.
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit/integration-test seam.
     pub async fn active_dtls_frontend_identities_for_test(&self) -> Vec<(usize, bool)> {
         let listeners = self.listeners.lock().await;
         listeners
@@ -2408,7 +2327,6 @@ impl StreamListenerManager {
     }
 
     /// Snapshot of the last accepted owner-scoped NodeWaypoint DTLS generation.
-    #[allow(dead_code)] // Test / introspection surface.
     pub fn snapshot_mesh_node_waypoint_dtls_generation(
         &self,
     ) -> Option<Arc<MeshNodeWaypointDtlsGeneration>> {
@@ -2418,8 +2336,8 @@ impl StreamListenerManager {
             .clone()
     }
 
-    /// Bounded redacted owner-scoped DTLS reload status.
-    #[allow(dead_code)] // Test / introspection surface.
+    /// Bounded redacted owner-scoped DTLS reload status, exposed on
+    /// `/overload` as `stream_listeners.mesh_node_waypoint_dtls_reload`.
     pub fn mesh_node_waypoint_dtls_reload_status(&self) -> FrontendDtlsReloadStatus {
         (**self.mesh_node_waypoint_dtls_reload_status.load()).clone()
     }
@@ -3780,10 +3698,10 @@ impl StreamListenerManager {
                         exited_for_exit.store(true, Ordering::Release);
                     }
                     if owner_for_exit && let Some(steering) = node_waypoint_udp_steering {
-                        // Do not await the listener map here: reconcile joins this
-                        // task while holding that lock. A helper observes the
-                        // non-serving mark and generation fence once the owner
-                        // releases.
+                        // Retract from a helper task so this listener task never
+                        // blocks its own exit on the listener map. The helper
+                        // observes the non-serving mark and generation fence once
+                        // the owner releases.
                         tokio::spawn(async move {
                             retract_owned_node_waypoint_udp_listener(
                                 &listeners_for_exit,
@@ -4298,7 +4216,8 @@ impl StreamListenerManager {
             self.node_waypoint_udp_source_index.load_full().as_ref(),
             &listeners,
             exclude,
-        );
+        )
+        .await;
     }
 
     /// Build-validate the cached backend TLS `ClientConfig` for a TCP+TLS
@@ -4367,6 +4286,7 @@ impl StreamListenerManager {
             dtls_demux_sessions_total,
             dtls_demux_sessions,
             frontend_dtls_reload: self.frontend_dtls_reload_status(),
+            mesh_node_waypoint_dtls_reload: self.mesh_node_waypoint_dtls_reload_status(),
             bind_failures_total: bind_failures.len(),
             bind_failures: bind_failures.as_ref().clone(),
         }
@@ -4389,7 +4309,6 @@ impl StreamListenerManager {
     }
 
     /// `(listener_key, bind_addr)` pairs currently owned by this manager.
-    #[allow(dead_code)] // Test / introspection surface.
     pub async fn active_binds(&self) -> Vec<(String, IpAddr)> {
         let listeners = self.listeners.lock().await;
         let mut out: Vec<_> = listeners
@@ -4583,8 +4502,8 @@ fn node_waypoint_udp_published_ifaces(
         .unwrap_or_default()
 }
 
-fn publish_bound_node_waypoint_udp_destinations(
-    steering: &crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering,
+async fn publish_bound_node_waypoint_udp_destinations(
+    steering: &Arc<crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering>,
     desired: &[crate::capture::NodeWaypointUdpSteerDestination],
     source_index: &Option<
         Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>,
@@ -4617,7 +4536,18 @@ fn publish_bound_node_waypoint_udp_destinations(
         Vec::new()
     };
     let ifaces = node_waypoint_udp_published_ifaces(source_index);
-    steering.set_bound_destinations(destinations, Some(&ifaces), serving);
+    // The steering apply runs `sh -c` iptables scripts that block until the
+    // child exits, so it runs on the blocking pool rather than a runtime worker
+    // (issue #7170). Callers hold the listener map lock across this await, so
+    // publications stay serialized exactly as before.
+    let steering = Arc::clone(steering);
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        steering.set_bound_destinations(destinations, Some(&ifaces), serving)
+    })
+    .await
+    {
+        warn!(%error, "NodeWaypoint UDP steering publication did not complete");
+    }
 }
 
 /// Mark this exact listener generation non-serving and republish the
@@ -4626,7 +4556,7 @@ fn publish_bound_node_waypoint_udp_destinations(
 async fn retract_owned_node_waypoint_udp_listener(
     listeners: &tokio::sync::Mutex<std::collections::HashMap<String, ListenerHandle>>,
     steering_open: &AtomicBool,
-    steering: &crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering,
+    steering: &Arc<crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering>,
     config: &arc_swap::ArcSwap<GatewayConfig>,
     source_index: &Option<
         Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>,
@@ -4650,7 +4580,8 @@ async fn retract_owned_node_waypoint_udp_listener(
         source_index,
         &guard,
         &std::collections::HashSet::new(),
-    );
+    )
+    .await;
 }
 
 /// Wait until this NodeWaypoint UDP/DTLS listener actually binds, then publish
@@ -4716,7 +4647,8 @@ fn spawn_node_waypoint_udp_steer_bind_watch(
             source_index.as_ref(),
             &guard,
             &std::collections::HashSet::new(),
-        );
+        )
+        .await;
     });
 }
 
@@ -4768,9 +4700,9 @@ async fn await_stream_listener_shutdown(listener_key: &str, handle: ListenerHand
             join_handle.abort();
             // Bound the post-abort join too. Abort only takes effect at the
             // task's next await point, so a task wedged in synchronous code
-            // would otherwise hang this await — and reconcile holds the
-            // listeners mutex, so a single wedged listener would deadlock
-            // every future reconcile. Giving up here is safe: reconcile never
+            // would otherwise hang this await — and reconcile holds
+            // `reconcile_serial` across this await, so a single wedged listener
+            // would block every future reconcile. Giving up here is safe: reconcile never
             // crashes, and if the old socket is still held the replacement's
             // bind probe fails and skips only the conflicting proxy until the
             // next reconcile.

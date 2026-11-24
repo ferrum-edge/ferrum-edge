@@ -4,9 +4,9 @@
 //! present / missing / mismatched classification without a live MongoDB.
 
 use ferrum_edge::config::mongo_index_plan::{
-    IndexPresence, REQUIRED_GUARD_COLLECTIONS, classify_guard_collections,
-    classify_plan_against_live, classify_required_index, default_index_name, dry_run_lines,
-    required_mongo_indexes, summarize_index,
+    HMAC_SECRET_HASHES_FIELD, IndexPresence, REQUIRED_GUARD_COLLECTIONS,
+    classify_guard_collections, classify_plan_against_live, classify_required_index,
+    default_index_name, dry_run_lines, required_mongo_indexes, summarize_index,
 };
 use mongodb::IndexModel;
 use mongodb::bson::doc;
@@ -411,5 +411,54 @@ fn plan_module_is_the_sole_index_definition_home() {
     assert!(
         PLAN_SOURCE.contains("pub fn required_mongo_indexes"),
         "plan module must export required_mongo_indexes"
+    );
+}
+
+/// Orphan and `proxy_group` cleanup rely on these indexes. Asserted against
+/// the plan `up` ensures rather than string searches over `mongo_store.rs`,
+/// which matched their own literals (issue #7222).
+#[test]
+fn plan_declares_proxy_plugin_cleanup_indexes() {
+    let plan = required_mongo_indexes();
+    let has = |collection: &str, keys: mongodb::bson::Document| {
+        plan.iter()
+            .any(|entry| entry.collection == collection && entry.model.keys == keys)
+    };
+    assert!(
+        has("proxies", doc! { "plugins.plugin_config_id": 1 }),
+        "MongoDB must index proxy plugin associations for orphan cleanup"
+    );
+    assert!(
+        has("plugin_configs", doc! { "scope": 1, "_id": 1 }),
+        "MongoDB must have a scope-leading plugin_configs index for proxy_group cleanup"
+    );
+}
+
+#[test]
+fn plan_declares_unique_consumer_credential_indexes() {
+    let plan = required_mongo_indexes();
+    for field in [
+        "credentials.keyauth.key",
+        "credentials.mtls_auth.identity",
+        HMAC_SECRET_HASHES_FIELD,
+    ] {
+        let keys = doc! { "namespace": 1, field: 1 };
+        let entry = plan
+            .iter()
+            .find(|entry| entry.collection == "consumers" && entry.model.keys == keys)
+            .unwrap_or_else(|| panic!("consumers (namespace, {field}) index"));
+        assert_eq!(
+            entry
+                .model
+                .options
+                .as_ref()
+                .and_then(|options| options.unique),
+            Some(true),
+            "MongoDB must enforce {field} uniqueness with an index"
+        );
+    }
+    assert!(
+        !MONGO_STORE_SOURCE.contains("drop_index("),
+        "MongoDB index setup must never drop the credential uniqueness backstops"
     );
 }

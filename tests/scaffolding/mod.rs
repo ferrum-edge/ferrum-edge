@@ -20,9 +20,9 @@
 //! - [`clients::Http1Client`] — a `reqwest`-backed client tuned for the
 //!   harness (insecure TLS, short timeout, buffered response).
 //!
-//! Phase 1 acceptance tests live under `tests/functional/scripted_backend/`
-//! (binary mode) and `tests/integration/scripted_backend/` (in-process
-//! smoke tests).
+//! Acceptance tests are the `tests/functional/scripted_backend_*_tests.rs`
+//! files (binary mode) and `tests/integration/scripted_backend_smoke_tests.rs`
+//! (in-process smoke tests).
 //!
 //! # Canonical usage
 //!
@@ -64,12 +64,11 @@ pub mod ports;
 
 // Curated re-exports so a test's imports fit on one line.
 pub use backends::{
-    ConnectionSettings, DatagramMatcher, DtlsConfig, ExecutionMode, GrpcStep, H2Step,
-    H3RecordedRequest, H3Step, H3TlsConfig, Http1Request, HttpStep, MatchHeaders, MatchRpc,
-    QuicRefuser, ReceivedStream, RecordedDatagram, RequestMatcher, ScriptedDtlsBackend,
-    ScriptedGrpcBackend, ScriptedH2Backend, ScriptedH3Backend, ScriptedHttp1Backend,
-    ScriptedTcpBackend, ScriptedTlsBackend, ScriptedUdpBackend, TcpStep, TlsConfig, UdpStep,
-    tls_backend_without_quic, tls_backend_without_quic_with_ok_response,
+    ConnectionSettings, DatagramMatcher, ExecutionMode, GrpcStep, H2Step, H3RecordedRequest,
+    H3Step, H3TlsConfig, Http1Request, HttpStep, MatchHeaders, MatchRpc, QuicRefuser,
+    ReceivedStream, RecordedDatagram, RequestMatcher, ScriptedGrpcBackend, ScriptedH2Backend,
+    ScriptedH3Backend, ScriptedHttp1Backend, ScriptedTcpBackend, ScriptedTlsBackend,
+    ScriptedUdpBackend, TcpStep, TlsConfig, UdpStep, tls_backend_without_quic_with_ok_response,
 };
 pub use certs::TestCa;
 pub use clients::{
@@ -80,7 +79,6 @@ pub use harness::{GatewayHarness, GatewayHarnessBuilder, HarnessMode};
 pub use matrix::{BackendKind, FrontendKind, MatrixBackend, MatrixResponse};
 pub use network::{
     BandwidthLimitedStream, DelayedStream, NetworkProfile, NetworkSimProxy, NetworkSimProxyBuilder,
-    TruncatedStream,
 };
 pub use ports::{
     BIND_DROP_SPAWN_ATTEMPTS, PortReservation, RefusedTcpPort, UdpPortReservation,
@@ -98,20 +96,6 @@ use serde_json::Value;
 /// the config-reload path.
 pub fn file_mode_yaml_for_backend(port: u16) -> String {
     file_mode_yaml_for_backend_with(port, Value::Null)
-}
-
-/// Build file-mode YAML for an HTTPS backend on `127.0.0.1:<port>`.
-/// `backend_read_timeout_ms` defaults to 5000 — callers can override via
-/// [`file_mode_yaml_for_backend_with`].
-pub fn file_mode_yaml_for_https_backend(port: u16) -> String {
-    file_mode_yaml_for_backend_with(
-        port,
-        serde_json::json!({
-            "backend_scheme": "https",
-            "backend_host": "localhost",
-            "backend_tls_verify_server_cert": false,
-        }),
-    )
 }
 
 /// Build file-mode YAML with explicit overrides. `overrides` is merged

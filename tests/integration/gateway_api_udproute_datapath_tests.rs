@@ -301,6 +301,44 @@ async fn start_translated_udp_lab(
     snapshot: &LabSnapshot,
     overrides: HashMap<String, String>,
 ) -> TranslatedUdpLab {
+    start_translated_udp_lab_in(snapshot, overrides, ROUTE_NS).await
+}
+
+/// Move every Gateway into `gateway_namespace`, admit routes from all
+/// namespaces on its listeners, and point each route's parentRef at it, so
+/// the routes in `ROUTE_NS` attach across namespaces (issue #7305).
+fn place_gateways_in(objects: &mut [K8sObject], gateway_namespace: &str) {
+    for object in objects.iter_mut() {
+        match object.kind.as_str() {
+            "Gateway" => {
+                object.metadata.namespace = gateway_namespace.to_string();
+                for listener in object.spec["listeners"]
+                    .as_array_mut()
+                    .into_iter()
+                    .flatten()
+                {
+                    listener["allowedRoutes"]["namespaces"]["from"] = json!("All");
+                }
+            }
+            "UDPRoute" => {
+                for parent in object.spec["parentRefs"]
+                    .as_array_mut()
+                    .into_iter()
+                    .flatten()
+                {
+                    parent["namespace"] = json!(gateway_namespace);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn start_translated_udp_lab_in(
+    snapshot: &LabSnapshot,
+    overrides: HashMap<String, String>,
+    gateway_namespace: &str,
+) -> TranslatedUdpLab {
     for attempt in 1..=MAX_LAB_ATTEMPTS {
         let mut reservations = Vec::new();
         for _ in 0..snapshot.routes.len() {
@@ -312,8 +350,13 @@ async fn start_translated_udp_lab(
             listen_ports.push(reservation.drop_and_take_port());
         }
 
-        let objects = snapshot.objects(&listen_ports);
-        let options = translation_options();
+        let mut objects = snapshot.objects(&listen_ports);
+        let mut options = translation_options();
+        if gateway_namespace != ROUTE_NS {
+            place_gateways_in(&mut objects, gateway_namespace);
+            let namespaces = vec![ROUTE_NS.to_string(), gateway_namespace.to_string()];
+            options = options.with_source_namespaces(namespaces);
+        }
         let translated = translate_k8s_objects(&objects, options);
         let config = translated.expect("UDPRoute snapshot translates").config;
         let served = try_serve_translated_config(config, listen_ports, &overrides);
@@ -651,6 +694,57 @@ async fn translated_weighted_udp_route_serves_each_session_from_one_leg() {
             "a UDP session must stay on the leg it selected, saw {tags:?}"
         );
     }
+
+    lab.shutdown().await;
+}
+
+/// A cross-namespace parentRef materializes the route in the Gateway's
+/// namespace (issue #7305). The weighted upstream must move there with the
+/// proxy: the live UDP path resolves `upstream_id` inside the proxy's own
+/// namespace, so an upstream left in the route's namespace would serve
+/// nothing.
+#[tokio::test]
+async fn cross_namespace_weighted_udp_route_serves_from_the_gateway_namespace() {
+    const GATEWAY_NS: &str = "edge-system";
+    let alpha = TaggedBackend::start("alpha").await;
+    let beta = TaggedBackend::start("beta").await;
+    let alpha_service = alpha.service();
+    let beta_service = beta.service();
+    let alpha_port = alpha.port;
+    let beta_port = beta.port;
+    let legs = json!([
+        {"name": alpha_service.as_str(), "port": alpha_port, "weight": 1},
+        {"name": beta_service.as_str(), "port": beta_port, "weight": 1}
+    ]);
+    let snapshot = LabSnapshot {
+        services: vec![
+            (alpha_service.clone(), alpha_port),
+            (beta_service.clone(), beta_port),
+        ],
+        routes: vec![RouteSpec {
+            gateway: "edge",
+            section: "dns",
+            route: "split",
+            backend_refs: legs,
+        }],
+        extra_objects: Vec::new(),
+    };
+
+    let overrides = dns_overrides(&[&alpha, &beta]);
+    let lab = start_translated_udp_lab_in(&snapshot, overrides, GATEWAY_NS).await;
+
+    let proxy = lab.sole_udp_proxy();
+    assert_eq!(proxy.namespace, GATEWAY_NS);
+    let upstream_id = proxy.upstream_id.clone().expect("weighted set upstream");
+    assert_eq!(lab.upstream(&upstream_id).namespace, GATEWAY_NS);
+
+    let allowed = BTreeSet::from(["alpha".to_string(), "beta".to_string()]);
+    let client = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    let reply = round_trip(&client, lab.gateway_addr(0), b"cross-ns").await;
+    let tag = responder_tag(&reply, "cross-ns");
+    assert!(allowed.contains(&tag), "served by a declared leg: {reply}");
 
     lab.shutdown().await;
 }

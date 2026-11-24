@@ -320,3 +320,109 @@ async fn first_insert_prunes_backlog_that_predates_retention_gate() {
     assert_eq!(listed.items[0].id, "new");
     assert_eq!(listed.items[1].id, "old-1");
 }
+
+async fn audit_total(store: &dyn DatabaseBackend, namespace: &str) -> i64 {
+    store
+        .list_audit_events(
+            namespace,
+            &AuditListFilter {
+                limit: 50,
+                offset: 0,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .total
+}
+
+/// Seed rows with retention disabled so no insert-path prune runs: the
+/// namespaces are idle from the store's point of view.
+async fn seed_idle_namespaces(store: &DatabaseStore) {
+    for event in [
+        event_at("idle-a", "old-a", 10, "1"),
+        event_at("idle-a", "new-a", 1, "1"),
+        event_at("idle-b", "old-b", 10, "1"),
+        event_at("idle-b", "older-b", 20, "1"),
+        event_at("idle-c", "new-c", 1, "1"),
+        event_at("idle-c", "new-c", 2, "2"),
+        event_at("idle-c", "new-c", 3, "3"),
+    ] {
+        store.insert_audit_event(&event).await.unwrap();
+    }
+}
+
+/// `FERRUM_AUDIT_RETENTION_DAYS` promises age pruning per namespace, but
+/// insert-path pruning only reaches a namespace that receives a new event. The
+/// sweep must age out every namespace holding rows, and only by age: the row
+/// cap is left to inserts because an idle namespace cannot grow.
+#[tokio::test]
+async fn expired_sweep_ages_out_every_namespace_without_inserts() {
+    let (mut store, _tmp) = sqlite_store_with_retention(disabled_retention()).await;
+    seed_idle_namespaces(&store).await;
+
+    assert_eq!(
+        store.prune_expired_audit_events().await.unwrap(),
+        0,
+        "the sweep is a no-op without age retention"
+    );
+
+    store.set_audit_retention_policy(AuditRetentionPolicy {
+        retention_days: Some(7),
+        max_rows_per_namespace: Some(1),
+    });
+    assert_eq!(store.prune_expired_audit_events().await.unwrap(), 3);
+    assert_eq!(audit_total(&store, "idle-a").await, 1);
+    assert_eq!(audit_total(&store, "idle-b").await, 0);
+    assert_eq!(
+        audit_total(&store, "idle-c").await,
+        3,
+        "the sweep must not apply the row cap"
+    );
+    assert_eq!(
+        store.prune_expired_audit_events().await.unwrap(),
+        0,
+        "a second sweep finds nothing left to age out"
+    );
+}
+
+/// The background task runs the sweep on its own, with no audit insert, and
+/// exits promptly on shutdown.
+#[tokio::test]
+async fn retention_sweep_task_prunes_idle_namespaces_and_stops_on_shutdown() {
+    use ferrum_edge::admin::audit::{spawn_retention_sweep, start_retention_sweep};
+    use std::sync::Arc;
+
+    let (mut store, _tmp) = sqlite_store_with_retention(disabled_retention()).await;
+    seed_idle_namespaces(&store).await;
+    store.set_audit_retention_policy(AuditRetentionPolicy {
+        retention_days: Some(7),
+        max_rows_per_namespace: None,
+    });
+    let db: Arc<dyn DatabaseBackend> = Arc::new(store);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    assert!(
+        start_retention_sweep(None, Arc::clone(&db), shutdown_rx.clone()).is_none(),
+        "no task without age retention"
+    );
+
+    // A zero interval still sleeps the 100 ms jitter floor between sweeps.
+    let handle = spawn_retention_sweep(Arc::clone(&db), std::time::Duration::ZERO, shutdown_rx);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while audit_total(db.as_ref(), "idle-a").await != 1
+            || audit_total(db.as_ref(), "idle-b").await != 0
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the sweep task must prune idle namespaces without any insert");
+    assert_eq!(audit_total(db.as_ref(), "idle-c").await, 3);
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("the sweep task must stop on shutdown")
+        .expect("the sweep task must not panic");
+}

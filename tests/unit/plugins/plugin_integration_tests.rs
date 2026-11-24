@@ -263,7 +263,7 @@ async fn test_plugin_creation_all_plugins() {
             "http_logging" => json!({"endpoint_url": "http://localhost:9200/logs"}),
             "tcp_logging" => json!({"host": "localhost", "port": 5140}),
             "ws_logging" => json!({"endpoint_url": "ws://localhost:9300/logs"}),
-            "otel_tracing" => json!({"endpoint": "http://localhost:4318/v1/traces"}),
+            "otel_tracing" => json!({"endpoint": "http://127.0.0.1:4318/v1/traces"}),
             "jwks_auth" => {
                 json!({"providers": [{"jwks_uri": "http://127.0.0.1:9/.well-known/jwks.json"}]})
             }
@@ -303,7 +303,7 @@ async fn test_plugin_creation_all_plugins() {
             "serverless_function" => {
                 json!({"provider": "azure_functions", "function_url": "https://example.com/func"})
             }
-            "request_mirror" => json!({"mirror_host": "mirror.local"}),
+            "request_mirror" => json!({"allow_plaintext": true, "mirror_host": "mirror.local"}),
             "load_testing" => {
                 json!({
                     "key": "test-load-key-0123456789abcdef!!",
@@ -529,7 +529,10 @@ async fn test_plugin_error_handling() {
     let error = create_plugin("jwt_auth", &json!({"invalid": "config"}))
         .err()
         .expect("jwt_auth must reject unknown config keys");
-    assert_eq!(error, "jwt_auth: unknown config key \"invalid\"");
+    assert_eq!(
+        error,
+        "jwt_auth: `config`: unknown configuration key(s): \"config.invalid\""
+    );
 }
 
 #[tokio::test]
@@ -629,7 +632,6 @@ async fn test_response_caching_stores_transformed_body() {
             &json!({
                 "ttl_seconds": 60,
                 "add_cache_status_header": true,
-                "cache_key_include_consumer": true,
             }),
         )
         .unwrap()
@@ -743,10 +745,6 @@ mod runtime_overlay_cache_provenance {
             &json!({
                 "ttl_seconds": 60,
                 "add_cache_status_header": true,
-                // Partitioning only: authenticated fixtures still need
-                // `Cache-Control: public` (see `origin_headers`) under
-                // RFC 9111 §3.5 / GHSA-7f28.
-                "cache_key_include_consumer": true,
             }),
         )
         .unwrap()
@@ -1368,7 +1366,7 @@ async fn test_response_cache_revalidation_respects_gate_change() {
 /// The published gate identity alone is not a sufficient provenance witness
 /// (GHSA-83rc-23c9-3g9x).
 ///
-/// Mesh publishes the gate map from `record_applied_slice`, i.e. AFTER
+/// Mesh publishes the gate map from `record_applied_slice_with_token`, i.e. AFTER
 /// `ProxyState::update_config` has published the new `RequestEpoch`. A request
 /// that pinned the previous plugin generation can therefore still pin the NEW
 /// publication identity — its authenticate/authorize phase runs before
@@ -1526,7 +1524,6 @@ async fn test_response_cache_hit_lifecycle_skips_non_idempotent_transforms() {
             &json!({
                 "ttl_seconds": 60,
                 "add_cache_status_header": true,
-                "cache_key_include_consumer": true,
             }),
         )
         .unwrap()
@@ -1702,7 +1699,6 @@ async fn response_cache_misses_after_route_response_header_policy_changes() {
             &json!({
                 "ttl_seconds": 60,
                 "add_cache_status_header": true,
-                "cache_key_include_consumer": true,
             }),
         )
         .unwrap()
@@ -1792,7 +1788,6 @@ fn route_override_replay_plugins() -> Vec<Arc<dyn Plugin>> {
         &json!({
             "ttl_seconds": 60,
             "add_cache_status_header": true,
-            "cache_key_include_consumer": true,
         }),
     )
     .unwrap()
@@ -1847,13 +1842,13 @@ async fn response_cache_misses_when_route_override_backend_tls_differs() {
     let path = "/route-override-backend-tls";
 
     let mut store_ctx = create_response_context(path);
-    store_ctx.route_override_resolved_tls = Some(tls_a.clone());
+    store_ctx.route_override_resolved_tls = Some(Arc::new(tls_a.clone()));
     store_route_override_entry(&plugins, &mut store_ctx).await;
 
     // Control: the unchanged TLS identity still addresses the stored entry, so
     // each miss below is caused by the TLS difference rather than a failed store.
     let mut hit_ctx = create_response_context(path);
-    hit_ctx.route_override_resolved_tls = Some(tls_a.clone());
+    hit_ctx.route_override_resolved_tls = Some(Arc::new(tls_a.clone()));
     assert!(
         route_override_replay_hit(&plugins, &mut hit_ctx).await,
         "the unchanged backend TLS override must replay the stored representation"
@@ -1901,7 +1896,7 @@ async fn response_cache_misses_when_route_override_backend_tls_differs() {
     ];
     for (label, tls) in variants {
         let mut miss_ctx = create_response_context(path);
-        miss_ctx.route_override_resolved_tls = tls;
+        miss_ctx.route_override_resolved_tls = tls.map(Arc::new);
         assert!(
             !route_override_replay_hit(&plugins, &mut miss_ctx).await,
             "the retained representation must miss under a {label}"
@@ -1969,7 +1964,6 @@ async fn test_response_cache_revalidated_lifecycle_skips_header_transforms() {
             &json!({
                 "ttl_seconds": 60,
                 "add_cache_status_header": true,
-                "cache_key_include_consumer": true,
             }),
         )
         .unwrap()
@@ -2267,7 +2261,10 @@ async fn test_request_size_limiting_checks_transformed_body() {
     let (status_code, body, _) =
         reject_parts(result).expect("expected transformed request body to be rejected");
     assert_eq!(status_code, 413);
-    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(parsed["error"], "Request body too large");
-    assert_eq!(parsed["limit"], 20);
+    // The plugin's 413 is the proxy core's shared request-body-size body, so
+    // the limit is not disclosed in it.
+    assert_eq!(
+        body,
+        ferrum_edge::util::body_limit::REQUEST_BODY_TOO_LARGE_BODY.as_bytes()
+    );
 }

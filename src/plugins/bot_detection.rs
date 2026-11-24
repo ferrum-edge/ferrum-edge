@@ -13,6 +13,12 @@
 //! - The `User-Agent` is client-controlled and spoofable, so this plugin is a
 //!   coarse first filter; for strong bot verification prefer forward-confirmed
 //!   reverse DNS or published IP ranges.
+//! - A `User-Agent` whose every field line is empty or whitespace-only (SP /
+//!   HTAB) is treated exactly like a missing header.
+//! - A present `User-Agent` field line that is not valid UTF-8 cannot be
+//!   matched (the materialized header map omits it), so it is rejected
+//!   regardless of `allow_list` and `allow_missing_user_agent`: it is never
+//!   mistaken for an absent header.
 //! - A no-op config (empty `blocked_patterns` while missing User-Agent headers
 //!   are allowed) is rejected at construction.
 //! - Configuration must be an object with only the four documented keys.
@@ -27,6 +33,7 @@ use std::collections::HashMap;
 use super::{Plugin, PluginResult, RequestContext};
 
 const FORBIDDEN_BODY: &str = r#"{"error":"Forbidden"}"#;
+const USER_AGENT: &str = "user-agent";
 
 /// Every accepted top-level configuration property.
 pub const BOT_DETECTION_CONFIG_KEYS: &[&str] = &[
@@ -53,7 +60,12 @@ impl BotDetection {
                 BOT_DETECTION_CONFIG_KEYS.join("`, `")
             )
         })?;
-        reject_unknown_config_keys(config)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config,
+            "config",
+            BOT_DETECTION_CONFIG_KEYS,
+            "bot_detection: `config`: ",
+        )?;
 
         let blocked_patterns =
             parse_pattern_list(config, "blocked_patterns", Some(default_blocked_patterns()))?;
@@ -82,19 +94,14 @@ impl BotDetection {
             allow_missing_user_agent,
         })
     }
-}
 
-fn reject_unknown_config_keys(config: &Map<String, Value>) -> Result<(), String> {
-    if let Some(unknown) = config
-        .keys()
-        .find(|key| !BOT_DETECTION_CONFIG_KEYS.contains(&key.as_str()))
-    {
-        return Err(format!(
-            "bot_detection: unknown config key {unknown:?}; allowed keys: `{}`",
-            BOT_DETECTION_CONFIG_KEYS.join("`, `")
-        ));
+    fn reject(&self) -> PluginResult {
+        PluginResult::Reject {
+            status_code: self.custom_response_code,
+            body: FORBIDDEN_BODY.to_string(),
+            headers: HashMap::new(),
+        }
     }
-    Ok(())
 }
 
 fn default_blocked_patterns() -> Vec<&'static str> {
@@ -270,6 +277,70 @@ fn json_type_name(value: &Value) -> &'static str {
     }
 }
 
+/// How a request presents its `User-Agent` to the matcher.
+enum UserAgentView<'a> {
+    /// No field line, or only empty / whitespace-only field lines.
+    Missing,
+    /// A field line is present but is not valid UTF-8, so the materialized
+    /// header map omitted it and its contents cannot be matched.
+    Unreadable,
+    /// The materialized (comma-folded) value to match against.
+    Present(&'a str),
+}
+
+/// Classify the request's `User-Agent` without allocating.
+///
+/// The materialized `ctx.headers` map omits a field line that is not valid
+/// UTF-8, so using it alone would let a client turn a present (and possibly
+/// blocked) User-Agent into an "absent" one by adding a single invalid byte,
+/// and a benign sibling line would hide the blocked one entirely. While the
+/// pristine wire map is held, every raw field line is therefore inspected for
+/// decodability and blankness first. Matching itself still uses the
+/// materialized value, which stays authoritative for removals.
+fn user_agent_view(ctx: &RequestContext) -> UserAgentView<'_> {
+    if ctx.has_raw_headers() {
+        let mut saw_line = false;
+        let mut saw_value = false;
+        let mut single_line: Option<&str> = None;
+        for line in ctx.raw_header_value_bytes(USER_AGENT) {
+            let Ok(text) = std::str::from_utf8(line) else {
+                return UserAgentView::Unreadable;
+            };
+            if !saw_line {
+                single_line = Some(text);
+            } else {
+                single_line = None;
+            }
+            saw_line = true;
+            saw_value |= !is_blank_field_value(line);
+        }
+        // Folding blank repeated lines yields only `, ` separators, which the
+        // check on the folded value below would not recognize as blank.
+        if saw_line && !saw_value {
+            return UserAgentView::Missing;
+        }
+        // On the request-header passthrough lane `ctx.headers` is unmaterialized
+        // and the wire block is guaranteed single-line UTF-8 with no prior
+        // plugin removals, so return the borrowed wire value directly.
+        if ctx.request_header_passthrough_active() {
+            return match single_line {
+                Some(ua) if saw_value => UserAgentView::Present(ua),
+                _ => UserAgentView::Missing,
+            };
+        }
+    }
+    match ctx.headers.get(USER_AGENT) {
+        Some(ua) if !is_blank_field_value(ua.as_bytes()) => UserAgentView::Present(ua.as_str()),
+        _ => UserAgentView::Missing,
+    }
+}
+
+/// Whether a field value is empty or only RFC 9110 OWS (SP / HTAB). HTTP/1.1
+/// parsing strips surrounding OWS, but HPACK / QPACK deliver it verbatim.
+fn is_blank_field_value(value: &[u8]) -> bool {
+    value.iter().all(|byte| matches!(*byte, b' ' | b'\t'))
+}
+
 /// Plugin priority: runs early in pre-processing (before auth).
 pub const BOT_DETECTION_PRIORITY: u16 = super::priority::BOT_DETECTION;
 
@@ -279,8 +350,20 @@ impl Plugin for BotDetection {
         "bot_detection"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         BOT_DETECTION_PRIORITY
+    }
+
+    fn supports_request_header_passthrough(&self) -> bool {
+        true
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -288,20 +371,25 @@ impl Plugin for BotDetection {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        let user_agent = match ctx.headers.get("user-agent").map(String::as_str) {
-            Some(ua) => ua,
-            None => {
-                // No user-agent header — allow or reject based on configuration.
-                // Health checks, load balancers, and internal services often omit
-                // User-Agent. Default is to allow missing User-Agent.
+        let user_agent = match user_agent_view(ctx) {
+            UserAgentView::Present(ua) => ua,
+            UserAgentView::Missing => {
+                // No (or only blank) user-agent — allow or reject based on
+                // configuration. Health checks, load balancers, and internal
+                // services often omit User-Agent. Default is to allow missing
+                // User-Agent.
                 if self.allow_missing_user_agent {
                     return PluginResult::Continue;
                 }
-                return PluginResult::Reject {
-                    status_code: self.custom_response_code,
-                    body: FORBIDDEN_BODY.to_string(),
-                    headers: HashMap::new(),
-                };
+                return self.reject();
+            }
+            UserAgentView::Unreadable => {
+                // Present but unmatchable: fail closed. Construction rejects a
+                // config with no blocked patterns while missing User-Agents are
+                // allowed, so at least one enforcement path is always active and
+                // an unidentifiable agent must not reach the allow path (the
+                // allow list cannot vouch for bytes it never saw either).
+                return self.reject();
             }
         };
 
@@ -327,11 +415,7 @@ impl Plugin for BotDetection {
             .as_ref()
             .is_some_and(|blocked_patterns| blocked_patterns.is_match(user_agent))
         {
-            return PluginResult::Reject {
-                status_code: self.custom_response_code,
-                body: FORBIDDEN_BODY.to_string(),
-                headers: HashMap::new(),
-            };
+            return self.reject();
         }
 
         PluginResult::Continue

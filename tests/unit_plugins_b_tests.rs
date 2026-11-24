@@ -5,10 +5,14 @@
 //! alone are half of that, so they are split alphabetically by test-file
 //! name (`a`–`j` in `unit_plugins_a_tests`, `k`–`z` in
 //! `unit_plugins_b_tests`) and compiled in parallel by the Unit Tests matrix.
-//! Shared helper modules the other half depends on are declared here too;
-//! the few helper modules that also carry tests run in both halves.
+//! Test-free helper modules shared with the other half are declared here too;
+//! no test file runs in both halves.
 //!
 //! Run with: cargo test --test unit_plugins_b_tests [filter]
+
+#[allow(dead_code)]
+#[path = "scaffolding/port_registry.rs"]
+pub(crate) mod port_registry;
 
 mod unit {
     pub mod env_lock;
@@ -16,6 +20,9 @@ mod unit {
     pub mod plugins {
         #[allow(dead_code)]
         pub(crate) mod plugin_utils;
+
+        // Built-in config contracts for the nested-closure / purity sweep.
+        pub(crate) mod plugin_config_corpus;
 
         // The one place a fake Redis peer's `TIME` reply is defined. Shared
         // with the integration and functional targets, which reach the same
@@ -25,16 +32,13 @@ mod unit {
         pub(crate) mod redis_resp;
 
         #[allow(dead_code, unused_imports)]
-        mod jwks_auth_support; // shared helper, also compiled by the other half
-        #[allow(dead_code, unused_imports)]
-        mod jwks_auth_tests; // shared helper, also compiled by the other half
-        #[allow(dead_code, unused_imports)]
-        mod jwks_cache_tests; // shared helper, also compiled by the other half
+        mod jwks_auth_support; // test-free helper, also compiled by the other half
         mod kafka_logging_tests;
         mod key_auth_tests;
         mod ldap_auth_tests;
         mod load_testing_tests;
         mod log_sampling_tests;
+        mod log_sink_contract_tests;
         mod logging_sink_lifecycle_tests;
         mod loki_logging_tests;
         mod mcp_aggregate_sse_tests;
@@ -48,16 +52,21 @@ mod unit {
         mod mtls_auth_certificate_lifetime_tests;
         mod mtls_auth_tests;
         mod oauth2_introspection_tests;
+        mod oauth_client_auth_tests;
         mod oidc_refresh_flight_tests;
         mod oidc_relying_party_tests;
         mod opa_tests;
+        mod openapi_validator_review_tests;
         mod openapi_validator_tests;
         mod otel_tracing_attempt_spans_tests;
+        mod otel_tracing_review_tests;
         mod otel_tracing_tests;
         mod plugin_cache_tests;
+        mod plugin_config_closure_tests;
         mod plugin_doc_parity_tests;
         mod plugin_http_client_tests;
         mod plugin_integration_tests;
+        mod plugin_lifecycle_hooks_tests;
         mod plugin_secret_env_tests;
         mod plugin_trigger_carrier_tests;
         mod plugin_trigger_gate_tests;
@@ -90,6 +99,7 @@ mod unit {
         mod serverless_function_tests;
         mod sink_loss_metric_tests;
         mod soap_ws_security_tests;
+        mod socket_endpoint_tests;
         mod spec_expose_tests;
         mod spiffe_identity_tests;
         mod sse_tests;
@@ -99,23 +109,23 @@ mod unit {
         mod stream_plugin_tests;
         mod synthetic_response_tests;
         mod tcp_connection_throttle_tests;
-        mod tcp_endpoint_tests;
         mod tcp_logging_tests;
         mod transaction_debugger_tests;
         mod transaction_log_schema_tests;
         mod transaction_summary_tests;
-        mod udp_endpoint_tests;
         mod udp_logging_tests;
         mod udp_rate_limiting_tests;
         mod validation_diagnostics_tests;
         mod validator_diagnostic_redaction_tests;
         mod waf_body_charset_parity_tests;
         mod waf_normalization_evasion_tests;
+        mod waf_review_hardening_tests;
         mod waf_rule_pack_coverage_tests;
         mod waf_tests;
         mod waf_tuning_controls_tests;
         mod waf_unlisted_content_type_tests;
         mod workload_metrics_custom_env_tags_tests;
+        mod workload_metrics_label_projection_tests;
         mod workload_metrics_tests;
         mod ws_frame_logging_tests;
         mod ws_logging_tests;

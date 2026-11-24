@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Host-side veth interface discovery for enrolled pods.
 //!
 //! When a pod is enrolled for eBPF capture, the node agent attaches a tc
@@ -190,7 +189,7 @@ fn resolve_dedicated_iface_by_ipv6_route(route_path: &Path, pod_ip: Ipv6Addr) ->
     }
     let routes = read_route_table(route_path)?;
     let address = pod_ip.octets();
-    let mut best: Option<(u32, String)> = None;
+    let mut found: Option<String> = None;
     let mut ambiguous = false;
 
     // `/proc/net/ipv6_route` rows are
@@ -218,50 +217,24 @@ fn resolve_dedicated_iface_by_ipv6_route(route_path: &Path, pod_ip: Ipv6Addr) ->
         // A covering subnet route commonly names a shared CNI bridge; using that
         // device as a capture boundary would cover every attached pod, and a tc
         // guard there would miss frames forwarded between them.
-        if flags & 0x1 == 0 || prefix_len != 128 {
-            continue;
-        }
-        if !ipv6_prefix_matches(&destination, &address, prefix_len) {
+        if flags & 0x1 == 0 || prefix_len != 128 || destination != address {
             continue;
         }
 
-        if let Some((best_prefix, best_iface)) = best.as_ref() {
-            if prefix_len < *best_prefix {
-                continue;
-            }
-            if prefix_len == *best_prefix {
-                // Two devices claiming the same longest prefix cannot be told
-                // apart, and a guessed interface is exactly the cross-tenant
-                // attribution error this lookup must not produce. Remember it
-                // and refuse at the end rather than taking the first row.
-                ambiguous |= best_iface.as_str() != iface;
-                continue;
-            }
+        match found.as_deref() {
+            // Two devices claiming the same host route cannot be told apart,
+            // and a guessed interface is exactly the cross-tenant attribution
+            // error this lookup must not produce. Remember it and refuse at the
+            // end rather than taking the first row.
+            Some(existing) => ambiguous |= existing != iface,
+            None => found = Some(iface.to_string()),
         }
-        best = Some((prefix_len, iface.to_string()));
-        ambiguous = false;
     }
 
     if ambiguous {
         return None;
     }
-    best.map(|(_, iface)| iface)
-}
-
-/// Whether `destination/prefix_len` covers `address`. `prefix_len` is bounded by
-/// `128` at the call site, so both indexes below are in range.
-#[cfg(target_os = "linux")]
-fn ipv6_prefix_matches(destination: &[u8; 16], address: &[u8; 16], prefix_len: u32) -> bool {
-    let whole_bytes = (prefix_len / 8) as usize;
-    if destination[..whole_bytes] != address[..whole_bytes] {
-        return false;
-    }
-    let remaining_bits = prefix_len % 8;
-    if remaining_bits == 0 {
-        return true;
-    }
-    let mask = 0xffu8 << (8 - remaining_bits);
-    destination[whole_bytes] & mask == address[whole_bytes] & mask
+    found
 }
 
 /// Parse one `%pi6`-formatted procfs address: exactly 32 hex digits, no

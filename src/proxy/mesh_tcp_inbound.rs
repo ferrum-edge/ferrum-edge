@@ -294,6 +294,7 @@ pub(crate) async fn handle_mesh_tcp_inbound(
                 orig_dst = %orig_dst,
                 app_port,
                 client_ip = %client_ip,
+                plugin = plugin.name(),
                 "Sidecar raw-TCP inbound connection rejected by stream policy; closing \
                  captured connection without relaying to loopback"
             );
@@ -310,8 +311,9 @@ pub(crate) async fn handle_mesh_tcp_inbound(
             // counts the deny (it only records a failure when `error_class` is
             // present) instead of logging a zero-byte graceful close. The
             // `connection_error` text matches the generic path's
-            // `STREAM_ERR_REJECTED_BY_PLUGIN` prefix so log consumers see
-            // consistent wording across the two stream paths.
+            // `STREAM_ERR_REJECTED_BY_PLUGIN` prefix followed by the refusing
+            // plugin's name, so log consumers see consistent wording across the
+            // two stream paths and can attribute the refusal.
             //
             // Finalize the mesh TCP lifecycle under the metadata the rejecting
             // (and prior) hooks left, before the zero-byte disconnect summary,
@@ -329,7 +331,11 @@ pub(crate) async fn handle_mesh_tcp_inbound(
                 connected_at,
                 0,
                 0,
-                Some(tcp_proxy::STREAM_ERR_REJECTED_BY_PLUGIN.to_string()),
+                Some(format!(
+                    "{} {}",
+                    tcp_proxy::STREAM_ERR_REJECTED_BY_PLUGIN,
+                    plugin.name()
+                )),
                 Some(crate::retry::ErrorClass::RequestError),
                 Some(crate::plugins::Direction::ClientToBackend),
                 Some(DisconnectCause::RecvError),
@@ -463,13 +469,15 @@ pub(crate) async fn handle_mesh_tcp_inbound(
                     bytes_out = result.bytes_backend_to_client,
                     "Sidecar raw-TCP inbound relay failed"
                 );
+                // The shared typed relay ending (#7030) classifies the cause
+                // and class exactly as the generic TCP proxy does.
+                let end_reason =
+                    tcp_proxy::RelayEndReason::from_first_failure(result.first_failure.as_ref());
                 (
                     Some(message.clone()),
-                    Some(*class),
+                    end_reason.error_class(),
                     Some(*direction),
-                    Some(tcp_proxy::disconnect_cause_for_failure(
-                        *direction, class, *side,
-                    )),
+                    Some(end_reason.disconnect_cause()),
                 )
             }
             None => {
@@ -537,6 +545,14 @@ async fn relay_to_loopback(
                     client_ip = %client_ip,
                     "Sidecar raw-TCP inbound loopback connect timed out; closing captured connection"
                 );
+                // The same classes the plugin-chain path's summary carries,
+                // so the counters do not depend on a stream plugin being
+                // configured (issue #7183).
+                crate::runtime_metrics::global_ref().record_stream_end(
+                    &proxy.id,
+                    Some(crate::retry::ErrorClass::ConnectionTimeout),
+                    None,
+                );
                 return;
             }
         }
@@ -551,6 +567,11 @@ async fn relay_to_loopback(
                 client_ip = %client_ip,
                 error = %error,
                 "Sidecar raw-TCP inbound loopback connect failed; closing captured connection"
+            );
+            crate::runtime_metrics::global_ref().record_stream_end(
+                &proxy.id,
+                Some(crate::retry::ErrorClass::ConnectionRefused),
+                None,
             );
             return;
         }
@@ -594,6 +615,13 @@ async fn relay_to_loopback(
             bytes_in = result.bytes_client_to_backend,
             bytes_out = result.bytes_backend_to_client,
             "Sidecar raw-TCP inbound relay failed"
+        );
+        let end_reason =
+            tcp_proxy::RelayEndReason::from_first_failure(result.first_failure.as_ref());
+        crate::runtime_metrics::global_ref().record_stream_end(
+            &proxy.id,
+            end_reason.error_class(),
+            Some(*direction),
         );
     } else {
         debug!(
@@ -639,6 +667,7 @@ async fn emit_disconnect(
         proxy_name: proxy.name.clone(),
         client_ip: client_ip.to_string(),
         consumer_username: stream_ctx.effective_identity().map(str::to_owned),
+        principal_origin: stream_ctx.principal_origin(),
         auth_method: stream_ctx.auth_method,
         backend_target,
         backend_resolved_ip: None,
@@ -656,12 +685,11 @@ async fn emit_disconnect(
         sni_hostname: stream_ctx.sni_hostname.clone(),
         metadata: stream_ctx.take_metadata(),
     };
-    crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
-    if summary.error_class == Some(crate::retry::ErrorClass::ConnectionReset)
-        && let Some(direction) = summary.disconnect_direction
-    {
-        crate::runtime_metrics::global_ref().record_tcp_rst(&summary.proxy_id, direction);
-    }
+    crate::runtime_metrics::global_ref().record_stream_end(
+        &summary.proxy_id,
+        summary.error_class,
+        summary.disconnect_direction,
+    );
     for plugin in plugins.iter() {
         plugin.on_stream_disconnect(&summary).await;
     }

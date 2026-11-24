@@ -568,12 +568,13 @@ fn control_plane_poll_tick_records_on_every_normal_exit_without_async_wrapper() 
     assert_fallthrough_records_completion(tick, "control_plane");
 
     let continue_count = tick.lines().filter(|l| l.trim() == "continue;").count();
-    // 11 in base main, plus the two exits per-namespace isolation added
-    // (#2983/#2984): a delta whose namespaces all rejected, and a non-empty
-    // delta that partitioned to no attributable namespace. Both still record
+    // 11 in base main, plus the exit per-namespace isolation added
+    // (#2983/#2984) for a delta whose namespaces all rejected. It still records
     // completion, which `assert_every_continue_records_completion` above proves.
+    // The "partitioned to no attributable namespace" exit was unreachable and
+    // is gone (#7252).
     assert_eq!(
-        continue_count, 13,
+        continue_count, 12,
         "control-plane poll tick handled-continue exit count drifted"
     );
     let record_count = tick.matches("record_poll_completed()").count();
@@ -615,7 +616,7 @@ fn gateway_trust_drift_escalates_into_the_same_tick_full_reload() {
             .find("detect_gateway_trust_drift(")
             .unwrap_or_else(|| panic!("{label}: poll tick must run the trust drift check"));
         let decision_at = tick[drift_at..]
-            .find("if force_full_reload {")
+            .find("if let Some(full_reload_reason) = force_full_reload {")
             .map(|offset| offset + drift_at)
             .unwrap_or_else(|| {
                 panic!("{label}: the drift check must precede the full-reload decision")
@@ -625,12 +626,13 @@ fn gateway_trust_drift_escalates_into_the_same_tick_full_reload() {
         // does not pay for a second authoritative read, and that guard must be
         // the negated one — not the reload branch itself.
         let guard_at = tick[..drift_at]
-            .rfind("if !force_full_reload {")
+            .rfind("if force_full_reload.is_none() {")
             .unwrap_or_else(|| {
                 panic!("{label}: the drift check must be skipped when a reload is already pending")
             });
         assert!(
-            !tick[guard_at..drift_at].contains("if force_full_reload {"),
+            !tick[guard_at..drift_at]
+                .contains("if let Some(full_reload_reason) = force_full_reload {"),
             "{label}: the drift check must run outside the full-reload branch"
         );
 

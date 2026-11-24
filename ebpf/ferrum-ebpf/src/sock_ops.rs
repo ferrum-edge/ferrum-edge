@@ -17,7 +17,7 @@
 //! program — so the same ringbuf + dropped-counter contract covers both.
 //!
 //! Records are written to the `FERRUM_SOCK_OPS_EVENTS` ringbuf. When the
-//! ringbuf is full, `__sync_fetch_and_add` bumps
+//! ringbuf is full, a per-CPU (non-atomic) increment bumps
 //! `FERRUM_SOCK_OPS_STATS[SOCK_OPS_STATS_EVENTS_DROPPED]` so the userspace
 //! consumer can detect overrun without per-event log spam.
 //!

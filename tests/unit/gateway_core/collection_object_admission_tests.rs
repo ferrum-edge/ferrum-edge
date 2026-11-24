@@ -92,7 +92,7 @@ fn shared_mesh_lists() -> Vec<(&'static str, Value)> {
         ("services", named()),
         ("mesh_policies", policy()),
         ("ext_authz_providers", provider()),
-        ("peer_authentications", named()),
+        ("peer_authentications", policy()),
         ("service_entries", service_entry()),
         ("request_authentications", policy()),
         (
@@ -128,7 +128,8 @@ fn mesh_config_and_slice_collection_elements_require_objects() {
         ("service_waypoint_bound_services", named()),
         ("ambient_udp_source_workloads", workload()),
         ("node_waypoint_capture_destinations", workload()),
-        ("node_waypoint_capture_peer_authentications", named()),
+        ("node_waypoint_capture_peer_authentications", policy()),
+        ("node_waypoint_capture_mesh_policies", policy()),
         ("local_inbound_services", named()),
         ("local_inbound_workloads", workload()),
         (
@@ -575,13 +576,19 @@ fn mesh_authz_raw_lists_require_object_elements_before_construction() {
     let valid = json!({
         "per_pod_policy_scoping": true,
         "mesh_policies": [policy()],
-        "node_waypoint_route_upstreams": [upstream]
+        "node_waypoint_route_upstreams": [upstream],
+        "node_waypoint_route_branches": [{
+            "namespace": "ferrum", "proxy_id": "route",
+            "destinations": [{"upstream_id": "route"}, {"upstream_id": "other"}]
+        }]
     });
     assert!(MeshAuthz::new(&valid).is_ok());
     for pointer in [
         "/mesh_policies/0",
         "/node_waypoint_route_upstreams/0",
         "/node_waypoint_route_upstreams/0/targets/0",
+        "/node_waypoint_route_branches/0",
+        "/node_waypoint_route_branches/0/destinations/0",
     ] {
         for rejected in [json!([]), json!(["positional"]), json!(7)] {
             let mut body = valid.clone();

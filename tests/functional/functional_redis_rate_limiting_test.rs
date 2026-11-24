@@ -1272,7 +1272,10 @@ async fn await_epoch_window_offset(window_nanos: u128, offset: std::ops::Range<u
 /// generate, so a runner slow enough to move the traffic out of the window the
 /// scenario needs is reported as a skip rather than passing vacuously.
 fn live_sub_bucket(window_seconds: u64) -> u64 {
-    ferrum_edge::_test_support::redis_sub_bucket(window_seconds).index
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after Unix epoch");
+    ferrum_edge::_test_support::redis_sub_bucket_at(now, window_seconds).index
 }
 
 /// Issue one bounded GET and return its status.
@@ -3091,7 +3094,9 @@ plugin_configs:
 #[tokio::test]
 #[ignore]
 async fn test_request_deduplication_redis_publication_is_ownership_fenced() {
-    use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        BoundedRedisValue, RedisConfig, RedisRateLimitClient,
+    };
 
     if !redis_is_available().await {
         if std::env::var_os("FERRUM_REDIS_REQUIRED").is_some() {
@@ -3154,8 +3159,11 @@ async fn test_request_deduplication_redis_publication_is_ownership_fenced() {
         "an expired owner must not publish while a successor owns the operation"
     );
     assert_eq!(
-        client.get_bytes(&key).await.expect("read record"),
-        Some(owner_b.clone())
+        client
+            .get_bytes_bounded(&key, 1024)
+            .await
+            .expect("read record"),
+        BoundedRedisValue::Found(owner_b.clone())
     );
 
     // The successor's own publication is the ownership transition.
@@ -3166,8 +3174,11 @@ async fn test_request_deduplication_redis_publication_is_ownership_fenced() {
             .expect("successor publication")
     );
     assert_eq!(
-        client.get_bytes(&key).await.expect("read record"),
-        Some(result_b.clone())
+        client
+            .get_bytes_bounded(&key, 1024)
+            .await
+            .expect("read record"),
+        BoundedRedisValue::Found(result_b.clone())
     );
 
     // Reversed completion order: the stale owner still cannot overwrite the
@@ -3179,8 +3190,11 @@ async fn test_request_deduplication_redis_publication_is_ownership_fenced() {
             .expect("stale overwrite")
     );
     assert_eq!(
-        client.get_bytes(&key).await.expect("read record"),
-        Some(result_b)
+        client
+            .get_bytes_bounded(&key, 1024)
+            .await
+            .expect("read record"),
+        BoundedRedisValue::Found(result_b.clone())
     );
 
     // A completely absent record cannot be resurrected by a stale owner.
@@ -3191,7 +3205,59 @@ async fn test_request_deduplication_redis_publication_is_ownership_fenced() {
             .await
             .expect("resurrect attempt")
     );
-    assert_eq!(client.get_bytes(&key).await.expect("read record"), None);
+    assert_eq!(
+        client
+            .get_bytes_bounded(&key, 1024)
+            .await
+            .expect("read record"),
+        BoundedRedisValue::Missing
+    );
+
+    // Bounded compares (issue #6622): a stored value that merely starts with
+    // the owner record, or is far larger than it, never matches, and the
+    // compare never has to download it.
+    let mut extended = owner_b.clone();
+    extended.extend_from_slice(b"-suffix");
+    let oversized = vec![b'x'; 4 * 1024 * 1024];
+    for stored in [extended, oversized] {
+        client
+            .set_bytes_with_expire(&key, &stored, 60)
+            .await
+            .expect("seed stored value");
+        assert!(
+            !client
+                .set_bytes_with_expire_if_value_matches(&key, &owner_b, &result_b, 60)
+                .await
+                .expect("bounded compare-and-set"),
+            "a longer stored value must not match the owner record"
+        );
+        assert!(
+            !client
+                .delete_if_value_matches(&key, &owner_b)
+                .await
+                .expect("bounded compare-and-delete"),
+            "a longer stored value must not be released"
+        );
+        assert_eq!(
+            client
+                .get_bytes_bounded(&key, stored.len())
+                .await
+                .expect("read record"),
+            BoundedRedisValue::Found(stored.clone()),
+            "a refused compare must leave the stored value untouched"
+        );
+    }
+    // An exact owner record still releases through the bounded compare.
+    client
+        .set_bytes_with_expire(&key, &owner_b, 60)
+        .await
+        .expect("seed owner record");
+    assert!(
+        client
+            .delete_if_value_matches(&key, &owner_b)
+            .await
+            .expect("exact release")
+    );
 
     delete_redis_keys_by_prefix(&prefix).await;
     println!("test_request_deduplication_redis_publication_is_ownership_fenced PASSED");
@@ -3625,6 +3691,10 @@ async fn test_request_deduplication_redis_finalized_empty_synthetic_successes_re
         .arg("+multi")
         .arg("+exec")
         .arg("+del")
+        // Bounded record reads and ownership compares (issue #6622).
+        .arg("+exists")
+        .arg("+strlen")
+        .arg("+getrange")
         .query_async(&mut admin)
         .await
         .unwrap();
@@ -3643,7 +3713,10 @@ async fn test_request_deduplication_redis_finalized_empty_synthetic_successes_re
         }
         let result: Result<redis::Value, redis::RedisError> =
             probe.query_async(&mut restricted).await;
-        assert_eq!(result.unwrap_err().code(), Some("NOPERM"));
+        assert!(
+            result.is_ok(),
+            "{command} must be granted for deduplication"
+        );
     }
 
     let config = format!(
@@ -3889,7 +3962,7 @@ plugin_configs:
 
     // Both instances should have published independent completed keys under the
     // shared default prefix (partitioned by plugin_config_id in the digest).
-    let completed_keys = redis_key_count_by_prefix(&format!("{default_prefix}:v6:")).await;
+    let completed_keys = redis_key_count_by_prefix(&format!("{default_prefix}:v7:")).await;
     assert!(
         completed_keys >= 2,
         "expected at least two completed Redis keys under the shared default prefix, got {completed_keys}"
@@ -4036,11 +4109,11 @@ plugin_configs:
         "no separate in-flight key may exist for instance B"
     );
     assert!(
-        redis_key_count_by_prefix(&format!("{prefix_a}:v6:")).await >= 1,
+        redis_key_count_by_prefix(&format!("{prefix_a}:v7:")).await >= 1,
         "instance A must publish a completed Redis value under its unique prefix"
     );
     assert!(
-        redis_key_count_by_prefix(&format!("{prefix_b}:v6:")).await >= 1,
+        redis_key_count_by_prefix(&format!("{prefix_b}:v7:")).await >= 1,
         "instance B must publish a completed Redis value under its unique prefix"
     );
 

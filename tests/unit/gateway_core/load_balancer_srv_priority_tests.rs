@@ -772,6 +772,7 @@ fn lb_with_port_override(targets: Vec<UpstreamTarget>, port: u16) -> Arc<LoadBal
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     };
     let config = GatewayConfig {

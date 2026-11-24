@@ -95,8 +95,6 @@ def sample_issues(sample):
                     issues.append(f"incomplete {role} measurement bracket")
     if sample.get("error"):
         issues.append(str(sample["error"]))
-    if sample.get("h2_guard_observation"):
-        issues.append("instrumented H2 guard build: diagnostic only")
     if sample.get("h2_observation"):
         observation = sample["h2_observation"]
         phases = sample.get("phases") or {}

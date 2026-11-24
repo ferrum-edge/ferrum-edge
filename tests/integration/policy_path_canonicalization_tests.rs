@@ -273,7 +273,10 @@ async fn request_termination_prefix_fires_for_every_spelling_of_the_prefix() {
         let mut ctx = boundary_ctx("GET", raw);
         let result = plugin.on_request_received(&mut ctx).await;
         assert!(
-            matches!(result, PluginResult::Reject { .. }),
+            matches!(
+                result,
+                PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }
+            ),
             "termination must fire for spelling {raw:?}, got {result:?}"
         );
     }
@@ -473,6 +476,7 @@ async fn escapes_that_cannot_be_forwarded_literally_never_reach_routing() {
     for raw in [
         "/admin%20reports",
         "/admin/%7Bid%7D",
+        "/admin%5Ereports",
         "/admin/caf%C3%A9",
         "/admin%5Bid%5D",
     ] {

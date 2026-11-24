@@ -2,7 +2,9 @@
 //!
 //! The pool owns HTTP/2 client connections to mesh sidecars on the standard
 //! HBONE listener. Each request opens a CONNECT stream to the application port
-//! and then speaks ordinary HTTP over the resulting byte tunnel.
+//! and then speaks ordinary HTTP over the resulting byte tunnel, unless it
+//! reuses an inner application connection already held open in a fenced
+//! tunnel (`hbone_inner_pool`).
 
 use crate::fips::approved::Sha256;
 use bytes::{Buf, Bytes};
@@ -94,7 +96,7 @@ const ADAPTIVE_STREAM_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 const ADAPTIVE_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
 /// Bounded poll for the peer's `SETTINGS_ENABLE_CONNECT_PROTOCOL` acknowledgement
 /// when opening a WebSocket Extended CONNECT over a freshly handshaked H2
-/// connection (see [`open_h2_ws_connect_stream`]). The setting rides the peer's
+/// connection (see [`open_h2_ws_connect_stream_within`]). The setting rides the peer's
 /// initial SETTINGS frame, processed asynchronously by the connection driver, so
 /// one yield + a few short sleeps let a capable peer's frame land before the dial
 /// fails closed. The interval is tiny and the count small: SETTINGS is the first
@@ -171,9 +173,14 @@ struct HboneConnectionLoadInner {
     /// CONNECT streams sent on this connection whose tunnel is still alive
     /// (including ones whose CONNECT response is still pending).
     active_streams: AtomicUsize,
-    /// Peer's `SETTINGS_MAX_CONCURRENT_STREAMS` as of the last CONNECT
-    /// response; `usize::MAX` until sampled or when the peer advertises none.
+    /// The connection's effective CONNECT stream cap: the peer's
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` as of the last CONNECT response,
+    /// bounded by `configured_max_streams`. Before the first sample it is
+    /// `configured_max_streams`.
     peer_max_streams: AtomicUsize,
+    /// The DestinationRule `maxConcurrentStreams` / global pool stream cap
+    /// this connection was dialed (and keyed) under; `usize::MAX` when none.
+    configured_max_streams: usize,
 }
 
 impl Default for HboneConnectionLoadInner {
@@ -181,11 +188,31 @@ impl Default for HboneConnectionLoadInner {
         Self {
             active_streams: AtomicUsize::new(0),
             peer_max_streams: AtomicUsize::new(usize::MAX),
+            configured_max_streams: usize::MAX,
         }
     }
 }
 
 impl HboneConnectionLoad {
+    /// A load bounded by the configured `maxConcurrentStreams` (issue #7181).
+    ///
+    /// The cap is part of the outer pool key, and `h2` cannot hold it on its
+    /// own: the dial seeds it as `initial_max_send_streams`, but the peer's
+    /// initial SETTINGS replace that (with "unlimited" when the peer
+    /// advertises nothing). The width decision therefore takes the smaller of
+    /// the peer's cap and this one, so a carrier at the operator's cap is
+    /// skipped and a sibling dialed while the key has room. `None` keeps the
+    /// peer's cap alone.
+    fn with_configured_stream_cap(cap: Option<u32>) -> Self {
+        let configured_max_streams =
+            cap.map_or(usize::MAX, |cap| usize::try_from(cap).unwrap_or(usize::MAX));
+        Self(Arc::new(HboneConnectionLoadInner {
+            active_streams: AtomicUsize::new(0),
+            peer_max_streams: AtomicUsize::new(configured_max_streams),
+            configured_max_streams,
+        }))
+    }
+
     #[inline]
     fn active_streams(&self) -> usize {
         self.0.active_streams.load(Ordering::Relaxed)
@@ -215,9 +242,10 @@ impl HboneConnectionLoad {
     /// lookup takes the connection's internal lock, which is why it runs here
     /// (outside every pool lock) rather than on the checkout scan.
     fn record_peer_max_streams(&self, sender: &SendRequest<Bytes>) {
-        self.0
-            .peer_max_streams
-            .store(sender.current_max_send_streams(), Ordering::Relaxed);
+        let effective = sender
+            .current_max_send_streams()
+            .min(self.0.configured_max_streams);
+        self.0.peer_max_streams.store(effective, Ordering::Relaxed);
     }
 }
 
@@ -335,6 +363,21 @@ pub enum HbonePoolError {
     ConnectStream { authority: String, message: String },
     #[error("HBONE CONNECT rejected for {authority} with status {status}")]
     ConnectRejected { authority: String, status: u16 },
+    /// The peer answered a Sidecar mesh-mTLS WebSocket Extended CONNECT
+    /// (RFC 8441) with a `3xx`-`5xx` application answer: the destination
+    /// gateway relayed its backend's refusal of the upgrade (its own
+    /// authentication, an Origin check, `404`, `429`, ...). The WebSocket
+    /// bridges relay the carried refusal to the client and charge the breaker
+    /// with its status exactly as the HTTP path does (GHSA-7x2j-3389-2h35),
+    /// rather than turning it into a breaker-tripping `502`. A bare HBONE
+    /// CONNECT rejection is the mesh transport's own admission decision and
+    /// stays [`Self::ConnectRejected`], as on the HTTP HBONE path.
+    #[error("WebSocket Extended CONNECT refused for {authority} with status {status}")]
+    WebSocketUpgradeRefused {
+        authority: String,
+        status: u16,
+        refusal: Box<super::WebSocketBackendRefusal>,
+    },
     /// A gateway trust authority was withdrawn while this transport was being
     /// established, or the transport it would have reused has since been
     /// retired (issue #3859). Fail closed: the connection is dropped rather
@@ -444,6 +487,7 @@ impl HbonePoolError {
             Self::InvalidConnectRequest { .. }
             | Self::ConnectStream { .. }
             | Self::ConnectRejected { .. }
+            | Self::WebSocketUpgradeRefused { .. }
             | Self::ExtendedConnectUnsupported { .. } => ErrorClass::ProtocolError,
             // Pre-wire, gateway-side ceiling refusal: no socket was opened, so
             // `retry_on_connect_failure` may rotate to another LB target with
@@ -505,6 +549,7 @@ impl HbonePoolError {
                 "tunnel setup failed"
             }
             Self::ConnectRejected { .. } => "tunnel rejected by peer",
+            Self::WebSocketUpgradeRefused { .. } => "WebSocket upgrade refused by peer",
             Self::TrustWithdrawn => "gateway trust authority withdrawn",
             Self::MaxConnectionsExceeded { .. } => "backend connection limit reached",
             Self::ExtendedConnectUnsupported { .. } => "peer does not support WebSocket tunneling",
@@ -515,8 +560,9 @@ impl HbonePoolError {
     }
 
     /// The peer's own CONNECT admission status, when the public body may carry
-    /// it. Only [`Self::ConnectRejected`] has one; every other variant returns
-    /// `None`, so no other failure can grow a numeric suffix.
+    /// it. Only [`Self::ConnectRejected`] and the WebSocket Extended CONNECT
+    /// refusal ([`Self::WebSocketUpgradeRefused`]) have one; every other
+    /// variant returns `None`, so no other failure can grow a numeric suffix.
     ///
     /// A three-digit HTTP status is the coarse outcome of the PEER's admission
     /// decision — not an address, an identity, a certificate subject, or
@@ -529,7 +575,9 @@ impl HbonePoolError {
     /// reason would silently coarsen that security check.
     pub fn public_status(&self) -> Option<u16> {
         match self {
-            Self::ConnectRejected { status, .. } => Some(*status),
+            Self::ConnectRejected { status, .. } | Self::WebSocketUpgradeRefused { status, .. } => {
+                Some(*status)
+            }
             _ => None,
         }
     }
@@ -604,6 +652,15 @@ impl HbonePoolError {
             Self::ConnectRejected { authority, status } => Self::ConnectRejected {
                 authority: authority.clone(),
                 status: *status,
+            },
+            Self::WebSocketUpgradeRefused {
+                authority,
+                status,
+                refusal,
+            } => Self::WebSocketUpgradeRefused {
+                authority: authority.clone(),
+                status: *status,
+                refusal: refusal.clone(),
             },
             Self::TrustWithdrawn => Self::TrustWithdrawn,
             Self::MaxConnectionsExceeded {
@@ -738,8 +795,8 @@ impl MeshTransportLabel {
     /// transport.
     ///
     /// Fields are closed-cardinality: `error_kind`, `error_phase` (from
-    /// [`HbonePoolError::public_reason`]), and `peer_status` only for
-    /// [`HbonePoolError::ConnectRejected`]. Never interpolates `Display`, so
+    /// [`HbonePoolError::public_reason`]), and `peer_status` only where
+    /// [`HbonePoolError::public_status`] has one. Never interpolates `Display`, so
     /// a host, address, CONNECT authority, tag value, SPIFFE ID, certificate
     /// subject/SAN/issuer/serial/fingerprint, trust root, key id, file path,
     /// verifier message, or peer-controlled string cannot ride this record.
@@ -905,6 +962,32 @@ struct HboneSvidIdentityCache {
     /// rotates out, so `force_drain_svid_generation(old_gen)` can resolve
     /// the passed generation to the fingerprint embedded in pool keys.
     svid_generation: u64,
+    /// The leaf's `notAfter` on the monotonic clock, parsed once when this
+    /// entry was built (issue #7166): see
+    /// [`HboneConnectionPool::source_credential_identity`]. Derived once, so a
+    /// later wall-clock step cannot move it.
+    leaf_deadline: Option<tokio::time::Instant>,
+}
+
+/// The leaf's credential deadline, as [`HboneSvidIdentityCache::leaf_deadline`]
+/// records it. A three-way result: a real `notAfter` bounds the lease; an
+/// unparseable or incoherent leaf (or a bundle with no leaf) yields an
+/// ALREADY-ELAPSED deadline, because a credential whose expiry the gateway
+/// cannot read must never hold a connection open across requests; and a
+/// `notAfter` beyond the representable monotonic range yields `None`
+/// (`CredentialDeadline::Unbounded`, "no representable bound", NOT "expired").
+fn svid_leaf_deadline(bundle: &SvidBundle) -> Option<tokio::time::Instant> {
+    use crate::plugins::utils::auth_flow::CredentialDeadline;
+    match bundle.cert_chain_der.first() {
+        Some(leaf) => {
+            match crate::proxy::hbone_admission_fence::parse_leaf_credential_deadline(leaf) {
+                CredentialDeadline::Bounded(deadline) => Some(deadline),
+                CredentialDeadline::Unbounded => None,
+                CredentialDeadline::Invalid => Some(tokio::time::Instant::now()),
+            }
+        }
+        None => Some(tokio::time::Instant::now()),
+    }
 }
 
 pub(crate) fn effective_connect_timeout_ms_for_policy_port(
@@ -920,7 +1003,6 @@ pub(crate) fn effective_connect_timeout_ms_for_policy_port(
 }
 
 impl HboneConnectionPool {
-    #[allow(dead_code)] // Used by tests and external lib callers; binary wires the shared generation counter.
     pub fn new(
         pool_config: PoolConfig,
         dns_cache: DnsCache,
@@ -979,8 +1061,10 @@ impl HboneConnectionPool {
         shard_amount: usize,
         backend_svid_generation: BackendSvidGeneration,
     ) -> Self {
+        let entries = Arc::new(DashMap::with_shard_amount(shard_amount));
+        spawn_idle_entry_sweeper(&entries, &pool_config);
         Self {
-            entries: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            entries,
             creation_locks: DashMap::with_shard_amount(shard_amount),
             growth_backoff_until: DashMap::new(),
             gateway_svid,
@@ -1073,42 +1157,15 @@ impl HboneConnectionPool {
     pub fn source_credential_identity(
         &self,
     ) -> Result<crate::proxy::hbone_inner_pool::HboneSourceCredential, HbonePoolError> {
-        let (identity, fingerprint) = self.current_svid_identity_cached()?;
         // The leaf's own `notAfter`, on the monotonic clock, parsed from the
         // same bundle the dial presents, by the SAME parser the receiver-side
         // fence bounds an inbound tunnel with — so the two halves of issue
-        // #5042 cannot disagree about when a credential ends.
-        //
-        // Its three-way result is preserved exactly: a real `notAfter` bounds
-        // the lease, an unparseable or incoherent leaf yields an ALREADY-ELAPSED
-        // deadline (a credential the gateway cannot read the expiry of must
-        // never be the basis for holding a connection open across requests),
-        // and a `notAfter` beyond the representable monotonic range yields
-        // `None` — `CredentialDeadline::Unbounded`, which is "no representable
-        // bound", NOT "expired". Collapsing that to elapsed would disable reuse
-        // outright for long-dated credentials; the idle timeout and the pool
-        // bounds still apply to it.
-        //
-        // A bundle with no leaf at all cannot dial in the first place
-        // (`current_svid_identity_cached` above already fingerprints it), so
-        // the arm exists only to fail closed rather than to be reached.
-        let leaf_deadline = match self
-            .gateway_svid
-            .load_full()
-            .as_ref()
-            .as_ref()
-            .and_then(|bundle| bundle.cert_chain_der.first().cloned())
-        {
-            Some(leaf) => {
-                use crate::plugins::utils::auth_flow::CredentialDeadline;
-                match crate::proxy::hbone_admission_fence::parse_leaf_credential_deadline(&leaf) {
-                    CredentialDeadline::Bounded(deadline) => Some(deadline),
-                    CredentialDeadline::Unbounded => None,
-                    CredentialDeadline::Invalid => Some(tokio::time::Instant::now()),
-                }
-            }
-            None => Some(tokio::time::Instant::now()),
-        };
+        // #5042 cannot disagree about when a credential ends. It is parsed once
+        // per SVID snapshot with the identity and fingerprint (issue #7166):
+        // no per-request leaf clone, X.509 parse, or wall-clock read. See
+        // `svid_leaf_deadline` for the three-way result; the idle timeout and
+        // the pool bounds still apply to an unbounded credential.
+        let (identity, fingerprint, leaf_deadline) = self.current_svid_credential_cached()?;
         Ok(crate::proxy::hbone_inner_pool::HboneSourceCredential {
             identity,
             fingerprint,
@@ -1272,17 +1329,38 @@ impl HboneConnectionPool {
     fn current_svid_identity_cached(
         &self,
     ) -> Result<(crate::identity::SpiffeId, Arc<str>), HbonePoolError> {
+        self.current_svid_credential_cached()
+            .map(|(identity, fingerprint, _)| (identity, fingerprint))
+    }
+
+    /// [`Self::current_svid_identity_cached`] plus the cached leaf deadline,
+    /// all from ONE identity-cache entry.
+    fn current_svid_credential_cached(
+        &self,
+    ) -> Result<
+        (
+            crate::identity::SpiffeId,
+            Arc<str>,
+            Option<tokio::time::Instant>,
+        ),
+        HbonePoolError,
+    > {
         let snapshot = self.gateway_svid.load_full();
         let cached = self.svid_identity_cache.load_full();
         if let Some(cache) = cached.as_ref()
             && Arc::ptr_eq(&cache.source, &snapshot)
         {
-            return Ok((cache.identity.clone(), cache.fingerprint.clone()));
+            return Ok((
+                cache.identity.clone(),
+                cache.fingerprint.clone(),
+                cache.leaf_deadline,
+            ));
         }
 
         let bundle = snapshot.as_ref().as_ref().ok_or(HbonePoolError::NoSvid)?;
         let identity = bundle.spiffe_id.clone();
         let fingerprint: Arc<str> = Arc::from(svid_fingerprint(bundle)?);
+        let leaf_deadline = svid_leaf_deadline(bundle);
         if let Some(previous) = cached.as_ref() {
             // The SVID slot rotated: file the outgoing fingerprint under the
             // generation it was current for, so the delayed drain task can
@@ -1302,8 +1380,9 @@ impl HboneConnectionPool {
                 identity: identity.clone(),
                 fingerprint: fingerprint.clone(),
                 svid_generation: self.backend_svid_generation.load(Ordering::Acquire),
+                leaf_deadline,
             })));
-        Ok((identity, fingerprint))
+        Ok((identity, fingerprint, leaf_deadline))
     }
 
     fn record_retired_fingerprint(&self, generation: u64, fingerprint: Arc<str>) {
@@ -1622,13 +1701,13 @@ impl HboneConnectionPool {
     /// Open a **bare** HBONE CONNECT byte tunnel to a peer's HBONE listener over
     /// a FRESH SVID-mTLS H2 connection for a WebSocket egress session, carrying
     /// the HBONE protocol marker and the W3C source-identity baggage just like
-    /// [`Self::get_tunnel`]. The connection is DIALED to `dial_host:hbone_port`
+    /// [`Self::get_tunnel_via`]. The connection is DIALED to `dial_host:hbone_port`
     /// (the peer's pod address + `:15008`/`mesh.hbone_port`); the bare CONNECT
     /// `:authority` is `app_host:app_port` — the destination workload's app
     /// address+port the peer's transparent HBONE relay byte-copies to locally.
     ///
-    /// This is the WebSocket analogue of [`Self::get_tunnel`] / the raw-TCP HBONE
-    /// egress path, NOT an Extended CONNECT. Ambient/Waypoint materialize NO
+    /// This is the WebSocket analogue of [`Self::get_tunnel_via`] / the raw-TCP
+    /// HBONE egress path, NOT an Extended CONNECT. Ambient/Waypoint materialize NO
     /// inbound routes, and the route-miss transparent-relay fallback
     /// (`build_inbound_hbone_relay_proxy`) is gated on a BARE CONNECT
     /// (`is_connect_request` requires `:protocol` to be ABSENT) — so an Extended
@@ -1649,7 +1728,6 @@ impl HboneConnectionPool {
     /// SVID rotation is automatic because every new session dials with the
     /// current SVID. The dial PINS `expected_peer`; a missing gateway SVID fails
     /// closed before the dial.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub async fn get_ws_byte_tunnel(
         &self,
@@ -1782,11 +1860,11 @@ impl HboneConnectionPool {
     /// lifetime. SVID rotation is automatic (each session dials with the current
     /// SVID). In-cluster dials pin `expected_peer`; cross-cluster dials use the
     /// supplied trust-domain scope and SNI override. A missing gateway SVID fails
-    /// closed before the dial. Distinct from [`Self::get_tunnel`], which hardcodes the
-    /// `hbone` marker on the pooled byte-stream path.
+    /// closed before the dial. Distinct from [`Self::get_tunnel_via`], which
+    /// hardcodes the `hbone` marker on the pooled byte-stream path.
     //
     // Callers: the mesh UDP capture egress datapath (Linux-only, `IP_TRANSPARENT`)
-    // AND the cross-platform UDP capability probe ([`Self::warmup_datagram_connection`]),
+    // AND the cross-platform UDP capability probe ([`Self::warmup_datagram_connection_via`]),
     // so this is reachable on every platform.
     #[allow(clippy::too_many_arguments)]
     pub async fn get_datagram_tunnel(
@@ -1873,7 +1951,7 @@ impl HboneConnectionPool {
     /// would, then DROP the tunnel. A UDP egress target's destination relay
     /// branches on the `udp` marker (`is_udp_hbone_connect`) and unframes the
     /// stream into a local `UdpSocket`; probing it with the byte-stream
-    /// [`Self::warmup_connection`] (which stamps the `hbone` marker) hits the
+    /// [`Self::warmup_connection_via`] (which stamps the `hbone` marker) hits the
     /// WRONG relay on the destination — the byte-stream path that TCP-connects
     /// to the app port — so the probe must carry the SAME `udp` marker the
     /// dispatch datapath uses, or it would prove the wrong capability (codex r1
@@ -2083,18 +2161,26 @@ impl HboneConnectionPool {
         max_entries: usize,
         connect_timeout: Duration,
     ) -> Option<MeshH2Transport> {
-        let now = unix_secs();
         if self
             .growth_backoff_until
             .get(key)
-            .is_some_and(|until| *until.value() > now)
+            .is_some_and(|until| *until.value() > unix_secs())
         {
             return None;
         }
         let creation_slot = self.creation_slot(key);
         let creation_lease = creation_slot.try_claim()?;
-        // Re-check under the lock: another grower may have widened the key
-        // (or a prune may have narrowed it) since the fast-path read.
+        // Re-check under the lock: a grower that failed between the read above
+        // and this claim has published its backoff before releasing the lease,
+        // and another grower may have widened the key (or a prune may have
+        // narrowed it) since the fast-path read.
+        if self
+            .growth_backoff_until
+            .get(key)
+            .is_some_and(|until| *until.value() > unix_secs())
+        {
+            return None;
+        }
         let live_connections = self
             .entries
             .get(key)
@@ -2124,8 +2210,7 @@ impl HboneConnectionPool {
                 effective_connect_timeout_ms,
             )
             .await;
-        drop(creation_lease);
-        match dialed {
+        let grown = match dialed {
             Ok(transport) => {
                 debug!(
                     dial_host,
@@ -2139,8 +2224,14 @@ impl HboneConnectionPool {
                 Some(transport)
             }
             Err(err) => {
+                // Measured from the failure, not the dial start, so a dial
+                // that used its whole connect timeout still backs off the full
+                // window. Recorded before the lock is released, and re-checked
+                // after every claim, so once a dial has failed no other caller
+                // starts a second one for the key in between. A dial whose
+                // future is dropped (cancellation) records no backoff.
                 self.growth_backoff_until
-                    .insert(key.to_string(), now + HBONE_GROWTH_BACKOFF_SECS);
+                    .insert(key.to_string(), unix_secs() + HBONE_GROWTH_BACKOFF_SECS);
                 debug!(
                     dial_host,
                     app_host,
@@ -2151,7 +2242,9 @@ impl HboneConnectionPool {
                 );
                 None
             }
-        }
+        };
+        drop(creation_lease);
+        grown
     }
 
     /// Dial one physical connection for `key` while holding its creation lock,
@@ -2429,11 +2522,7 @@ impl HboneConnectionPool {
 
     fn maybe_prune_idle_entries(&self) {
         let now = unix_secs();
-        let interval = if self.pool_config.idle_timeout_seconds == 0 {
-            60
-        } else {
-            self.pool_config.idle_timeout_seconds.clamp(1, 60)
-        };
+        let interval = idle_prune_interval_secs(&self.pool_config);
         let last = self.last_idle_prune_unix_secs.load(Ordering::Relaxed);
         if now.saturating_sub(last) < interval {
             return;
@@ -2919,8 +3008,18 @@ pub(crate) async fn dial_h2_connect_sender(
                 .max_frame_size(pool_config.http2_max_frame_size)
                 .max_header_list_size(max_header_list_size)
                 .max_concurrent_reset_streams(4096);
+            // The DestinationRule `maxConcurrentStreams` / global stream cap,
+            // exactly as `pool::hyper_h2_client_builder` applies it (issue
+            // #7181): advertised to the peer as our own inbound cap, and our
+            // own outbound CONNECT bound until the peer's SETTINGS replace it.
+            // `max_concurrent_streams` alone caps only peer-initiated streams
+            // on a client, so the keyed cap bounded nothing. After SETTINGS
+            // the transport's `HboneConnectionLoad` keeps holding the cap
+            // for carrier selection.
             if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-                builder.max_concurrent_streams(max_streams);
+                builder
+                    .max_concurrent_streams(max_streams)
+                    .initial_max_send_streams(max_streams as usize);
             }
 
             let (sender, mut connection) =
@@ -3001,7 +3100,9 @@ pub(crate) async fn dial_h2_connect_sender(
             Ok(MeshH2Transport {
                 sender,
                 gate,
-                load: HboneConnectionLoad::default(),
+                load: HboneConnectionLoad::with_configured_stream_cap(
+                    pool_config.http2_max_concurrent_streams,
+                ),
             })
         }
     })
@@ -3147,6 +3248,9 @@ pub struct H2WsConnectTunnel {
     /// proxy that offered the extension forwards only its `permessage-deflate`
     /// part, and a `terminate` proxy validates all of it.
     pub backend_extensions: Option<http::HeaderValue>,
+    /// The peer's end-to-end `200` response headers, collected with the
+    /// backend-response strip (issue #7391).
+    pub backend_response_headers: std::collections::HashMap<String, String>,
 }
 
 /// Open one HTTP/2 **Extended** CONNECT stream (RFC 8441 — `:method=CONNECT`
@@ -3181,8 +3285,18 @@ pub struct H2WsConnectTunnel {
 /// Fails closed: if the peer never acknowledged
 /// `SETTINGS_ENABLE_CONNECT_PROTOCOL`, sending an Extended CONNECT would be a
 /// protocol violation, so we return [`HbonePoolError::ExtendedConnectUnsupported`]
-/// before sending anything. A non-200 response also fails closed.
-pub(crate) async fn open_h2_ws_connect_stream(
+/// before sending anything. A non-200 response also fails closed; a `3xx`-`5xx`
+/// one carries the peer's refusal ([`HbonePoolError::WebSocketUpgradeRefused`]).
+///
+/// `head_timeout` bounds the Extended CONNECT up to and including the peer's
+/// response HEAD only. The optional body read of a refusal
+/// ([`read_ws_upgrade_refusal_body`]) runs after that deadline with its own
+/// short bound, so a refusal head that arrived in time is always relayed: a
+/// slow refusal body can never turn it into a connect-timeout `502`
+/// (GHSA-7x2j-3389-2h35).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_h2_ws_connect_stream_within(
+    head_timeout: Duration,
     transport: MeshH2Transport,
     authority: &str,
     path_and_query: &str,
@@ -3190,6 +3304,80 @@ pub(crate) async fn open_h2_ws_connect_stream(
     baggage: Option<&str>,
     marker: Option<&'static str>,
 ) -> Result<H2WsConnectTunnel, HbonePoolError> {
+    let head = tokio::time::timeout(
+        head_timeout,
+        open_h2_ws_connect_stream_head(
+            transport,
+            authority,
+            path_and_query,
+            ws_handshake_headers,
+            baggage,
+            marker,
+        ),
+    )
+    .await
+    .map_err(|_| HbonePoolError::ConnectStream {
+        authority: authority.to_string(),
+        message: format!(
+            "timed out after {}ms waiting for sidecar mesh-mTLS WebSocket Extended CONNECT \
+             response",
+            head_timeout.as_millis()
+        ),
+    })??;
+    finish_ws_connect_head(head).await
+}
+
+/// The outcome of an Extended CONNECT once the peer's response head arrived:
+/// an open tunnel, or a `3xx`-`5xx` refusal whose body is still to be read.
+pub(crate) enum WsConnectHead {
+    Open(Box<H2WsConnectTunnel>),
+    Refused {
+        authority: String,
+        status: StatusCode,
+        headers: http::HeaderMap,
+        body: RecvStream,
+    },
+}
+
+/// Turn a [`WsConnectHead`] into the opener result: an open tunnel, or the
+/// carried [`HbonePoolError::WebSocketUpgradeRefused`] with the refusal body
+/// when it ended within [`WS_UPGRADE_REFUSAL_BODY_WAIT`].
+pub(crate) async fn finish_ws_connect_head(
+    head: WsConnectHead,
+) -> Result<H2WsConnectTunnel, HbonePoolError> {
+    let (authority, status, headers, body) = match head {
+        WsConnectHead::Open(tunnel) => return Ok(*tunnel),
+        WsConnectHead::Refused {
+            authority,
+            status,
+            headers,
+            body,
+        } => (authority, status, headers, body),
+    };
+    let complete_body = read_ws_upgrade_refusal_body(body).await;
+    match super::WebSocketBackendRefusal::from_response_parts(status, &headers, complete_body) {
+        Some(refusal) => Err(HbonePoolError::WebSocketUpgradeRefused {
+            authority,
+            status: status.as_u16(),
+            refusal: Box::new(refusal),
+        }),
+        None => Err(HbonePoolError::ConnectRejected {
+            authority,
+            status: status.as_u16(),
+        }),
+    }
+}
+
+/// Open the Extended CONNECT and wait for the peer's response head; see
+/// [`open_h2_ws_connect_stream_within`].
+async fn open_h2_ws_connect_stream_head(
+    transport: MeshH2Transport,
+    authority: &str,
+    path_and_query: &str,
+    ws_handshake_headers: &[(String, String)],
+    baggage: Option<&str>,
+    marker: Option<&'static str>,
+) -> Result<WsConnectHead, HbonePoolError> {
     // Synchronous refusal (issue #3859): a transport retired between checkout
     // and Extended CONNECT may not open a new stream.
     if transport.is_retired() {
@@ -3314,10 +3502,23 @@ pub(crate) async fn open_h2_ws_connect_stream(
             message: e.to_string(),
         })?;
     load.record_peer_max_streams(&sender);
-    if response.status() != StatusCode::OK {
+    let status = response.status();
+    if status != StatusCode::OK {
+        // A `3xx`-`5xx` is the destination's application answer to the
+        // upgrade (GHSA-7x2j-3389-2h35): hand back its head so the caller can
+        // carry it to the relay after the head deadline, body read included.
+        if (300..=599).contains(&status.as_u16()) {
+            let (parts, body) = response.into_parts();
+            return Ok(WsConnectHead::Refused {
+                authority,
+                status,
+                headers: parts.headers,
+                body,
+            });
+        }
         return Err(HbonePoolError::ConnectRejected {
             authority,
-            status: response.status().as_u16(),
+            status: status.as_u16(),
         });
     }
     let negotiated_subprotocol = response
@@ -3325,7 +3526,9 @@ pub(crate) async fn open_h2_ws_connect_stream(
         .get(http::header::SEC_WEBSOCKET_PROTOCOL)
         .cloned();
     let backend_extensions = super::backend_extensions_answer(response.headers());
-    Ok(H2WsConnectTunnel {
+    let mut backend_response_headers = std::collections::HashMap::new();
+    super::collect_hyper_response_headers(response.headers(), &mut backend_response_headers);
+    Ok(WsConnectHead::Open(Box::new(H2WsConnectTunnel {
         tunnel: H2ConnectTunnel {
             recv_stream: response.into_body(),
             send_stream,
@@ -3341,7 +3544,41 @@ pub(crate) async fn open_h2_ws_connect_stream(
         },
         negotiated_subprotocol,
         backend_extensions,
-    })
+        backend_response_headers,
+    })))
+}
+
+/// How long a Sidecar mesh-mTLS WebSocket refusal may wait for its body after
+/// the refusal head arrived. A peer gateway writes the head and its small body
+/// together, so this only absorbs frame-processing skew. It runs after the
+/// head deadline ([`open_h2_ws_connect_stream_within`]), so a stalled or failed
+/// body read only drops the body, never the refusal.
+const WS_UPGRADE_REFUSAL_BODY_WAIT: Duration = Duration::from_millis(100);
+
+/// The complete body of a refused Extended CONNECT, or `None` when it did not
+/// end within [`WS_UPGRADE_REFUSAL_BODY_WAIT`], failed, or exceeded the relay
+/// cap ([`super::WEBSOCKET_BACKEND_REFUSAL_MAX_BODY_BYTES`]). `None` makes the
+/// relay carry an empty body without the representation headers.
+async fn read_ws_upgrade_refusal_body(mut body: RecvStream) -> Option<Bytes> {
+    if body.is_end_stream() {
+        return Some(Bytes::new());
+    }
+    let collect = async {
+        let mut collected = bytes::BytesMut::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.ok()?;
+            let _ = body.flow_control().release_capacity(chunk.len());
+            if collected.len() + chunk.len() > super::WEBSOCKET_BACKEND_REFUSAL_MAX_BODY_BYTES {
+                return None;
+            }
+            collected.extend_from_slice(&chunk);
+        }
+        Some(collected.freeze())
+    };
+    tokio::time::timeout(WS_UPGRADE_REFUSAL_BODY_WAIT, collect)
+        .await
+        .ok()
+        .flatten()
 }
 
 pub fn target_hbone_enabled(target: &UpstreamTarget) -> bool {
@@ -3715,6 +3952,50 @@ fn record_hbone_evictions(count: usize) {
         .record_pool_evictions(crate::runtime_metrics::PoolKind::Hbone, count as u64);
 }
 
+/// Seconds between idle sweeps: the global idle timeout clamped to `1..=60`,
+/// or 60 when idle expiry is off globally (a per-proxy timeout may still
+/// apply to individual entries).
+fn idle_prune_interval_secs(pool_config: &PoolConfig) -> u64 {
+    if pool_config.idle_timeout_seconds == 0 {
+        60
+    } else {
+        pool_config.idle_timeout_seconds.clamp(1, 60)
+    }
+}
+
+/// Periodic idle sweep for the HBONE / mesh CONNECT pool (issue #7182).
+///
+/// The rate-limited prune also runs on the cold create path, but a
+/// destination that stops receiving lookups never reaches it, so without this
+/// task its connections — sockets, DestinationRule `maxConnections` slots,
+/// trust-registry registrations — would outlive `idleTimeout` indefinitely.
+/// Holds only a `Weak` reference to the entry map, so the task ends with the
+/// pool, exactly like the direct pools' sweepers. Spawned only inside a Tokio
+/// runtime.
+fn spawn_idle_entry_sweeper(
+    entries: &Arc<DashMap<String, Vec<HbonePoolEntry>>>,
+    pool_config: &PoolConfig,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let weak = Arc::downgrade(entries);
+    let interval = Duration::from_secs(idle_prune_interval_secs(pool_config));
+    handle.spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(entries) = weak.upgrade() else { break };
+            entries.retain(|_, entries| {
+                record_hbone_evictions(prune_pool_entries(entries));
+                !entries.is_empty()
+            });
+        }
+    });
+}
+
 /// Remove the pool entry whose gate is `gate`. Identity match (not key-only)
 /// so a concurrent checkout that replaced this transport under the same key
 /// is not evicted (issue #4162). Mirrors `DashMap::remove_if` + `Arc::ptr_eq`
@@ -4020,7 +4301,6 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
-            pool_max_requests_per_connection: None,
             pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,
@@ -5249,42 +5529,6 @@ mod tests {
         );
     }
 
-    /// The outer-TLS SNI resolution `dial_h2_connect_sender` applies: `None`
-    /// keeps the dial host (byte-identical to the prior hardcoded
-    /// `ServerName::try_from(target_host)`); `Some(x)` overrides to `x` (the
-    /// cross-cluster destination FQDN). Pins the exact expression so the
-    /// in-cluster callers can never silently change SNI.
-    #[test]
-    fn sni_override_resolves_to_dial_host_when_none_else_the_override() {
-        // Mirrors the resolution inside `dial_h2_connect_sender`:
-        //   let sni_host = sni_override.unwrap_or(target_host);
-        let resolve = |target_host: &str, sni_override: Option<&str>| -> String {
-            let sni_host = sni_override.unwrap_or(target_host);
-            let server_name = rustls::pki_types::ServerName::try_from(sni_host.to_string())
-                .expect("valid server name");
-            match server_name {
-                rustls::pki_types::ServerName::DnsName(dns) => dns.as_ref().to_string(),
-                rustls::pki_types::ServerName::IpAddress(ip) => {
-                    let ip: std::net::IpAddr = ip.into();
-                    ip.to_string()
-                }
-                _ => unreachable!("unexpected server name variant"),
-            }
-        };
-
-        // None ⇒ SNI = the dial host (unchanged in-cluster behavior).
-        assert_eq!(resolve("10.9.9.9", None), "10.9.9.9");
-        assert_eq!(
-            resolve("svc-b.default.svc.cluster.local", None),
-            "svc-b.default.svc.cluster.local"
-        );
-        // Some(x) ⇒ SNI = x even though the dial host is the gateway IP.
-        assert_eq!(
-            resolve("10.9.9.9", Some("svc-b.default.svc.cluster.local")),
-            "svc-b.default.svc.cluster.local"
-        );
-    }
-
     #[test]
     fn read_path_returns_none_on_empty_and_missing_keys() {
         let pool = HboneConnectionPool::new(
@@ -5348,7 +5592,8 @@ mod tests {
         });
 
         let sender = h2_client_to(addr).await;
-        let result = open_h2_ws_connect_stream(
+        let result = open_h2_ws_connect_stream_within(
+            Duration::from_secs(10),
             sender,
             "orders.default.svc.cluster.local:8080",
             "/",
@@ -5363,6 +5608,150 @@ mod tests {
             }
             Err(other) => panic!("expected ExtendedConnectUnsupported, got error {other:?}"),
             Ok(_) => panic!("expected ExtendedConnectUnsupported, got an open tunnel"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_extended_connect_refusal_is_carried_for_the_relay() {
+        // GHSA-7x2j-3389-2h35: the destination gateway relays its backend's
+        // 401 on the Extended CONNECT response. The opener must carry that
+        // answer (status, stripped headers, complete body) for the WebSocket
+        // relay, not collapse it into a breaker-tripping ConnectRejected.
+        let body = r#"{"error":"backend-auth"}"#;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind h2 server");
+        let addr = listener.local_addr().expect("server addr");
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("server accept");
+            let mut builder = h2::server::Builder::new();
+            builder.enable_connect_protocol();
+            let mut conn = builder
+                .handshake::<_, Bytes>(tcp)
+                .await
+                .expect("server handshake");
+            let (_request, mut respond) = conn
+                .accept()
+                .await
+                .expect("server has a stream")
+                .expect("accepted request");
+            let response = http::Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("www-authenticate", "Bearer realm=\"ws\"")
+                .header("content-type", "application/json")
+                .header("x-gateway-error", "forged")
+                .body(())
+                .expect("build response");
+            let mut send = respond
+                .send_response(response, false)
+                .expect("send response");
+            send.send_data(Bytes::from_static(body.as_bytes()), true)
+                .expect("send body");
+            // Keep driving the connection so the frames are flushed.
+            while conn.accept().await.is_some() {}
+        });
+
+        let sender = h2_client_to(addr).await;
+        // `H2WsConnectTunnel` deliberately has no `Debug`, so match rather
+        // than `expect_err`.
+        let Err(error) = open_h2_ws_connect_stream_within(
+            Duration::from_secs(10),
+            sender,
+            "orders.default.svc.cluster.local:8080",
+            "/ws",
+            &[],
+            None,
+            None,
+        )
+        .await
+        else {
+            panic!("a 401 is not an open tunnel");
+        };
+        assert_eq!(error.public_status(), Some(401));
+        assert_eq!(error.error_class(), ErrorClass::ProtocolError);
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(error);
+        let refusal = crate::proxy::websocket_backend_refusal(boxed.as_ref())
+            .expect("the shared relay must find the mesh refusal");
+        assert_eq!(refusal.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            refusal.headers.get("www-authenticate").map(String::as_str),
+            Some("Bearer realm=\"ws\"")
+        );
+        assert!(!refusal.headers.contains_key("x-gateway-error"));
+        assert_eq!(refusal.body.as_ref(), body.as_bytes());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_extended_connect_refusal_head_survives_a_slow_body_past_the_deadline() {
+        // Round-2 review (sol F1): the head deadline must not erase a refusal
+        // whose head arrived in time. The peer sends the 401 head at once and
+        // its body only after both the head deadline and the body wait, so
+        // the refusal is relayed with an empty body and no representation
+        // headers instead of a connect-timeout ConnectStream (a 502).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind h2 server");
+        let addr = listener.local_addr().expect("server addr");
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("server accept");
+            let mut builder = h2::server::Builder::new();
+            builder.enable_connect_protocol();
+            let mut conn = builder
+                .handshake::<_, Bytes>(tcp)
+                .await
+                .expect("server handshake");
+            let (_request, mut respond) = conn
+                .accept()
+                .await
+                .expect("server has a stream")
+                .expect("accepted request");
+            let response = http::Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("www-authenticate", "Bearer realm=\"ws\"")
+                .header("content-type", "application/json")
+                .body(())
+                .expect("build response");
+            let mut send = respond
+                .send_response(response, false)
+                .expect("send response");
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                let _ = send.send_data(Bytes::from_static(b"{}"), true);
+            });
+            while conn.accept().await.is_some() {}
+        });
+
+        let sender = h2_client_to(addr).await;
+        // `H2WsConnectTunnel` deliberately has no `Debug`, so match rather
+        // than `expect_err`.
+        let Err(error) = open_h2_ws_connect_stream_within(
+            Duration::from_millis(250),
+            sender,
+            "orders.default.svc.cluster.local:8080",
+            "/ws",
+            &[],
+            None,
+            None,
+        )
+        .await
+        else {
+            panic!("a 401 is not an open tunnel");
+        };
+        match error {
+            HbonePoolError::WebSocketUpgradeRefused {
+                status, refusal, ..
+            } => {
+                assert_eq!(status, 401);
+                assert_eq!(
+                    refusal.headers.get("www-authenticate").map(String::as_str),
+                    Some("Bearer realm=\"ws\"")
+                );
+                assert!(refusal.body.is_empty());
+                assert!(!refusal.headers.contains_key("content-type"));
+            }
+            other => panic!("the in-time refusal head must be kept, got {other:?}"),
         }
         server.abort();
     }
@@ -5458,7 +5847,8 @@ mod tests {
         });
 
         let sender = h2_client_to(addr).await;
-        let ws = open_h2_ws_connect_stream(
+        let ws = open_h2_ws_connect_stream_within(
+            Duration::from_secs(10),
             sender,
             "orders.default.svc.cluster.local:8080",
             "/ws?room=1",

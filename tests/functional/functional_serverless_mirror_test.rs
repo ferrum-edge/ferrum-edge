@@ -8,6 +8,7 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_serverless_mirror
 
+use crate::common::GatewayChildGuard;
 use crate::scaffolding::port_registry::TestSocket;
 
 use bytes::Bytes;
@@ -156,13 +157,19 @@ fn start_gateway(
     proxy_port: u16,
     admin_port: u16,
     identity: &crate::common::SpawnedGatewayIdentity,
-) -> std::process::Child {
+) -> GatewayChildGuard {
     let binary_path = crate::common::gateway_binary_path();
 
     let mut cmd = std::process::Command::new(binary_path);
+    crate::common::configure_coverage_gateway_command(&mut cmd);
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
+        // Keep any managed-TLS/ACME/event store inside the config's temp dir.
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            std::path::Path::new(config_path).with_file_name("managed-tls"),
+        )
         .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_LOG_LEVEL", "debug")
@@ -170,7 +177,7 @@ fn start_gateway(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     identity.apply_to_command(&mut cmd);
-    cmd.spawn().expect("Failed to start gateway binary")
+    GatewayChildGuard::new(cmd.spawn().expect("Failed to start gateway binary"))
 }
 
 /// Wait until `child` owns `admin_port`. Unauthenticated `/health` and
@@ -199,7 +206,7 @@ async fn ephemeral_port() -> u16 {
 
 /// Start the gateway with retry logic for port allocation races.
 /// Allocates fresh gateway/admin ports each attempt.
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+async fn start_gateway_with_retry(config_path: &str) -> (GatewayChildGuard, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         let proxy_port = ephemeral_port().await;
@@ -208,7 +215,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         let identity = crate::common::SpawnedGatewayIdentity::mint("serverless-mirror");
         let mut child = start_gateway(config_path, proxy_port, admin_port, &identity);
 
-        if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
+        if wait_for_owned_gateway(child.child_mut(), admin_port, &identity).await {
             return (child, proxy_port, admin_port);
         }
 
@@ -216,8 +223,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
             "Gateway startup attempt {}/{} failed (proxy_port={}, admin_port={})",
             attempt, MAX_ATTEMPTS, proxy_port, admin_port
         );
-        let _ = child.kill();
-        let _ = child.wait();
+        child.shutdown();
 
         if attempt < MAX_ATTEMPTS {
             sleep(Duration::from_secs(1)).await;
@@ -593,8 +599,7 @@ upstreams: []
     // `ai_response_guard` independently fails closed on a non-JSON body, so this
     // proxy cannot express an unclaimed response.
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
 }
 
 /// Test request_mirror plugin sends a copy of the request to the mirror server.
@@ -689,6 +694,5 @@ upstreams: []
         "Mirror server should have received a copy of the request"
     );
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
 }

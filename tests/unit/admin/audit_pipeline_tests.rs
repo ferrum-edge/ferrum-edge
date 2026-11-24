@@ -19,8 +19,11 @@ use ferrum_edge::_test_support::prepare_audit_intent_with_barriers_for_test;
 use ferrum_edge::admin::audit::{
     AuditActor, AuditDurabilityMode, AuditEvent, AuditEventDelivery, AuditOutcome, AuditPipeline,
     AuditPipelineConfig, AuditRequestContext, AuditUnavailablePolicy, AuditUnavailableReason,
-    AuditWorker, audit_destination_identity, credential_update_diff, new_request_slot,
-    note_request_actor, sanitize_audit_namespace, sanitize_audit_path, scope_request, update_diff,
+    AuditWorker, LocalAuditRetentionBounds, LocalRetentionAppend, append_local_retention_event,
+    audit_destination_identity, credential_update_diff, list_local_retention_events,
+    new_request_slot, note_request_actor, record_without_database_with_pipeline,
+    sanitize_audit_namespace, sanitize_audit_path, scope_request,
+    set_local_audit_sync_hook_for_tests, spawn_local_retention_worker, update_diff,
 };
 use ferrum_edge::admin::audit_spool::{
     AUDIT_DIFF_OMITTED_MARKER, AUDIT_SPOOL_RECORD_VERSION, AuditSpool, RetainOutcome,
@@ -72,6 +75,8 @@ fn config(spool_dir: Option<&TempDir>) -> AuditPipelineConfig {
         spool_max_records: 64,
         retained_max_records: 8,
         max_delivery_attempts: 3,
+        local_retention_dir: None,
+        local_retention: LocalAuditRetentionBounds::default(),
     }
 }
 
@@ -690,6 +695,60 @@ fn fail_open_accounts_for_a_mutation_that_proceeded_unaudited() {
     assert_eq!(status.metrics.dropped_durable_handoff_failed_total, 1);
 }
 
+/// Issue #7200: under `fail_open` a saturated `prepare` lets the mutation run,
+/// and its later finalize has no prepared twin to replace. That finalize adds
+/// a new durable record, so it must respect the same ceiling instead of
+/// growing `pending/` without bound; a finalize that replaces its prepared
+/// twin is still admitted at the ceiling.
+#[test]
+fn finalize_without_a_prepared_twin_respects_the_ceiling() {
+    let dir = TempDir::new().expect("temp dir");
+    let spool = AuditSpool::open(
+        dir.path().to_path_buf(),
+        Uuid::new_v4().to_string(),
+        TEST_DESTINATION.to_string(),
+        1,
+        8,
+    )
+    .expect("spool opens");
+    let record = |id: &str, finalized: bool| {
+        SpooledAuditRecord::with_bounded_diff(
+            event_with(id, json!({"finalized": finalized})),
+            TEST_DESTINATION,
+            spool.generation(),
+            finalized,
+            1024 * 1024,
+        )
+    };
+    let admitted = Uuid::new_v4().to_string();
+    spool
+        .prepare(&record(&admitted, false))
+        .expect("the first intent fits the ceiling");
+
+    let unaudited = Uuid::new_v4().to_string();
+    assert_eq!(
+        spool
+            .prepare(&record(&unaudited, false))
+            .expect_err("the ceiling refuses a second intent")
+            .kind,
+        SpoolErrorKind::Saturated
+    );
+    assert_eq!(
+        spool
+            .finalize(&record(&unaudited, true))
+            .expect_err("a finalize without a twin is a new record")
+            .kind,
+        SpoolErrorKind::Saturated
+    );
+
+    spool
+        .finalize(&record(&admitted, true))
+        .expect("replacing the prepared twin is admitted at the ceiling");
+    let stats = spool.stats();
+    assert_eq!(stats.prepared_records, 0);
+    assert_eq!(stats.pending_records, 1);
+}
+
 #[test]
 fn memory_only_mode_never_claims_durable_coverage() {
     let pipeline = pipeline(config(None));
@@ -734,6 +793,89 @@ fn a_live_generation_owns_its_instance_directory_exclusively() {
         "a live process's in-flight intent is never claimed by a sibling"
     );
     assert_eq!(second.status().metrics.unknown_outcome_total, 0);
+}
+
+/// Issue #7200: a sibling that is still building its instance tree (under the
+/// staging name, before the locked rename) is never mistaken for an abandoned
+/// generation, and a generation's own tree is only visible once it is locked.
+#[cfg(unix)]
+#[test]
+fn a_sibling_still_staging_its_instance_is_never_claimed() {
+    let dir = TempDir::new().expect("temp dir");
+    let staging = dir
+        .path()
+        .join("instances")
+        .join(format!(".staging-{}", Uuid::new_v4()));
+    for sub in ["prepared", "pending", "tmp"] {
+        std::fs::create_dir_all(staging.join(sub)).expect("stage a sibling tree");
+    }
+
+    let spool = AuditSpool::open(
+        dir.path().to_path_buf(),
+        Uuid::new_v4().to_string(),
+        TEST_DESTINATION.to_string(),
+        64,
+        8,
+    )
+    .expect("spool opens");
+    let report = spool.claim_abandoned();
+
+    assert!(staging.is_dir(), "a fresh staging tree is left alone");
+    assert!(
+        !staging.join("owner.lock").exists(),
+        "the claimer never creates a lock inside a sibling's staging tree"
+    );
+    assert_eq!(report.live_instances, 0);
+    let own = dir.path().join("instances").join(spool.generation());
+    assert!(own.join("owner.lock").is_file());
+    assert!(
+        !dir.path()
+            .join("instances")
+            .join(format!(".staging-{}", spool.generation()))
+            .exists(),
+        "the generation's tree was renamed into place"
+    );
+}
+
+/// Issue #7200: processes starting together on one spool root each end up
+/// owning a usable instance; none claims or removes a sibling's tree.
+#[cfg(unix)]
+#[test]
+fn concurrent_spool_opens_and_claims_never_steal_a_sibling() {
+    let dir = TempDir::new().expect("temp dir");
+    let root = dir.path().to_path_buf();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let root = root.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let spool = AuditSpool::open(
+                    root,
+                    Uuid::new_v4().to_string(),
+                    TEST_DESTINATION.to_string(),
+                    64,
+                    8,
+                )
+                .expect("every concurrent open succeeds");
+                spool.claim_abandoned();
+                spool
+            })
+        })
+        .collect();
+    let spools: Vec<AuditSpool> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("open thread"))
+        .collect();
+    for spool in &spools {
+        let own = root.join("instances").join(spool.generation());
+        for sub in ["prepared", "pending", "tmp"] {
+            assert!(own.join(sub).is_dir(), "{sub} survives sibling claims");
+        }
+        assert!(own.join("owner.lock").is_file());
+    }
+    assert_eq!(instance_dirs(&root).len(), spools.len());
 }
 
 #[test]
@@ -1522,6 +1664,461 @@ async fn shutdown_with_no_worker_is_a_no_op() {
     assert!(
         worker.shutdown(Duration::from_secs(5)).await,
         "a second shutdown is idempotent and never detaches a task"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// DB-less local retention (issue #7200)
+// ---------------------------------------------------------------------------
+
+const RETENTION_FILE: &str = "admin-audit-retention.json";
+
+fn retention_config(spool_dir: Option<&TempDir>, retention_dir: &Path) -> AuditPipelineConfig {
+    AuditPipelineConfig {
+        local_retention_dir: Some(retention_dir.to_path_buf()),
+        ..config(spool_dir)
+    }
+}
+
+fn pending_records(spool_root: &Path) -> usize {
+    instance_dirs(spool_root)
+        .iter()
+        .map(|instance| count_json(&instance.join("pending")))
+        .sum()
+}
+
+fn retained_ids(dir: &Path) -> Vec<String> {
+    list_local_retention_events(dir, LocalAuditRetentionBounds::default())
+        .expect("retention file reads")
+        .into_iter()
+        .map(|event| event.id)
+        .collect()
+}
+
+/// With a spool, DB-less records are finalized into `pending/` and the local
+/// retention worker drains them into the retention file, so `pending/` empties
+/// instead of growing.
+#[tokio::test]
+async fn db_less_records_drain_from_the_spool_into_the_local_retention_file() {
+    let spool_dir = TempDir::new().expect("spool dir");
+    let retention_dir = TempDir::new().expect("retention dir");
+    let pipeline = pipeline(retention_config(Some(&spool_dir), retention_dir.path()));
+    let worker = spawn_local_retention_worker(Arc::clone(&pipeline));
+
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let event = event();
+        ids.push(event.id.clone());
+        ids.sort();
+        record_without_database_with_pipeline(
+            true,
+            Arc::clone(&pipeline),
+            Some(Arc::clone(&worker)),
+            event,
+        )
+        .await
+        .expect("DB-less handoff is durable");
+    }
+
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            // Startup replay and the queue may race to deliver a record;
+            // the retention file dedupes on the id, so compare as a set.
+            let mut retained = retained_ids(retention_dir.path());
+            retained.sort();
+            retained == ids && pending_records(spool_dir.path()) == 0
+        })
+        .await,
+        "every record must reach the retention file and leave pending/: retained={:?} pending={}",
+        retained_ids(retention_dir.path()),
+        pending_records(spool_dir.path())
+    );
+    let status = pipeline.status();
+    assert!(!status.evidence_lost);
+    assert!(!status.degraded);
+    assert!(status.metrics.delivered_total >= 3);
+    assert!(worker.shutdown(Duration::from_secs(5)).await);
+}
+
+/// The DB-less backlog no longer saturates the spool: records that filled the
+/// ceiling while no worker ran are drained into the retention file, and
+/// admission reopens.
+#[tokio::test]
+async fn db_less_spool_saturation_drains_into_retention_and_reopens_admission() {
+    let spool_dir = TempDir::new().expect("spool dir");
+    let retention_dir = TempDir::new().expect("retention dir");
+    let pipeline = pipeline(AuditPipelineConfig {
+        spool_max_records: 2,
+        ..retention_config(Some(&spool_dir), retention_dir.path())
+    });
+
+    for _ in 0..2 {
+        record_without_database_with_pipeline(true, Arc::clone(&pipeline), None, event())
+            .await
+            .expect("records are durable in pending/ while no worker runs");
+    }
+    assert_eq!(pending_records(spool_dir.path()), 2);
+    assert_eq!(
+        pipeline
+            .prepare_intent(event())
+            .expect_err("the spool ceiling is reached"),
+        AuditUnavailableReason::SpoolSaturated
+    );
+
+    let worker = spawn_local_retention_worker(Arc::clone(&pipeline));
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            retained_ids(retention_dir.path()).len() == 2 && pending_records(spool_dir.path()) == 0
+        })
+        .await,
+        "the startup replay must drain the saturated backlog into the retention file"
+    );
+    pipeline
+        .prepare_intent(event())
+        .expect("draining the backlog reopens durable admission");
+    assert!(!pipeline.status().evidence_lost);
+    assert!(worker.shutdown(Duration::from_secs(5)).await);
+}
+
+/// Without a spool the event is written straight into the retention file;
+/// only a failed retention write latches `evidence_lost`.
+#[tokio::test]
+async fn db_less_record_without_spool_writes_the_retention_file_and_latches_only_on_failure() {
+    let retention_dir = TempDir::new().expect("retention dir");
+    let pipeline_ok = pipeline(retention_config(None, retention_dir.path()));
+    let retained_event = event();
+    let id = retained_event.id.clone();
+    record_without_database_with_pipeline(true, Arc::clone(&pipeline_ok), None, retained_event)
+        .await
+        .expect("the retention write is the durable record");
+    assert_eq!(retained_ids(retention_dir.path()), vec![id]);
+    let status = pipeline_ok.status();
+    assert!(
+        !status.evidence_lost,
+        "a successful retention write is not evidence loss"
+    );
+    assert_eq!(status.metrics.delivered_total, 1);
+    assert_eq!(status.metrics.dropped_no_durable_spool_total, 0);
+
+    // A retention "directory" that is a regular file cannot be written.
+    let not_a_dir = retention_dir.path().join("not-a-directory");
+    std::fs::write(&not_a_dir, b"x").expect("plant a regular file");
+    let pipeline_failing = pipeline(retention_config(None, &not_a_dir));
+    record_without_database_with_pipeline(true, Arc::clone(&pipeline_failing), None, event())
+        .await
+        .expect_err("a failed retention write is reported");
+    let status = pipeline_failing.status();
+    assert!(
+        status.evidence_lost,
+        "a failed retention write is real evidence loss"
+    );
+    assert_eq!(status.metrics.dropped_no_durable_spool_total, 1);
+}
+
+/// The retention file rotates like the backup fallback file: newest kept,
+/// bounded by record count.
+#[test]
+fn db_less_retention_rotates_by_record_count() {
+    let dir = TempDir::new().expect("retention dir");
+    let bounds = LocalAuditRetentionBounds {
+        max_records: 3,
+        ..LocalAuditRetentionBounds::default()
+    };
+    let mut ids = Vec::new();
+    for index in 0..5 {
+        let event = event();
+        ids.push(event.id.clone());
+        let outcome = append_local_retention_event(dir.path(), bounds, &event).expect("append");
+        let expected_rotated = usize::from(index >= 3);
+        assert_eq!(
+            outcome,
+            LocalRetentionAppend::Retained {
+                rotated: expected_rotated
+            }
+        );
+    }
+    let retained: Vec<String> = list_local_retention_events(dir.path(), bounds)
+        .expect("list")
+        .into_iter()
+        .map(|event| event.id)
+        .collect();
+    assert_eq!(retained, ids[2..].to_vec(), "the newest three are kept");
+}
+
+/// The byte bound rotates the oldest records out until the file fits.
+#[test]
+fn db_less_retention_rotates_by_bytes() {
+    let dir = TempDir::new().expect("retention dir");
+    let bounds = LocalAuditRetentionBounds {
+        max_records: 1_000,
+        max_bytes: ferrum_edge::admin::audit::AUDIT_LOCAL_RETENTION_MAX_BYTES_MIN,
+    };
+    let blob = "x".repeat(700_000);
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let event = event_with(&Uuid::new_v4().to_string(), json!({ "blob": blob }));
+        ids.push(event.id.clone());
+        append_local_retention_event(dir.path(), bounds, &event).expect("append");
+    }
+    let retained: Vec<String> = list_local_retention_events(dir.path(), bounds)
+        .expect("list")
+        .into_iter()
+        .map(|event| event.id)
+        .collect();
+    assert_eq!(
+        retained,
+        ids[2..].to_vec(),
+        "two ~700 KB records fit in 2 MiB, a third does not"
+    );
+    let size = std::fs::metadata(dir.path().join(RETENTION_FILE))
+        .expect("retention file exists")
+        .len();
+    assert!(size <= bounds.max_bytes, "file is {size} bytes");
+}
+
+/// Replayed delivery of the same stable id is not written twice.
+#[test]
+fn db_less_retention_is_idempotent_on_the_event_id() {
+    let dir = TempDir::new().expect("retention dir");
+    let bounds = LocalAuditRetentionBounds::default();
+    let event = event();
+    assert_eq!(
+        append_local_retention_event(dir.path(), bounds, &event).expect("first append"),
+        LocalRetentionAppend::Retained { rotated: 0 }
+    );
+    assert_eq!(
+        append_local_retention_event(dir.path(), bounds, &event).expect("replayed append"),
+        LocalRetentionAppend::AlreadyRetained
+    );
+    assert_eq!(retained_ids(dir.path()), vec![event.id]);
+}
+
+/// Review of #7369 (sol F1, dsf F1): the byte bound is the rotation target,
+/// not the read ceiling. A file written under a larger bound is still read
+/// after the operator lowers `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES`,
+/// and the next append rotates it down instead of failing forever.
+#[test]
+fn db_less_retention_rotates_down_after_the_byte_bound_is_lowered() {
+    let dir = TempDir::new().expect("retention dir");
+    let lowered = LocalAuditRetentionBounds {
+        max_records: 1_000,
+        max_bytes: ferrum_edge::admin::audit::AUDIT_LOCAL_RETENTION_MAX_BYTES_MIN,
+    };
+    let larger = LocalAuditRetentionBounds {
+        max_bytes: lowered.max_bytes * 2,
+        ..lowered
+    };
+    let blob = "x".repeat(700_000);
+    let mut ids = Vec::new();
+    for _ in 0..5 {
+        let event = event_with(&Uuid::new_v4().to_string(), json!({ "blob": blob }));
+        ids.push(event.id.clone());
+        append_local_retention_event(dir.path(), larger, &event).expect("append, larger bound");
+    }
+    let size = std::fs::metadata(dir.path().join(RETENTION_FILE))
+        .expect("retention file exists")
+        .len();
+    assert!(
+        size > lowered.max_bytes,
+        "the file written under the larger bound ({size} bytes) exceeds the lowered one"
+    );
+
+    let event = event_with(&Uuid::new_v4().to_string(), json!({ "blob": blob }));
+    ids.push(event.id.clone());
+    assert_eq!(
+        append_local_retention_event(dir.path(), lowered, &event)
+            .expect("an append under a lowered bound rotates the existing file down"),
+        LocalRetentionAppend::Retained { rotated: 4 }
+    );
+    let retained: Vec<String> = list_local_retention_events(dir.path(), lowered)
+        .expect("list under the lowered bound")
+        .into_iter()
+        .map(|event| event.id)
+        .collect();
+    assert_eq!(retained, ids[4..].to_vec(), "the newest two fit in 2 MiB");
+    let size = std::fs::metadata(dir.path().join(RETENTION_FILE))
+        .expect("retention file exists")
+        .len();
+    assert!(size <= lowered.max_bytes, "file is {size} bytes");
+}
+
+/// Clears the process-global directory-sync hook, including on panic.
+struct ClearLocalAuditSyncHook;
+
+impl Drop for ClearLocalAuditSyncHook {
+    fn drop(&mut self) {
+        set_local_audit_sync_hook_for_tests(None);
+    }
+}
+
+/// Review of #7369 (sol F2): an earlier attempt can publish the event and
+/// then fail its directory sync. A replay that finds the id must redo the
+/// sync, and must not acknowledge (letting the spool copy be settled) while
+/// the sync still fails.
+#[test]
+fn db_less_retention_replay_resyncs_the_directory_before_acknowledging() {
+    let dir = TempDir::new().expect("retention dir");
+    let bounds = LocalAuditRetentionBounds::default();
+    let target = dir.path().to_path_buf();
+    let fail_next = Arc::new(AtomicBool::new(true));
+    let syncs = Arc::new(AtomicU64::new(0));
+    let hook_fail_next = Arc::clone(&fail_next);
+    let hook_syncs = Arc::clone(&syncs);
+    let _clear = ClearLocalAuditSyncHook;
+    set_local_audit_sync_hook_for_tests(Some(Arc::new(
+        move |synced: &Path| -> std::io::Result<()> {
+            if synced != target.as_path() {
+                return Ok(());
+            }
+            hook_syncs.fetch_add(1, Ordering::SeqCst);
+            if hook_fail_next.swap(false, Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected directory sync failure"));
+            }
+            Ok(())
+        },
+    )));
+
+    let event = event();
+    append_local_retention_event(dir.path(), bounds, &event)
+        .expect_err("the first attempt fails its directory sync after publishing");
+    assert_eq!(
+        retained_ids(dir.path()),
+        vec![event.id.clone()],
+        "the rename is visible although its directory sync failed"
+    );
+
+    fail_next.store(true, Ordering::SeqCst);
+    append_local_retention_event(dir.path(), bounds, &event)
+        .expect_err("a replay must not acknowledge while the directory sync still fails");
+
+    assert_eq!(
+        append_local_retention_event(dir.path(), bounds, &event).expect("replay"),
+        LocalRetentionAppend::AlreadyRetained
+    );
+    assert_eq!(
+        syncs.load(Ordering::SeqCst),
+        3,
+        "every attempt, replays included, syncs the retention directory"
+    );
+    assert_eq!(retained_ids(dir.path()), vec![event.id]);
+}
+
+/// Review of #7369 (sol F3): delivery order is not age. A late replay of an
+/// older event never rotates a newer one out; the newest by timestamp stay.
+#[test]
+fn db_less_retention_keeps_the_newest_by_timestamp_not_delivery_order() {
+    let dir = TempDir::new().expect("retention dir");
+    let bounds = LocalAuditRetentionBounds {
+        max_records: 2,
+        ..LocalAuditRetentionBounds::default()
+    };
+    let now = Utc::now();
+    let at = |offset_secs: i64| {
+        let mut event = event();
+        event.ts = now + chrono::TimeDelta::seconds(offset_secs);
+        event
+    };
+    let (a, b, c, d) = (at(-1), at(0), at(1), at(2));
+
+    for event in [&b, &d] {
+        append_local_retention_event(dir.path(), bounds, event).expect("append");
+    }
+    assert_eq!(
+        append_local_retention_event(dir.path(), bounds, &a)
+            .expect("late replay of an older event"),
+        LocalRetentionAppend::Retained { rotated: 1 },
+        "the older replay is the record rotated out"
+    );
+    assert_eq!(
+        retained_ids(dir.path()),
+        vec![b.id.clone(), d.id.clone()],
+        "a late older event never evicts newer evidence"
+    );
+
+    append_local_retention_event(dir.path(), bounds, &c).expect("append out of order");
+    assert_eq!(
+        retained_ids(dir.path()),
+        vec![c.id, d.id],
+        "the oldest by timestamp is rotated out, and the file is in timestamp order"
+    );
+}
+
+#[test]
+fn db_less_retention_bounds_are_validated() {
+    for (bounds, needle) in [
+        (
+            LocalAuditRetentionBounds {
+                max_records: 0,
+                ..LocalAuditRetentionBounds::default()
+            },
+            "FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS",
+        ),
+        (
+            LocalAuditRetentionBounds {
+                max_bytes: 1024,
+                ..LocalAuditRetentionBounds::default()
+            },
+            "FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES",
+        ),
+        (
+            LocalAuditRetentionBounds {
+                max_bytes: ferrum_edge::admin::audit::AUDIT_LOCAL_RETENTION_MAX_BYTES_MAX + 1,
+                ..LocalAuditRetentionBounds::default()
+            },
+            "FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES",
+        ),
+    ] {
+        let error = AuditPipelineConfig {
+            local_retention: bounds,
+            ..config(None)
+        }
+        .validate()
+        .expect_err("out-of-range retention bounds are refused at startup");
+        assert!(error.contains(needle), "{error}");
+    }
+    AuditPipelineConfig::default()
+        .validate()
+        .expect("the shipped defaults are valid");
+}
+
+/// Issue #7200, non-Unix startup claim race: a host that creates its instance
+/// tree in place and only then locks it must never have its fresh, lock-less
+/// tree claimed by a sibling; an old lock-less tree (a crash between mkdir and
+/// lock) is still claimed. On Unix the tree only becomes visible after its
+/// locked rename, so a lock-less tree is claimable at once.
+#[cfg(unix)]
+#[test]
+fn a_young_lockless_instance_is_never_claimed_where_trees_are_created_in_place() {
+    use ferrum_edge::_test_support::audit_spool_instance_lock_is_claimable_for_test as claimable;
+
+    let dir = TempDir::new().expect("temp dir");
+    let instance = dir.path().join(Uuid::new_v4().to_string());
+    std::fs::create_dir_all(instance.join("pending")).expect("instance tree");
+
+    assert!(
+        !claimable(&instance, true),
+        "a fresh lock-less tree may be a sibling that has not locked it yet"
+    );
+    assert!(
+        claimable(&instance, false),
+        "with locked-rename establishment a lock-less tree is a leftover"
+    );
+
+    std::fs::write(instance.join("owner.lock"), b"").expect("lock file");
+    assert!(
+        claimable(&instance, true),
+        "an existing lock decides ownership itself"
+    );
+    std::fs::remove_file(instance.join("owner.lock")).expect("remove lock file");
+
+    let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+    std::fs::File::open(&instance)
+        .expect("open instance directory")
+        .set_modified(old)
+        .expect("age the instance directory");
+    assert!(
+        claimable(&instance, true),
+        "an old lock-less tree is a crash leftover and is claimed"
     );
 }
 

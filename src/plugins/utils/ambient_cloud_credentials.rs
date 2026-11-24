@@ -39,11 +39,15 @@
 //! named after the service would otherwise pass. Only the hostnames that are
 //! the service itself for the configured region match.
 //!
-//! These plugins read only the three AWS credential variables (plus the region
-//! and, for Lambda, the function name and endpoint override) from the
-//! environment. They never consult the AWS SDK default credential chain
-//! (instance metadata, ECS container credentials, web identity, SSO, or profile
-//! files), so this scope covers every ambient credential source they use.
+//! By default these plugins read only the three AWS credential variables (plus
+//! the region and, for Lambda, the function name and endpoint override) from
+//! the environment. The one exception is `serverless_function` with
+//! `aws_credentials: default_chain`, which consults the AWS SDK default
+//! credential chain (environment, profile files, web identity, ECS container
+//! credentials, instance metadata) through
+//! [`super::aws_refreshing_credentials`]; those credentials are the process's
+//! own identity too and are held to exactly this scope, so it covers every
+//! ambient credential source either plugin uses.
 
 use url::{Host, Url};
 

@@ -149,25 +149,9 @@ impl PreparedLiveApply {
         }
     }
 
-    pub fn from_covering_sequence(sequence: u64) -> Self {
-        Self::from_covering_cursor(LiveApplyCursor::new(0, sequence))
-    }
-
     pub fn from_covering_cursor(cursor: LiveApplyCursor) -> Self {
         Self {
             covering: PreparedLiveApplyCovering::Cursor(cursor),
-        }
-    }
-
-    pub fn is_noop(&self) -> bool {
-        matches!(self.covering, PreparedLiveApplyCovering::Noop)
-    }
-
-    /// Covering watermark to wait for, if this process serves the write.
-    pub fn covering_sequence(&self) -> Option<u64> {
-        match self.covering {
-            PreparedLiveApplyCovering::Noop => None,
-            PreparedLiveApplyCovering::Cursor(cursor) => Some(cursor.sequence),
         }
     }
 
@@ -254,15 +238,6 @@ impl UnappliedWrites {
 }
 
 impl RuntimeConfigApply {
-    pub fn new(namespace: impl Into<String>, accepted_sequence: u64) -> Self {
-        Self::with_timeout_at_epoch(
-            namespace,
-            0,
-            accepted_sequence,
-            ADMIN_WRITE_LIVE_APPLY_TIMEOUT,
-        )
-    }
-
     pub fn at_epoch(
         namespace: impl Into<String>,
         topology_epoch: u64,
@@ -274,14 +249,6 @@ impl RuntimeConfigApply {
             accepted_sequence,
             ADMIN_WRITE_LIVE_APPLY_TIMEOUT,
         )
-    }
-
-    pub fn with_timeout(
-        namespace: impl Into<String>,
-        accepted_sequence: u64,
-        timeout: Duration,
-    ) -> Self {
-        Self::with_timeout_at_epoch(namespace, 0, accepted_sequence, timeout)
     }
 
     pub fn with_timeout_at_epoch(
@@ -316,17 +283,9 @@ impl RuntimeConfigApply {
         Arc::clone(&self.wake)
     }
 
-    pub fn accepted_sequence(&self) -> u64 {
-        self.snapshot.borrow().accepted
-    }
-
     pub fn accepted_cursor(&self) -> LiveApplyCursor {
         let snapshot = *self.snapshot.borrow();
         LiveApplyCursor::new(snapshot.topology_epoch, snapshot.accepted)
-    }
-
-    pub fn waiter_count(&self) -> usize {
-        self.waiter_count.load(Ordering::Acquire)
     }
 
     /// Record a cursor returned by an admin mutation in this process.
@@ -378,12 +337,6 @@ impl RuntimeConfigApply {
                 .is_some_and(|issued| cursor.sequence <= issued)
     }
 
-    /// Publish that the poll loop accepted a generation covering `sequence`.
-    pub fn record_accepted(&self, sequence: u64) {
-        let topology_epoch = self.snapshot.borrow().topology_epoch;
-        self.record_accepted_cursor(LiveApplyCursor::new(topology_epoch, sequence));
-    }
-
     /// Publish an accepted cursor without ever comparing it to a different
     /// topology's sequence. Older in-flight poll results are ignored.
     pub fn record_accepted_cursor(&self, cursor: LiveApplyCursor) {
@@ -399,13 +352,6 @@ impl RuntimeConfigApply {
                 snap.accepted = cursor.sequence;
             }
         });
-    }
-
-    /// Publish that a completed poll attempted `sequence` and rejected it.
-    /// Waiters whose covering sequence is `<= sequence` fail closed.
-    pub fn record_rejected(&self, sequence: u64) {
-        let topology_epoch = self.snapshot.borrow().topology_epoch;
-        self.record_rejected_cursor(LiveApplyCursor::new(topology_epoch, sequence));
     }
 
     pub fn record_rejected_cursor(&self, cursor: LiveApplyCursor) {
@@ -473,17 +419,11 @@ impl RuntimeConfigApply {
         }
     }
 
-    /// Wait until the poll loop has accepted a generation covering `sequence`
-    /// or a truthful failure is known. `sequence` must already have been
+    /// Wait until the poll loop has accepted a generation covering `cursor`
+    /// or a truthful failure is known. `cursor` must already have been
     /// captured under the write-topology pin; this method never reads the
     /// database. Signals an immediate coalesced wake so the wait does not sit
     /// on `FERRUM_DB_POLL_INTERVAL`.
-    pub async fn await_committed(&self, sequence: u64) -> Result<(), LiveApplyFailure> {
-        let topology_epoch = self.snapshot.borrow().topology_epoch;
-        self.await_committed_cursor(LiveApplyCursor::new(topology_epoch, sequence))
-            .await
-    }
-
     pub async fn await_committed_cursor(
         &self,
         cursor: LiveApplyCursor,

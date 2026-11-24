@@ -16,10 +16,11 @@ use ferrum_edge::_test_support::{
     FrontendAppSendAdmitForTest, FrontendAppSendRejectForTest, admit_frontend_app_send_for_test,
     earliest_frontend_app_send_deadline_for_test,
     encode_frontend_session_auth_deadline_offset_for_test,
-    frontend_app_ciphertext_send_until_expiry_for_test, frontend_app_send_cancel_fired_for_test,
-    frontend_app_send_reject_as_str_for_test, frontend_session_auth_deadline_for_test,
-    frontend_trust_raced_delivery_for_test, publish_frontend_session_auth_deadline_for_test,
-    read_frontend_session_auth_deadline_for_test,
+    frontend_app_ciphertext_send_until_expiry_for_test,
+    frontend_app_ciphertext_send_with_completion_cancel_for_test,
+    frontend_app_send_cancel_fired_for_test, frontend_app_send_reject_as_str_for_test,
+    frontend_session_auth_deadline_for_test, frontend_trust_raced_delivery_for_test,
+    publish_frontend_session_auth_deadline_for_test, read_frontend_session_auth_deadline_for_test,
     reconstruct_frontend_session_auth_deadline_for_test,
     reconstruct_frontend_session_auth_deadline_from_duration_for_test,
     shutdown_queued_frontend_app_send_for_test,
@@ -934,14 +935,16 @@ fn refused_dtls_handshakes_never_commit_the_server_final_flight() {
 #[test]
 fn dtls_demux_opens_sessions_only_on_client_hello() {
     let dispatch = DTLS_SOURCE
-        .split("} else if dtls_datagram_opens_session(&data) {")
+        .split("} else if dtls_datagram_opens_session(data) {")
         .nth(1)
         .expect("ClientHello demux spawn arm")
         .split("fn spawn_session(")
         .next()
         .expect("spawn_session follows demux");
     assert!(
-        dispatch.contains("self.spawn_session(peer_addr, data, reply_local, forwarded_client);"),
+        dispatch.contains(
+            "self.spawn_session(peer_addr, data.to_vec(), reply_local, forwarded_client);"
+        ),
         "a ClientHello from an unknown peer must still spawn a session"
     );
     assert!(
@@ -954,7 +957,7 @@ fn dtls_demux_opens_sessions_only_on_client_hello() {
         .split("Err(mpsc::error::TrySendError::Closed(data)) => {")
         .nth(1)
         .expect("Closed-arm re-dispatch")
-        .split("} else if dtls_datagram_opens_session(&data) {")
+        .split("} else if dtls_datagram_opens_session(data) {")
         .next()
         .expect("Closed arm ends before unknown-peer spawn");
     assert!(
@@ -1004,7 +1007,7 @@ async fn unauthenticated_delivery_does_not_poll_a_retirement_future() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // isolated_registry() must span awaits to serialize process-global registry state
 async fn already_retired_session_wins_an_exact_ready_tie_without_delivering() {
-    let _registry = crate::unit::tls::isolated_registry();
+    let _registry = crate::unit::client_trust_registry_lock::isolated_registry();
     let guard = registered_frontend_dtls_session();
     let session = guard.session().clone();
     session.cancellation_token().cancel();
@@ -1031,7 +1034,7 @@ async fn already_retired_session_wins_an_exact_ready_tie_without_delivering() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // isolated_registry() must span awaits to serialize process-global registry state
 async fn a_full_channel_delivery_is_released_by_trust_withdrawal_without_delivering() {
-    let _registry = crate::unit::tls::isolated_registry();
+    let _registry = crate::unit::client_trust_registry_lock::isolated_registry();
     let guard = registered_frontend_dtls_session();
     let session = guard.session().clone();
     let session_for_task = session.clone();
@@ -1060,5 +1063,79 @@ async fn a_full_channel_delivery_is_released_by_trust_withdrawal_without_deliver
     assert!(
         rx.try_recv().is_err(),
         "trust withdrawal must drop the in-flight send rather than deliver plaintext"
+    );
+}
+
+#[tokio::test]
+async fn completion_sender_cancellation_rejects_before_and_during_send() {
+    // Pre-cancelled completion sender never polls `send`.
+    let (mut completion_tx, completion_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    drop(completion_rx);
+    let polled = Arc::new(AtomicBool::new(false));
+    let polled_flag = Arc::clone(&polled);
+    let res = frontend_app_ciphertext_send_with_completion_cancel_for_test(
+        None,
+        Some(&mut completion_tx),
+        async move {
+            polled_flag.store(true, Ordering::SeqCst);
+            Ok::<usize, std::io::Error>(1)
+        },
+    )
+    .await;
+    assert_eq!(res.unwrap_err(), FrontendAppSendRejectForTest::Cancelled);
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "already-dropped completion receiver must never poll send"
+    );
+
+    // Dropping completion receiver mid-send deterministically cancels the
+    // parked send future and drops it without completing.
+    struct SignallingPendingSend {
+        polled_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl std::future::Future for SignallingPendingSend {
+        type Output = Result<usize, std::io::Error>;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            if let Some(tx) = self.polled_tx.take() {
+                let _ = tx.send(());
+            }
+            std::task::Poll::Pending
+        }
+    }
+    impl Drop for SignallingPendingSend {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let (mut completion_tx, completion_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let (polled_tx, polled_rx) = tokio::sync::oneshot::channel::<()>();
+    let send_dropped = Arc::new(AtomicBool::new(false));
+    let send_dropped_flag = Arc::clone(&send_dropped);
+    let handle = tokio::spawn(async move {
+        frontend_app_ciphertext_send_with_completion_cancel_for_test(
+            Some(future_deadline(Duration::from_secs(30))),
+            Some(&mut completion_tx),
+            SignallingPendingSend {
+                polled_tx: Some(polled_tx),
+                dropped: send_dropped_flag,
+            },
+        )
+        .await
+    });
+    polled_rx.await.expect("send future entered Pending");
+    drop(completion_rx);
+    let outcome = handle.await.expect("join");
+    assert_eq!(
+        outcome.unwrap_err(),
+        FrontendAppSendRejectForTest::Cancelled
+    );
+    assert!(
+        send_dropped.load(Ordering::SeqCst),
+        "cancelling an in-flight send must drop the pending send future"
     );
 }

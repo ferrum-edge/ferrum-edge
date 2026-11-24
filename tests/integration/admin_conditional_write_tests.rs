@@ -59,7 +59,7 @@ fn token_with_role(secret: &str, role: &str) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).unwrap(),
     )
     .expect("token encodes")
 }
@@ -594,7 +594,7 @@ async fn every_full_replacement_family_refuses_a_stale_tag() {
         ),
         (
             "/plugins/config",
-            "/plugins/config/shared-plugin",
+            "/plugins/config/shared-plugin?expected_proxy_ids=",
             json!({"id": "shared-plugin", "plugin_name": "cors", "scope": "global", "enabled": false, "config": {"allowed_origins": ["https://a.example"]}}),
             json!({"id": "shared-plugin", "plugin_name": "cors", "scope": "global", "enabled": true, "config": {"allowed_origins": ["https://a.example"]}}),
             json!({"id": "shared-plugin", "plugin_name": "cors", "scope": "global", "enabled": false, "config": {"allowed_origins": ["https://b.example"]}}),
@@ -736,6 +736,444 @@ async fn if_match_on_a_route_that_does_not_evaluate_it_is_refused() {
     )
     .await;
     assert_eq!(batch.status, 400, "{}", batch.body);
+}
+
+fn if_match_spec_document(id: &str) -> Value {
+    json!({
+        "openapi": "3.0.3", "info": {"title": id, "version": "1"},
+        "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
+        "x-ferrum-proxy": {"id": id, "listen_path": format!("/{id}"),
+            "backend_host": "backend.example.com", "backend_port": 8080}
+    })
+}
+
+/// `POST /api-specs` and the cascading `DELETE /api-specs/{id}` dispatch before
+/// the shared `If-Match` refusal, so they refuse the header themselves instead
+/// of creating or deleting unconditionally, including when the header is the
+/// strong `ETag` from `GET /api-specs/{id}` (issue #7439). The role gate still
+/// answers first for a non-admin caller.
+#[tokio::test]
+async fn api_spec_create_and_delete_refuse_if_match_without_writing() {
+    let (_dir, base, _shutdown) = serve().await;
+    let imported = send(
+        Method::POST,
+        &base,
+        "/api-specs",
+        &admin_token(),
+        None,
+        Some(&if_match_spec_document("spec-held")),
+    )
+    .await;
+    assert_eq!(imported.status, 201, "{}", imported.body);
+    let spec_id = imported.body["id"].as_str().unwrap().to_string();
+    let spec_path = format!("/api-specs/{spec_id}");
+    let read = get(&base, &spec_path).await;
+    assert_eq!(read.status, 200, "{}", read.body);
+    let spec_etag = read.etag.expect("GET /api-specs/{id} returns an ETag");
+
+    let operator = token_with_role(JWT_SECRET, "operator");
+    for header in [spec_etag.as_str(), "*", r#""row-token""#, "unquoted"] {
+        let created = send(
+            Method::POST,
+            &base,
+            "/api-specs",
+            &admin_token(),
+            Some(header),
+            Some(&if_match_spec_document("spec-refused")),
+        )
+        .await;
+        assert_eq!(
+            created.status, 400,
+            "POST If-Match {header}: {}",
+            created.body
+        );
+        assert!(
+            created.body["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("If-Match is only supported")),
+            "POST If-Match {header}: {}",
+            created.body
+        );
+
+        let deleted = send(
+            Method::DELETE,
+            &base,
+            &spec_path,
+            &admin_token(),
+            Some(header),
+            None,
+        )
+        .await;
+        assert_eq!(
+            deleted.status, 400,
+            "DELETE If-Match {header}: {}",
+            deleted.body
+        );
+        assert!(
+            deleted.body["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("If-Match is only supported")),
+            "DELETE If-Match {header}: {}",
+            deleted.body
+        );
+
+        for (method, path, body) in [
+            (
+                Method::POST,
+                "/api-specs",
+                Some(if_match_spec_document("spec-operator")),
+            ),
+            (Method::DELETE, spec_path.as_str(), None),
+        ] {
+            let forbidden = send(
+                method.clone(),
+                &base,
+                path,
+                &operator,
+                Some(header),
+                body.as_ref(),
+            )
+            .await;
+            assert_eq!(
+                forbidden.status, 403,
+                "{method} {path} as operator with If-Match {header}: {}",
+                forbidden.body
+            );
+        }
+    }
+
+    // Nothing was created or deleted.
+    let listed = get(&base, "/api-specs").await;
+    assert_eq!(listed.status, 200, "{}", listed.body);
+    let items = listed.body["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1, "{}", listed.body);
+    assert_eq!(items[0]["id"], spec_id.as_str());
+    assert_eq!(get(&base, &spec_path).await.status, 200);
+    assert_eq!(get(&base, "/proxies/spec-held").await.status, 200);
+    for refused in ["spec-refused", "spec-operator"] {
+        assert_eq!(get(&base, &format!("/proxies/{refused}")).await.status, 404);
+    }
+
+    // Without the header the delete is still the documented unconditional
+    // cascade.
+    let deleted = send(
+        Method::DELETE,
+        &base,
+        &spec_path,
+        &admin_token(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(deleted.status, 204, "{}", deleted.body);
+    assert_eq!(get(&base, &spec_path).await.status, 404);
+    assert_eq!(get(&base, "/proxies/spec-held").await.status, 404);
+}
+
+// Fixture credential values for the credential sub-route tests (issue #7393).
+const ENTRY_A: &str = "fixture-entry-a-0123456789abcdef";
+const ENTRY_B: &str = "fixture-entry-b-0123456789abcdef";
+const ENTRY_C: &str = "fixture-entry-c-0123456789abcdef";
+const ENTRY_D: &str = "fixture-entry-d-0123456789abcdef";
+const ROTATING_PATH: &str = "/consumers/rotating";
+
+/// The stored `keyauth` entries, in order, read straight from the store:
+/// every admin response redacts them.
+async fn stored_entries(db: &dyn DatabaseBackend) -> Vec<String> {
+    db.get_consumer("ferrum", "rotating")
+        .await
+        .expect("read consumer")
+        .expect("consumer exists")
+        .credential_entries("keyauth")
+        .iter()
+        .map(|entry| entry["key"].as_str().expect("string entry").to_string())
+        .collect()
+}
+
+async fn seed_rotating_consumer(base: &str, entries: &[&str]) {
+    let keyauth: Vec<Value> = entries.iter().map(|entry| json!({"key": entry})).collect();
+    create(
+        base,
+        "/consumers",
+        json!({"id": "rotating", "username": "rotating", "credentials": {"keyauth": keyauth}}),
+    )
+    .await;
+}
+
+/// The race from issue #7393. The operator reads `[A, B]` and selects index 0
+/// to revoke A. Before the delete lands, automation removes A and appends C,
+/// so index 0 is now B. The operator's delete carries the tag of the read it
+/// selected from and is refused; without it Edge would revoke B and report
+/// success. A fresh read then removes exactly the selected entry.
+#[tokio::test]
+async fn indexed_credential_delete_with_a_stale_tag_removes_nothing() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    seed_rotating_consumer(&base, &[ENTRY_A, ENTRY_B]).await;
+
+    let operator_read = get(&base, ROTATING_PATH).await;
+    let stale = operator_read.etag.expect("consumer GET issues an ETag");
+
+    // Concurrent automation, unconditioned: remove A, append C.
+    let removed = send(
+        Method::DELETE,
+        &base,
+        "/consumers/rotating/credentials/keyauth/0",
+        &admin_token(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(removed.status, 200, "automation delete: {}", removed.body);
+    let appended = send(
+        Method::POST,
+        &base,
+        "/consumers/rotating/credentials/keyauth",
+        &admin_token(),
+        None,
+        Some(&json!({"key": ENTRY_C})),
+    )
+    .await;
+    assert_eq!(appended.status, 200, "automation append: {}", appended.body);
+    assert!(
+        stored_entries(db.as_ref()).await == [ENTRY_B, ENTRY_C],
+        "automation left B at index 0"
+    );
+
+    let refused = send(
+        Method::DELETE,
+        &base,
+        "/consumers/rotating/credentials/keyauth/0",
+        &admin_token(),
+        Some(&stale),
+        None,
+    )
+    .await;
+    assert_eq!(
+        refused.status, 412,
+        "stale indexed delete: {}",
+        refused.body
+    );
+    let message = refused.body["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("rotating") && message.contains("re-read"),
+        "the refusal names the consumer and the recovery: {message}"
+    );
+    assert!(
+        stored_entries(db.as_ref()).await == [ENTRY_B, ENTRY_C],
+        "a refused indexed delete must not remove any entry"
+    );
+
+    // Re-read and select again: index 1 is C now, and only C goes.
+    let fresh = get(&base, ROTATING_PATH)
+        .await
+        .etag
+        .expect("consumer GET issues an ETag");
+    assert_ne!(fresh, stale, "the credential writes advanced the tag");
+    let deleted = send(
+        Method::DELETE,
+        &base,
+        "/consumers/rotating/credentials/keyauth/1",
+        &admin_token(),
+        Some(&fresh),
+        None,
+    )
+    .await;
+    assert_eq!(
+        deleted.status, 200,
+        "current indexed delete: {}",
+        deleted.body
+    );
+    assert!(
+        stored_entries(db.as_ref()).await == [ENTRY_B],
+        "the conditioned delete removes exactly the selected entry"
+    );
+}
+
+/// The comparison and the removal run under the namespace admission lease, so
+/// two indexed deletes holding one tag cannot both commit (each would
+/// otherwise remove a different entry from the same read).
+///
+/// Competing credential writes can also be refused before admission with the
+/// documented namespace-fence `503` (`Retry-After: 1`, "Namespace mutation is
+/// temporarily unavailable; retry later"): the mTLS DNS admission guard is
+/// claimed fail-fast and a writer that reaches it while the previous one is
+/// still releasing it is told to retry. That answer writes nothing, so each
+/// writer retries it, as a client would, and the test still requires exactly
+/// one commit across every final answer. Any other `503` fails the test.
+#[tokio::test]
+async fn concurrent_indexed_deletes_holding_one_tag_commit_exactly_once() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    seed_rotating_consumer(&base, &[ENTRY_A, ENTRY_B]).await;
+    let tag = get(&base, ROTATING_PATH)
+        .await
+        .etag
+        .expect("consumer GET issues an ETag");
+
+    // Spawn every writer before awaiting any, and release them together, so
+    // the deletes really compete for the comparison (review sol F2).
+    let start = Arc::new(tokio::sync::Barrier::new(4));
+    let writers: Vec<_> = (0..4)
+        .map(|_| {
+            let base = base.clone();
+            let tag = tag.clone();
+            let start = start.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    let reply = send(
+                        Method::DELETE,
+                        &base,
+                        "/consumers/rotating/credentials/keyauth/0",
+                        &admin_token(),
+                        Some(&tag),
+                        None,
+                    )
+                    .await;
+                    let fence_contention = reply.status == 503
+                        && reply.body["error"]
+                            == crate::common::scheduled_scaling::NAMESPACE_FENCE_RETRY_MESSAGE;
+                    if !fence_contention || tokio::time::Instant::now() >= deadline {
+                        return (reply.status, reply.body);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+        })
+        .collect();
+    let mut accepted = 0;
+    for writer in writers {
+        match writer.await.expect("writer task") {
+            (200, _) => accepted += 1,
+            (412, _) => {}
+            (other, body) => panic!("unexpected status {other}: {body}"),
+        }
+    }
+    assert_eq!(accepted, 1, "exactly one conditioned delete commits");
+    assert!(
+        stored_entries(db.as_ref()).await == [ENTRY_B],
+        "only the entry selected from the tagged read was removed"
+    );
+}
+
+/// `PUT`, `POST` and per-type `DELETE` on the credential sub-route take the
+/// same Consumer tag: stale is `412` with nothing written, current succeeds,
+/// and a malformed header is `400` rather than treated as absent.
+#[tokio::test]
+async fn credential_sub_routes_evaluate_the_consumer_tag() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    seed_rotating_consumer(&base, &[ENTRY_A]).await;
+    let stale = get(&base, ROTATING_PATH)
+        .await
+        .etag
+        .expect("consumer GET issues an ETag");
+    // Any change to the Consumer advances the tag, not only credential writes.
+    // The redaction placeholder keeps the stored entry across the whole PUT.
+    let edited = send(
+        Method::PUT,
+        &base,
+        ROTATING_PATH,
+        &admin_token(),
+        None,
+        Some(&json!({
+            "id": "rotating",
+            "username": "rotating",
+            "custom_id": "changed",
+            "credentials": {"keyauth": [{"key": "[REDACTED]"}]},
+        })),
+    )
+    .await;
+    assert_eq!(edited.status, 200, "{}", edited.body);
+    assert!(
+        stored_entries(db.as_ref()).await == [ENTRY_A],
+        "the metadata edit kept the stored entry"
+    );
+
+    let path = "/consumers/rotating/credentials/keyauth";
+    let cases = [
+        (Method::PUT, Some(json!([{"key": ENTRY_D}]))),
+        (Method::POST, Some(json!({"key": ENTRY_D}))),
+        (Method::DELETE, None),
+    ];
+    for (method, body) in &cases {
+        let refused = send(
+            method.clone(),
+            &base,
+            path,
+            &admin_token(),
+            Some(&stale),
+            body.as_ref(),
+        )
+        .await;
+        assert_eq!(refused.status, 412, "{method} stale: {}", refused.body);
+        let malformed = send(
+            method.clone(),
+            &base,
+            path,
+            &admin_token(),
+            Some("unquoted"),
+            body.as_ref(),
+        )
+        .await;
+        assert_eq!(
+            malformed.status, 400,
+            "{method} malformed: {}",
+            malformed.body
+        );
+        assert!(
+            stored_entries(db.as_ref()).await == [ENTRY_A],
+            "a refused {method} must not change the credentials"
+        );
+    }
+
+    let current = get(&base, ROTATING_PATH).await.etag.expect("tag");
+    let appended = send(
+        Method::POST,
+        &base,
+        path,
+        &admin_token(),
+        Some(&current),
+        Some(&json!({"key": ENTRY_B})),
+    )
+    .await;
+    assert_eq!(appended.status, 200, "current append: {}", appended.body);
+    let current = get(&base, ROTATING_PATH).await.etag.expect("tag");
+    let replaced = send(
+        Method::PUT,
+        &base,
+        path,
+        &admin_token(),
+        Some(&current),
+        Some(&json!([{"key": ENTRY_C}])),
+    )
+    .await;
+    assert_eq!(replaced.status, 200, "current replace: {}", replaced.body);
+    assert!(
+        stored_entries(db.as_ref()).await == [ENTRY_C],
+        "the conditioned replace stored its body"
+    );
+    let removed = send(Method::DELETE, &base, path, &admin_token(), Some("*"), None).await;
+    assert_eq!(removed.status, 204, "star delete: {}", removed.body);
+    assert!(stored_entries(db.as_ref()).await.is_empty());
+
+    // The role gate still answers before the header is parsed.
+    let operator = token_with_role(JWT_SECRET, "operator");
+    let gated = send(
+        Method::DELETE,
+        &base,
+        "/consumers/rotating/credentials/keyauth/0",
+        &operator,
+        Some("unquoted"),
+        None,
+    )
+    .await;
+    assert_eq!(gated.status, 403, "{}", gated.body);
 }
 
 #[tokio::test]
@@ -2809,7 +3247,93 @@ async fn mongo_replica_set_conditional_restore_checks_state_and_lease_in_transac
     })
     .await;
     assert_http_restore_spans_keeper_renewal(db.clone()).await;
+    assert_orphan_upstream_cleanup_is_namespace_scoped(db.as_ref()).await;
     assert_mongo_legacy_consumer_tags(db, &raw).await;
+}
+
+/// Issue #7193: upstream ids are unique only per namespace, so the
+/// "is this upstream still referenced" check in both orphan-cleanup paths
+/// must count proxies in the deleting namespace only. A proxy in another
+/// namespace that references the same bare upstream id must not keep the
+/// deleting namespace's orphan alive (the replica-set transaction paths used
+/// to count across namespaces).
+async fn assert_orphan_upstream_cleanup_is_namespace_scoped(db: &dyn DatabaseBackend) {
+    use ferrum_edge::config::types::{Proxy, Upstream};
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let deleting = format!("orphan-a-{suffix}");
+    let other = format!("orphan-b-{suffix}");
+    for namespace in [&deleting, &other] {
+        for upstream_id in ["shared-delete", "shared-cleanup"] {
+            let upstream: Upstream = serde_json::from_value(json!({
+                "id": upstream_id,
+                "namespace": namespace,
+                "targets": [{"host": "backend.example.com", "port": 8080}]
+            }))
+            .unwrap();
+            db.create_upstream(&upstream).await.unwrap();
+            let proxy: Proxy = serde_json::from_value(json!({
+                "id": format!("proxy-{upstream_id}"),
+                "namespace": namespace,
+                "listen_path": format!("/{upstream_id}"),
+                "backend_host": "backend.example.com",
+                "backend_port": 8080,
+                "upstream_id": upstream_id
+            }))
+            .unwrap();
+            db.create_proxy(&proxy).await.unwrap();
+        }
+    }
+
+    // Proxy delete with orphan cleanup.
+    assert!(
+        db.delete_proxy(&deleting, "proxy-shared-delete")
+            .await
+            .unwrap()
+    );
+    assert!(
+        db.get_upstream(&deleting, "shared-delete")
+            .await
+            .unwrap()
+            .is_none(),
+        "the deleting namespace's orphaned upstream must be cascade-deleted"
+    );
+    assert!(
+        db.get_upstream(&other, "shared-delete")
+            .await
+            .unwrap()
+            .is_some(),
+        "the other namespace's referenced upstream must survive"
+    );
+
+    // Explicit orphan cleanup after a delete that skipped it.
+    assert!(
+        db.delete_proxy_with_orphan_cleanup(&deleting, "proxy-shared-cleanup", false)
+            .await
+            .unwrap()
+    );
+    assert!(
+        db.get_upstream(&deleting, "shared-cleanup")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    db.cleanup_orphaned_upstream(&deleting, "shared-cleanup")
+        .await
+        .unwrap();
+    assert!(
+        db.get_upstream(&deleting, "shared-cleanup")
+            .await
+            .unwrap()
+            .is_none(),
+        "cleanup_orphaned_upstream must ignore other namespaces' references"
+    );
+    assert!(
+        db.get_upstream(&other, "shared-cleanup")
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -3191,7 +3715,10 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
                     .await
                     .body;
                 plugin["config"] = json!({"allowed_origins": ["https://operator.example"]});
-                ("/plugins/config/generated".to_string(), Some(plugin))
+                (
+                    "/plugins/config/generated?expected_proxy_ids=".to_string(),
+                    Some(plugin),
+                )
             }
             "spec" => {
                 document["info"]["description"] = json!("operator changed spec");
@@ -4102,7 +4629,7 @@ async fn assert_deployment_cancellation_and_live_ack(db: Arc<dyn DatabaseBackend
         });
         if live {
             tokio::time::timeout(Duration::from_secs(10), async {
-                while apply.waiter_count() == 0 {
+                while apply.wake_signal().signals_total() == 0 {
                     tokio::task::yield_now().await;
                 }
             })
@@ -4935,7 +5462,7 @@ async fn assert_mongo_deployment_raw_preservation(
         }
     });
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while apply.waiter_count() == 0 {
+        while apply.wake_signal().signals_total() == 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -5055,9 +5582,9 @@ async fn assert_sql_deployment_raw_preservation(
     let namespace = format!("deployment-sql-{}", uuid::Uuid::new_v4());
     let pool = db.pool();
     for table in ["proxies", "plugin_configs", "proxy_plugins"] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE {table} ADD COLUMN deployment_future_metadata TEXT"
-        ))
+        )))
         .execute(&pool)
         .await
         .unwrap();
@@ -5082,26 +5609,28 @@ async fn assert_sql_deployment_raw_preservation(
             ("deployment_future_null_text", "TEXT"),
             ("deployment_future_null_bytes", blob_type),
         ] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "ALTER TABLE {table} ADD COLUMN {column} {sql_type}"
-            ))
+            )))
             .execute(&pool)
             .await
             .unwrap();
         }
         if dialect == "postgres" {
             for column in ["deployment_future_flag", "deployment_future_null_flag"] {
-                sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} BOOLEAN"))
-                    .execute(&pool)
-                    .await
-                    .unwrap();
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} BOOLEAN"
+                )))
+                .execute(&pool)
+                .await
+                .unwrap();
             }
         } else if dialect == "sqlite" {
             // SQLite can store text in an integer-affinity column. Decoding by
             // column type instead of runtime value type would fail this fixture.
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "ALTER TABLE {table} ADD COLUMN deployment_future_dynamic BIGINT"
-            ))
+            )))
             .execute(&pool)
             .await
             .unwrap();
@@ -5142,10 +5671,10 @@ async fn assert_sql_deployment_raw_preservation(
     let spec_id = imported.body["id"].as_str().unwrap();
     let placeholder = if dialect == "postgres" { "$1" } else { "?" };
     for table in ["proxies", "plugin_configs", "proxy_plugins"] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {table} SET deployment_future_metadata = ' opaque-original ' \
              WHERE namespace = {placeholder}"
-        ))
+        )))
         .bind(&namespace)
         .execute(&pool)
         .await
@@ -5157,42 +5686,42 @@ async fn assert_sql_deployment_raw_preservation(
         }
         let second = if dialect == "postgres" { "$2" } else { "?" };
         for table in ["proxies", "plugin_configs", "proxy_plugins"] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {table} SET deployment_future_metadata = ' opaque-original ', \
                  deployment_future_count = 9007199254740993, deployment_future_small = -123, \
                  deployment_future_integer = 123456, deployment_future_real = 1.25, \
                  deployment_future_double = -0.125, deployment_future_bytes = {placeholder} \
                  WHERE namespace = {second}"
-            ))
+            )))
             .bind(vec![0u8, 255, 1, 128])
             .bind(&namespace)
             .execute(&pool)
             .await
             .unwrap();
             if dialect == "postgres" {
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE {table} SET deployment_future_flag = TRUE \
                      WHERE namespace = {placeholder}"
-                ))
+                )))
                 .bind(&namespace)
                 .execute(&pool)
                 .await
                 .unwrap();
             } else if dialect == "sqlite" {
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE {table} SET deployment_future_dynamic = '007opaque' \
                      WHERE namespace = {placeholder}"
-                ))
+                )))
                 .bind(&namespace)
                 .execute(&pool)
                 .await
                 .unwrap();
             }
         }
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE proxies SET hosts = ' [ ] ', created_at = '2000-01-01T00:00:00Z', \
              updated_at = '2001-01-01T00:00:00Z' WHERE namespace = {placeholder}"
-        ))
+        )))
         .bind(&namespace)
         .execute(&pool)
         .await
@@ -5263,10 +5792,10 @@ async fn assert_sql_deployment_raw_preservation(
     }
     let original = get_ns(&base, "/deployment-snapshot", &namespace).await;
     assert_eq!(original.status, 200, "{}", original.body);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE proxy_plugins SET deployment_future_metadata = 'operator' \
          WHERE namespace = {placeholder}"
-    ))
+    )))
     .bind(&namespace)
     .execute(&pool)
     .await
@@ -5328,10 +5857,10 @@ async fn assert_sql_deployment_raw_preservation(
             &["hand-added", "sql-generated"][..],
         ),
     ] {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {identity_columns}, deployment_future_metadata FROM {table} \
              WHERE namespace = {placeholder}"
-        ))
+        )))
         .bind(&namespace)
         .fetch_all(&pool)
         .await
@@ -5365,4 +5894,309 @@ async fn assert_sql_deployment_raw_preservation(
         let expected_ids: Vec<String> = expected_ids.iter().map(|id| (*id).to_string()).collect();
         assert_eq!(identities, expected_ids, "{table} row identities");
     }
+}
+
+/// forge-ops #569: plugin-config `PUT`/`DELETE` require `expected_proxy_ids`
+/// and refuse, atomically with the write, to detach a referencing proxy the
+/// caller did not account for.
+fn assoc_proxy(id: &str, plugin_ids: &[&str]) -> Value {
+    json!({
+        "id": id,
+        "listen_path": format!("/{id}"),
+        "backend_scheme": "http",
+        "backend_host": "10.0.0.1",
+        "backend_port": 8080,
+        "plugins": plugin_ids
+            .iter()
+            .map(|plugin_id| json!({"plugin_config_id": plugin_id}))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn group_plugin(id: &str, scope: &str, origin: &str) -> Value {
+    json!({
+        "id": id,
+        "plugin_name": "cors",
+        "scope": scope,
+        "enabled": true,
+        "config": {"allowed_origins": [origin]},
+    })
+}
+
+fn referencing(body: &Value, plugin_id: &str) -> bool {
+    body["plugins"]
+        .as_array()
+        .map(|plugins| {
+            plugins
+                .iter()
+                .any(|entry| entry["plugin_config_id"] == plugin_id)
+        })
+        .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn plugin_delete_requires_and_enforces_expected_proxy_ids() {
+    let (_dir, base, _shutdown) = serve().await;
+    create(
+        &base,
+        "/plugins/config",
+        group_plugin("pc-del", "proxy_group", "https://a.example"),
+    )
+    .await;
+    create(&base, "/proxies", assoc_proxy("pa", &["pc-del"])).await;
+    create(&base, "/proxies", assoc_proxy("pb", &["pc-del"])).await;
+
+    // Absent parameter: 400, nothing deleted.
+    let reply = send(
+        Method::DELETE,
+        &base,
+        "/plugins/config/pc-del",
+        &admin_token(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, 400, "absent: {}", reply.body);
+    assert_eq!(get(&base, "/plugins/config/pc-del").await.status, 200);
+
+    // Malformed values: duplicate, empty entry, invalid id, repeated key.
+    for query in [
+        "expected_proxy_ids=pa,pa",
+        "expected_proxy_ids=pa,,pb",
+        "expected_proxy_ids=bad!id",
+        "expected_proxy_ids=pa&expected_proxy_ids=pb",
+    ] {
+        let reply = send(
+            Method::DELETE,
+            &base,
+            &format!("/plugins/config/pc-del?{query}"),
+            &admin_token(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(reply.status, 400, "{query}: {}", reply.body);
+    }
+
+    // A referencing proxy outside the expected set: 412 naming it, state intact.
+    let reply = send(
+        Method::DELETE,
+        &base,
+        "/plugins/config/pc-del?expected_proxy_ids=pa",
+        &admin_token(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, 412, "incomplete: {}", reply.body);
+    assert!(
+        reply.body["error"].as_str().expect("error").contains("pb"),
+        "names pb: {}",
+        reply.body
+    );
+    assert_eq!(get(&base, "/plugins/config/pc-del").await.status, 200);
+    assert!(referencing(&get(&base, "/proxies/pb").await.body, "pc-del"));
+
+    // The complete set: delete lands and the associations are gone.
+    let reply = send(
+        Method::DELETE,
+        &base,
+        "/plugins/config/pc-del?expected_proxy_ids=pa,pb",
+        &admin_token(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, 204, "complete: {}", reply.body);
+    assert_eq!(get(&base, "/plugins/config/pc-del").await.status, 404);
+    assert!(!referencing(
+        &get(&base, "/proxies/pa").await.body,
+        "pc-del"
+    ));
+
+    // An explicitly empty expectation deletes an unreferenced config.
+    create(
+        &base,
+        "/plugins/config",
+        group_plugin("pc-lonely", "global", "https://a.example"),
+    )
+    .await;
+    let reply = send(
+        Method::DELETE,
+        &base,
+        "/plugins/config/pc-lonely?expected_proxy_ids=",
+        &admin_token(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, 204, "empty: {}", reply.body);
+}
+
+#[tokio::test]
+async fn plugin_retarget_put_enforces_expected_proxy_ids() {
+    let (_dir, base, _shutdown) = serve().await;
+    create(
+        &base,
+        "/plugins/config",
+        group_plugin("pc-move", "proxy_group", "https://a.example"),
+    )
+    .await;
+    create(&base, "/proxies", assoc_proxy("pa", &["pc-move"])).await;
+    create(&base, "/proxies", assoc_proxy("pb", &["pc-move"])).await;
+
+    let global = group_plugin("pc-move", "global", "https://a.example");
+    // Absent parameter: 400 even though the body is valid.
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-move",
+        &admin_token(),
+        None,
+        Some(&global),
+    )
+    .await;
+    assert_eq!(reply.status, 400, "absent: {}", reply.body);
+
+    // Retarget to global with an incomplete set: 412, scope unchanged.
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-move?expected_proxy_ids=pa",
+        &admin_token(),
+        None,
+        Some(&global),
+    )
+    .await;
+    assert_eq!(reply.status, 412, "incomplete: {}", reply.body);
+    assert_eq!(
+        get(&base, "/plugins/config/pc-move").await.body["scope"],
+        "proxy_group"
+    );
+
+    // Complete set: retarget lands, both proxies detached.
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-move?expected_proxy_ids=pa,pb",
+        &admin_token(),
+        None,
+        Some(&global),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "complete: {}", reply.body);
+    assert!(!referencing(
+        &get(&base, "/proxies/pb").await.body,
+        "pc-move"
+    ));
+
+    // Re-home a proxy_group config onto pb: pa references it, pb is kept.
+    create(
+        &base,
+        "/plugins/config",
+        group_plugin("pc-home", "proxy_group", "https://a.example"),
+    )
+    .await;
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/proxies/pa",
+        &admin_token(),
+        None,
+        Some(&assoc_proxy("pa", &["pc-home"])),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "attach pa: {}", reply.body);
+    let mut homed = group_plugin("pc-home", "proxy", "https://a.example");
+    homed["proxy_id"] = json!("pb");
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-home?expected_proxy_ids=",
+        &admin_token(),
+        None,
+        Some(&homed),
+    )
+    .await;
+    assert_eq!(reply.status, 412, "pa unexpected: {}", reply.body);
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-home?expected_proxy_ids=pa",
+        &admin_token(),
+        None,
+        Some(&homed),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "re-home: {}", reply.body);
+    assert!(!referencing(
+        &get(&base, "/proxies/pa").await.body,
+        "pc-home"
+    ));
+    assert!(referencing(
+        &get(&base, "/proxies/pb").await.body,
+        "pc-home"
+    ));
+
+    // The kept target need not be listed: a same-target update with an
+    // empty expectation succeeds while pb references the config.
+    let mut tweaked = group_plugin("pc-home", "proxy", "https://b.example");
+    tweaked["proxy_id"] = json!("pb");
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-home?expected_proxy_ids=",
+        &admin_token(),
+        None,
+        Some(&tweaked),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "kept target: {}", reply.body);
+
+    // The precondition is unconditional: a non-detaching proxy_group update
+    // is still refused when a referencing proxy is not expected.
+    create(
+        &base,
+        "/plugins/config",
+        group_plugin("pc-group", "proxy_group", "https://a.example"),
+    )
+    .await;
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/proxies/pa",
+        &admin_token(),
+        None,
+        Some(&assoc_proxy("pa", &["pc-group"])),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "attach group: {}", reply.body);
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-group?expected_proxy_ids=",
+        &admin_token(),
+        None,
+        Some(&group_plugin(
+            "pc-group",
+            "proxy_group",
+            "https://b.example",
+        )),
+    )
+    .await;
+    assert_eq!(reply.status, 412, "group unconditional: {}", reply.body);
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-group?expected_proxy_ids=pa",
+        &admin_token(),
+        None,
+        Some(&group_plugin(
+            "pc-group",
+            "proxy_group",
+            "https://b.example",
+        )),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "group expected: {}", reply.body);
 }

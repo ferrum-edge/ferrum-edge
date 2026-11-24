@@ -68,11 +68,19 @@ fn seed_body(index: usize) -> String {
 }
 
 fn request_context() -> RequestContext {
-    RequestContext::new(
+    let mut context = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
-    )
+    );
+    // Stand in for the protocol entry path, which copies the static
+    // response-presentation digest from the plugin-cache view; without one the
+    // cache treats the response policy as unprovable and bypasses.
+    ferrum_edge::_test_support::set_response_presentation_policy_digest_for_test(
+        &mut context,
+        Some([0x5c; 32]),
+    );
+    context
 }
 
 /// Finalized backend-visible request headers, including the framed length the

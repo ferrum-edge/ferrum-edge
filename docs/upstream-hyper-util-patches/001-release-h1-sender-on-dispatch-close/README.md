@@ -18,8 +18,10 @@ Ferrum issue [#5714](https://github.com/ferrum-edge/ferrum-edge/issues/5714)
 
 ## The bug
 
-Ferrum sends every plain-`http` HTTP/1.1 backend request through reqwest, which
-uses hyper-util's legacy `Client`. For an HTTP/1 connection, the client hands
+Ferrum sends an HTTP/1.1 backend request through reqwest, which uses
+hyper-util's legacy `Client`, whenever the direct HTTP/1.1 pool does not take it
+(retry attempts, requests with pending body-plugin work, or
+`FERRUM_POOL_HTTP1_DIRECT=false`). For an HTTP/1 connection, the client hands
 the request to hyper's connection task over a tokio unbounded channel
 (`hyper::client::dispatch::Sender::try_send` → `UnboundedSender::send`). In
 tokio 1.52.3, `UnboundedSender::send` works in two steps:
@@ -59,8 +61,9 @@ and `try_recv` found nothing.
 
 The base is the crates.io `hyper-util` 0.1.21 source (package checksum
 `ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff`, upstream
-commit `23a868965964c1d6bb1b94f30ba4c420a4bebe7c`). Only
-`src/client/legacy/client.rs` differs; the unified diff is
+commit `23a868965964c1d6bb1b94f30ba4c420a4bebe7c`). This patch changes only
+`src/client/legacy/client.rs` ([patch 002](../002-forward-h2-response-write-timeout/README.md)
+adds a server-builder forward on top); the unified diff is
 [`hyper-util-release-h1-sender-on-dispatch-close.patch`](hyper-util-release-h1-sender-on-dispatch-close.patch).
 The crate's `.github/`, `Cargo.lock`, `Cargo.toml.orig`, `.gitignore` and
 `.cargo_vcs_info.json` are not vendored. `examples/` and `tests/` are kept
@@ -207,10 +210,10 @@ the response wait after its dispatcher closes, or when a hyper release stops
 stranding a racing send (for example, the dispatcher drains the channel until
 in-progress sends publish). Then:
 
-1. Remove the `hyper-util` line from `[patch.crates-io]` in `Cargo.toml` and
-   `tests/performance/mesh/Cargo.toml`.
-2. `git rm -r vendor/hyper-util-0.1.21-ferrum-patched/`, and restore the
-   registry `source`/`checksum` lines in `Cargo.lock` and
-   `tests/performance/mesh/Cargo.lock` with a normal lockfile update.
+1. Remove the `hyper-util` line from `[patch.crates-io]` in `Cargo.toml`,
+   `fuzz/Cargo.toml` and `tests/performance/mesh/Cargo.toml`.
+2. Restore the registry `source`/`checksum` lines in `Cargo.lock`,
+   `fuzz/Cargo.lock` and `tests/performance/mesh/Cargo.lock` with a normal
+   lockfile update, then `git rm -r vendor/hyper-util-0.1.21-ferrum-patched/`.
 3. Remove the inventory row and the lifecycle entry, drop the CI step, and
    regenerate `vendor/VENDOR_INTEGRITY.sha256`.

@@ -1,0 +1,40 @@
+# Optional, non-required PR check exercising the real Docker SQLite volume
+# smoke (`scripts/smoke_sqlite_volume.sh` and `scripts/smoke_sqlite_volume_verify.py`)
+# anonymously against the published image before release day.
+name: SQLite Volume Smoke
+
+on:
+  pull_request:
+    paths:
+      - scripts/smoke_sqlite_volume.sh
+      - scripts/smoke_sqlite_volume_verify.py
+      - Dockerfile.release
+      - .github/workflows/sqlite-volume-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same pull request cancels the superseded run. Manual
+# dispatches get a unique group so they always run to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  sqlite-volume-smoke:
+    name: SQLite volume smoke
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pull published image anonymously and run SQLite volume smoke
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/anon-docker-config"
+          mkdir -p "$DOCKER_CONFIG"
+          docker pull --quiet docker.io/ferrumedge/ferrum-edge:v0.9.21
+          bash scripts/smoke_sqlite_volume.sh docker.io/ferrumedge/ferrum-edge:v0.9.21

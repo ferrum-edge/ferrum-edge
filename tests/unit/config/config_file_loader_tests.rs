@@ -72,8 +72,8 @@ fn file_and_database_full_loads_keep_the_shared_rejecting_admission_gate() {
         (
             "file",
             include_str!("../../../src/config/file_loader.rs"),
-            "pub fn load_config_from_file(",
-            "/// Decode and validate a config document from in-memory bytes.",
+            "fn decode_and_validate_document(",
+            "/// Load and validate an owned file-mode candidate",
         ),
         (
             "SQL",
@@ -95,21 +95,212 @@ fn file_and_database_full_loads_keep_the_shared_rejecting_admission_gate() {
             "{name} full load must inherit the shared rejecting-validator set"
         );
         if name == "file" {
-            let rejecting = body
-                .find("collect_rejecting_runtime_config_errors(&config)")
-                .unwrap();
-            let local_files = body.find(".validate_plugin_file_dependencies(").unwrap();
+            // The gate closes the shared decode core, so both the file loader
+            // and the in-memory (fuzz) decode inherit it; the file loader
+            // commits the MMDB handoff only after the core accepted the graph.
             assert!(
-                rejecting < local_files,
+                !body.contains(".validate_plugin_file_dependencies("),
+                "node-local MMDB checks stay out of the shared core"
+            );
+            let loader = source
+                .split_once("pub fn load_config_from_file(")
+                .unwrap()
+                .1
+                .split_once("/// Decode and validate a config document from in-memory bytes.")
+                .unwrap()
+                .0;
+            let decoded = loader.find("decode_and_validate_document(").unwrap();
+            let local_files = loader.find(".validate_plugin_file_dependencies(").unwrap();
+            assert!(
+                decoded < local_files,
                 "a rejected graph must not publish an MMDB validation handoff"
             );
         }
     }
 }
 
+/// The production loader and the in-memory (fuzz) decode share ONE
+/// decode-and-validate core. The fuzz copy was once a hand-maintained replica
+/// and silently missed a later admission fix; this pins that neither entry
+/// point grows its own parse/version/validator chain again, and that the core
+/// keeps its load-bearing step order.
+#[test]
+fn file_and_in_memory_decode_share_one_decode_and_validate_core() {
+    let source = include_str!("../../../src/config/file_loader.rs");
+    let section = |start: &str, end: &str| -> &str {
+        let body = source.split_once(start).expect(start).1;
+        body.split_once(end).expect(end).0
+    };
+    let production = section(
+        "pub fn load_config_from_file(",
+        "/// Decode and validate a config document from in-memory bytes.",
+    );
+    let in_memory = section(
+        "pub fn decode_and_validate_config_document(",
+        "/// The decode-and-validate core shared by",
+    );
+    let core = section(
+        "fn decode_and_validate_document(",
+        "/// Load and validate an owned file-mode candidate",
+    );
+
+    for (name, wrapper, scope) in [
+        (
+            "file",
+            production,
+            "DocumentNamespaceScope::Filter(namespace)",
+        ),
+        ("in-memory", in_memory, "DocumentNamespaceScope::Unfiltered"),
+    ] {
+        assert!(
+            wrapper.contains("decode_and_validate_document(") && wrapper.contains(scope),
+            "{name} entry point must decode through the shared core with {scope}"
+        );
+        for owned_by_core in [
+            "take_resource_counts_from_json",
+            "migrate_in_memory",
+            "from_yaml_value",
+            "validate_all_fields_with_ip_policy",
+            "validate_operator_provided_fields",
+            "validate_unique_listen_paths",
+        ] {
+            assert!(
+                !wrapper.contains(owned_by_core),
+                "{name} entry point must not re-implement core step `{owned_by_core}`"
+            );
+        }
+    }
+
+    // Load-bearing order inside the core: the seal is checked against the
+    // pre-filter document, field-level validators run on every namespace, and
+    // the namespace filter runs before the cross-resource validators.
+    let mut last = 0;
+    for step in [
+        "take_resource_counts_from_json",
+        "migrate_in_memory",
+        "validate_resource_counts(",
+        "validate_all_fields_with_ip_policy",
+        "plaintext_basic_auth_consumers",
+        "validate_operator_provided_fields",
+        "DocumentNamespaceScope::Filter(namespace) = namespace_scope",
+        "config.known_namespaces = known",
+        "config.proxies.retain(",
+        "validate_unique_listen_paths",
+        "validate_stream_proxies",
+    ] {
+        let at = core
+            .find(step)
+            .unwrap_or_else(|| panic!("core step `{step}` missing"));
+        assert!(at >= last, "core step `{step}` moved out of order");
+        last = at;
+    }
+}
+
 // ============================================================================
 // Basic Loading Tests
 // ============================================================================
+
+/// Issue #7218: file mode is fatal on invalid local config, so the CORS-style
+/// `allowed_ws_origins: ["*"]` footgun and non-origin entries fail startup and
+/// SIGHUP reload (database/CP/DP loads keep #5454's warn-only grandfathering).
+#[test]
+fn file_mode_refuses_star_and_non_origin_allowed_ws_origins_at_load_and_reload() {
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+    let document = |namespace: &str, origins: serde_json::Value| {
+        serde_json::json!({
+            "version": "1",
+            "proxies": [{
+                "id": "ws-proxy",
+                "namespace": namespace,
+                "listen_path": "/ws",
+                "backend_scheme": "http",
+                "backend_host": "localhost",
+                "backend_port": 3000,
+                "allowed_ws_origins": origins
+            }],
+            "consumers": [],
+            "plugin_configs": []
+        })
+    };
+    let cases = [
+        ("star", "ferrum", serde_json::json!(["*"]), "is '*'"),
+        (
+            "star among literal origins",
+            "ferrum",
+            serde_json::json!(["https://app.example.com", " * "]),
+            "allowed_ws_origins[1] is '*'",
+        ),
+        (
+            "origin with a path",
+            "ferrum",
+            serde_json::json!(["https://app.example.com/path"]),
+            "scheme://host[:port]",
+        ),
+        (
+            "opaque null origin",
+            "ferrum",
+            serde_json::json!(["null"]),
+            "scheme://host[:port]",
+        ),
+        // Every namespace in the file is checked, like the other field-level
+        // validators, not only the namespace this gateway serves.
+        (
+            "star in another namespace",
+            "tenant-b",
+            serde_json::json!(["*"]),
+            "is '*'",
+        ),
+    ];
+    for (name, namespace, origins, expected) in cases {
+        for extension in [".json", ".yaml"] {
+            let doc = document(namespace, origins.clone());
+            let mut file = NamedTempFile::with_suffix(extension).unwrap();
+            let contents = if extension == ".json" {
+                serde_json::to_string(&doc).unwrap()
+            } else {
+                serde_yaml::to_string(&doc).unwrap()
+            };
+            write!(file, "{contents}").unwrap();
+            let path = file.path().to_str().unwrap();
+            for (operation, result) in [
+                ("load", load_config_from_file(path, 30, &policy, "ferrum")),
+                (
+                    "reload",
+                    reload_config_from_file(path, 30, &policy, "ferrum"),
+                ),
+            ] {
+                let error = format!("{:#}", result.expect_err(name));
+                assert!(
+                    error.contains("invalid `allowed_ws_origins` entry(ies)")
+                        && error.contains(expected)
+                        && error
+                            .contains(ferrum_edge::config::types::ALLOWED_WS_ORIGINS_STAR_GUIDANCE),
+                    "{name} {extension} {operation}: {error}"
+                );
+            }
+        }
+    }
+
+    // Literal origins (and the empty allow-all list) still load.
+    for origins in [
+        serde_json::json!(["https://app.example.com", "wss://ws.example.com:8443"]),
+        serde_json::json!([]),
+    ] {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            "{}",
+            serde_json::to_string(&document("ferrum", origins.clone())).unwrap()
+        )
+        .unwrap();
+        let config = load_config_from_file(file.path().to_str().unwrap(), 30, &policy, "ferrum")
+            .unwrap_or_else(|error| panic!("{origins}: {error:#}"));
+        assert_eq!(
+            serde_json::to_value(&config.proxies[0].allowed_ws_origins).unwrap(),
+            origins
+        );
+    }
+}
 
 #[test]
 fn test_load_yaml_without_consumers_key() {
@@ -161,6 +352,57 @@ fn documented_file_mode_configuration_loads_and_validates() {
     assert_eq!(config.proxies.len(), 1);
     assert_eq!(config.consumers.len(), 1);
     assert_eq!(config.plugin_configs.len(), 2);
+}
+
+#[test]
+fn documented_backend_mtls_mixed_configuration_loads_and_validates() {
+    // docs/backend_mtls.md "Example 2: Mixed Configuration" writes a complete
+    // file-mode config with a heredoc and starts the gateway on it unchanged.
+    let docs = include_str!("../../../docs/backend_mtls.md");
+    let section = docs
+        .split("### Example 2: Mixed Configuration")
+        .nth(1)
+        .expect("Example 2: Mixed Configuration section exists");
+    let yaml = section
+        .split("cat > config.yaml << EOF\n")
+        .nth(1)
+        .and_then(|tail| tail.split("\nEOF\n").next())
+        .expect("section writes config.yaml with a heredoc");
+    // Point the documented certificate paths at real test material so source
+    // validation runs against readable files. Each documented double-quoted
+    // scalar is replaced with a single-quoted one, which YAML reads without
+    // backslash escapes (Windows canonical paths contain backslashes).
+    let single_quoted = |path: &str| {
+        let path = std::fs::canonicalize(path).unwrap();
+        format!("'{}'", path.to_str().unwrap().replace('\'', "''"))
+    };
+    let yaml = yaml
+        .replace(
+            "\"/etc/ssl/certs/secure-client.pem\"",
+            &single_quoted("tests/certs/server.crt"),
+        )
+        .replace(
+            "\"/etc/ssl/private/secure-client-key.pem\"",
+            &single_quoted("tests/certs/server.key"),
+        );
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("the documented backend mTLS mixed configuration loads and validates");
+    assert_eq!(config.proxies.len(), 2);
+    let secure = config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == "secure-api")
+        .expect("secure-api proxy loads");
+    assert!(secure.backend_tls_client_cert_path.is_some());
+    assert!(secure.backend_tls_client_key_path.is_some());
 }
 
 #[test]
@@ -1000,7 +1242,7 @@ consumers:
     username: "user1"
     credentials:
       keyauth:
-        - key: "api-key-123"
+        - key: "api-key-123-0123456789"
       jwt:
         - secret: "jwt-secret-padding-12345678901234"
       basicauth:
@@ -1666,7 +1908,7 @@ proxies: []
 consumers: []
 plugin_configs:
   - id: "plugin-optional-bad-config"
-    plugin_name: "stdout_logging"
+    plugin_name: "transaction_debugger"
     config: "not-an-object"
     scope: global
     enabled: true
@@ -1683,11 +1925,44 @@ plugin_configs:
 
     assert_eq!(config.plugin_configs.len(), 1);
     assert_eq!(config.plugin_configs[0].id, "plugin-optional-bad-config");
-    assert_eq!(config.plugin_configs[0].plugin_name, "stdout_logging");
+    assert_eq!(config.plugin_configs[0].plugin_name, "transaction_debugger");
 }
 
+/// `stdout_logging` is the access log (an audit trail), registered
+/// `KeepLastKnownGood`: a typo'd config must fail file-mode load rather than
+/// start a gateway that silently logs nothing.
 #[test]
-fn test_ws_frame_logging_optional_fail_open_admission_in_file_mode() {
+fn test_invalid_stdout_logging_config_rejects_file_mode_load() {
+    let yaml = r#"
+version: "1"
+proxies: []
+consumers: []
+plugin_configs:
+  - id: "access-log-typo"
+    plugin_name: "stdout_logging"
+    config:
+      filtr:
+        errors_only: true
+    scope: global
+    enabled: true
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    let error = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("an unconstructible stdout_logging config must reject file-mode load");
+    let message = format!("{error:#}");
+    assert!(message.contains("1 plugin config error(s)"), "{message}");
+}
+
+/// Issue #7144: `ws_frame_logging` is a log sink and therefore
+/// `KeepLastKnownGood`: an invalid config fails file-mode load.
+#[test]
+fn test_invalid_ws_frame_logging_config_rejects_file_mode_load() {
     let yaml = r#"
 version: "1"
 proxies: []
@@ -1703,16 +1978,15 @@ plugin_configs:
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(
+    let error = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
-    .expect("ws_frame_logging OptionalFailOpen must not reject file-mode load");
-
-    assert_eq!(config.plugin_configs.len(), 1);
-    assert_eq!(config.plugin_configs[0].plugin_name, "ws_frame_logging");
+    .expect_err("an unconstructible ws_frame_logging config must reject file-mode load");
+    let message = format!("{error:#}");
+    assert!(message.contains("1 plugin config error(s)"), "{message}");
 }
 
 #[test]
@@ -2297,6 +2571,41 @@ plugin_configs: []
     // `known_namespaces` is captured before filtering so /namespaces can
     // report the full set.
     assert!(config.known_namespaces.iter().any(|n| n == "prod"));
+    assert!(config.known_namespaces.iter().any(|n| n == "staging"));
+}
+
+/// File mode keeps only its own namespace before the cross-resource
+/// validators, so another namespace's dangling `upstream_id` does not block
+/// the load. The in-memory (fuzz) decode is unfiltered and refuses the same
+/// document (`fuzz/tests/smoke_properties.rs`
+/// `config_decode_validates_every_namespace_together`).
+#[test]
+fn file_mode_skips_cross_resource_checks_for_other_namespaces() {
+    let json = r#"{
+        "version":"1",
+        "proxies":[
+            {"id":"prod-proxy","namespace":"prod","listen_path":"/prod",
+             "backend_scheme":"http","backend_host":"localhost","backend_port":3001},
+            {"id":"staging-proxy","namespace":"staging","listen_path":"/staging",
+             "backend_scheme":"http","backend_host":"localhost","backend_port":3002,
+             "upstream_id":"missing-upstream"}
+        ],
+        "consumers":[],
+        "plugin_configs":[],
+        "upstreams":[]
+    }"#;
+    let mut file = NamedTempFile::with_suffix(".json").unwrap();
+    write!(file, "{json}").unwrap();
+
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "prod",
+    )
+    .expect("another namespace's dangling upstream reference must not block file mode");
+    assert_eq!(config.proxies.len(), 1);
+    assert_eq!(config.proxies[0].id, "prod-proxy");
     assert!(config.known_namespaces.iter().any(|n| n == "staging"));
 }
 

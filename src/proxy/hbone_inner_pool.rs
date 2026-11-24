@@ -147,8 +147,9 @@
 //!   sampled once (issue #5042 step 2 re-review). hyper exposes
 //!   `current_max_send_streams()` on the `Connection`, never on the
 //!   `SendRequest` the pool holds, and the value it reports right after
-//!   `h2c_preface::await_peer_settings` is still hyper's
-//!   `DEFAULT_INITIAL_MAX_SEND_STREAMS` (100): observing the peer's SETTINGS
+//!   `h2c_preface::await_peer_settings` is still the pre-settings bound (the
+//!   configured stream cap, else hyper's `DEFAULT_INITIAL_MAX_SEND_STREAMS` of
+//!   100): observing the peer's SETTINGS
 //!   BYTES is not the same as `h2` having applied them, which it defers until
 //!   it writes the SETTINGS ACK. A single sample therefore recorded 100 for a
 //!   destination advertising 8, `is_saturated()` never fired, and RPCs 9..100
@@ -280,7 +281,7 @@
 //! the pre-#5042 cost.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 use hyper::client::conn::{http1, http2};
@@ -657,7 +658,6 @@ impl HboneInnerH1Checkout {
     /// The drain generation this lease is bound to. Exposed for the external
     /// fence regression tests.
     #[inline]
-    #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
     pub fn drain_generation(&self) -> u64 {
         self.generation
     }
@@ -741,6 +741,12 @@ struct HboneInnerH2LoadInner {
     /// connection driver last observed it; `usize::MAX` before the first poll
     /// and when the peer advertises none.
     peer_max_streams: AtomicUsize,
+    /// A dispatch on this carrier failed with a pre-wire cancel or a protocol
+    /// NACK (issue #7180). The pooled entry is then no longer live: the next
+    /// checkout or sweep of its key evicts it, as for a closed sender, rather
+    /// than handing a retry the same dying carrier until hyper reports it
+    /// closed. Set once, never cleared.
+    retired: AtomicBool,
 }
 
 impl Default for HboneInnerH2LoadInner {
@@ -748,6 +754,7 @@ impl Default for HboneInnerH2LoadInner {
         Self {
             active_rpcs: AtomicUsize::new(0),
             peer_max_streams: AtomicUsize::new(usize::MAX),
+            retired: AtomicBool::new(false),
         }
     }
 }
@@ -758,6 +765,7 @@ impl std::fmt::Debug for HboneInnerH2Load {
             .debug_struct("HboneInnerH2Load")
             .field("active_rpcs", &self.active_rpcs())
             .field("peer_max_streams", &self.peer_max_streams())
+            .field("retired", &self.is_retired())
             .finish()
     }
 }
@@ -773,6 +781,13 @@ impl HboneInnerH2Load {
     #[inline]
     pub fn peer_max_streams(&self) -> usize {
         self.0.peer_max_streams.load(Ordering::Relaxed)
+    }
+
+    /// Whether a dispatch retired this carrier; see
+    /// [`HboneInnerH2StreamLease::retire_carrier`].
+    #[inline]
+    fn is_retired(&self) -> bool {
+        self.0.retired.load(Ordering::Acquire)
     }
 
     /// True when one more RPC would only queue pending-open inside `h2` behind
@@ -795,9 +810,10 @@ impl HboneInnerH2Load {
     /// hyper exposes that only on the `Connection`, never on the `SendRequest`
     /// the pool holds, so the driver is the only place the value stays
     /// current — and it has to stay current, because the value right after
-    /// `h2c_preface::await_peer_settings` is still hyper's pre-settings default
-    /// of 100 (`h2` defers applying the peer's SETTINGS until it writes the
-    /// ACK). A one-shot sample there recorded 100 for every destination and
+    /// `h2c_preface::await_peer_settings` is still the pre-settings bound (the
+    /// configured stream cap, else hyper's default of 100; `h2` defers applying
+    /// the peer's SETTINGS until it writes the ACK). A one-shot sample there
+    /// recorded 100 for every uncapped destination and
     /// silently disabled the widen decision; see the module doc.
     ///
     /// `Relaxed` is sufficient: the value only steers a widen heuristic, and a
@@ -815,6 +831,22 @@ impl HboneInnerH2Load {
 /// when that dispatch releases the carrier.
 #[derive(Debug)]
 pub struct HboneInnerH2StreamLease(HboneInnerH2Load);
+
+impl HboneInnerH2StreamLease {
+    /// Retire the carrier this lease holds, so the pool stops handing it out.
+    ///
+    /// Called by the gRPC dispatch after a provably pre-wire cancellation or a
+    /// protocol NACK on this carrier (issue #7180), the two signals on which
+    /// the direct gRPC pool invalidates its own sender: both are connect-class
+    /// and retried, and waiting for `is_closed()` is racy, so the retry could
+    /// otherwise check out the same dying carrier. The lease identifies the
+    /// entry by its shared load, so this evicts exactly that carrier — never a
+    /// sibling under the same key — at the next checkout or sweep of the key.
+    /// RPCs already multiplexed on it are unaffected.
+    pub fn retire_carrier(&self) {
+        self.0.0.retired.store(true, Ordering::Release);
+    }
+}
 
 impl Drop for HboneInnerH2StreamLease {
     fn drop(&mut self) {
@@ -912,12 +944,13 @@ impl KeySlot {
         None
     }
 
-    /// Drop every carrier whose connection has ended, and report how many
-    /// left. A closed incumbent is an EVICTION, not a silent replacement: it
+    /// Drop every carrier whose connection has ended or that a dispatch
+    /// retired, and report how many left. A closed incumbent is an EVICTION, not a silent replacement: it
     /// leaves the pool and its residency slot goes back to the ceiling.
     fn retire_closed_h2(&mut self) -> usize {
         let before = self.h2.len();
-        self.h2.retain(|entry| !entry.sender.is_closed());
+        self.h2
+            .retain(|entry| !entry.sender.is_closed() && !entry.load.is_retired());
         before.saturating_sub(self.h2.len())
     }
 }
@@ -1090,7 +1123,6 @@ impl HboneInnerConnectionPool {
 
     /// Check-ins and publications a retirement fenced out. Exposed for the
     /// external fence regression tests.
-    #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
     pub fn fenced_checkins(&self) -> u64 {
         self.fenced_checkins.load(Ordering::Relaxed)
     }
@@ -1252,7 +1284,7 @@ impl HboneInnerConnectionPool {
             let before_h2 = slot.h2.len();
             slot.h2.retain(|entry| {
                 Self::entry_live(
-                    entry.sender.is_closed(),
+                    entry.sender.is_closed() || entry.load.is_retired(),
                     entry.last_used_at.load(Ordering::Relaxed),
                     entry.idle_timeout_seconds,
                     entry.credential_deadline,
@@ -1650,7 +1682,7 @@ impl HboneInnerConnectionPool {
                 slot.h2.retain(|entry| {
                     entry.entry_generation == entry_generation
                         && Self::entry_live(
-                            entry.sender.is_closed(),
+                            entry.sender.is_closed() || entry.load.is_retired(),
                             entry.last_used_at.load(Ordering::Relaxed),
                             entry.idle_timeout_seconds,
                             // The ENTRY's own bound, deliberately not folded
@@ -2012,11 +2044,5 @@ impl HboneInnerConnectionPool {
         });
         self.record_evictions(HboneInnerProtocol::Http1, h1_dropped);
         self.record_evictions(HboneInnerProtocol::H2, h2_dropped);
-    }
-}
-
-impl Default for HboneInnerConnectionPool {
-    fn default() -> Self {
-        Self::new(8)
     }
 }

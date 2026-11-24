@@ -28,7 +28,7 @@ The root CLAUDE.md "Testing Policy" applies (test what changed; CI is the full g
 ## Cargo Target Isolation
 
 - Leave `CARGO_TARGET_DIR` unset across parallel worktrees so each uses its own `target/`. A stale inherited value causes `Blocking waiting for file lock on build directory`; work around it per command with `unset CARGO_TARGET_DIR && cargo ...`.
-- Sharing `SCCACHE_DIR` is safe; the repo `.cargo/config.toml` already uses `sccache`.
+- Sharing `SCCACHE_DIR` is safe. The repo `.cargo/config.toml` names no `rustc-wrapper` (Dependabot's cargo updater has no sccache), so sccache runs only where the user-level `$CARGO_HOME/config.toml` or `RUSTC_WRAPPER` enables it; `scripts/install-build-deps.sh` sets the former.
 - Within one workspace, run fmt, clippy, and tests sequentially because they share that workspace's target dir.
 
 ## Environment Isolation
@@ -91,6 +91,8 @@ Do not substitute sleeps, scrape retries, or runner/process isolation for owners
 
 - Prefer external tests under `tests/` over new inline `#[cfg(test)] mod tests` in production source files.
 - Do not add ad hoc test runners, manually invoked assertions, mock fixtures, or test-only runtime branches to main source modules.
+- Exception (issue #7122): a small, inert per-operation test hook is allowed in a main source module when it does nothing while unset and costs at most a relaxed atomic load, a plain flag read, or a task-local lookup per operation — no lock, allocation, or I/O — and is set only through a `#[doc(hidden)]` `*_for_tests` entry point (for example `ai_tool_governor`'s `approval_clock_offset_ms`, `api_chargeback`'s `invalidate_every_render_walk`, and `compression`'s `TEST_CODEC_BUDGET` / `TEST_RESPONSE_BUFFER_BUDGET` task-locals). `#[doc(hidden)]` `*_for_tests` accessors and constructors that only read state or build an instance are allowed too.
+- Anything else test-only goes behind the `test-support` cargo feature (`#[cfg(feature = "test-support")]`), which never ships: fault injection on a durable-write, security, or billing path, and any hook that takes a lock or allocates on every operation even when unset. The crate's self dev-dependency (`ferrum-edge = { path = ".", default-features = false, features = ["test-support"] }` in `Cargo.toml`) turns the feature on for every test, bench and example build on both crypto profiles. `cargo build --release` resolves no dev-dependencies, so release, Docker, and FIPS artifacts never get it. Give a gated per-operation check a `#[cfg(not(feature = "test-support"))]` stub (for example a snapshot that returns `None`) so production call sites compile unchanged and the check folds away. The `api_chargeback_sink` billing spool's `SpoolFsFault` / `SpoolFsOps::with_fault` fsync/rename/directory fault dispatch, its faulted constructors, and its process-global spool write/walk/replay hook slots are gated this way.
 - Existing inline tests may remain, but new coverage should use `tests/unit/<category>/<module>_tests.rs`, `tests/integration/`, `tests/functional/`, or `tests/conformance/` when possible.
 - If private-only behavior cannot be tested externally without widening a runtime API, keep any inline test module minimal and do not add production-visible test helpers.
 - Public API tests go in `tests/unit/<category>/<module>_tests.rs`.
@@ -224,7 +226,7 @@ shares.
   wait for `overload::SHUTDOWN_DRAIN_BEGUN_LOG` (`expect_drain_begun`). A hyper
   client closes an idle connection once its last `SendRequest` drops; keep the
   sender alive when asserting that the server closed it.
-- Readiness is not identity — and that applies to bespoke spawners too, not just `TestGateway`. `functional_websocket_test.rs::wait_for_owned_gateway` reuses the exported `probe_gateway_identity` because a bare TCP accept let a foreign H2 fixture answer (and `PROTOCOL_ERROR`-reset) an RFC 8441 Extended CONNECT handshake (issue #3435).
+- Readiness is not identity — and that applies to bespoke spawners too, not just `TestGateway`. Bespoke spawners mint a `SpawnedGatewayIdentity` per attempt, `apply_to_command` it, and wait on the child-bound `wait_for_owned_gateway_identity` (issue #7076): the metrics-token `/health` tier alone is also granted by `FERRUM_METRICS_ALLOWED_CIDRS`, and a bare TCP accept let a foreign H2 fixture answer (and `PROTOCOL_ERROR`-reset) an RFC 8441 Extended CONNECT handshake (issue #3435). `wait_for_child_gateway_readiness` is the health-only alternative for a scenario that cannot enable admin auth; `bespoke_spawner_readiness_contract_tests.rs` pins each site.
 - `TestGateway` mints a per-spawn-attempt admin JWT secret/issuer and `FERRUM_METRICS_BEARER_TOKEN` (effective caller overrides win; explicitly shared credentials are only as unique as the value chosen). On the standard spawn path with admin-auth verification, its barrier is a conjunction: ready `/health`, HTTP 200 from JWT-only `GET /proxies` under the effective attempt identity (`wait_for_owned_gateway_identity`), and `Child::try_wait` liveness around the waits and before success; that combination, not health detail alone, proves the child owns its proxy port, because `ready` flips only after every listener bind and `/health` detail is also granted by a matching metrics token or an allowed source IP. When admin-auth verification is not enabled the caller takes an explicit health-only alternative instead — do not imply every builder/mode takes the JWT path. Do not weaken the authenticated path to an unauthenticated `/health` or a bare TCP accept, and do not add sleeps or test-level retries in its place.
 - Use a struct harness with `try_new()` retry wrapper or a `start_gateway_with_retry()` helper.
 - Every retry needs fresh ports and fresh temp dirs/DBs. Reusing killed SQLite can corrupt WAL.
@@ -266,7 +268,7 @@ shares.
   source range, through `unbound_port_outside`.
 - **An attempt whose gateway died mid-run is VOID**: retry with fresh ports/dirs/control planes instead of returning the resulting transport error. Never retry an observation from a healthy fixture — authoritative protocol responses and fail-closed security assertions must be made exactly once.
 - `FERRUM_POOL_WARMUP_ENABLED=true` makes the gateway issue `HEAD /` to each backend at startup and shifts backend-hit assertions by one.
-- **Every spawned gateway must be owned by an RAII guard, not a bare `std::process::Child`** (issue #4991). `Child` does nothing on drop, so a panic between spawn and the explicit shutdown call leaves a live gateway holding its ports. Bespoke spawners wrap the child in `crate::common::GatewayChildGuard` at the instant of spawn; `shutdown()` is idempotent and also runs from `Drop`.
+- **Every spawned gateway must be owned by an RAII guard, not a bare `std::process::Child`** (issue #4991). `Child` does nothing on drop, so a panic between spawn and the explicit shutdown call leaves a live gateway holding its ports. Bespoke spawners wrap the child in `crate::common::GatewayChildGuard` at the instant of spawn; `shutdown()` is idempotent and also runs from `Drop`. Never tear a gateway down with a raw `kill()` (a SIGKILLed gateway writes no coverage profile); call `configure_coverage_gateway_command` after `Command::new`. `bespoke_spawner_lifecycle_contract_tests.rs` pins this, the managed-store path and the guard for the spawners migrated in issue #7077.
 - **Socket fixtures must not assume Linux host behaviour** (issue #4983): a secondary loopback alias (`127.0.0.2`) exists on Linux but not on macOS; a bound-but-unlistened TCP port refuses on Linux and black-holes on Darwin (`ports::REFUSED_TCP_PORT_REFUSES_CONNECT_IMMEDIATELY`); Darwin's default UDP datagram ceiling is 9216 bytes; and `SO_REUSEADDR` lets a specific-address and a wildcard listener share one port on Darwin. Prefer a shape every supported host provides (`::1` for a second listen identity, a second ephemeral port for a second UDP session, a sub-ceiling payload for transport probes); where the prerequisite is genuinely required, probe for it and skip with an explicit message naming it. See `docs/functional_testing.md` -> "Host-Dependent Socket Fixtures".
 - Set `FERRUM_POOL_WARMUP_ENABLED=false` in tests that count backend hits.
 - Warmup off does not mean no backend traffic: once ready, file mode still runs
@@ -276,43 +278,57 @@ shares.
   as a hit. Match the request line instead
   (`functional_graceful_shutdown_test.rs::is_client_request`).
 - Keep warmup true when tests require the capability registry to have a `Supported` entry before traffic, such as native H3 or direct H2 routing.
+- With warmup off, an HTTPS target's registry entry appears as soon as its HTTP/2 probe answers, with `plain_http.h3` still at its previous value (`unknown` on a first probe) until the HTTP/3 probe finishes. Poll for the exact field a test needs, never for "an entry exists" or for `h2_tls` as a proxy for "the refresh has settled". To hold the HTTP/3 probe open deterministically use `ScriptedH3BackendBuilder::hold_handshakes` / `release_handshakes` (`backend_capability_staged_commit_tests.rs`).
 
 ## Fuzz / property lane
 
 - Hostile-parser fuzzing lives in the isolated `fuzz/` cargo-fuzz workspace; see
   `docs/fuzz.md` for budgets, corpora policy, and crash promotion.
-- Ordinary full-mode PR CI runs the deterministic `Fuzz Smoke` property gate
-  (`cargo test --locked` in `fuzz/`) in `.github/workflows/ci.yml`.
-- The bounded sanitizer smoke runs on push to `main` and manual
-  `workflow_dispatch` of `ci.yml` only -- not on `pull_request` (#3902, cost)
-  and not on `merge_group` (#4238, blast radius). Six targets run at
-  `-runs=512`, `-max_total_time=8`, `-max_len=4096`; `datagram_client_address`
-  runs as its own invocation at the same bounds with `-max_len=65536`, its
-  documented 64 KiB budget (#4442).
-- `Swatinem/rust-cache` `save-if` for that job is strictly a push to `main`;
-  pull_request, fork, merge_group, and workflow_dispatch never publish a
-  `fuzz-smoke` cache.
+- Ordinary full-mode CI runs the deterministic `Fuzz Smoke` property gate
+  (`cargo test --locked` in `fuzz/`) in `.github/workflows/ci.yml` on every
+  event; it is the only fuzz job in the required `Tests` aggregate.
+- The bounded sanitizer smoke runs in its own workflow,
+  `.github/workflows/fuzz-smoke-main.yml`, on push to `main` and manual
+  `workflow_dispatch` only -- not on `pull_request` (#3902, cost) and not on
+  `merge_group` (#4238, blast radius) -- and is not a required check, so its
+  ~55-minute sanitizer build stays off main's `CI` critical path. Six targets
+  run at `-runs=512`, `-max_total_time=8`, `-max_len=4096`;
+  `datagram_client_address` runs as its own invocation at the same bounds with
+  `-max_len=65536`, its documented 64 KiB budget (#4442), and `ocsp_response` /
+  `jwt_svid` / `tls_material` (#6584) run as their own loop at the same 64 KiB
+  `-max_len`. A new fuzz target must be scheduled in that file and in
+  `fuzz.yml` (`fuzz_target_schedule_parity_tests.rs`).
+- Fuzz caches: `fuzz-property-smoke` holds only the line-tables-only property
+  build; `fuzz-sanitizer-smoke` holds only the Cargo registry
+  (`cache-targets: "false"`). Do not cache the sanitizer target directory: the
+  retired combined `fuzz-smoke` entry was 7.2 GB and evicted
+  `ci-standalone-cargo`. Both smoke caches' `save-if` is strictly a push to
+  `main`; pull_request, fork, merge_group, and workflow_dispatch never publish
+  them (the scheduled `fuzz.yml` `fuzz-sanitized` cache is a separate frozen
+  contract). `fuzz-smoke-main.yml` uses `queue: max` so every push to `main`
+  gets its own sanitizer run; do not drop it.
+- Both smoke lanes compile the whole `ferrum-edge` library in one rustc process
+  and need the bounded 12 GiB `/mnt` swap step on the 16 GB runner
+  (`docs/ci_cd.md` → "Fuzz lane runner losses (2026-11)").
 - Longer sanitizer-backed runs remain scheduled in `.github/workflows/fuzz.yml`.
 
 ## CI Expectations
 
-- Full-mode PR CI runs formatting and integration-shard coverage inside `ci-plan`; independent readonly `ci-policy` runs the complete immutable-base policy self-tests and scan alongside compilation, including on light-mode PRs. `Tests` requires successful planning, successful policy, and its post-verification `verified=true` output even in light mode. The planner pins its own authenticated base before extracting trusted planner modules and cheaply rejects frozen verifier/workflow edits. Full mode then runs consolidated test jobs (unit + inline lib, Consul + LDAP), two integration shards, four functional shards (the service-backed `data-plane` / `data-plane-runtime` pair is serial per runner), lint, perf regression, and the native Linux x86_64 pr-build compile gate. `merge_group` also compile-gates macOS x86_64/ARM64 with `cargo check` and Windows x86_64 with a linked pr-build; push-to-main uses the fast Linux verification build and packages tested Linux binaries into an Actions image artifact. Production builds run only in release.yml after a version tag is created. The planner also emits trusted, fail-closed Helm/eBPF/Secret Backends (`run_secrets_backends`)/PKCS#11 SoftHSM (`run_pkcs11`) path gates so irrelevant jobs skip before runner allocation. Secret Backends and PKCS#11 remain required when their planner outputs are true and may skip when those outputs are false; pushes to `main`, manual runs, empty/unavailable diffs, unclassifiable paths, a missing or non-`true` `paths_classifiable` handshake from an old trusted-base planner, and gate-controller edits fail closed and schedule both. Ordinary non-vendored documentation, license, and agent-instruction-only PRs stay on a lightweight diff-hygiene + `Tests` aggregate path; vendored Markdown and live-suite contract/runbook docs still select full mode. On full-mode PRs, the perf-regression job always runs lightweight protocol-perf static contracts (workflow/evaluator self-tests + scenario `py_compile`) after checkout; the expensive HTTP overhead benchmark runs only for shared runtime infrastructure (top-level `src/*.rs`), proxy/connection hot paths, file-mode startup and config, performance fixtures, or dependency/build-graph changes; plugin-internal, admin, secrets, and unrelated-mode changes skip the benchmark. The job's `setup-rust-ci` `ci-perf` cache includes both `. -> target` and `tests/performance/mesh -> target` so the standalone Criterion workspace is not a cold compile. It always runs on pushes to `main` and manual `workflow_dispatch`, and runs fail-closed when the PR diff cannot be computed.
-- Branch protection must directly require the nine dedicated checks: `Tests`, `Merge Coverage`, `Gateway API Conformance`, `Mesh E2E Sidecar Live`, `Trusted Cross Build Policy`, `Multicluster Federation Live`, `Multicluster Poller Partition Live`, `Ambient Host UDP Live`, and `FIPS Build & Test`. Do not list `Launch Readiness Integrity` or `Launch Readiness Gate`; that lane was removed (#4010). The dedicated workflows trigger on every PR and on `merge_group`, and path-filter internally; do not add polling mirror jobs back to `ci.yml`. See `docs/ci_cd.md` for the live no-bypass posture and merge-queue SHA semantics. `NodeWaypoint eBPF Live`, `Istio Status CAS Live`, and `CNI Lifecycle Live` use the same trusted-base classifier and always-reporting aggregate pattern but are **not** branch-protection-required.
-- Production release is gated on the COMPLETE required set. `.github/required-publication-checks.json` is the canonical machine-consumed inventory; both `release-dispatch.yml` and `release.yml` run `verify_publication_gate.py --enforce release` for the exact selected commit. `verify_required_ci.py` checks inventory parity and the release contracts. Ordinary main CI and `gateway-api-conformance.yml` have no publication-evidence collector or polling job. The trusted base freezes the release dispatcher, production publisher, input validator, evidence verifier, and inventory; ordinary PRs cannot approve their own changes to those controls. Missing, queued, in-progress, failed, cancelled, skipped, timed-out, wrong-SHA/event/branch/path/id, and untrusted evidence blocks version-tag creation and production publication. A policy override does not create successful release evidence. See `docs/ci_cd.md` -> "Publish-blocking required checks".
-- `ci.yml` never publishes registry images or GitHub Releases (the trusted Cross policy's `nonpublishing_ci_errors` enforces it). The only main-driven publication is `main-latest-image.yml`: after a successful `push` CI run on `main` it builds that exact SHA, pushes and signs `main-<sha>` (reusing an already signed one on re-runs), and moves the Docker `latest` tag forward only while that SHA is still on main's history and the commit `latest` names, when on main's history, is its ancestor, so `latest` never moves backwards (owner decision 2026-09-28). One workflow-level concurrency group serializes publishers and keeps only the newest waiting run, so intermediate commits may get no image. Jobs holding registry credentials never check out or run repository code; the checkout-and-verify (`python3 -I`) and image smoke run in credential-free jobs. It must never touch version tags, `-ebpf*` variants, or GitHub Releases; `verify_main_latest_image_workflow.py` (run by `verify_required_ci.py`) pins that contract, so update both together; both are CODEOWNERS-protected like `release.yml`. Start Production Release (`release-dispatch.yml`) takes a stable version tag, verifies the selected main SHA, and creates the tag using RELEASE_TAG_TOKEN. The separate tag-triggered release.yml builds and publishes production artifacts.
-- Tags `v*` create versioned releases and Docker tags.
-- Required secrets are `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
+Details for every bullet live in `docs/ci_cd.md`.
+
+- CI is planned by the trusted-base `pr_ci_plan.py` (`ci-plan`), which pins its own authenticated base and rejects frozen verifier/workflow edits. Ordinary documentation, license, and agent-instruction-only PRs run light mode (diff hygiene + `Tests` aggregate); `vendor/` and `charts/` files, the Prometheus metric contract docs, and dependency-governance docs (`docs/dependency-policy.md`, `docs/vendored-patch-lifecycle.json`, `docs/upstream-*`) still select full mode.
+- `ci-policy` runs the immutable-base workflow scan alongside compilation on every CI event, including light mode (verifier self-tests run in `trusted-policy-candidate.yml`). `Tests` requires successful `ci-plan` and `ci-policy` plus its post-verification `verified=true` output, even in light mode.
+- Full mode runs consolidated unit jobs, three integration shards (`admin-platform`, `mesh-protocols`, and the PostgreSQL/MySQL/Mongo-backed `conditional-live-stores`), four functional shards, lint, and the native Linux x86_64 pr-build compile gate. `merge_group` also compile-gates macOS and Windows; push-to-main uses the fast Linux verification build. Performance regression is out of band: `performance-regression.yml` runs daily on the `main` tip and on manual dispatch, never on a PR or main push.
+- Helm/eBPF/Secret Backends (`run_secrets_backends`)/PKCS#11 (`run_pkcs11`) jobs are planner-gated and fail closed: pushes to `main`, manual runs, empty/unavailable or unclassifiable diffs, and gate-controller edits schedule them.
+- Branch protection must directly require the nine dedicated checks: `Tests`, `Merge Coverage`, `Gateway API Conformance`, `Mesh E2E Sidecar Live`, `Trusted Cross Build Policy`, `Multicluster Federation Live`, `Multicluster Poller Partition Live`, `Ambient Host UDP Live`, and `FIPS Build & Test`. `NodeWaypoint eBPF Live`, `Istio Status CAS Live`, and `CNI Lifecycle Live` are **not** branch-protection-required. Do not add polling mirror jobs back to `ci.yml`.
+- `ci.yml` never publishes. Only `main-latest-image.yml` publishes from `main` (`main-<sha>` and a never-backwards `latest`); it never touches version tags, `-ebpf*` variants, or GitHub Releases, and `verify_main_latest_image_workflow.py` pins that contract.
+- Releases require the complete `.github/required-publication-checks.json` set for the exact commit: `release-dispatch.yml` verifies the selected main SHA and creates the `v*` tag; the tag-triggered `release.yml` publishes versioned binaries, Docker tags, and the GitHub Release.
+- Required secrets are `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` and `RELEASE_TAG_TOKEN` (release-dispatch tag creation); see `docs/ci_cd.md` -> GitHub Actions Secrets.
 - GitHub Actions workflow permissions must be Read+Write for release automation.
 
 ## Test Structure
 
-```text
-tests/{unit_tests,integration_tests,functional_tests,conformance_tests}.rs
-tests/unit/{config,plugins,admin,gateway_core,identity,secrets,tls,cli,notifications}/
-tests/{integration,functional,performance,conformance}/
-tests/scaffolding/
-tests/common/
-```
+Layout and target list: `tests/README.md`. Unit targets: `unit_tests`, `unit_plugins_a_tests`, `unit_plugins_b_tests`, `unit_gateway_core_tests`; other suite targets: `integration_tests`, `functional_tests`, `conformance_tests`; extra `[[test]]` targets: `service_integration`, `secrets_functional`, `acme_dns01_tests`.
 
 Functional tests are ignored by default. Conformance reporter emits `target/conformance/coverage.{json,md}`.
 

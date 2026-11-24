@@ -4,12 +4,12 @@ index cfa11fb5d..c8a4dd49e 100644
 +++ b/vendor/tokio-tungstenite-0.29.0-ferrum-patched/CHANGELOG.md
 @@ -1,6 +1,7 @@
  # Ferrum local patch
-
+ 
  - Backport snapview/tokio-tungstenite#380: add `WebSocketStream::into_inner_with_read_buffer()` delegating to the patched tungstenite accessor so raw stream takeovers can recover buffered bytes.
 +- Add `WebSocketStream::set_fragment_accounting()` delegating to the patched tungstenite fragment-accounting API, so a caller can install a shared `FragmentMeter` and the incomplete-message frame/duration bounds before `split()` hides the codec.
-
+ 
  # 0.29.0
-
+ 
 diff --git a/vendor/tokio-tungstenite-0.29.0-ferrum-patched/src/lib.rs b/vendor/tokio-tungstenite-0.29.0-ferrum-patched/src/lib.rs
 index 2e96f063d..300de86e9 100644
 --- a/vendor/tokio-tungstenite-0.29.0-ferrum-patched/src/lib.rs
@@ -23,7 +23,7 @@ index 2e96f063d..300de86e9 100644
 +    time::Duration,
  };
  use tokio::io::{AsyncRead, AsyncWrite};
-
+ 
 @@ -46,7 +48,7 @@ use tungstenite::{
  };
  use tungstenite::{
@@ -31,12 +31,12 @@ index 2e96f063d..300de86e9 100644
 -    protocol::{Message, Role, WebSocket, WebSocketConfig},
 +    protocol::{FragmentMeter, Message, Role, WebSocket, WebSocketConfig},
  };
-
+ 
  #[cfg(any(feature = "native-tls", feature = "__rustls-tls", feature = "connect"))]
 @@ -289,6 +291,22 @@ impl<S> WebSocketStream<S> {
          self.inner.get_config()
      }
-
+ 
 +    /// Install fragment accounting for this read direction (Ferrum local
 +    /// extension).
 +    ///
@@ -65,9 +65,9 @@ index 4e462f69f..f26ca8076 100644
  * Enforce caller-supplied frame limits before payload reservation while exempting valid Close frames; all control frames remain capped at RFC 6455's 125-byte maximum before allocation. Frame-policy failures retain a distinct `CapacityError::FrameTooLong` origin so callers can distinguish them from reassembled-message limits.
  * Add `WebSocketConfig::auto_pong` (default `true`) so transparent proxies can surface Ping frames without queuing a local Pong reply. Explicit `Message::Pong` writes remain unchanged.
 +* Add physical-fragment accounting for message reassembly: `FragmentMeter`, `WebSocket::set_fragment_accounting()` / `WebSocketContext::set_fragment_accounting()`, `WebSocketConfig::max_incomplete_message_frames`, and `WebSocketConfig::max_incomplete_message_duration` (both default `None` = upstream behavior), plus `ProtocolError::IncompleteMessageFrameLimitExceeded` and `ProtocolError::IncompleteMessageTimeout`. The reader only ever sees reassembled messages, so initial non-final and continuation frames — including zero-length ones — were previously invisible to per-message admission policy and unbounded in count and duration.
-
+ 
  # 0.29.0
-
+ 
 diff --git a/vendor/tungstenite-0.29.0-ferrum-patched/src/error.rs b/vendor/tungstenite-0.29.0-ferrum-patched/src/error.rs
 index 224348b3f..3bb5db49a 100644
 --- a/vendor/tungstenite-0.29.0-ferrum-patched/src/error.rs
@@ -95,7 +95,7 @@ index 224348b3f..3bb5db49a 100644
      #[error("Connection reset without closing handshake")]
      ResetWithoutClosingHandshake,
 diff --git a/vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/mod.rs b/vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/mod.rs
-index f61e0a383..017e6e786 100644
+index f61e0a383..089a854cf 100644
 --- a/vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/mod.rs
 +++ b/vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/mod.rs
 @@ -22,8 +22,63 @@ use log::*;
@@ -108,7 +108,7 @@ index f61e0a383..017e6e786 100644
 +    },
 +    time::{Duration, Instant},
  };
-
+ 
 +/// Shared, lock-free accounting of the physical data frames a peer spends on
 +/// message reassembly (Ferrum local extension).
 +///
@@ -162,7 +162,7 @@ index f61e0a383..017e6e786 100644
  /// Indicates a Client or Server role of the websocket
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
  pub enum Role {
-@@ -100,6 +155,25 @@ pub struct WebSocketConfig {
+@@ -100,6 +155,27 @@ pub struct WebSocketConfig {
      ///
      /// Explicit `Message::Pong` writes are unaffected.
      pub auto_pong: bool,
@@ -188,9 +188,9 @@ index f61e0a383..017e6e786 100644
 +    /// `None` (the default) means unbounded, matching upstream behavior.
 +    pub max_incomplete_message_duration: Option<Duration>,
  }
-
+ 
  impl Default for WebSocketConfig {
-@@ -112,6 +186,8 @@ impl Default for WebSocketConfig {
+@@ -112,6 +188,8 @@ impl Default for WebSocketConfig {
              max_frame_size: Some(16 << 20),
              accept_unmasked_frames: false,
              auto_pong: true,
@@ -199,10 +199,10 @@ index f61e0a383..017e6e786 100644
          }
      }
  }
-@@ -159,6 +235,18 @@ impl WebSocketConfig {
+@@ -159,6 +237,18 @@ impl WebSocketConfig {
          self
      }
-
+ 
 +    /// Set [`Self::max_incomplete_message_frames`].
 +    pub fn max_incomplete_message_frames(mut self, max_frames: Option<usize>) -> Self {
 +        self.max_incomplete_message_frames = max_frames;
@@ -218,10 +218,10 @@ index f61e0a383..017e6e786 100644
      /// Panic if values are invalid.
      pub(crate) fn assert_valid(&self) {
          assert!(
-@@ -270,6 +358,17 @@ impl<Stream> WebSocket<Stream> {
+@@ -270,6 +360,17 @@ impl<Stream> WebSocket<Stream> {
          self.context.get_config()
      }
-
+ 
 +    /// Install fragment accounting for this read direction (Ferrum local
 +    /// extension). See [`WebSocketContext::set_fragment_accounting`].
 +    pub fn set_fragment_accounting(
@@ -236,7 +236,7 @@ index f61e0a383..017e6e786 100644
      /// Check if it is possible to read messages.
      ///
      /// Reading is impossible after receiving `Message::Close`. It is still possible after
-@@ -412,6 +511,17 @@ pub struct WebSocketContext {
+@@ -412,6 +513,17 @@ pub struct WebSocketContext {
      state: WebSocketState,
      /// Receive: an incomplete message being processed.
      incomplete: Option<IncompleteMessage>,
@@ -254,7 +254,7 @@ index f61e0a383..017e6e786 100644
      /// Send in addition to regular messages E.g. "pong" or "close".
      additional_send: Option<Frame>,
      /// True indicates there is an additional message (like a pong)
-@@ -449,6 +559,9 @@ impl WebSocketContext {
+@@ -449,6 +561,9 @@ impl WebSocketContext {
              frame,
              state: WebSocketState::Active,
              incomplete: None,
@@ -264,10 +264,10 @@ index f61e0a383..017e6e786 100644
              additional_send: None,
              unflushed_additional: false,
              config,
-@@ -471,6 +584,56 @@ impl WebSocketContext {
+@@ -471,6 +586,75 @@ impl WebSocketContext {
          &self.config
      }
-
+ 
 +    /// Install fragment accounting for this read direction (Ferrum local
 +    /// extension).
 +    ///
@@ -340,7 +340,9 @@ index f61e0a383..017e6e786 100644
      /// Consume the context, returning the bytes that were read from the stream
      /// into the internal read buffer but not yet consumed as a WebSocket
      /// message.
-@@ -742,11 +921,17 @@ impl WebSocketContext {
+@@ -728,6 +912,9 @@ impl WebSocketContext {
+                         Err(Error::Protocol(ProtocolError::UnknownControlFrameType(i)))
+                     }
                      OpCtl::Ping => {
 +                        if self.incomplete.is_some() {
 +                            self.enforce_incomplete_message_duration()?;
@@ -348,10 +350,7 @@ index f61e0a383..017e6e786 100644
                          let data = frame.into_payload();
                          // No ping processing after we sent a close frame.
                          // `auto_pong` defaults to true (ordinary endpoints);
-                         // transparent proxies disable it so Ping can be
-                         // forwarded without a local reply.
-                         if self.state.is_active() && self.config.auto_pong {
-                             self.set_additional(Frame::pong(data.clone()));
+@@ -738,7 +925,12 @@ impl WebSocketContext {
                          }
                          Ok(Some(Message::Ping(data)))
                      }
@@ -364,23 +363,10 @@ index f61e0a383..017e6e786 100644
 +                    }
                  }
              }
-
-+@@ -758,10 +964,23 @@ impl WebSocketContext {
-             OpCode::Data(data) => {
-                 let fin = frame.header().is_final;
-
-                 let payload = match (data, self.incomplete.as_mut()) {
-                     (OpData::Continue, None) => Err(ProtocolError::UnexpectedContinueFrame),
-                     (OpData::Continue, Some(incomplete)) => {
-                         incomplete.extend(frame.into_payload(), self.config.max_message_size)?;
-                         Ok(None)
-                     }
-                     (_, Some(_)) => Err(ProtocolError::ExpectedFragment(data)),
-                     (OpData::Text, _) => Ok(Some((frame.into_payload(), MessageType::Text))),
-                     (OpData::Binary, _) => Ok(Some((frame.into_payload(), MessageType::Binary))),
-                     (OpData::Reserved(i), _) => Err(ProtocolError::UnknownDataFrameType(i)),
+ 
+@@ -758,10 +950,23 @@ impl WebSocketContext {
                  }?;
-
+ 
                  match (payload, fin) {
 -                    (None, true) => Ok(Some(self.incomplete.take().unwrap().complete()?)),
 -                    (None, false) => Ok(None),
@@ -404,7 +390,7 @@ index f61e0a383..017e6e786 100644
                          match t {
                              MessageType::Text => Ok(Some(Message::Text(payload.try_into()?))),
                              MessageType::Binary => Ok(Some(Message::Binary(payload))),
-@@ -771,6 +964,8 @@ impl WebSocketContext {
+@@ -771,6 +976,8 @@ impl WebSocketContext {
                          let mut incomplete = IncompleteMessage::new(t);
                          incomplete.extend(payload, self.config.max_message_size)?;
                          self.incomplete = Some(incomplete);
@@ -413,24 +399,24 @@ index f61e0a383..017e6e786 100644
                          Ok(None)
                      }
                  }
-@@ -914,10 +1091,10 @@ impl<T> CheckConnectionReset for Result<T> {
-
+@@ -914,10 +1121,10 @@ impl<T> CheckConnectionReset for Result<T> {
+ 
  #[cfg(test)]
  mod tests {
 -    use super::{Message, Role, WebSocket, WebSocketConfig};
 -    use crate::error::{CapacityError, Error};
 +    use super::{FragmentMeter, Message, Role, WebSocket, WebSocketConfig};
 +    use crate::error::{CapacityError, Error, ProtocolError};
-
+ 
 -    use std::{io, io::Cursor};
 +    use std::{io, io::Cursor, sync::Arc, time::Duration};
-
+ 
      struct WriteMoc<Stream>(Stream);
-
-@@ -1009,6 +1186,116 @@ mod tests {
+ 
+@@ -1009,6 +1216,185 @@ mod tests {
          );
      }
-
+ 
 +    /// A zero-length fragment chain accumulates no bytes, so `max_message_size`
 +    /// never fires. The meter must still count every physical data frame the
 +    /// reader cannot see, and must count the completing frame exactly once via

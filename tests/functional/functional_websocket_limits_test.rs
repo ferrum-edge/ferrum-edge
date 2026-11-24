@@ -4,6 +4,7 @@
 //! exercise the global `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` runtime setting
 //! applied by the proxy's WebSocket frame parser.
 
+use crate::common::GatewayChildGuard;
 use crate::scaffolding::port_registry::TestSocket;
 
 use futures_util::{SinkExt, StreamExt};
@@ -224,37 +225,45 @@ async fn raw_ws_client_first_backend_frame(
     Ok(frame)
 }
 
-async fn wait_for_gateway(gateway_port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    let addr = format!("127.0.0.1:{gateway_port}");
-
-    loop {
-        if std::time::Instant::now() >= deadline {
-            return Err("gateway did not start within 15 seconds".into());
-        }
-        match TcpStream::connect(&addr).await {
-            Ok(mut stream) => {
-                let _ = stream.shutdown().await;
-                return Ok(());
-            }
-            Err(_) => sleep(Duration::from_millis(300)).await,
-        }
-    }
+/// Prove *this* child owns its admin and proxy listeners before returning.
+///
+/// A bare TCP accept on the proxy port is not identity (issue #2132): the port
+/// is released before the child binds it, so a foreign listener could answer.
+/// The JWT ownership barrier (ready `/health`, HTTP 200 from JWT-only
+/// `GET /proxies` under this attempt's admin JWT, `try_wait` liveness) runs
+/// first; the TCP stage then shares the same absolute deadline.
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
+    admin_port: u16,
+    identity: &crate::common::SpawnedGatewayIdentity,
+    gateway_port: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+    crate::common::wait_for_owned_gateway_identity(child, admin_port, identity, STARTUP_TIMEOUT)
+        .await?;
+    crate::common::wait_for_child_tcp_accept(child, gateway_port, deadline).await
 }
 
 async fn start_gateway_with_retry(
     config_path: &str,
     extra_env: &[(&str, &str)],
-) -> (std::process::Child, u16) {
+) -> (GatewayChildGuard, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
         let admin_port = free_port().await;
         let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "file")
             .env("FERRUM_FILE_CONFIG_PATH", config_path)
+            // Keep any managed-TLS/ACME/event store inside the config's temp dir.
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                std::path::Path::new(config_path).with_file_name("managed-tls"),
+            )
             .env("FERRUM_PROXY_HTTP_PORT", gateway_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
             .env("FERRUM_POOL_WARMUP_ENABLED", "false")
@@ -265,16 +274,21 @@ async fn start_gateway_with_retry(
         for (name, value) in extra_env {
             cmd.env(name, value);
         }
+        let identity = crate::common::SpawnedGatewayIdentity::mint("ws-limits");
+        identity.apply_to_command(&mut cmd);
 
-        match cmd.spawn() {
-            Ok(mut child) => match wait_for_gateway(gateway_port).await {
-                Ok(()) => return (child, gateway_port),
-                Err(e) => {
-                    last_err = e.to_string();
-                    let _ = child.kill();
-                    let _ = child.wait();
+        match cmd.spawn().map(GatewayChildGuard::new) {
+            Ok(mut child) => {
+                match wait_for_owned_gateway(child.child_mut(), admin_port, &identity, gateway_port)
+                    .await
+                {
+                    Ok(()) => return (child, gateway_port),
+                    Err(e) => {
+                        last_err = e.to_string();
+                        child.shutdown();
+                    }
                 }
-            },
+            }
             Err(e) => {
                 last_err = e.to_string();
             }
@@ -352,8 +366,7 @@ async fn test_websocket_global_frame_size_limit_rejects_oversized_frame() {
         }
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -386,8 +399,7 @@ async fn test_websocket_tunnel_preserves_backend_frame_coalesced_with_101() {
             .expect("client receives backend frame");
         assert_eq!(frame, first_backend_frame());
 
-        let _ = gateway.kill();
-        let _ = gateway.wait();
+        gateway.shutdown();
         backend.abort();
     }
 }

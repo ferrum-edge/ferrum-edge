@@ -12,7 +12,6 @@
 //! Unlike the historical vacuous check, this requires successful delivery
 //! (`delivered_total >= 1` with zero failures) against that external broker.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -38,6 +37,7 @@ fn summary() -> TransactionSummary {
         timestamp_received: Utc::now().to_rfc3339(),
         client_ip: "203.0.113.10".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/kafka-broker-test".to_string(),
@@ -59,12 +59,13 @@ fn summary() -> TransactionSummary {
         error_class: None,
         body_error_class: None,
         body_completed: true,
+        response_delivery: Default::default(),
         bytes_sent: 0,
         bytes_received: 0,
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }

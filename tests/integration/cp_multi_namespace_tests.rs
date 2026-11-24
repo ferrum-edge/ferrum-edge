@@ -67,7 +67,7 @@ fn mint_token_with_ns_and_audience(
     encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()).unwrap(),
     )
     .expect("test JWT must encode")
 }
@@ -116,7 +116,6 @@ fn proxy_in(id: &str, namespace: &str) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -677,6 +676,7 @@ async fn native_mesh_subscribe_filters_tenant_slice_and_trust_material() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     });
     let mut stream = client.mesh_subscribe(req).await.unwrap().into_inner();
     let first = timeout(Duration::from_secs(5), stream.message())
@@ -713,6 +713,7 @@ async fn native_mesh_subscribe_rejects_missing_claim_in_multi_scope() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     });
     let err = client.mesh_subscribe(req).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);

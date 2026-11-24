@@ -48,7 +48,7 @@ For H1/H2 frontend requests, that loop is transport-neutral across mixed plain, 
 
 gRPC retries handle connection-level failures (connect refused, timeout, DNS, TLS, and pooled-sender dispatch cancellations where hyper proves the request never left the client) by buffering the request body and replaying it against alternative upstream targets. Read timeouts and gRPC application-level errors (e.g., UNAVAILABLE status in trailers) are not retried because the request was already sent to the backend.
 
-A client `grpc-timeout` is anchored once at request receipt into an absolute monotonic deadline (independent of whether the `grpc_deadline` plugin is installed). Plugins, request-body collection, pool/client acquisition, backoff, response headers, and body reads all consume that same Instant. Native gRPC and pass-through gRPC-Web dispatch each forward a decremented remaining `grpc-timeout` on every attempt rather than re-arming the original relative header. Native H3 computes it after QUIC/H3 pool acquisition immediately before request HEADERS construction, including replacement of a failed cached connection. Retry attempts also reuse the real collected `HeaderMap` so duplicate metadata lines and opaque field values stay byte-identical to attempt 1.
+A client `grpc-timeout` is anchored once at request receipt into an absolute monotonic deadline (independent of whether the `grpc_deadline` plugin is installed). The proxy and the plugin share one parser: at most 8 ASCII digits plus one unit letter, a zero value is treated as absent, and positive sub-millisecond values round up to the next millisecond (`1500u` is 2 ms). Plugins, request-body collection, pool/client acquisition, backoff, response headers, and body reads all consume that same Instant. Native gRPC and pass-through gRPC-Web dispatch each forward a decremented remaining `grpc-timeout` on every attempt rather than re-arming the original relative header. Native H3 computes it after QUIC/H3 pool acquisition immediately before request HEADERS construction, including replacement of a failed cached connection. Retry attempts also reuse the real collected `HeaderMap` so duplicate metadata lines and opaque field values stay byte-identical to attempt 1.
 
 WebSocket retries handle connection-level failures during the initial backend connection attempt (before the upgrade response — 101 Switching Protocols for HTTP/1.1, 200 OK for HTTP/2 Extended CONNECT). Once the WebSocket connection is established, retries no longer apply — the bidirectional stream is managed by the application layer.
 
@@ -172,11 +172,11 @@ backoff: !fixed
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `delay_ms` | integer | `100` | Milliseconds to wait between retries |
+| `delay_ms` | integer | — | Milliseconds to wait between retries (required) |
 
 ### Exponential Backoff with Jitter
 
-Delay doubles on each attempt, capped at a maximum, with decorrelated jitter to prevent thundering herd effects when multiple clients retry against the same failing backend.
+Delay doubles on each attempt, capped at a maximum, with ±50% jitter to prevent thundering herd effects when multiple clients retry against the same failing backend.
 
 ```yaml
 backoff: !exponential
@@ -206,7 +206,7 @@ The default backoff strategy (when `backoff` is not specified) is `!fixed { dela
 
 ## Retry with Load Balancing
 
-When a proxy has both `retry` and `upstream_id` configured, retries automatically select a **different target** from the upstream on each attempt. HTTP/H3 retry loops call `select_next_target()` with the previous **configured** sticky/routing identity excluded. TCP/stream `retry_on_connect_failure` rotation retains only the live `(host, dial port, policy lane)` and excludes through the endpoint-lane contract instead, so it never reselects that effective lane.
+When a proxy has both `retry` and `upstream_id` configured, retries automatically select a **different target** from the upstream on each attempt. HTTP/H3 retry loops call the `select_next_target*_from` snapshot selectors with the previous **configured** sticky/routing identity excluded. TCP/stream `retry_on_connect_failure` rotation retains only the live `(host, dial port, policy lane)` and excludes through the endpoint-lane contract instead, so it never reselects that effective lane.
 
 Rotation honors health state across **all protocols**: candidates that are actively unhealthy or passive-ejected (the `maxEjectionPercent` cap is evaluated against the post-exclusion candidate pool) are skipped. When every remaining candidate is unhealthy or ejected, rotation returns no alternate rather than synthesizing a dial to a known-unhealthy target — HTTP-family retries then re-attempt the previously tried target, and TCP `retry_on_connect_failure` rotation stops looking for an alternate.
 
@@ -250,6 +250,7 @@ When both `retry` and `circuit_breaker` are configured on the same proxy, they w
 1. Each failed retry attempt is recorded as a failure against the target's circuit breaker **before** the next retry.
 2. If the circuit breaker opens for a target during retries, subsequent retry attempts route to different targets (via load balancing).
 3. The circuit breaker uses per-target tracking when an upstream is configured — a single target's breaker opening does not affect other targets.
+4. Every retry attempt is admitted by the breaker of the target it will dial, on every frontend (HTTP/1.1, HTTP/2, HTTP/3 native and cross-protocol, gRPC, WebSocket, TCP). Admission runs after the retry backoff, just before the attempt is dispatched, so no probe slot is held while the retry waits, and a breaker whose open timeout ends during the backoff admits the retry as its recovery probe. A breaker that is still OPEN refuses the retry, and the previous attempt's already-recorded result is served. An attempt's outcome settles on the breaker instance that admitted it. If a configuration reload or a target prune has since replaced that breaker, the outcome is dropped as stale and never applied to the new breaker.
 
 ```yaml
 retry:
@@ -272,7 +273,7 @@ The retry system handles request bodies as follows:
 - **Connection failures**: Only failures classified as pre-wire (DNS, connect, TLS/pool/handshake) bypass the method filter. The retained body is safe to replay because the application received no request bytes.
 - **HTTP status and post-wire failures**: Replay requires both a configured retryable status/error and a method in `retryable_methods`; this is the explicit side-effect/idempotency gate.
 - **Per-attempt phases**: Target selection, health/circuit-breaker checks, backend admission and adaptive-concurrency reservation, DNS, mesh identity/authorization, pool acquisition, and passive-health/outcome recording run for each attempt. Request transforms/finalization do not.
-- **Response streaming**: The retry decision is made from response headers alone (status code, connection-error flag, error class, method), so a proxy configured for streaming streams on *every* attempt, not just the last one. An attempt selected for retry drops its undrained response before any byte reaches the client. See [Interaction with Retry Logic](response_body_streaming.md#interaction-with-retry-logic).
+- **Response streaming**: The retry decision is made from response headers alone (status code, connection-error flag, error class, method), so on the HTTP/1.1 and HTTP/2 frontends, and on the H3 frontend whenever the initial attempt goes through the H3 cross-protocol bridge (every H3 request except plain HTTP dispatched on the native QUIC pool) (its reqwest and gRPC paths; plain-HTTP attempts to HBONE or sidecar mesh-mTLS targets from H3 are always buffered), a proxy configured for streaming streams on *every* attempt, not just the last one. When the H3 frontend's initial attempt is dispatched on the native QUIC pool, the native handler's retry loop buffers each attempt's response instead, including attempts rotated onto non-H3 targets; only its initial attempt can still stream an inherently streaming response, and only when every plugin opts in to releasing it after headers. An attempt selected for retry drops its undrained response before any byte reaches the client. See [Interaction with Retry Logic](response_body_streaming.md#interaction-with-retry-logic).
 
 ## Examples
 

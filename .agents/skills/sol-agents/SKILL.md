@@ -1,11 +1,11 @@
 ---
 name: sol-agents
-description: Dispatch and orchestrate external GPT-6.1 Sol Codex CLI agents for Ferrum Edge issues, PRs, review-feedback fixes, CI repair, and shepherding, with optional fast mode only when the user explicitly requests it. Use when the user asks Codex or GPT to delegate to Sol or Codex CLI workers, run multiple GPT-6.1 Sol agents, select low/medium/high/xhigh/max/ultra reasoning effort, resume interrupted Sol runs, or drive agent-owned branches and PRs. Do not use for Codex-native collaboration subagents or ordinary single-agent work.
+description: Dispatch and orchestrate external GPT-6.2 Sol Codex CLI agents for Ferrum Edge issues, PRs, review-feedback fixes, CI repair, and shepherding, with optional fast mode only when the user explicitly requests it. Use when the user asks Codex or GPT to delegate to Sol or Codex CLI workers, run multiple GPT-6.2 Sol agents, select low/medium/high/xhigh/max/ultra reasoning effort, resume interrupted Sol runs, or drive agent-owned branches and PRs. Do not use for Codex-native collaboration subagents or ordinary single-agent work.
 ---
 
 # Sol agents
 
-Act as the Codex orchestrator. Treat external GPT-6.1 Sol Codex CLI processes as implementation
+Act as the Codex orchestrator. Treat external GPT-6.2 Sol Codex CLI processes as implementation
 workers. Own task decomposition, worktree isolation, effort selection, liveness, independent diff
 review, and the final merge recommendation. Require each worker to carry its assigned scope through
 the stopping point in the prompt. Never accept a worker's report without checking the repository
@@ -49,10 +49,10 @@ prompt, including continuation prompts and any permitted nested delegation.
    - `codex` on `PATH`.
 3. Confirm that the installed CLI supports `--model`, `--config`, `--sandbox`, `--cd`, and reading
    a prompt from stdin with `-`. If the user explicitly requests fast mode, also confirm the
-   installed model catalog advertises a Fast tier for `gpt-6.1-sol` (its ID may
+   installed model catalog advertises a Fast tier for `gpt-6.2-sol` (its ID may
    be `fast` or the compatible `priority` alias), and the CLI accepts `service_tier="fast"`
    with `features.fast_mode=true`.
-4. Use the pinned model `gpt-6.1-sol`. Stop and report the exact error if authentication, model
+4. Use the pinned model `gpt-6.2-sol`. Stop and report the exact error if authentication, model
    access, requested effort, or requested service tier is rejected. Do not silently substitute
    another model, effort, or service tier. Confirm the installed model catalog advertises the
    selected effort (including `ultra`) before dispatch.
@@ -116,7 +116,7 @@ requested; the default is standard. Never infer fast mode from urgency, deadline
 available credits. Carry an explicit choice through continuations of the same task until the user
 changes it, and record the selected mode beside each worker. Do not pass both flags.
 
-The launcher pins `gpt-6.1-sol`, the reasoning effort, `danger-full-access`, the verified worktree
+The launcher pins `gpt-6.2-sol`, the reasoning effort, `danger-full-access`, the verified worktree
 root, and stdin prompt mode. Standard mode (omitted flag or `--no-fast`) pins
 `service_tier="default"`; only `--fast` adds `features.fast_mode=true` alongside
 `service_tier="fast"`. These per-run overrides take precedence over saved speed settings.
@@ -136,16 +136,15 @@ cap.
 Every prompt must contain this role instruction even though the briefs repeat it:
 
 ```text
-YOU are the implementer. Complete every task and validation the controller assigns before ending.
-Do not stop at analysis, partial implementation, or a handoff for someone else to finish. Perform
+YOU are the implementer. Complete every task and validation the controller assigns before ending. Do
+not stop at analysis, partial implementation, or a handoff for someone else to finish. Perform
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
-for a separate review-bot pass unless explicitly assigned. After the final requested push and
-report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents,
-grok-agents, composer-agents, qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
-opencode-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not manually spawn
-nested workers.
-Codex-managed automatic delegation is permitted only when the controller explicitly selected `ultra`.
+for a separate review-bot pass unless explicitly assigned. After the final requested push and report,
+exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch skills or
+scripts (including astra-agents, sol-agents, opus-agents, muse-agents, qwen-agents,
+deepseek-flash-agents, antigravity-neon-agents, or any .agents/skills/*/scripts/dispatch-agent.sh),
+and do not manually spawn nested workers. Codex-managed automatic delegation is permitted only when
+the controller explicitly selected `ultra`.
 ```
 
 This prevents a worker from replacing the selected model or effort through nested delegation.
@@ -212,12 +211,12 @@ into prompts. Never put credentials, tokens, cookies, or secrets in prompts or w
 - An explicitly requested review receives no response: verify the trigger, bot identity,
   availability, and head SHA before posting another trigger.
 - Model, effort, or service-tier mismatch: stop the worker, record the exact diagnostic, correct
-  the launch contract, and relaunch. Never claim a selected effort, `gpt-6.1-sol`, or fast mode
+  the launch contract, and relaunch. Never claim a selected effort, `gpt-6.2-sol`, or fast mode
   without launch evidence.
 
 ## Model contract source
 
-The [GPT-6.1 Sol model page](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
+The [GPT-6.2 Sol model page](https://developers.openai.com/api/docs/models/gpt-6.2-sol)
 lists API efforts `low`, `medium`, `high`, `xhigh`, and `max`; `none` and `minimal` are not
 supported. `ultra` is a Codex harness option: use it only when the installed model catalog
 advertises it. The [Codex speed documentation](https://learn.chatgpt.com/docs/agent-configuration/speed)

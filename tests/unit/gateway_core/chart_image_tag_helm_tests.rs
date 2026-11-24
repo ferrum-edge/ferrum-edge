@@ -96,10 +96,6 @@ fn mesh_workloads_use_image_helper_not_raw_tag() {
             include_str!("../../../charts/ferrum-mesh/templates/control-plane-deployment.yaml"),
         ),
         (
-            "templates/ca-deployment.yaml",
-            include_str!("../../../charts/ferrum-mesh/templates/ca-deployment.yaml"),
-        ),
-        (
             "templates/east-west-gateway-deployment.yaml",
             include_str!("../../../charts/ferrum-mesh/templates/east-west-gateway-deployment.yaml"),
         ),

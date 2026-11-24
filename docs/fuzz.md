@@ -15,12 +15,15 @@ only under `fuzz/` — the production `ferrum-edge` binary does not depend on th
 | `mesh_udp_frame` | HBONE datagram framing | 64 KiB input, 256 frames/invocation | Length prefix bounded; encode/decode round-trip |
 | `k8s_crd` | Istio/Gateway API JSON → translation | 32 objects, depth 64 | Fail-closed translation errors |
 | `plugin_config` | Representative plugin JSON validation (one selector byte followed by JSON) | depth 64 | `validate_plugin_config` never panics |
+| `ocsp_response` | Hand-rolled stapled-OCSP DER grammar (`tls::ocsp::validate_structure_with_policy`), under both the interoperable and the FIPS-enforced profile | 64 KiB (`MAX_OCSP_RESPONSE_BYTES`, equal to the fuzz input budget) | No panic; an accepted response reports the input length and 1–64 `SingleResponse` entries; FIPS acceptance implies interoperable acceptance with the same structure |
+| `jwt_svid` | JWT-SVID strict duplicate-key-refusing JSON parser, compact-token validator, authority PEM admission, and external JWKS bundle admission (one selector byte, then mode-specific bytes; see `fuzz_support::FUZZ_JWT_SVID_MODES`) | 8 KiB token, 4 KiB segment, 64 KiB fuzz input | No panic; no token validates against the fixed fuzz bundle without the authority's signature; an accepted JWKS republishes and re-admits to the same keys |
+| `tls_material` | PEM certificate-bundle and private-key admission (`parse_pem_certificate_bundle`, `parse_pem_private_key`) and CRL window classification (`classify_crl_window`) for PEM bundles and single DER records (selector byte; see `fuzz_support::FUZZ_TLS_MATERIAL_MODES`) | 64 KiB fuzz input, 64 CRL records per input | No panic; an accepted bundle holds 1–4096 records; a CRL admitted at the fixed instant reports a later `nextUpdate` |
 
 The `datagram_client_address` target parses attacker-controlled UDP bytes
 entirely **before** the MAC decision, so it is scheduled in **both** required
 lanes (issue #4442): the `.github/workflows/fuzz.yml` sanitizer matrix and its
-shell allowlist, and the byte-frozen `fuzz-smoke` bounded budget in
-`.github/workflows/ci.yml`. Its entry point walks the header, both
+shell allowlist, and the byte-frozen push-to-main bounded budget in
+`.github/workflows/fuzz-smoke-main.yml`. Its entry point walks the header, both
 application-reserved TLVs (`0xE0` authentication tag, `0xE1` freshness record),
 and — when a freshness TLV is present — the fixed-length freshness value.
 The structural parser the target exercises permits either TLV to be absent
@@ -33,8 +36,8 @@ envelope here is deliberate and is not an authentication decision.
 Both lanes run it at `-max_len=65536`, the target's documented 64 KiB budget
 (`fuzz_support::MAX_FUZZ_INPUT_BYTES`), rather than the smoke loop's generic
 4 KiB ceiling: a parser whose length boundaries are reachable in one required
-lane and unreachable in the other is not actually scheduled. In the smoke job
-it is therefore its own invocation rather than a seventh entry in the
+lane and unreachable in the other is not actually scheduled. In the bounded
+budget it is therefore its own invocation rather than a seventh entry in the
 six-target loop; every other bound (`-runs=512`, `-max_total_time=8`,
 `-timeout=2`, `-rss_limit_mb=1024`) matches the loop's.
 
@@ -44,10 +47,22 @@ truncated header, a TLV whose declared length runs past the address block,
 duplicate authentication and duplicate freshness TLVs, a wrong-length freshness
 value, and an authenticated-shape envelope (freshness + tag TLVs).
 
-Because the whole `fuzz-smoke` job is byte-frozen, scheduling the target
-required a new admitted generation of that job rather than an edit, and the
-`fuzz.yml` whole-file freeze had to move with it. That is a direct-to-`main`
-trusted-policy change; no pull request can carry it.
+`ocsp_response`, `jwt_svid`, and `tls_material` (issue #6584) cover the
+hand-rolled parsers and admission rules for hostile ASN.1, PEM, and JSON input.
+Stapled OCSP responses and TLS material arrive from files, provider URIs,
+Kubernetes Secrets, and the admin API. JWT-SVIDs and federated JWKS bundles
+arrive through the Workload API. All three run in both lanes at the 64 KiB
+fuzz input budget, as their own smoke loop, because their size bounds (64 KiB
+OCSP, 8 KiB token, larger PEM) sit above the six-target loop's 4 KiB ceiling.
+`jwt_svid` validates against a fixed bundle holding the public half of the
+repository's synthetic `tests/fixtures/test_rsa_*.pem` test key. The deterministic
+smoke proves that bundle is admitted and verifies a correctly signed token, so
+fuzz inputs reach signature verification instead of stopping at authority
+admission. Seeds are synthetic DER, PEM, and JSON under
+`fuzz/corpus/{ocsp_response,jwt_svid,tls_material}/`. Every `valid_*` OCSP seed
+must be accepted, every `jwks_valid_*` seed must be an accepted JWKS, and every
+`valid_crl*` seed must be inside its window at the fixed instant
+(`FUZZ_CRL_NOW_UNIX`).
 
 Shared budgets and helpers live in `src/fuzz_support.rs`.
 
@@ -62,54 +77,66 @@ rejects crash artifacts larger than 64 KiB before upload.
 - **PR gate** (`ci.yml` → `Fuzz Smoke`): the locked `proptest` smoke tests
   (`cargo test --locked` in `fuzz/`). This is a required gate for full-mode
   pull requests and merge-queue runs whose changes match the `run_fuzz_smoke`
-  path gate (see [ci_cd.md](ci_cd.md)); every other event runs it
-  unconditionally.
-- **Bounded libFuzzer budget** (same `Fuzz Smoke` job, `if: github.event_name ==
-  'push' || github.event_name == 'workflow_dispatch'`): six targets at ~8 s each
-  (`-runs=512`, `-max_total_time=8`, `-max_len=4096`, `-timeout=2`,
-  `-rss_limit_mb=1024`), then `datagram_client_address` at the same bounds with
-  `-max_len=65536` (issue #4442). It runs on the push to `main` and on manual
-  `workflow_dispatch` of `ci.yml` only (#3902 moved it off `pull_request` for
-  cost, #4238 off `merge_group` for blast radius; the bounds did not change).
-  Every merged change still reaches the budget seconds later through
-  the push to `main`, which is also the only event permitted to populate this
-  lane's cache.
+  path gate (see [ci_cd.md](ci_cd.md)); every other event, including the push
+  to `main`, runs it unconditionally. It caches only the property build, at
+  line-tables-only debuginfo, under the `fuzz-property-smoke` key, which only a
+  push to `main` may write.
+- **Bounded libFuzzer budget** (`.github/workflows/fuzz-smoke-main.yml` →
+  `Fuzz sanitizer smoke`): six targets at `-runs=512`, `-max_total_time=8`,
+  `-max_len=4096`, `-timeout=2`, `-rss_limit_mb=1024`, then `ocsp_response`,
+  `jwt_svid`, and `tls_material` (issue #6584) and `datagram_client_address`
+  (issue #4442) at the same bounds with `-max_len=65536`. It runs on every push
+  to `main` and on manual `workflow_dispatch` only (#3902 moved it off
+  `pull_request` for cost, #4238 off `merge_group` for blast radius; the bounds
+  did not change). Every push to `main` gets its own run of its own commit:
+  runs are serialized and never cancelled, and `queue: max` keeps pending runs
+  queued instead of letting a newer push replace them, so a busy day builds a
+  backlog rather than skipping commits. It is not a required check: until the 2026-11-09 test sweep
+  it was a step of the required `Fuzz Smoke` job, where its ~55-minute
+  sanitizer build kept main's serialized `CI` run open for 25–55 minutes after
+  every other job had finished, while every target reached `-runs=512` in 0–2
+  seconds. Its cache holds only the Cargo registry (`cache-targets: "false"`).
 - **Scheduled sanitizer lane** (`.github/workflows/fuzz.yml`): AddressSanitizer
-  builds of all seven targets, 300 s per target at `-max_len=65536`, bounded
+  builds of all ten targets, 300 s per target at `-max_len=65536`, bounded
   crash artifacts uploaded after size/count checks, a 2048 MiB RSS cap, 7-day
   retention, and concurrency capped at two targets. Unchanged by #3902/#4238.
 
 `cargo fuzz run` defaults to AddressSanitizer, so the bounded budget is a
-sanitizer build in both lanes. That build, not the fuzzing, was the cost: the
-`Fuzz Smoke` job averaged ~47 minutes on pull requests, of which ~39 minutes was
-compiling the instrumented targets for ~48 seconds of fuzzing. The `Fuzz Smoke`
-job now uses the repository's checksum-pinned `setup-sccache` action, then
-selects its cache backend: `setup-boringcache` runs first, and
-`Swatinem/rust-cache` (fuzz workspace, `fuzz-smoke` shared key) runs only as
-the legacy fallback when `CI_BORINGCACHE_ENABLED` is not `true`. The fallback
-does not archive the local `.cache/sccache` directory; BoringCache retains
-compiler objects through its own adapter instead. On the fallback, `save-if`
-is strictly `${{ github.event_name == 'push' && github.ref ==
-'refs/heads/main' }}`: pull requests (including same-repository PR refs and
-forks), `merge_group`, and `workflow_dispatch` never publish a `fuzz-smoke`
-cache. The generation that predates #3902 had no `save-if` at all, which is how
-a full-mode predecessor PR could still mint a PR-ref Fuzz cache; neither
-admitted generation can create another.
+sanitizer build in both libFuzzer lanes. That build, not the fuzzing, is the
+cost (measured at `opt-level = 3`, before the build profile below): about 47
+minutes for the first target plus about 8 minutes of serial per-target
+rebuilds, for fewer than ten seconds of fuzzing in total. Caching the sanitizer
+target directory did not help: rust-cache drops the `ferrum-edge` path dependency and every vendored patch crate, so a restore
+(about three minutes for 7.2 GB) saved about three minutes of compile, and the
+entry evicted `ci-standalone-cargo` on alternate main runs. The property gate
+reuses compiler output only through `Swatinem/rust-cache` and installs no
+compiler-cache wrapper (its never-persisted local sccache store measured 0 hits,
+#7285); it clears every rustc-wrapper input, holds only `contents: read` and
+uses no remote compiler-cache backend. Both smoke caches (`fuzz-property-smoke` and
+`fuzz-sanitizer-smoke`) save only under the strict `save-if`
+`${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`: pull
+requests (including same-repository PR refs and forks), `merge_group`, and
+`workflow_dispatch` never publish one. The scheduled `fuzz.yml` lane keeps its
+own frozen `fuzz-sanitized` cache, which runs only on `schedule` and
+`workflow_dispatch` and has no such predicate.
 The credential-bearing sccache GHA backend is never enabled. After a
 successful property-smoke command the run logs `Fuzz property smoke seconds`,
 and after a successful sanitizer budget `Fuzz sanitizer lane seconds`; both
 echoes sit after their commands under `set -e`, so a failed or skipped
-command emits no duration line. The closing report step runs on every
-outcome: it prints the lane shape the run took and whether the sccache
-wrapper is available (pointing at the BoringCache command logs for cache
-results), warning when the wrapper is unavailable. The job no longer emits
-`sccache --show-stats` or an on-disk cache-size report; before the sanitizer
-budget it only checks wrapper availability and warns when it is absent.
+command emits no duration line. The property gate's closing report step runs
+on every outcome: it prints the lane shape, a closing `--show-stats`, and the
+on-disk cache size, and emits a warning annotation when sccache is
+unavailable.
 
-Both hosted shapes are byte-frozen by the trusted Cross build policy. The
-`fuzz-smoke` job is admitted as two generations with a one-way transition
-(`CI_FUZZ_SMOKE_JOB_GENERATIONS`); see
-[ci_cd.md](ci_cd.md#admitted-fuzz-smoke-lane-split-generation).
+All three hosted shapes are byte-frozen by the trusted Cross build policy. The
+`fuzz-smoke` job is admitted as an ordered list of generations with one-way
+transitions (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, currently one generation:
+#7398's swap transition is retired);
+`fuzz.yml` (`FUZZ_WORKFLOW`) and
+`fuzz-smoke-main.yml` (`FUZZ_SANITIZER_SMOKE_WORKFLOW`) are whole-file
+contracts; see [ci_cd.md](ci_cd.md#admitted-fuzz-smoke-generations).
+Scheduling a new target therefore moves both whole-file freezes, a
+trusted-policy change that no ordinary pull request can carry.
 
 The fuzz crate links the main Ferrum Edge crate, whose Kafka dependency builds
 `librdkafka` from source with OAuthBearer OIDC disabled. librdkafka 2.12.1
@@ -160,65 +187,55 @@ in the `fuzz/` crate per `docs/dependency-policy.md`.
 
 ## Compile-time resource observations (#4694)
 
-The existing main/manual sanitizer smoke step emits `Fuzz build resources:`
-JSON records during compilation and its unchanged seven-target run. Samples
-are spaced 30 seconds apart, capped at 240 records and two hours, and written
-directly to the hosted log. Hard runner loss can prevent that log from being
-published: the first observer trial lost communication and left no retrievable
-Fuzz log or resource samples. Outer job status can also lag the actual failed
-step; compare step timestamps before inferring ongoing compilation.
-The observer stops with the owning shell and preserves its original exit code.
+The push-to-main / manual sanitizer smoke step (`fuzz-smoke-main.yml`) emits `Fuzz build resources:` JSON records
+to the hosted log during compilation and its sanitizer target run: samples 30
+seconds apart, capped at 240 records and two hours, holding only numeric host
+memory/swap, root-cgroup, and visible-process RSS counters (no process
+arguments, environment, request bytes, or corpus data). A second, best-effort
+channel emits at most nine notice annotations at first threshold crossings.
+Thresholds only select diagnostic samples and never stop the build. Hard runner
+loss can lose both channels, notices may be delayed or omitted while the step
+is live, and missing records do not prove absence of memory pressure. RSS sums
+double-count shared pages and root-cgroup counters may include other runner
+processes, so no sample alone proves a rustc OOM; compare the final samples and
+OOM counters with the runner's termination annotation.
 
-A second, best-effort channel emits at most nine notice annotations: the initial
-sample, first available-memory crossings of 75/50/25/10/5 percent, first free-swap
-crossings of 25/5 percent when swap exists, and the first increase in exposed root
-cgroup OOM counters. Simultaneous reasons share one annotation. Notices carry
-only selected numeric counters, are queued as runner timeline issues,
-and do not grant API credentials to the observer or compiler. Results-only live
-step updates can omit annotations; queuing does not establish that the Checks
-API exposes them before step/job completion. They can also be
-lost if the runner stops before forwarding them; missing records do not prove
-absence of memory pressure. Validate retrieval on a hosted run before relying
-on this channel. Thresholds select diagnostic samples and do not stop the build.
-The [notice command](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#setting-a-notice-message)
-and [runner issue handling](https://github.com/actions/runner/blob/0b0ac2fdabf53d69add6175026945b8afc8549a5/src/Runner.Worker/ExecutionContext.cs#L795)
-describe the annotation path and the ten-notice limit; these are not a delivery
-guarantee after runner loss.
+Both sanitizer lanes (`fuzz-smoke-main.yml` on main/manual and the scheduled `fuzz.yml`)
+add a bounded 12 GiB swap file under `/mnt` before building, because the
+AddressSanitizer release compile exceeds a 16 GiB RAM + 3 GiB swap runner (the
+2026-10-01 observer sample recorded a 14.6 GiB rustc RSS peak). Provisioning
+fails visibly if allocation or activation fails; toolchain, profile, sanitizer,
+targets, and every libFuzzer bound are unchanged. Trial data and the scheduled
+lane's failure history are on issue
+[#4694](https://github.com/ferrum-edge/ferrum-edge/issues/4694).
 
-Records contain host available memory/swap, swap page counters, root cgroup
-memory limits/events when exposed, and an RSS summary of at most 1,024 visible
-processes. No process arguments, environment, request bytes or corpus data are
-read or logged. Missing kernel counters are reported as null. RSS sums double
-count shared pages, sampled maxima are not exact peaks, and root cgroup counters
-may include other runner processes; none alone proves that rustc exhausted
-memory. Compare the final samples and cgroup OOM counters with the runner's
-termination annotation before attributing a shutdown to resource pressure.
+### Sanitizer build profile
 
-The second trial recovered 44 samples and six notices after a runner shutdown
-(exit 143). The largest visible process reached about 14.3 GiB RSS, available
-host memory fell below 250 MiB and the 3 GiB swap area had less than 45 MiB free.
-Root cgroup OOM counters were unavailable, so this establishes severe sampled
-pressure without proving a kernel OOM kill or the exact shutdown cause. Notices
-were not observed through the Checks API during the run; both channels became
-available afterward, so this is not proof of recovery after hard runner loss.
+`cargo fuzz run` (cargo-fuzz 0.13.1) builds with `--release`, so both libFuzzer
+lanes compile with `fuzz/Cargo.toml`'s `[profile.release]`. Cargo-fuzz already
+passes `--config 'profile.release.debug="line-tables-only"'` plus ASan,
+SanitizerCoverage, and `-Ccodegen-units=16`, without setting `-Copt-level`.
+Even with the extra swap, the `opt-level = 3` build lost the smoke runner in
+5 of 30 pushes to main: in run 44461627224 compiling the `ferrum-edge` library
+peaked at 14.66 GiB largest-process RSS (with 2.33 GiB host swap used) and
+9.26 GiB host swap used (with 12.53 GiB largest-process RSS) on a 15.6 GiB
+runner, `MemAvailable` fell to 0.17 GiB, and that crate alone took 39 minutes
+under ~48.6 GiB of swap I/O. The profile is now:
 
-Main/manual jobs now add a bounded 12 GiB swap file under `/mnt`, following the
-existing unit/PKCS11 provisioning. Existing swap remains enabled; provisioning
-fails visibly if allocation or activation fails. The observer records whether
-this adds useful headroom, and a fresh full run must validate it. Paging may
-increase wall time; this is not a measured latency improvement. Compiler/profile/
-cache settings, AddressSanitizer, all seven targets and every libFuzzer bound
-remain unchanged.
+| Setting | Value | Why |
+|---------|-------|-----|
+| `[profile.release]` `opt-level` | `2` | Target dependencies and fuzz binaries stay optimized (host build scripts and proc macros keep Cargo's O0 default); they were never the memory peak |
+| `[profile.release.package.ferrum-edge]` `opt-level` | `1` | Cuts the inlining/unrolling/vectorization IR growth in the `ferrum-edge` compilation (including the generic instances emitted there); O1 is ASan's usual floor for reasonable speed |
+| `debug` | `"line-tables-only"` | Aligns direct Cargo builds with what cargo-fuzz 0.13.1 already passes to the hosted lanes, retaining file:line and inlined-frame data for ASan and libFuzzer stack traces |
 
-The scheduled sanitizer lane (`fuzz.yml`) builds the same AddressSanitizer
-release library with the same profile and `--codegen-units 16`, but had only
-the runner's 3 GiB swap. On 2026-10-01 the `fuzz-smoke` observer recorded a
-14.6 GiB rustc RSS peak and about 22-23 GiB of RAM plus swap in use (up to
-7.9 GiB of swap) during that compile, which a 16 GiB RAM + 3 GiB swap runner
-cannot hold. As `ferrum-edge` grew (the `src/` tree is about 10% larger than on
-2026-09-07, the last all-green week), scheduled lanes started dying inside that
-compile with the runner shutdown signal: 1/7 on 2026-09-14, 7/7 on 09-21, 3/7
-on 09-28, and 7/7 on the first `nightly-2026-09-30` dispatch. The lane now adds
-the same bounded 12 GiB `/mnt` swap file before building; the toolchain,
-profile, sanitizer, targets, matrix concurrency and every libFuzzer bound are
-unchanged.
+An earlier branch trial (`workflow_dispatch` run 43900143614) confirmed that
+`CARGO_BUILD_JOBS=2` with the existing `line-tables-only` debug level still
+lost the runner; the `opt-level` reduction is the active change, with actual
+peak-memory savings pending measurement in hosted `Fuzz build resources:` logs.
+
+`[profile.fuzz]` and `[profile.fuzz-with-sanitizer]` inherit `release`, including
+the package override. Historical O3 timings showed headroom (the smoke's
+`-runs=512` finished in 0–2 seconds per target against the 8 second cap), and
+the scheduled lane is time-bounded, so slower execution lowers its execution
+count; verify each target's `Done 512 runs` line and `Fuzz build resources:`
+records in hosted runs of the new profile.

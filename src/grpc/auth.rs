@@ -9,7 +9,7 @@
 //! # Audience binding (issue #2475)
 //!
 //! Issuer + expiry + signature bind a token to a *credential*, not to a
-//! *destination*. Two clusters that share the deprecated fallback
+//! *destination*. Two clusters that share the fleet-wide
 //! `FERRUM_CP_DP_GRPC_JWT_SECRET` and the same issuer therefore used to accept
 //! each other's cross-cluster remote-discovery tokens. Every gRPC surface now
 //! runs an explicit [`GrpcAudiencePolicy`] on top of the existing checks:
@@ -220,8 +220,7 @@ fn parse_audience_claim(claims: &Value) -> Result<Option<String>, AudienceReject
         if normalized.len() > 1 {
             return Err(AudienceRejectReason::Ambiguous);
         }
-        // `normalized` is non-empty here (the empty array returned above and
-        // dedup cannot empty a non-empty vector).
+        // `normalized` is non-empty here (the empty array returned above).
         return Ok(normalized.pop());
     }
 
@@ -372,15 +371,6 @@ impl AllowedNamespaces {
             None
         }
     }
-}
-
-#[allow(clippy::result_large_err, dead_code)]
-pub(crate) fn verify_grpc_jwt_metadata(
-    metadata: &tonic::metadata::MetadataMap,
-    verifier: &CpDpVerifier,
-    expected_issuer: &str,
-) -> Result<(), Status> {
-    verify_grpc_jwt_metadata_with_claims(metadata, verifier, expected_issuer, None).map(|_| ())
 }
 
 /// Authenticated gRPC bearer identity: tenant namespace ceiling plus the JWT
@@ -921,35 +911,6 @@ where
         }
         next
     }
-}
-
-/// Verify the JWT and return any `ns` claim it carried. Use this variant
-/// whenever the caller needs the tenancy-claim path (CP `Subscribe` and
-/// `GetFullConfig` today). The verification logic is identical to
-/// [`verify_grpc_jwt_metadata`]; the only difference is the extra claim
-/// extraction.
-///
-/// Audience posture is [`GrpcAudiencePolicy::ReservedForbidden`]: these
-/// surfaces do not mint or expect an audience, but they must never honor a
-/// token minted for the cross-cluster remote-discovery purpose. Surfaces that
-/// need a real audience check call
-/// [`verify_grpc_jwt_metadata_with_audience`].
-#[allow(clippy::result_large_err)]
-pub(crate) fn verify_grpc_jwt_metadata_with_claims(
-    metadata: &tonic::metadata::MetadataMap,
-    verifier: &CpDpVerifier,
-    expected_issuer: &str,
-    peer: Option<&CpGrpcConnectInfo>,
-) -> Result<AllowedNamespaces, Status> {
-    verify_grpc_jwt_metadata_with_audience(
-        metadata,
-        verifier,
-        expected_issuer,
-        GrpcAudiencePolicy::ReservedForbidden,
-        peer,
-    )
-    .map(|identity| identity.allowed_namespaces)
-    .map_err(|(status, _)| status)
 }
 
 /// Reserved-audience verification variant for long-lived ConfigSync and ADS

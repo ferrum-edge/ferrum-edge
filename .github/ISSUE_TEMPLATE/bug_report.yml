@@ -97,6 +97,10 @@ body:
         - file
         - cp (Control Plane)
         - dp (Data Plane)
+        - mesh
+        - injector
+        - node_agent
+        - migrate
         - Other
   - type: checkboxes
     id: checks

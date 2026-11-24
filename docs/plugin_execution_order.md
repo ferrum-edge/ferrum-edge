@@ -35,7 +35,16 @@ WebSocket connections optionally enter a frame phase after the HTTP upgrade
 completes. Successful H1/H2/H3 WebSocket handshakes run a synchronous,
 non-rejecting response-header decoration boundary in configured priority order
 before transport-owned handshake fields are restored. Plugins only run in the
-phases they implement:
+phases they implement. For `on_request_received`, `before_proxy`, `after_proxy`,
+and `log`, which have no other participation predicate, dispatchers consult
+each plugin's `lifecycle_hooks()` declaration and skip a hook it does not
+implement instead of awaiting the trait's no-op default (issue #6615). Skipping
+changes no ordering or result: a skipped hook yields the default's `Continue`
+at its position in the chain, chain-level work tied to that position (route
+header finalization, per-plugin header snapshots) still runs, and a skipped
+`after_proxy` still refuses an elapsed pre-commitment deadline as the no-op
+did. Custom plugins default to every hook, and an instance with an execution
+trigger keeps every hook dispatched:
 
 ```
 Request In
@@ -186,8 +195,19 @@ Request In
 `on_request_received` is therefore a post-route, post-allowed-method hook, not
 a pre-routing receipt hook. Once it runs, `ctx.matched_proxy` is populated and
 the plugin list is the resolved view for that proxy: applicable global plugins
-plus proxy/proxy-group-scoped plugins. Unmatched 404 responses run neither
-global nor scoped hooks because there is no proxy view to select. Matched 405
+plus proxy/proxy-group-scoped plugins. Unmatched 404 responses have one narrow
+exception: the generation's global `correlation_id` instances resolve their
+IDs and decorate the error response in priority order. Their `inbound_policy`
+and `echo_downstream` settings apply on H1/H2/H3, and their canonical
+`request_id` reaches the unrouted access log.
+No other ordinary request policy runs because there is no proxy view to
+select. These responses emit one terminal transaction summary to every global
+`stdout_logging` instance that carries no execution trigger (no proxy,
+backend, or consumer; `metadata.rejection_phase = "route_not_found"`), on
+HTTP/1.1, HTTP/2, and HTTP/3 alike, so scanner and stale-route traffic reaches
+the access log. Other sinks and trigger-gated instances do not receive it, and a
+generation with neither a global correlation policy nor such a logger keeps
+the allocation-free route-miss path. Matched 405
 responses also return before either kind of ordinary request hook runs, but
 they still emit one terminal transaction summary from the protocol-filtered
 plugin-cache view (`metadata.rejection_phase = "allowed_methods"`) without
@@ -205,7 +225,13 @@ A matched request using a different method is rejected at its protocol
 admission gate before either kind of hook, even if `allowed_methods` permits
 that method. H1, H2, and H3 share the ordinary-hook blind spots for unmatched
 404 and gRPC non-POST admission; matched-proxy `allowed_methods` 405 responses
-are included in transaction logs. Terminal transaction logging is separate from
+are included in transaction logs, unmatched 404 responses reach global
+`stdout_logging` as described above, and gRPC non-POST refusals are logged once
+with `rejection_phase: "grpc_post_required"` and the status the wire carries
+(`200` for native gRPC and gRPC-Web). Unmatched-route 404s (and mesh `REGISTRY_ONLY` route-miss refusals) are
+also counted on `/metrics` by the shared route-miss path as
+`ferrum_unmatched_requests_total`, independent of any plugin. Terminal
+transaction logging is separate from
 ordinary request hooks; whether a terminal summary exists must not be inferred
 from whether `on_request_received` ran.
 
@@ -231,7 +257,10 @@ segments used by the backend URL builder, including regex/exact/prefix match
 length, the canonical policy path, `strip_listen_path`, `backend_path`, and
 the selected target's path. `grpc_method_router` uses this phase so
 allow/deny/rate policy and `grpc_*` metadata describe the method placed on the
-backend wire. The selected target remains pinned across deferred external hooks,
+backend wire. A `grpc`-enrolled `ai_transcript_audit` joins it too, so the
+proxy binds the backend-effective path its enrollment decision reads; that
+bound path is authoritative, and the plugin-writable `grpc_full_method` only
+stands in before it is bound. The selected target remains pinned across deferred external hooks,
 so routing-header mutations cannot steer the request onto a different method.
 The gateway enforces the selected path, including stateful per-method rate
 limits, exactly once before invoking those hooks or a terminal final-request-
@@ -245,7 +274,11 @@ the same assembled effective backend path, including the proxy `backend_path`
 fallback when a target has no explicit path. A candidate with a different path
 aborts the retry instead of redialing the failed target or silently changing
 the authorized method. This applies to HTTP, native and bridged gRPC/H3, and
-WebSocket retry loops.
+WebSocket retry loops. A `grpc`-enrolled `ai_response_guard` joins this
+boundary as well: the bound backend-effective path (its trailing
+`/Service/Method`) is the method its enrollment, buffering vote, inspection,
+and redaction read, never outranked by the plugin-writable `grpc_full_method`, so a guard-only route with `strip_listen_path` or a
+`backend_path` still governs the method the backend serves.
 
 When backend-path policy is active, `before_proxy` hooks that can dispatch
 external work or synthesize a terminal response opt into the deferred phases.
@@ -499,9 +532,9 @@ Phases 8 (`normalize_response_body`) and 10 (`transform_response_body`) are the 
 
 Peak accounting follows from (2): while a rewrite runs, the body being read from and the covering window are both charged, so a maximum-size rewritten response peaks at **two** ceilings.
 
-When a plugin returns a replacement body from `transform_response_body`, the core first removes representation metadata that can no longer describe the client-visible bytes: range fields, ETag/Last-Modified validators, content digests/checksums, and content-bound signatures. It then calls that plugin's `on_response_body_transformed` callback before the next transform, allowing the plugin to attach metadata it recomputed for the replacement representation. Neither step runs when the transform returns `None`, so unmodified responses retain their original semantics — with one exception: a body the representation gate **decoded** has already had its client-visible bytes changed (encoded in, identity out), so that same metadata invalidation is applied at the decode itself, whether or not a later rule matches. Otherwise a decoded body no rule happened to change would be served as identity bytes carrying the origin's validator for the encoded ones. `206 Partial Content` and `226 IM Used` responses that no configured body policy claims skip provider normalization and presentation transforms entirely: the buffered bytes are only a selected range or delta, so Ferrum cannot rewrite them into a truthful full representation merely by changing headers or status. When a configured body policy *does* claim such a response, skipping the transform would silently forward protected bytes, so the representation gate described below rejects it instead — see [Buffered response representation gate](#buffered-response-representation-gate). Transform-dependent header hooks also decline these statuses: compression does not attach `Content-Encoding`, gRPC-Web does not relabel native gRPC bytes or expose transformed trailers, and SSE does not force a non-SSE representation into event-stream headers when wrapping cannot run. Inspection hooks still run. If an enforcing policy detects content whose safe disposition requires redaction, it rejects the response instead of forwarding the original bytes with false redaction telemetry. This lifecycle rule is shared by buffered H1, H2, H3, gRPC, and synthetic/rejection response paths rather than delegated to individual transformer implementations.
+When a plugin returns a replacement body from `transform_response_body`, the core first removes representation metadata that can no longer describe the client-visible bytes: range fields, ETag/Last-Modified validators, content digests/checksums, and content-bound signatures. It then calls that plugin's `on_response_body_transformed` callback before the next transform, allowing the plugin to attach metadata it recomputed for the replacement representation. Neither step runs when the transform returns `None`, so unmodified responses retain their original semantics — with one exception: a body the representation gate **decoded** has already had its client-visible bytes changed (encoded in, identity out), so that same metadata invalidation is applied at the decode itself, whether or not a later rule matches. Otherwise a decoded body no rule happened to change would be served as identity bytes carrying the origin's validator for the encoded ones. `206 Partial Content` and `226 IM Used` responses that no configured body policy claims skip provider normalization and presentation transforms entirely: the buffered bytes are only a selected range or delta, so Ferrum cannot rewrite them into a truthful full representation merely by changing headers or status. When a configured body policy *does* claim such a response, skipping the transform would silently forward protected bytes, so the representation gate described below rejects it instead — see [Buffered response representation gate](#buffered-response-representation-gate). Transform-dependent header hooks also decline these statuses: compression does not attach `Content-Encoding`, gRPC-Web does not relabel native gRPC bytes or expose transformed trailers, and SSE neither wraps nor forces a non-SSE representation into event-stream headers. Inspection hooks still run. If an enforcing policy detects content whose safe disposition requires redaction, it rejects the response instead of forwarding the original bytes with false redaction telemetry. This lifecycle rule is shared by buffered H1, H2, H3, gRPC, and synthetic/rejection response paths rather than delegated to individual transformer implementations.
 
-Gateway-generated synthetic responses normally skip the body pipeline when they contain zero bytes. A validator whose contract distinguishes an empty representation from a valid one can opt into zero-byte processing; `openapi_validator` does so for matching response contracts, keeping empty synthetic and buffered backend responses under the same final-schema rule. HEAD and 1xx/204/205/304 responses retain their no-body semantics and do not enter this path.
+Gateway-generated synthetic responses normally skip the body pipeline when they contain zero bytes. A validator whose contract distinguishes an empty representation from a valid one can opt into zero-byte processing; `openapi_validator` does so for matching response contracts, keeping empty synthetic and buffered backend responses under the same final-schema rule, and `ai_response_guard` does so for successful responses when `require_json` or `required_fields` is active, so an empty synthetic `200` is refused exactly like an empty backend one. HEAD and 1xx/204/205/304 responses retain their no-body semantics and do not enter this path.
 
 ### Authoritative backend-visible request representation phase
 
@@ -518,6 +551,9 @@ is part of the question: a `monitor`-mode WAF, a rule set whose applicable body
 rules only log, or a body the operator opted out of scanning with
 `on_body_too_large: skip` all lose an observation when a body is unscannable,
 which is not a protection-mechanism failure and does not become a `400`.
+`ai_transcript_audit` claims candidate-shaped `POST`s only under a fail-closed
+sink policy (`sink.on_buffer_full: reject` or `sink.on_sink_error: reject`),
+because only then can it refuse a request it cannot audit.
 
 - **Nothing claims the request, or the finalized bytes are identity-coded.**
   Nothing changes. Ordinary compressed uploads keep flowing to backends that
@@ -600,6 +636,16 @@ output-policy phase between them (`GHSA-62jg-v563-4q23`,
    over the exact bytes the client will receive. `waf` (response body scan),
    `body_validator` (response validation), and `ai_response_guard`
    (undischarged-redaction check plus a residual re-detection) decide here.
+   `response_transformer` participates only for a response whose JSON body its
+   semantic-stage rules refused as ambiguous (duplicate member names, a
+   document past the duplicate-key screen's budgets, or one the rule engine
+   cannot materialize; `GHSA-pq95-952r-2x32`). Only the instance whose rules
+   refused it participates, and it replaces the response with a `502` so the
+   ambiguous bytes are never published. When an earlier inspection-stage
+   rejection already owns the response, this sweep stays closed, but the
+   lifecycle still invokes the finalize hook of a plugin whose own transform
+   staged such a refusal over that replacement
+   (`has_staged_response_body_transform_refusal`), and of no other policy.
    Header policy is NOT decided here — the header map is not final at this point
    on the synthetic lifecycle — it is decided in
    `finalize_client_visible_response_headers` below.
@@ -611,7 +657,7 @@ Why the split matters:
 
 - Without it, `compression` (4050) would encode the body before WAF's and
   `body_validator`'s final response hooks and before `ai_response_guard`'s
-  redaction transform: the WAF would match gzip/Brotli octets, the validator
+  redaction transform: the WAF would match gzip/Brotli/zstd octets, the validator
   would read them as non-UTF-8 and skip, and a promised redaction could not
   parse them while its metadata already claimed one.
 - `ai_response_guard` inspects at phase 9, before `response_transformer`. Its
@@ -622,8 +668,13 @@ Why the split matters:
   inspection defers to the charged representation decoder and this final
   plaintext check. A private per-instance digest recognizes the exact HTTP
   output already verified by the redactor, including generated placeholders
-  and deliberately preserved structural scalars. Changed bytes or media types
-  require fresh detection; size, structure, and length checks still run.
+  and deliberately preserved structural scalars; native gRPC redactions are
+  recognized the same way, bound to their `grpc-encoding`. Changed bytes or
+  media types require fresh detection; size, structure, and length checks still
+  run. A second, private per-instance witness records a representation phase 9
+  inspected and decided completely (no origin-decoding deferral, no pending
+  redaction); the final phase skips its re-parse and re-scan only when status,
+  media type, `grpc-encoding`, and bytes are all unchanged.
 
 The phase also runs when the transform phase is skipped (an unclaimed `206`/`226`
 representation), because it is non-rewriting and must still decide.
@@ -826,7 +877,7 @@ Post-routing method-filter responses and native-gRPC gateway errors also apply t
 
 If `on_response_body`, the shared representation gate, or a body-transform deadline has already selected a gateway-authored terminal response, the remaining presentation/protocol transforms may still run to preserve the client's wire shape, but `on_final_response_body` is skipped. A final validator or storage hook must never reinterpret the gateway's error payload and replace the first fail-closed decision. `on_response_committed` still observes the response that will actually be sent.
 
-`on_response_stream_terminated` is streaming-only. It receives mutable request context plus the terminal body outcome and response status, cannot replace the response or access a full body buffer, and fires before the final `TransactionSummary.metadata` snapshot and `log` from the same deferred terminal path used for streaming accounting. It is distinct from `ResponseStreamInspector` chunk inspection: this hook is for state cleanup, accounting, and aggregate metadata write-back after the stream ends. Plugins can key bounded shared inspector state by `ctx.response_stream_id()`, remove it here on every terminal outcome (including client disconnect), and write the aggregate into `ctx.metadata`; for example, `ai_tool_governor` writes streamed dry-run decisions before transaction logging. `request_deduplication` uses the same hook to release an ordinary non-buffered streamed marker on clean completion (`body_completed`) but intentionally retains it until `inflight_ttl_seconds` when the stream is interrupted (client disconnect or backend error). When the stream sits behind a declared completed external operation — a terminate-mode `serverless_function` that may already have executed before `on_error: continue` fell through to the stream, or a plugin that marked `ferrum:external_operation_completed` — the hook instead publishes a durable non-replayable 409 completion tombstone (locally, and in Redis through the fenced ownership transition) on both clean and interrupted terminations. That closes the gap where an already-charged operation became re-executable the moment the raw in-flight lease expired: a same-key retry is refused for `max(ttl_seconds, inflight_ttl_seconds)`, never merely for `inflight_ttl_seconds` and never for less.
+`on_response_stream_terminated` is streaming-only. It receives mutable request context plus the terminal body outcome and response status, cannot replace the response or access a full body buffer, and fires before the final `TransactionSummary.metadata` snapshot and `log` from the same deferred terminal path used for streaming accounting. It is distinct from `ResponseStreamInspector` chunk inspection: this hook is for state cleanup, accounting, and aggregate metadata write-back after the stream ends. Plugins pass inspector state to this hook through the request-owned `ctx.response_stream_handoff()` under a per-instance key (from `allocate_response_stream_handoff_id()`), take it here on every terminal outcome (including client disconnect), and write the aggregate into `ctx.metadata`; the handoff drops with the request context if the hook is cancelled. For example, `ai_tool_governor` writes streamed dry-run decisions and `a2a_gateway` its stream counters before transaction logging. `request_deduplication` uses the same hook to release an ordinary non-buffered streamed marker on clean completion (`body_completed`) but intentionally retains it until `inflight_ttl_seconds` when the stream is interrupted (client disconnect or backend error). When the stream sits behind a declared completed external operation — a terminate-mode `serverless_function` that may already have executed before `on_error: continue` fell through to the stream, or a plugin that marked `ferrum:external_operation_completed` — the hook instead publishes a durable non-replayable 409 completion tombstone (locally, and in Redis through the fenced ownership transition) on both clean and interrupted terminations. That closes the gap where an already-charged operation became re-executable the moment the raw in-flight lease expired: a same-key retry is refused for `max(ttl_seconds, inflight_ttl_seconds)`, never merely for `inflight_ttl_seconds` and never for less.
 
 ### Synthetic-response completion contract
 
@@ -895,8 +946,22 @@ Removed from the trailer section: RFC 9110 §7.6.1 request-direction hop-by-hop
 and framing fields (`connection`, `expect`, `keep-alive`, `proxy-authorization`,
 `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`,
 `content-length`); reserved gateway assertions (the whole `x-consumer-*`
-namespace and `x-geo-country`); Ferrum-owned names (`x-ferrum-*`,
-`x-path-param-*`); credentials (`authorization`, `cookie`, `x-api-key`);
+namespace and `x-geo-country`, matched with the same ASCII-case-insensitive,
+`_`-equals-`-` predicate as the initial header block, so `x_geo_country`,
+`x_geo-country`, and `x-geo_country` are removed too); Ferrum-owned names
+(`x-ferrum-*`, `x-path-param-*`); credentials (`authorization`, `cookie`,
+`x-api-key`, plus every credential header location the route's auth plugins
+configure — a `key_auth` `header:<name>`, a custom `jwt_auth` / `jwks_auth` /
+`oauth2_introspection` token header — removed whether or not
+`hide_credentials` is set, because trailers are never a credential location);
+every gateway-asserted request header a plugin on the route owns, whatever
+that instance's execution trigger decides (`claim_headers` /
+`output_claim_headers` destinations of `jwks_auth`, `oauth2_introspection`,
+and `oidc_relying_party`, `opa` `decision_request_headers`, and
+`spiffe_identity` `x-ferrum-peer-spiffe-id`; route-configured names are matched
+ASCII-case-insensitively with `_` read as `-`). Untranslated gRPC-Web carries
+its trailers inside the body, where only the `grpc_web` translator parses
+them, so it is refused with `415` on a route that owns such a header;
 forwarding identity the gateway regenerates (`x-forwarded-*`, `forwarded`);
 initial-only gRPC call parameters (`grpc-*`); the gateway-owned `early-data`
 marker; the initial-section-only `via` intermediary chain; and header-section
@@ -937,7 +1002,7 @@ Connection/Session In
 
 **Phase 2 — `on_stream_disconnect`**: Runs after the stream completes (TCP connection closed, or a UDP/DTLS session expires, is cleaned up, or otherwise ends). Receives a `StreamTransactionSummary` with bytes transferred, duration, error info, and metadata from the connect phase. Fire-and-forget — does not block cleanup.
 
-Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream proxy because it is relayed through a mesh CONNECT tunnel. Those handlers run only the `workload_metrics` connect/disconnect lifecycle, once per logical captured session, to produce the source-side outbound CLIENT span with final duration, bytes, and error state. They do not run authentication, authorization, throttling, or other policy plugins a second time; destination-side mesh authorization remains the enforcement point.
+Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream proxy because it is relayed through a mesh CONNECT tunnel. Those handlers run only the configured built-in observability plugins — `workload_metrics` and `prometheus_metrics` — through the connect/disconnect lifecycle, once per logical captured session, in the configured chain's order and with its priority overrides and execution-trigger wrappers. `workload_metrics` produces the source-side outbound CLIENT span with final duration, bytes, and error state; `prometheus_metrics` records the stream summary and the mesh TCP opened/closed and byte families. Custom plugins that reuse either name are never selected. They do not run authentication, authorization, throttling, or other policy plugins a second time; destination-side mesh authorization remains the enforcement point.
 
 ### Stream Hook Implementations by Plugin
 
@@ -947,8 +1012,8 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 | `spiffe_identity` | ✓ | | Extracts peer SPIFFE IDs from TLS/DTLS client certificates |
 | `mtls_auth` | ✓ | | Maps the client certificate to a Consumer on TCP+TLS or UDP+DTLS |
 | `access_control` | ✓ | | Applies consumer and group allow/deny rules once a stream Consumer exists |
-| `mesh_authz` | ✓ | | Applies Layer 2 mesh authorization policies from SPIFFE/HBONE identity. Istio `AuthorizationPolicy` is a destination-side contract, so the plugin evaluates policy only on **inbound** mesh legs; the Sidecar/Ambient outbound capture leg is not judged and egress scoping is enforced there by `mesh_outbound_registry` instead (see [mesh.md](mesh.md#which-leg-enforces-which-policy-family-issue-4158)). An Istio `AuthorizationPolicy` with `action: CUSTOM` performs its bounded external-authorization check **in this phase** — before `before_proxy`, route dispatch, and every transformer — and fails closed on timeout/transport/oversize/malformed outcomes unless the provider sets `failOpen` (see [mesh.md](mesh.md#authorizationpolicy-action-custom-issue-3235)) |
-| `tcp_connection_throttle` | ✓ | | Owns an opaque permit that caps process-local active TCP/TCP+TLS connections per Consumer, else canonical client IP; UDP/DTLS attachment is rejected |
+| `mesh_authz` | ✓ | | Applies Layer 2 mesh authorization policies from SPIFFE/HBONE identity. Istio `AuthorizationPolicy` is a destination-side contract, so the plugin evaluates policy only on **inbound** mesh legs; the Sidecar/Ambient outbound capture leg is not judged and egress scoping is enforced there by `mesh_outbound_registry` instead (see [mesh.md](mesh.md#which-leg-enforces-which-policy-family-issue-4158)). An Istio `AuthorizationPolicy` with `action: CUSTOM` performs its bounded external-authorization check **in this phase** — before `before_proxy`, route dispatch, and every transformer — and fails closed on timeout/transport/oversize/malformed outcomes unless the provider sets `failOpen` (see [mesh.md](mesh.md#authorizationpolicy-action-custom-issue-3235)). An allowed check's `headersToUpstreamOnAllow` result is applied later, in this plugin's own `before_proxy` hook at 2075 (before `mesh_route_dispatch` and every request transformer), and its `headersToDownstreamOnAllow` result in its `after_proxy` / WebSocket handshake hook. **Exception (issue #7383):** on a NodeWaypoint VirtualService route whose `mesh_route_dispatch` rules can select another destination, the CUSTOM check is not run in this phase: the `before_proxy` hook at 2075 only removes the client's copies of every candidate provider's owned header names (given back unchanged except for the names the selected destination's own provider owns), and the check for the destination the dispatch group selects runs in the dispatch finalizer (after the last `mesh_route_dispatch` instance, 2995, before request transformers at 3000), which installs only that provider's values. On those routes the `before_proxy` plugins between 2075 and 2995 (`rate_limiting`, `waf`, the body validators, and the `ai_*` plugins in that band) therefore run before the CUSTOM check, so a request the provider denies may already have consumed rate-limit quota; `ai_prompt_compressor` (4055), `ai_federation` (4060) and `ai_rate_limiter` (4200) still run after it |
+| `tcp_connection_throttle` | ✓ | | Owns an opaque permit that caps process-local active TCP/TCP+TLS connections per Consumer, else canonical client IP (native IPv6 grouped to `ipv6_prefix`, default `/64`); IP keys sit under the accept-time `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` bound, which runs first; UDP/DTLS attachment is rejected |
 | `geo_restriction` | ✓ | | Rejects connections from denied countries |
 | `rate_limiting` | ✓ | | Consumer-aware rate limiting when a stream identity exists, else IP-based |
 | `waf` | ✓ | | Inspects TCP first bytes before the backend is dialed when a `stream` block is configured |
@@ -985,12 +1050,26 @@ WebSocket connections go through the normal HTTP plugin pipeline during the upgr
 
 Successful upgrade responses do not run the general asynchronous `after_proxy`
 chain. They run the ordered `apply_websocket_handshake_response_headers`
-boundary instead, with status 101 for H1 and 200 for H2/H3. The hook cannot
+boundary instead, with status 101 for H1 and 200 for H2/H3. The header map
+that boundary sees starts from the backend's own handshake response headers
+(its `101`, or a mesh peer's Extended CONNECT `200`), after the backend
+response strip (hop-by-hop, `Connection`-listed and gateway-owned diagnostic
+names), so a backend `Set-Cookie` on the upgrade reaches the client and
+response policy such as `security_headers.remove` governs it like any HTTP
+response header (issue #7391). The hook cannot
 reject or perform I/O after the backend has accepted the session. Ferrum then
 strips connection/framing/WebSocket transport fields, adds the authoritative
 H1 Upgrade fields or Extended CONNECT response, preserves the verified backend
 subprotocol, and appends any gateway-owned sticky cookie. `correlation_id`
-uses this boundary to echo generated and preserved IDs consistently.
+uses this boundary to echo generated and preserved IDs consistently,
+`otel_tracing` uses it to echo the gateway `SERVER` span's `traceparent`
+(replacing any backend-supplied copy), `oidc_relying_party` uses it to
+deliver the session cookie it rotated or slid while authenticating the
+handshake, so a refresh performed for a WebSocket never leaves the browser
+holding the spent refresh token, `mesh_authz` uses it to apply an allowed
+CUSTOM check's `headersToDownstreamOnAllow` result, and `rate_limiting` uses it
+to publish the charged handshake's `x-ratelimit-*` headers (under
+`expose_headers`) and strip `x-ratelimit-identity`.
 
 Plugins that opt into `on_ws_disconnect` receive exactly one terminal callback
 after both relay directions finish, including clean closes, typed errors, drain
@@ -1008,6 +1087,8 @@ continuations are reassembled before this ordinary hook. Parser-level size
 policy is the exception: `ws_message_size_limiting` installs the strictest
 configured actual-frame and reassembled-message ceilings before either parser
 reads, so continuation payloads are checked individually before allocation.
+Each direction is combined separately (`client_to_backend` for the client-side
+parser, `backend_to_client` for the backend-side parser), once per session.
 
 Physical fragments that produce no message — the initial non-final Text/Binary
 frame and every intermediate continuation, including zero-length ones — are
@@ -1059,10 +1140,12 @@ WebSocket Upgrade (HTTP pipeline: authenticate → authorize → before_proxy �
 Delivery-accurate observers prepare metadata before `send()` (so large payloads
 are not cloned solely for logging) and emit only after the sink accepts the
 write — the same success boundary as `frames_*` / `bytes_*`. Cancelled or failed
-writes discard the prepared observation. `ws_frame_logging` uses this path for
-ordinary frames and peer Close (`outcome=delivered`) and records plugin
-rejection Closes separately (`outcome=policy_close`) when it observes the final
-decision in the mutating chain.
+writes discard the prepared observation. `prepare_ws_frame_delivery` receives
+the session `connection_id` and direction so an observer can apply per-session
+or per-direction selection (for example `ws_frame_logging`'s `sample_rate` /
+`direction`) before any per-message work. `ws_frame_logging` uses this path for
+ordinary frames and peer Close (`outcome=delivered`) and records policy Closes
+separately (`outcome=policy_close`) through `on_ws_policy_close`.
 
 ### Connection Tracking
 
@@ -1077,14 +1160,24 @@ directions. The first terminal Close from a priority-ordered admission/mutating
 `on_ws_frame` hook is preserved for the rest of the chain: later mutating
 plugins (including additional `ws_rate_limiting` instances) are not invoked for
 that frame, so they neither charge local/Redis budget nor replace the Close
-code/reason. Observational hooks that opt in via
-`observes_ws_frame_decisions()` (today: `ws_frame_logging`) still receive the
-already-final Close so they can record the decision. The relay then records the
-first detailed policy Close, signals shared cancellation before any potentially
-backpressured write, then attempts the same protocol-valid Close to both peers
-under a short bound. Parser-level size rejections
+code/reason. Observational plugins after the rejecting plugin are skipped too
+for that message. Instead, every plugin that opts in via
+`observes_ws_frame_decisions()` (today: `ws_frame_logging`) receives the final
+decision exactly once through `on_ws_policy_close`, after the full pass, so the
+observation does not depend on priority order (an observer moved ahead of the
+rejecting plugin by `priority_override` still records it). The relay then
+records the first detailed policy Close, signals shared cancellation before any
+potentially backpressured write, then attempts the same protocol-valid Close to
+both peers under a short bound. Parser-level size rejections
 (`ws_message_size_limiting` via `websocket_size_limits`) never enter the
 post-reassembly hook chain and use the same dual-peer Close path with code 1009.
+The same `on_ws_policy_close` notification fires for those parser rejections
+(plugin or global size ceilings, incomplete-message bounds, terminated
+`permessage-deflate` faults) and for fragment-budget Closes from
+`on_ws_reassembly_frames`, with the direction of the rejected input. Session
+stops (idle timeout, drain, maximum lifetime, credential expiry, trust
+withdrawal) and transport faults are not policy Closes; `on_ws_disconnect`
+reports them through `websocket.termination_reason` and the failure fields.
 
 ### Session-Bound Message Policy (`bind_ws_session`)
 
@@ -1128,10 +1221,11 @@ Fragmentation and compression need no WAF-side state. Tungstenite reassembles
 Text/Binary continuations before the hook, incomplete messages are bounded by
 `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES` /
 `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`, and `permessage-deflate` is
-never negotiated end to end (the client's `Sec-WebSocket-Extensions` offer is
-stripped before the backend handshake and no negotiated extension is echoed
-back), so payloads reaching the hook are complete and uncompressed on H1
-upgrade and on H2/H3 Extended CONNECT alike.
+never negotiated end to end on a route the WAF protects (config validation
+refuses `websocket_permessage_deflate: passthrough` wherever a `waf` instance is
+effective, and under `terminate` the gateway inflates every message before the
+relay parses it), so payloads reaching the hook are complete and uncompressed
+on H1 upgrade and on H2/H3 Extended CONNECT alike.
 
 Fail-closed behavior mirrors the HTTP body path. A message larger than
 `max_scan_bytes` is decided by `on_body_too_large`: `fail_closed` (default)
@@ -1172,21 +1266,25 @@ Plugins execute in priority order (lower number runs first):
 | # | Plugin | Priority | Behavior |
 |---|--------|----------|----------|
 | 1 | `ws_message_size_limiting` | 2810 | Pre-read actual-frame and bounded-reassembly policy; closes both peers with 1009 |
-| 2 | `ws_rate_limiting` | 2910 | Per-connection token-bucket rate limiting, charged per physical frame (fragments batched via `on_ws_reassembly_frames`) |
-| 3 | `ws_frame_logging` | 9050 | Logs final delivered frame metadata (and policy Close decisions); never mutates |
+| 2 | `ws_rate_limiting` | 2910 | Per-connection (or `limit_by` consumer/IP/service aggregate) token-bucket rate limiting, charged per physical frame (fragments batched via `on_ws_reassembly_frames`); aggregate identity bound once via `bind_ws_session`, connection state released on `on_ws_disconnect` |
+| 3 | `waf` | 2930 | Inspects reassembled Text/Binary messages when WebSocket message inspection is active (see the WAF subsection above) |
+| 4 | `ws_frame_logging` | 9050 | Logs final delivered frame metadata (and policy Close decisions); never mutates |
 
 ### Zero-Overhead Opt-In
 
 When no plugin contributes parser policy or returns `true` from
-`requires_ws_frame_hooks()`, tunnel mode may use raw copy and the parsed relay
-otherwise forwards messages without entering plugin hooks. This aggregate
+`requires_ws_frame_hooks()` / `requires_websocket_framing()`, tunnel mode may use
+raw copy and the parsed relay otherwise forwards messages without entering plugin
+hooks. A bandwidth-priced `api_chargeback` requires the parsed relay without any
+frame hook: it bills WebSocket bandwidth from the parsed relay's payload byte
+counters, which the raw copy does not produce on the same basis. This aggregate
 framing requirement is pre-computed per proxy in `PluginCache` at reload time.
 
 The same aggregate requirement gates `websocket_permessage_deflate: passthrough`:
 config admission refuses passthrough on a proxy where any effective plugin can
 require the parsed relay (`waf`, `ws_frame_logging`, `ws_message_size_limiting`,
-`ws_rate_limiting`, or a custom plugin whose `requires_websocket_framing()` is
-`true`), and at runtime the offer is only forwarded when the proxy's precomputed
+`ws_rate_limiting`, an `api_chargeback` that prices bandwidth, or a custom plugin
+whose `requires_websocket_framing()` is `true`), and at runtime the offer is only forwarded when the proxy's precomputed
 requirement is `false`. A session that negotiates `permessage-deflate` always uses
 the raw relay, on H1, H2, and H3 alike.
 
@@ -1222,6 +1320,8 @@ Session Established (on_stream_connect already ran)
 | # | Plugin | Priority | Behavior |
 |---|--------|----------|----------|
 | 1 | `udp_rate_limiting` | 2915 | Per-client-IP datagram and byte rate limiting |
+| 2 | `waf` | 2930 | Datagram payload inspection (see `waf` in the Complete Execution Order) |
+| 3 | `fault_injection` | 2940 | Datagram fault injection |
 
 ### Silent Drop Semantics
 
@@ -1229,7 +1329,7 @@ Unlike HTTP plugins which return status codes and response bodies, UDP datagram 
 
 ### Direction Handling
 
-`UdpDatagramContext.direction` is `ClientToBackend` for inbound datagrams and `BackendToClient` for backend responses. Built-in `udp_rate_limiting` intentionally shares one per-client window across both directions; plugins that need asymmetric policy should branch on `ctx.direction`.
+`UdpDatagramContext.direction` is `ClientToBackend` for inbound datagrams and `BackendToClient` for backend responses. Built-in `udp_rate_limiting` shares one per-client window across both directions by default and accepts `direction: client_to_backend | backend_to_client` to limit one direction only; custom plugins that need asymmetric policy should branch on `ctx.direction`. `UdpDatagramContext.admission_datagram` is `true` only for a session's first client→backend datagram after `on_stream_connect` admitted it: the packet that opened a plain-UDP session (the proxy runs `on_stream_connect` and then the datagram hooks on that same packet during session setup), or the first decrypted application datagram of a terminating-DTLS session (admitted at handshake accept). A plugin that makes one first-contact decision in both hooks (for example the `fault_injection` abort roll) must skip it there. It is `false` for every later datagram and every backend→client datagram. A session binds its datagram-hook list at first-datagram admission; a reload that changes the proxy's datagram-hook plugin configs ends the established session so its next datagram is admitted under the new list (a full rebuild that reconstructs identical configs does not).
 
 ### Zero-Overhead Opt-In
 
@@ -1288,7 +1388,9 @@ Available `match` predicates:
 | `source_cidr` | gateway-resolved client IP | exact address or CIDR; IPv4-mapped IPv6 normalized |
 | `namespace` / `proxy_id` | matched proxy identity | list is an OR |
 | `listen_port` | accepting frontend port | list is an OR |
-| `consumer` | authenticated consumer / external identity | **post-authentication only**; never gates a stream connection; refused on auth and stream-only plugins |
+| `consumer` | mapped gateway Consumer username only (never an unmapped external identity that spells the same string) | **post-authentication only**; never gates a stream connection; refused on auth and stream-only plugins |
+| `external_identity` | unmapped external identity, only when no Consumer is mapped (combine with `external_identity_authority` under `all` to scope it to one verifying authority) | same as `consumer` |
+| `external_identity_authority` | committed verifying-authority digest of the external identity (64 hex characters; `opa`'s `input.consumer.realm.authority`), so two providers of one mechanism are told apart | same as `consumer` |
 | `auth_method` | successful mechanism name | **post-authentication only**; never gates a stream connection; refused on auth and stream-only plugins |
 | `spiffe_id` | peer SPIFFE ID | **post-authentication only**; no authoritative stream fact, so it never gates a stream connection; refused on auth and stream-only plugins |
 
@@ -1347,6 +1449,13 @@ instance when every request must authenticate.
   configured name and is skipped. The bytes are never copied, reflected, or
   logged. Lossy transcoding is deliberately not used — it would let `?q=%FF`
   match a configured `U+FFFD` and, under `not`, switch a security instance off.
+* **An unencoded `;` in the query is refused.** `query` predicates split
+  pairs only on `&`, while some backends also split on `;`. When any instance
+  on the chain has a trigger that reads `query`, a request whose raw query
+  contains an unencoded `;` is answered `400` (`semicolon_separator`,
+  rejection phase `query_trigger_admission`) before any plugin phase runs, on
+  HTTP/1.1, HTTP/2, and HTTP/3. `%3B` is a literal `;` and is accepted. A
+  chain without a query-reading trigger is unaffected.
 * **Protocol identity is a set.** Transport and flavor are independent, so an
   HTTP/2 native-gRPC request matches both `http2` and `grpc`.
   Stream identities are likewise client-facing: `udp` versus `dtls` comes from
@@ -1362,7 +1471,7 @@ phase of that instance reuses it. This is what makes a skip *symmetric*: a
 from "skipped its request hooks" to "runs its response hooks", which would leave
 half-initialized plugin state behind.
 
-Identity predicates (`consumer`, `auth_method`, `spiffe_id`) are not
+Identity predicates (`consumer`, `external_identity`, `external_identity_authority`, `auth_method`, `spiffe_id`) are not
 authoritative before the authentication boundary. A trigger that uses them
 therefore **does not gate** hooks at or before `authenticate` — the instance runs
 and no decision is memoized, so the first `authorize`-or-later hook makes the
@@ -1525,7 +1634,7 @@ a trigger, so a skipped instance would still see the override applied while its
 request-conditional trailer policy stood down; such a trigger is refused.
 
 An **authentication** plugin may not carry an identity predicate: `authenticate`
-is the phase that establishes `consumer` / `auth_method` / `spiffe_id`, so such a
+is the phase that establishes `consumer` / `external_identity` / `external_identity_authority` / `auth_method` / `spiffe_id`, so such a
 trigger could only read another mechanism's committed identity and would make the
 effective auth chain order-dependent. That composition is rejected at
 publication, as is an identity predicate on a **stream-only** plugin (see
@@ -1535,6 +1644,81 @@ chain for the request. If every auth instance is skipped, the excluded request
 is intentionally unauthenticated; if another instance applies, that instance's
 ordinary credential requirement and `WWW-Authenticate` challenge remain in
 force.
+
+Two pieces of fail-safe request work stay **outside** the trigger boundary,
+because gating them could only add disclosure or forgery, never remove work:
+
+- **Credential-redaction discovery** (`mark_query_credentials_for_redaction`,
+  `request_headers_to_redact`): a skipped auth instance still marks the query
+  parameters and headers that carry its credentials, so a trigger never leaks
+  a token into a log line.
+- **Owned request-header sanitization** (`sanitize_owned_request_headers`):
+  where `before_proxy` would have run, a skipped instance still removes the
+  client copies of the request headers it owns as gateway assertions and
+  installs nothing. Today that is every `claim_headers` / `output_claim_headers`
+  destination of `jwks_auth`, `oauth2_introspection`, and `oidc_relying_party`,
+  `opa` `decision_request_headers`, and `spiffe_identity`'s
+  `x-ferrum-peer-spiffe-id` with `forward_identity`. A skipped instance keeps
+  one of its names only as the current authorized value an admitted owner, of
+  any of these plugins, set for this request (one shared typed per-request
+  state, which a skipped instance never changes), never because of the value
+  alone: a skipped `jwks_auth` sharing
+  `X-Tenant` with an admitted OPA keeps OPA's value and drops every other
+  copy. `mesh_authz` ext_authz `headersToUpstreamOnAllow` names follow
+  Istio semantics instead: they are provider-owned only on a request the
+  instance CUSTOM-checked, so a skipped instance does not touch them. The
+  owned names are also on the route's request-trailer strip list (see
+  [Backend Request Trailers](#backend-request-trailers)), which no trigger
+  affects.
+
+The authoritative check runs once more over the finalized outbound header
+map, inside the backend-boundary header policy pass every H1/H2 and H3 ladder
+runs after each `before_proxy` pass and after any finalized-egress header
+overlay: on a route that owns asserted headers, each owned name survives only
+as its CURRENT authorized value for the request (typed per-request state: the
+latest admitted owner's install replaces, and its clear retires, any earlier
+decision), as ONE entry under the exact name that owner wrote, and every other
+copy or spelling is removed (an equal-valued `x_app_user` beside an installed
+`x-app-user` too, since each spelling would reach the backend as its own field
+line),
+whatever any trigger decided or any later plugin wrote. The client's own
+field lines for those names are then dropped from every pristine header
+store — the dispatch body and the request context's retained wire view — so
+the boundaries that rebuild a backend request from raw field lines (the
+native-gRPC, HBONE, mesh-mTLS and Unix merges, the WebSocket handshake
+collector, the secured-mesh retry replay and `request_mirror`) emit only the
+approved value, once, instead of restoring the client's lines because their
+joined form equals it. A request whose
+outbound `content-type` became a gRPC-Web media type during a `before_proxy`
+pass without the `grpc_web` translator having translated that request is
+refused with `415` (a `grpc_web` instance configured on the route but declining
+the request does not count); one set by an egress overlay is removed. A value
+listing more than one media type counts as gRPC-Web here, since a backend may
+resolve the singleton field to any member; a single media type counts when its
+essence (`type/subtype`, ignoring parameters) is a gRPC-Web type, and its
+parameter values are never inspected;
+the ingress protocol guard already refuses a client request with repeated or
+list-valued `Content-Type` with `400`.
+
+Publication also refuses, as defence in depth, a configured request-header
+write that would undo either guarantee: a `request_transformer` header rule or
+`mesh_route_dispatch` `request_transform` whose destination is a header another
+plugin on the route owns as a gateway assertion, and, on such a route without a
+`grpc_web` translator, one that could set `content-type` to a gRPC-Web media
+type.
+
+The final pass is the last point a plugin's outbound map is judged; some
+request fields are written after it by the gateway (per-attempt
+`traceparent`, the remaining `grpc-timeout`, `early-data`, the WebSocket
+handshake's gateway assertions, forwarding fields) or by a client library
+(`Accept: */*` and `User-Agent` from reqwest, `Host` and framing from hyper,
+the `Sec-WebSocket-*` handshake from tungstenite). Configuration admission
+therefore requires every owned assertion destination (`claim_headers`,
+`output_claim_headers`, OPA `decision_request_headers`, mesh
+`outputClaimToHeaders`) to be an application-specific header and refuses every
+standard HTTP request field (one shared list,
+`proxy::headers::is_reserved_assertion_destination`), so an absent claim stays
+absent on the wire.
 
 `response_caching` has one configuration-specific restriction: its default
 `add_cache_status_header: true` publishes named response-trailer ownership, a
@@ -1585,13 +1769,20 @@ The authenticated `GET /metrics/runtime` snapshot additionally carries three
 | `missing_decision_carriers` | contextless hooks that ran because no decision was carried (compatibility path) |
 
 They have no labels at all: no trigger input, route, identity, header value,
-plugin-controlled string, or secret can reach them. A sustained nonzero
-`missing_decision_carriers` on a deployment that uses triggers means some summary
-or session path is not stamping the carrier.
+plugin-controlled string, or secret can reach them.
+
+`missing_decision_carriers` does not count instances whose decision is
+undecided by design. A trigger that reads `consumer` or `auth_method` is never
+decided at or before the authentication boundary: it does not gate stream
+connections at all, and an HTTP request that ends at or before `authenticate`
+(an authentication refusal, an early termination) never reaches its decision.
+Such an instance's hooks still run on those paths, but the absent carrier is
+not counted, so a sustained nonzero rate always means some summary or session
+path is not stamping the carrier.
 
 ## Priority Bands
 
-Within each lifecycle phase, plugins are sorted by **priority** (lower number runs first). Each plugin has a built-in priority constant, but this can be overridden per plugin-config via the `priority_override` field (0–10000). When two plugins share the same effective priority, their relative order is stable (based on config order) but not explicitly controllable — use `priority_override` to guarantee ordering.
+Within each lifecycle phase, plugins are sorted by **priority** (lower number runs first). Each plugin has a built-in priority constant, but this can be overridden per plugin-config via the `priority_override` field (0–10000). When two plugins share the same effective priority, the tie is broken deterministically by plugin name (ascending). Instances of the same plugin at the same priority run globals first, then proxy-scoped instances, then proxy-group instances, each in ascending plugin-config `id`. The complete order is therefore `(priority, plugin name, scope, id)`: it does not depend on database row order, file entry order, association order, or which reload path built the chain, and candidate admission validates exactly that order. No two built-in plugins share a default priority, so the tiebreak only applies under `priority_override`, to custom plugins, or to multiple instances of one plugin. Use `priority_override` when a different relative order is required.
 
 Multiple instances of the same plugin type are supported on a single proxy (e.g., two `http_logging` instances for different log destinations). When merging global, proxy-scoped, and proxy-group-scoped plugins, a scoped plugin replaces only the **global** plugin of the same name — other scoped instances of the same type are preserved. See [Plugin Scope](plugins.md#plugin-scope-merging) for the full merging rules and examples.
 
@@ -1599,17 +1790,19 @@ Multiple instances of the same plugin type are supported on a single proxy (e.g.
 
 Priority bands are spaced with gaps so future plugins can slot in without renumbering:
 
-| Band | Priority Range | Purpose | Plugins |
-|------|---------------|---------|---------|
-| **Early** | 0–949 | Matched-request tracing, IDs, preflight, and short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `mesh_outbound_registry` (130), `ip_restriction` (150), `geo_restriction` (175), `bot_detection` (200), `spec_expose` (210), `sse` (250), `grpc_web` (260), `grpc_method_router` (275), `spiffe_identity` (940) |
-| **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `oauth2_introspection` (1050), `oidc_relying_party` (1075), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
-| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `opa` (2080), `adaptive_concurrency` (2090), `ai_transcript_audit` (2740), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `openapi_validator` (2960), `ai_semantic_firewall` (2968), `ai_request_guard` (2975), `ai_tool_governor` (2978), `ai_stream_router` (2984), `mcp_gateway` (2992), `a2a_gateway` (2993), `mesh_route_dispatch` (2995) |
-| **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `request_deduplication` (3010), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `load_testing` (3070), `request_mirror` (3075), `response_size_limiting` (3490), `response_caching` (3500) |
-| **Response** | 4000–4999 | Response transformation, compression, security headers, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_prompt_compressor` (4055), `ai_semantic_cache` (4057), `ai_federation` (4060), `ai_response_guard` (4075), `security_headers` (4080), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
+| Band | Priority Range | Purpose | Examples |
+|------|---------------|---------|----------|
+| **Early** | 0–949 | Matched-request tracing, IDs, preflight, and short-circuiting before auth | `otel_tracing` (25), `cors` (100), `ip_restriction` (150) |
+| **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `key_auth` (1200) |
+| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `rate_limiting` (2900), `mesh_route_dispatch` (2995) |
+| **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `request_deduplication` (3010), `response_caching` (3500) |
+| **Response** | 4000–4999 | Response transformation, compression, security headers, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_federation` (4060) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
-| **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `kafka_logging` (9150), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `proxy_alerts` (9250), `prometheus_metrics` (9300), `api_chargeback` (9350), `api_chargeback_sink` (9351), `workload_metrics` (9360), `__mesh_bpf_metrics` (9365), `transaction_log_schema` (9999, config-only) |
+| **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `http_logging` (9100), `prometheus_metrics` (9300) |
 
-`soap_ws_security` keeps AuthN-band priority 1500. A configuration that establishes a principal (`username_token`, `x509_signature`, or `saml`) is an auth plugin: it opts into `requires_request_body_before_authenticate` and validates the SOAP message in the `authenticate` phase, publishing `authenticated_identity` and a namespace-correct `identified_consumer` so `access_control` (2000) and consumer-scoped `rate_limiting` (2900) evaluate the SOAP principal rather than the source IP. A timestamp-only configuration establishes no principal, is not an auth plugin, and keeps validating in `before_proxy` after request-body buffering — the two phases are selected by configuration and never both run. The identity-establishing form additionally runs `on_final_request_body` before backend dispatch to refuse a message whose bytes changed after validation; the timestamp-only form authenticates nobody and claims no integrity over the Body, so it does not bind the representation and stays composable with request-body transformers. The opt-in `username_token.remove_credential` policy is the one configuration that also declares `modifies_request_body`: it deletes the verified `wsse:UsernameToken` in `transform_request_body`, and the representation it binds is the sanitized message, so its own removal is admitted while every other post-validation mutation still fails closed. Composition admission requires an identity-establishing instance to be the proxy's sole authentication mechanism in both auth modes (each mode stops after the first successful identity, while their rejection behavior also cannot preserve multiple mandatory message gates) and rejects it alongside `compression` with `decompress_request` (authentication precedes body normalization).
+Every built-in plugin and its priority is listed in [Complete Execution Order](#complete-execution-order).
+
+`soap_ws_security` keeps AuthN-band priority 1500. A configuration that establishes a principal (`username_token`, `x509_signature`, or `saml`) is an auth plugin: it opts into `requires_request_body_before_authenticate` and validates the SOAP message in the `authenticate` phase, publishing the SOAP principal as an external `authenticated_identity` so `access_control` (2000, through `allow_authenticated_identity`) and identity-keyed `rate_limiting` (2900) evaluate the SOAP principal rather than the source IP. It never sets `identified_consumer`: a same-named Consumer is not bound (issue #6082), so Consumer ACL groups and Consumer-specific policy do not apply. A timestamp-only configuration establishes no principal, is not an auth plugin, and keeps validating in `before_proxy` after request-body buffering — the two phases are selected by configuration and never both run. The identity-establishing form additionally runs `on_final_request_body` before backend dispatch to refuse a message whose bytes changed after validation; the timestamp-only form authenticates nobody and claims no integrity over the Body, so it does not bind the representation and stays composable with request-body transformers. The opt-in `username_token.remove_credential` policy is the one configuration that also declares `modifies_request_body`: it deletes the verified `wsse:UsernameToken` in `transform_request_body`, and the representation it binds is the sanitized message, so its own removal is admitted while every other post-validation mutation still fails closed. Composition admission requires an identity-establishing instance to be the proxy's sole authentication mechanism in both auth modes (each mode stops after the first successful identity, while their rejection behavior also cannot preserve multiple mandatory message gates) and rejects it alongside `compression` with `decompress_request` (authentication precedes body normalization).
 
 `serverless_function` runs in the finalized-request-egress phase, not `before_proxy` (advisory `GHSA-4vr5-4wm3-x5xv`). With `forward_body: true` it receives the exact lossless **backend-visible** representation: request-body transforms have run and every final request-policy hook has accepted those bytes. It may therefore share a protocol chain with a body transformer. The capability-based refusal still applies — covering body transformers and final request-body policy plugins — to registered custom plugins that declare `egresses_request_body_before_finalization()`. Candidate admission derives the built-in serverless protocol, effective priority, `mode`, and `forward_body` capabilities without constructing its environment-bound HTTP/AWS client, and derives static protocol/`enforces_finalized_request_policy()` metadata for expensive final validators (`waf`, `openapi_validator`, `body_validator`, `request_size_limiting`, `ai_tool_governor`, `ai_semantic_firewall`) without compiling their rule sets, so a CP can validate composition without requiring credentials or schema packs that intentionally exist only on DPs. Runtime cache construction still resolves and validates those node-local values as a fail-closed backstop. Ferrum does not allow an external decision to govern bytes different from those ultimately dispatched. Non-identity encoded bodies fail closed before function egress. When a terminate-mode instance shares a protocol chain with `request_deduplication`, every deduplication instance must have a strictly lower effective priority so retry ownership exists before the function can execute; candidate admission and cache construction reject equal or reversed ordering. Deduplication runs after request-transformer header/query rules and built-in route dispatch so its fingerprint observes their effective output. Every same-protocol header/query/destination mutator must run before deduplication, including under priority overrides; a deferred request-body rewrite is likewise rejected when it cannot be fully observed during the earlier normalization phase.
 
@@ -1635,9 +1828,9 @@ All attached instances must remain a contiguous priority block so this
 finalization runs before later short-circuit plugins. Cache construction rejects
 priority overrides that interleave another plugin between dispatch instances.
 
-When a `mesh_route_dispatch` rule matches on query params, the predicate reads the shared canonical query view rather than the protocol-dependent `ctx.query_params` map. The plugin still opts the whole proxy into decoded query-param materialization for HTTP/3 so every *other* plugin on that proxy observes decoded `ctx.query_params` while the query-rule instance is configured.
+When a `mesh_route_dispatch` rule matches on query params, the predicate reads the shared canonical query view rather than the lossy single-value `ctx.query_params` map. Every frontend (HTTP/1.1, HTTP/2, and HTTP/3) materializes that map percent-decoded, so other plugins on the proxy see the same values regardless of protocol or of which plugins are configured (issue #6580).
 
-Matched VirtualService `headers.request` / `headers.response` transforms are published onto `RequestContext` as shared route-override lists. Every enabled `request_transformer` / `response_transformer` instance applies only its **static** header rules in configured (stable or priority-overridden) order. Proxy core then applies each matched route list **exactly once** after the last eligible enabled transformer in that chain — the authoritative route-header final phase — so a later static add/update/remove/rename cannot recreate or overwrite a field the matched route removed or set (GHSA-3xxr-xhhj-9962). A disabled RTDS transformer instance is not eligible and neither consumes nor suppresses the shared list. The same finalization runs on ordinary H1/H2/H3 responses, synthetic/rejection `after_proxy` paths, header-capability simulation, and deadline provenance rebuilds. Query and body transform ordering is unchanged. When the chain has no eligible consumer, the published list remains unused (the VirtualService translator auto-emits an `apply_route_overrides` consumer when route header transforms are configured). That translator-owned empty consumer composes with a same-name global transformer, preserving global static rules before the matched route list is finalized; ordinary operator-authored proxy-scoped transformers retain the normal proxy-overrides-global behavior.
+Matched VirtualService `headers.request` / `headers.response` transforms are published onto `RequestContext` as shared route-override lists. Every enabled `request_transformer` / `response_transformer` instance applies only its **static** header rules in configured (stable or priority-overridden) order. Proxy core then applies each matched route list **exactly once** after the last eligible enabled transformer in that chain — the authoritative route-header final phase — so a later static add/update/remove/rename cannot recreate or overwrite a field the matched route removed or set (GHSA-3xxr-xhhj-9962). The request list's boundary is the LATER of that consumer and the last `mesh_route_dispatch` instance, so a consumer a priority override places ahead of the dispatcher cannot finalize an empty slot and drop the list the dispatcher publishes afterwards. A disabled RTDS transformer instance is not eligible and neither consumes nor suppresses the shared list. The same finalization runs on ordinary H1/H2/H3 responses, synthetic/rejection `after_proxy` paths, header-capability simulation, and deadline provenance rebuilds. Query and body transform ordering is unchanged. When the chain has no eligible consumer, the published list remains unused (the VirtualService translator auto-emits an `apply_route_overrides` consumer when route header transforms are configured); a chain whose dispatch rules carry route transforms but that has no configured transformer for that direction at all is refused at plugin-cache construction and admin admission. That translator-owned empty consumer composes with a same-name global transformer, preserving global static rules before the matched route list is finalized; ordinary operator-authored proxy-scoped transformers retain the normal proxy-overrides-global behavior.
 
 A `mesh_route_dispatch` rule may also carry a per-rule `fault` action (`{delay, abort}`) that runs as soon as the rule matches and BEFORE any route override is applied. The fault uses the shared `FaultRoller` (`src/plugins/utils/fault_roll.rs`) so a static-percentage rule uses the same 64-bit threshold math as the proxy-scoped `fault_injection` plugin. When delay and abort both trigger, the delay runs first; the abort then short-circuits dispatch and the route override is skipped. An earlier proxy-scoped fault marks the request so the route-local surface does not stack; a route-local fault writes a private source marker so a priority-overridden later proxy-scoped fault also no-ops. Ordinary sibling `fault_injection` instances do not suppress one another: each independently decides until an abort short-circuits the chain.
 
@@ -1647,7 +1840,7 @@ Given all built-in plugins enabled, the execution order is:
 
 | # | Plugin | Priority | Active Phases |
 |---|--------|----------|---------------|
-| 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect, on_ws_disconnect |
+| 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, apply_websocket_handshake_response_headers, log, on_stream_disconnect, on_ws_disconnect |
 | 2 | `correlation_id` | 50 | on_request_received, before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect |
 | 3 | `cors` | 100 | on_request_received, after_proxy |
 | 4 | `request_termination` | 125 | on_request_received |
@@ -1656,15 +1849,15 @@ Given all built-in plugins enabled, the execution order is:
 | 7 | `geo_restriction` | 175 | on_request_received, on_stream_connect |
 | 8 | `bot_detection` | 200 | on_request_received |
 | 9 | `spec_expose` | 210 | on_request_received, after_proxy |
-| 10 | `sse` | 250 | on_request_received, before_proxy, after_proxy, transform_response_body |
+| 10 | `sse` | 250 | on_request_received, before_proxy, after_proxy, transform_response_body, response_stream_inspector |
 | 11 | `grpc_web` | 260 | on_request_received, before_proxy, transform_request_body, on_final_request_body, after_proxy, transform_response_body |
 | 12 | `grpc_method_router` | 275 | on_request_received, on_backend_path_resolved |
-| 13 | `spiffe_identity` | 940 | on_request_received, on_stream_connect |
+| 13 | `spiffe_identity` | 940 | on_request_received, before_proxy, on_stream_connect |
 | 14 | `mtls_auth` | 950 | authenticate, on_stream_connect |
 | 15 | `jwks_auth` | 1000 | authenticate, before_proxy |
 | 16 | `oauth2_introspection` | 1050 | authenticate, before_proxy |
-| 17 | `oidc_relying_party` | 1075 | on_request_received, authenticate, before_proxy, after_proxy |
-| 18 | `jwt_auth` | 1100 | authenticate |
+| 17 | `oidc_relying_party` | 1075 | on_request_received, authenticate, before_proxy, after_proxy, apply_websocket_handshake_response_headers |
+| 18 | `jwt_auth` | 1100 | authenticate, before_proxy |
 | 19 | `key_auth` | 1200 | authenticate, before_proxy |
 | 20 | `ldap_auth` | 1250 | authenticate, before_proxy |
 | 21 | `basic_auth` | 1300 | authenticate, before_proxy |
@@ -1672,15 +1865,15 @@ Given all built-in plugins enabled, the execution order is:
 | 23 | `soap_ws_security` | 1500 | authenticate, before_proxy, transform_request_body, on_final_request_body |
 | 24 | `access_control` | 2000 | authorize, on_stream_connect |
 | 25 | `tcp_connection_throttle` | 2050 | on_stream_connect (opaque connection permit releases on rejection/teardown) |
-| 26 | `mesh_authz` | 2075 | authorize, on_stream_connect |
+| 26 | `mesh_authz` | 2075 | authorize, before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect |
 | 27 | `opa` | 2080 | authorize |
 | 28 | `adaptive_concurrency` | 2090 | backend_admission |
 | 29 | `ai_transcript_audit` | 2740 | before_proxy, on_final_request_body, after_proxy, on_final_response_body, on_response_committed, response_stream_inspector, on_response_stream_terminated, log |
 | 30 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
 | 31 | `ws_message_size_limiting` | 2810 | parser-level frame/message limits |
 | 32 | `graphql` | 2850 | before_proxy, on_final_request_body |
-| 33 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
-| 34 | `ws_rate_limiting` | 2910 | on_ws_frame, on_ws_reassembly_frames |
+| 33 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect |
+| 34 | `ws_rate_limiting` | 2910 | on_ws_frame, on_ws_reassembly_frames, on_ws_disconnect |
 | 35 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 36 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body, on_final_request_body |
 | 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, finalize_client_visible_response_body, finalize_client_visible_response_headers, on_ws_frame, on_stream_connect, on_udp_datagram |
@@ -1694,7 +1887,7 @@ Given all built-in plugins enabled, the execution order is:
 | 45 | `mcp_gateway` | 2992 | before_proxy, transform_request_body, enforce_final_backend_header_policy, on_final_request_body, normalize_response_body, transform_response_body, after_proxy, on_final_response_body |
 | 46 | `a2a_gateway` | 2993 | before_proxy, on_final_request_body, after_proxy, normalize_response_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
 | 47 | `mesh_route_dispatch` | 2995 | before_proxy |
-| 48 | `request_transformer` | 3000 | before_proxy, transform_request_body |
+| 48 | `request_transformer` | 3000 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
 | 49 | `request_deduplication` | 3010 | before_proxy, on_final_response_body, on_response_stream_terminated, on_response_committed |
 | 50 | `serverless_function` | 3025 | finalized request egress |
 | 51 | `response_mock` | 3030 | before_proxy |
@@ -1703,23 +1896,23 @@ Given all built-in plugins enabled, the execution order is:
 | 54 | `request_mirror` | 3075 | authorize (pre-buffer mirror admission; never rejects), finalized request egress |
 | 55 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
 | 56 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_headers, on_final_response_body |
-| 57 | `response_transformer` | 4000 | after_proxy, transform_response_body |
+| 57 | `response_transformer` | 4000 | after_proxy, transform_response_body, finalize_client_visible_response_body |
 | 58 | `compression` | 4050 | normalize_buffered_request_body_before_before_proxy, before_proxy, after_proxy, transform_request_body_with_context, transform_response_body_with_context |
 | 59 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
-| 60 | `ai_semantic_cache` | 4057 | on_final_request_body_with_context, after_proxy, on_final_response_body |
+| 60 | `ai_semantic_cache` | 4057 | on_final_request_body_with_context, after_proxy, on_final_response_body, on_response_committed |
 | 61 | `ai_federation` | 4060 | before_proxy, transform_request_body_with_context, finalized request egress, enforce_final_backend_header_policy, on_final_request_body_with_context, origin response-header boundary, after_proxy, response_stream_inspector, on_response_stream_terminated (HTTP only) |
-| 62 | `ai_response_guard` | 4075 | after_proxy, on_response_body, transform_response_body, finalize_client_visible_response_body |
-| 63 | `security_headers` | 4080 | after_proxy, initial response-header boundary |
-| 64 | `ai_token_metrics` | 4100 | on_response_body |
+| 62 | `ai_token_metrics` | 4070 | on_response_body, response_stream_inspector, on_response_stream_terminated |
+| 63 | `ai_response_guard` | 4075 | after_proxy, on_response_body, transform_response_body, finalize_client_visible_response_body |
+| 64 | `security_headers` | 4080 | after_proxy, initial response-header boundary |
 | 65 | `ai_rate_limiter` | 4200 | before_proxy, on_final_request_body_with_context, after_proxy, on_response_body, response_stream_inspector, on_response_stream_terminated |
 | 66 | `stdout_logging` | 9000 | log, on_stream_disconnect, on_ws_disconnect |
-| 67 | `ws_frame_logging` | 9050 | on_ws_frame, prepare_ws_frame_delivery, emit_ws_frame_delivery, on_ws_disconnect |
+| 67 | `ws_frame_logging` | 9050 | on_ws_policy_close, prepare_ws_frame_delivery, emit_ws_frame_delivery, on_ws_disconnect |
 | 68 | `statsd_logging` | 9075 | log, on_stream_disconnect, on_ws_disconnect |
-| 69 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 70 | `tcp_logging` | 9125 | log, on_stream_disconnect |
-| 71 | `kafka_logging` | 9150 | log, on_stream_disconnect |
-| 72 | `loki_logging` | 9155 | log, on_stream_disconnect |
-| 73 | `udp_logging` | 9160 | log, on_stream_disconnect |
+| 69 | `http_logging` | 9100 | log, on_stream_disconnect, on_ws_disconnect |
+| 70 | `tcp_logging` | 9125 | log, on_stream_disconnect, on_ws_disconnect |
+| 71 | `kafka_logging` | 9150 | log, on_stream_disconnect, on_ws_disconnect |
+| 72 | `loki_logging` | 9155 | log, on_stream_disconnect, on_ws_disconnect |
+| 73 | `udp_logging` | 9160 | log, on_stream_disconnect, on_ws_disconnect |
 | 74 | `ws_logging` | 9175 | log, on_stream_disconnect, on_ws_disconnect |
 | 75 | `transaction_debugger` | 9200 | on_request_received, before_proxy, on_final_request_body, after_proxy, on_final_response_body, log, on_stream_disconnect, on_ws_disconnect |
 | 76 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
@@ -1753,7 +1946,7 @@ That ordering has a few practical effects:
 - A later `HIT`/`REVALIDATED` synthetic replay marks a private finalized-response capability so ordinary presentation transforms (including `response_transformer` body and header sequences) are not applied a second time, while inspectors, final-body validators, and reject-path observability hooks still run over the replayed bytes.
 - Backend `Vary` headers are respected when building the cache key, so variants such as `Accept-Encoding: gzip` stay isolated from uncompressed responses.
 - Fresh cached validators (`ETag`, `Last-Modified`) can satisfy conditional requests at the edge with a `304 Not Modified` response.
-- The `compression` plugin (4050) generates gzip/brotli responses at the gateway during the response-body transform phase. `response_caching` stores the final encoded representation in `on_final_response_body` (which runs after all response-body transforms), so cache entries contain the gateway-compressed bytes and `Content-Encoding` header — not the uncompressed backend response. A cache `HIT` replays those stored bytes and headers directly from `response_caching::before_proxy` (3500), short-circuiting before `compression::before_proxy` (4050) runs, so no second compression pass occurs and compression-setting changes do not rewrite existing entries. `max_entry_size_bytes` compares the encoded body length; `max_total_size_bytes` and per-entry accounting use the stored entry's approximate footprint, including that body and its headers. The `body_validator` plugin separately decompresses gzip-compressed gRPC frames for protobuf validation — this is internal to the validation path and does not affect the forwarded body.
+- The `compression` plugin (4050) generates gzip/brotli (or opt-in zstd) responses at the gateway during the response-body transform phase. `response_caching` stores the final encoded representation in `on_final_response_body` (which runs after all response-body transforms), so cache entries contain the gateway-compressed bytes and `Content-Encoding` header — not the uncompressed backend response. A cache `HIT` replays those stored bytes and headers directly from `response_caching::before_proxy` (3500), short-circuiting before `compression::before_proxy` (4050) runs, so no second compression pass occurs and compression-setting changes do not rewrite existing entries. `max_entry_size_bytes` compares the encoded body length; `max_total_size_bytes` and per-entry accounting use the stored entry's approximate footprint, including that body and its headers. The `body_validator` plugin separately decompresses gzip-compressed gRPC frames for protobuf validation — this is internal to the validation path and does not affect the forwarded body.
 
 ### OTel tracing runs first (priority 25)
 
@@ -1802,20 +1995,20 @@ After all plugin phases complete, the gateway injects `X-Consumer-Username` (and
 
 ### Rate limiting runs after auth (priority 2900)
 
-Rate limiting sits late in the Admission band (priority 2900) so it can enforce limits by **authenticated identity**, not just by IP address. When `limit_by: "consumer"`, the plugin uses the mapped Consumer username when available, otherwise external `ctx.authenticated_identity`; those values only exist after the authenticate phase. When `limit_by: "spiffe_identity"`, the plugin uses `ctx.peer_spiffe_id`, populated earlier by the `spiffe_identity` plugin.
+Rate limiting sits late in the Admission band (priority 2900) so it can enforce limits by **authenticated identity**, not just by IP address. When `limit_by: "consumer"`, the plugin keys a mapped Consumer by username and an unmapped external `ctx.authenticated_identity` by a separate realm-scoped key; those values only exist after the authenticate phase. When `limit_by: "spiffe_identity"`, the plugin uses `ctx.peer_spiffe_id`, populated earlier by the `spiffe_identity` plugin.
 
 **Dual-phase behavior:**
 - `limit_by: "ip"` — enforces IP-based limits in `on_request_received` (phase 1, before auth). This protects auth endpoints from brute-force attacks.
-- `limit_by: "consumer"` — enforces identity-based limits in `authorize` (phase 3, after auth). Uses mapped Consumer username first, then external `authenticated_identity`, and falls back to IP-based keying only when no authenticated identity exists. `limits` must include one `scope: "default"` rule for generic consumers/IP fallback, and may include `scope: "consumers"` rules that share a configured limit/window template across named identities. Each effective identity has its own counter; the configured window is not a pooled budget.
+- `limit_by: "consumer"` — enforces identity-based limits in `authorize` (phase 3, after auth). Keys a mapped Consumer as `consumer:<username>` and an unmapped external `authenticated_identity` as `external:<mechanism>:<authority>:<identity>` (the two never share a counter), and falls back to IP-based keying only when no authenticated identity exists. `scope: "consumers"` rules match mapped Consumer usernames only. `limits` must include one `scope: "default"` rule for generic consumers/IP fallback, and may include `scope: "consumers"` rules that share a configured limit/window template across named identities. Each effective identity has its own counter; the configured window is not a pooled budget.
 - `limit_by: "spiffe_identity"` — enforces SPIFFE-based limits in `authorize` (phase 3, after `spiffe_identity`). Uses the peer SPIFFE URI and falls back to IP-based keying when no SPIFFE identity exists. The shorter alias `spiffe` is accepted.
 
 **Header exposure** (`expose_headers: true`): When enabled, the plugin injects `x-ratelimit-limit`, `x-ratelimit-remaining`, and `x-ratelimit-window` headers on both upstream requests (`before_proxy`) and downstream responses (`after_proxy`). This lets backends and clients see current rate-limit state without additional lookups. Disabled by default so gateway admins control whether limit details are exposed. The limiter key/identity is deliberately never injected as a header: for `limit_by: "consumer"`/`"spiffe_identity"` it would disclose the gateway's internal notion of the caller identity (consumer username) or the peer workload SVID to the downstream client.
 
-**Redis mode** (`sync_mode: "redis"`): rate-limit counter plugins support only `local` and `redis` storage; database-backed counters are intentionally unsupported. `rate_limiting`, `ai_rate_limiter`, `graphql`, `grpc_method_router`, and `udp_rate_limiting` use Redis for coordinated counters across multiple gateway instances. `ws_rate_limiting` also supports Redis, but only to externalize its per-connection counters; because WebSocket connection IDs are process-local, it namespaces keys per gateway instance to avoid cross-instance collisions rather than sharing a portable connection budget across reconnects. When Redis is unavailable, behavior is governed by `redis_failure_policy`, which defaults to `local_fallback` for `rate_limiting`: the plugin enforces the configured quota independently in each pod's memory during an outage and switches back when connectivity is restored. Explicit `fail_closed` returns `503` while centralized enforcement is unavailable. The other five rate-limit plugins retain the `fail_closed` default and require explicit `local_fallback` for per-process budgets. `request_deduplication` expresses the same choice through its own `on_redis_unavailable` field (also fail-closed by default) and does not accept `redis_failure_policy`; `ai_semantic_cache` keeps automatic local fallback because a cache miss carries no enforcement consequence. The shared client reconnects in the background under either policy. Redis Cluster is not supported and is screened rather than assumed: the client runs `INFO CLUSTER` on every newly established connection and reacts to `MOVED`/`ASK`/`CROSSSLOT`/`CLUSTERDOWN`/`TRYAGAIN`; a proven Cluster endpoint is refused terminally for the life of the client. HTTP/GraphQL/gRPC quota admission is charge-then-compensate: one atomic `MULTI`/`EXEC` charges every configured window (`GET` previous, `INCR` current, `EXPIRE` current) so the decision is tied to that increment rather than to a stale read, and any refusal issues one compensating atomic `MULTI`/`EXEC` (`DECR` + `EXPIRE`) over every window it charged, so a refused request leaves no lasting charge on any window and a tighter window's refusal never consumes a looser window's budget. Between the two transactions the transient charge is visible to a concurrent request for the same identity, which can refuse slightly early under contention but never over-admits. The Redis backend uses native RESP protocol commands (no Lua scripts), so it works with Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
+**Redis mode** (`sync_mode: "redis"`): rate-limit counter plugins support only `local` and `redis` storage; database-backed counters are intentionally unsupported. `rate_limiting`, `ai_rate_limiter`, `graphql`, `grpc_method_router`, and `udp_rate_limiting` use Redis for coordinated counters across multiple gateway instances. `ws_rate_limiting` also supports Redis; in its default `limit_by: connection` mode only to externalize its per-connection counters: because WebSocket connection IDs are process-local, it namespaces keys per gateway instance to avoid cross-instance collisions rather than sharing a portable connection budget across reconnects. Its aggregate `limit_by` budgets (`consumer`, `ip`, `service`) are keyed by that identity and coordinated across replicas. When Redis is unavailable, behavior is governed by `redis_failure_policy`, which defaults to `local_fallback` for `rate_limiting`: the plugin enforces the configured quota independently in each pod's memory during an outage and switches back when connectivity is restored. Explicit `fail_closed` returns `503` while centralized enforcement is unavailable. The other five rate-limit plugins retain the `fail_closed` default and require explicit `local_fallback` for per-process budgets. `request_deduplication` expresses the same choice through its own `on_redis_unavailable` field (also fail-closed by default) and does not accept `redis_failure_policy`; `ai_semantic_cache` keeps automatic local fallback because a cache miss carries no enforcement consequence. The shared client reconnects in the background under either policy. Redis Cluster is not supported and is screened rather than assumed: the client runs `INFO CLUSTER` on every newly established connection and reacts to `MOVED`/`ASK`/`CROSSSLOT`/`CLUSTERDOWN`/`TRYAGAIN`; a proven Cluster endpoint is refused terminally for the life of the client. HTTP/GraphQL/gRPC quota admission is charge-then-compensate: one atomic `MULTI`/`EXEC` charges every configured window on the 16-sub-bucket trailing-window ladder (bounded `GETRANGE` reads of the older sub-buckets, `INCR` + `EXPIRE` of the sub-bucket the request lands in, and one `TIME` so sub-buckets follow the Redis server clock) so the decision is tied to that increment rather than to a stale read, and any refusal issues one compensating atomic `MULTI`/`EXEC` (`DECR` + `EXPIRE`) over every window it charged, so a refused request leaves no lasting charge on any window and a tighter window's refusal never consumes a looser window's budget. Between the two transactions the transient charge is visible to a concurrent request for the same identity, which can refuse slightly early under contention but never over-admits. The Redis backend uses native RESP protocol commands (no Lua scripts), so it works with Redis, Valkey, DragonflyDB, KeyDB, or Garnet, provided the store implements `MULTI`/`EXEC` and `TIME`: the request-quota plugins (`rate_limiting`, `graphql`, `grpc_method_router`) require `TIME` (see the Redis ACL requirement under [`rate_limiting`](plugins.md#rate_limiting)).
 
 ### OpenAPI client validation precedes before_proxy (priority 2960)
 
-`openapi_validator` decides a matched client request contract before `body_validator` runs its `before_proxy` request checks. Priorities 2950 and 2960 order hooks within a lifecycle phase; they do not reorder distinct phases. OpenAPI response validation runs in `on_final_response_body`, while unknown-operation admission and backend-request fallback retain the phases described below.
+`openapi_validator` decides a matched client request contract before `body_validator` runs its `before_proxy` request checks. Priorities 2950 and 2960 order hooks within a lifecycle phase; they do not reorder distinct phases. OpenAPI response validation runs in `on_final_response_body`, while unknown-operation admission and backend-request fallback retain the phases described below. Declared request parameters (path / query / header / cookie) are validated in `before_proxy` at priority 2960, together with unknown-operation admission and before `request_transformer` (3000) can rewrite them; they are read from the canonical path, the client's raw query string, and the pristine wire header block, so no earlier `before_proxy` hook (whatever its `priority_override`) can add, rewrite, or strip one.
 
 That ordering is enforced by a dedicated lifecycle phase, not by priority alone. The imported OpenAPI **request** contract is decided in `validate_client_request_body_contract`, which the proxy runs on the prebuffered original client body after gateway-owned normalization (bounded `Content-Encoding` decoding) and **before any `before_proxy` hook or `transform_request_body` transformer**. A configured transform therefore cannot add a schema-required property, coerce an invalid type, rename a field, or delete an `additionalProperties: false` violation and have the result accepted as if the client had sent it (`GHSA-896v-jx23-9g6p`). The phase is read-only: it admits or rejects, it never rewrites the body or headers.
 
@@ -1830,15 +2023,15 @@ Buffering for that phase is selected from the matched operation alone — not fr
 The AI plugins are ordered to compose correctly:
 
 1. **`ai_transcript_audit` (2740)** runs after authentication/authorization and before `request_deduplication` (3010), so local and Redis replays cannot terminate the chain before audit staging. It also stages before reject-capable AI guardrails so blocked prompts can still be captured when `always_capture_on_guardrail` is enabled. Its final request-body hook reclassifies and refreshes the captured request after downstream redaction/transforms when traffic continues; priority overrides that reverse audit/dedup order are rejected. Its `after_proxy` hook is an active admission point, not an observer: on a `before_proxy` short circuit (reject or synthetic response) no final request-body hook ran, so this is where the staged request is captured from the final `request_body` — and where a refuted gRPC enrollment discards staging. On the explicitly replaceable rejection pass it also performs fail-closed stream and buffered-commit admission, so `sink.on_buffer_full: reject` / `sink.on_sink_error: reject` can select a `503` here in place of the response another plugin chose. On the non-replaceable pass it cannot re-reject, so a provisional `rejected` sink status is downgraded to `deferred` rather than reported as a rejection that never happened.
-2. **`ai_prompt_shield` (2925)** runs next in the pre-proxy body flow — PII must be detected/redacted before the request reaches the backend or later body validators. It sits right after audit staging and rate limiting so brute-force protection applies first. Its `before_proxy` decision is not the last one: later `transform_request_body` hooks can change policy-relevant content, so every request it admits into its bare-JSON `POST` scope is re-decided in `on_final_request_body` over the exact backend-visible body — `reject`/`warn` re-decide there and `redact` fails closed, because that hook cannot rewrite wire bytes. Configured request decompression runs earlier still, in the shared pre-`before_proxy` normalization phase, so an ordinary compressed body is already plaintext here and is scanned (and redacted) like any other; only a body that is still encoded at `before_proxy` is deferred to the final hook, where enforcing actions fail closed if nothing reduced it to plaintext and compressed redaction rejects detected PII. `waf` request metadata checks have already run in `authorize`; WAF request-body checks run on the final backend-visible body after request body transforms.
+2. **`ai_prompt_shield` (2925)** runs next in the pre-proxy body flow — PII must be detected/redacted before the request reaches the backend or later body validators. It sits right after audit staging and rate limiting so brute-force protection applies first. Its `before_proxy` decision is not the last one: later `transform_request_body` hooks can change policy-relevant content, and a header rewrite can bring a request into scope, so `on_final_request_body` decides scope again from the final headers and re-decides every in-scope `POST` over the exact backend-visible body — `reject`/`warn` re-decide there and `redact` fails closed, because that hook cannot rewrite wire bytes. In `content`/`all` mode every `POST` / `PUT` / `PATCH` that is not framed gRPC is in scope: a JSON media type is declared JSON (a non-UTF-8, unparseable, oversized, or non-UTF-8-`charset` body is refused by enforcing actions), and any other or missing `Content-Type` is sniffed — held to the same rules whenever the body may be a JSON document, and left alone when it is a text or binary upload. Configured request decompression runs earlier still, in the shared pre-`before_proxy` normalization phase, so an ordinary compressed body is already plaintext here and is scanned (and redacted) like any other; only a body that is still encoded at `before_proxy` is deferred to the final hook, where enforcing actions fail closed if nothing reduced it to plaintext and compressed redaction rejects detected PII. `waf` request metadata checks have already run in `authorize`; WAF request-body checks run on the final backend-visible body after request body transforms.
 3. **`ai_semantic_firewall` (2968)** runs after body/OpenAPI validation and before request guard, semantic cache, and federation — semantically dangerous prompts, RAG content, tool calls, and responses are evaluated before they can reach semantic cache or a federated provider. Because request/response body transformers run after the initial semantic pass, the firewall uses instance-scoped body hashes and re-evaluates changed final backend-visible requests and client-visible responses; unchanged bodies avoid duplicate embedding calls. Encoded requests are deferred until the final request hook after optional decompression. Encoded governed responses are decided at the final response hook the same way, and the decode is NOT limited to bodies the gateway compressed: a `gzip`/`x-gzip`/`br` response is inflated within the bounded inspection limit and classified from the decoded representation whether the origin sent that coding or a `compression` instance produced it. Only an unsupported coding, a malformed or truncated payload, or one exceeding the decode bound is uninspectable, and that follows `on_error` (fail-closed by default). The one deliberate release is a response that was never in the firewall's scope as plaintext and is encoded only because the gateway compressed it — proven by the compression plugin's private ownership marker, never by `Content-Type` or public metadata — which is not inflated again merely to repeat a decision already made.
 4. **`ai_request_guard` (2975)** runs after semantic firewall — it validates model names, max_tokens, message counts, prompt size, and provider-native temperature fields. It revalidates the final backend-visible JSON after later request-body transforms, so a transformer cannot replace a protected field after admission; clamp/default caps that are undone after transformation fail closed.
 5. **`ai_tool_governor` (2978)** runs after the request guard and before semantic cache and federation — it applies deterministic allow/deny/approval policy to concrete tool/function calls by name, arguments, JSON Schema, regex, identity, and an optional approval webhook. A disallowed tool schema in the request `tools[]`, a dangerous tool call in `choices[].message.tool_calls[]`, or a streamed SSE tool-call delta is screened before it reaches the client, semantic cache, or a federated provider. It complements `ai_semantic_firewall` (which catches intent); this plugin is purely deterministic (names, args, schema, regex, identity, approval). Because `request_transformer` (3000) and `response_transformer` (4000) run after the initial `before_proxy`/`on_response_body` inspection, the governor re-runs its deterministic request policy on the final backend-visible body (`on_final_request_body`) and its response policy on the final client-visible body (`on_final_response_body`), so a transform that rewrites an allowed body into a denied `tools/call` or injects a denied `choices[].message.tool_calls[]` is still fail-closed before dispatch or delivery.
 6. **`ai_stream_router` (2984)** claims enabled POST JSON requests with `"stream": true`, a nonempty model, and a matching provider before non-streaming federation. The selector does not require a particular incoming path or a `messages` field. Provider-specific translation still validates the request representation it needs (including Anthropic and Gemini tool/history shapes). It rewrites the route for provider-native streaming and normalizes Anthropic and Google Gemini / Vertex-compatible provider streams to OpenAI SSE where needed. Identity-encoded provider streams use incremental normalization; when a supported residual `Content-Encoding` reaches the normalizer, encoded chunks are retained under finite limits and decoded/normalized at EOF before output is released.
-7. **`ai_prompt_compressor` (4055)** runs after the guard and after `compression` request decompression. It boundedly shortens prompt text only for admitted OpenAI Chat/Text Completions representations (`messages[].content` for configured roles, plus legacy `prompt`). In `auto`, standard operation paths and body shapes must agree; the original incoming classification path is kept in one private per-request snapshot so a later routing rewrite cannot change eligibility, while fixed-family config is the explicit custom-path opt-in. Its request-time buffering gate stages plaintext `ctx.metadata["request_body"]` rewrites for compatible direct dispatch, privately reuses transformed bodies of at most 65,536 bytes when the wire source is unchanged, and otherwise recomputes against the final pre-compressor wire representation (including opt-in decompression) under the same work budget. Larger prompts therefore retain no second transformed-body copy across provider latency. Final wire counters replace provisional counters and remain instance-scoped before aggregation. Matching-backtick code, URLs, Unicode numbers, common identifiers, nested preserve text, and negations survive; successful changes intentionally reserialize the complete JSON body. Configured preserve markers use a separate non-queuing bounded sanitation lane and representation-preserving fallback when statistical work is saturated/over budget or output would overflow; the context-aware final hook rejects decoded bodies that exceed the hard sanitation bound or cannot enter the sanitation lane. Federation consumes the same final transformed body.
-8. **`ai_semantic_cache` (4057)** performs exact and semantic lookup in `on_final_request_body_with_context`, not `before_proxy`. That places it after every `before_proxy` admission guardrail, after `request_transformer` (3000) header/query rewrites, after every `transform_request_body` hook (`compression` request decode at 4050, `ai_prompt_compressor` at 4055), and after `ai_prompt_compressor`'s final hook enforces its staged marker-sanitization rejection — so a hit can never answer a request the gateway had already decided to refuse, and the replay partition binds the finalized outbound headers, the effective query, the post-routing destination, and the exact prompt bytes the provider would receive. Its decision remains ahead of `ai_federation` (4060), so a hit short-circuits before the later finalized-request-egress phase. Store stays in `on_final_response_body`. This observer sees transport-encoded bytes on buffered HTTP and native H3; it performs bounded content decoding and retains decoded JSON with representation-specific headers removed, so synthetic hits can pass through live compression once.
+7. **`ai_prompt_compressor` (4055)** runs after the guard and after `compression` request decompression. It boundedly shortens prompt text only for admitted OpenAI Chat/Text Completions representations (`messages[].content` for configured roles, plus legacy `prompt`). In `auto`, standard operation paths and body shapes must agree; the original incoming classification path is kept in one private per-request snapshot so a later routing rewrite cannot change eligibility, while fixed-family config is the explicit custom-path opt-in. Its request-time buffering gate stages plaintext `ctx.metadata["request_body"]` rewrites for compatible direct dispatch, privately reuses transformed bodies of at most 65,536 bytes when the wire source is unchanged, and otherwise recomputes against the final pre-compressor wire representation (including opt-in decompression) under the same work budget. Larger prompts therefore retain no second transformed-body copy across provider latency. Final wire counters replace provisional counters and remain instance-scoped before aggregation. Matching-backtick code, URLs, Unicode numbers, common identifiers, nested preserve text, and negations survive; successful changes intentionally reserialize the complete JSON body. Configured preserve markers use a separate non-queuing bounded sanitation lane and representation-preserving fallback (repeated until no marker is synthesized, at most eight passes) when statistical work is saturated/over budget or output would overflow; the context-aware final hook rejects decoded bodies that exceed the hard sanitation bound or cannot enter the sanitation lane, and refuses (`400`) an admitted final body whose string values still carry a marker — so a body transform ordered after 4055 cannot reintroduce one. Preserve-tag instances also claim content-coded candidates through the shared request representation gate and verify the decoded view. OpenAI Responses and Anthropic Messages bodies are compressed only under their fixed families. Federation consumes the same final transformed body.
+8. **`ai_semantic_cache` (4057)** performs exact and semantic lookup in `on_final_request_body_with_context`, not `before_proxy`. That places it after every `before_proxy` admission guardrail, after `request_transformer` (3000) header/query rewrites, after every `transform_request_body` hook (`compression` request decode at 4050, `ai_prompt_compressor` at 4055), and after `ai_prompt_compressor`'s final hook enforces its staged marker-sanitization rejection — so a hit can never answer a request the gateway had already decided to refuse, and the replay partition binds the finalized outbound headers, the effective query, the post-routing destination, and the exact prompt bytes the provider would receive. Its decision remains ahead of `ai_federation` (4060), so a hit short-circuits before the later finalized-request-egress phase. Composition admission enforces this under `priority_override`: a chain in which any plugin declaring `enforces_finalized_request_policy()` (other than the `ai_federation` dispatcher) has an effective priority at or after an `ai_semantic_cache` instance is refused at candidate validation and cache construction. Store stays in `on_final_response_body` for backend responses. A provider-backed `ai_federation` 2xx answer (federation's external-operation provenance plus its origin-retention marker, recorded only when the provider's ORIGINAL headers carried no `no-store` / `private` / `Set-Cookie`) is staged there and published from `on_response_committed`, after the synthetic path's late reject `after_proxy` header hooks, re-checking the final status and headers; every fabricated synthetic body stays ineligible. This observer sees transport-encoded bytes on buffered HTTP and native H3; it performs bounded content decoding and retains decoded JSON with representation-specific headers removed, so synthetic hits can pass through live compression once.
 9. **`ai_federation` (4060)** is HTTP-only and handles non-streaming provider routing from the finalized-request-egress phase, after all request transforms and every final request-policy hook. It translates OpenAI-format requests to the matched provider, normalizes bounded non-streaming responses, and returns via `RejectBinary` before backend egress/admission/transport. Matched requests with `"stream": true` are handled by the plugin's own streaming path when the root `streaming` block is enabled (issue #3298), and are otherwise rejected with `501`; either way the plugin stands down when `ai_stream_router` already recorded its private claim for the request (or explicitly passed it through via `ai_stream_router_pass_through=true`). The streaming path claims in `before_proxy` at 4060, commits exactly ONE eligible provider before any downstream-visible byte, and rewrites the routing decision through `route_override_*` so the ordinary dispatch path relays provider SSE incrementally — it does NOT use the terminate-and-respond short-circuit. Fallback across providers is confined to that pre-commit selection (open circuit, streaming-ineligible provider, unusable endpoint); once the claim exists no second provider may be spliced into the same logical stream, and a failure after body bytes are committed truncates with one gateway-authored terminal SSE `error` event rather than switching providers. Streaming eligibility requires a provider whose native streaming wire format already is the OpenAI Chat Completions SSE contract (`openai`, `mistral`, `xai`, `deepseek`, `meta_llama`, `hugging_face`, `azure_openai`) with a static header credential; `anthropic`, `google_gemini`, `google_vertex`, `aws_bedrock`, and `cohere`, and any AWS SigV4 / Google OAuth2 provider, fail closed with a field-specific `501` and belong to `ai_stream_router`. A claimed stream mints the same private provider claim `ai_stream_router` uses, so `request_mirror`, `serverless_function`, `mcp_gateway`, and `mesh_route_dispatch` stand down on it identically, and `enforce_final_backend_header_policy` plus `on_final_request_body_with_context` re-assert the credential, destination, and committed model over the finalized backend-visible request (GHSA-xhp5-hqj8-3mwg). Enabling `streaming` therefore makes `ai_federation` incompatible with `request_deduplication` and `response_caching` on the same proxy. A claimed stream is accounted exactly like a buffered call: it takes one non-queuing `max_concurrent_requests` permit and one real `ProviderCircuit` admission (`admit`, so a half-open circuit still grants exactly one probe), both held in a clone-safe reservation on the private claim whose `Drop` releases them on client disconnect, downstream policy cut, pre-header cancellation, or shutdown. A 2xx stream is scored a circuit SUCCESS only after the SSE guard proves a valid terminal `data: [DONE]` — the guard RETAINS that terminal event (bounded by `streaming.max_event_bytes`) and releases it verbatim only at a clean upstream EOF, because a client may stop reading at `[DONE]`, so any provider byte after it fails the stream closed and DROPS the marker instead of appending an error a completed client would never read; a truncated, oversized, malformed, post-terminal, content-coded, or non-event-stream response is a circuit FAILURE; a configured fallback status or a redirect is a failure and every other non-2xx keeps its provider-answered success exactly as the buffered path scores it. Because `model_mapping` / `default_model` mean the provider-visible generation is frequently not the client's, the claim owner rewrites the final top-level `model` to the frozen resolved value in `transform_request_body_with_context` (owner-scoped, bounded, `stream: true` re-asserted, and skipped outright for a body with duplicate JSON members so the final hook still fails it closed). The committed provider's `connect_timeout_seconds` / `read_timeout_seconds` become the effective route's dispatch budgets — on the reqwest path `read_timeout_seconds` is a WHOLE-EXCHANGE bound (connect through last body byte), not a per-chunk inactivity bound, so `streaming.read_timeout_seconds` overrides it for streams and `0` there removes the gateway-imposed bound for long generations. Provider response headers are reduced at the origin response-header boundary (6c) rather than forwarded wholesale. Successful synthetic federation responses pass through the response-side body hooks before the client receives them, including `ai_semantic_firewall`, `ai_response_guard`, response transforms, final-response hooks, and committed observers when configured. `ai_token_metrics` is the deliberate exception: it skips synthetic short-circuit bodies, so `ai_federation` writes token metadata and a trusted typed usage snapshot directly.
-10. **`ai_token_metrics` (4100)** runs after the response comes back from the backend — it parses supported HTTP JSON/SSE provider usage (prompt, completion, total, model) and writes it to `ctx.metadata`. SSE accounting requires `buffer_streaming_responses: true`: it collects the complete stream before inspection and disables live delivery. By default, origin SSE releases this plugin's buffering requirement even under retries without a request `Accept` hint. Native gRPC protobuf messages are explicitly unsupported because no generic method/schema contract exists. Provider normalization runs before inspection; origin `gzip`/`br` coding chains are decoded only into a bounded inspection copy, leaving the encoded client response and headers unchanged. Public metadata flows into `TransactionSummary` for downstream logging, while bounded-label `prometheus_metrics` token/cost counters consume a separate typed usage snapshot that backend/operator metadata cannot mint. When several token-metrics instances publish different prefixes, Prometheus selects one most-complete token snapshot and at most one independently selected trusted cost per request instead of summing duplicates. It is observability-only and never enforces budget policy. When `ai_federation` is active, `ai_federation` publishes the same authoritative usage representation directly, and `ai_rate_limiter` reconciles usage from the public metadata on the rejection path.
+10. **`ai_token_metrics` (4070)** runs after the response comes back from the backend — it parses supported HTTP JSON/SSE provider usage (prompt, completion, total, model) and writes it to `ctx.metadata`. It runs after `ai_federation` (4060) and BEFORE `ai_response_guard` (4075): a guard rejection breaks the `on_response_body` loop and replaces a 2xx body the provider already generated, and a streaming guard cut stops later inspectors from seeing the terminal usage event, so observing first keeps that consumed generation's tokens and cost. Streamed SSE and AWS event-stream responses are metered by a pass-through `response_stream_inspector` that forwards every chunk immediately, and the observed usage is published once from `on_response_stream_terminated` before the transaction is logged; `buffer_streaming_responses: true` instead collects the complete SSE stream before inspection and disables live delivery. By default, origin SSE and AWS event-stream responses release this plugin's buffering requirement even under retries without a request `Accept` hint, and non-2xx responses are never collected for it. Native gRPC protobuf messages are explicitly unsupported because no generic method/schema contract exists. Provider normalization runs before inspection; origin `gzip`/`br` coding chains are decoded only into a bounded inspection copy, leaving the encoded client response and headers unchanged. Public metadata flows into `TransactionSummary` for downstream logging, while bounded-label `prometheus_metrics` token/cost counters consume a separate typed usage snapshot that backend/operator metadata cannot mint. When several token-metrics instances publish different prefixes, Prometheus selects one most-complete token snapshot and at most one independently selected trusted cost per request instead of summing duplicates. It is observability-only and never enforces budget policy. When `ai_federation` is active, `ai_federation` publishes the same authoritative usage representation directly, and `ai_rate_limiter` reconciles usage from the public metadata on the rejection path.
 11. **`ai_rate_limiter` (4200)** reserves estimated token usage before proxying JSON `POST` requests, based on output-token caps plus estimated prompt tokens. It runs after `ai_token_metrics` on the response body path, reconciles the reservation to actual usage when usage metadata is available, and keeps/rejects/releases unmetered 2xx responses according to `on_unmetered_response`. Every response hook — buffered, stream-inspector, and terminal — first re-checks that this instance classified the request as an AI call, so a non-AI reply that happens to carry a usage-shaped JSON document is never charged on any transport. An origin-encoded JSON/SSE body is read through a bounded inspection copy: scratch and decoded-output construction are budget-charged, with a 4 MiB encoded/per-layer ceiling, 8 MiB cumulative decoded ceiling, at most four codings, and 500:1 amplification bound. The construction charge is released when decoding returns, before synchronous usage extraction reads the returned plaintext; the retained client body has its separate charge. The client-visible bytes and headers remain unchanged. A coding it cannot decode safely (and a content-coded stream, whose framing parsers do not undo codings) is resolved by `on_unmetered_response` rather than parsed. It requests response buffering only for a request it classified as an AI call and only for a successful JSON representation; streaming responses (SSE and AWS Bedrock `application/vnd.amazon.eventstream`) are metered by a bounded pass-through `response_stream_inspector` that forwards bytes unchanged — Bedrock event-stream prelude and message CRC32 values are verified before any declared length or usage payload is trusted — and their reservation is reconciled once from `on_response_stream_terminated` — which also fires on client disconnect and backend error. A non-2xx backend response releases its reservation from the status-only `after_proxy` phase. A genuine pre-provider / failed-dispatch gateway rejection releases on the reject-replay `after_proxy` pass; a later body-policy or after_proxy rejection of a provider-consumed 2xx keeps the charge. Window/TTL is only the backstop for cancellation-only cases that cannot await those hooks. Every reservation-lifecycle metadata key is scoped to the limiter instance, so composed per-consumer and per-IP budgets reconcile and release independently. Synthetic short-circuit bodies (cache/dedup/mock/etc.) are never charged or released — the limiter exempts them via the internal `ferrum:synthetic_short_circuit` marker. When `ai_federation` is active, the rate limiter uses `applies_after_proxy_on_reject()` to reconcile token usage from federation metadata on the rejection path (the sole federation charger, scoped per limiter instance).
 
 ### Streaming AI: ai_stream_router (2984) claims `stream: true`, ai_federation (4060) owns the rest
@@ -1879,7 +2072,7 @@ phase, so live header rules (including `no-transform` and strong `ETag`) govern
 the encoding. The shared bounded buffered transform pipeline then encodes the
 replay before final client-visible header policy and committed observers.
 
-The `compression` plugin runs at priority 4050 — after `response_transformer` (4000) so it compresses the final transformed response body, before `ai_prompt_compressor` (4055) so opt-in request decompression exposes plaintext prompt JSON before prompt compression, and before `ai_token_metrics` (4100) and `ai_rate_limiter` (4200). Gateway-owned compression therefore presents normalized bytes to the later AI hooks. If an origin nevertheless returns an encoded JSON/SSE body, `ai_token_metrics` performs its own bounded inspection-only decoding without normalizing the client-visible bytes or headers. Configured request decompression (`decompress_request`) additionally runs in the shared pre-`before_proxy` body-normalization phase on H1/H2 and native H3 so `before_proxy` body consumers observe the same size-bounded plaintext that is forwarded upstream. It therefore runs *after* the `authenticate` phase, so composing it with an identity-establishing `soap_ws_security` instance is rejected at admission rather than validating encoded bytes. In `before_proxy`, compression can strip `Accept-Encoding` from the backend request so the backend sends uncompressed responses for the gateway to compress. Response body buffering is required when this plugin is enabled.
+The `compression` plugin runs at priority 4050 — after `response_transformer` (4000) so it compresses the final transformed response body, before `ai_prompt_compressor` (4055) so opt-in request decompression exposes plaintext prompt JSON before prompt compression, and before `ai_token_metrics` (4070) and `ai_rate_limiter` (4200). Gateway-owned compression therefore presents normalized bytes to the later AI hooks. If an origin nevertheless returns an encoded JSON/SSE body, `ai_token_metrics` performs its own bounded inspection-only decoding without normalizing the client-visible bytes or headers. Configured request decompression (`decompress_request`) additionally runs in the shared pre-`before_proxy` body-normalization phase on H1/H2 and native H3 so `before_proxy` body consumers observe the same size-bounded plaintext that is forwarded upstream. It therefore runs *after* the `authenticate` phase, so composing it with an identity-establishing `soap_ws_security` instance is rejected at admission rather than validating encoded bytes. In `before_proxy`, compression can strip `Accept-Encoding` from the backend request so the backend sends uncompressed responses for the gateway to compress. Response body buffering is required when this plugin is enabled.
 
 ### Logging runs last (9000+)
 
@@ -1909,6 +2102,27 @@ transaction hook sequentially:
 - Native H3 drives the response body to completion inside its handler. It then
   synchronously awaits streaming terminal hooks and sequential log hooks before
   the handler finishes; it does not use the detached hyper-body logger.
+- An H1/H2 request whose client resets or disconnects while the handler is
+  still pending (before any response head) is dropped by hyper, so none of the
+  handler's own log paths runs. Its `ClientAbortScope` hands one `499`
+  client-abort summary (`client_disconnected: true`, rejection phase
+  `client_disconnect_before_response`) to the same detached terminal delivery
+  the streamed body uses, so the `log` hooks still run exactly once (issue
+  #6768). Only `log` / `log_with_mesh_key` run for it: there is no response, so
+  no response-phase or streaming terminal hook does. A reset the gateway's own
+  HTTP/2 stack sent is recorded the same way as a `400`, and a connection the
+  gateway closed itself as a `444`.
+- `log_with_mirror` is cancellation-safe and at-most-once per sink: if the task
+  awaiting it is dropped while a sink's `log` is pending, the summary, context,
+  and the sinks that had not started move to detached terminal delivery, which
+  invokes each of them once and then records the runtime counters and mirrors.
+  The interrupted sink is never invoked again: it may already have persisted
+  or enqueued the record, and a dropped record is preferred over a duplicate.
+
+A buffered record is built before the response is handed to the transport and
+says so with `response_delivery: not_observed`; streamed, HTTP/3 post-send,
+client-abort, and gateway-close records carry `response_delivery: observed`
+(issue #6769).
 
 Potentially slow sinks should use an explicitly bounded, plugin-owned handoff.
 Own the queue, worker, cancellation state, and retry budget in the plugin;
@@ -2024,7 +2238,9 @@ built-ins the refusal applies on both flavors to `soap_ws_security` in every
 configuration (timestamp-only included), `openapi_validator` in `block` mode,
 `mcp_gateway`, `request_deduplication` with `enforce_required`,
 `ai_prompt_shield`, `ai_rate_limiter`, `ai_tool_governor`,
-`ai_semantic_firewall`, and `rate_limiting` with `mcp_tool_calls`; to native
+`ai_semantic_firewall`, `rate_limiting` with `mcp_tool_calls`, and `sse`
+while `require_get_method` or `require_accept_header` is enabled (the
+default); to native
 gRPC for `graphql` with any protection rule (it runs on WebSocket); and to
 WebSocket for `a2a_gateway` with a deny policy (it runs on gRPC). Serve gRPC or
 WebSocket traffic from a separate route that does not carry those plugins, or
@@ -2148,7 +2364,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `mcp_gateway` | ✓ | | | | | HTTP-only MCP JSON-RPC parsing, metadata, and namespaced tool/resource/prompt routing |
 | `a2a_gateway` | ✓ | ✓ | | | | Detects A2A HTTP/REST/gRPC methods, rewrites HTTP and gRPC Agent Cards, applies method policy, and emits `a2a.*` metadata |
 | `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |
-| `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
+| `request_transformer` | ✓ | ✓ | ✓ | | | Modifies HTTP headers/query/body; WebSocket handshake headers/query only |
 | `serverless_function` | ✓ | ✓ | | | | Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions); terminate supports HTTP and native unary gRPC |
 | `response_mock` | ✓ | | ✓ | | | Short-circuits HTTP and WebSocket upgrade handshakes; native gRPC unsupported by design — only the validated serverless_function terminate contract carries provenance-authorized framed unary Reject semantics |
 | `grpc_deadline` | | ✓ | | | | gRPC timeout enforcement and propagation |
@@ -2157,15 +2373,15 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `response_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy response body size limits |
 | `response_caching` | ✓ | | | | | HTTP-only response cache lookup and store |
 | `response_transformer` | ✓ | ✓ | | | | Modifies HTTP response headers/body |
-| `compression` | ✓ | | | | | HTTP response compression and request decompression (gzip, brotli) |
+| `compression` | ✓ | | | | | HTTP response compression and request decompression (gzip, brotli, zstd) |
 | `ai_prompt_compressor` | ✓ | | | | | HTTP-only JSON prompt compression; native gRPC wire frames are not rewritten |
 | `ai_federation` | ✓ | | | | | HTTP-only; routes final OpenAI JSON bodies to providers, normalizes bounded responses, and relays committed provider SSE incrementally |
+| `ai_token_metrics` | ✓ | | | | | HTTP JSON/SSE accounting only; native gRPC protobuf has no supported provider schema contract |
 | `ai_response_guard` | ✓ | ✓ | | | | HTTP JSON/SSE/text response inspection; native gRPC only for methods enrolled in the descriptor-based `grpc` block |
 | `security_headers` | ✓ | ✓ | ✓ | | | HTTP-family response security headers and fingerprint stripping |
-| `ai_token_metrics` | ✓ | | | | | HTTP JSON/SSE accounting only; native gRPC protobuf has no supported provider schema contract |
 | `ai_rate_limiter` | ✓ | | | | | HTTP JSON/SSE token accounting only; native gRPC protobuf frames have no supported usage schema, so gRPC attachment would never charge |
 | `stdout_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
-| `ws_frame_logging` | | | ✓ | | | `on_ws_frame` records policy decisions such as Close; delivery observations are emitted after successful destination sends |
+| `ws_frame_logging` | | | ✓ | | | `on_ws_policy_close` records final policy Close decisions; delivery observations are emitted after successful destination sends |
 | `statsd_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `http_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `tcp_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
@@ -2247,7 +2463,7 @@ An **absent** `Content-Type` is treated as JSON, and the representation gate's c
 
 ## gRPC Compatibility
 
-All plugins in the execution pipeline work transparently with gRPC requests. gRPC metadata maps directly to HTTP/2 headers, so:
+Plugins whose [protocol matrix](#per-plugin-protocol-matrix) row includes `Grpc` run for native gRPC requests; HTTP-only plugins are skipped, or the request is refused when the skipped plugin gates admission (see [Protocol Support](#protocol-support)). For the supported plugins, gRPC metadata maps directly to HTTP/2 headers, so:
 
 - **Authentication plugins** split by credential location. JWKS, JWT, and Basic inspect the `authorization` header, which gRPC clients send as metadata. `key_auth` uses its configured `key_location` and defaults to `x-api-key` metadata (`header:X-API-Key`); it does not read `authorization` unless you set `key_location: header:Authorization`. Configure `key_location: query:<name>` only when the gRPC request URI actually carries that query parameter.
 - **Rate limiting** works identically for gRPC — keyed by IP or consumer identity.

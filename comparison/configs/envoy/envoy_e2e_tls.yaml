@@ -48,10 +48,8 @@ static_resources:
         name: envoy.transport_sockets.tls
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-          common_tls_context:
-            validation_context:
-              trusted_ca:
-                filename: /etc/envoy/tls/server.crt
+          # No validation_context: like every other gateway's E2E TLS leg, Envoy
+          # re-encrypts to the backend without verifying its certificate.
       load_assignment:
         cluster_name: backend_cluster_tls
         endpoints:

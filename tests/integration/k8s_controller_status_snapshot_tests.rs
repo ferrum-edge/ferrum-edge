@@ -1,11 +1,13 @@
 //! Integration coverage for the shared Gateway API + Istio status-writer
 //! object snapshot (#3281): one immutable generation, independent plans,
-//! failure isolation, reload/delete, and status output parity.
+//! failure isolation, reload/delete, and status output parity. Also pins that
+//! the reconciler's dispatch runs the two writers' batches concurrently.
 
-use ferrum_edge::_test_support::shared_status_objects_snapshot;
+use ferrum_edge::_test_support::{run_status_patchers_for_test, shared_status_objects_snapshot};
 use ferrum_edge::config_sources::k8s::{K8sMetadata, K8sObject, K8sTranslationOptions};
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::istio_status::{IstioStatusWriter, plan_istio_status_updates};
+use ferrum_edge::k8s_controller::metrics::ControllerMetrics;
 use ferrum_edge::k8s_controller::status::{
     GatewayApiStatusWriter, plan_gateway_api_status_updates,
 };
@@ -15,14 +17,51 @@ use kube::client::Body;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tower::service_fn;
 
 #[derive(Default)]
 struct MockKubeState {
     gets: Vec<String>,
     patches: Vec<String>,
+    /// Kind of every request (GET or PATCH) in the order the mock handled it.
+    requests: Vec<String>,
     fail_kinds: Vec<String>,
+}
+
+/// How long one mock API request waits for the other writer's batch to reach
+/// the API server. Comfortably below the 5 s per-request status budget, so a
+/// sequential dispatch still completes (and fails the overlap assertion)
+/// instead of timing out.
+const PEER_WAIT: Duration = Duration::from_secs(2);
+
+/// Rendezvous between the two writers' mock API servers. Every request marks
+/// its own writer as in flight, then waits (bounded by [`PEER_WAIT`]) for the
+/// peer writer to send a request too. `overlapped` records that the peer was
+/// seen while this writer's request was still open.
+struct WriterGate {
+    arrived: CancellationToken,
+    peer: CancellationToken,
+    overlapped: AtomicBool,
+}
+
+fn writer_gates() -> (Arc<WriterGate>, Arc<WriterGate>) {
+    let gateway_arrived = CancellationToken::new();
+    let istio_arrived = CancellationToken::new();
+    let gateway = Arc::new(WriterGate {
+        arrived: gateway_arrived.clone(),
+        peer: istio_arrived.clone(),
+        overlapped: AtomicBool::new(false),
+    });
+    let istio = Arc::new(WriterGate {
+        arrived: istio_arrived,
+        peer: gateway_arrived,
+        overlapped: AtomicBool::new(false),
+    });
+    (gateway, istio)
 }
 
 fn options() -> K8sTranslationOptions {
@@ -97,8 +136,21 @@ fn json_response(status: StatusCode, value: Value) -> Response<Body> {
 }
 
 fn mock_kube_client(state: Arc<Mutex<MockKubeState>>) -> Client {
+    mock_kube_client_with_gates(state, None)
+}
+
+/// Mock API server dispatched by path. Live reads and patch responses echo the
+/// object's name and its `uid-{name}` UID (the fixtures' UID scheme), so both
+/// writers' identity guards pass and their PATCHes land. With `gates`
+/// (Gateway API gate, Istio gate), every request first meets its writer's
+/// rendezvous, so one client can serve both writers as in production.
+fn mock_kube_client_with_gates(
+    state: Arc<Mutex<MockKubeState>>,
+    gates: Option<(Arc<WriterGate>, Arc<WriterGate>)>,
+) -> Client {
     let service = service_fn(move |request: Request<Body>| {
         let state = state.clone();
+        let gates = gates.clone();
         async move {
             let method = request.method().clone();
             let path = request.uri().path().to_string();
@@ -113,6 +165,28 @@ fn mock_kube_client(state: Arc<Mutex<MockKubeState>>) -> Client {
             } else {
                 "Unknown"
             };
+            let name = path
+                .trim_end_matches("/status")
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let uid = format!("uid-{name}");
+
+            let gate = gates.and_then(|(gateway, istio)| match kind {
+                "GatewayClass" | "HTTPRoute" => Some(gateway),
+                "VirtualService" | "DestinationRule" => Some(istio),
+                _ => None,
+            });
+            if let Some(gate) = gate {
+                gate.arrived.cancel();
+                if tokio::time::timeout(PEER_WAIT, gate.peer.cancelled())
+                    .await
+                    .is_ok()
+                {
+                    gate.overlapped.store(true, Ordering::SeqCst);
+                }
+            }
 
             let _body = request
                 .into_body()
@@ -124,6 +198,7 @@ fn mock_kube_client(state: Arc<Mutex<MockKubeState>>) -> Client {
             let response = match method {
                 Method::GET => {
                     state.gets.push(kind.to_string());
+                    state.requests.push(kind.to_string());
                     if state.fail_kinds.iter().any(|failed| failed == kind) {
                         json_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -142,8 +217,9 @@ fn mock_kube_client(state: Arc<Mutex<MockKubeState>>) -> Client {
                                 "apiVersion": "v1",
                                 "kind": kind,
                                 "metadata": {
-                                    "name": "resource",
+                                    "name": name,
                                     "namespace": "default",
+                                    "uid": uid,
                                     "resourceVersion": "1"
                                 },
                                 "status": {}
@@ -153,6 +229,7 @@ fn mock_kube_client(state: Arc<Mutex<MockKubeState>>) -> Client {
                 }
                 Method::PATCH => {
                     state.patches.push(kind.to_string());
+                    state.requests.push(kind.to_string());
                     if state.fail_kinds.iter().any(|failed| failed == kind) {
                         json_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -171,8 +248,9 @@ fn mock_kube_client(state: Arc<Mutex<MockKubeState>>) -> Client {
                                 "apiVersion": "v1",
                                 "kind": kind,
                                 "metadata": {
-                                    "name": "resource",
+                                    "name": name,
                                     "namespace": "default",
+                                    "uid": uid,
                                     "resourceVersion": "2"
                                 },
                                 "status": {}
@@ -296,5 +374,204 @@ async fn istio_writer_failure_does_not_block_gateway_plan_from_shared_snapshot()
     assert!(
         !gateway_state.patches.is_empty(),
         "gateway patches must still land when Istio fails"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_dispatch_runs_gateway_and_istio_batches_concurrently() {
+    // EDGE-CP-3: the reconcile loop must be held for the slower batch, not the
+    // sum. As in production, both writers share one kube client and one
+    // metrics Arc. Each mock API request waits for the other writer's batch
+    // to reach the API server; a sequential dispatch would let the Gateway API
+    // batch finish before the Istio batch issues anything.
+    let (gateway_gate, istio_gate) = writer_gates();
+    let state = Arc::new(Mutex::new(MockKubeState::default()));
+    let client = mock_kube_client_with_gates(
+        state.clone(),
+        Some((gateway_gate.clone(), istio_gate.clone())),
+    );
+    let metrics = Arc::new(ControllerMetrics::new());
+    let gateway_writer = GatewayApiStatusWriter::new(client.clone()).with_metrics(metrics.clone());
+    let istio_writer = IstioStatusWriter::new(client).with_metrics(metrics.clone());
+
+    run_status_patchers_for_test(
+        Some(gateway_writer),
+        Some(istio_writer),
+        mixed_generation(),
+        options(),
+        &metrics,
+    )
+    .await;
+
+    assert!(
+        gateway_gate.overlapped.load(Ordering::SeqCst),
+        "the Istio batch must reach the API server while the Gateway API batch is in flight"
+    );
+    assert!(
+        istio_gate.overlapped.load(Ordering::SeqCst),
+        "the Istio batch's requests must observe the Gateway API batch's requests"
+    );
+    let state = state.lock().expect("lock mock Kubernetes state");
+    assert!(
+        state
+            .patches
+            .iter()
+            .any(|kind| kind == "GatewayClass" || kind == "HTTPRoute"),
+        "Gateway API status patches must land: {:?}",
+        state.patches
+    );
+    assert!(
+        state
+            .patches
+            .iter()
+            .any(|kind| kind == "VirtualService" || kind == "DestinationRule"),
+        "Istio status patches must land: {:?}",
+        state.patches
+    );
+    assert_eq!(
+        metrics.status_batch_timeouts.load(Ordering::Relaxed),
+        0,
+        "neither batch may hit the reconciler backstop"
+    );
+    assert_eq!(
+        metrics.status_request_timeouts.load(Ordering::Relaxed),
+        0,
+        "no status request may exhaust its budget"
+    );
+    assert_eq!(
+        metrics
+            .gateway_api_status_window_failed_batches
+            .load(Ordering::Relaxed),
+        0,
+        "the Gateway API batch must succeed"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_dispatch_keeps_writer_failures_isolated_when_concurrent() {
+    // A failing Gateway API batch must not stop the concurrently running Istio
+    // batch on the shared client, and it must still record exactly one failed
+    // batch on the status-plan cursor (cursor retry semantics are unchanged,
+    // #6370).
+    let (gateway_gate, istio_gate) = writer_gates();
+    let state = Arc::new(Mutex::new(MockKubeState {
+        fail_kinds: vec!["GatewayClass".to_string(), "HTTPRoute".to_string()],
+        ..MockKubeState::default()
+    }));
+    let client = mock_kube_client_with_gates(
+        state.clone(),
+        Some((gateway_gate.clone(), istio_gate.clone())),
+    );
+    let metrics = Arc::new(ControllerMetrics::new());
+    let gateway_writer = GatewayApiStatusWriter::new(client.clone()).with_metrics(metrics.clone());
+    let istio_writer = IstioStatusWriter::new(client).with_metrics(metrics.clone());
+
+    run_status_patchers_for_test(
+        Some(gateway_writer),
+        Some(istio_writer),
+        mixed_generation(),
+        options(),
+        &metrics,
+    )
+    .await;
+
+    assert!(
+        gateway_gate.overlapped.load(Ordering::SeqCst),
+        "the failing Gateway API batch must overlap the Istio batch"
+    );
+    assert_eq!(
+        metrics
+            .gateway_api_status_window_failed_batches
+            .load(Ordering::Relaxed),
+        1,
+        "the failed Gateway API batch keeps its cursor-retry accounting"
+    );
+    let state = state.lock().expect("lock mock Kubernetes state");
+    assert!(
+        state
+            .gets
+            .iter()
+            .any(|kind| kind == "GatewayClass" || kind == "HTTPRoute"),
+        "the Gateway API batch must have run: {:?}",
+        state.gets
+    );
+    assert!(
+        state
+            .patches
+            .iter()
+            .any(|kind| kind == "VirtualService" || kind == "DestinationRule"),
+        "Istio status patches must land despite the Gateway API failure: {:?}",
+        state.patches
+    );
+}
+
+#[tokio::test]
+async fn reconcile_dispatch_runs_large_istio_batch_after_gateway_batch() {
+    // An Istio plan larger than STATUS_PATCH_PARALLELISM (32) starts every
+    // update at once, so it must not overlap the Gateway API batch on the
+    // shared client: dispatch stays sequential, Gateway API first.
+    let mut objects = mixed_generation();
+    objects.extend((0..40).map(|index| {
+        object(
+            "networking.istio.io/v1beta1",
+            "VirtualService",
+            &format!("vs-{index}"),
+            json!({
+                "hosts": [format!("host-{index}.example.com")],
+                "http": [{"route": [{"destination": {"host": "svc.default.svc.cluster.local"}}]}]
+            }),
+        )
+    }));
+    let istio_plan = plan_istio_status_updates(&objects, options()).len();
+    assert!(
+        istio_plan > 32,
+        "fixture must plan more Istio updates than the overlap threshold, got {istio_plan}"
+    );
+
+    let state = Arc::new(Mutex::new(MockKubeState::default()));
+    let client = mock_kube_client(state.clone());
+    let metrics = Arc::new(ControllerMetrics::new());
+    let gateway_writer = GatewayApiStatusWriter::new(client.clone()).with_metrics(metrics.clone());
+    let istio_writer = IstioStatusWriter::new(client).with_metrics(metrics.clone());
+
+    run_status_patchers_for_test(
+        Some(gateway_writer),
+        Some(istio_writer),
+        objects,
+        options(),
+        &metrics,
+    )
+    .await;
+
+    let state = state.lock().expect("lock mock Kubernetes state");
+    let is_gateway = |kind: &String| kind == "GatewayClass" || kind == "HTTPRoute";
+    let last_gateway = state
+        .requests
+        .iter()
+        .rposition(is_gateway)
+        .expect("the Gateway API batch must reach the API server");
+    let first_istio = state
+        .requests
+        .iter()
+        .position(|kind| !is_gateway(kind))
+        .expect("the Istio batch must reach the API server");
+    assert!(
+        last_gateway < first_istio,
+        "the Gateway API batch must finish before any Istio request starts: {:?}",
+        state.requests
+    );
+    assert!(
+        state.patches.iter().any(is_gateway),
+        "Gateway API status patches must land: {:?}",
+        state.patches
+    );
+    assert_eq!(
+        state
+            .patches
+            .iter()
+            .filter(|kind| *kind == "VirtualService" || *kind == "DestinationRule")
+            .count(),
+        istio_plan,
+        "every planned Istio status patch must land"
     );
 }

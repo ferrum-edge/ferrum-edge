@@ -25,7 +25,6 @@
     "pending_aborted",
     "pending_aborted_datagrams",
     "pending_aborted_bytes",
-    "request_size_stores",
     "request_budget_calls",
     "amplification_charge_calls",
     "fast_activity_stores",

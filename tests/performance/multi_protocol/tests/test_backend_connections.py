@@ -16,6 +16,13 @@ from backend_connections import backend_connections, read_counters, stamp  # noq
 RUNNER = HARNESS / "run_gateway_protocol_bench.sh"
 
 
+_STREAM_WINDOW_LINE_RE = re.compile(r"(?m)^    pool_http2_initial_stream_window_size: *8388608")
+_BASELINE_PUBLISHED_RE = re.compile(r"BASELINE_PUBLISHED='([^']+)'")
+_WORKFLOW_PUBLISHED_RE = re.compile(r"published='([^']+)'")
+_BASELINE_MIRRORED_RE = re.compile(r"BASELINE_MIRRORED='([^']+)'")
+_WORKFLOW_MIRRORED_RE = re.compile(r"mirrored='([^']+)'")
+
+
 def counters(**overrides):
     values = dict(h2_tls_accepted=10, h2_tls_handshakes=10, grpcs_accepted=4,
                   http_echo_requests=100, grpc_echo_requests=50)
@@ -123,8 +130,7 @@ class RunnerOptionTests(unittest.TestCase):
         # and refuses the run when it does not match exactly once.
         for name in ("http2_perf.yaml", "grpcs_e2e_perf.yaml"):
             text = (HARNESS / "configs" / name).read_text()
-            self.assertEqual(len(re.findall(
-                r"(?m)^    pool_http2_initial_stream_window_size: *8388608", text)), 1, name)
+            self.assertEqual(len(_STREAM_WINDOW_LINE_RE.findall(text)), 1, name)
 
     def test_window_rewrite_failure_refuses_the_run_before_any_work(self):
         source = RUNNER.read_text()
@@ -143,27 +149,27 @@ class RunnerOptionTests(unittest.TestCase):
     def test_dispatch_job_validates_baseline_with_the_runner_patterns(self):
         source = RUNNER.read_text()
         workflow = (REPO_ROOT / ".github/workflows/gateways-protocol-benchmark.yml").read_text()
-        self.assertEqual(re.search(r"BASELINE_PUBLISHED='([^']+)'", source)[1],
-                         re.search(r"published='([^']+)'", workflow)[1])
-        self.assertEqual(re.search(r"BASELINE_MIRRORED='([^']+)'", source)[1],
-                         re.search(r"mirrored='([^']+)'", workflow)[1])
+        self.assertEqual(_BASELINE_PUBLISHED_RE.search(source)[1],
+                         _WORKFLOW_PUBLISHED_RE.search(workflow)[1])
+        self.assertEqual(_BASELINE_MIRRORED_RE.search(source)[1],
+                         _WORKFLOW_MIRRORED_RE.search(workflow)[1])
 
     def test_only_published_main_images_are_pulled(self):
         source = RUNNER.read_text()
-        published = re.search(r"BASELINE_PUBLISHED='([^']+)'", source)[1]
-        mirrored = re.search(r"BASELINE_MIRRORED='([^']+)'", source)[1]
+        published = re.compile(_BASELINE_PUBLISHED_RE.search(source)[1])
+        mirrored = re.compile(_BASELINE_MIRRORED_RE.search(source)[1])
         sha = "0123456789abcdef0123456789abcdef01234567"
         digest = "@sha256:" + "a" * 64
         for image in (f"ferrumedge/ferrum-edge:main-{sha}",
                       f"docker.io/ferrumedge/ferrum-edge:main-{sha}",
                       f"ferrumedge/ferrum-edge:main-{sha}{digest}"):
-            self.assertTrue(re.fullmatch(published, image), image)
-        self.assertTrue(re.fullmatch(mirrored, f"ghcr.io/ferrum-edge/ferrum-edge:main-{sha}"))
+            self.assertTrue(published.fullmatch(image), image)
+        self.assertTrue(mirrored.fullmatch(f"ghcr.io/ferrum-edge/ferrum-edge:main-{sha}"))
         for image in ("ferrumedge/ferrum-edge:latest", "ferrumedge/ferrum-edge:main-abc",
                       f"evil/ferrum-edge:main-{sha}", f"ferrumedge/ferrum-edge:main-{sha} x",
                       f"ghcr.io/other/ferrum-edge:main-{sha}"):
-            self.assertIsNone(re.fullmatch(published, image), image)
-            self.assertIsNone(re.fullmatch(mirrored, image), image)
+            self.assertIsNone(published.fullmatch(image), image)
+            self.assertIsNone(mirrored.fullmatch(image), image)
 
 
 if __name__ == "__main__":

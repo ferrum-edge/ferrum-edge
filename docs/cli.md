@@ -14,7 +14,7 @@ sudo cp target/release/ferrum-edge /usr/local/bin/
 # Pin an immutable semver tag (vX.Y.Z from the Releases page). Do not rely on a moving
 # "latest" channel: GitHub /releases/latest skips prerelease tags.
 set -euo pipefail
-TAG=v0.9.17 # Latest published release at the time of writing.
+TAG=v0.9.21 # Latest published release at the time of writing.
 BASE="https://github.com/ferrum-edge/ferrum-edge/releases/download/${TAG}"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64.sha256"
@@ -129,7 +129,7 @@ Validation passed.
 
 `run` reports the same non-secret facts as structured `info!` records instead, so serving modes keep normal log-level semantics.
 
-1. **Settings** (`ferrum.conf`) — all 300+ environment variables are parsed and validated (ports, paths, TLS configuration, pool sizes, etc.)
+1. **Settings** (`ferrum.conf`) — `EnvConfig` settings are parsed and validated (ports, paths, TLS configuration, pool sizes, etc.; see [configuration.md](configuration.md))
 2. **Spec** (resources YAML/JSON, file mode only):
    - YAML/JSON syntax and deserialization
    - Field-level validation on all proxies, consumers, upstreams, and plugin configs
@@ -140,7 +140,7 @@ Validation passed.
    - Shared runtime admission, including plugin security composition (such as duplicate effective `correlation_id` headers) and `tcp_connection_throttle` attachment compatibility
    - TLS certificate path existence checks
    - Upstream reference validation
-   - Namespace filter summary: the active `FERRUM_NAMESPACE` (default `ferrum`) and post-filter resource counts. When the document contains at least one namespaced resource and zero resources survive namespace filtering, `validate` fails closed with **exit code 1** and a diagnostic naming the active namespace, the namespaces present in the document, and the counts. `--allow-empty-namespace` downgrades that case to a warning and exit 0. An empty document (no namespaced resources) is not a mismatch. Filtering itself is unchanged.
+   - Namespace filter summary: the active `FERRUM_NAMESPACE` (default `ferrum`) and post-filter resource counts. When the document contains at least one namespaced resource and zero resources survive namespace filtering, `validate` fails closed with **exit code 1** and a diagnostic carrying the post-filter counts and the number of namespaces the document resources use. Like every other supplied value, the namespace names are withheld from the rendered diagnostic (see [Diagnostic redaction](#diagnostic-redaction)); the active namespace is on the report's `Namespace:` line. `--allow-empty-namespace` downgrades that case to a warning and exit 0. An empty document (no namespaced resources) is not a mismatch. Filtering itself is unchanged.
 3. **Startup security** (env-level TLS/CIDR/metrics surfaces shared with `run`) — side-effect-free loaders that `serve()` also uses, so `validate` cannot report success for configs that refuse to start. Mode-scoped:
    - TLS policy (`TlsPolicy::from_env_config`) and CRLs (`FERRUM_TLS_CRL_FILE_PATH`) for file/database/cp/dp/mesh, and for `node_agent` when admin HTTPS security intent applies (complete HTTPS that would bind, or explicit nonzero HTTPS intent)
    - Strict `FERRUM_ADMIN_ALLOWED_CIDRS` and `FERRUM_METRICS_ALLOWED_CIDRS` / metrics bearer policy; node-agent validates these when any admin surface is active (plaintext HTTP or complete HTTPS), matching `run`
@@ -170,7 +170,7 @@ Validation passed.
 
 Resource discovery runs after external secret resolution and settings loading. A `FERRUM_FILE_CONFIG_PATH` in the selected `ferrum.conf` suppresses resource discovery, and `--spec` overrides the environment and settings file. A bare `ferrum-edge` invocation prints usage and exits nonzero; use `run`.
 
-**Externally sourced values are never printed.** Failure diagnostics name the base variable, the provider, and the reason, but not the source reference, even when a provider SDK echoes it (a one- or two-byte reference that cannot be removed safely causes the provider detail to be replaced with a fixed key-level failure). After materialization, externally sourced values are withheld from later settings and spec diagnostics, from warnings emitted during parsing (matched verbatim, trimmed, per list entry, case-normalized, and JSON-escaped), and from `validate` report fields. For example, a malformed `FERRUM_DB_PORT_FILE` reports `Invalid FERRUM_DB_PORT value <redacted: value from external secret source>. Expected a valid u16 integer`, and `FERRUM_MODE_FILE` containing `database` prints `Mode: <redacted: value from external secret source>` (`run` withholds its `Operating mode:` log line the same way). The overall result, including `Validation passed.` and spec counts, is unaffected. Rejection and startup diagnostics also withhold directly supplied scalar values, keeping field names, failure reasons, allowed bounds, and recovery guidance.
+**Externally sourced values are never printed.** Failure diagnostics name the base variable, the provider, and the reason, but not the source reference, even when a provider SDK echoes it (a one- or two-byte reference that cannot be removed safely causes the provider detail to be replaced with a fixed key-level failure). After materialization, externally sourced values are withheld from later settings and spec diagnostics, from warnings emitted during parsing (matched verbatim, trimmed, per list entry, case-normalized, and JSON-escaped), and from `validate` report fields. For example, a malformed `FERRUM_PROXY_HTTP_PORT_FILE` reports `Invalid FERRUM_PROXY_HTTP_PORT value <redacted: value from external secret source>. Expected a valid u16 integer`, and `FERRUM_MODE_FILE` containing `database` prints `Mode: <redacted: value from external secret source>` (`run` withholds its `Operating mode:` log line the same way). The overall result, including `Validation passed.` and spec counts, is unaffected. Rejection and startup diagnostics also withhold directly supplied scalar values, keeping field names, failure reasons, allowed bounds, and recovery guidance.
 
 ### Examples
 
@@ -226,13 +226,15 @@ Mesh runtime: OK
 Validation passed.
 ```
 
-On failure:
+On failure, the report printed so far stays on stdout and the failure is one
+`ERROR` log record on stderr (JSON, like every other log record), whose message
+is `Validation error: ` followed by the rendered cause chain:
 
 ```
 Settings (ferrum.conf): OK
   Mode: File
   Namespace: ferrum
-Error: Spec validation failed: Configuration file not found: /nonexistent.yaml
+{"timestamp":"…","level":"ERROR","fields":{"message":"Validation error: Spec validation failed: Configuration file not found: <redacted scalar>"},"target":"ferrum_edge"}
 ```
 
 A namespace-filter mismatch (document resources in `ferrum`, `FERRUM_NAMESPACE=other-ns`) looks like:
@@ -246,7 +248,7 @@ Spec (/etc/ferrum/resources.yaml): OK
   Consumers: 0
   Upstreams: 0
   Plugin configs: 0
-Error: namespace filter mismatch: active namespace 'other-ns' left 0 surviving resources (proxies=0, consumers=0, upstreams=0, plugin_configs=0); document namespaces: ferrum. Set FERRUM_NAMESPACE to a namespace present in the document, or pass --allow-empty-namespace to accept an empty filtered document.
+{"timestamp":"…","level":"ERROR","fields":{"message":"Validation error: namespace filter mismatch: active namespace <redacted scalar> left 0 surviving resources (proxies=0, consumers=0, upstreams=0, plugin_configs=0); the document resources use 1 namespace(s): <redacted scalar>. Set FERRUM_NAMESPACE to the namespace in the `namespace` fields of the document resources, or pass --allow-empty-namespace to accept an empty filtered document."},"target":"ferrum_edge"}
 ```
 
 That failure uses **exit code 1**, the same code as other validation failures.
@@ -262,7 +264,7 @@ Spec (/etc/ferrum/resources.yaml): OK
   Consumers: 0
   Upstreams: 0
   Plugin configs: 0
-Error: Startup security validation failed: Invalid TLS configuration: ...
+{"timestamp":"…","level":"ERROR","fields":{"message":"Validation error: Startup security validation failed: Invalid TLS configuration: …"},"target":"ferrum_edge"}
 ```
 
 ### Diagnostic redaction
@@ -446,10 +448,10 @@ ferrum-edge version [OPTIONS]
 
 ```bash
 $ ferrum-edge version
-ferrum-edge 0.9.17 (aarch64-apple-darwin)
+ferrum-edge 0.9.21 (aarch64-apple-darwin)
 
 $ ferrum-edge version --json
-{"version":"0.9.17","target":"aarch64-apple-darwin"}
+{"version":"0.9.21","target":"aarch64-apple-darwin"}
 ```
 
 ## ambient-udp-preflight

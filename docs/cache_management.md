@@ -68,7 +68,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### Status Code Counters
 
-**What it stores:** Per-status-code request counters exposed via the admin `/status` endpoint. Common HTTP status codes (200, 201, 204, 301, 302, 304, 400, 401, 403, 404, 405, 408, 429, 500, 502, 503, 504) are pre-populated at startup so the hot path uses DashMap read locks.
+**What it stores:** Per-status-code request counters exposed via `GET /admin/metrics` (`gateway.status_codes_total`) and `GET /metrics/runtime`. Common HTTP status codes (200, 201, 204, 301, 302, 304, 400, 401, 403, 404, 405, 408, 429, 500, 502, 503, 504) are pre-populated at startup so the hot path uses DashMap read locks.
 
 **Default limit:** 200 entries.
 
@@ -122,11 +122,11 @@ When the cache reaches the max entry count, new circuit breaker entries for prev
 
 **What it stores:** Per-key (IP or consumer) rate counters with sliding window timestamps or token bucket state. The local (and Redis-fallback) DashMap uses the normalized `FERRUM_POOL_SHARD_AMOUNT`.
 
-**Default limit:** 100,000 entries (hardcoded `MAX_STATE_ENTRIES`).
+**Default limit:** 100,000 entries (`DEFAULT_MAX_STATE_ENTRIES`).
 
-**Config field:** N/A (hardcoded constant).
+**Config field:** `max_state_entries` (default `100000`, range `1..=10000000`). It is read on every admission and is not part of the local-state compatibility fingerprint, so resizing it on a live policy keeps consumed budgets.
 
-**Cleanup mechanism:** Sampled piggyback sweeps during normal request processing (every 1,024 requests, cooldown-gated to at most once per second) prune idle keys even while the map is below the 100,000 hard cap. Hard cardinality is enforced by atomic reservation on admission: existing keys continue at capacity, and previously unseen local/fallback keys are denied fail-closed. Cleanup never force-evicts still-active budgets (that would reset consumed windows). When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback (subject to the same below-cap stale prune and atomic admission rules). `sync_mode` supports only `local` and `redis`; database-backed counters are intentionally unsupported.
+**Cleanup mechanism:** Sampled piggyback sweeps during normal request processing (every 1,024 requests, cooldown-gated to at most once per second) prune idle keys even while the map is below the `max_state_entries` hard cap. Hard cardinality is enforced by atomic reservation on admission: existing keys continue at capacity, and previously unseen local/fallback keys are denied fail-closed. Cleanup never force-evicts still-active budgets (that would reset consumed windows). When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback (subject to the same below-cap stale prune and atomic admission rules). `sync_mode` supports only `local` and `redis`; database-backed counters are intentionally unsupported.
 
 ### AI Rate Limiter
 
@@ -234,11 +234,13 @@ at construction without disclosing credentials.
 
 ### LDAP Auth Cache
 
-**What it stores:** Successful LDAP bind results (a process-random HMAC over the presented username/password -> canonical identity and expiry timestamp) to avoid repeated LDAP round-trips. The HMAC prevents a cache-only disclosure from exposing a reusable fast password verifier; a full process-memory compromise can still recover the in-process HMAC key.
+**What it stores:** Successful LDAP bind results (a process-random HMAC over the exact presented username and password -> canonical identity, entry DN, expiry timestamp and last group-check time) to avoid repeated LDAP round-trips. When enabled, two further maps share `max_cache_entries` as their cap: rejected credentials (`negative_cache_ttl_seconds`, an HMAC digest -> expiry) and per-username failure runs (`max_failed_attempts_per_user`, an HMAC digest of the case-folded username -> consecutive-failure count and backoff deadline). Those two are retained across compatible reloads of the same plugin config and never evict a live failure run; a full tracker refuses untracked usernames with `500`. The HMAC prevents a cache-only disclosure from exposing a reusable fast password verifier; a full process-memory compromise can still recover the in-process HMAC key.
 
 **Default limit:** 10,000 entries. Caching is disabled by default.
 
-**Config field:** `cache_ttl_seconds` (default `0`, disabled; maximum `86,400` seconds / 24 hours) and `max_cache_entries` (default `10,000`; maximum `1,000,000`).
+**Config field:** `cache_ttl_seconds` (default `0`, disabled; maximum `86,400` seconds / 24 hours), `group_cache_ttl_seconds` (default `60`; maximum `86,400`) and `max_cache_entries` (default `10,000`; maximum `1,000,000`).
+
+**Revocation lag:** a hit skips the bind, so a password change or account disablement takes effect only when the entry expires (`cache_ttl_seconds`; values above 900 seconds log a warning). With `required_groups`, a hit older than `group_cache_ttl_seconds` since its last group check re-runs the group search first; a user removed from every required group is refused and evicted.
 
 **Cleanup mechanism:** TTL-based expiration is checked on lookup. Admission uses atomic entry accounting to preserve the hard cap during concurrent authentication. At capacity, one existing entry is replaced for each new admission; the request path never performs a full-cache scan.
 
@@ -254,13 +256,13 @@ at construction without disclosing credentials.
 
 ### JWKS Cache
 
-**What it stores:** JWKS key sets fetched from remote JWKS endpoints, shared across all `jwks_auth` plugin instances.
+**What it stores:** JWKS key sets fetched from remote JWKS endpoints, or read from admin-managed JWKS records (`jwks_source: managed://jwks/<id>#jwks`, keyed by that canonical reference), shared across all `jwks_auth` and `oidc_relying_party` plugin instances. A managed entry re-reads its record at the same refresh interval and immediately after a local `/admin/tls/jwks` write; it is fresh while the record is present and drops every key once the record is withdrawn (see [plugins.md](plugins.md#managed-jwks-records)).
 
 **Default limit:** No hard entry cap -- bounded by the number of configured JWKS provider URLs (typically 1-3 per plugin instance).
 
 **Config fields:** Entry count equals configured provider count. Trust retention is controlled by `jwks_max_stale_seconds` (default `3600` seconds / 1 hour, maximum `86400` seconds / 24 hours); `0` is invalid and cannot disable expiry. A remote provider may set a provider-specific override.
 
-**Cleanup mechanism:** Periodic background refresh (`jwks_refresh_interval_secs`, default `900` seconds). The global JWKS store is keyed by provider URL, so duplicate URLs across plugin instances share a single cache entry and deterministically use the minimum refresh interval and minimum maximum-stale requirement of active consumers. The store records monotonic last-success and last-attempt times plus a bounded failure class/count. Failed, empty, malformed, oversized, or non-2xx refreshes preserve the key map for diagnostics and a finite grace interval without advancing trust; verification fails closed after the deadline. Empty and failed refreshes use a 5s/15s/30s capped retry sequence (or the shorter configured refresh interval). A later valid non-empty response atomically replaces keys and restores trust. Discovery success alone does not refresh key age. Independently of the periodic cadence, a token naming a non-empty `kid` the trusted key set does not contain asks the store for one out-of-band fetch, rate-limited to at most one per `kid_miss_refresh_cooldown_seconds` (default `30`, `0` disables) so a key rotation does not cost a full refresh interval of blanket 401s; the triggering request still fails closed and the periodic deadline and retry backoff are left unchanged. Authenticated metrics and `/health`/`/status` detail aggregate **active remote** stores only by `fresh`/`grace`/`expired` and fixed failure class, never by URL or key/token data. "Active" means claimed by a committed plugin generation: a store an OIDC discovery task resolves after that generation was published becomes active immediately, without waiting for another reload, while a staged or rejected generation never contributes. Unauthenticated `/health`/`/status` keep the coarse `status`+`ready` shape: grace degrades while remaining ready, expiry makes the gateway not-ready/`unavailable`, and no active remote JWKS stays neutral — all from an O(1) precomputed aggregate with monotonic deadlines. See the [`jwks_auth` plugin reference](plugins.md#jwks_auth).
+**Cleanup mechanism:** Periodic background refresh (`jwks_refresh_interval_secs`, default `900` seconds). The global JWKS store is keyed by provider URL, so duplicate URLs across plugin instances share a single cache entry and deterministically use the minimum refresh interval and minimum maximum-stale requirement of active consumers. The store records monotonic last-success and last-attempt times plus a bounded failure class/count. Failed, empty, malformed, oversized, or non-2xx refreshes preserve the key map for diagnostics and a finite grace interval without advancing trust; verification fails closed after the deadline. Empty and failed refreshes use a 5s/15s/30s capped retry sequence (or the shorter configured refresh interval). A later valid non-empty response atomically replaces keys and restores trust. Discovery success alone does not refresh key age. A `discovery_url` provider re-runs OIDC discovery every `jwks_refresh_interval_secs` after its first resolution; a changed `jwks_uri` is adopted only once its key set has usable keys, and the superseded store is retired when nothing else references it. Independently of the periodic cadence, a token naming a non-empty `kid` the trusted key set does not contain asks the store for one out-of-band fetch, rate-limited to at most one per `kid_miss_refresh_cooldown_seconds` (default `30`, `0` disables) so a key rotation does not cost a full refresh interval of blanket 401s; the triggering request still fails closed and the periodic deadline and retry backoff are left unchanged. Authenticated metrics and `/health`/`/status` detail aggregate **active remote** stores only by `fresh`/`grace`/`expired` and fixed failure class, never by URL or key/token data. "Active" means claimed by a committed plugin generation: a store an OIDC discovery task resolves after that generation was published becomes active immediately, without waiting for another reload, while a staged or rejected generation never contributes. Unauthenticated `/health`/`/status` keep the coarse `status`+`ready` shape: grace degrades while remaining ready, expiry makes the gateway not-ready/`unavailable`, and no active remote JWKS stays neutral — all from an O(1) precomputed aggregate with monotonic deadlines. See the [`jwks_auth` plugin reference](plugins.md#jwks_auth).
 
 ### TCP Connection Throttle
 
@@ -268,9 +270,9 @@ at construction without disclosing credentials.
 
 **Default limit:** No hard entry cap -- bounded by unique clients with active connections.
 
-**Config fields:** `max_connections_per_key` (required, controls the per-key connection limit, not the map size) and `cleanup_interval_seconds` (default `60`, `0` disables only the residual sweep).
+**Config fields:** `max_connections_per_key` (required, controls the per-key connection limit, not the map size) and `ipv6_prefix`.
 
-**Cleanup mechanism:** Each admission owns an opaque permit bound to the exact counter entry it incremented. Permit release decrements and removes a zero-count entry inline while holding the same DashMap entry guard used by admission. A configurable background sweep removes only residual zero-count entries; it cannot repair a missed positive decrement. `cleanup_interval_seconds: 0` disables only that residual sweep, not inline release/removal. Accounting state is shared across compatible cache generations by plugin namespace/config ID. Removing the policy stops its sweep and removes the state from the cache registry; old connection permits retain only that retired state until they release.
+**Cleanup mechanism:** Each admission owns an opaque permit bound to the exact counter entry it incremented. An entry is created at one connection, and the permit release that takes it to zero removes it inline while holding the same DashMap entry guard used by admission, so the map never holds a zero-count entry and there is no background sweep. Accounting state is shared across compatible cache generations by plugin namespace/config ID. Removing the policy removes the state from the cache registry; old connection permits retain only that retired state until they release.
 
 ### API Chargeback
 
@@ -280,17 +282,17 @@ at construction without disclosing credentials.
 
 **Config fields:** `max_entries`, `max_retained_bytes` (process-global — every enabled instance must use the same values), and `render_cache_ttl_seconds` (default `5`).
 
-**Cleanup mechanism:** A background eviction task runs periodically and removes entries that have not been updated within the configured staleness window **and** whose current counters a completed `GET /charges` export has already collected. Idle age alone never deletes uncollected billing state; rows held past the TTL awaiting collection are reported by `ferrum_api_chargeback_uncollected_retained_entries` and by the JSON `registry.uncollected_retained_entries` field, and remain bounded by `max_entries` / `max_retained_bytes` (see [plugins.md](plugins.md#api_chargeback) → collection contract). The rendered Prometheus/JSON output is cached with a configurable TTL (`render_cache_ttl_seconds`, default 5s); `cache_invalidation_min_age_ms` is evaluated per format against that document's own timestamp. Registry saturation is exported via `ferrum_api_chargeback_registry_entries`, `ferrum_api_chargeback_registry_max_entries`, `ferrum_api_chargeback_registry_retained_bytes`, `ferrum_api_chargeback_registry_max_retained_bytes`, `ferrum_api_chargeback_identity_overflow_total`, `ferrum_api_chargeback_dropped_charges_total`, and `ferrum_api_chargeback_uncollected_retained_entries`.
+**Cleanup mechanism:** A background eviction task runs periodically and removes entries that have not been updated within the configured staleness window **and** whose current counters two delivered `GET /charges` responses to a collector whose admin JWT grants the `charges:collect` scope have already collected. Other authenticated reads (dashboards, operator `curl`, every `FERRUM_ADMIN_JWT_VIEWER_SECRET` token) collect nothing (GHSA-jjvr-vvwv-8qmh), so the billing collector's token must carry that scope. Idle age alone never deletes uncollected billing state; rows held past the TTL awaiting collection are reported by `ferrum_api_chargeback_uncollected_retained_entries` and by the JSON `registry.uncollected_retained_entries` field, and remain bounded by `max_entries` / `max_retained_bytes` (see [plugins.md](plugins.md#api_chargeback) → collection contract). The rendered Prometheus/JSON output is cached with a configurable TTL (`render_cache_ttl_seconds`, default 5s); `cache_invalidation_min_age_ms` is evaluated per format against that document's own timestamp. Registry saturation is exported via `ferrum_api_chargeback_registry_entries`, `ferrum_api_chargeback_registry_max_entries`, `ferrum_api_chargeback_registry_retained_bytes`, `ferrum_api_chargeback_registry_max_retained_bytes`, `ferrum_api_chargeback_identity_overflow_total`, `ferrum_api_chargeback_dropped_charges_total`, and `ferrum_api_chargeback_uncollected_retained_entries`.
 
 ### Prometheus Metrics
 
 **What it stores:** Per-proxy, per-status-code metric counters and a cached rendered output string.
 
-**Default limit:** No hard entry cap -- bounded by proxy count multiplied by observed status codes.
+**Default limit:** Per-proxy families have no hard entry cap -- bounded by proxy count multiplied by observed status codes. Mesh request families are capped at `mesh_series_budget_per_family` (default 10,000 live series per family).
 
-**Config field:** N/A.
+**Config fields:** `render_cache_ttl_seconds` (default `5`), `stale_entry_ttl_seconds` (default `3600`), `mesh_series_budget_per_family` (default `10000`).
 
-**Cleanup mechanism:** Piggyback eviction on cache miss (at most once per `render_cache_ttl_seconds`). Stale proxy entries (for proxies removed from config) are evicted during the render sweep.
+**Cleanup mechanism:** Piggyback eviction on a render-cache miss (at most once per `render_cache_ttl_seconds`): every series not updated within `stale_entry_ttl_seconds` is removed, which is how series for removed proxies age out.
 
 ## Environment Variable Summary
 
@@ -319,14 +321,19 @@ at construction without disclosing credentials.
 | `response_caching` | `max_total_size_bytes` | `104857600` | Maximum accounted approximate retained response-entry footprint |
 | `ai_semantic_cache` | `max_entries` | `10000` | Maximum cached LLM responses |
 | `request_deduplication` | `max_entries` | `10000` | Maximum tracked idempotency keys |
+| `request_deduplication` | `max_inflight_entries` | `max_entries` | Hard ceiling on live in-flight markers (executing plus interrupted requests retained until `inflight_ttl_seconds`); a new key past it gets `503` |
 | `request_deduplication` | `max_entry_size_bytes` | `1048576` | Maximum retained completed response entry |
 | `request_deduplication` | `max_total_size_bytes` | `104857600` | Exact maximum retained local completed response-entry bytes |
+| `rate_limiting` | `max_state_entries` | `100000` | Hard ceiling on distinct local/Redis-fallback rate-limit keys (1–10,000,000); unseen keys are refused at the cap |
 | `soap_ws_security` | `nonce.max_cache_size` | `100000` | Maximum tracked nonces |
 | `soap_ws_security` | *(fixed, not configurable)* | `93601`s | Nonce claim retention — `max created_max_age_seconds + 2 x max created_clock_skew_seconds + 1`, the widest window the schema admits, so a later reload cannot outlive a claim |
 | `soap_ws_security` | `nonce.max_encoded_length` | `512` | Maximum encoded `wsse:Nonce` length |
 | `soap_ws_security` | `nonce.max_total_cache_bytes` | `67108864` | Maximum retained nonce-key UTF-8 payload bytes (one count per shared key allocation) |
 | `ldap_auth` | `max_cache_entries` | `10000` | Maximum cached LDAP bind results (1–1,000,000) |
 | `ldap_auth` | `cache_ttl_seconds` | `0` | LDAP cache entry TTL (`0` = disabled; maximum `86400`) |
+| `ldap_auth` | `group_cache_ttl_seconds` | `60` | Longest a cached entry is admitted without re-checking `required_groups` (`0` = every hit; maximum `86400`) |
+| `ldap_auth` | `negative_cache_ttl_seconds` | `0` | How long an exact rejected username/password pair is refused without a directory round trip (`0` = disabled; maximum `300`) |
+| `ldap_auth` | `max_failed_attempts_per_user` | `0` | Consecutive directory rejections after which a username is refused for `failed_attempt_backoff_seconds` (default `60`, 1–3,600) without a directory round trip (`0` = disabled; maximum `1000`) |
 | `oauth2_introspection` | `providers[].max_cache_entries` | `10000` | Per-provider hard entry ceiling, split 75/25 between active and negative results |
 | `oauth2_introspection` | `providers[].max_cache_entry_bytes` | `16384` | Maximum normalized active authorization-result bytes retained per token |
 | `oauth2_introspection` | `providers[].max_cache_total_bytes` | `16777216` | Per-provider total retained bytes, including fixed eviction indexes and entry/key state |
@@ -337,5 +344,7 @@ at construction without disclosing credentials.
 | `api_chargeback` | `max_retained_bytes` | `67108864` | Hard ceiling on retained billing-row bytes |
 | `api_chargeback` | `render_cache_ttl_seconds` | `5` | Rendered output cache TTL |
 | `prometheus_metrics` | `render_cache_ttl_seconds` | `5` | Rendered output cache TTL |
+| `prometheus_metrics` | `stale_entry_ttl_seconds` | `3600` | Idle metric-series TTL |
+| `prometheus_metrics` | `mesh_series_budget_per_family` | `10000` | Hard ceiling on live mesh series per family |
 
-Rate limiting plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `graphql`, `grpc_method_router`) use hardcoded maximum entry constants (50,000-100,000) and are not configurable via plugin config. These limits are intentionally high to avoid false rejections under normal traffic patterns while still preventing unbounded growth from IP/key churn. Counter storage supports only local memory and Redis; there is no database-backed counter policy.
+Rate limiting plugins (`ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `graphql`, `grpc_method_router`) use hardcoded maximum entry constants (50,000-100,000) and are not configurable via plugin config; `rate_limiting` alone exposes its cap as `max_state_entries` (default 100,000). These limits are intentionally high to avoid false rejections under normal traffic patterns while still preventing unbounded growth from IP/key churn. Counter storage supports only local memory and Redis; there is no database-backed counter policy.

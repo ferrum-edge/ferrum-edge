@@ -1,6 +1,7 @@
 //! Tests for `crate::notifications::dispatch`.
 
 use super::parse_channels;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,7 +9,8 @@ use std::time::Duration;
 
 use ferrum_edge::notifications::channels::NotificationChannel;
 use ferrum_edge::notifications::{
-    EventAction, Notification, NotificationField, Severity, dispatch,
+    DeliveryRetryPolicy, DispatchGeneration, EventAction, Notification, NotificationField,
+    Severity, dispatch_one,
 };
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use serde_json::json;
@@ -42,6 +44,35 @@ fn webhook_channel_to(url: String) -> Arc<NotificationChannel> {
     }))
     .unwrap();
     map.into_values().next().unwrap()
+}
+
+/// Fan `notification` out to every channel in `targets` through the production
+/// per-channel entry point, sharing one generation as `proxy_alerts` does.
+/// Returns whether each channel's delivery was admitted.
+fn dispatch_all(
+    notification: &Arc<Notification>,
+    targets: &[Arc<NotificationChannel>],
+    sem: &Arc<Semaphore>,
+    http: &PluginHttpClient,
+) -> Vec<bool> {
+    let generation = DispatchGeneration::new();
+    let extras = Arc::new(HashMap::new());
+    targets
+        .iter()
+        .map(|channel| {
+            dispatch_one(
+                Arc::clone(notification),
+                Arc::clone(&extras),
+                Arc::clone(channel),
+                Arc::clone(sem),
+                http.clone(),
+                Arc::clone(&generation),
+                DeliveryRetryPolicy::DEFAULT,
+                "test_caller",
+                None,
+            )
+        })
+        .collect()
 }
 
 async fn read_request_headers(socket: &mut TcpStream) {
@@ -124,12 +155,10 @@ async fn dispatch_drops_when_semaphore_exhausted() {
     let channel = webhook_channel_to(format!("http://{addr}/notify"));
     let notification = Arc::new(fixed_notification());
 
-    dispatch(
-        Arc::clone(&notification),
-        &[Arc::clone(&channel)],
-        &sem,
-        &http,
-        "test_caller",
+    assert_eq!(
+        dispatch_all(&notification, &[Arc::clone(&channel)], &sem, &http),
+        vec![false],
+        "an exhausted semaphore must drop the delivery"
     );
 
     assert_eq!(sem.available_permits(), 0);
@@ -149,12 +178,9 @@ async fn dispatch_spawns_task_when_permit_available() {
     let channel = webhook_channel_to(format!("http://{addr}/notify"));
     let notification = Arc::new(fixed_notification());
 
-    dispatch(
-        Arc::clone(&notification),
-        &[Arc::clone(&channel)],
-        &sem,
-        &http,
-        "test_caller",
+    assert_eq!(
+        dispatch_all(&notification, &[Arc::clone(&channel)], &sem, &http),
+        vec![true]
     );
 
     wait_for_request_count(&count, &notify, 1).await;
@@ -173,16 +199,18 @@ async fn dispatch_with_multiple_channels_sends_each() {
     let channel = webhook_channel_to(format!("http://{addr}/notify"));
     let notification = Arc::new(fixed_notification());
 
-    dispatch(
-        Arc::clone(&notification),
-        &[
-            Arc::clone(&channel),
-            Arc::clone(&channel),
-            Arc::clone(&channel),
-        ],
-        &sem,
-        &http,
-        "test_caller",
+    assert_eq!(
+        dispatch_all(
+            &notification,
+            &[
+                Arc::clone(&channel),
+                Arc::clone(&channel),
+                Arc::clone(&channel),
+            ],
+            &sem,
+            &http,
+        ),
+        vec![true, true, true]
     );
 
     wait_for_request_count(&count, &notify, 3).await;

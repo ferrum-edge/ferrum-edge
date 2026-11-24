@@ -6,6 +6,9 @@
 //! [`crate::plugins::BUILTIN_PLUGIN_REGISTRATIONS`]: classification,
 //! documented active phases, protocol-matrix capability surface, and rationale.
 
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
 use super::{
     ALL_PROTOCOLS, GRPC_ONLY_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, HTTP_GRPC_PROTOCOLS,
     HTTP_ONLY_PROTOCOLS, ProxyProtocol, ResponseBodyProduction, TCP_ONLY_PROTOCOLS,
@@ -45,7 +48,10 @@ pub const BUILTIN_RESPONSE_BODY_PRODUCERS: &[&str] = &[
 /// built-in that can require framing but is missing here would let a proxy
 /// accept compression the plugin then cannot see, so
 /// `tests/unit/plugins/plugin_doc_parity_tests.rs` pins the set against the
-/// documented `on_ws_frame` / parser-limit phases. Out-of-tree plugins declare
+/// documented `on_ws_frame` / parser-limit phases. `api_chargeback` is the one
+/// built-in whose need is config-dependent (only bandwidth pricing requires the
+/// parsed relay); it is deliberately absent here and passthrough admission
+/// answers for it from its parsed pricing. Out-of-tree plugins declare
 /// the capability by overriding `requires_ws_frame_hooks()`,
 /// `websocket_size_limits()`, or `requires_websocket_framing()`; admission
 /// constructs them and asks the instance.
@@ -64,17 +70,27 @@ pub const BUILTIN_WEBSOCKET_FRAMING_PLUGINS: &[&str] = &[
 /// letting an undeclared producer allocate a replacement without a bound. A
 /// custom plugin cannot take a built-in's name: `create_plugin_with_http_client`
 /// resolves built-in names before it ever reaches the custom registry.
+///
+/// The answer for every built-in name is precomputed once, so the buffered
+/// response phases that consult it per plugin do one hash lookup instead of
+/// scanning the parity table.
 pub fn declared_response_body_production(name: &str) -> ResponseBodyProduction {
-    if BUILTIN_RESPONSE_BODY_PRODUCERS.contains(&name) {
-        ResponseBodyProduction::BoundedByRetainedCeiling
-    } else if BUILTIN_PLUGIN_PARITY_META
-        .iter()
-        .any(|meta| meta.name == name)
-    {
-        ResponseBodyProduction::Never
-    } else {
-        ResponseBodyProduction::Undeclared
-    }
+    static DECLARED: LazyLock<HashMap<&'static str, ResponseBodyProduction>> =
+        LazyLock::new(|| {
+            BUILTIN_PLUGIN_PARITY_META
+                .iter()
+                .map(|meta| (meta.name, ResponseBodyProduction::Never))
+                .chain(
+                    BUILTIN_RESPONSE_BODY_PRODUCERS
+                        .iter()
+                        .map(|name| (*name, ResponseBodyProduction::BoundedByRetainedCeiling)),
+                )
+                .collect()
+        });
+    DECLARED
+        .get(name)
+        .copied()
+        .unwrap_or(ResponseBodyProduction::Undeclared)
 }
 
 /// How a built-in plugin appears in public inventories.
@@ -115,7 +131,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "otel_tracing",
         classification: BuiltinPluginClassification::Public,
         priority: 25,
-        active_phases: "on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect, on_ws_disconnect",
+        active_phases: "on_request_received, on_stream_connect, before_proxy, after_proxy, apply_websocket_handshake_response_headers, log, on_stream_disconnect, on_ws_disconnect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Tracing for all protocols",
     },
@@ -187,7 +203,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "sse",
         classification: BuiltinPluginClassification::Public,
         priority: 250,
-        active_phases: "on_request_received, before_proxy, after_proxy, transform_response_body",
+        active_phases: "on_request_received, before_proxy, after_proxy, transform_response_body, response_stream_inspector",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "SSE is HTTP-only (text/event-stream over chunked transfer)",
     },
@@ -211,7 +227,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "spiffe_identity",
         classification: BuiltinPluginClassification::Public,
         priority: 940,
-        active_phases: "on_request_received, on_stream_connect",
+        active_phases: "on_request_received, before_proxy, on_stream_connect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Extracts SPIFFE IDs from TLS/DTLS client certificates",
     },
@@ -243,7 +259,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "oidc_relying_party",
         classification: BuiltinPluginClassification::Public,
         priority: 1075,
-        active_phases: "on_request_received, authenticate, before_proxy, after_proxy",
+        active_phases: "on_request_received, authenticate, before_proxy, after_proxy, apply_websocket_handshake_response_headers",
         matrix_protocols: HTTP_FAMILY_PROTOCOLS,
         protocol_rationale: "Browser-oriented HTTP authentication flow",
     },
@@ -251,7 +267,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "jwt_auth",
         classification: BuiltinPluginClassification::Public,
         priority: 1100,
-        active_phases: "authenticate",
+        active_phases: "authenticate, before_proxy",
         matrix_protocols: HTTP_FAMILY_PROTOCOLS,
         protocol_rationale: "Requires HTTP headers",
     },
@@ -315,7 +331,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "mesh_authz",
         classification: BuiltinPluginClassification::Public,
         priority: 2075,
-        active_phases: "authorize, on_stream_connect",
+        active_phases: "authorize, before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Applies Layer 2 mesh policy using SPIFFE or HBONE identities",
     },
@@ -372,7 +388,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "rate_limiting",
         classification: BuiltinPluginClassification::Public,
         priority: 2900,
-        active_phases: "on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect",
+        active_phases: "on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Connection/session rate applies everywhere",
     },
@@ -380,7 +396,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ws_rate_limiting",
         classification: BuiltinPluginClassification::Public,
         priority: 2910,
-        active_phases: "on_ws_frame, on_ws_reassembly_frames",
+        active_phases: "on_ws_frame, on_ws_reassembly_frames, on_ws_disconnect",
         matrix_protocols: WS_ONLY_PROTOCOLS,
         protocol_rationale: "Per-connection frame rate limiting for WebSocket",
     },
@@ -500,9 +516,9 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "request_transformer",
         classification: BuiltinPluginClassification::Public,
         priority: 3000,
-        active_phases: "before_proxy, transform_request_body",
-        matrix_protocols: HTTP_GRPC_PROTOCOLS,
-        protocol_rationale: "Modifies HTTP headers/query/body",
+        active_phases: "before_proxy, transform_request_body_with_context, on_final_request_body_with_context",
+        matrix_protocols: HTTP_FAMILY_PROTOCOLS,
+        protocol_rationale: "Modifies HTTP headers/query/body; WebSocket handshake headers/query only",
     },
     BuiltinPluginParityMeta {
         name: "serverless_function",
@@ -564,7 +580,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "response_transformer",
         classification: BuiltinPluginClassification::Public,
         priority: 4000,
-        active_phases: "after_proxy, transform_response_body",
+        active_phases: "after_proxy, transform_response_body, finalize_client_visible_response_body",
         matrix_protocols: HTTP_GRPC_PROTOCOLS,
         protocol_rationale: "Modifies HTTP response headers/body",
     },
@@ -574,7 +590,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         priority: 4050,
         active_phases: "normalize_buffered_request_body_before_before_proxy, before_proxy, after_proxy, transform_request_body_with_context, transform_response_body_with_context",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
-        protocol_rationale: "HTTP response compression and request decompression (gzip, brotli)",
+        protocol_rationale: "HTTP response compression and request decompression (gzip, brotli, zstd)",
     },
     BuiltinPluginParityMeta {
         name: "ai_prompt_compressor",
@@ -588,7 +604,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ai_semantic_cache",
         classification: BuiltinPluginClassification::Public,
         priority: 4057,
-        active_phases: "on_final_request_body_with_context, after_proxy, on_final_response_body",
+        active_phases: "on_final_request_body_with_context, after_proxy, on_final_response_body, on_response_committed",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "HTTP-only exact/semantic cache for LLM JSON request and response bodies",
     },
@@ -599,6 +615,14 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         active_phases: "before_proxy, transform_request_body_with_context, finalized request egress, enforce_final_backend_header_policy, on_final_request_body_with_context, origin response-header boundary, after_proxy, response_stream_inspector, on_response_stream_terminated (HTTP only)",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "HTTP-only; routes final OpenAI JSON bodies to providers, normalizes bounded responses, and relays committed provider SSE incrementally",
+    },
+    BuiltinPluginParityMeta {
+        name: "ai_token_metrics",
+        classification: BuiltinPluginClassification::Public,
+        priority: 4070,
+        active_phases: "on_response_body, response_stream_inspector, on_response_stream_terminated",
+        matrix_protocols: HTTP_ONLY_PROTOCOLS,
+        protocol_rationale: "HTTP JSON/SSE accounting only; native gRPC protobuf has no supported provider schema contract",
     },
     BuiltinPluginParityMeta {
         name: "ai_response_guard",
@@ -615,14 +639,6 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         active_phases: "after_proxy, initial response-header boundary",
         matrix_protocols: HTTP_FAMILY_PROTOCOLS,
         protocol_rationale: "HTTP-family response security headers and fingerprint stripping",
-    },
-    BuiltinPluginParityMeta {
-        name: "ai_token_metrics",
-        classification: BuiltinPluginClassification::Public,
-        priority: 4100,
-        active_phases: "on_response_body",
-        matrix_protocols: HTTP_ONLY_PROTOCOLS,
-        protocol_rationale: "HTTP JSON/SSE accounting only; native gRPC protobuf has no supported provider schema contract",
     },
     BuiltinPluginParityMeta {
         name: "ai_rate_limiter",
@@ -644,9 +660,9 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ws_frame_logging",
         classification: BuiltinPluginClassification::Public,
         priority: 9050,
-        active_phases: "on_ws_frame, prepare_ws_frame_delivery, emit_ws_frame_delivery, on_ws_disconnect",
+        active_phases: "on_ws_policy_close, prepare_ws_frame_delivery, emit_ws_frame_delivery, on_ws_disconnect",
         matrix_protocols: WS_ONLY_PROTOCOLS,
-        protocol_rationale: "`on_ws_frame` records policy decisions such as Close; delivery observations are emitted after successful destination sends",
+        protocol_rationale: "`on_ws_policy_close` records final policy Close decisions; delivery observations are emitted after successful destination sends",
     },
     BuiltinPluginParityMeta {
         name: "statsd_logging",
@@ -660,7 +676,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "http_logging",
         classification: BuiltinPluginClassification::Public,
         priority: 9100,
-        active_phases: "log, on_stream_disconnect",
+        active_phases: "log, on_stream_disconnect, on_ws_disconnect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Observability applies everywhere",
     },
@@ -668,7 +684,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "tcp_logging",
         classification: BuiltinPluginClassification::Public,
         priority: 9125,
-        active_phases: "log, on_stream_disconnect",
+        active_phases: "log, on_stream_disconnect, on_ws_disconnect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Observability applies everywhere",
     },
@@ -676,7 +692,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "kafka_logging",
         classification: BuiltinPluginClassification::Public,
         priority: 9150,
-        active_phases: "log, on_stream_disconnect",
+        active_phases: "log, on_stream_disconnect, on_ws_disconnect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Observability applies everywhere",
     },
@@ -684,7 +700,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "loki_logging",
         classification: BuiltinPluginClassification::Public,
         priority: 9155,
-        active_phases: "log, on_stream_disconnect",
+        active_phases: "log, on_stream_disconnect, on_ws_disconnect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Observability applies everywhere",
     },
@@ -692,7 +708,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "udp_logging",
         classification: BuiltinPluginClassification::Public,
         priority: 9160,
-        active_phases: "log, on_stream_disconnect",
+        active_phases: "log, on_stream_disconnect, on_ws_disconnect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Observability applies everywhere",
     },

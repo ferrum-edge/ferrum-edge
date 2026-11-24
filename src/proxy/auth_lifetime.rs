@@ -296,7 +296,34 @@ impl StreamAuthTerminationLatch {
 ///
 /// Cloning is cheap and every clone signals the same connection.
 #[derive(Clone, Debug)]
-pub struct AuthorizationConnectionCloser(Arc<tokio::sync::watch::Sender<bool>>);
+pub struct AuthorizationConnectionCloser(Arc<AuthorizationConnectionCloserInner>);
+
+#[derive(Debug)]
+pub(crate) struct AuthorizationConnectionCloserInner {
+    close: tokio::sync::watch::Sender<bool>,
+    settled_watchdog: std::sync::OnceLock<crate::proxy::response_watchdog::SettledWatchdogHub>,
+}
+
+impl AuthorizationConnectionCloserInner {
+    pub(crate) fn request_close(&self) {
+        let _previous = self.close.send_replace(true);
+    }
+
+    pub(crate) fn settled_watchdog_hub(
+        &self,
+    ) -> &crate::proxy::response_watchdog::SettledWatchdogHub {
+        self.settled_watchdog
+            .get_or_init(crate::proxy::response_watchdog::SettledWatchdogHub::new)
+    }
+}
+
+impl Drop for AuthorizationConnectionCloserInner {
+    fn drop(&mut self) {
+        if let Some(hub) = self.settled_watchdog.get() {
+            hub.shutdown();
+        }
+    }
+}
 
 impl AuthorizationConnectionCloser {
     /// Create one signal for one accepted connection.
@@ -306,13 +333,16 @@ impl AuthorizationConnectionCloser {
         // connection task's receiver, and `send` on a receiver-less channel is a
         // deliberate no-op rather than an error worth reporting.
         let (sender, _initial) = tokio::sync::watch::channel(false);
-        Self(Arc::new(sender))
+        Self(Arc::new(AuthorizationConnectionCloserInner {
+            close: sender,
+            settled_watchdog: std::sync::OnceLock::new(),
+        }))
     }
 
     /// A receiver for the connection task's `select!`.
     #[must_use]
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.0.subscribe()
+        self.0.close.subscribe()
     }
 
     /// Ask the connection task to close this client connection.
@@ -329,7 +359,7 @@ impl AuthorizationConnectionCloser {
     /// The signal is a security decision about an admitted stream, so it must be
     /// RECORDED whether or not anybody is listening at that instant.
     pub fn request_close(&self) {
-        let _previous = self.0.send_replace(true);
+        self.0.request_close();
     }
 
     /// Whether a close has already been requested.
@@ -339,10 +369,13 @@ impl AuthorizationConnectionCloser {
     /// mask a silent `watch::Sender::send` drop. Production observes the same
     /// value through [`subscribe`](Self::subscribe) and
     /// [`authorization_close_requested`].
-    #[allow(dead_code)] // Used by external tests; dead code in the separately compiled bin target.
     #[must_use]
     pub fn close_requested(&self) -> bool {
-        *self.0.borrow()
+        *self.0.close.borrow()
+    }
+
+    pub(crate) fn inner(&self) -> &Arc<AuthorizationConnectionCloserInner> {
+        &self.0
     }
 }
 

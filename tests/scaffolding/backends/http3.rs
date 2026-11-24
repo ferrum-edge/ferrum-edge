@@ -24,6 +24,10 @@
 //!   `CloseConnectionWithCode` step fired.
 //! - [`ScriptedH3Backend::step_errors`] — any errors the scripted interpreter
 //!   captured. Empty on the happy path.
+//! - [`ScriptedH3Backend::held_handshakes`] /
+//!   [`ScriptedH3Backend::release_handshakes`] — explicit test↔fixture barrier
+//!   for [`ScriptedH3BackendBuilder::hold_handshakes`]: inbound QUIC
+//!   connections stay un-accepted until the test releases them.
 //!
 //! ## Script execution model
 //!
@@ -44,7 +48,7 @@ use rustls::ServerConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 
 /// A single deterministic instruction in an HTTP/3 script.
@@ -172,6 +176,7 @@ pub struct ScriptedH3BackendBuilder {
     udp: UdpSocket,
     tls: H3TlsConfig,
     steps: Vec<H3Step>,
+    hold_handshakes: bool,
 }
 
 impl ScriptedH3BackendBuilder {
@@ -183,7 +188,25 @@ impl ScriptedH3BackendBuilder {
             udp,
             tls,
             steps: Vec::new(),
+            hold_handshakes: false,
         }
+    }
+
+    /// Hold every inbound QUIC connection un-accepted until the test calls
+    /// [`ScriptedH3Backend::release_handshakes`].
+    ///
+    /// While held, the fixture has received the client's Initial (so
+    /// [`ScriptedH3Backend::accepted_connections`] and
+    /// [`ScriptedH3Backend::held_handshakes`] count it) but has not answered
+    /// it: the client sees a silent peer and keeps retransmitting, exactly as
+    /// against a slow QUIC listener. On release quinn replays the buffered
+    /// Initial, so the handshake proceeds without waiting for another client
+    /// retransmit, and the script then runs as usual. Unlike
+    /// [`H3Step::DropInitialPacket`] this is a barrier the test controls, so
+    /// "the handshake has not completed yet" is a fact, not a sleep.
+    pub fn hold_handshakes(mut self) -> Self {
+        self.hold_handshakes = true;
+        self
     }
 
     pub fn step(mut self, step: H3Step) -> Self {
@@ -228,6 +251,9 @@ impl ScriptedH3BackendBuilder {
         let state = Arc::new(H3BackendState::default());
         let state_task = state.clone();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        // `true` means "handshakes may proceed". The accept loop keeps a
+        // receiver for as long as it runs, and each held connection clones it.
+        let (handshake_gate_tx, handshake_gate_rx) = watch::channel(!self.hold_handshakes);
         let steps = self.steps;
         let endpoint_task = endpoint.clone();
 
@@ -283,8 +309,28 @@ impl ScriptedH3BackendBuilder {
                         }
 
                         let track = state_conn.clone();
+                        let mut handshake_gate = handshake_gate_rx.clone();
                         let jh = tokio::spawn(async move {
                             let state_err = state_conn.clone();
+                            // `hold_handshakes`: keep `incoming` un-accepted
+                            // (quinn buffers its Initial and answers nothing)
+                            // until the test opens the gate. A closed channel
+                            // means the backend was dropped while holding.
+                            if !*handshake_gate.borrow_and_update() {
+                                state_conn.held_handshakes.fetch_add(1, Ordering::SeqCst);
+                                let released = loop {
+                                    if *handshake_gate.borrow_and_update() {
+                                        break true;
+                                    }
+                                    if handshake_gate.changed().await.is_err() {
+                                        break false;
+                                    }
+                                };
+                                state_conn.held_handshakes.fetch_sub(1, Ordering::SeqCst);
+                                if !released {
+                                    return;
+                                }
+                            }
                             if let Err(e) =
                                 run_h3_script(incoming, script, state_conn, conn_index).await
                             {
@@ -303,6 +349,7 @@ impl ScriptedH3BackendBuilder {
             endpoint,
             handle: Some(handle),
             shutdown: Some(shutdown_tx),
+            handshake_gate: handshake_gate_tx,
         })
     }
 }
@@ -314,6 +361,7 @@ pub struct ScriptedH3Backend {
     endpoint: Endpoint,
     handle: Option<JoinHandle<()>>,
     shutdown: Option<oneshot::Sender<()>>,
+    handshake_gate: watch::Sender<bool>,
 }
 
 impl ScriptedH3Backend {
@@ -338,6 +386,19 @@ impl ScriptedH3Backend {
     /// were refused before H3 setup.
     pub fn accepted_handshakes(&self) -> u32 {
         self.state.handshakes.load(Ordering::SeqCst)
+    }
+
+    /// Connections currently held un-accepted by
+    /// [`ScriptedH3BackendBuilder::hold_handshakes`]. Non-zero proves the
+    /// client's Initial reached the fixture and has not been answered.
+    pub fn held_handshakes(&self) -> u32 {
+        self.state.held_handshakes.load(Ordering::SeqCst)
+    }
+
+    /// Open the [`ScriptedH3BackendBuilder::hold_handshakes`] gate: every held
+    /// connection and every later one is accepted. No-op without the gate.
+    pub fn release_handshakes(&self) {
+        let _ = self.handshake_gate.send_replace(true);
     }
 
     /// Connections refused via `RejectHandshake`.
@@ -409,6 +470,7 @@ pub struct H3RecordedRequest {
 struct H3BackendState {
     accepted: AtomicU32,
     handshakes: AtomicU32,
+    held_handshakes: AtomicU32,
     refused_handshakes: AtomicU32,
     dropped_initial_packets: AtomicU32,
     connection_close_sent: AtomicU32,

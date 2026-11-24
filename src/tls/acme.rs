@@ -55,7 +55,6 @@ use crate::tls::source::MaterialKind;
 const STORE_FILE_NAME: &str = "acme-certificates.json";
 const ORDER_STORE_FILE_NAME: &str = "acme-orders.json";
 const ACCOUNT_STORE_FILE_NAME: &str = "acme-accounts.json";
-const DEFAULT_STORE_DIR: &str = "./ferrum-managed-tls";
 const HTTP01_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 /// Longest HTTP-01 token [`validate_http01_token`] accepts.
 const MAX_HTTP01_TOKEN_LEN: usize = 256;
@@ -89,6 +88,67 @@ pub enum AcmeOrderStatus {
     Valid,
     Failed,
     Cancelled,
+}
+
+impl AcmeOrderStatus {
+    /// Whether the order is still in flight: it can be finalized, serves its
+    /// challenges, blocks a duplicate renewal order, and keeps its key/CSR.
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::PendingChallenges | Self::Ready | Self::Processing
+        )
+    }
+
+    /// The lifecycle transition function: `Some(next)` when `self -> next` is a
+    /// legal move, `None` otherwise.
+    ///
+    /// Active states only move forward (`pending_challenges -> ready ->
+    /// processing`) or into a terminal state. `valid`, `failed` and `cancelled`
+    /// are terminal and can never be left, so a failed order cannot later be
+    /// finalized into `valid`. Re-entering the current state is not a
+    /// transition.
+    pub fn transition_to(self, next: Self) -> Option<Self> {
+        let legal = match (self, next) {
+            (Self::PendingChallenges, Self::Ready | Self::Processing)
+            | (Self::Ready, Self::Processing) => true,
+            (from, Self::Valid | Self::Failed | Self::Cancelled) => from.is_active(),
+            _ => false,
+        };
+        legal.then_some(next)
+    }
+
+    /// Whether a stored order in `self` may be replaced by a record in `next`
+    /// (an `allow_overwrite` write).
+    ///
+    /// A replacement is a lifecycle write like any other, so it must be a legal
+    /// [`transition_to`](Self::transition_to) move. The one addition is
+    /// re-submitting the *same active* state: that is not a transition (the
+    /// order stays where it is in the lifecycle), and it is what an operator
+    /// replacing a still in-flight order with a freshly prepared one does.
+    /// A terminal order is never replaced, and an active order never moves
+    /// backwards through a replacement.
+    pub fn admits_overwrite_with(self, next: Self) -> bool {
+        self.transition_to(next).is_some() || (self == next && self.is_active())
+    }
+
+    /// The wire spelling (`serde` `snake_case`), for diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PendingChallenges => "pending_challenges",
+            Self::Ready => "ready",
+            Self::Processing => "processing",
+            Self::Valid => "valid",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl std::fmt::Display for AcmeOrderStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,12 +229,17 @@ pub struct AcmeOrderFinalization {
     csr_der_base64: String,
 }
 
-/// Fixed, redacted diagnostic for unusable finalization material.
+/// Unusable finalization material: the one content-free failure every
+/// [`AcmeOrderFinalization`] check returns.
 ///
-/// Deliberately content-free: the caller knows which order it was driving, and
-/// anything derived from the key or the CSR would be a disclosure.
-const UNUSABLE_FINALIZATION_MATERIAL: &str =
-    "ACME order finalization material is missing or unusable";
+/// Deliberately carries nothing: the caller knows which order it was driving,
+/// and anything derived from the key or the CSR would be a disclosure. Store
+/// and Admin callers that know the order surface it as
+/// [`AcmeError::UnusableFinalizationMaterial`], the single store-level variant
+/// for this failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("ACME order finalization material is missing or unusable")]
+pub struct UnusableFinalization;
 
 impl AcmeOrderFinalization {
     /// Generate a fresh key and a CSR covering exactly `domains`.
@@ -182,15 +247,14 @@ impl AcmeOrderFinalization {
     /// Mirrors what `instant_acme::Order::finalize()` would have generated
     /// internally (SANs from the order identifiers, empty distinguished name),
     /// except that it happens early enough to be persisted first.
-    pub fn generate(domains: &[String]) -> Result<Self, AcmeError> {
-        let mut params = rcgen::CertificateParams::new(domains.to_vec())
-            .map_err(|_| AcmeError::InvalidConfiguration(UNUSABLE_FINALIZATION_MATERIAL.into()))?;
+    pub fn generate(domains: &[String]) -> Result<Self, UnusableFinalization> {
+        let mut params =
+            rcgen::CertificateParams::new(domains.to_vec()).map_err(|_| UnusableFinalization)?;
         params.distinguished_name = rcgen::DistinguishedName::new();
-        let key_pair = rcgen::KeyPair::generate()
-            .map_err(|_| AcmeError::InvalidConfiguration(UNUSABLE_FINALIZATION_MATERIAL.into()))?;
+        let key_pair = rcgen::KeyPair::generate().map_err(|_| UnusableFinalization)?;
         let csr = params
             .serialize_request(&key_pair)
-            .map_err(|_| AcmeError::InvalidConfiguration(UNUSABLE_FINALIZATION_MATERIAL.into()))?;
+            .map_err(|_| UnusableFinalization)?;
         Self::from_parts(key_pair.serialize_pem(), csr.der().as_ref(), domains)
     }
 
@@ -200,7 +264,7 @@ impl AcmeOrderFinalization {
         key_pem: String,
         csr_der: &[u8],
         domains: &[String],
-    ) -> Result<Self, AcmeError> {
+    ) -> Result<Self, UnusableFinalization> {
         let material = Self {
             key_pem,
             csr_der_base64: BASE64_STANDARD.encode(csr_der),
@@ -218,14 +282,14 @@ impl AcmeOrderFinalization {
     ///
     /// Fails closed on corrupt material or a CSR that does not exactly match
     /// `domains`. Never regenerates anything.
-    pub fn csr_der(&self, domains: &[String]) -> Result<Vec<u8>, AcmeError> {
+    pub fn csr_der(&self, domains: &[String]) -> Result<Vec<u8>, UnusableFinalization> {
         validate_persisted_finalization_package(&self.key_pem, &self.csr_der_base64, domains)
     }
 
     /// Reject material that cannot later be used, at the store boundary and
     /// every network entrypoint, so a corrupt package cannot be written or
     /// drive a directory request.
-    pub fn validate(&self, domains: &[String]) -> Result<(), AcmeError> {
+    pub fn validate(&self, domains: &[String]) -> Result<(), UnusableFinalization> {
         self.csr_der(domains).map(|_| ())
     }
 }
@@ -239,13 +303,13 @@ impl AcmeOrderFinalization {
 /// domains (wildcards included). Multiple keys, malformed trailing PEM input,
 /// non-DNS SANs, duplicate DNS SANs, duplicate SAN extensions, and domain
 /// ambiguity fail closed. Errors never carry key, CSR, derived bytes, domains,
-/// or parse detail — only [`UNUSABLE_FINALIZATION_MATERIAL`].
+/// or parse detail — only [`UnusableFinalization`].
 fn validate_persisted_finalization_package(
     key_pem: &str,
     csr_der_base64: &str,
     domains: &[String],
-) -> Result<Vec<u8>, AcmeError> {
-    let unusable = || AcmeError::Parse(UNUSABLE_FINALIZATION_MATERIAL.to_string());
+) -> Result<Vec<u8>, UnusableFinalization> {
+    let unusable = || UnusableFinalization;
     if key_pem.trim().is_empty() || csr_der_base64.trim().is_empty() {
         return Err(unusable());
     }
@@ -408,7 +472,7 @@ pub struct AcmeIssuedCertificateInput {
 }
 
 #[derive(Debug, Clone)]
-pub struct AcmeHttp01OrderInput {
+pub struct AcmeOrderInput {
     pub id: String,
     pub certificate_id: Option<String>,
     pub domains: Vec<String>,
@@ -545,6 +609,19 @@ pub enum AcmeError {
     OrderNotFound(String),
     #[error("ACME order '{0}' already exists")]
     OrderAlreadyExists(String),
+    /// An overwrite would move a stored order through a transition the
+    /// lifecycle forbids (`AcmeOrderStatus::admits_overwrite_with`), such as
+    /// reopening a terminal order. Carries only the id and the two statuses.
+    #[error(
+        "ACME order '{id}' is `{from}` and cannot be replaced by a `{to}` order; \
+         terminal orders cannot be reopened and active orders only move forward, \
+         so create the order under a new id"
+    )]
+    IllegalOrderTransition {
+        id: String,
+        from: AcmeOrderStatus,
+        to: AcmeOrderStatus,
+    },
     #[error("invalid ACME HTTP-01 challenge token: {0}")]
     InvalidChallengeToken(String),
     #[error("ACME certificate '{id}' does not contain {kind} material")]
@@ -739,7 +816,6 @@ impl AcmeCertificateStore {
     }
 
     /// Version of the authoritative document behind the last read. Non-secret.
-    #[allow(dead_code)]
     pub fn store_version(&self) -> Result<u64, AcmeError> {
         Ok(self.file.version()?)
     }
@@ -810,6 +886,39 @@ impl AcmeCertificateStore {
                 None => Err(AcmeError::NotFound(id)),
             }
         })
+    }
+
+    /// Delete `id` only while `still_authorized` holds (issue #7394).
+    ///
+    /// The check runs under the store's exclusive lock immediately before the
+    /// record is removed, and again after the removal has been persisted. If
+    /// it fails before, nothing changes; if it fails after (the caller's lease
+    /// lapsed while persistence I/O stalled), the record is restored before
+    /// the lock is released. Either way the result is `Ok(None)`, so a delete
+    /// made without authority is never left in place or reported as done.
+    pub fn delete_certificate_if_authorized(
+        &self,
+        id: &str,
+        still_authorized: impl Fn() -> bool,
+    ) -> Result<Option<AcmeCertificateRecord>, AcmeError> {
+        validate_acme_id(id)?;
+        let id = id.to_string();
+        let outcome = self.file.mutate_if_confirmed(
+            |document| {
+                if !document.certificates.contains_key(&id) {
+                    return Err(AcmeError::NotFound(id.clone()));
+                }
+                if !still_authorized() {
+                    return Ok((false, None));
+                }
+                match document.certificates.remove(&id) {
+                    Some(record) => Ok((true, Some(record))),
+                    None => Err(AcmeError::NotFound(id.clone())),
+                }
+            },
+            &still_authorized,
+        )?;
+        Ok(outcome.flatten())
     }
 
     pub fn material(
@@ -903,7 +1012,6 @@ impl AcmeOrderStore {
     }
 
     /// Version of the authoritative document behind the last read. Non-secret.
-    #[allow(dead_code)]
     pub fn store_version(&self) -> Result<u64, AcmeError> {
         Ok(self.file.version()?)
     }
@@ -940,6 +1048,14 @@ impl AcmeOrderStore {
         Ok(latest.cloned())
     }
 
+    /// Create an order, or (with `allow_overwrite`) replace a stored one.
+    ///
+    /// Creating a brand-new id is always admitted. Replacing an existing order
+    /// is admitted only when [`AcmeOrderStatus::admits_overwrite_with`] allows
+    /// the stored status to become the record's status; otherwise nothing is
+    /// written and [`AcmeError::IllegalOrderTransition`] is returned. Writers
+    /// that act on an earlier read of an order (finalize, renewal publication,
+    /// CA-invalid evidence) use the compare-and-set methods instead.
     pub fn upsert_order(
         &self,
         record: AcmeOrderRecord,
@@ -954,7 +1070,9 @@ impl AcmeOrderStore {
         validate_tls_alpn01_challenges(&record.tls_alpn01_challenges)?;
         validate_dns01_challenges(&record.dns01_challenges)?;
         if let Some(finalization) = record.finalization.as_ref() {
-            finalization.validate(&record.domains)?;
+            finalization
+                .validate(&record.domains)
+                .map_err(|_| AcmeError::UnusableFinalizationMaterial(record.id.clone()))?;
         }
         let terminal_history = self.terminal_history;
         let outcome = self.file.mutate(move |document| {
@@ -963,6 +1081,16 @@ impl AcmeOrderStore {
             if let Some(existing) = document.orders.get(&record.id) {
                 if !allow_overwrite {
                     return Err(AcmeError::OrderAlreadyExists(record.id));
+                }
+                // An overwrite is a status write on the stored order, so it goes
+                // through the lifecycle table under this same lock: a terminal
+                // order is never reopened and an active one never moves back.
+                if !existing.status.admits_overwrite_with(record.status) {
+                    return Err(AcmeError::IllegalOrderTransition {
+                        id: record.id,
+                        from: existing.status,
+                        to: record.status,
+                    });
                 }
                 record.created_at = existing.created_at;
                 record.updated_at = now;
@@ -979,49 +1107,90 @@ impl AcmeOrderStore {
     }
 
     /// Persist authoritative CA-invalid evidence only for the same active
-    /// snapshot. Callers must also hold the certificate's renewal lease fence.
-    /// Never recreate a deleted order, overwrite an operator update, or make an
-    /// older failed order hide a newer order from the renewal planner.
+    /// snapshot. The renewal path also holds the certificate's renewal lease
+    /// fence; admin finalize, which takes no lease, relies on the snapshot
+    /// compare alone. Never recreate a deleted order, overwrite an operator
+    /// update, or make an older failed order hide a newer order from the
+    /// renewal planner.
+    ///
+    /// The order becomes terminal in this write, so its key/CSR is dropped with
+    /// it: a failed order is never resumed or finalized again.
     pub fn fail_ca_invalid_order_if_current(
         &self,
         expected: &AcmeOrderRecord,
     ) -> Result<bool, AcmeError> {
+        let failed =
+            self.transition_order_if_current(expected, AcmeOrderStatus::Failed, |order| {
+                order.error =
+                    Some("CA reports that the ACME order is terminally invalid".to_string());
+                order.finalization = None;
+            })?;
+        Ok(failed.is_some())
+    }
+
+    /// Commit `Valid` for an order finalized from the snapshot `expected`, and
+    /// only if the stored order is still exactly that snapshot.
+    ///
+    /// Admin finalize reads the order, then spends up to the poll timeout on CA
+    /// I/O without holding the renewal lease. Writing its result back blind
+    /// would overwrite a renewal that completed the same order meanwhile,
+    /// recreate an order an operator deleted, or move a terminal order to
+    /// `Valid`. Returns `Ok(None)` and writes nothing in each of those cases.
+    /// The finalization material is cleared in the same write, as on the
+    /// renewal path.
+    pub fn complete_order_if_current(
+        &self,
+        expected: &AcmeOrderRecord,
+        certificate_id: String,
+    ) -> Result<Option<AcmeOrderRecord>, AcmeError> {
+        validate_acme_id(&certificate_id)?;
+        self.transition_order_if_current(expected, AcmeOrderStatus::Valid, move |order| {
+            order.certificate_id = Some(certificate_id);
+            order.error = None;
+            order.finalization = None;
+        })
+    }
+
+    /// Compare-and-set lifecycle write shared by every writer that acts on an
+    /// earlier read of an order.
+    ///
+    /// Applies `target` (plus `apply`'s field updates) only when the stored
+    /// order still matches `expected` (`order_matches_snapshot`), the move is
+    /// legal (`AcmeOrderStatus::transition_to`, so terminal states are never
+    /// left), and the record as it would be persisted — including a
+    /// `certificate_id` that `apply` reassigns — would not hide another active
+    /// order from the renewal planner (`commit_would_hide_active_order`).
+    /// Otherwise nothing is written and `Ok(None)` is returned.
+    fn transition_order_if_current(
+        &self,
+        expected: &AcmeOrderRecord,
+        target: AcmeOrderStatus,
+        apply: impl FnOnce(&mut AcmeOrderRecord),
+    ) -> Result<Option<AcmeOrderRecord>, AcmeError> {
         validate_acme_id(&expected.id)?;
-        let expected = expected.clone();
         let terminal_history = self.terminal_history;
-        let outcome = self.file.mutate_if::<_, AcmeError>(move |document| {
+        let outcome = self.file.mutate_if::<_, AcmeError>(|document| {
             let Some(current) = document.orders.get(&expected.id) else {
-                return Ok((false, (false, 0)));
+                return Ok((false, (None, 0)));
             };
-            let latest = document
-                .orders
-                .values()
-                .filter(|order| order.certificate_id == expected.certificate_id)
-                .max_by_key(|order| order.updated_at);
-            if current.created_at != expected.created_at
-                || current.updated_at != expected.updated_at
-                || current.order_url != expected.order_url
-                || current.certificate_id != expected.certificate_id
-                || current.status != expected.status
-                || !matches!(
-                    current.status,
-                    AcmeOrderStatus::PendingChallenges
-                        | AcmeOrderStatus::Ready
-                        | AcmeOrderStatus::Processing
-                )
-                || latest.is_none_or(|order| order.id != expected.id)
-            {
-                return Ok((false, (false, 0)));
+            let Some(next) = current.status.transition_to(target) else {
+                return Ok((false, (None, 0)));
+            };
+            if !order_matches_snapshot(current, expected) {
+                return Ok((false, (None, 0)));
             }
-            let Some(current) = document.orders.get_mut(&expected.id) else {
-                return Ok((false, (false, 0)));
-            };
-            current.status = AcmeOrderStatus::Failed;
-            current.error =
-                Some("CA reports that the ACME order is terminally invalid".to_string());
-            current.updated_at = Utc::now();
+            let mut committed = current.clone();
+            committed.status = next;
+            apply(&mut committed);
+            if commit_would_hide_active_order(document, &committed) {
+                return Ok((false, (None, 0)));
+            }
+            committed.updated_at = Utc::now();
+            document
+                .orders
+                .insert(committed.id.clone(), committed.clone());
             let pruned = prune_terminal_order_history(document, terminal_history);
-            Ok((true, (true, pruned)))
+            Ok((true, (Some(committed), pruned)))
         })?;
         record_store_pruned(outcome.1 as u64);
         Ok(outcome.0)
@@ -1051,14 +1220,7 @@ impl AcmeOrderStore {
         document
             .orders
             .values()
-            .filter(|order| {
-                matches!(
-                    order.status,
-                    AcmeOrderStatus::PendingChallenges
-                        | AcmeOrderStatus::Ready
-                        | AcmeOrderStatus::Processing
-                )
-            })
+            .filter(|order| order.status.is_active())
             .flat_map(|order| order.http01_challenges.iter())
             .find(|challenge| challenge.token == token)
             .map(|challenge| challenge.key_authorization.clone())
@@ -1070,14 +1232,7 @@ impl AcmeOrderStore {
         document
             .orders
             .values()
-            .filter(|order| {
-                matches!(
-                    order.status,
-                    AcmeOrderStatus::PendingChallenges
-                        | AcmeOrderStatus::Ready
-                        | AcmeOrderStatus::Processing
-                )
-            })
+            .filter(|order| order.status.is_active())
             .flat_map(|order| order.tls_alpn01_challenges.iter())
             .find(|challenge| {
                 normalize_tls_alpn_identifier(&challenge.identifier) == Some(identifier.clone())
@@ -1155,7 +1310,6 @@ impl AcmeAccountStore {
     }
 
     /// Version of the authoritative document behind the last read. Non-secret.
-    #[allow(dead_code)]
     pub fn store_version(&self) -> Result<u64, AcmeError> {
         Ok(self.file.version()?)
     }
@@ -1314,7 +1468,15 @@ impl AcmeCertificateRecord {
 }
 
 impl AcmeOrderRecord {
-    pub fn new_http01(input: AcmeHttp01OrderInput) -> Result<Self, AcmeError> {
+    /// Whether preparation recorded any challenge. An order whose
+    /// authorizations were all already valid records none (issue #7195).
+    pub fn has_challenge_records(&self) -> bool {
+        !self.http01_challenges.is_empty()
+            || !self.tls_alpn01_challenges.is_empty()
+            || !self.dns01_challenges.is_empty()
+    }
+
+    pub fn new(input: AcmeOrderInput) -> Result<Self, AcmeError> {
         validate_acme_domains(&input.domains)?;
         if let Some(certificate_id) = input.certificate_id.as_deref() {
             validate_acme_id(certificate_id)?;
@@ -1323,7 +1485,9 @@ impl AcmeOrderRecord {
         validate_tls_alpn01_challenges(&input.tls_alpn01_challenges)?;
         validate_dns01_challenges(&input.dns01_challenges)?;
         if let Some(finalization) = input.finalization.as_ref() {
-            finalization.validate(&input.domains)?;
+            finalization
+                .validate(&input.domains)
+                .map_err(|_| AcmeError::UnusableFinalizationMaterial(input.id.clone()))?;
         }
         let now = Utc::now();
         Ok(Self {
@@ -1670,25 +1834,162 @@ fn validate_acme_terminal_history(terminal_history: usize) -> Result<usize, Acme
     Ok(terminal_history.min(crate::config::env_config::HARD_MAX_TLS_ACME_TERMINAL_ORDER_HISTORY))
 }
 
-/// Whether an order is still active or recoverable and must not be pruned.
+/// Whether `certificate` is the certificate `order` was completed into.
 ///
-/// Pending/ready/processing orders are always retained, including their
-/// finalization packages. `Valid` orders that still carry finalization material
-/// are also retained (corrupt/partial states). Terminal history is
-/// `Failed`/`Cancelled`, plus `Valid` once finalization has been cleared.
-fn order_is_active_or_recoverable(order: &AcmeOrderRecord) -> bool {
-    match order.status {
-        AcmeOrderStatus::PendingChallenges
-        | AcmeOrderStatus::Ready
-        | AcmeOrderStatus::Processing => true,
-        AcmeOrderStatus::Valid => order.finalization.is_some(),
-        AcmeOrderStatus::Failed | AcmeOrderStatus::Cancelled => false,
-    }
+/// True only when the order is `valid`, was finalized into this certificate
+/// id, and both records carry the same non-empty CA `order_url` — the CA's own
+/// identity for the order, which the certificate record keeps as its
+/// completion evidence. The order's key/CSR is cleared when it becomes
+/// `valid`, so the `order_url` is the evidence there is to compare. Admin
+/// finalize uses this to answer a repeated finalize of an already completed
+/// order (by an earlier finalize or by a renewal of the same CA order) as an
+/// idempotent success instead of a conflict.
+pub fn order_produced_certificate(
+    order: &AcmeOrderRecord,
+    certificate: &AcmeCertificateRecord,
+) -> bool {
+    let Some(order_url) = order
+        .order_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+    else {
+        return false;
+    };
+    order.status == AcmeOrderStatus::Valid
+        && order.certificate_id.as_deref() == Some(certificate.id.as_str())
+        && certificate.order_url.as_deref() == Some(order_url)
 }
 
-/// Retain all active/recoverable orders plus at most `max_terminal` newest
-/// terminal orders per certificate (or orphan bucket). Returns how many were
-/// removed. Runs under the exclusive mutation lock of the order store.
+/// The stored `(order, certificate)` pair when a finalize of `order_id` into
+/// `certificate_id` has already completed, `Ok(None)` otherwise.
+///
+/// Admin finalize asks this in three places, each of which would otherwise
+/// answer `409`: before any CA I/O when the order is already terminal (a repeat
+/// of a finalize that succeeded), when its certificate write finds the record
+/// already present (a renewal or a concurrent finalize published it first), and
+/// when its order compare-and-set is refused (that renewal or finalize also
+/// completed the order). Both records are re-read from the stores, so the
+/// answer is about the current state rather than the request's snapshot.
+///
+/// Completed means: the order still exists and is `valid`, it still names the
+/// CA order this request finalized (`finalized_order_url`; `None` accepts the
+/// stored order's own URL), it was finalized into `certificate_id`, and the
+/// stored certificate is the one it produced ([`order_produced_certificate`]).
+/// A deleted order, a different or still-active order, a missing certificate,
+/// or one issued for another CA order is not completion. A store that cannot
+/// be read is an error, never "not completed".
+pub fn completed_finalize(
+    order_store: &AcmeOrderStore,
+    certificate_store: &AcmeCertificateStore,
+    order_id: &str,
+    certificate_id: &str,
+    finalized_order_url: Option<&str>,
+) -> Result<Option<(AcmeOrderRecord, AcmeCertificateRecord)>, AcmeError> {
+    let order = match order_store.get_order(order_id) {
+        Ok(order) => order,
+        Err(AcmeError::OrderNotFound(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if finalized_order_url.is_some_and(|url| order.order_url.as_deref() != Some(url))
+        || order.status != AcmeOrderStatus::Valid
+        || order.certificate_id.as_deref() != Some(certificate_id)
+    {
+        return Ok(None);
+    }
+    let certificate = match certificate_store.get_certificate(certificate_id) {
+        Ok(certificate) => certificate,
+        Err(AcmeError::NotFound(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(order_produced_certificate(&order, &certificate).then_some((order, certificate)))
+}
+
+/// The refusal an order write of a new `next`-status record under `id` would
+/// meet, decided before the caller prepares that record with the CA.
+///
+/// Preparing an order creates it with the CA, which cannot be undone, so the
+/// Admin API asks this first: `Ok(Some(OrderAlreadyExists))` for an existing
+/// id without `allow_overwrite`, `Ok(Some(IllegalOrderTransition))` when the
+/// stored order's status does not admit `next`
+/// ([`AcmeOrderStatus::admits_overwrite_with`]), and `Ok(None)` when the write
+/// may proceed — including a brand-new id, or an id the store rejects as
+/// malformed (the write itself reports that). [`AcmeOrderStore::upsert_order`]
+/// makes the same decision again under its lock, so a change after this read
+/// is still refused there.
+pub fn order_replacement_refusal(
+    order_store: &AcmeOrderStore,
+    id: &str,
+    allow_overwrite: bool,
+    next: AcmeOrderStatus,
+) -> Result<Option<AcmeError>, AcmeError> {
+    let existing = match order_store.get_order(id) {
+        Ok(existing) => existing,
+        Err(AcmeError::OrderNotFound(_) | AcmeError::InvalidId(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !allow_overwrite {
+        return Ok(Some(AcmeError::OrderAlreadyExists(existing.id)));
+    }
+    if existing.status.admits_overwrite_with(next) {
+        return Ok(None);
+    }
+    Ok(Some(AcmeError::IllegalOrderTransition {
+        id: existing.id,
+        from: existing.status,
+        to: next,
+    }))
+}
+
+/// Whether `current` is still exactly the order a caller read as `expected`.
+///
+/// `updated_at` is stamped by every store write and `created_at` by the write
+/// that created the id, so together they act as the record's version: an
+/// intervening update, a delete-and-recreate, or a completed renewal all fail
+/// this check.
+fn order_matches_snapshot(current: &AcmeOrderRecord, expected: &AcmeOrderRecord) -> bool {
+    current.created_at == expected.created_at
+        && current.updated_at == expected.updated_at
+        && current.order_url == expected.order_url
+        && current.certificate_id == expected.certificate_id
+        && current.status == expected.status
+}
+
+/// Whether persisting `candidate` would hide another active order from
+/// `plan_renewal_order`.
+///
+/// The write stamps `updated_at = now`, so `candidate` becomes the latest order
+/// for the certificate it is persisted under — the *destination*, which may
+/// differ from the one the order was read with. The planner only looks at that
+/// latest order, so the commit hides an active order exactly when, before the
+/// commit, the destination's latest order is an active order other than this
+/// one: a newer competing order in the order's own certificate, or any current
+/// active order in a certificate it is being moved into. Moving an order away
+/// from its certificate leaves that certificate's other orders visible, and
+/// orders without a certificate are never planned, so neither can hide
+/// anything.
+fn commit_would_hide_active_order(
+    document: &AcmeOrderStoreFile,
+    candidate: &AcmeOrderRecord,
+) -> bool {
+    let Some(certificate_id) = candidate.certificate_id.as_deref() else {
+        return false;
+    };
+    document
+        .orders
+        .values()
+        .filter(|order| order.certificate_id.as_deref() == Some(certificate_id))
+        .max_by_key(|order| order.updated_at)
+        .is_some_and(|latest| latest.id != candidate.id && latest.status.is_active())
+}
+
+/// Retain all active orders plus at most `max_terminal` newest terminal orders
+/// per certificate (or orphan bucket). Returns how many were removed. Runs
+/// under the exclusive mutation lock of the order store.
+///
+/// Only active orders are resumable, so only they keep their key/CSR beyond the
+/// history bound. A terminal order that still carries finalization material
+/// (only a hand-written record can) has no recovery path — it can be neither
+/// finalized nor resumed — and is history like any other terminal order.
 fn prune_terminal_order_history(document: &mut AcmeOrderStoreFile, max_terminal: usize) -> usize {
     use std::collections::HashMap;
 
@@ -1697,7 +1998,7 @@ fn prune_terminal_order_history(document: &mut AcmeOrderStoreFile, max_terminal:
     let mut terminal_by_group: HashMap<Option<String>, Vec<(String, DateTime<Utc>)>> =
         HashMap::new();
     for (id, order) in &document.orders {
-        if order_is_active_or_recoverable(order) {
+        if order.status.is_active() {
             continue;
         }
         terminal_by_group
@@ -2234,7 +2535,12 @@ impl AcmeResolverFallback {
 
 pub struct AcmeTlsAlpnResolver {
     fallback: AcmeResolverFallback,
-    cache: Mutex<BTreeMap<String, Arc<rustls::sign::CertifiedKey>>>,
+    /// TLS-ALPN-01 validation certificates keyed by server name, each with
+    /// the key authorization it was built for. Holds at most one entry per
+    /// name: a new challenge replaces the previous key, and a name whose
+    /// challenge is no longer pending is evicted on its next `acme-tls/1`
+    /// handshake, so served validation keys do not accumulate.
+    cache: Mutex<BTreeMap<String, (String, Arc<rustls::sign::CertifiedKey>)>>,
 }
 
 impl std::fmt::Debug for AcmeTlsAlpnResolver {
@@ -2293,16 +2599,26 @@ impl AcmeTlsAlpnResolver {
     }
 
     fn tls_alpn_certified_key(&self, server_name: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let key_authorization = tls_alpn01_key_authorization_for_identifier(server_name)?;
-        let cache_key = format!("{server_name}\0{key_authorization}");
+        let Some(key_authorization) = tls_alpn01_key_authorization_for_identifier(server_name)
+        else {
+            // No pending challenge for this name any more: release its key.
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.remove(server_name);
+            }
+            return None;
+        };
         if let Ok(cache) = self.cache.lock()
-            && let Some(certified_key) = cache.get(&cache_key)
+            && let Some((cached_authorization, certified_key)) = cache.get(server_name)
+            && *cached_authorization == key_authorization
         {
             return Some(certified_key.clone());
         }
         let certified_key = build_tls_alpn01_certified_key(server_name, &key_authorization).ok()?;
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(cache_key, certified_key.clone());
+            cache.insert(
+                server_name.to_string(),
+                (key_authorization, certified_key.clone()),
+            );
         }
         Some(certified_key)
     }
@@ -2413,15 +2729,6 @@ pub fn http01_key_authorization_for_path(path: &str) -> Option<String> {
     global_order_store().ok()?.http01_key_authorization(&token)
 }
 
-fn acme_store_dir_from_env() -> PathBuf {
-    let path = crate::config::env_config::tls_managed_store_path_from_env();
-    if path.is_empty() {
-        PathBuf::from(DEFAULT_STORE_DIR)
-    } else {
-        PathBuf::from(path)
-    }
-}
-
 static GLOBAL_ACME_CERTIFICATE_STORE: OnceLock<Result<Arc<AcmeCertificateStore>, String>> =
     OnceLock::new();
 static GLOBAL_ACME_ORDER_STORE: OnceLock<Result<Arc<AcmeOrderStore>, String>> = OnceLock::new();
@@ -2430,7 +2737,7 @@ static GLOBAL_ACME_ACCOUNT_STORE: OnceLock<Result<Arc<AcmeAccountStore>, String>
 pub fn global_certificate_store() -> Result<Arc<AcmeCertificateStore>, String> {
     GLOBAL_ACME_CERTIFICATE_STORE
         .get_or_init(|| {
-            AcmeCertificateStore::open(acme_store_dir_from_env())
+            AcmeCertificateStore::open(crate::tls::store_dir::managed_store_dir())
                 .map(Arc::new)
                 .map_err(|error| error.to_string())
         })
@@ -2440,7 +2747,7 @@ pub fn global_certificate_store() -> Result<Arc<AcmeCertificateStore>, String> {
 pub fn global_order_store() -> Result<Arc<AcmeOrderStore>, String> {
     GLOBAL_ACME_ORDER_STORE
         .get_or_init(|| {
-            AcmeOrderStore::open(acme_store_dir_from_env())
+            AcmeOrderStore::open(crate::tls::store_dir::managed_store_dir())
                 .map(Arc::new)
                 .map_err(|error| error.to_string())
         })
@@ -2450,17 +2757,17 @@ pub fn global_order_store() -> Result<Arc<AcmeOrderStore>, String> {
 pub fn global_account_store() -> Result<Arc<AcmeAccountStore>, String> {
     GLOBAL_ACME_ACCOUNT_STORE
         .get_or_init(|| {
-            AcmeAccountStore::open(acme_store_dir_from_env())
+            AcmeAccountStore::open(crate::tls::store_dir::managed_store_dir())
                 .map(Arc::new)
                 .map_err(|error| error.to_string())
         })
         .clone()
 }
 
-// Also compiled for `test` without the `acme` feature: the renewal-resumption
-// planner infers this type from persisted challenge records, and that inference
-// is pure store logic that must be provable without real ACME networking.
-#[cfg(any(feature = "acme", test))]
+// Compiled without the `acme` feature too: `EnvConfig::validate` checks
+// `FERRUM_ACME_RENEW_CHALLENGE_TYPE` with `parse` in every build (issue #7194),
+// and the renewal-resumption planner infers this type from persisted challenge
+// records, which is pure store logic provable without real ACME networking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcmeRenewalChallengeType {
     Http01,
@@ -2468,7 +2775,6 @@ pub enum AcmeRenewalChallengeType {
     Dns01,
 }
 
-#[cfg(any(feature = "acme", test))]
 impl AcmeRenewalChallengeType {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -2479,7 +2785,7 @@ impl AcmeRenewalChallengeType {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Http01 => "http01",
             Self::TlsAlpn01 => "tls_alpn01",
@@ -2719,10 +3025,7 @@ pub(crate) fn plan_renewal_order(
     let Some(order) = order_store.latest_order_for_certificate(certificate_id)? else {
         return Ok(RenewalOrderPlan::NewOrder);
     };
-    if !matches!(
-        order.status,
-        AcmeOrderStatus::PendingChallenges | AcmeOrderStatus::Ready | AcmeOrderStatus::Processing
-    ) {
+    if !order.status.is_active() {
         return Ok(RenewalOrderPlan::NewOrder);
     }
     let Some(order_url) = order
@@ -2758,13 +3061,16 @@ pub(crate) fn plan_renewal_order(
 /// whatever `FERRUM_ACME_RENEWAL_CHALLENGE_TYPE` happens to say now: an operator
 /// who switched types between the crash and the takeover would otherwise have
 /// the successor poll authorizations it never provisioned. Exactly one non-empty
-/// challenge family is a usable answer; zero families and two or more families
-/// are both explicit failures. Diagnostics name the order id only — never a
-/// token, key authorization, or credential.
+/// challenge family is a usable answer; two or more families are an explicit
+/// failure. `None` means the order recorded no challenge at all, which
+/// preparation produces when every authorization was already valid (issue
+/// #7195): such an order needs no challenge type, and completion refuses any
+/// pending authorization it meets. Diagnostics name the order id only — never
+/// a token, key authorization, or credential.
 #[cfg(any(feature = "acme", test))]
 pub(crate) fn infer_persisted_challenge_type(
     order: &AcmeOrderRecord,
-) -> Result<AcmeRenewalChallengeType, AcmeError> {
+) -> Result<Option<AcmeRenewalChallengeType>, AcmeError> {
     let families = [
         (
             AcmeRenewalChallengeType::Http01,
@@ -2781,12 +3087,8 @@ pub(crate) fn infer_persisted_challenge_type(
     ];
     let mut present = families.iter().filter(|(_, populated)| *populated);
     match (present.next(), present.next()) {
-        (Some((challenge_type, _)), None) => Ok(*challenge_type),
-        (None, _) => Err(AcmeError::InvalidId(format!(
-            "ACME order {} has no persisted challenge records, so its challenge type cannot be \
-             determined; not resuming it",
-            order.id
-        ))),
+        (Some((challenge_type, _)), None) => Ok(Some(*challenge_type)),
+        (None, _) => Ok(None),
         (Some(_), Some(_)) => Err(AcmeError::InvalidId(format!(
             "ACME order {} has more than one persisted challenge family, so its challenge type is \
              ambiguous; not resuming it",
@@ -2860,10 +3162,15 @@ pub(crate) async fn claim_and_plan_renewal(
 /// Outcome of the lease-fenced final publication of renewed ACME material.
 ///
 /// Both final store writes are always attempted under the same lease fence
-/// (when the fence is entered). This enum distinguishes the four write-result
-/// combinations so neither a single-target failure nor a storage outage can be
-/// mistaken for a successful renewal, and so published material can clear a
-/// matching stale active order via exact `order_url` correlation.
+/// (when the fence is entered). The order write is a compare-and-set on the
+/// order snapshot the renewal drove (`AcmeOrderStore::complete_order_if_current`),
+/// so it has three results — committed, refused because the order is no longer
+/// that snapshot, or a store failure — and the certificate write two. This enum
+/// distinguishes the combinations so neither a single-target failure nor a
+/// storage outage can be mistaken for a successful renewal, so an order an
+/// operator deleted or rewrote mid-renewal is never recreated or overwritten,
+/// and so published material can clear a matching stale active order via exact
+/// `order_url` correlation.
 #[derive(Debug)]
 pub(crate) enum FinalRenewalPublication {
     /// Order `Valid` status and certificate material both committed.
@@ -2878,6 +3185,20 @@ pub(crate) enum FinalRenewalPublication {
     /// published certificate's `order_url` is durable completion evidence for
     /// [`has_active_renewal_order`].
     MaterialPublishedOrderNotCommitted(AcmeError),
+    /// Certificate material published; the order was left untouched because it
+    /// was no longer the snapshot this renewal drove — an operator deleted or
+    /// rewrote it, admin finalize already completed it, it is already terminal,
+    /// or the certificate gained a newer active order — while the renewal was
+    /// in flight. The CA has issued and nothing failed, so new material is
+    /// authoritative, reload is requested, and the renewal counts as renewed;
+    /// the order is never recreated or overwritten. A still-active order with
+    /// the same `order_url` is cleared by the published certificate exactly as
+    /// for [`Self::MaterialPublishedOrderNotCommitted`].
+    MaterialPublishedOrderNotCurrent,
+    /// The order was no longer current (left untouched, as above) and the
+    /// certificate write failed. No reload; explicit renewal failure, and the
+    /// prior material remains due.
+    OrderNotCurrentMaterialNotPublished(AcmeError),
     /// Neither final write landed. No reload. Diagnostics for both failures are
     /// preserved without disclosing PEM or private-key material.
     NeitherCommitted {
@@ -2886,8 +3207,16 @@ pub(crate) enum FinalRenewalPublication {
     },
 }
 
-/// Persist the already-CA-valid order as `Valid`, then always attempt certificate
-/// publication under the same lease fence — even when the order write fails.
+/// Commit the already-CA-valid order as `Valid` through the order lifecycle's
+/// compare-and-set, then always attempt certificate publication under the same
+/// lease fence — even when the order write fails or is refused.
+///
+/// `order` must be the order exactly as this renewal read or created it. The
+/// `Valid` write lands only while the stored order is still that snapshot
+/// (`AcmeOrderStore::complete_order_if_current`): the lease fences other
+/// renewers, but not an operator, so an order deleted, overwritten, or
+/// finalized through the Admin API mid-renewal is left as it is rather than
+/// recreated from this stale copy.
 ///
 /// # Lock order
 ///
@@ -2903,37 +3232,48 @@ pub(crate) fn commit_final_renewal_publication(
     certificate_store: &AcmeCertificateStore,
     order_store: &AcmeOrderStore,
     issued: AcmeCertificateRecord,
-    mut order: AcmeOrderRecord,
+    order: AcmeOrderRecord,
 ) -> FinalRenewalPublication {
-    order.status = AcmeOrderStatus::Valid;
-    order.error = None;
     // Retention is tied to resumability, not to success. The material exists so
     // a successor can finish an order that is still resumable, and an order is
     // resumable exactly while it is in an active status: `plan_renewal_order`
     // treats `Valid` as terminal and plans a fresh order (with fresh material)
-    // instead. So it is dropped in the *same* write that makes the order
-    // terminal, which keeps all four partial-publication outcomes recoverable:
-    // both-committed and order-only-committed reach `Valid` and no longer need
-    // it; the two outcomes where the order write fails never apply this record
-    // at all, so the stored material survives untouched and the still-active
-    // order stays resumable.
-    order.finalization = None;
+    // instead. So `complete_order_if_current` drops it in the *same* write that
+    // makes the order terminal, which keeps every partial-publication outcome
+    // recoverable: the outcomes where the order commits reach `Valid` and no
+    // longer need it; the outcomes where the order write fails or is refused
+    // never touch the stored record, so whatever is stored keeps its material.
+    //
     // Attempt the order Valid write first, then always attempt certificate
     // publication. Test-only injection hooks scope each fault to its own write
     // so either side (or both) can fail independently through this helper.
     let order_result = {
         #[cfg(test)]
         let _order_write_fault = take_final_publication_order_write_fault();
-        order_store.upsert_order(order, true)
+        order_store.complete_order_if_current(&order, issued.id.clone())
     };
+    if matches!(order_result, Ok(None)) {
+        tracing::warn!(
+            order_id = %order.id,
+            certificate_id = %issued.id,
+            "ACME renewal order was deleted, changed, or superseded while the renewal was in \
+             flight; leaving it unchanged and publishing the issued certificate"
+        );
+    }
     let certificate_result = {
         #[cfg(test)]
         let _certificate_write_fault = take_final_publication_certificate_write_fault();
         certificate_store.upsert_certificate(issued, true)
     };
     match (order_result, certificate_result) {
-        (Ok(_), Ok(_)) => FinalRenewalPublication::Complete,
-        (Ok(_), Err(error)) => FinalRenewalPublication::OrderCommittedMaterialNotPublished(error),
+        (Ok(Some(_)), Ok(_)) => FinalRenewalPublication::Complete,
+        (Ok(Some(_)), Err(error)) => {
+            FinalRenewalPublication::OrderCommittedMaterialNotPublished(error)
+        }
+        (Ok(None), Ok(_)) => FinalRenewalPublication::MaterialPublishedOrderNotCurrent,
+        (Ok(None), Err(error)) => {
+            FinalRenewalPublication::OrderNotCurrentMaterialNotPublished(error)
+        }
         (Err(error), Ok(_)) => FinalRenewalPublication::MaterialPublishedOrderNotCommitted(error),
         (Err(order), Err(certificate)) => {
             FinalRenewalPublication::NeitherCommitted { order, certificate }
@@ -2945,10 +3285,13 @@ pub(crate) fn commit_final_renewal_publication(
 ///
 /// A partial or total persistence failure is always an explicit renewal error
 /// and never a successful renewal. Reload is requested when new certificate
-/// material landed ([`FinalRenewalPublication::Complete`] or
+/// material landed ([`FinalRenewalPublication::Complete`],
+/// [`FinalRenewalPublication::MaterialPublishedOrderNotCurrent`], or
 /// [`FinalRenewalPublication::MaterialPublishedOrderNotCommitted`]). An
-/// order-only commit and a both-failed outage must not reload. On full success,
-/// returns the surfaces that accepted the force-reload request.
+/// outcome without published material must not reload. A refused order write
+/// is not a failure: material published next to an order that was no longer
+/// current is a successful renewal. On success, returns the surfaces that
+/// accepted the force-reload request.
 pub(crate) fn apply_final_renewal_publication(
     outcome: FinalRenewalPublication,
 ) -> Result<Vec<&'static str>, AcmeError> {
@@ -2967,7 +3310,16 @@ pub(crate) fn map_final_renewal_publication_outcome(
     request_reloads: impl FnOnce() -> Vec<&'static str>,
 ) -> Result<Vec<&'static str>, AcmeError> {
     match outcome {
-        FinalRenewalPublication::Complete => Ok(request_reloads()),
+        // Material landed and nothing failed: the order was deliberately left
+        // to whoever changed it, so this is a successful renewal.
+        FinalRenewalPublication::Complete
+        | FinalRenewalPublication::MaterialPublishedOrderNotCurrent => Ok(request_reloads()),
+        FinalRenewalPublication::OrderNotCurrentMaterialNotPublished(error) => {
+            Err(AcmeError::Write(format!(
+                "ACME order changed while the renewal was in flight and was left unchanged, \
+                 and renewed certificate material failed to publish: {error}"
+            )))
+        }
         FinalRenewalPublication::OrderCommittedMaterialNotPublished(error) => {
             Err(AcmeError::Write(format!(
                 "ACME order was marked valid but renewed certificate material failed to publish: {error}"
@@ -3164,6 +3516,33 @@ fn take_final_publication_certificate_write_fault()
     }
 }
 
+/// Account credentials a scheduled renewal of `certificate_id` signs with.
+///
+/// The shared account store, keyed by the certificate's own
+/// `(directory_url, account_id)`, is authoritative: every renewal and every
+/// Admin order/finalize writes the credentials it used there. The latest order
+/// for the certificate is only a fallback for an account the store has never
+/// seen. It is not a safe first choice — "latest" is by `updated_at`, and a
+/// terminal commit on an older order (a CA-invalid `failed`, an Admin finalize)
+/// restamps it, so an order carrying an earlier account key, or another
+/// account's key, can become the latest one.
+///
+/// A store that cannot be read is an error, not "no credentials".
+pub fn renewal_account_credentials(
+    account_store: &AcmeAccountStore,
+    order_store: &AcmeOrderStore,
+    certificate_id: &str,
+    directory_url: &str,
+    account_id: &str,
+) -> Result<Option<String>, AcmeError> {
+    if let Some(credentials) = account_store.get_credentials(directory_url, account_id)? {
+        return Ok(Some(credentials));
+    }
+    Ok(order_store
+        .latest_order_for_certificate(certificate_id)?
+        .and_then(|order| order.account_credentials_json))
+}
+
 /// Renew one certificate under a continuously maintained shared claim.
 ///
 /// Every stretch of external work — account registration, order creation, the
@@ -3196,6 +3575,10 @@ fn take_final_publication_certificate_write_fault()
 /// a later retry. When both writes fail, there is no reload and the outcome is
 /// an explicit combined failure (that storage-outage case may remain
 /// fail-closed). Lease loss before entering the fence performs neither write.
+/// The `Valid` write is a compare-and-set on the order this renewal drove: if
+/// an operator deleted or rewrote that order meanwhile (the lease fences other
+/// renewers, not the Admin API), it is left as it is — never recreated — while
+/// the issued certificate is still published and reloaded.
 ///
 /// One residual is inherent to ACME: an order already created with the CA
 /// cannot be un-created if the claim is lost immediately afterwards. The check
@@ -3213,10 +3596,13 @@ async fn renew_certificate_once(
     let Some(account_id) = certificate.account_id.as_deref() else {
         return Ok(false);
     };
-    let Some(account_credentials_json) = order_store
-        .latest_order_for_certificate(&certificate.id)?
-        .and_then(|order| order.account_credentials_json)
-        .or(account_store.get_credentials(&certificate.directory_url, account_id)?)
+    let Some(account_credentials_json) = renewal_account_credentials(
+        account_store,
+        order_store,
+        &certificate.id,
+        &certificate.directory_url,
+        account_id,
+    )?
     else {
         return Ok(false);
     };
@@ -3327,7 +3713,10 @@ pub(crate) async fn resume_persisted_renewal_order(
     order: AcmeOrderRecord,
     config: &AcmeRenewalSchedulerConfig,
 ) -> Result<bool, AcmeError> {
-    let challenge_type = infer_persisted_challenge_type(&order)?;
+    let inferred_challenge_type = infer_persisted_challenge_type(&order)?;
+    // An order with no challenge records needs none (every authorization was
+    // already valid); completion fails closed on any pending authorization.
+    let challenge_type = inferred_challenge_type.unwrap_or(config.challenge_type);
     // Fail before any side effect if the persisted order cannot actually be
     // driven. `complete_prepared_renewal_order` checks both again; checking here
     // keeps a hopeless resume from re-presenting DNS-01 records first.
@@ -3367,7 +3756,7 @@ pub(crate) async fn resume_persisted_renewal_order(
         "resuming a persisted ACME renewal order under a newly acquired claim"
     );
 
-    if challenge_type == AcmeRenewalChallengeType::Dns01 {
+    if inferred_challenge_type == Some(AcmeRenewalChallengeType::Dns01) {
         let Some(command) = config.dns01_hook_command.as_deref() else {
             tracing::warn!(
                 certificate_id = %certificate.id,
@@ -3508,6 +3897,9 @@ async fn finish_renewal_order(
     // material-without-Valid still reloads and uses the published order_url as
     // durable completion evidence; Valid-without-material does not reload;
     // both-failed does neither and remains an explicit storage-outage failure.
+    // The Valid write is a compare-and-set on `order`, so an order deleted or
+    // rewritten through the Admin API meanwhile is left untouched (material
+    // still publishes and reloads).
     let certs = Arc::clone(certificate_store);
     let orders = Arc::clone(order_store);
     let publication = match keeper
@@ -3589,7 +3981,7 @@ async fn prepare_renewal_order(
         }
     }
 
-    AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+    AcmeOrderRecord::new(AcmeOrderInput {
         id: format!("renew-{}", Uuid::new_v4().simple()),
         certificate_id: Some(certificate.id.clone()),
         domains: prepared.domains,
@@ -3630,8 +4022,8 @@ pub(crate) async fn resolve_renewal_completion_result(
     order_store: &Arc<AcmeOrderStore>,
     keeper: &crate::tls::lease::RenewalLeaseKeeper,
     order: &AcmeOrderRecord,
-    result: Result<client::CompletedAcmeHttp01Order, RenewalCompletionError>,
-) -> Result<Option<client::CompletedAcmeHttp01Order>, AcmeError> {
+    result: Result<client::CompletedAcmeOrder, RenewalCompletionError>,
+) -> Result<Option<client::CompletedAcmeOrder>, AcmeError> {
     let error = match result {
         Ok(completed) => return Ok(Some(completed)),
         Err(RenewalCompletionError::Preparation(error)) => return Err(error),
@@ -3661,7 +4053,7 @@ async fn complete_prepared_renewal_order(
     order: &AcmeOrderRecord,
     challenge_type: AcmeRenewalChallengeType,
     config: &AcmeRenewalSchedulerConfig,
-) -> Result<client::CompletedAcmeHttp01Order, RenewalCompletionError> {
+) -> Result<client::CompletedAcmeOrder, RenewalCompletionError> {
     let account_credentials_json = order
         .account_credentials_json
         .clone()
@@ -3681,7 +4073,7 @@ async fn complete_prepared_renewal_order(
     finalization
         .validate(&order.domains)
         .map_err(|_| AcmeError::UnusableFinalizationMaterial(order.id.clone()))?;
-    let complete_config = client::CompleteAcmeHttp01OrderConfig {
+    let complete_config = client::CompleteAcmeOrderConfig {
         directory_url: order.directory_url.clone(),
         account_credentials_json: crate::tls::source::SecretString::new(account_credentials_json),
         order_url,
@@ -3689,6 +4081,7 @@ async fn complete_prepared_renewal_order(
         poll_timeout: config.poll_timeout,
         dns_cache: config.dns_cache.clone(),
         finalization,
+        no_challenges_provisioned: !order.has_challenge_records(),
     };
     match challenge_type {
         AcmeRenewalChallengeType::Http01 => client::complete_http01_order(complete_config).await,
@@ -3790,7 +4183,6 @@ async fn run_dns01_hook(
 /// production surface with anything callers could mistake for an API.
 #[cfg(feature = "acme")]
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn run_dns01_hook_for_tests(
     command: &str,
     action: &str,
@@ -3825,12 +4217,13 @@ fn validate_completed_certificate_pair(cert_pem: &str, key_pem: &str) -> Result<
 
 #[cfg(feature = "acme")]
 pub mod client {
-    //! Optional RFC 8555 ACME client substrate.
+    //! Optional RFC 8555 ACME client substrate: order preparation
+    //! (`prepare_*_order`) and remote-state-aware completion
+    //! (`complete_*_order`) behind the screened ACME egress boundary.
     //!
-    //! This module intentionally prepares orders and challenge material without
-    //! wiring challenge publication to listeners. Runtime surfaces decide how to
-    //! expose HTTP-01, TLS-ALPN-01, or DNS-01 material before calling ACME
-    //! challenge readiness/finalization in follow-on manager work.
+    //! Challenge publication lives in the parent module: the HTTP-01 lookup
+    //! (`http01_key_authorization_for_path`), `AcmeTlsAlpnResolver`
+    //! for TLS-ALPN-01, and the DNS-01 hook (`run_dns01_hook`).
 
     use std::future::{Future, ready};
     use std::io;
@@ -3847,8 +4240,9 @@ pub mod client {
     use hyper_util::client::legacy::Client as HyperClient;
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use instant_acme::{
-        Account, AccountCredentials, BodyWrapper, BytesBody, BytesResponse, ChallengeStatus,
-        ChallengeType, HttpClient, Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
+        Account, AccountCredentials, AuthorizationStatus, BodyWrapper, BytesBody, BytesResponse,
+        ChallengeStatus, ChallengeType, HttpClient, Identifier, NewAccount, NewOrder, OrderStatus,
+        RetryPolicy,
     };
     use serde::Serialize;
     use thiserror::Error;
@@ -3874,26 +4268,26 @@ pub mod client {
     }
 
     #[derive(Debug, Clone, Serialize)]
-    pub struct AcmeHttp01Challenge {
+    pub struct AcmeChallenge {
         pub identifier: String,
         pub token: String,
         pub key_authorization: String,
     }
 
     #[derive(Debug, Clone)]
-    pub struct PreparedAcmeHttp01Order {
+    pub struct PreparedAcmeOrder {
         pub domains: Vec<String>,
         pub order_url: String,
         pub account_id: String,
         pub account_credentials_json: SecretString,
-        pub challenges: Vec<AcmeHttp01Challenge>,
+        pub challenges: Vec<AcmeChallenge>,
         /// Generated before the order was created with the CA, so persisting the
         /// prepared order also persists everything finalization will need.
         pub finalization: super::AcmeOrderFinalization,
     }
 
     #[derive(Clone)]
-    pub struct CompleteAcmeHttp01OrderConfig {
+    pub struct CompleteAcmeOrderConfig {
         pub directory_url: String,
         pub account_credentials_json: SecretString,
         pub order_url: String,
@@ -3906,22 +4300,19 @@ pub mod client {
         /// order's own CSR has no safe move left, so callers must resolve the
         /// persisted material (or fail closed) before they can build this.
         pub finalization: super::AcmeOrderFinalization,
+        /// The order was prepared with no challenge because every
+        /// authorization was already valid (issue #7195). A pending
+        /// authorization then means challenge records were lost, so
+        /// completion fails closed instead of answering a challenge nothing
+        /// provisioned.
+        pub no_challenges_provisioned: bool,
     }
 
     #[derive(Debug, Clone)]
-    pub struct CompletedAcmeHttp01Order {
+    pub struct CompletedAcmeOrder {
         pub cert_pem: String,
         pub key_pem: String,
     }
-
-    pub type AcmeTlsAlpn01Challenge = AcmeHttp01Challenge;
-    pub type PreparedAcmeTlsAlpn01Order = PreparedAcmeHttp01Order;
-    pub type CompleteAcmeTlsAlpn01OrderConfig = CompleteAcmeHttp01OrderConfig;
-    pub type CompletedAcmeTlsAlpn01Order = CompletedAcmeHttp01Order;
-    pub type AcmeDns01Challenge = AcmeHttp01Challenge;
-    pub type PreparedAcmeDns01Order = PreparedAcmeHttp01Order;
-    pub type CompleteAcmeDns01OrderConfig = CompleteAcmeHttp01OrderConfig;
-    pub type CompletedAcmeDns01Order = CompletedAcmeHttp01Order;
 
     #[derive(Debug, Error)]
     pub enum AcmeClientError {
@@ -4331,8 +4722,11 @@ pub mod client {
         dns_cache: DnsCache,
     ) -> Result<Box<dyn HttpClient>, AcmeClientError> {
         let connector = ScreenedAcmeConnector::new(dns_cache);
+        // The provider is named rather than left to rustls's process-default
+        // lookup, which panics when both of its providers are linked and no
+        // default was installed.
         let https = HttpsConnectorBuilder::new()
-            .try_with_platform_verifier()
+            .with_provider_and_platform_verifier(crate::fips::base_crypto_provider())
             .map_err(|error| AcmeClientError::Client(error.to_string()))?
             .https_only()
             .enable_http1()
@@ -4384,19 +4778,19 @@ pub mod client {
 
     pub async fn prepare_http01_order(
         config: AcmeOrderConfig,
-    ) -> Result<PreparedAcmeHttp01Order, AcmeClientError> {
+    ) -> Result<PreparedAcmeOrder, AcmeClientError> {
         prepare_order(config, ChallengeType::Http01, "http-01").await
     }
 
     pub async fn prepare_tls_alpn01_order(
         config: AcmeOrderConfig,
-    ) -> Result<PreparedAcmeTlsAlpn01Order, AcmeClientError> {
+    ) -> Result<PreparedAcmeOrder, AcmeClientError> {
         prepare_order(config, ChallengeType::TlsAlpn01, "tls-alpn-01").await
     }
 
     pub async fn prepare_dns01_order(
         config: AcmeOrderConfig,
-    ) -> Result<PreparedAcmeDns01Order, AcmeClientError> {
+    ) -> Result<PreparedAcmeOrder, AcmeClientError> {
         prepare_order(config, ChallengeType::Dns01, "dns-01").await
     }
 
@@ -4404,7 +4798,7 @@ pub mod client {
         config: AcmeOrderConfig,
         challenge_type: ChallengeType,
         challenge_name: &'static str,
-    ) -> Result<PreparedAcmeHttp01Order, AcmeClientError> {
+    ) -> Result<PreparedAcmeOrder, AcmeClientError> {
         let endpoint_policy = super::AcmeEndpointPolicy::new(&config.account.directory_url)
             .map_err(|error| AcmeClientError::InvalidRequest(error.to_string()))?;
         let domains = normalize_order_domains(config.domains)?;
@@ -4438,6 +4832,14 @@ pub mod client {
             endpoint_policy
                 .validate_endpoint(&authorization_url, "authorization URL")
                 .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
+            // A CA may reuse an authorization that is already valid (RFC 8555
+            // §7.1.3); it lists only the challenge that validated it and needs
+            // none now. Terminal authorizations fail closed (issue #7195).
+            if authorization_completion_action(authorization.status)?
+                == AuthorizationCompletionAction::Skip
+            {
+                continue;
+            }
             let Some(challenge) = authorization.challenge(challenge_type.clone()) else {
                 return Err(AcmeClientError::InvalidRequest(format!(
                     "ACME authorization does not offer {challenge_name}"
@@ -4447,14 +4849,14 @@ pub mod client {
                 .validate_endpoint(&challenge.url, "challenge URL")
                 .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
             let key_authorization = challenge.key_authorization();
-            challenges.push(AcmeHttp01Challenge {
+            challenges.push(AcmeChallenge {
                 identifier: challenge.identifier().to_string(),
                 token: challenge.token.clone(),
                 key_authorization: key_authorization.as_str().to_string(),
             });
         }
 
-        Ok(PreparedAcmeHttp01Order {
+        Ok(PreparedAcmeOrder {
             domains,
             order_url,
             account_id: account.account.id().to_string(),
@@ -4465,20 +4867,20 @@ pub mod client {
     }
 
     pub async fn complete_http01_order(
-        config: CompleteAcmeHttp01OrderConfig,
-    ) -> Result<CompletedAcmeHttp01Order, AcmeClientError> {
+        config: CompleteAcmeOrderConfig,
+    ) -> Result<CompletedAcmeOrder, AcmeClientError> {
         complete_order(config, ChallengeType::Http01, "http-01").await
     }
 
     pub async fn complete_tls_alpn01_order(
-        config: CompleteAcmeTlsAlpn01OrderConfig,
-    ) -> Result<CompletedAcmeTlsAlpn01Order, AcmeClientError> {
+        config: CompleteAcmeOrderConfig,
+    ) -> Result<CompletedAcmeOrder, AcmeClientError> {
         complete_order(config, ChallengeType::TlsAlpn01, "tls-alpn-01").await
     }
 
     pub async fn complete_dns01_order(
-        config: CompleteAcmeDns01OrderConfig,
-    ) -> Result<CompletedAcmeDns01Order, AcmeClientError> {
+        config: CompleteAcmeOrderConfig,
+    ) -> Result<CompletedAcmeOrder, AcmeClientError> {
         complete_order(config, ChallengeType::Dns01, "dns-01").await
     }
 
@@ -4576,16 +4978,46 @@ pub mod client {
         }
     }
 
+    /// What a resumed order does with one of its authorizations.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum AuthorizationCompletionAction {
+        /// Still awaiting validation: drive its challenge.
+        DriveChallenge,
+        /// Already valid (validated by this order earlier, or reused by the CA
+        /// from another order, RFC 8555 §7.1.3): nothing to do. A reused valid
+        /// authorization may list only the challenge type that validated it.
+        Skip,
+    }
+
+    /// Decide what a resumed order does with one remote authorization status
+    /// (issue #7195). `Pending` → drive its challenge, `Valid` → skip it, and
+    /// every terminal state fails closed with a fixed diagnostic.
+    pub(crate) fn authorization_completion_action(
+        status: AuthorizationStatus,
+    ) -> Result<AuthorizationCompletionAction, AcmeClientError> {
+        match status {
+            AuthorizationStatus::Pending => Ok(AuthorizationCompletionAction::DriveChallenge),
+            AuthorizationStatus::Valid => Ok(AuthorizationCompletionAction::Skip),
+            AuthorizationStatus::Invalid
+            | AuthorizationStatus::Revoked
+            | AuthorizationStatus::Expired
+            | AuthorizationStatus::Deactivated => Err(AcmeClientError::Client(
+                "ACME authorization is no longer pending or valid and cannot be completed"
+                    .to_string(),
+            )),
+        }
+    }
+
     /// Drive a persisted order to a certificate, whatever state the CA is in.
     ///
     /// Idempotent across a crash: the private key is never generated here, only
     /// read from the material preparation already persisted, so every path
     /// returns the one key the certificate is actually issued against.
     async fn complete_order(
-        config: CompleteAcmeHttp01OrderConfig,
+        config: CompleteAcmeOrderConfig,
         challenge_type: ChallengeType,
         challenge_name: &'static str,
-    ) -> Result<CompletedAcmeHttp01Order, AcmeClientError> {
+    ) -> Result<CompletedAcmeOrder, AcmeClientError> {
         let endpoint_policy = super::AcmeEndpointPolicy::new(&config.directory_url)
             .map_err(|error| AcmeClientError::InvalidRequest(error.to_string()))?;
         let order_url = config.order_url.trim();
@@ -4641,6 +5073,21 @@ pub mod client {
                                 .map_err(|error| {
                                     AcmeClientError::EgressPolicy(error.to_string())
                                 })?;
+                            // An authorization that became valid elsewhere
+                            // may no longer list this challenge type; it needs
+                            // no challenge at all (issue #7195).
+                            if authorization_completion_action(authorization.status)?
+                                == AuthorizationCompletionAction::Skip
+                            {
+                                continue;
+                            }
+                            if config.no_challenges_provisioned {
+                                return Err(AcmeClientError::InvalidRequest(
+                                    "ACME order has a pending authorization but no provisioned \
+                                     challenge; not answering it"
+                                        .to_string(),
+                                ));
+                            }
                             let Some(mut challenge) =
                                 authorization.challenge(challenge_type.clone())
                             else {
@@ -4697,7 +5144,7 @@ pub mod client {
             AcmeClientError::Client("ACME completion produced no certificate".to_string())
         })?;
 
-        Ok(CompletedAcmeHttp01Order { cert_pem, key_pem })
+        Ok(CompletedAcmeOrder { cert_pem, key_pem })
     }
 
     struct ResolvedAccount {
@@ -5276,7 +5723,7 @@ pub mod client {
 
         #[tokio::test]
         async fn renewal_completion_uses_credential_and_persisted_order_boundary() {
-            let config = CompleteAcmeHttp01OrderConfig {
+            let config = CompleteAcmeOrderConfig {
                 directory_url: "https://acme.example/directory".to_string(),
                 account_credentials_json: SecretString::new(
                     serde_json::json!({
@@ -5291,6 +5738,7 @@ pub mod client {
                 poll_timeout: Duration::from_secs(1),
                 dns_cache: default_acme_dns_cache(),
                 finalization: test_finalization(),
+                no_challenges_provisioned: false,
             };
             let error = complete_order(config, ChallengeType::Http01, "http-01")
                 .await
@@ -5311,7 +5759,7 @@ pub mod client {
         /// instead means the check ran first.
         #[tokio::test]
         async fn unusable_finalization_material_fails_before_any_network_call() {
-            let config = CompleteAcmeHttp01OrderConfig {
+            let config = CompleteAcmeOrderConfig {
                 directory_url: "https://acme.example/directory".to_string(),
                 account_credentials_json: SecretString::new(
                     serde_json::json!({
@@ -5326,6 +5774,7 @@ pub mod client {
                 poll_timeout: Duration::from_secs(1),
                 dns_cache: default_acme_dns_cache(),
                 finalization: corrupt_finalization(),
+                no_challenges_provisioned: false,
             };
             let error = complete_order(config, ChallengeType::Http01, "http-01")
                 .await
@@ -5423,6 +5872,35 @@ pub mod client {
                 let error = completion_call_result(result, OrderStatus::Invalid).unwrap_err();
                 assert!(matches!(error, AcmeClientError::TerminalInvalidOrder));
                 assert!(!error.to_string().contains("CA problem detail"));
+            }
+        }
+
+        /// Issue #7195: a resumed order skips an authorization that is already
+        /// valid (it may not list the configured challenge type any more),
+        /// drives a pending one, and fails closed on every terminal state.
+        #[test]
+        fn authorization_completion_plan_covers_every_remote_status() {
+            assert_eq!(
+                authorization_completion_action(AuthorizationStatus::Pending).expect("pending"),
+                AuthorizationCompletionAction::DriveChallenge,
+            );
+            assert_eq!(
+                authorization_completion_action(AuthorizationStatus::Valid).expect("valid"),
+                AuthorizationCompletionAction::Skip,
+            );
+            for status in [
+                AuthorizationStatus::Invalid,
+                AuthorizationStatus::Revoked,
+                AuthorizationStatus::Expired,
+                AuthorizationStatus::Deactivated,
+            ] {
+                let error = authorization_completion_action(status)
+                    .expect_err("a terminal authorization must fail closed");
+                assert!(matches!(error, AcmeClientError::Client(_)));
+                assert!(
+                    error.to_string().contains("cannot be completed"),
+                    "unexpected diagnostic: {error}"
+                );
             }
         }
 
@@ -5738,7 +6216,7 @@ mod tests {
     fn order_store_serves_pending_http01_challenge() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = AcmeOrderStore::open(dir.path()).expect("open order store");
-        let record = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let record = AcmeOrderRecord::new(AcmeOrderInput {
             id: "edge-order".to_string(),
             certificate_id: Some("edge-cert".to_string()),
             domains: vec!["example.com".to_string()],
@@ -5779,7 +6257,7 @@ mod tests {
 
     #[test]
     fn order_store_rejects_malformed_http01_token() {
-        let error = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let error = AcmeOrderRecord::new(AcmeOrderInput {
             id: "edge-order".to_string(),
             certificate_id: None,
             domains: vec!["example.com".to_string()],
@@ -5807,7 +6285,7 @@ mod tests {
     fn order_store_serves_pending_tls_alpn01_challenge() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = AcmeOrderStore::open(dir.path()).expect("open order store");
-        let record = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let record = AcmeOrderRecord::new(AcmeOrderInput {
             id: "edge-order".to_string(),
             certificate_id: Some("edge-cert".to_string()),
             domains: vec!["example.com".to_string()],
@@ -5847,7 +6325,7 @@ mod tests {
 
     #[test]
     fn order_summary_exposes_dns01_txt_record() {
-        let record = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let record = AcmeOrderRecord::new(AcmeOrderInput {
             id: "edge-order".to_string(),
             certificate_id: Some("edge-cert".to_string()),
             domains: vec!["*.example.com".to_string()],
@@ -5896,7 +6374,7 @@ mod tests {
     fn latest_order_for_certificate_selects_newest_record() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = AcmeOrderStore::open(dir.path()).expect("open order store");
-        let older = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let older = AcmeOrderRecord::new(AcmeOrderInput {
             id: "older-order".to_string(),
             certificate_id: Some("edge-cert".to_string()),
             domains: vec!["example.com".to_string()],
@@ -5914,7 +6392,7 @@ mod tests {
         .expect("older order");
         store.upsert_order(older, false).expect("upsert older");
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let newer = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let newer = AcmeOrderRecord::new(AcmeOrderInput {
             id: "newer-order".to_string(),
             certificate_id: Some("edge-cert".to_string()),
             domains: vec!["example.com".to_string()],
@@ -5960,7 +6438,7 @@ mod tests {
         certificate_store
             .upsert_certificate(certificate, false)
             .expect("upsert certificate");
-        let order = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let order = AcmeOrderRecord::new(AcmeOrderInput {
             id: "edge-order".to_string(),
             certificate_id: Some("edge-cert".to_string()),
             domains: vec!["example.com".to_string()],

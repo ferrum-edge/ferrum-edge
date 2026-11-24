@@ -1,7 +1,7 @@
 //! The gateway TLS policy on DTLS surfaces (issue #4507).
 //!
 //! `FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_MAX_VERSION`, `FERRUM_TLS_CIPHER_SUITES`
-//! and `FERRUM_TLS_CURVES` are documented as applying "inbound + outbound".
+//! and `FERRUM_TLS_KEY_EXCHANGE_GROUPS` are documented as applying "inbound + outbound".
 //! Before #4507 the DTLS builders never received the parsed `TlsPolicy`, so a
 //! `udp` + `dtls` proxy kept accepting DTLS 1.2 with the DTLS stack's full
 //! default suite list under `FERRUM_TLS_MIN_VERSION=1.3`.

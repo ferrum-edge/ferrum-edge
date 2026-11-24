@@ -52,7 +52,7 @@ async fn test_all_protocol_plugins() {
         ("correlation_id", json!({})),
         (
             "otel_tracing",
-            json!({"endpoint": "http://example.com/traces"}),
+            json!({"endpoint": "https://example.com/traces"}),
         ),
         (
             "http_logging",
@@ -89,6 +89,11 @@ fn test_http_family_plugins() {
         ("basic_auth", json!({})),
         ("bot_detection", json!({})),
         ("request_termination", json!({"status_code": 503})),
+        // Header/query rules apply to WebSocket handshakes too.
+        (
+            "request_transformer",
+            json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]}),
+        ),
     ];
 
     for (name, config) in plugins {
@@ -150,10 +155,6 @@ fn test_http_family_and_stream_plugins() {
 fn test_http_grpc_plugins() {
     // Plugins that support HTTP and gRPC only (modify headers/body)
     let plugins = vec![
-        (
-            "request_transformer",
-            json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]}),
-        ),
         (
             "response_transformer",
             json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]}),
@@ -247,11 +248,7 @@ fn test_tcp_only_plugins() {
 
 #[tokio::test]
 async fn test_ip_restriction_stream_connect_allowed() {
-    let plugin = make_plugin(
-        "ip_restriction",
-        json!({"allow": ["10.0.0.0/8"], "mode": "allow_first"}),
-    )
-    .unwrap();
+    let plugin = make_plugin("ip_restriction", json!({"allow": ["10.0.0.0/8"]})).unwrap();
 
     let mut ctx = StreamConnectionContext::new(
         "10.1.2.3".to_string(),
@@ -269,11 +266,7 @@ async fn test_ip_restriction_stream_connect_allowed() {
 
 #[tokio::test]
 async fn test_ip_restriction_stream_connect_denied() {
-    let plugin = make_plugin(
-        "ip_restriction",
-        json!({"allow": ["10.0.0.0/8"], "mode": "allow_first"}),
-    )
-    .unwrap();
+    let plugin = make_plugin("ip_restriction", json!({"allow": ["10.0.0.0/8"]})).unwrap();
 
     let mut ctx = StreamConnectionContext::new(
         "192.168.1.1".to_string(),
@@ -318,6 +311,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         proxy_name: Some("Test Proxy".to_string()),
         client_ip: "10.1.2.3".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: "10.0.0.50:5432".to_string(),
         backend_resolved_ip: Some("10.0.0.50".to_string()),
@@ -333,7 +327,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         timestamp_connected: "2026-03-29T12:00:00Z".to_string(),
         timestamp_disconnected: "2026-03-29T12:00:01.5Z".to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 
@@ -534,7 +528,7 @@ async fn test_correlation_id_stream_connect_assigns_id() {
 async fn test_otel_tracing_stream_connect_assigns_trace_id() {
     let plugin = make_plugin(
         "otel_tracing",
-        json!({"endpoint": "http://example.com/traces"}),
+        json!({"endpoint": "https://example.com/traces"}),
     )
     .unwrap();
     let mut ctx = make_stream_ctx();
@@ -792,14 +786,14 @@ async fn udp_and_dtls_restore_correlation_after_public_cache_and_metadata_mutati
     let (udp_metadata, dtls_metadata) =
         ferrum_edge::_test_support::udp_dtls_disconnect_metadata_after_datagram_metadata_for_test(
             &mut ctx,
-            datagram_metadata,
+            datagram_metadata.into_iter().collect(),
         );
     let mut udp_summary = make_stream_summary();
     udp_summary.protocol = "udp".to_string();
-    udp_summary.metadata = udp_metadata;
+    udp_summary.metadata = udp_metadata.into_iter().collect();
     let mut dtls_summary = make_stream_summary();
     dtls_summary.protocol = "dtls".to_string();
-    dtls_summary.metadata = dtls_metadata;
+    dtls_summary.metadata = dtls_metadata.into_iter().collect();
 
     for summary in [&udp_summary, &dtls_summary] {
         assert_eq!(

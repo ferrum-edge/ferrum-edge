@@ -806,7 +806,7 @@ fn test_admin_transaction_log_schema_rejects_unknown_closed_object_keys() {
         (
             "outer-key",
             json!({"schemas": {"audit": {}}, "strict": true}),
-            "unknown config key \"strict\" at `config`",
+            "`config`: unknown configuration key(s): \"config.strict\"",
         ),
         (
             "derived-key",
@@ -926,7 +926,10 @@ fn test_redact_jwt_secret() {
 #[test]
 fn test_redact_keyauth_key() {
     let mut credentials = std::collections::HashMap::new();
-    credentials.insert("keyauth".to_string(), json!({"key": "api-key-value"}));
+    credentials.insert(
+        "keyauth".to_string(),
+        json!({"key": "api-key-value-0123456789"}),
+    );
     let consumer = make_consumer(credentials);
 
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
@@ -945,7 +948,10 @@ fn test_redact_multiple_credential_types() {
         "hmac_auth".to_string(),
         json!({"username": "alice", "secret": "secret123"}),
     );
-    credentials.insert("keyauth".to_string(), json!({"key": "api-key-value"}));
+    credentials.insert(
+        "keyauth".to_string(),
+        json!({"key": "api-key-value-0123456789"}),
+    );
     let consumer = make_consumer(credentials);
 
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
@@ -1310,7 +1316,9 @@ fn late_api_spec_post_compensation_preserves_intervening_proxy_plugins() {
     assert!(api_spec_source.contains("late_api_spec_create_compensation_safe("));
     assert!(api_spec_source.contains("current_proxy.plugins.len() != expected_associations.len()"));
     assert!(
-        api_spec_source.contains("plugin.proxy_id.as_deref() == Some(bundle.proxy.id.as_str())")
+        api_spec_source
+            .contains("list_proxy_scoped_plugin_config_ids(&spec.namespace, &bundle.proxy.id)"),
+        "compensation must check scoped plugins through the authoritative id-only reader"
     );
 }
 
@@ -1440,7 +1448,10 @@ fn test_consumer_update_preserves_response_hidden_credential_types() {
         json!([{"api_token": "custom-token-must-survive"}]),
     );
     credentials.insert("another_custom".to_string(), json!([{"opaque": "value"}]));
-    credentials.insert("keyauth".to_string(), json!([{"key": "live-api-key"}]));
+    credentials.insert(
+        "keyauth".to_string(),
+        json!([{"key": "live-api-key-0123456789"}]),
+    );
     credentials.insert("jwt".to_string(), json!([{"secret": jwt_secret.clone()}]));
     credentials.insert(
         "hmac_auth".to_string(),
@@ -1472,7 +1483,7 @@ fn test_consumer_update_preserves_response_hidden_credential_types() {
     // Placeholder secrets are restored, never persisted literally.
     assert_eq!(
         round_tripped.credentials["keyauth"],
-        json!([{"key": "live-api-key"}])
+        json!([{"key": "live-api-key-0123456789"}])
     );
     assert_eq!(
         round_tripped.credentials["jwt"],
@@ -1497,7 +1508,10 @@ fn test_consumer_update_preserves_response_hidden_credential_types() {
 #[test]
 fn test_consumer_update_preserves_only_unexpressible_credential_state() {
     let mut credentials = std::collections::HashMap::new();
-    credentials.insert("keyauth".to_string(), json!([{"key": "old-api-key"}]));
+    credentials.insert(
+        "keyauth".to_string(),
+        json!([{"key": "old-api-key-0123456789"}]),
+    );
     credentials.insert("mtls_auth".to_string(), json!([{"identity": "spiffe://a"}]));
     credentials.insert("custom_auth".to_string(), json!([{"api_token": "old"}]));
     credentials.insert(
@@ -1510,9 +1524,10 @@ fn test_consumer_update_preserves_only_unexpressible_credential_state() {
     updated
         .credentials
         .insert("custom_auth".to_string(), json!([{"api_token": "new"}]));
-    updated
-        .credentials
-        .insert("keyauth".to_string(), json!([{"key": "rotated-api-key"}]));
+    updated.credentials.insert(
+        "keyauth".to_string(),
+        json!([{"key": "rotated-api-key-0123456789"}]),
+    );
 
     ferrum_edge::config::types::preserve_response_hidden_consumer_credentials(
         &mut updated,
@@ -1527,7 +1542,7 @@ fn test_consumer_update_preserves_only_unexpressible_credential_state() {
     );
     assert_eq!(
         updated.credentials["keyauth"],
-        json!([{"key": "rotated-api-key"}])
+        json!([{"key": "rotated-api-key-0123456789"}])
     );
     // Hidden types the request never mentioned are still preserved.
     assert_eq!(
@@ -1542,14 +1557,14 @@ fn test_consumer_update_restores_placeholder_entries_positionally() {
     let mut credentials = std::collections::HashMap::new();
     credentials.insert(
         "keyauth".to_string(),
-        json!([{"key": "first-live-key"}, {"key": "second-live-key"}]),
+        json!([{"key": "first-live-key-0123456789"}, {"key": "second-live-key-0123456789"}]),
     );
     let stored = make_consumer(credentials);
 
     let mut updated = make_consumer(std::collections::HashMap::new());
     updated.credentials.insert(
         "keyauth".to_string(),
-        json!([{"key": "rotated-key"}, {"key": "[REDACTED]"}]),
+        json!([{"key": "rotated-key-0123456789"}, {"key": "[REDACTED]"}]),
     );
 
     ferrum_edge::config::types::preserve_response_hidden_consumer_credentials(
@@ -1559,7 +1574,7 @@ fn test_consumer_update_restores_placeholder_entries_positionally() {
 
     assert_eq!(
         updated.credentials["keyauth"],
-        json!([{"key": "rotated-key"}, {"key": "second-live-key"}])
+        json!([{"key": "rotated-key-0123456789"}, {"key": "second-live-key-0123456789"}])
     );
 }
 
@@ -1646,7 +1661,10 @@ fn test_backup_normalizes_legacy_single_object_credentials_to_arrays() {
         "jwt".to_string(),
         json!({"secret": secret.clone(), "algorithm": "HS256"}),
     );
-    credentials.insert("keyauth".to_string(), json!({"key": "legacy-key"}));
+    credentials.insert(
+        "keyauth".to_string(),
+        json!({"key": "legacy-key-0123456789"}),
+    );
     let stored = make_consumer(credentials);
     assert!(
         stored.validate_fields().is_err(),
@@ -1659,7 +1677,7 @@ fn test_backup_normalizes_legacy_single_object_credentials_to_arrays() {
     assert_eq!(exported.credentials["jwt"], json!([{"secret": secret}]));
     assert_eq!(
         exported.credentials["keyauth"],
-        json!([{"key": "legacy-key"}]),
+        json!([{"key": "legacy-key-0123456789"}]),
         "types without a single-field rule keep their fields, only the shape changes"
     );
     exported
@@ -1713,7 +1731,10 @@ fn test_consumer_update_restores_legacy_jwt_entries_canonically() {
 #[test]
 fn test_consumer_update_rejects_unmatched_redaction_placeholders() {
     let mut credentials = std::collections::HashMap::new();
-    credentials.insert("keyauth".to_string(), json!([{"key": "live-key"}]));
+    credentials.insert(
+        "keyauth".to_string(),
+        json!([{"key": "live-key-0123456789"}]),
+    );
     let stored = make_consumer(credentials);
 
     let mut submitted = ferrum_edge::config::types::redact_consumer_credentials(&stored);
@@ -1729,7 +1750,7 @@ fn test_consumer_update_rejects_unmatched_redaction_placeholders() {
 
     assert_eq!(
         submitted.credentials["keyauth"],
-        json!([{"key": "live-key"}, {"key": "[REDACTED]"}]),
+        json!([{"key": "live-key-0123456789"}, {"key": "[REDACTED]"}]),
         "only the index backed by a stored entry is restored"
     );
     let errors = submitted
@@ -1965,8 +1986,22 @@ fn proxy_ws_origin_star_is_rejected_on_admin_and_validate_admission() {
         .next()
         .unwrap_or(cli);
     assert!(
-        execute_validate.contains("allowed_ws_origins_admission_errors()"),
-        "ferrum-edge validate must reject '*' after loading the file spec"
+        execute_validate.contains("file_loader::load_config_from_file("),
+        "ferrum-edge validate must load the file spec through the file-mode loader"
+    );
+    // Issue #7218: file mode refuses '*' at load and reload, so `validate`
+    // inherits the refusal from the loader it shares with startup.
+    let file_loader = include_str!("../../../src/config/file_loader.rs");
+    let core = file_loader
+        .split("fn decode_and_validate_document(")
+        .nth(1)
+        .expect("file-mode decode core")
+        .split("/// Load and validate an owned file-mode candidate")
+        .next()
+        .unwrap_or(file_loader);
+    assert!(
+        core.contains("config.allowed_ws_origins_admission_errors()"),
+        "file-mode load/reload (and so `ferrum-edge validate`) must reject '*'"
     );
 }
 
@@ -2034,4 +2069,45 @@ fn role_projected_resources_refuse_writing_their_placeholders_back() {
         crud.contains("masked_placeholder_sites(&resource, actor.role)"),
         "the generic write path must run the check with the caller's role"
     );
+}
+
+/// Issue #6539: a disabled row skips plugin construction, but a native
+/// librdkafka key is refused on it anyway, so the admin API (single writes,
+/// batch and restore share this check) can never store one without
+/// `FERRUM_KAFKA_ALLOW_NATIVE_CONFIG=true`.
+#[test]
+fn test_disabled_kafka_config_still_refuses_native_producer_keys() {
+    let env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let now = chrono::Utc::now();
+    let plugin_config = ferrum_edge::config::types::PluginConfig {
+        labels: Default::default(),
+        id: "disabled-kafka-native".to_string(),
+        plugin_name: "kafka_logging".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config: json!({
+            "broker_list": "localhost:9092",
+            "topic": "logs",
+            "producer_config": {"plugin.library.paths": "/opt/attacker/payload"}
+        }),
+        scope: ferrum_edge::config::types::PluginScope::Global,
+        proxy_id: None,
+        enabled: false,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let error = ferrum_edge::_test_support::validate_admin_plugin_config_for_test(&plugin_config)
+        .expect_err("a disabled row must not store a native producer_config key");
+    assert!(
+        error.contains("FERRUM_KAFKA_ALLOW_NATIVE_CONFIG"),
+        "{error}"
+    );
+    assert!(!error.contains("/opt/attacker/payload"), "{error}");
+
+    env.set("FERRUM_KAFKA_ALLOW_NATIVE_CONFIG", "true");
+    ferrum_edge::_test_support::validate_admin_plugin_config_for_test(&plugin_config)
+        .expect("the opt-in admits the disabled row");
 }

@@ -16,7 +16,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::data_path_metrics;
 use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::load_balancer::LoadBalancerCache;
-use ferrum_edge::overload::OverloadState;
+use ferrum_edge::overload::{OverloadState, RequestAdmissionEvent};
 use ferrum_edge::service_discovery::merge_targets;
 use std::sync::atomic::Ordering;
 
@@ -68,7 +68,9 @@ fn samples<'a>(text: &'a str, metric: &str) -> Vec<&'a str> {
 #[test]
 fn overload_families_render_the_live_shedding_state() {
     let overload = OverloadState::new();
-    overload.reject_new_requests.store(true, Ordering::Relaxed);
+    overload
+        .request_admission
+        .apply(RequestAdmissionEvent::RequestPressure { reject: true });
     overload.disable_keepalive.store(true, Ordering::Relaxed);
     overload.port_exhaustion_events.store(7, Ordering::Relaxed);
     overload.active_requests.store(41, Ordering::Relaxed);
@@ -480,6 +482,45 @@ fn connection_pool_entries_render_one_series_per_closed_set_pool() {
         "{out}"
     );
     assert_eq!(samples(&out, "ferrum_connection_pool_entries").len(), 6);
+}
+
+#[test]
+fn direct_h1_pool_families_render_idle_dials_reuse_and_each_eviction_reason() {
+    let stats = ferrum_edge::proxy::http2_pool::Http1PoolStats {
+        idle_connections: 37,
+        connections_opened: 120,
+        connections_reused: 9_880,
+        evicted_ceiling: 3,
+        evicted_expired: 41,
+        evicted_closed: 2,
+        evicted_retired: 5,
+    };
+    let mut out = String::new();
+    data_path_metrics::render_direct_h1_pool(&mut out, &stats, NS_LABEL);
+
+    for line in [
+        "# TYPE ferrum_connection_pool_h1_idle_connections gauge",
+        "ferrum_connection_pool_h1_idle_connections{namespace=\"ferrum\"} 37",
+        "# TYPE ferrum_connection_pool_h1_connections_opened_total counter",
+        "ferrum_connection_pool_h1_connections_opened_total{namespace=\"ferrum\"} 120",
+        "# TYPE ferrum_connection_pool_h1_connections_reused_total counter",
+        "ferrum_connection_pool_h1_connections_reused_total{namespace=\"ferrum\"} 9880",
+        "# TYPE ferrum_connection_pool_h1_idle_evictions_total counter",
+        "ferrum_connection_pool_h1_idle_evictions_total{reason=\"ceiling\",namespace=\"ferrum\"} 3",
+        "ferrum_connection_pool_h1_idle_evictions_total{reason=\"expired\",namespace=\"ferrum\"} 41",
+        "ferrum_connection_pool_h1_idle_evictions_total{reason=\"closed\",namespace=\"ferrum\"} 2",
+        "ferrum_connection_pool_h1_idle_evictions_total{reason=\"retired\",namespace=\"ferrum\"} 5",
+    ] {
+        assert!(
+            out.lines().any(|candidate| candidate == line),
+            "missing `{line}`:\n{out}"
+        );
+    }
+    assert_eq!(
+        samples(&out, "ferrum_connection_pool_h1_idle_evictions_total").len(),
+        4,
+        "exactly one series per eviction reason"
+    );
 }
 
 #[test]

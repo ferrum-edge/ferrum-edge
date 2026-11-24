@@ -69,6 +69,8 @@ ACTION_DIRECT_K8S_TOOL_DOWNLOAD = re.compile(
 )
 ACTION_DISALLOWED_HELM = re.compile(r"^azure/setup-helm(?:@|$)", re.IGNORECASE)
 
+_LINE_CONTINUATION_RE = re.compile(r"\\\r?\n[ \t]*")
+
 
 def normalize_action_uses_ref(raw: str) -> str:
     ref = raw.strip()
@@ -268,7 +270,7 @@ def scan_action_policy_text(
     non_comment_text = "\n".join(
         line for line in text.splitlines() if not line.lstrip().startswith("#")
     )
-    continued = re.sub(r"\\\r?\n[ \t]*", "", non_comment_text)
+    continued = _LINE_CONTINUATION_RE.sub("", non_comment_text)
     if not pipe_found and ACTION_PIPE_TO_SHELL.search(continued):
         failures.append(f"{rel}: continued pipe-to-shell installer is forbidden")
     if not mutable_helm_found and ACTION_MUTABLE_HELM_INSTALL.search(continued):
@@ -530,12 +532,30 @@ LIGHTWEIGHT_PATTERNS = [
 # security validation.
 FULL_CI_PREFIXES = ("vendor/", "charts/")
 
+# Release-note documents that `tests/unit/config/changelog_upgrade_parity_tests.rs`
+# embeds with `include_str!`: every Unreleased `BREAKING` changelog entry must
+# cite an issue the upgrade guide also cites, and the guide must not promise an
+# in-place schema migration that docs/migrations.md rules out. A pull request
+# that edits only these files must still run that unit test, so they select
+# full mode and the `run_rust` lane. `validate_doc_parity_inputs()`, run by
+# verify_required_ci.py with this revision's planner, keeps this set equal to
+# the test's `include_str!` targets.
+DOC_PARITY_TEST = "tests/unit/config/changelog_upgrade_parity_tests.rs"
+DOC_PARITY_TEST_INPUTS = frozenset(
+    {
+        "CHANGELOG.md",
+        "docs/migrations.md",
+        "docs/upgrade_guide.md",
+    }
+)
+
 # These checked-in artifacts are executable contract inputs, not lightweight
 # prose. Changes must run the Rust parity tests and static contract validator.
 FULL_CI_CONTRACT_PATHS = frozenset(
     {
         "docs/prometheus_metric_contract.json",
         "docs/prometheus_metrics.md",
+        *DOC_PARITY_TEST_INPUTS,
     }
 )
 
@@ -549,8 +569,9 @@ FULL_CI_DOCUMENTATION_PATHS: frozenset[str] = frozenset()
 
 # Vendored-patch lifecycle governance inputs. The fail-closed parity gate that
 # reads them (`scripts/check_vendored_patch_lifecycle.py`, run by the
-# `dependency-audit` job) must keep its `mode == 'full'` guard — that is
-# asserted by .github/scripts/verify_required_ci.py's DIRECT_FULL_CI_JOBS — so a
+# `dependency-audit` job) keeps its `mode == 'full'` guard and its
+# `run_dependency_audit` path gate, both asserted by
+# .github/scripts/verify_required_ci.py's PATH_GATED_JOBS, so a
 # governance-doc-only pull request would otherwise skip the only check that
 # guards these files. Hyper artifact changes also reconstruct the pinned patch
 # stack in that job without requiring Rust test artifacts.
@@ -558,7 +579,6 @@ FULL_CI_GOVERNANCE_PATHS = frozenset(
     {
         "docs/dependency-policy.md",
         "docs/vendored-patch-lifecycle.json",
-        "PRODUCTION_READINESS.md",
     }
 )
 
@@ -635,15 +655,15 @@ LIVE_SUITE_SHARED_PATTERNS = (
 # package-ferrum-runtime-image are already justified by the shared-pattern
 # comment above (the ci.yml jobs cargo-test locally and build no runtime image).
 #
-# `tests/k8s/lib/` (kind.sh, spire.sh, live_assertions.sh,
-# native_probe_classify.py, spire_ambient_metrics.py) is the shared Kind/SPIRE
-# live harness; no ci.yml live job consumes it, so none of the three gates list
-# it. It is owned by node-waypoint-ebpf-live.yml, which gates it both in its
-# `pull_request.paths` (`tests/k8s/lib/**`) and in its trusted planner scoped
-# suite (ci_runtime_plan.py `node-waypoint-ebpf-live` lists `^tests/k8s/lib/`).
-# ambient-host-udp-live.yml's `live_suite_path_filter.py` additionally gates the
-# `live_assertions.sh` / `spire.sh` / `native_probe_classify.py` members, so the
-# shared harness is covered by both dedicated live workflows.
+# `tests/k8s/lib/` (spire.sh, live_assertions.sh, native_probe_classify.py,
+# spire_ambient_metrics.py) is the shared Kind/SPIRE
+# live harness. No ci.yml live job consumes it, so none of the three gates list
+# it. On a pull request it is deliberately non-sensitive for
+# `node-waypoint-ebpf-live` (that workflow has no `paths:` filter, and
+# `ci_runtime_plan.py` allowlists `tests/`); it runs there on every push to
+# `main`. The trusted `live_suite_path_filter.py` gates the `live_assertions.sh`
+# / `spire.sh` members for the multicluster federation / poller-partition suites
+# and those plus `native_probe_classify.py` for `mesh-e2e-sidecar-live.yml`.
 
 
 def compile_path_patterns(*pattern_groups: tuple[str, ...]) -> list[re.Pattern[str]]:
@@ -715,7 +735,7 @@ SHARED_FEATURE_JOB_PATTERNS = (
     r"^Cargo\.(?:toml|lock)$",
     r"^\.cargo/",
     r"^rust-toolchain\.toml$",
-    r"^build\.rs$",
+    r"^build(?:\.rs$|/)",
     r"^proto/",
     r"^vendor/",
 )
@@ -728,13 +748,16 @@ SHARED_FEATURE_JOB_PATTERNS = (
 # `secrets::resolve_all_env_secrets()` before `EnvConfig` parse. `src/startup.rs`
 # is listener-failure bookkeeping and is not on that path.
 #
-# `tests/service_integration/common/host_ports.rs` is compiled INTO this target
-# as well: the Vault/LocalStack fixtures include it through `#[path]` rather than
-# reimplementing host-port allocation (issue #5488). It is the one file outside
-# `tests/secrets_functional/` that changes what this job runs, so it is listed
-# here explicitly — the rest of that suite is not an input. The shared
-# container-start retry (`tests/service_integration/common/container_retry.rs`)
-# is included the same way.
+# Files outside `tests/secrets_functional/` that are compiled INTO this target
+# through `#[path]` are listed explicitly; the rest of their suites are not
+# inputs:
+# - `tests/service_integration/common/host_ports.rs`: the Vault/LocalStack
+#   fixtures reuse its host-port allocation (issue #5488);
+# - `tests/service_integration/common/container_retry.rs`: the shared
+#   container-start retry;
+# - `tests/scaffolding/` and `tests/common/gateway_harness.rs`: the port
+#   registry and the gateway child guard / ownership barrier that the
+#   `startup_smoke` binary tests spawn through (issues #7076, #7077).
 SECRETS_BACKENDS_PATTERNS = [
     re.compile(pattern)
     for pattern in (
@@ -744,6 +767,8 @@ SECRETS_BACKENDS_PATTERNS = [
         r"^tests/secrets_functional/",
         r"^tests/service_integration/common/host_ports\.rs$",
         r"^tests/service_integration/common/container_retry\.rs$",
+        r"^tests/scaffolding/",
+        r"^tests/common/gateway_harness\.rs$",
         r"^src/(?:main|gateway_entry)\.rs$",
         r"^src/config/env_config\.rs$",
         r"^\.config/nextest\.toml$",
@@ -772,9 +797,12 @@ PKCS11_PATTERNS = [
 ]
 
 
-# Inputs that change what the Rust build graph compiles. Any of these forces
-# the complete compile-and-test lane (unit, lint, artifacts, functional,
-# integration) and, through the per-job groups below, every feature-gated job.
+# Inputs that change what the Rust build graph compiles. `build/` holds the
+# modules `build.rs` `include!`s (protoc preflight, plugin name / migration
+# export generators), so it is matched with `build.rs` everywhere the build
+# script is. Any of these forces the complete compile-and-test lane (unit,
+# lint, artifacts, functional, integration) and, through the per-job groups
+# below, every feature-gated job.
 RUST_BUILD_GRAPH_PATTERNS = (
     r"^\.github/workflows/ci\.yml$",
     r"^\.github/actions/(?:setup-rust-ci|setup-sccache|setup-fast-linker)/",
@@ -783,7 +811,7 @@ RUST_BUILD_GRAPH_PATTERNS = (
     r"^\.cargo/",
     r"^\.config/nextest\.toml$",
     r"^rust-toolchain\.toml$",
-    r"^build\.rs$",
+    r"^build(?:\.rs$|/)",
     r"^proto/",
     r"^vendor/",
     r"^ebpf/",
@@ -821,9 +849,19 @@ RUST_PATTERNS = [
             for path in sorted(PERFORMANCE_TREE_WORKSPACE_INPUTS)
         ),
         r"^schemas/clickhouse/",  # DDL embedded by Rust integration tests
+        # Release-note documents embedded by the changelog/upgrade-guide
+        # parity unit test (DOC_PARITY_TEST_INPUTS).
+        *("^" + re.escape(path) + "$" for path in sorted(DOC_PARITY_TEST_INPUTS)),
+        # The Prometheus metric contract and reference, embedded by the unit
+        # parity tests (`prometheus_metric_contract_tests`,
+        # `openapi_yaml_tests`, `tls_store_bounds_tests`).
+        r"^docs/prometheus_metric_contract\.json$",
+        r"^docs/prometheus_metrics\.md$",
         r"^ferrum\.conf$",
         r"^openapi\.yaml$",
         r"^deny\.toml$",
+        # `disallowed-methods` and other lint configuration read by the Lint job.
+        r"^clippy\.toml$",
     )
 ]
 
@@ -907,6 +945,13 @@ FUZZ_SMOKE_PATTERNS = [
         r"^src/config/file_loader\.rs$",
         r"^src/config_sources/k8s/",
         r"^src/identity/spiffe",
+        # `ocsp_response` / `jwt_svid` / `tls_material` (issue #6584): the OCSP
+        # grammar, PEM/CRL admission, the JWT-SVID validator and its authority
+        # type, and the synthetic RSA key pair the fixed fuzz bundle embeds.
+        r"^src/tls/(?:mod|ocsp|crl_policy)\.rs$",
+        r"^src/identity/jwt_svid/",
+        r"^src/identity/ca/mod\.rs$",
+        r"^tests/fixtures/test_rsa_(?:public|private)\.pem$",
         r"^src/plugins/otel_tracing\.rs$",
         r"^src/plugins/mod\.rs$",
         r"^src/proxy/(?:datagram_client_address|mesh_udp_frame|proxy_protocol)\.rs$",
@@ -957,9 +1002,15 @@ DEPENDENCY_AUDIT_PATTERNS = [
         r"^docs/dependency-policy\.md$",
         r"^docs/vendored-patch-lifecycle\.json$",
         r"^docs/upstream-",
-        r"^PRODUCTION_READINESS\.md$",
         r"^scripts/(?:check_advisory_expiry\.sh|check_vendored_patch_lifecycle\.py)$",
         r"^scripts/verify_dependency_security_chain\.py$",
+        # The CORS PSL ancestor index parity gate (psl bumps arrive via
+        # Cargo.lock above).
+        r"^scripts/generate_cors_psl_ancestors\.py$",
+        r"^src/plugins/cors_psl_ancestors\.rs$",
+        # The lifecycle checker requires the cargo `ignore` list to cover every
+        # vendored `[patch.crates-io]` crate.
+        r"^\.github/dependabot\.yml$",
     )
 ]
 
@@ -978,7 +1029,7 @@ STANDALONE_CARGO_PATTERNS = [
         r"(?:^|/)Cargo\.(?:toml|lock)$",
         r"(?:^|/)rust-toolchain(?:\.toml)?$",
         r"^\.cargo/",
-        r"^build\.rs$",
+        r"^build(?:\.rs$|/)",
         r"^proto/",
         r"^vendor/",
         r"^ebpf/ferrum-ebpf-common/",
@@ -989,6 +1040,8 @@ STANDALONE_CARGO_PATTERNS = [
         r"^src/config/",
         r"^src/config_sources/k8s/",
         r"^src/identity/",
+        r"^src/tls/(?:mod|ocsp|crl_policy)\.rs$",
+        r"^tests/fixtures/test_rsa_(?:public|private)\.pem$",
         r"^src/load_balancer",
         r"^src/modes/mesh/",
         r"^src/xds/",
@@ -1347,6 +1400,113 @@ def nul_transport_self_test() -> list[str]:
     return failures
 
 
+INCLUDE_STR_REPO_PATH_RE = re.compile(r'include_str!\(\s*"((?:\.\./)+)([^"]+)"\s*\)')
+
+
+def doc_parity_embedded_inputs(text: str) -> tuple[set[str], list[str]]:
+    """Repository paths DOC_PARITY_TEST embeds with `include_str!`."""
+
+    failures: list[str] = []
+    embedded: set[str] = set()
+    parts = PurePosixPath(DOC_PARITY_TEST).parent.parts
+    for match in INCLUDE_STR_REPO_PATH_RE.finditer(text):
+        ups = match.group(1).count("../")
+        if ups > len(parts):
+            failures.append(
+                f"{DOC_PARITY_TEST}: include_str! path escapes the repository: "
+                f"{match.group(0)!r}"
+            )
+            continue
+        target = PurePosixPath(*parts[: len(parts) - ups], match.group(2))
+        embedded.add(target.as_posix())
+    if not embedded:
+        failures.append(f"{DOC_PARITY_TEST}: found no include_str! inputs")
+    return embedded, failures
+
+
+def doc_parity_drift_errors(text: str, inputs: frozenset[str]) -> list[str]:
+    """Compare the parity test's embedded paths with `inputs`, both ways."""
+
+    embedded, failures = doc_parity_embedded_inputs(text)
+    for missing in sorted(embedded - inputs):
+        failures.append(
+            f"{DOC_PARITY_TEST} embeds {missing}; add it to DOC_PARITY_TEST_INPUTS "
+            "in .github/scripts/pr_ci_plan.py so a change to it runs the test"
+        )
+    for stale in sorted(inputs - embedded):
+        failures.append(
+            f"DOC_PARITY_TEST_INPUTS lists {stale}, which {DOC_PARITY_TEST} "
+            "no longer embeds"
+        )
+    return failures
+
+
+def doc_parity_scheduling_errors(inputs: frozenset[str]) -> list[str]:
+    """Every listed doc-parity input must select full CI and `run_rust`."""
+
+    failures: list[str] = []
+    for path in sorted(inputs):
+        if is_lightweight_path(path):
+            failures.append(f"{path}: doc-parity input must select full CI")
+        if not select_job_gates("pull_request", [path])["run_rust"]:
+            failures.append(f"{path}: doc-parity input must schedule run_rust")
+    return failures
+
+
+def validate_doc_parity_inputs(repo_root: Path) -> list[str]:
+    """Fail when DOC_PARITY_TEST_INPUTS drifts from the parity test's inputs.
+
+    Each `include_str!` target of DOC_PARITY_TEST must be listed, so editing
+    it alone still schedules the test, and each listed path must still be one
+    of those targets, so the set never schedules the Rust lane for nothing.
+
+    The comparison reads the checkout's test file, so it must run with the
+    planner from the SAME revision. `self_test()` does not call it: on pull
+    requests and merge groups CI Plan runs the trusted-base planner's
+    self-test against the candidate checkout, and comparing the base set with
+    a candidate test would refuse every change to the test's inputs, atomic or
+    split. `.github/scripts/verify_required_ci.py` calls it next to the
+    proposed planner's self-test, where both sides come from the candidate.
+    """
+
+    test_path = repo_root / DOC_PARITY_TEST
+    try:
+        text = test_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        return [f"{DOC_PARITY_TEST}: unreadable during doc-parity input scan: {error}"]
+    return doc_parity_drift_errors(text, DOC_PARITY_TEST_INPUTS) + (
+        doc_parity_scheduling_errors(DOC_PARITY_TEST_INPUTS)
+    )
+
+
+def doc_parity_self_test() -> list[str]:
+    """Revision-independent checks: synthetic drift cases and this planner's
+    own set. Safe to run from the trusted base against any checkout."""
+
+    failures = doc_parity_scheduling_errors(DOC_PARITY_TEST_INPUTS)
+    sample = (
+        'const A: &str = include_str!("../../../CHANGELOG.md");\n'
+        'const B: &str = include_str!( "../../../docs/upgrade_guide.md" );\n'
+    )
+    pair = frozenset({"CHANGELOG.md", "docs/upgrade_guide.md"})
+    if doc_parity_drift_errors(sample, pair):
+        failures.append("doc-parity drift check rejected a matching input set")
+    missing = doc_parity_drift_errors(sample, frozenset({"CHANGELOG.md"}))
+    if len(missing) != 1 or "embeds docs/upgrade_guide.md" not in missing[0]:
+        failures.append(f"doc-parity drift check missed an unlisted input: {missing!r}")
+    stale = doc_parity_drift_errors(sample, pair | {"docs/x.md"})
+    if len(stale) != 1 or "lists docs/x.md" not in stale[0]:
+        failures.append(f"doc-parity drift check missed a stale input: {stale!r}")
+    if not doc_parity_drift_errors("fn main() {}", pair):
+        failures.append("doc-parity drift check accepted a test with no inputs")
+    escaped = doc_parity_drift_errors(
+        'include_str!("../../../../etc/passwd")', frozenset()
+    )
+    if not any("escapes the repository" in failure for failure in escaped):
+        failures.append("doc-parity drift check accepted a path above the repository")
+    return failures
+
+
 PERFORMANCE_TREE_REFERENCE_RE = re.compile(r"tests/performance/[A-Za-z0-9._/-]+")
 
 
@@ -1403,6 +1563,12 @@ def self_test() -> int:
         # Executable contract inputs and governance inputs stay full.
         ("pull_request", ["docs/prometheus_metric_contract.json"], "full"),
         ("pull_request", ["docs/prometheus_metrics.md"], "full"),
+        # Release-note documents embedded by the changelog parity unit test.
+        ("pull_request", ["CHANGELOG.md"], "full"),
+        ("pull_request", ["docs/upgrade_guide.md"], "full"),
+        ("pull_request", ["docs/migrations.md"], "full"),
+        ("pull_request", ["CHANGELOG.md", "docs/upgrade_guide.md"], "full"),
+        ("merge_group", ["CHANGELOG.md"], "full"),
         (
             "pull_request",
             ["vendor/tungstenite-0.29.0-ferrum-patched/README.md"],
@@ -1471,6 +1637,10 @@ def self_test() -> int:
     # Source changes: the same lane (performance regression is out of band).
     src_only = rust_only
     gate_cases = [
+        # Release-note documents run the changelog/upgrade-guide parity test.
+        ("pull_request", ["CHANGELOG.md"], rust_only),
+        ("pull_request", ["docs/upgrade_guide.md"], rust_only),
+        ("pull_request", ["docs/migrations.md"], rust_only),
         # Nothing Rust-related: only planning/policy run.
         (
             "pull_request",
@@ -1513,8 +1683,16 @@ def self_test() -> int:
                 "run_two_cluster_live": False,
             },
         ),
-        ("pull_request", ["docs/prometheus_metric_contract.json"], {"run_helm": True}),
-        ("pull_request", ["docs/prometheus_metrics.md"], {"run_helm": True}),
+        (
+            "pull_request",
+            ["docs/prometheus_metric_contract.json"],
+            {"run_helm": True, "run_rust": True},
+        ),
+        (
+            "pull_request",
+            ["docs/prometheus_metrics.md"],
+            {"run_helm": True, "run_rust": True},
+        ),
         (
             "pull_request",
             [".github/scripts/validate_prometheus_metric_contract.py"],
@@ -1607,7 +1785,13 @@ def self_test() -> int:
         (
             "pull_request",
             ["src/tls/mod.rs"],
-            src_only | {"run_acme": True, "run_pkcs11": True},
+            src_only
+            | {
+                "run_acme": True,
+                "run_pkcs11": True,
+                "run_fuzz_smoke": True,
+                "run_standalone_cargo": True,
+            },
         ),
         (
             "pull_request",
@@ -1670,6 +1854,18 @@ def self_test() -> int:
             ["tests/service_integration/common/container_retry.rs"],
             rust_only | {"run_service_integration": True, "run_secrets_backends": True},
         ),
+        # The startup smoke spawns through the shared port registry and gateway
+        # harness, both compiled into the secrets target (issues #7076, #7077).
+        (
+            "pull_request",
+            ["tests/common/gateway_harness.rs"],
+            rust_only | {"run_secrets_backends": True},
+        ),
+        (
+            "merge_group",
+            ["tests/scaffolding/ports.rs"],
+            rust_only | {"run_secrets_backends": True},
+        ),
         (
             "pull_request",
             ["src/plugins/ldap_auth.rs"],
@@ -1716,6 +1912,16 @@ def self_test() -> int:
         ),
         (
             "pull_request",
+            ["src/tls/ocsp.rs"],
+            {"run_fuzz_smoke": True, "run_standalone_cargo": True},
+        ),
+        (
+            "pull_request",
+            ["src/identity/jwt_svid/strict_json.rs"],
+            {"run_fuzz_smoke": True, "run_standalone_cargo": True},
+        ),
+        (
+            "pull_request",
             ["vendor/h3-0.0.8-ferrum-patched/src/lib.rs"],
             {
                 "run_rust": True,
@@ -1730,6 +1936,42 @@ def self_test() -> int:
             "pull_request",
             ["deny.toml"],
             {"run_dependency_audit": True, "run_rust": True},
+        ),
+        # Issue #7284: the modules `build.rs` `include!`s and the lint
+        # configuration must not leave every gate false (a no-CI merge).
+        (
+            "pull_request",
+            ["build/protoc_preflight.rs"],
+            {
+                "run_rust": True,
+                "run_artifacts": True,
+                "run_acme": True,
+                "run_conformance": True,
+                "run_service_integration": True,
+                "run_ebpf_userspace": True,
+                "run_platform_build": True,
+                "run_secrets_backends": True,
+                "run_pkcs11": True,
+                "run_standalone_cargo": True,
+                "run_ebpf_kernel_live": False,
+                "run_two_cluster_live": False,
+            },
+        ),
+        (
+            "merge_group",
+            ["build/plugin_migration_exports.rs"],
+            {"run_rust": True, "run_platform_build": True},
+        ),
+        (
+            "pull_request",
+            ["clippy.toml"],
+            rust_only,
+        ),
+        # A root file merely named like the build tree stays out of the lane.
+        (
+            "pull_request",
+            ["build.rs.md"],
+            {name: False for name in JOB_GATE_NAMES},
         ),
         (
             "pull_request",
@@ -1898,6 +2140,7 @@ def self_test() -> int:
     failures.extend(action_pinning_self_test())
     failures.extend(validate_action_pinning_policy(Path.cwd()))
     failures.extend(validate_performance_tree_inputs(Path.cwd()))
+    failures.extend(doc_parity_self_test())
     failures.extend(nul_transport_self_test())
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)

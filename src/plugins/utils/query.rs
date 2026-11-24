@@ -57,17 +57,22 @@ fn decode_form_urlencoded_component_for_hpp(raw: &str) -> String {
         .into_owned()
 }
 
-/// Whether one decoded query name appears with conflicting decoded values.
+/// Whether one decoded query name appears with conflicting decoded values
+/// among pre-split, still-encoded pairs, so a caller can drop excluded pairs
+/// under each separator convention.
 ///
 /// The WAF parameter-pollution rule deliberately keeps this narrower
 /// predicate: it reports the concrete first/last-value differential, while an
-/// identical repeated value does not trigger that rule. Security-sensitive
-/// routing and delegated policy must use [`CanonicalQuery`] instead, because
-/// they also fail closed on identical duplicates, encoded aliases, literal
-/// plus, and invalid encodings.
-pub fn has_conflicting_duplicate_query_key(raw_query: &str) -> bool {
+/// identical repeated value does not trigger that rule. It judges both
+/// separator conventions, `&` only and `&` plus `;` for backends that also
+/// split on `;` (issue #6579): `tenant=admin&x=;tenant=victim` has one
+/// `tenant` under the first and two conflicting ones under the second.
+/// Security-sensitive routing and delegated policy must use [`CanonicalQuery`]
+/// instead, because they also fail closed on identical duplicates, encoded
+/// aliases, literal plus, and invalid encodings.
+pub fn has_conflicting_duplicate_among<'a>(pairs: impl IntoIterator<Item = &'a str>) -> bool {
     let mut seen: HashMap<String, String> = HashMap::new();
-    for pair in raw_query.split('&') {
+    for pair in pairs {
         if pair.is_empty() {
             continue;
         }
@@ -112,6 +117,14 @@ pub enum QueryAmbiguity {
     /// values, or reject, so no single value is the one the backend executes
     /// (advisory `GHSA-j2j6-f9c7-hh85`).
     DuplicateName,
+    /// An unencoded `;` in a name or value. Ferrum separates pairs only on
+    /// `&`, but HTML 4's recommendation, Rack before 3.0, Go before 1.17, and
+    /// Python before 3.9.2 also split on `;`, so `?a=1;tenant=admin` is one
+    /// parameter to Ferrum and two to such a backend. This is the query
+    /// counterpart of the `;` path-parameter differential
+    /// (`GHSA-fcqw-793q-wg5x`, `GHSA-5mrg-vq2h-6j3w`); `%3B` is an
+    /// unambiguous literal semicolon.
+    SemicolonSeparator,
 }
 
 impl QueryAmbiguity {
@@ -124,6 +137,7 @@ impl QueryAmbiguity {
             Self::NonUtf8Name => "non_utf8_name",
             Self::NonUtf8Value => "non_utf8_value",
             Self::DuplicateName => "duplicate_name",
+            Self::SemicolonSeparator => "semicolon_separator",
         }
     }
 }
@@ -142,6 +156,25 @@ pub struct CanonicalQueryParam {
     /// value). Both decode to an empty `value`; this bit is what keeps the two
     /// distinguishable in a lossless representation.
     pub bare: bool,
+    /// Decoded names of this pair's `;`-separated sub-pairs, split on the
+    /// still-encoded bytes (issue #6579; see [`semicolon_sub_pair_names`]),
+    /// plus each sub-pair's raw spelling when it differs from every decoding.
+    /// Empty unless the pair carries an unencoded `;`. A backend that also
+    /// splits on `;` reads each of these as a parameter of its own, so
+    /// credential redaction must consult them; a `%3B` is content and never
+    /// produces an entry.
+    pub semicolon_sub_names: Vec<String>,
+    /// The name under form decoding (`+` as space), when the raw name has a
+    /// `+` and that reading differs from [`Self::name`]. A form-decoding
+    /// backend reads the parameter under this name, so redaction consults it.
+    pub form_name: Option<String>,
+    /// The still-encoded name, when it differs from [`Self::name`] and
+    /// [`Self::form_name`] (for example `workspace%2Dslot`). Authentication
+    /// matches a configured name against the raw spelling as well as the
+    /// decodings ([`query_name_matches`]), so credential redaction consults it
+    /// (GHSA-c259-vchc-3vgr). Comparison only: policy payloads serialize
+    /// [`Self::name`], never this field.
+    pub raw_name: Option<String>,
 }
 
 /// Ordered, occurrence-complete, explicitly ambiguity-classified view of a
@@ -219,6 +252,9 @@ impl CanonicalQuery {
             if raw_name.contains('+') || raw_value.contains('+') {
                 record(&mut ambiguities, QueryAmbiguity::LiteralPlus);
             }
+            if raw_name.contains(';') || raw_value.contains(';') {
+                record(&mut ambiguities, QueryAmbiguity::SemicolonSeparator);
+            }
             if !has_valid_percent_triplets(raw_name) || !has_valid_percent_triplets(raw_value) {
                 record(&mut ambiguities, QueryAmbiguity::MalformedPercentEncoding);
             }
@@ -240,7 +276,22 @@ impl CanonicalQuery {
                         .into_owned()
                 }
             };
-            params.push(CanonicalQueryParam { name, value, bare });
+            let semicolon_sub_names = semicolon_sub_pair_names_with_raw(pair);
+            let form_name = if raw_name.contains('+') {
+                query_name_decodings(raw_name).into_iter().nth(1)
+            } else {
+                None
+            };
+            let raw_name = (raw_name != name && form_name.as_deref() != Some(raw_name))
+                .then(|| raw_name.to_string());
+            params.push(CanonicalQueryParam {
+                name,
+                value,
+                bare,
+                semicolon_sub_names,
+                form_name,
+                raw_name,
+            });
         }
 
         // Duplicate detection runs on decoded names, so `a=1&%61=2` is one
@@ -318,6 +369,172 @@ impl CanonicalQuery {
 /// what the backend actually receives.
 pub fn canonical_query_for_policy(ctx: &crate::plugins::RequestContext) -> CanonicalQuery {
     CanonicalQuery::parse(&crate::proxy::effective_backend_query_string(ctx))
+}
+
+/// A raw query name under RFC 3986 percent-decoding and, when it holds a raw
+/// `+`, under form decoding too (`+` converted to space before
+/// percent-decoding, so `%2B` stays a literal plus). Ferrum and the backend
+/// may read a name either way, so credential stripping, redaction, and
+/// endpoint-parameter protection compare every decoding (issue #6579).
+pub fn query_name_decodings(raw: &str) -> Vec<String> {
+    let rfc = percent_decode_str(raw).decode_utf8_lossy().into_owned();
+    if !raw.contains('+') {
+        return vec![rfc];
+    }
+    let form = percent_decode_str(&raw.replace('+', " "))
+        .decode_utf8_lossy()
+        .into_owned();
+    if form == rfc {
+        vec![rfc]
+    } else {
+        vec![rfc, form]
+    }
+}
+
+/// Decoded names of a still-encoded `&`-separated pair's `;`-separated
+/// sub-pairs (issue #6579), or nothing when the pair carries no raw `;`.
+///
+/// The split happens on the encoded bytes, so a `%3B` is content and never
+/// creates a sub-pair, and each name is decoded only afterwards. A name is
+/// reported under RFC 3986 percent-decoding and, when it holds a raw `+`,
+/// under form decoding too (`+` as space, converted before percent-decoding
+/// so `%2B` stays a literal plus), because the backend that splits on `;`
+/// may be a form decoder.
+pub fn semicolon_sub_pair_names(segment: &str) -> Vec<String> {
+    if !segment.contains(';') {
+        return Vec::new();
+    }
+    segment
+        .split(';')
+        .flat_map(|sub_pair| {
+            query_name_decodings(sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name))
+        })
+        .collect()
+}
+
+/// [`semicolon_sub_pair_names`] plus each sub-pair's raw spelling when it
+/// differs from that sub-pair's own decodings, in one linear pass.
+///
+/// Authentication matches a configured name against a sub-pair's raw spelling
+/// as well as its decodings (`query_has_semicolon_credential_alias`), so
+/// policy redaction must consult the same set (GHSA-c259-vchc-3vgr). A name
+/// with neither `%` nor `+` decodes to itself and is reported once without
+/// decoding. Entries are not deduplicated across sub-pairs; consumers only
+/// test membership.
+pub fn semicolon_sub_pair_names_with_raw(segment: &str) -> Vec<String> {
+    if !segment.contains(';') {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    for sub_pair in segment.split(';') {
+        let raw_name = sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name);
+        if !raw_name.contains('%') && !raw_name.contains('+') {
+            names.push(raw_name.to_string());
+            continue;
+        }
+        let decodings = query_name_decodings(raw_name);
+        let raw_differs = decodings.iter().all(|decoded| decoded != raw_name);
+        names.extend(decodings);
+        if raw_differs {
+            names.push(raw_name.to_string());
+        }
+    }
+    names
+}
+
+/// Whether a still-encoded `&`-separated query pair carries a parameter in
+/// `names` once a backend also splits it on `;` (issue #6579).
+///
+/// `carrier=;api_key=secret` is one `carrier` pair to Ferrum but also an
+/// `api_key` parameter to a `;`-splitting backend, so credential stripping must
+/// drop the whole `&` segment. Each `;` sub-pair matches by its raw name or by
+/// any decoding [`semicolon_sub_pair_names`] reports, the same raw-or-decoded
+/// contract as [`crate::proxy::query_string_after_plugin_strips`]. A segment
+/// without `;` never matches here; callers check the pair's own name
+/// separately.
+pub fn semicolon_sub_pair_names_any(segment: &str, names: &HashSet<&str>) -> bool {
+    segment.contains(';')
+        && segment.split(';').any(|sub_pair| {
+            query_name_matches_any(
+                sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name),
+                names,
+            )
+        })
+}
+
+/// The one query-name equivalence every credential consumer shares with the
+/// outbound strip ([`crate::proxy::query_string_after_plugin_strips`]): a
+/// still-encoded name reads as `name` by its raw spelling, its RFC 3986
+/// percent-decoding, or (with a raw `+`) its form decoding
+/// (GHSA-c259-vchc-3vgr). A name with neither `%` nor `+` decodes to itself
+/// under both readings, so only the raw comparison runs and nothing is
+/// allocated.
+pub fn query_name_matches(raw_name: &str, name: &str) -> bool {
+    raw_name == name
+        || ((raw_name.contains('%') || raw_name.contains('+'))
+            && query_name_decodings(raw_name)
+                .iter()
+                .any(|decoded| decoded == name))
+}
+
+/// [`query_name_matches`] against a set of names.
+pub fn query_name_matches_any(raw_name: &str, names: &HashSet<&str>) -> bool {
+    names.contains(raw_name)
+        || ((raw_name.contains('%') || raw_name.contains('+'))
+            && query_name_decodings(raw_name)
+                .iter()
+                .any(|decoded| names.contains(decoded.as_str())))
+}
+
+/// Whether a still-encoded `&`-separated query pair is an occurrence of a
+/// name in `names`: by its own name ([`query_name_matches_any`]) or by any
+/// `;` sub-pair ([`semicolon_sub_pair_names_any`]). This is exactly the set
+/// of pairs the outbound credential strip removes, so any consumer that must
+/// agree with that strip (policy redaction, templates, mirror provenance)
+/// uses this predicate.
+pub fn query_pair_names_any(pair: &str, names: &HashSet<&str>) -> bool {
+    let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
+    query_name_matches_any(raw_name, names) || semicolon_sub_pair_names_any(pair, names)
+}
+
+/// Whether `raw_query` carries `name` as a `;`-separated sub-parameter that
+/// Ferrum's `&`-only parser does not see as that name (issue #6579 shape):
+/// `carrier=;api_key=k`, or `api_key;x=1` whose Ferrum name is `api_key;x`.
+///
+/// Every authentication plugin with a query credential location applies this
+/// one contract (GHSA-c259-vchc-3vgr): extraction refuses such a request as an
+/// invalid credential format, and the pre-authentication discovery hook marks
+/// the name for policy redaction and, when the plugin hides credentials, for
+/// removal from the forwarded query.
+///
+/// A sub-pair name matches by its raw spelling or by any decoding
+/// [`query_name_decodings`] reports, the same raw-or-decoded contract the
+/// outbound strip uses. The leading sub-pair of a segment is the segment's own
+/// parameter, already represented in the decoded map, unless the segment's
+/// NAME itself holds the `;`. Allocation-free unless the query contains a raw
+/// `;`.
+pub fn query_has_semicolon_credential_alias(raw_query: Option<&str>, name: &str) -> bool {
+    let Some(raw_query) = raw_query else {
+        return false;
+    };
+    if !raw_query.contains(';') {
+        return false;
+    }
+    raw_query.split('&').any(|segment| {
+        if !segment.contains(';') {
+            return false;
+        }
+        let ferrum_name = segment
+            .split_once('=')
+            .map_or(segment, |(pair_name, _)| pair_name);
+        let skip_leading = usize::from(!ferrum_name.contains(';'));
+        segment.split(';').skip(skip_leading).any(|sub_pair| {
+            let sub_name = sub_pair
+                .split_once('=')
+                .map_or(sub_pair, |(sub_name, _)| sub_name);
+            query_name_matches(sub_name, name)
+        })
+    })
 }
 
 /// Whether every `%` in `value` begins a complete `%HH` triplet.
@@ -513,7 +730,24 @@ impl OrderedQuery {
         }
         let before = self.pairs.len();
         self.pairs.retain(|pair| {
-            !names.contains(pair.raw_name.as_str()) && !names.contains(pair.decoded_name.as_str())
+            if names.contains(pair.decoded_name.as_str())
+                || query_name_matches_any(&pair.raw_name, names)
+            {
+                return false;
+            }
+            // A credential smuggled behind a `;` (`carrier=;api_key=secret`)
+            // is still a parameter to a `;`-splitting backend (issue #6579).
+            let has_semicolon = pair.raw_name.contains(';')
+                || pair
+                    .raw_value
+                    .as_deref()
+                    .is_some_and(|value| value.contains(';'));
+            if !has_semicolon {
+                return true;
+            }
+            let mut segment = String::new();
+            pair.write_to(&mut segment);
+            !semicolon_sub_pair_names_any(&segment, names)
         });
         self.pairs.len() != before
     }

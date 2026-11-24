@@ -289,7 +289,6 @@ async fn read_credential_file_detached_inner(
 /// logical size exceeds the payload (sparse / holey file). Used by external
 /// tests to prove metadata fast-reject without allocating the full length.
 #[doc(hidden)]
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn write_sparse_credential_fixture(
     path: &Path,
     prefix: &[u8],

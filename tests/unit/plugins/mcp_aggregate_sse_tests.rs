@@ -1,11 +1,12 @@
 //! External unit coverage for the aggregate MCP SSE session broker (#3295).
 //!
-//! Covers the invariants the broker exists to hold: one listener per session
-//! multiplexing many request streams, race-free session and stream
-//! cardinality, a single retained-byte budget, deterministic replay-then-live
-//! ordering, explicit `Last-Event-ID` semantics, reliable teardown on
-//! disconnect / delete / reload, and value-free diagnostics.
+//! Covers the invariants the broker exists to hold: POST-attached delivery
+//! with `Last-Event-ID` replay, one listener per session, race-free session and
+//! stream cardinality, a single retained-byte budget, explicit `Last-Event-ID`
+//! semantics, reliable teardown on disconnect / delete / reload, and
+//! value-free diagnostics.
 
+use bytes::Bytes;
 use ferrum_edge::plugins::mcp_aggregate_sse::{
     AggregateSseBody, AggregateSseBounds, AggregateSseBroker, AggregateSseError as SseError,
     AggregateSseStream, SseFrameResult, StreamIdentity,
@@ -47,19 +48,32 @@ fn identity_error(id: Value) -> SseError {
     }
 }
 
-/// One request's whole broker lifecycle: open the identity, then publish its
-/// terminal response. This is the production shape — the request path opens
-/// before its slow work and the response path publishes on the lease.
+/// One request's whole broker lifecycle: open the identity, stage its terminal
+/// response as the POST-attached body, then commit it the way the pipeline does
+/// once the final policy accepted those bytes. Returns the assigned cursor.
 fn publish(broker: &AggregateSseBroker, session: &str, id: i64) -> Result<u64, SseError> {
     let payload = json!({"jsonrpc": "2.0", "id": id, "result": {"n": id}});
     let stream = broker.open_stream(session, &number_id(id))?;
-    stream.publish_encoded(&encode(&payload))
+    stage_and_commit(&stream, &encode(&payload))
 }
 
 fn publish_text(broker: &AggregateSseBroker, session: &str, id: &str) -> Result<u64, SseError> {
     let payload = json!({"jsonrpc": "2.0", "id": id, "result": {}});
     let stream = broker.open_stream(session, &text_id(id))?;
-    stream.publish_encoded(&encode(&payload))
+    stage_and_commit(&stream, &encode(&payload))
+}
+
+/// Stage `encoded` on an open lease and commit it, returning the cursor.
+fn stage_and_commit(stream: &AggregateSseStream, encoded: &[u8]) -> Result<u64, SseError> {
+    let (_framed, publication) = stream.reserve_post_attached_response(encoded)?;
+    publication.commit()
+}
+
+/// Stage and commit, returning the POST-attached body the client receives.
+fn post_attached(stream: &AggregateSseStream, encoded: &[u8]) -> Result<Bytes, SseError> {
+    let (framed, publication) = stream.reserve_post_attached_response(encoded)?;
+    publication.commit()?;
+    Ok(framed)
 }
 
 /// The exact client-visible bytes a response carries. Production never hands
@@ -132,11 +146,13 @@ async fn drain_until(body: &mut AggregateSseBody, wanted: &[&str], max_frames: u
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn one_listener_multiplexes_concurrent_request_streams() {
+async fn concurrent_post_attached_responses_never_reach_a_plain_listener() {
     let broker = Arc::new(broker());
     broker.ensure_session("sess-a").unwrap();
     let listener = broker.attach_listener("sess-a", None).unwrap();
     let mut body = listener.take_body().expect("body claimed once");
+    let greeting = frame_text(next_frame(&mut body).await);
+    assert!(greeting.contains(": mcp-sse"));
 
     let publish_a = {
         let broker = Arc::clone(&broker);
@@ -148,15 +164,11 @@ async fn one_listener_multiplexes_concurrent_request_streams() {
     };
     let first = publish_a.await.unwrap().unwrap();
     let second = publish_b.await.unwrap().unwrap();
-    // Each multiplexed event carries its own monotonic SSE id.
+    // Each response carries its own session-wide SSE cursor.
     assert_ne!(first, second);
-
-    let seen = drain_until(&mut body, &["req-a", "\"n\":42"], 8).await;
-    // The greeting proves the stream is established before any event.
-    assert!(seen.contains(": mcp-sse"));
-    assert!(seen.contains("req-a"), "string identity delivered");
-    assert!(seen.contains("\"n\":42"), "number identity delivered");
-    assert!(seen.contains("event: message"));
+    // Both answers went out on their own POSTs: the plain `GET` listener that
+    // was attached the whole time is advanced past them, never handed a copy.
+    assert!(stays_idle(&mut body).await);
 }
 
 #[test]
@@ -213,13 +225,13 @@ fn completed_stream_releases_capacity_and_refuses_late_duplicates() {
     // Completing a stream must return its capacity, or the session would be
     // permanently exhausted after `max_streams_per_session` requests.
     let reply = json!({"jsonrpc": "2.0", "id": "s1", "result": {}});
-    first.publish_encoded(&encode(&reply)).unwrap();
+    stage_and_commit(&first, &encode(&reply)).unwrap();
     let _third = open(&broker, "sess-cap", "s3");
 
     // A late or duplicate response for a completed identity is refused rather
     // than misattributed onto a fresh stream. The lease itself refuses a second
     // terminal attempt, and re-opening the identity is refused too.
-    let late = first.publish_encoded(&encode(&reply));
+    let late = first.reserve_post_attached_response(&encode(&reply));
     assert_eq!(late.unwrap_err(), SseError::StreamCompleted);
     let reopen = broker.open_stream("sess-cap", &text_id("s1"));
     assert_eq!(reopen.unwrap_err(), SseError::StreamCompleted);
@@ -280,48 +292,53 @@ fn cancelled_lease_release_never_republishes_or_double_counts() {
     assert_eq!(still_cancelled.unwrap_err(), SseError::StreamCancelled);
 }
 
-#[test]
-fn repeated_retention_overflow_cannot_exhaust_stream_capacity() {
-    // One retained event and no replay window: with nothing consuming the ring,
-    // every publish after the first fails closed.
+#[tokio::test]
+async fn retention_pressure_costs_resumability_never_delivery_or_capacity() {
+    // One retained event and one replay slot: every commit after the first
+    // evicts the previous response, because it already went out on its POST.
     let tuned = AggregateSseBounds {
         max_streams_per_session: 4,
         max_retained_events: 1,
-        max_replay_events: 0,
+        max_replay_events: 1,
         ..bounds()
     };
     let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
-    broker.ensure_session("sess-overflow").unwrap();
-    publish(&broker, "sess-overflow", 0).unwrap();
+    broker.ensure_session("sess-pressure").unwrap();
 
-    // Far more overflowing responses than `max_streams_per_session`. Each one
-    // must be refused for RETENTION, never for cardinality: the refusal
-    // terminalizes its identity, so capacity is returned every time.
+    // Far more responses than either the ring or `max_streams_per_session`:
+    // staging is never refused for capacity, and every commit returns its
+    // stream slot.
     for id in 1..=12 {
-        let refused = publish(&broker, "sess-overflow", id);
-        assert_eq!(
-            refused.unwrap_err(),
-            SseError::RetentionOverflow,
-            "overflow {id} must not consume stream capacity"
-        );
+        assert_eq!(publish(&broker, "sess-pressure", id), Ok(id as u64));
     }
+    assert_eq!(broker.outstanding_reservations("sess-pressure"), Some(0));
 
-    // An inline-completed identity is terminal: a retry of it can never be
-    // published onto the stream later.
-    let retry = broker.open_stream("sess-overflow", &number_id(12));
+    // A completed identity is terminal: a retry of it is refused.
+    let retry = broker.open_stream("sess-pressure", &number_id(12));
     assert_eq!(retry.unwrap_err(), SseError::StreamCompleted);
 
     // Capacity really is reusable: a full set of fresh identities still opens.
     let mut held = Vec::new();
     for id in 100..104 {
-        match broker.open_stream("sess-overflow", &number_id(id)) {
+        match broker.open_stream("sess-pressure", &number_id(id)) {
             Ok(stream) => held.push(stream),
-            Err(error) => panic!("capacity must be reusable after overflow: {error:?}"),
+            Err(error) => panic!("capacity must be reusable: {error:?}"),
         }
     }
-    assert_eq!(held.len(), 4);
-    let beyond = broker.open_stream("sess-overflow", &number_id(104));
+    let beyond = broker.open_stream("sess-pressure", &number_id(104));
     assert_eq!(beyond.unwrap_err(), SseError::StreamCardinalityOverflow);
+
+    // Only resumability was lost: a cursor below the evicted prefix fails
+    // closed, and the newest cursor still resumes the last response.
+    let gone = broker.attach_listener("sess-pressure", Some("0"));
+    assert_eq!(gone.unwrap_err(), SseError::LastEventIdTooOld);
+    let resumed = broker.attach_listener("sess-pressure", Some("11")).unwrap();
+    let mut body = resumed.take_body().expect("body claimed once");
+    let seen = drain_until(&mut body, &["\"n\":12"], 4).await;
+    assert!(
+        seen.contains("\"n\":12"),
+        "the newest response replays: {seen:?}"
+    );
 }
 
 #[test]
@@ -337,7 +354,7 @@ fn oversized_event_on_an_open_lease_releases_capacity() {
     let stream = open(&broker, "sess-oversize", "big");
     let blob = "y".repeat(4096);
     let payload = json!({"jsonrpc": "2.0", "id": "big", "result": {"blob": blob}});
-    let refused = stream.publish_encoded(&encode(&payload));
+    let refused = stream.reserve_post_attached_response(&encode(&payload));
     assert_eq!(refused.unwrap_err(), SseError::EventTooLarge);
     // Refused before retention, but still terminal: the identity's capacity is
     // back and the identity itself cannot be reused.
@@ -362,7 +379,7 @@ fn cancelled_stream_refuses_its_own_response() {
     assert_eq!(again.unwrap_err(), SseError::StreamCancelled);
 
     let reply = json!({"jsonrpc": "2.0", "id": "c1", "result": {}});
-    let refused = in_flight.publish_encoded(&encode(&reply));
+    let refused = in_flight.reserve_post_attached_response(&encode(&reply));
     assert_eq!(refused.unwrap_err(), SseError::StreamCancelled);
 }
 
@@ -381,7 +398,7 @@ fn invalid_response_envelope_falls_back_and_releases_capacity() {
         "id": "different",
         "result": {}
     });
-    let refused = stream.publish_encoded(&encode(&mismatched));
+    let refused = stream.reserve_post_attached_response(&encode(&mismatched));
     assert_eq!(refused.unwrap_err(), SseError::ResponseEnvelopeInvalid);
 
     // Refusal is terminal and returns the one stream slot, so the gateway can
@@ -433,28 +450,25 @@ async fn listener_past_its_lifetime_is_superseded_not_refused() {
     // exact case an in-body timer cannot resolve.
     let mut stalled_body = stalled.take_body().expect("body claimed once");
 
-    // Inside the lifetime the slot is owned, and the gateway routes to it.
+    // Inside the lifetime the slot is owned.
     let duplicate = broker.attach_listener("sess-stall", None);
     assert_eq!(duplicate.unwrap_err(), SseError::DuplicateListener);
-    assert!(broker.has_listener("sess-stall"));
 
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // Past the lifetime the session stops routing new responses to it, and a
-    // fresh attach takes the slot instead of receiving 409.
-    assert!(!broker.has_listener("sess-stall"));
+    // Past the lifetime a fresh attach takes the slot instead of receiving 409.
     let replacement = broker
         .attach_listener("sess-stall", None)
         .expect("expired listener must be superseded");
     // Hold the replacement body: dropping it would release the slot again.
     let _replacement_body = replacement.take_body().expect("body claimed once");
-    assert!(broker.has_listener("sess-stall"));
 
     // The superseded body ends on its next poll and its own release is a no-op,
     // so it cannot evict the listener that replaced it.
     assert_ended(&mut stalled_body).await;
     drop(stalled_body);
-    assert!(broker.has_listener("sess-stall"));
+    let still_owned = broker.attach_listener("sess-stall", None);
+    assert_eq!(still_owned.unwrap_err(), SseError::DuplicateListener);
 }
 
 #[tokio::test]
@@ -473,42 +487,14 @@ async fn unclaimed_listener_lease_releases_the_slot_on_drop() {
 }
 
 #[tokio::test]
-async fn attach_delivers_staged_events_exactly_once() {
-    let broker = broker();
-    broker.ensure_session("sess-stage").unwrap();
-    publish(&broker, "sess-stage", 1).unwrap();
-
-    let listener = broker.attach_listener("sess-stage", None).unwrap();
-    let mut body = listener.take_body().unwrap();
-    let seen = drain_until(&mut body, &["\"n\":1"], 4).await;
-    // Staging and replay share one ring, so an event is never delivered twice.
-    assert_eq!(seen.matches("\"n\":1").count(), 1);
-
-    // Reattaching without a cursor resumes at the delivery watermark, so an
-    // already-delivered event is not replayed.
-    drop(body);
-    let listener = broker.attach_listener("sess-stage", None).unwrap();
-    let mut body = listener.take_body().unwrap();
-    let greeting = frame_text(next_frame(&mut body).await);
-    assert!(greeting.contains(": mcp-sse"));
-    assert!(stays_idle(&mut body).await);
-}
-
-#[tokio::test]
 async fn last_event_id_replays_only_newer_events() {
     let broker = broker();
     broker.ensure_session("sess-replay").unwrap();
-    let listener = broker.attach_listener("sess-replay", None).unwrap();
-    let mut body = listener.take_body().unwrap();
 
     let mut ids = Vec::new();
     for index in 1..=3 {
         ids.push(publish(&broker, "sess-replay", index).unwrap());
     }
-    let seen = drain_until(&mut body, &["\"n\":3"], 8).await;
-    assert!(seen.contains("\"n\":1"));
-    assert!(seen.contains("\"n\":3"));
-    drop(body);
 
     let cursor = ids[0].to_string();
     let resumed = broker.attach_listener("sess-replay", Some(&cursor));
@@ -547,16 +533,11 @@ async fn cursor_older_than_retained_history_is_gone_not_silently_resumed() {
     };
     let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
     broker.ensure_session("sess-gone").unwrap();
-    let listener = broker.attach_listener("sess-gone", None).unwrap();
-    let mut body = listener.take_body().unwrap();
 
     let mut ids = Vec::new();
     for index in 1..=3 {
         ids.push(publish(&broker, "sess-gone", index).unwrap());
     }
-    let seen = drain_until(&mut body, &["\"n\":3"], 8).await;
-    assert!(seen.contains("\"n\":3"));
-    drop(body);
 
     let stale = ids[0].to_string();
     let refused = broker.attach_listener("sess-gone", Some(&stale));
@@ -570,67 +551,10 @@ async fn cursor_older_than_retained_history_is_gone_not_silently_resumed() {
 }
 
 #[tokio::test]
-async fn retention_is_one_budget_and_never_drops_an_undelivered_response() {
-    // Two retained events, no replay window. With no listener attached every
-    // event is still owed to a consumer, so the third publish must fail closed
-    // rather than evict a JSON-RPC response nobody has seen.
-    let tuned = AggregateSseBounds {
-        max_retained_events: 2,
-        max_replay_events: 0,
-        ..bounds()
-    };
-    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
-    broker.ensure_session("sess-budget").unwrap();
-    publish(&broker, "sess-budget", 1).unwrap();
-    publish(&broker, "sess-budget", 2).unwrap();
-    let overflow = publish(&broker, "sess-budget", 3);
-    assert_eq!(overflow.unwrap_err(), SseError::RetentionOverflow);
-
-    // Draining frees the consumed prefix, so the session recovers instead of
-    // being stranded by one overflow. Identity 3 was answered inline and is
-    // therefore terminal for good, so recovery is proven with a fresh id — a
-    // retry of an inline-completed identity must never reach the stream.
-    let listener = broker.attach_listener("sess-budget", None).unwrap();
-    let mut body = listener.take_body().unwrap();
-    let seen = drain_until(&mut body, &["\"n\":2"], 6).await;
-    assert!(seen.contains("\"n\":1"));
-    assert!(seen.contains("\"n\":2"));
-    let retried = broker.open_stream("sess-budget", &number_id(3));
-    assert_eq!(retried.unwrap_err(), SseError::StreamCompleted);
-    publish(&broker, "sess-budget", 4).unwrap();
-}
-
-#[tokio::test]
-async fn delivered_history_is_evicted_to_admit_at_the_event_cap() {
-    // Replay may use the full retained-event allowance. Once that event has
-    // been delivered it is safely evictable, and a new response must replace
-    // it instead of being refused merely because the ring was exactly full
-    // before admission.
-    let tuned = AggregateSseBounds {
-        max_retained_events: 1,
-        max_replay_events: 1,
-        ..bounds()
-    };
-    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
-    broker.ensure_session("sess-event-admit").unwrap();
-    let listener = broker.attach_listener("sess-event-admit", None).unwrap();
-    let mut body = listener.take_body().unwrap();
-
-    publish(&broker, "sess-event-admit", 1).unwrap();
-    let seen = drain_until(&mut body, &["\"n\":1"], 4).await;
-    assert!(seen.contains("\"n\":1"));
-
-    publish(&broker, "sess-event-admit", 2)
-        .expect("delivered history at the event cap must make room for a new response");
-    let seen = drain_until(&mut body, &["\"n\":2"], 4).await;
-    assert!(seen.contains("\"n\":2"));
-}
-
-#[tokio::test]
-async fn delivered_history_is_evicted_to_admit_at_the_byte_cap() {
+async fn consumed_history_is_evicted_to_retain_at_the_byte_cap() {
     // The event-count budget has room, but the byte budget fits only one of
-    // these responses. Delivery makes the first event evictable, so byte
-    // pressure must reclaim it before deciding the second response overflows.
+    // these responses. Both already went out on their POSTs, so byte pressure
+    // evicts the older one and the newer one stays resumable.
     let tuned = AggregateSseBounds {
         max_event_bytes: 4096,
         max_retained_bytes: 4096 + 128,
@@ -640,94 +564,28 @@ async fn delivered_history_is_evicted_to_admit_at_the_byte_cap() {
     };
     let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
     broker.ensure_session("sess-byte-admit").unwrap();
-    let listener = broker.attach_listener("sess-byte-admit", None).unwrap();
-    let mut body = listener.take_body().unwrap();
     let filler = "x".repeat(3800);
 
     let first_payload = json!({"jsonrpc": "2.0", "id": 1, "result": {"blob": filler.clone()}});
     let first = broker
         .open_stream("sess-byte-admit", &number_id(1))
         .unwrap();
-    first.publish_encoded(&encode(&first_payload)).unwrap();
-    let seen = drain_until(&mut body, &["\"id\":1"], 4).await;
-    assert!(seen.contains("\"id\":1"));
+    assert_eq!(stage_and_commit(&first, &encode(&first_payload)), Ok(1));
 
     let second_payload = json!({"jsonrpc": "2.0", "id": 2, "result": {"blob": filler}});
     let second = broker
         .open_stream("sess-byte-admit", &number_id(2))
         .unwrap();
-    second
-        .publish_encoded(&encode(&second_payload))
-        .expect("delivered history at the byte cap must make room for a new response");
+    assert_eq!(stage_and_commit(&second, &encode(&second_payload)), Ok(2));
+
+    let gone = broker.attach_listener("sess-byte-admit", Some("0"));
+    assert_eq!(gone.unwrap_err(), SseError::LastEventIdTooOld);
+    let resumed = broker
+        .attach_listener("sess-byte-admit", Some("1"))
+        .unwrap();
+    let mut body = resumed.take_body().unwrap();
     let seen = drain_until(&mut body, &["\"id\":2"], 4).await;
     assert!(seen.contains("\"id\":2"));
-}
-
-#[test]
-fn byte_budget_bounds_total_retained_bytes() {
-    // One ~4 KiB event fits; two do not. The retired design's independent
-    // pending and replay caps would have retained about twice this.
-    let tuned = AggregateSseBounds {
-        max_event_bytes: 4096,
-        max_retained_bytes: 4096 + 128,
-        max_replay_events: 0,
-        ..bounds()
-    };
-    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
-    broker.ensure_session("sess-bytes").unwrap();
-    let filler = "x".repeat(3800);
-    // Each response must name its OWN stream identity: publishing id 1's body
-    // under id 2 is refused as an invalid envelope long before retention is
-    // consulted, which would make this a byte-budget test in name only.
-    let first_payload = json!({"jsonrpc": "2.0", "id": 1, "result": {"blob": filler.clone()}});
-    let second_payload = json!({"jsonrpc": "2.0", "id": 2, "result": {"blob": filler}});
-    let one = number_id(1);
-    let two = number_id(2);
-    let first = broker.open_stream("sess-bytes", &one).unwrap();
-    first.publish_encoded(&encode(&first_payload)).unwrap();
-    let second = broker.open_stream("sess-bytes", &two).unwrap();
-    let overflow = second.publish_encoded(&encode(&second_payload));
-    assert_eq!(overflow.unwrap_err(), SseError::RetentionOverflow);
-}
-
-#[tokio::test]
-async fn reserved_publication_is_invisible_and_protects_commit_capacity() {
-    let tuned = AggregateSseBounds {
-        max_retained_events: 2,
-        max_replay_events: 0,
-        ..bounds()
-    };
-    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
-    broker.ensure_session("sess-reserved").unwrap();
-    let listener = broker.attach_listener("sess-reserved", None).unwrap();
-    let mut body = listener.take_body().unwrap();
-    assert!(frame_text(next_frame(&mut body).await).contains(": mcp-sse"));
-
-    let first = broker.open_stream("sess-reserved", &number_id(1)).unwrap();
-    let first_payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
-    let reserved = first.reserve_encoded(&first_payload).unwrap();
-    assert!(
-        stays_idle(&mut body).await,
-        "a reservation must not become listener-visible before commit"
-    );
-
-    publish(&broker, "sess-reserved", 2)
-        .expect("one direct publication fits beside the promised event");
-    let third = broker.open_stream("sess-reserved", &number_id(3)).unwrap();
-    let third_payload = encode(&json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
-    assert_eq!(
-        third.publish_encoded(&third_payload).unwrap_err(),
-        SseError::RetentionOverflow,
-        "direct publishers must account for promised event capacity"
-    );
-
-    reserved
-        .commit()
-        .expect("a successful reservation must remain commit-capable");
-    let seen = drain_until(&mut body, &["\"id\":2", "\"id\":1"], 5).await;
-    assert!(seen.contains("\"id\":2"));
-    assert!(seen.contains("\"id\":1"));
-    assert!(!seen.contains("\"id\":3"));
 }
 
 #[test]
@@ -742,7 +600,7 @@ fn oversized_event_payload_fails_closed() {
     let payload = json!({"jsonrpc": "2.0", "id": 1, "result": {"blob": blob}});
     let one = number_id(1);
     let stream = broker.open_stream("sess-big", &one).unwrap();
-    let refused = stream.publish_encoded(&encode(&payload));
+    let refused = stream.reserve_post_attached_response(&encode(&payload));
     assert_eq!(refused.unwrap_err(), SseError::EventTooLarge);
 }
 
@@ -764,7 +622,7 @@ fn unframable_event_payload_fails_closed_with_its_own_reason() {
         encoded.len() <= bounds().max_event_bytes,
         "the refusal under test must be framing, not size"
     );
-    let refused = stream.publish_encoded(&encoded);
+    let refused = stream.reserve_post_attached_response(&encoded);
     assert_eq!(refused.unwrap_err(), SseError::EventFramingInvalid);
     assert_eq!(
         SseError::EventFramingInvalid.reason_token(),
@@ -820,7 +678,7 @@ async fn session_removal_ends_the_attached_body() {
     publish(&broker, "sess-del", 1).unwrap();
     assert!(
         body.retained_session_bytes_for_test() > 0,
-        "the live session must retain the staged response"
+        "the live session must retain the committed response for replay"
     );
 
     broker.remove_session("sess-del");
@@ -909,22 +767,8 @@ fn unknown_session_operations_fail_closed() {
     assert_eq!(open.unwrap_err(), SseError::UnknownSession);
     let published = publish(&broker, "missing", 1);
     assert_eq!(published.unwrap_err(), SseError::UnknownSession);
-    assert!(!broker.has_listener("missing"));
     let empty = broker.ensure_session("");
     assert_eq!(empty.unwrap_err(), SseError::MissingSession);
-}
-
-#[tokio::test]
-async fn idle_sessions_are_reaped_and_their_bodies_end() {
-    let broker = broker();
-    broker.ensure_session("sess-idle").unwrap();
-    let listener = broker.attach_listener("sess-idle", None).unwrap();
-    let mut body = listener.take_body().unwrap();
-
-    assert_eq!(broker.reap_idle(Duration::from_secs(3600)), 0);
-    assert_eq!(broker.reap_idle(Duration::from_millis(0)), 1);
-    assert_eq!(broker.session_count(), 0);
-    assert_ended(&mut body).await;
 }
 
 #[test]
@@ -1052,7 +896,6 @@ fn every_error_reason_is_a_fixed_low_cardinality_token() {
         SseError::ResponseEnvelopeInvalid,
         SseError::EventTooLarge,
         SseError::EventFramingInvalid,
-        SseError::RetentionOverflow,
         SseError::StreamCardinalityOverflow,
         SseError::SessionCardinalityOverflow,
     ];
@@ -1093,20 +936,16 @@ fn raw_numeric_identities_are_injective_and_responses_must_match() {
             assert_ne!(identity, other);
         }
     }
-    for reserve in [false, true] {
-        let broker = broker();
-        broker.ensure_session("exact").unwrap();
-        let wrong = broker.open_stream("exact", &identities[0]).unwrap();
-        let response = format!(r#"{{"jsonrpc":"2.0","id":{},"result":{{}}}}"#, ids[1]);
-        let error = if reserve {
-            wrong.reserve_encoded(response.as_bytes()).err().unwrap()
-        } else {
-            wrong.publish_encoded(response.as_bytes()).unwrap_err()
-        };
-        assert_eq!(error, SseError::ResponseEnvelopeInvalid);
-        let correct = broker.open_stream("exact", &identities[1]).unwrap();
-        assert_eq!(correct.publish_encoded(response.as_bytes()).unwrap(), 1);
-    }
+    let broker = broker();
+    broker.ensure_session("exact").unwrap();
+    let wrong = broker.open_stream("exact", &identities[0]).unwrap();
+    let response = format!(r#"{{"jsonrpc":"2.0","id":{},"result":{{}}}}"#, ids[1]);
+    let error = wrong
+        .reserve_post_attached_response(response.as_bytes())
+        .unwrap_err();
+    assert_eq!(error, SseError::ResponseEnvelopeInvalid);
+    let correct = broker.open_stream("exact", &identities[1]).unwrap();
+    assert_eq!(stage_and_commit(&correct, response.as_bytes()), Ok(1));
 }
 
 #[test]
@@ -1116,7 +955,7 @@ fn mismatched_pretty_printed_response_cannot_use_the_inline_fallback() {
     let stream = open(&broker, "pretty", "expected");
     let body = b"{\n\"jsonrpc\":\"2.0\",\"id\":\"wrong\",\"result\":{}}";
     assert_eq!(
-        stream.reserve_encoded(body).err().unwrap(),
+        stream.reserve_post_attached_response(body).unwrap_err(),
         SseError::ResponseEnvelopeInvalid
     );
 }
@@ -1130,13 +969,13 @@ fn an_escaped_jsonrpc_version_token_still_matches_the_envelope() {
     broker.ensure_session("escaped").unwrap();
     let stream = open(&broker, "escaped", "esc-1");
     let body = b"{\"jsonrpc\":\"\\u0032.0\",\"id\":\"esc-1\",\"result\":{}}";
-    assert_eq!(stream.publish_encoded(body).unwrap(), 1);
+    assert_eq!(stage_and_commit(&stream, body), Ok(1));
 
     // A different version string is still refused.
     let other = open(&broker, "escaped", "esc-2");
     let wrong = br#"{"jsonrpc":"2.1","id":"esc-2","result":{}}"#;
     assert_eq!(
-        other.publish_encoded(wrong).unwrap_err(),
+        other.reserve_post_attached_response(wrong).unwrap_err(),
         SseError::ResponseEnvelopeInvalid
     );
 }
@@ -1178,9 +1017,8 @@ async fn a_post_attached_response_is_framed_on_the_post_and_never_on_the_listene
     let payload = json!({"jsonrpc": "2.0", "id": 7, "result": {"n": 7}});
     let encoded = encode(&payload);
     let stream = broker.open_stream("sess-post", &number_id(7)).unwrap();
-    let framed = stream
-        .post_attached_response(&encoded)
-        .expect("a correlated response frames its own POST stream");
+    let framed =
+        post_attached(&stream, &encoded).expect("a correlated response frames its own POST stream");
     let framed = String::from_utf8(framed.to_vec()).expect("the POST body is UTF-8");
 
     // Greeting, exactly one `message` record carrying the governed bytes, and a
@@ -1211,14 +1049,14 @@ async fn post_attached_delivery_refuses_a_cancelled_or_mismatched_response() {
     broker.cancel_stream("sess-refuse", &number_id(1)).unwrap();
     let payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
     assert_eq!(
-        cancelled.post_attached_response(&payload).unwrap_err(),
+        post_attached(&cancelled, &payload).unwrap_err(),
         SseError::StreamCancelled
     );
 
     let mismatched = broker.open_stream("sess-refuse", &number_id(2)).unwrap();
     let wrong = encode(&json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
     assert_eq!(
-        mismatched.post_attached_response(&wrong).unwrap_err(),
+        post_attached(&mismatched, &wrong).unwrap_err(),
         SseError::ResponseEnvelopeInvalid
     );
     // Capacity came back: the same identity can be opened again only because a
@@ -1235,7 +1073,7 @@ async fn post_attached_delivery_refuses_a_cancelled_or_mismatched_response() {
     let both = broker.open_stream("sess-refuse", &number_id(4)).unwrap();
     broker.cancel_stream("sess-refuse", &number_id(4)).unwrap();
     assert_eq!(
-        both.post_attached_response(&wrong).unwrap_err(),
+        post_attached(&both, &wrong).unwrap_err(),
         SseError::StreamCancelled
     );
 }
@@ -1252,7 +1090,7 @@ async fn a_post_attached_event_replays_only_for_an_explicit_cursor() {
     for id in [1_i64, 2] {
         let payload = encode(&json!({"jsonrpc": "2.0", "id": id, "result": {}}));
         let stream = broker.open_stream("sess-resume", &number_id(id)).unwrap();
-        let framed = stream.post_attached_response(&payload).unwrap();
+        let framed = post_attached(&stream, &payload).unwrap();
         let framed = String::from_utf8(framed.to_vec()).expect("the POST body is UTF-8");
         assert!(framed.contains(&format!("id: {id}\nevent: message")));
     }
@@ -1577,19 +1415,13 @@ fn a_staged_publication_refuses_after_session_teardown() {
     );
 }
 
-/// Aborting or dropping a staged reservation returns its capacity for real, not
-/// just its stream slot: a FRESH id must still be admissible at a ring sized for
-/// exactly one event and exactly one framing.
+/// Aborting or dropping a staged reservation returns its stream slot and its
+/// staged count exactly once, and never leaves a replayable copy behind.
 #[tokio::test]
-async fn aborting_a_staged_reservation_returns_ring_capacity_to_the_next_request() {
+async fn aborted_and_dropped_stages_release_their_slot_and_retain_nothing() {
     let session = "s-returned";
-    let payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
     let tuned = AggregateSseBounds {
         max_streams_per_session: 1,
-        max_retained_events: 1,
-        max_event_bytes: payload.len(),
-        max_retained_bytes: payload.len() + 64,
-        max_replay_events: 1,
         ..bounds()
     };
     let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
@@ -1597,100 +1429,73 @@ async fn aborting_a_staged_reservation_returns_ring_capacity_to_the_next_request
 
     // Abort.
     let first = broker.open_stream(session, &number_id(1)).unwrap();
-    first
-        .reserve_encoded(&payload)
-        .expect("the first deliverable reservation is admitted")
-        .abort();
+    let first_payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+    let (_framed, aborted) = first
+        .reserve_post_attached_response(&first_payload)
+        .expect("the first response stages");
+    assert_eq!(broker.outstanding_reservations(session), Some(1));
+    aborted.abort();
+    assert_eq!(broker.outstanding_reservations(session), Some(0));
 
     // Drop.
     let second = broker.open_stream(session, &number_id(2)).unwrap();
     let second_payload = encode(&json!({"jsonrpc": "2.0", "id": 2, "result": {}}));
-    let dropped = second
-        .reserve_encoded(&second_payload)
-        .expect("the aborted reservation released the ring");
+    let (_framed, dropped) = second
+        .reserve_post_attached_response(&second_payload)
+        .expect("the aborted stage returned the only stream slot");
     drop(dropped);
+    assert_eq!(broker.outstanding_reservations(session), Some(0));
 
-    // A third, fresh id must still be admitted at the same tight bounds and must
-    // still commit — proving both the event and the byte budget came back.
+    // A third, fresh id still opens in the only slot and commits.
     let third = broker.open_stream(session, &number_id(3)).unwrap();
     let third_payload = encode(&json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
-    let reserved = third
-        .reserve_encoded(&third_payload)
-        .expect("the dropped reservation released the ring");
-    assert_eq!(reserved.commit().unwrap(), 1);
+    assert_eq!(stage_and_commit(&third, &third_payload), Ok(3));
+    assert_eq!(broker.outstanding_reservations(session), Some(0));
 
     let resumed = broker.attach_listener(session, Some("0")).unwrap();
     let mut body = resumed.take_body().expect("body claimed once");
     let seen = drain_until(&mut body, &[r#""id":3"#], 4).await;
     assert!(
         seen.contains(r#""id":3"#),
-        "the third response is real: {seen:?}"
+        "the committed response replays: {seen:?}"
     );
+    assert!(!seen.contains(r#""id":1"#), "{seen:?}");
+    assert!(!seen.contains(r#""id":2"#), "{seen:?}");
 }
 
-/// Issue #5441: the two reservation budgets are separate on purpose. A staged
-/// POST-attached response is best effort and must never consume the promise a
-/// DELIVERABLE reservation was admitted under, or a response the broker already
-/// promised could be lost to `RetentionOverflow` at commit.
+/// Issue #7138: a commit that lands while a resumed listener is still
+/// replaying must not move that listener's cursor past the older events it
+/// asked for. Advancing by `max(event_id)` there skipped every event between
+/// the cursor and the new commit.
 #[tokio::test]
-async fn a_staged_post_attached_reservation_never_spends_a_deliverable_promise() {
-    let session = "s-budgets";
-    let payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
-    let tuned = AggregateSseBounds {
-        max_streams_per_session: 2,
-        max_retained_events: 1,
-        max_event_bytes: payload.len(),
-        max_retained_bytes: 64 * 1024,
-        max_replay_events: 1,
-        ..bounds()
-    };
-    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
+async fn a_commit_during_replay_does_not_skip_the_events_being_replayed() {
+    let session = "s-mid-replay";
+    let broker = broker();
     broker.ensure_session(session).unwrap();
+    assert_eq!(publish(&broker, session, 1), Ok(1));
+    assert_eq!(publish(&broker, session, 2), Ok(2));
 
-    // A deliverable reservation is a PROMISE: the ring admitted it.
-    let deliverable = broker.open_stream(session, &number_id(1)).unwrap();
-    let promised = deliverable
-        .reserve_encoded(&payload)
-        .expect("the one-event ring admits the promise");
-
-    // A POST-attached response is staged in between. Its bytes are already going
-    // out on its own POST, so it is best effort and is accounted apart.
-    let attached = broker.open_stream(session, &number_id(2)).unwrap();
-    let post_payload = encode(&json!({"jsonrpc": "2.0", "id": 2, "result": {}}));
-    let (_framed, staged) = attached
-        .reserve_post_attached_response(&post_payload)
-        .expect("a POST-attached response is never refused for capacity");
-    assert_eq!(
-        broker.outstanding_reservations(session),
-        Some((1, 1)),
-        "the promise and the best-effort stage are tracked apart"
-    );
-
-    let published = promised
-        .commit()
-        .expect("a promised deliverable commit must not be lost to a stage");
-    assert_eq!(
-        published, 2,
-        "the staged POST-attached response already assigned cursor 1"
-    );
-    // The best-effort commit yields instead: the one-event ring already holds
-    // the promised answer, so only this response's resumability is lost and its
-    // cursor becomes unreachable.
-    assert!(staged.commit().is_ok());
-    assert_eq!(broker.outstanding_reservations(session), Some((0, 0)));
-    assert_eq!(
-        broker.attach_listener(session, Some("0")).unwrap_err(),
-        SseError::LastEventIdTooOld,
-        "a cursor below the skipped retention fails closed"
-    );
-
-    let resumed = broker.attach_listener(session, Some("1")).unwrap();
+    let resumed = broker.attach_listener(session, Some("0")).unwrap();
     let mut body = resumed.take_body().expect("body claimed once");
-    let seen = drain_until(&mut body, &[r#""id":1"#], 4).await;
-    assert!(
-        seen.contains(r#""id":1"#),
-        "the promised response is the one that publishes: {seen:?}"
-    );
+    assert_eq!(frame_text(next_frame(&mut body).await), ": mcp-sse\n\n");
+    let first = frame_text(next_frame(&mut body).await);
+    assert!(first.contains("\"n\":1"), "{first:?}");
+
+    // Event 2 is still owed to this replay when event 3 commits.
+    assert_eq!(publish(&broker, session, 3), Ok(3));
+
+    let seen = drain_until(&mut body, &["\"n\":2", "\"n\":3"], 4).await;
+    let second_at = seen
+        .find("\"n\":2")
+        .expect("the older replayed event is not skipped");
+    let third_at = seen
+        .find("\"n\":3")
+        .expect("the newer event replays after it");
+    assert!(second_at < third_at, "replay stays ordered: {seen:?}");
+
+    // Caught up, the listener is advanced past later commits as usual.
+    assert_eq!(publish(&broker, session, 4), Ok(4));
+    assert!(stays_idle(&mut body).await);
 }
 
 /// Settling for an inline JSON answer reports a cancellation the caller has to

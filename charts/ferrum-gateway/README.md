@@ -2,11 +2,11 @@
 
 Deploys the Ferrum Edge binary in one of the **core gateway** operating modes.
 For the service-mesh components (mesh data plane, injector webhook, ambient
-node-agent, mesh CA) use the sibling [`ferrum-mesh`](../ferrum-mesh) chart
+node-agent) use the sibling [`ferrum-mesh`](../ferrum-mesh) chart
 instead — the two charts share naming, labelling, secret, and validation
 conventions so they feel like one product.
 
-The current `appVersion` is **0.9.17**, the published v0.9.17 release. When
+The current `appVersion` is **0.9.21**, the published v0.9.21 release. When
 you override `image.tag`, pin a published release tag and keep the migration
 Job and gateway pins on the same build.
 
@@ -15,7 +15,7 @@ Job and gateway pins on the same build.
 | Database | `database` | yes | read/write | `database.*`, `admin.jwtSecret` (>=32) |
 | File | `file` | yes | read-only | `file.inlineConfig` or `file.existingConfigMap` |
 | Control plane | `cp` | no | read/write | `database.*`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) or `cp.trustBundlePath` |
-| Data plane | `dp` | yes | read-only | `dp.cpGrpcUrls`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) or `dp.cpGrpcTokenFile`; optional `dp.configMaxStaleSeconds` / `dp.configStaleAction` |
+| Data plane | `dp` | yes | read-only | `dp.cpGrpcUrls`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32, plus `grpc.jwtKeyId` against a trust-bundle CP); optional `dp.configMaxStaleSeconds` / `dp.configStaleAction` |
 
 ### Multi-tenant control planes
 
@@ -25,8 +25,8 @@ read another tenant's configuration (advisory GHSA-3f2j-wwqw-grmg). A control
 plane serving more than one namespace therefore requires
 `cp.trustBundlePath` — a mounted JSON bundle of namespace-bound verification
 credentials — and the chart fails render without it. Data planes then present
-either an externally issued token (`dp.cpGrpcTokenFile`, no signing key on the
-node) or a per-tenant secret selected by `grpc.jwtKeyId`. See
+a per-tenant secret selected by `grpc.jwtKeyId` (a stock DP cannot present an
+externally issued token; the binary refuses one in dp mode). See
 [docs/cp_namespace_tenancy.md](../../docs/cp_namespace_tenancy.md).
 
 Tenancy enforcement spans both planes: set **`cp.requireNamespaceClaim: true`**
@@ -93,6 +93,10 @@ for `status`, dry-run and operator-controlled `up` / `config` workflows.
   entry containing `::1` (such as `::/127`, `::1/128`, or bare `::1`) — an
   unspecified IPv6 bind is not guaranteed to accept v4-mapped `127.0.0.1`.
   A concrete IPv6 bind is dialed directly and its concrete source must be allowed.
+  An IPv4-mapped bind (`::ffff:a.b.c.d`) is treated as its IPv4 address, as
+  the runtime does: `::ffff:127.0.0.2` is a 127/8 dial whose probes arrive from
+  `127.0.0.1`. A bare mapped allowlist entry (`::ffff:10.0.0.1`) is one IPv4
+  host (`/32`); a mapped CIDR's prefix length counts the 96-bit mapped prefix.
   IPv6 allowlist entries use bare address syntax (`fd00::/8`, `::1/128`), not
   URL-style brackets (`[fd00::]/8`), matching the runtime's strict CIDR parser.
   `admin.bindAddress` must be an IP literal — any hostname (`localhost`,
@@ -440,6 +444,12 @@ gateway pod without dropping the front door to zero. The optional
 PodDisruptionBudget (`podDisruptionBudget.enabled`, default **true**,
 `minAvailable: 1`) renders only when at least two replicas are configured (or
 `autoscaling.minReplicas >= 2` when HPA is enabled).
+
+With `autoscaling.enabled=true`, the HorizontalPodAutoscaler uses only Resource
+(cpu/memory) metrics, so the render fails unless
+`1 <= autoscaling.minReplicas <= autoscaling.maxReplicas`. Kubernetes accepts
+scale-to-zero only with Object or External metrics and rejects `maxReplicas`
+below `minReplicas`, so the chart refuses both before a manifest is produced.
 
 Single-replica installs (`replicaCount: 1`) are an explicit non-HA choice: the
 chart skips the PDB so `minAvailable: 1` cannot block all voluntary evictions

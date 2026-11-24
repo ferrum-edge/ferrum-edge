@@ -9,9 +9,26 @@
 //!
 //! This design allows each consumer to have their own JWT secret (stored in
 //! `consumer.credentials["jwt"]["secret"]`), avoiding a single shared secret.
+//! Because the signer chooses the identity claim, a secret shared by two
+//! Consumers would let either sign as the other: config admission refuses
+//! such duplicates and every load/swap quarantines them on all holders
+//! (`GatewayConfig::quarantine_invalid_jwt_credentials_against`). The verifier itself
+//! never checks a signature against a stored secret below the
+//! non-whitespace length floor.
+//!
+//! The HMAC algorithm (`HS256` by default, or `HS384` / `HS512`) is pinned by
+//! the plugin configuration and never taken from the token header.
 //!
 //! Token location is configurable via `token_lookup` (default `"header:Authorization"`).
-//! Supports `"header:<name>"` and `"query:<name>"` extraction modes.
+//! Supports `"header:<name>"` and `"query:<name>"` extraction modes. With
+//! `hide_credentials: true` the token-bearing header (for `Authorization`, only
+//! a `Bearer` value) or query parameter is removed before backend forwarding.
+//!
+//! A `query:<name>` token that also appears as a `;`-separated sub-parameter
+//! (`?carrier=;token=...`) is ambiguous and refused (`401`), and the sub-pair
+//! is still marked for policy redaction and, with `hide_credentials`, for
+//! removal, so a chain won by another mechanism cannot forward it
+//! (GHSA-c259-vchc-3vgr, the `key_auth` issue #6579 contract).
 
 use std::collections::HashSet;
 
@@ -21,12 +38,20 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, dangerous::insecure_decod
 use serde_json::Value;
 use tracing::debug;
 
+use zeroize::Zeroizing;
+
+use crate::config::types::jwt_secret_meets_minimum_strength;
 use crate::consumer_index::ConsumerIndex;
+use crate::fips::backend::rand::{SecureRandom, SystemRandom};
 
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::utils::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
-use super::utils::jwt_verifier::issuer_claim_is_single_string;
-use super::utils::token_extract::bearer_credential_from_authorization_value;
+use super::utils::jwt_verifier::{audience_claim_is_acceptable, issuer_claim_is_single_string};
+use super::utils::query::query_has_semicolon_credential_alias;
+use super::utils::token_extract::{
+    AMBIGUOUS_QUERY_TOKEN_BODY, STRIP_QUERY_PARAM_METADATA_PREFIX,
+    bearer_credential_from_authorization_value,
+};
 use super::{RequestContext, strip_auth_scheme};
 
 /// Unsafe validation that skips signature verification, used only to extract
@@ -43,6 +68,18 @@ pub struct JwtAuth {
     consumer_claim_field: String,
     validation: Validation,
     require_nbf: bool,
+    audiences_configured: bool,
+    /// Remove the token-bearing header or query parameter before forwarding.
+    hide_credentials: bool,
+    /// Precomputed `auth.strip_query_param.<name>` key for query lookups.
+    strip_query_metadata_key: Option<String>,
+    /// Per-instance random key for the equalizing verification run when the
+    /// token names no Consumer that has an eligible JWT secret. Its 32-byte
+    /// secret is drawn from the CSPRNG at construction and never exposed, so
+    /// no client can sign a token that passes it: the run always stops at the
+    /// signature check, exactly like a wrong-signature attempt on the real
+    /// path. Built once here so the decoy run cannot be skipped per request.
+    timing_equalization_key: DecodingKey,
 }
 
 enum TokenLookup {
@@ -82,8 +119,21 @@ impl JwtAuth {
         if leeway_secs > 300 {
             return Err("jwt_auth: `leeway_secs` must be <= 300".to_string());
         }
+        let hide_credentials =
+            parse_optional_bool(config_obj.get("hide_credentials"), "hide_credentials")?
+                .unwrap_or(false);
+        let algorithm = parse_algorithm(config_obj.get("algorithm"))?;
+        let mut timing_equalization_secret = Zeroizing::new([0u8; 32]);
+        SystemRandom::new()
+            .fill(timing_equalization_secret.as_mut())
+            .map_err(|_| "jwt_auth: failed to generate the timing-equalization key".to_string())?;
+        let timing_equalization_key = DecodingKey::from_secret(&timing_equalization_secret[..])
+            .map_err(|_| "jwt_auth: failed to build the timing-equalization key".to_string())?;
 
-        let mut validation = Validation::new(Algorithm::HS256);
+        // The algorithm is pinned here and never read from the token header:
+        // `jsonwebtoken` refuses a token whose header names any other
+        // algorithm, including another HMAC size and every asymmetric family.
+        let mut validation = Validation::new(algorithm);
         validation.validate_exp = true;
         validation.validate_nbf = true;
         validation.leeway = leeway_secs;
@@ -109,14 +159,28 @@ impl JwtAuth {
         if !audiences.is_empty() {
             validation.set_audience(&audiences);
             required.insert("aud".to_string());
-        } else {
-            validation.validate_aud = false;
         }
+        // With no audiences configured, keep jsonwebtoken's strict
+        // `validate_aud = true` default (same contract as `jwt_verifier.rs` and
+        // the admin verifier): a token without `aud` still passes, but a token
+        // that carries `aud` is rejected because no acceptable audience is
+        // configured (RFC 7519 §4.1.3). Disabling it would let a token minted
+        // for another service with the same consumer secret authenticate here.
         validation.required_spec_claims = required;
 
         let request_headers_to_redact = match &token_lookup {
             TokenLookup::Header { lower_name, .. } => vec![lower_name.clone()],
             TokenLookup::Query(_) => Vec::new(),
+        };
+        let strip_query_metadata_key = match &token_lookup {
+            TokenLookup::Query(name) => {
+                let mut key =
+                    String::with_capacity(STRIP_QUERY_PARAM_METADATA_PREFIX.len() + name.len());
+                key.push_str(STRIP_QUERY_PARAM_METADATA_PREFIX);
+                key.push_str(name);
+                Some(key)
+            }
+            TokenLookup::Header { .. } => None,
         };
 
         Ok(Self {
@@ -125,7 +189,35 @@ impl JwtAuth {
             consumer_claim_field,
             validation,
             require_nbf,
+            audiences_configured: !audiences.is_empty(),
+            hide_credentials,
+            strip_query_metadata_key,
+            timing_equalization_key,
         })
+    }
+
+    /// Spend one signature verification when the token names no Consumer
+    /// with an eligible JWT secret, doing what one wrong-signature attempt on
+    /// the real path does (run `decode`, fail at the signature because the
+    /// key is unknowable), so an unknown identity costs about what a known
+    /// identity with a single wrong key does. The run is unconditional and its
+    /// result is discarded either way.
+    fn equalize_verification_work(&self, token: &str) {
+        let _ = decode::<Value>(token, &self.timing_equalization_key, &self.validation);
+    }
+
+    /// Whether `before_proxy` should remove the value it found under the
+    /// configured header. A non-`Authorization` header belongs to this plugin
+    /// alone; `Authorization` is shared with other schemes, so only a
+    /// `Bearer` value is this plugin's credential.
+    fn header_value_is_hidden_credential(lower_name: &str, value: &str) -> bool {
+        if !lower_name.eq_ignore_ascii_case("authorization") {
+            return true;
+        }
+        value
+            .split(|c: char| c.is_ascii_whitespace())
+            .next()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer"))
     }
 
     fn extract_credential(&self, ctx: &RequestContext) -> ExtractedCredential {
@@ -161,10 +253,21 @@ impl JwtAuth {
                     )
                 }
             }
-            TokenLookup::Query(param_name) => match ctx.query_params.get(param_name.as_str()) {
-                Some(token) => ExtractedCredential::BearerToken(token.clone()),
-                None => ExtractedCredential::Missing,
-            },
+            TokenLookup::Query(param_name) => {
+                // A `;`-aliased spelling is ambiguous between Ferrum's
+                // `&`-only parser and a `;`-splitting backend, so it is
+                // refused rather than skipped (issue #6579,
+                // GHSA-c259-vchc-3vgr).
+                if query_has_semicolon_credential_alias(ctx.raw_query_string(), param_name) {
+                    return ExtractedCredential::InvalidFormat(
+                        AMBIGUOUS_QUERY_TOKEN_BODY.to_string(),
+                    );
+                }
+                match ctx.query_params.get(param_name.as_str()) {
+                    Some(token) => ExtractedCredential::BearerToken(token.clone()),
+                    None => ExtractedCredential::Missing,
+                }
+            }
         }
     }
 }
@@ -172,7 +275,7 @@ impl JwtAuth {
 /// Reject unrecognized config keys so misspelled issuer or audience policy
 /// fails configuration validation instead of silently disabling enforcement.
 fn reject_unknown_keys(config: &serde_json::Map<String, Value>) -> Result<(), String> {
-    const KNOWN_KEYS: [&str; 8] = [
+    const KNOWN_KEYS: [&str; 10] = [
         "token_lookup",
         "consumer_claim_field",
         "require_exp",
@@ -181,19 +284,36 @@ fn reject_unknown_keys(config: &serde_json::Map<String, Value>) -> Result<(), St
         "expected_issuers",
         "audiences",
         "leeway_secs",
+        "hide_credentials",
+        "algorithm",
     ];
-    for key in config.keys() {
-        if !KNOWN_KEYS.contains(&key.as_str()) {
-            return Err(format!("jwt_auth: unknown config key {key:?}"));
-        }
-    }
-    Ok(())
+    crate::util::unknown_keys::reject_unknown_keys(
+        config,
+        "config",
+        &KNOWN_KEYS,
+        "jwt_auth: `config`: ",
+    )
 }
 
 #[async_trait]
 impl AuthMechanism for JwtAuth {
     fn mechanism_name(&self) -> &'static str {
         "jwt_auth"
+    }
+
+    fn authentication_challenge(&self) -> &'static str {
+        auth_flow::BEARER_AUTHENTICATION_CHALLENGE
+    }
+
+    fn rejection_challenge(&self, rejection: auth_flow::CredentialRejection) -> &'static str {
+        match rejection {
+            auth_flow::CredentialRejection::InvalidFormat => {
+                auth_flow::BEARER_INVALID_REQUEST_CHALLENGE
+            }
+            auth_flow::CredentialRejection::InvalidCredential => {
+                auth_flow::BEARER_INVALID_TOKEN_CHALLENGE
+            }
+        }
     }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
@@ -236,23 +356,31 @@ impl AuthMechanism for JwtAuth {
         let consumer = match consumer_index.find_by_identity(identity) {
             Some(consumer) => consumer,
             None => {
-                debug!("jwt_auth: no consumer found for identity '{}'", identity);
+                // The identity claim is unverified, attacker-chosen text:
+                // never interpolate it into a log record.
+                debug!("jwt_auth: no consumer found for the JWT identity claim");
+                self.equalize_verification_work(&token);
                 return VerifyOutcome::ConsumerNotFound(r#"{"error":"Invalid JWT token"}"#.into());
             }
         };
 
         let jwt_entries = consumer.credential_entries("jwt");
-        if jwt_entries.is_empty() {
-            debug!(
-                "jwt_auth: consumer '{}' has no JWT secret configured",
-                consumer.username
-            );
-            return VerifyOutcome::VerificationFailed(r#"{"error":"Invalid JWT token"}"#.into());
-        }
-
+        let mut verification_attempted = false;
         for jwt_cred in &jwt_entries {
-            if let Some(secret) = jwt_cred.get("secret").and_then(|secret| secret.as_str()) {
-                let key = DecodingKey::from_secret(secret.as_bytes());
+            // A stored secret below the non-whitespace floor is never a
+            // signing key, whatever path published it (defense in depth for
+            // the load/swap quarantine).
+            if let Some(secret) = jwt_cred
+                .get("secret")
+                .and_then(|secret| secret.as_str())
+                .filter(|secret| jwt_secret_meets_minimum_strength(secret))
+            {
+                verification_attempted = true;
+                // The strength floor above rules out an empty secret, the only
+                // input jsonwebtoken 12 refuses as an HMAC key.
+                let Ok(key) = DecodingKey::from_secret(secret.as_bytes()) else {
+                    continue;
+                };
                 if let Ok(token_data) = decode::<serde_json::Value>(&token, &key, &self.validation)
                 {
                     // `jsonwebtoken` matches a multi-valued `iss` by set
@@ -261,6 +389,11 @@ impl AuthMechanism for JwtAuth {
                     // allows exactly one `StringOrURI` (issue #5522).
                     if !issuer_claim_is_single_string(&token_data.claims) {
                         debug!("jwt_auth: JWT 'iss' claim is not a single string");
+                        return VerifyOutcome::Invalid(r#"{"error":"Invalid JWT token"}"#.into());
+                    }
+                    if !audience_claim_is_acceptable(&token_data.claims, self.audiences_configured)
+                    {
+                        debug!("jwt_auth: JWT 'aud' claim is malformed or unexpected");
                         return VerifyOutcome::Invalid(r#"{"error":"Invalid JWT token"}"#.into());
                     }
                     if self.require_nbf && token_data.claims.get("nbf").is_none() {
@@ -278,7 +411,15 @@ impl AuthMechanism for JwtAuth {
             }
         }
 
-        debug!("jwt_auth: signature verification failed for all secrets");
+        if verification_attempted {
+            debug!("jwt_auth: signature verification failed for all secrets");
+        } else {
+            debug!(
+                "jwt_auth: consumer '{}' has no eligible JWT secret configured",
+                consumer.id
+            );
+            self.equalize_verification_work(&token);
+        }
         VerifyOutcome::VerificationFailed(r#"{"error":"Invalid JWT token"}"#.into())
     }
 }
@@ -290,11 +431,23 @@ auth_flow::impl_auth_plugin!(
     crate::plugins::HTTP_FAMILY_PROTOCOLS,
     auth_flow::run_auth;
 
+    /// Mark the configured query token — in the decoded map or behind a `;`
+    /// — for policy redaction and, with `hide_credentials`, for removal from
+    /// the forwarded query. Runs for every auth instance before the chain can
+    /// short-circuit, so a sub-pair spelling is hidden even when another
+    /// mechanism authenticates the request (the same contract as `key_auth`).
     fn mark_query_credentials_for_redaction(&self, ctx: &mut crate::plugins::RequestContext) {
         if let TokenLookup::Query(name) = &self.token_lookup
-            && ctx.query_params.contains_key(name)
+            && (ctx.query_params.contains_key(name)
+                || query_has_semicolon_credential_alias(ctx.raw_query_string(), name))
         {
             crate::plugins::utils::token_extract::mark_query_credential_metadata(ctx, name);
+            if self.hide_credentials
+                && let Some(metadata_key) = &self.strip_query_metadata_key
+            {
+                ctx.metadata
+                    .insert(metadata_key.clone(), "true".to_string());
+            }
         }
     }
 
@@ -302,15 +455,87 @@ auth_flow::impl_auth_plugin!(
         &self.request_headers_to_redact
     }
 
-    /// HTTP/3 materializes decoded query parameters only when an active plugin
-    /// declares it needs them; H1/H2 always decode. Without this, the same URL
-    /// authenticates over H1/H2 and returns `401` over H3 whenever the
-    /// configured parameter name or the token itself carries percent-encoding
-    /// (`t%6fken`, or `%2E` for a JWT's `.` separators). `key_auth` and
-    /// `jwks_auth` already declare it for their query token locations; this is
-    /// the same contract for `token_lookup: query:<name>`.
+    fn modifies_request_headers(&self) -> bool {
+        self.hide_credentials && matches!(self.token_lookup, TokenLookup::Header { .. })
+    }
+
+    /// `hide_credentials` removes only the configured token header.
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        Some(match &self.token_lookup {
+            TokenLookup::Header { lower_name, .. } => vec![lower_name.clone()],
+            TokenLookup::Query(_) => Vec::new(),
+        })
+    }
+
+    /// `authenticate` marks a query token for stripping from the forwarded
+    /// query, and `before_proxy` removes it.
+    fn modifies_request_query(&self) -> bool {
+        self.hide_credentials && matches!(self.token_lookup, TokenLookup::Query(_))
+    }
+
+    /// With `hide_credentials`, remove the token-bearing location before the
+    /// backend request, including when another mechanism won a multi-auth
+    /// chain (the same contract as `key_auth`). `Authorization` is removed
+    /// only while it carries a `Bearer` value, so another scheme's credential
+    /// on a shared route is left to its own plugin.
+    async fn before_proxy(
+        &self,
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) -> crate::plugins::PluginResult {
+        if !self.hide_credentials {
+            return crate::plugins::PluginResult::Continue;
+        }
+        match &self.token_lookup {
+            TokenLookup::Header {
+                lower_name,
+                original_name,
+            } => {
+                for name in [lower_name.as_str(), original_name.as_str()] {
+                    if headers.get(name).is_some_and(|value| {
+                        Self::header_value_is_hidden_credential(lower_name, value)
+                    }) {
+                        headers.remove(name);
+                    }
+                }
+            }
+            TokenLookup::Query(name) => {
+                let sub_pair_alias =
+                    query_has_semicolon_credential_alias(ctx.raw_query_string(), name);
+                if (ctx.query_params.remove(name.as_str()).is_some() || sub_pair_alias)
+                    && let Some(metadata_key) = &self.strip_query_metadata_key
+                {
+                    ctx.metadata
+                        .insert(metadata_key.clone(), "true".to_string());
+                }
+            }
+        }
+        crate::plugins::PluginResult::Continue
+    }
+
+    /// `token_lookup: query:<name>` decides on a query parameter. Every
+    /// frontend materializes decoded query params (#6580), so a percent-encoded
+    /// name or token (`t%6fken`, `%2E` for a JWT's `.` separators)
+    /// authenticates identically on H1/H2/H3.
     fn requires_decoded_query_params(&self) -> bool {
         matches!(self.token_lookup, TokenLookup::Query(_))
+    }
+
+    fn supports_request_header_passthrough(&self) -> bool {
+        !self.hide_credentials
+            && !self.requires_decoded_query_params()
+            && !matches!(
+                &self.token_lookup,
+                TokenLookup::Header { lower_name, .. } if lower_name == "host"
+            )
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        if self.hide_credentials {
+            crate::plugins::PluginHooks::BEFORE_PROXY
+        } else {
+            crate::plugins::PluginHooks::NONE
+        }
     }
 );
 
@@ -391,6 +616,24 @@ fn parse_non_empty_string(
         return Err(format!("jwt_auth: `{field}` must not be empty"));
     }
     Ok(value.to_string())
+}
+
+/// Parse the pinned HMAC algorithm. Only the HMAC family is admitted: the
+/// Consumer `jwt` credential is a shared `secret`, and asymmetric or JWKS
+/// verification belongs to `jwks_auth`. The value is exact (no trimming or
+/// case folding) so it matches the RFC 7518 `alg` spelling tokens carry.
+fn parse_algorithm(value: Option<&Value>) -> Result<Algorithm, String> {
+    let Some(value) = value else {
+        return Ok(Algorithm::HS256);
+    };
+    match value.as_str() {
+        Some("HS256") => Ok(Algorithm::HS256),
+        Some("HS384") => Ok(Algorithm::HS384),
+        Some("HS512") => Ok(Algorithm::HS512),
+        _ => Err(
+            "jwt_auth: `algorithm` must be one of \"HS256\", \"HS384\", or \"HS512\"".to_string(),
+        ),
+    }
 }
 
 fn parse_optional_bool(value: Option<&Value>, field: &str) -> Result<Option<bool>, String> {

@@ -27,11 +27,10 @@ env:
   CARGO_TERM_COLOR: always
   # Absolute line-coverage FLOORS (regression backstops), not targets. They sit
   # deliberately BELOW measured coverage so ordinary drift does not flap main red.
-  # Every PR is measured against its own base, but many PRs land independently and
-  # the merged total on main can dip a fraction of a point below any single PR's
-  # figure — a floor pinned to the peak then fails ~half of merges for a sub-0.1pt
-  # miss. The real protection for NEW code is the diff-scoped
-  # MIN_CHANGED_PLUGIN_LINE_COVERAGE gate that runs on pull_request events.
+  # Main's measured total moves by a fraction of a point between runs, so a floor
+  # pinned to the peak fails ~half of main runs for a sub-0.1pt miss. PRs and
+  # merge groups skip instrumented coverage unless they edit a coverage
+  # controller; these main-branch floors are the gate.
   #
   # Sizing: when this gate was introduced main measured ~78.29% overall / ~84.99%
   # plugins; it has since oscillated 78.20%–78.42% overall (a ~0.2pt band that
@@ -63,8 +62,9 @@ jobs:
       shard-matrix: ${{ steps.plan.outputs.shard-matrix }}
       plugin_gate: ${{ steps.plan.outputs.plugin_gate }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Validate coverage planner examples
@@ -181,7 +181,9 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.coverage-plan.outputs.shard-matrix) }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Extend runner swap for the aggregated unit_tests compile
         run: |
@@ -195,14 +197,15 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-coverage"
-          # The lib-unit shard compiles the superset of the instrumented
-          # dependency graph and is the lane's sole producer on main.
-          save: ${{ matrix.kind == 'lib-unit' && 'true' || 'false' }}
+          # Keep one designated cache producer for ci-coverage: lib-unit today
+          # and unit-core once coverage_plan.py switches to split unit shards
+          # (phase 2 of the required-workflow-safe split).
+          save: ${{ (matrix.kind == 'lib-unit' || matrix.shard == 'unit-core') && 'true' || 'false' }}
           # Publish a complete instrumented dependency lane only after success.
           cache-on-failure: "false"
 
       - name: Install cargo-llvm-cov and cargo-nextest
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
@@ -213,19 +216,56 @@ jobs:
         run: cargo llvm-cov clean --workspace
 
       - name: Run lib and unit coverage
-        if: matrix.kind == 'lib-unit'
+        if: matrix.kind == 'lib-unit' || matrix.kind == 'unit'
         run: |
           set -euo pipefail
-          # One llvm-cov invocation compiles lib + the four unit targets together so a
-          # runner-loss after the library suite does not throw away that compile
-          # and then recompile ferrum-edge for the unit-test target (#3888).
-          cargo llvm-cov --no-report \
-            --lib \
-            --test unit_tests \
-            --test unit_plugins_a_tests \
-            --test unit_plugins_b_tests \
-            --test unit_gateway_core_tests
+          # Phase 1 of splitting lib-unit into five unit shards (runs 44421056963
+          # and 44464896365 lost the runner in the combined shard). Because the
+          # required-workflows ruleset executes coverage.yml from refs/heads/main
+          # while coverage_plan.py runs from the PR tree, accept both the legacy
+          # `lib-unit` row and the split `unit` rows here before switching the
+          # planner in phase 2.
+          if [ "$COVERAGE_KIND" = "lib-unit" ]; then
+            cargo llvm-cov --no-report \
+              --lib \
+              --test unit_tests \
+              --test unit_plugins_a_tests \
+              --test unit_plugins_b_tests \
+              --test unit_gateway_core_tests
+          elif [ "$COVERAGE_KIND" = "unit" ]; then
+            case "$UNIT_TARGET" in
+              lib)
+                cargo llvm-cov --no-report \
+                  --lib
+                ;;
+              unit_tests)
+                cargo llvm-cov --no-report \
+                  --test unit_tests
+                ;;
+              unit_plugins_a_tests)
+                cargo llvm-cov --no-report \
+                  --test unit_plugins_a_tests
+                ;;
+              unit_plugins_b_tests)
+                cargo llvm-cov --no-report \
+                  --test unit_plugins_b_tests
+                ;;
+              unit_gateway_core_tests)
+                cargo llvm-cov --no-report \
+                  --test unit_gateway_core_tests
+                ;;
+              *)
+                echo "::error::unexpected unit coverage target: ${UNIT_TARGET}" >&2
+                exit 1
+                ;;
+            esac
+          else
+            echo "::error::unexpected coverage shard kind: ${COVERAGE_KIND}" >&2
+            exit 1
+          fi
         env:
+          COVERAGE_KIND: ${{ matrix.kind }}
+          UNIT_TARGET: ${{ matrix.target }}
           RUST_BACKTRACE: 1
 
       - name: Run integration coverage shard
@@ -261,6 +301,16 @@ jobs:
           INTEGRATION_FILTERS: ${{ matrix.filters }}
           INTEGRATION_FILTERSET: ${{ matrix.filterset }}
           INTEGRATION_PARTITION: ${{ matrix.partition }}
+          # Same pooling as the functional step below. nextest runs every test
+          # in its own process, and cargo-llvm-cov's default `%p` name gave each
+          # one an ~11 MB profile, all copied again into the shard tar:
+          # mesh-routing wrote 357 (3.7 GB) in under 20 s and lost its hosted
+          # runner during that burst and while writing its 6.9 GB tar. Pooled,
+          # each instrumented binary's processes merge into at most four files
+          # (~41 MB for integration_tests; a shard that also runs the
+          # ferrum-cni binary gets four more), and the tar shrinks to the
+          # ~3.4 GB of instrumented binaries.
+          LLVM_PROFILE_FILE_NAME: ferrum-edge-integration-%4m.profraw
           RUST_BACKTRACE: 1
 
       - name: Start functional data-plane service containers
@@ -274,11 +324,15 @@ jobs:
           set -euo pipefail
 
           docker run -d --name ferrum-cov-redis -p 6379:6379 redis:7-alpine
-          docker run -d --name ferrum-cov-mongo -p 27017:27017 mongo:7
+          # GLIBC_TUNABLES keeps mongo:9 clear of its kernel 6.19-7.0.13 startup
+          # gate on the ubuntu-26.04 runners; see ci.yml (issue #6589).
+          docker run -d --name ferrum-cov-mongo -p 27017:27017 \
+            -e GLIBC_TUNABLES=glibc.pthread.rseq=1 mongo:9
           # A replica-set member advertises its own host:port, so it must run
           # on the host network at the port the driver dials.
           docker run -d --name ferrum-cov-mongo-rs --network host \
-            mongo:7 --replSet rs0 --port 27020 --bind_ip_all \
+            -e GLIBC_TUNABLES=glibc.pthread.rseq=1 \
+            mongo:9 --replSet rs0 --port 27020 --bind_ip_all \
             --setParameter enableTestCommands=1
           docker run -d --name ferrum-cov-postgres \
             -e POSTGRES_DB=ferrum \
@@ -496,12 +550,19 @@ jobs:
             -type d \( -name incremental -o -name .fingerprint \) -prune -o \
             -type f ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' ! -name '*.o' -print \
             > coverage-files.txt
-          echo "packaging $(grep -c '' coverage-files.txt) files ($(grep -c '\.profraw$' coverage-files.txt) profraw)"
+          profraw_count="$(grep -c '\.profraw$' coverage-files.txt || true)"
+          echo "packaging $(grep -c '' coverage-files.txt) files (${profraw_count} profraw)"
+          if [ "$profraw_count" -eq 0 ]; then
+            echo "::error::coverage shard ${COVERAGE_SHARD} produced 0 .profraw files" >&2
+            exit 1
+          fi
           tar -cf "coverage-${{ matrix.shard }}.tar" -T coverage-files.txt
           ls -lh "coverage-${{ matrix.shard }}.tar"
+        env:
+          COVERAGE_SHARD: ${{ matrix.shard }}
 
       - name: Upload coverage data
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: coverage-data-${{ matrix.shard }}
           path: coverage-${{ matrix.shard }}.tar
@@ -511,7 +572,7 @@ jobs:
   coverage-merge:
     name: Merge Coverage
     runs-on: ubuntu-26.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     needs:
       - coverage-plan
       - coverage-shard
@@ -532,17 +593,17 @@ jobs:
             echo "## Coverage Gate"
             echo ""
             echo "No coverage-relevant files changed in this run."
-            echo "Full coverage still runs on core source, proto/build-input, pushes to main, manual dispatch, and schedule."
-            echo "Classifiable pull-request and merge-group diffs run lib-unit plus the affected integration shards."
+            echo "Pull requests and merge groups skip coverage unless they edit a coverage controller; pushes to main, manual dispatch and schedule run the full matrix."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fail when planned coverage shards fail
         if: needs.coverage-plan.outputs.mode != 'skip' && needs.coverage-shard.result != 'success'
         run: exit 1
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.coverage-plan.outputs.mode != 'skip'
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-rust-ci
@@ -552,7 +613,7 @@ jobs:
 
       - name: Install cargo-llvm-cov
         if: needs.coverage-plan.outputs.mode != 'skip'
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-llvm-cov
 
@@ -780,7 +841,7 @@ jobs:
 
       - name: Upload coverage report
         if: always() && needs.coverage-plan.outputs.mode != 'skip'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: coverage-report
           path: coverage-report/

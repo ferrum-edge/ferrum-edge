@@ -172,6 +172,7 @@ fn summary_for(ctx: &RequestContext, status: u16) -> TransactionSummary {
         timestamp_received: "2026-03-23T12:00:00Z".to_string(),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/api/test".to_string(),
@@ -193,6 +194,7 @@ fn summary_for(ctx: &RequestContext, status: u16) -> TransactionSummary {
         error_class: None,
         body_error_class: None,
         body_completed: false,
+        response_delivery: Default::default(),
         bytes_sent: 0,
         bytes_received: 0,
         grpc_request_messages: 0,
@@ -768,7 +770,7 @@ async fn only_a_request_with_an_attempt_recorder_records_backend_attempts() {
 /// Run one HTTP/3 bridge attempt in its scope, then record how it ended at
 /// the bridge's one record point.
 async fn record_bridge_attempt(
-    ctx: &RequestContext,
+    ctx: &mut RequestContext,
     headers: &HashMap<String, String>,
     end: PlainBridgeAttemptEndForTest,
 ) {
@@ -788,7 +790,7 @@ fn attempt_outcome(span: &Value) -> (Option<i64>, Option<&str>) {
 async fn http3_bridge_attempts_record_the_class_their_terminal_reports() {
     let server = collector().await;
     let plugin = otel(Some(&endpoint(&server)), json!({}));
-    let (ctx, headers) = traced_request(&plugin).await;
+    let (mut ctx, headers) = traced_request(&plugin).await;
 
     // Every way an HTTP/3 → HTTP/1.1/HTTP/2 bridge attempt can end, each
     // recorded once, in order (issue #5875).
@@ -801,7 +803,7 @@ async fn http3_bridge_attempts_record_the_class_their_terminal_reports() {
         PlainBridgeAttemptEndForTest::UploadTooLarge,
         PlainBridgeAttemptEndForTest::Response(200),
     ] {
-        record_bridge_attempt(&ctx, &headers, end).await;
+        record_bridge_attempt(&mut ctx, &headers, end).await;
     }
 
     let clients = client_spans(&exported_spans(&server, 7).await);
@@ -852,7 +854,7 @@ async fn an_http3_bridge_attempt_budget_expiry_is_the_backends_only_after_handof
     // attempt is recorded the same way.
     for handed_off in [true, false] {
         let end = PlainBridgeAttemptEndForTest::GrpcWebDeadline { handed_off };
-        record_bridge_attempt(&ctx, &headers, end).await;
+        record_bridge_attempt(&mut ctx, &headers, end).await;
     }
 
     let clients = client_spans(&exported_spans(&server, 2).await);

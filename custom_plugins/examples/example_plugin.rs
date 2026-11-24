@@ -308,6 +308,16 @@ impl Plugin for ExamplePlugin {
     //     self.is_auth_plugin()
     // }
     //
+    // fn authentication_challenge(&self) -> Option<&'static str> {
+    //     // An auth plugin should name the `WWW-Authenticate` challenge
+    //     // (RFC 9110 §11.6.1) for its scheme, for example
+    //     // `Some(r#"Bearer realm="example""#)`. Every gateway `401` lists the
+    //     // challenges of the route's applicable auth plugins; a fixed,
+    //     // header-valid literal only. Without one, a `401` this plugin causes
+    //     // falls back to the other mechanisms' challenges or `ferrum-edge`.
+    //     None
+    // }
+    //
     // fn requires_response_body_buffering(&self) -> bool {
     //     // Return `true` if your plugin needs to inspect or transform the
     //     // response body. This disables streaming for proxies using this plugin.
@@ -334,4 +344,23 @@ pub fn create_plugin(
 
 pub fn failure_policy() -> crate::plugins::PluginFailurePolicy {
     crate::plugins::PluginFailurePolicy::KeepLastKnownGood
+}
+
+/// Config contract — required export. The plugin test sweep validates every
+/// example, checks that construction neither needs nor spawns onto a tokio
+/// runtime, and injects an unknown key into every nested object (this
+/// plugin's config is flat, so only the root key set applies). List examples
+/// that reach every nested object your plugin reads.
+pub fn config_contract() -> crate::plugins::PluginConfigContract {
+    crate::plugins::PluginConfigContract::closed(vec![
+        serde_json::json!({}),
+        serde_json::json!({
+            "header_value": "my-gateway",
+            "request_body_prefix": "prefix:",
+            "correlation_header_name": "x-example-correlation",
+            "protocol": "http",
+            "egresses_request_body_before_finalization": false
+        }),
+        serde_json::json!({"protocol": "tcp"}),
+    ])
 }

@@ -2,20 +2,14 @@
 //! it says it is.
 //!
 //! Each attestor consumes some piece of identity material gathered from the
-//! transport layer (Unix socket peer creds, mTLS peer certificate, projected
-//! K8s SA token) and returns the SPIFFE ID the workload is allowed to claim.
+//! transport layer and returns the SPIFFE ID the workload is allowed to claim.
+//! The mesh Workload API server (`build_mesh_workload_api_attestors` in
+//! `modes::mesh`) chains the Unix peer-credentials attestor (kernel-attested
+//! UID rules) with the dev-only static attestor.
 //!
-//! Attestors are layered so a workload-API server can run several in
-//! parallel: K8s PSAT for K8s pods, Unix peer-creds for VM workloads, and a
-//! cross-cluster federated JWT-SVID attestor for foreign trust domains.
-//!
-//! The trait is intentionally opaque on the input side — every attestor
-//! consumes the same [`PeerInfo`] struct; the parts it cares about (PID,
-//! peer cert, projected token) live as `Option`s so callers do not have to
-//! teach the trait about every new transport.
+//! Every attestor consumes the same [`PeerInfo`] struct: the kernel-attested
+//! `SO_PEERCRED` values the server read from the accepted socket.
 
-pub mod k8s_psat;
-pub mod spiffe_jwt_svid;
 pub mod static_id;
 pub mod unix;
 
@@ -34,14 +28,6 @@ pub struct PeerInfo {
     pub uid: Option<u32>,
     /// `SO_PEERCRED` GID, where supported.
     pub gid: Option<u32>,
-    /// DER-encoded peer certificate (mTLS terminator paths).
-    pub peer_cert_der: Option<Vec<u8>>,
-    /// Caller-supplied bearer token (e.g. K8s projected SA token presented
-    /// in a metadata field).
-    pub bearer_token: Option<String>,
-    /// Free-form metadata for transports that need to ship additional info
-    /// (e.g. socket path, namespace hint).
-    pub metadata: HashMap<String, String>,
 }
 
 /// Identity returned by a successful attestation.
@@ -72,7 +58,7 @@ pub enum AttestError {
 #[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait Attestor: Send + Sync + 'static {
-    /// Short kind identifier, e.g. "k8s_psat", "unix", "static".
+    /// Short kind identifier, e.g. "unix", "static".
     fn kind(&self) -> &'static str;
 
     /// Attest the peer. `Err(AttestError::NotApplicable)` signals that the
@@ -83,9 +69,9 @@ pub trait Attestor: Send + Sync + 'static {
 /// Run a chain of attestors, returning the first successful identity. If every
 /// attestor declines (`NotApplicable`), returns an aggregate failure.
 ///
-/// Hard attestor failures are intentionally non-terminal: a K8s PSAT failure
-/// records diagnostic context, but a later Unix peer-creds or static-dev
-/// attestor may still succeed. This matches Ferrum's existing multi-auth
+/// Hard attestor failures are intentionally non-terminal: one attestor's
+/// failure records diagnostic context, but a later attestor in the chain may
+/// still succeed. This matches Ferrum's existing multi-auth
 /// first-success-wins model and SPIRE-style selector composition. Operators
 /// who need terminal rejection should configure mutually exclusive attestor
 /// chains for that listener instead of mixing fallback identity sources.

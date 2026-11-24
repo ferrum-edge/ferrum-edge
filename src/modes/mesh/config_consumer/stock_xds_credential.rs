@@ -135,11 +135,10 @@ fn alloc_read_epoch() -> StockCredentialReadEpoch {
 ///
 /// A bearer is already capped at 64 KiB by the credential reader; this bounds
 /// the *parsing* work on a value that is untrusted input from an external
-/// issuer. Anything larger simply has no `exp` hint.
+/// issuer. Anything larger simply has no `exp` hint. It also bounds the
+/// decoded payload handed to the JSON parser: unpadded base64url of at most
+/// 8 KiB decodes to at most 6 KiB.
 const MAX_JWT_SEGMENT_BYTES: usize = 8 * 1024;
-
-/// Longest decoded JWT payload this decoder will parse as JSON.
-const MAX_JWT_PAYLOAD_BYTES: usize = 8 * 1024;
 
 /// In-process content identity of a bearer credential.
 ///
@@ -548,9 +547,7 @@ impl StockXdsCredentialSource {
     }
 
     // Constructed by the external mesh stock-xDS test suites, which drive the
-    // production client with no bearer configured. The binary target has no
-    // downstream consumer, so the accessor is dead there by construction.
-    #[allow(dead_code)]
+    // production client with no bearer configured.
     pub fn unauthenticated() -> Self {
         Self {
             path: None,
@@ -722,8 +719,7 @@ impl StockBearerCredential {
 
     /// The in-process content identity. Read by the external credential tests
     /// to prove a rotation is observed as a CONTENT change (production compares
-    /// through `observed_state`), so it is dead in the binary target.
-    #[allow(dead_code)]
+    /// through `observed_state`).
     pub fn fingerprint(&self) -> StockCredentialFingerprint {
         self.fingerprint
     }
@@ -890,9 +886,6 @@ pub fn jwt_expiration_hint(raw_token: &str) -> Option<i64> {
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
         .ok()?;
-    if decoded.len() > MAX_JWT_PAYLOAD_BYTES {
-        return None;
-    }
     let claim: JwtExpClaim = serde_json::from_slice(&decoded).ok()?;
     numeric_date_floor_secs(claim.exp?.get())
 }

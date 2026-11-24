@@ -6,27 +6,28 @@ The CORS plugin handles the [CORS protocol](https://developer.mozilla.org/en-US/
 
 ### What the plugin does
 
-1. **Preflight interception** -- When a browser sends an `OPTIONS` request with `Origin` and `Access-Control-Request-Method` headers, the native direct plugin validates the origin and requested method against the configured allow-lists. If both pass, it responds with `204 No Content` and all required CORS headers. If either fails (or a requested header is not allowed), it responds with `403 Forbidden` and a JSON error body. The request never reaches the backend unless `preflight_continue` is enabled.
+1. **Preflight interception** -- When a browser sends an `OPTIONS` request with `Origin` and `Access-Control-Request-Method` headers, the native direct plugin validates the origin and requested method against the configured allow-lists. If both pass, it responds with `204 No Content` and all required CORS headers. If either fails, it responds with `403 Forbidden` and a JSON error body. Requested headers (`Access-Control-Request-Headers`) are not refused by a single policy: the response carries the configured `Access-Control-Allow-Headers` list and the browser blocks the follow-up request when a header it needs is missing from that list. The gateway returns `403 "CORS header not allowed"` only when [multiple CORS policies](#multiple-instances) compose and a requested header is allowed by at least one of them but not by every one. The request never reaches the backend unless `preflight_continue` is enabled.
 
 2. **Actual-request origin enforcement** -- Non-preflight requests that carry an `Origin` header are checked against the allowed origins list. A native direct policy rejects disallowed origins with `403 Forbidden` and the JSON body `{"error":"CORS origin not allowed"}`; an Istio projection forwards unmatched actual requests while stripping every upstream `Access-Control-*` response field and adding no gateway CORS authorization fields. `allowed_methods` and `allowed_headers` are preflight policy only: they never reject an actual request or re-authorize headers on that phase.
 
 3. **Response header injection** -- For allowed cross-origin requests that pass through to the backend, the plugin injects `Access-Control-Allow-Origin`, `Vary`, and optionally `Access-Control-Allow-Credentials` and `Access-Control-Expose-Headers` into the backend response before it reaches the client. Every participating CORS policy merges `Origin` into `Vary`, including responses to originless or unmatched requests. Preflight responses also vary on `Access-Control-Request-Method` and `Access-Control-Request-Headers`. Existing `Vary` tokens and `Vary: *` are preserved.
 
-Denials use a JSON object with a fixed `error` message (`CORS origin not allowed`, `CORS method not allowed`, or `CORS header not allowed`). Denied method and header values are not reflected. Successful preflights keep their empty response bodies.
+Denials use a JSON object with a fixed `error` message (`CORS origin not allowed`, `CORS method not allowed`, or — for composed policies only — `CORS header not allowed`). Denied method and header values are not reflected. Successful preflights keep their empty response bodies.
 
 ## Configuration
 
-The CORS plugin is configured via the `plugin_configs` section in your YAML configuration file, or through the admin API when running in control-plane mode.
+The CORS plugin is configured via the `plugin_configs` section in your YAML configuration file, or through the Admin API in `database` or `cp` mode.
 
 ### Configuration Fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `allowed_origins` | `(string \| object)[]` | required, max 64 entries | Origins permitted to make cross-origin requests. Use `"*"` only for intentional allow-all. **Plain strings are native syntax:** exact `scheme://host[:port]` values are URL-parsed and canonicalized once at config load (scheme/host case, default ports, IDNA, IPv4, and IPv6) and matched case-insensitively, and `"*.company.com"` matches subdomains; request matching remains a direct comparison with no per-request URL parse/allocation. **Istio-shaped objects carry exactly one of `exact` / `prefix` / `regex` and retain literal source semantics:** object `exact` is a byte-for-byte, case-sensitive comparison with no canonicalization and no wildcard interpretation (so `{exact: "*.example.com"}` matches only that literal string), except `{exact: "*"}` which is Istio allow-all. Each matcher value is bounded at 512 bytes; regexes are compiled once at config construction/reload under explicit complexity limits. |
-| `allowed_methods` | `string[]` | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Case-sensitive preflight-only policy returned in `Access-Control-Allow-Methods`. Native preflights for unlisted methods are rejected with 403. With credentials disabled, `*` allows any valid method; with credentials enabled, it is a literal token. The list is not evaluated against an actual request's method. |
-| `allowed_headers` | `string[]` | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Case-insensitive preflight-only policy returned in `Access-Control-Allow-Headers`. With credentials disabled, `*` permits every header except `Authorization`, which requires an explicit entry. With credentials enabled, `*` is a literal token. It is not evaluated against headers on the actual request. |
-| `exposed_headers` | `string[]` | `[]` | Response headers the browser is allowed to access via JavaScript, returned in `Access-Control-Expose-Headers`. |
+| `allowed_methods` | `string[]` | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Case-sensitive preflight-only policy returned in `Access-Control-Allow-Methods`. Native preflights for unlisted methods are rejected with 403. With credentials disabled, `*` allows any valid method; with credentials enabled, it is a literal token. The list is not evaluated against an actual request's method. Max 128 entries of at most 256 bytes each. |
+| `allowed_headers` | `string[]` | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Case-insensitive preflight-only policy returned in `Access-Control-Allow-Headers`. With credentials disabled, `*` permits every header except `Authorization`, which requires an explicit entry. With credentials enabled, `*` is a literal token. It is not evaluated against headers on the actual request. A single policy does not refuse an unlisted requested header; the browser enforces the emitted list. Max 128 entries of at most 256 bytes each. |
+| `exposed_headers` | `string[]` | `[]` | Case-insensitive list of response headers the browser is allowed to access via JavaScript, returned in `Access-Control-Expose-Headers`. With credentials disabled, `*` exposes every response header; with credentials enabled, it is a literal token. Max 128 entries of at most 256 bytes each. |
 | `allow_credentials` | `bool` | `false` | When `true`, sends `Access-Control-Allow-Credentials: true`. Cannot be used with wildcard origins, opaque exact `null`, or an effectively universal prefix/regex (see below). A credentialed prefix must be the host-bounded `scheme://host:` form. |
+| `allow_private_network` | `bool` | `false` | Private Network Access opt-in. When `true`, a preflight from an allowed origin that carries `Access-Control-Request-Private-Network: true` is answered with `Access-Control-Allow-Private-Network: true`. See [Private Network Access](#private-network-access). |
 | `max_age` | `u64` | `86400` | Number of seconds browsers should cache preflight results (`Access-Control-Max-Age`), from 0 through 18446744073709551615. Translated Istio omission remains absent. |
 | `preflight_continue` | `bool` | `false` | When `true`, preflight requests are passed through to the backend instead of being short-circuited by the plugin. Useful if your backend needs to handle `OPTIONS` itself. |
 | `unmatched_preflights` | `forward` or `ignore` | not set | Translation marker used for Istio policies. `forward` represents omitted/`UNSPECIFIED`/`FORWARD`; `ignore` answers unmatched preflights locally with 200 and no CORS authorization fields. Its presence also preserves empty method/header lists and absent max age. Do not combine it with `preflight_continue`. |
@@ -36,6 +37,36 @@ whitespace-padded tokens, and an omitted/empty `allowed_origins` policy are
 rejected during startup or reload. There is no implicit wildcard origin policy;
 write `allowed_origins: ["*"]` when allow-all is intended.
 
+### Private Network Access
+
+Clients that implement [Private Network Access](https://wicg.github.io/private-network-access/)
+(PNA) send a preflight carrying `Access-Control-Request-Private-Network: true`
+before a public website calls an API on a private or local address, and block
+the call unless the preflight response carries
+`Access-Control-Allow-Private-Network: true`. Ferrum strips every backend
+`Access-Control-*` field on CORS-owned responses, so the backend cannot supply
+that field itself; set `allow_private_network: true` on the gateway policy
+instead:
+
+```yaml
+config:
+  allowed_origins: ["https://app.vendor.example"]
+  allow_private_network: true
+```
+
+The field is emitted only on a preflight that asked for it, only for an allowed
+origin, and never on actual responses. With `preflight_continue: true` the
+gateway value is written onto the forwarded response. When several CORS
+policies compose, every matching policy must enable `allow_private_network`.
+
+`allow_private_network` answers only the PNA preflight protocol. Chrome 142
+and later replaced the PNA experiment with
+[Local Network Access](https://developer.chrome.com/blog/local-network-access)
+(LNA), a user permission prompt that this response field neither satisfies nor
+replaces. If Chrome blocks a public-to-local call, check the site's local
+network permission in the browser; enabling this option does not change that
+decision, and a call the user has permitted needs no PNA response field.
+
 ### Credentials and Wildcard Origins
 
 Per the CORS specification, `Access-Control-Allow-Origin: *` cannot be combined with `Access-Control-Allow-Credentials: true`. If you configure `allow_credentials: true` with wildcard origins (`["*"]` or `{exact: "*"}`), the plugin logs a warning and automatically disables credentials. That drop-credentials contract is intentional for exact allow-all.
@@ -44,8 +75,10 @@ Opaque exact `{exact: "null"}` and effectively universal **prefix** and **regex*
 
 To use credentials, the origin policy must constrain the host.
 
+- **Wildcard subdomain.** A native `"*.suffix"` entry admits every host under `suffix`. When `suffix` is a single label (`"*.com"`, `"*.localhost"`), is itself on the Public Suffix List (`"*.co.uk"`, `"*.github.io"`), or is the parent of a Public Suffix List wildcard rule (`"*.run.app"`, `"*.compute.amazonaws.com"`), anyone can register a matching host, so the entry is classified effectively universal and refused with `allow_credentials: true`. A domain with any Public Suffix List rule beneath it, such as a hosting provider's apex (`"*.amazonaws.com"` above `s3.amazonaws.com`), is refused the same way, using an index generated from the bundled list. It is still accepted without credentials. `"*.example.com"`, `"*.api.example.co.uk"` and `"*.tenant.github.io"` stay strict.
+
 - **Prefix.** Prefix matching is an unbounded `starts_with` on the raw `Origin` header — it never parses the origin and therefore never stops at an origin boundary. A bare `{prefix: "https://app.example.com"}` also matches `https://app.example.com.evil.net`; `{prefix: "https://app."}` also matches `https://app.evil.com`; `{prefix: "https://preview-"}` also matches `https://preview-evil.com`; and `{prefix: "https://app.example.com:8443"}` is extendable in the same way (`:84` prefix-matches `:8443`). The **only** prefix shape that pins the host is `scheme://host:` — a trailing port separator, so any matching origin must continue with `:` and its host is exactly the prefix's host. Every other prefix shape is classified effectively universal and refused with `allow_credentials: true`. This is scheme-agnostic, so `{prefix: "chrome-extension://<id>:"}` behaves the same way.
-- **Regex.** It must not match `null` or every origin of a scheme. Universality is probed against reserved DNS-shaped origins only, so an ordinary hostname character class such as `{regex: "https://[\\w.-]+"}` or `{regex: "^https://([a-z0-9-]+\\.)+[a-z]{2,}$"}` is correctly classified as effectively universal and refused. An anchored host-constraining pattern such as `{regex: "^https://[a-z0-9-]+\\.example\\.com$"}` stays strict.
+- **Regex.** It must not match `null` or every origin of a scheme. Universality is probed against reserved DNS-shaped origins only, so an ordinary hostname character class such as `{regex: "https://[\\w.-]+"}` or `{regex: "^https://([a-z0-9-]+\\.)+[a-z]{2,}$"}` is correctly classified as effectively universal and refused. Beyond those probes, a credentialed regex must **prove** that it pins the host: Ferrum parses the pattern and extracts the literal suffixes every match must end with. Each must be a complete origin, contain the whole literal authority (`://host[:port]`), or end in a fixed domain after its first `.` that is neither a single label nor a public suffix (nor the parent of a Public Suffix List wildcard rule), optionally followed by a literal `:port`. So `{regex: "^https://[a-z]+\\.example\\.com$"}`, `{regex: "^https://pr-[0-9]+\\.preview\\.example\\.com$"}` and finite alternations such as `{regex: "^https://(?:a|b)\\.github\\.io$"}` stay strict, while `{regex: "https://[a-z]{2,}\\.com"}`, `{regex: "https://[a-z]+\\.github\\.io"}` and `{regex: "https://[a-z]+example\\.com"}` (also matches `evilexample.com`) are refused. A fixed DNS suffix followed by a variable numeric port (`[a-z]+\\.example\\.com:[0-9]+`) is proven on the host part, and a pattern whose every match starts with a literal `scheme://host:` (including a bracketed IPv6 host) also pins the host, so a variable port such as `{regex: "^https://app\\.example\\.com:[0-9]+$"}` stays strict. Patterns the analysis cannot bound, such as most case-insensitive `(?i)` patterns, are refused with credentials too; use explicit alternatives or the host-bounded prefix form instead. Istio `corsPolicy` translation still projects a credentialed regex that only fails this proof (so the route keeps CORS ownership); `cors` construction then refuses it, and because `cors` is fail-closed the reload is rejected and the last published policy keeps serving. An anchored host-constraining pattern such as `{regex: "^https://[a-z0-9-]+\\.example\\.com$"}` stays strict.
 
 For a credentialed policy, prefer `{exact: "https://app.example.com"}`, the native wildcard-subdomain form `"*.example.com"`, an anchored host-constraining `regex`, or the host-bounded `{prefix: "https://app.example.com:"}`.
 
@@ -65,10 +98,11 @@ the proxy core (see [routing.md](routing.md#websocket-origin-admission)).
 These fields are independent: a strict CORS allowlist does **not** restrict WebSocket
 upgrades until `allowed_ws_origins` is populated. `*` is not a wildcard on
 `allowed_ws_origins` (unlike `cors.allowed_origins`); the empty list is the only
-allow-all, and Admin API / `ferrum-edge validate` reject `"*"`. At config load the
-gateway warns when a proxy has non-wildcard CORS but an empty `allowed_ws_origins`
-list, and also warns once per proxy whose loaded `allowed_ws_origins` still
-contains `*` or a non-origin entry.
+allow-all, and Admin API writes, file-mode loads (startup and SIGHUP reload), and
+`ferrum-edge validate` reject `"*"`. At config load the gateway warns when a proxy has
+non-wildcard CORS but an empty `allowed_ws_origins` list, and in database, CP and DP
+modes also warns once per proxy whose stored `allowed_ws_origins` still contains `*`
+or a non-origin entry.
 
 ## Usage Examples
 
@@ -240,6 +274,8 @@ Origin matchers are admitted against explicit bounds on the cold config path. Ev
 | --- | --- |
 | `allowed_origins` entries | 64 |
 | Bytes per matcher value (native string, `exact`, `prefix`, `regex` pattern) | 512 |
+| `allowed_methods` / `allowed_headers` / `exposed_headers` entries (each list) | 128 |
+| Bytes per method or header-name token | 256 |
 | Compiled regex program size | 64 KiB |
 | Regex lazy-DFA cache | 64 KiB |
 | Regex AST nesting depth | 24 |
@@ -304,7 +340,7 @@ CORS plugin is emitted, and the VirtualService's
 `status.ferrum.translation.deferred_fields` names `http[].corsPolicy`. That
 applies to a malformed or unknown origin matcher, a matcher value or list beyond
 its bound, an un-compilable or over-complex regex, an unparseable `maxAge`, an
-invalid method/header token, and credentialed exact `*`, opaque exact `null`, or an effectively universal prefix/regex (which cannot emit a host-constrained origin credentialed CORS requires). Ferrum never approximates
+invalid method/header token, and credentialed exact `*`, opaque exact `null`, or an effectively universal prefix, or a regex the reserved-name probes show to be universal (which cannot emit a host-constrained origin credentialed CORS requires). A credentialed regex that passes those probes but fails the host-pinning proof is instead projected, and `cors` construction refuses it. That rejects the update, and the previous generation keeps serving. Ferrum never approximates
 or widens such a policy.
 
 These rules do not alter operator-authored native direct-plugin behavior.
@@ -322,7 +358,11 @@ earlier instance cannot short-circuit a stricter later preflight policy.
 
 Method intersections are case-sensitive (`REPORT` and `report` are distinct);
 header-name intersections are case-insensitive. An uncredentialed wildcard
-intersected with a specific list retains that list. `Authorization` survives
+intersected with a specific list retains that list. This applies to
+`exposed_headers` too: an uncredentialed `["*"]` intersected with
+`["Content-Disposition"]` exposes `Content-Disposition`, and two uncredentialed
+`["*"]` policies expose `*`. `allow_private_network` composes like
+credentials: every matching policy must enable it. `Authorization` survives
 only when every sibling lists it explicitly, even if a sibling allows `*`.
 Each policy's credential setting controls its wildcard meaning; a credentialed
 policy's literal `*` never becomes a wildcard when composed with a policy that
@@ -337,89 +377,37 @@ The same rules apply when gRPC-Web requests use the gRPC request-policy chain.
 
 ## Request Flow
 
-### Preflight Request (OPTIONS)
+Allowed preflight and actual requests:
 
 ```
 Browser                    Gateway (CORS Plugin)                Backend
   |                              |                                |
   |-- OPTIONS /api/users ------->|                                |
-  |   Origin: https://app.com   |                                |
-  |   Access-Control-Request-    |                                |
+  |   Origin: https://app.com    |-- origin + method allowed       |
+  |   Access-Control-Request-    |   (request never hits backend)  |
   |     Method: DELETE           |                                |
-  |                              |-- Check origin: allowed? ---   |
-  |                              |-- Check method: allowed? ---   |
-  |                              |                                |
-  |<---- 204 No Content --------|   (request never hits backend)  |
-  |   Access-Control-Allow-      |                                |
-  |     Origin: https://app.com |                                |
-  |   Access-Control-Allow-      |                                |
-  |     Methods: GET, POST, ...  |                                |
-  |   Access-Control-Max-Age:    |                                |
-  |     86400                    |                                |
-```
-
-### Preflight Rejected (Disallowed Origin)
-
-```
-Browser                    Gateway (CORS Plugin)
-  |                              |
-  |-- OPTIONS /api/users ------->|
-  |   Origin: https://evil.com  |
-  |   Access-Control-Request-    |
-  |     Method: GET              |
-  |                              |-- Check origin: NOT allowed ---
-  |                              |
-  |<---- 403 Forbidden ---------|
-  |   {"error":"CORS origin     |
-  |      not allowed"}           |
-```
-
-### Preflight Rejected (Disallowed Method)
-
-```
-Browser                    Gateway (CORS Plugin)
-  |                              |
-  |-- OPTIONS /api/users ------->|
-  |   Origin: https://app.com   |
-  |   Access-Control-Request-    |
-  |     Method: TRACE            |
-  |                              |-- Check origin: allowed ------
-  |                              |-- Check method: NOT allowed --
-  |                              |
-  |<---- 403 Forbidden ---------|
-  |   {"error":"CORS method     |
-  |      not allowed"}           |
-```
-
-### Actual Cross-Origin Request (Allowed)
-
-```
-Browser                    Gateway (CORS Plugin)                Backend
+  |<---- 204 No Content ---------|                                |
+  |   Access-Control-Allow-*     |                                |
+  |   Access-Control-Max-Age     |                                |
   |                              |                                |
   |-- GET /api/users ----------->|                                |
-  |   Origin: https://app.com   |-- origin allowed, stash ----   |
-  |                              |-- proxy to backend ----------->|
-  |                              |                                |
-  |                              |<--- 200 OK + body ------------|
-  |                              |-- inject CORS headers ------   |
-  |<---- 200 OK + body ---------|                                |
+  |   Origin: https://app.com    |-- origin allowed -------------->|
+  |                              |<--- 200 OK + body --------------|
+  |<---- 200 OK + body ----------|-- inject CORS headers           |
   |   Access-Control-Allow-      |                                |
-  |     Origin: https://app.com |                                |
-  |   Vary: Origin              |                                |
+  |     Origin: https://app.com  |                                |
+  |   Vary: Origin               |                                |
 ```
 
-### Actual Cross-Origin Request (Disallowed Origin)
+Rejections by a native direct policy with `preflight_continue: false`:
 
-```
-Browser                    Gateway (CORS Plugin)
-  |                              |
-  |-- GET /api/users ----------->|
-  |   Origin: https://evil.com  |-- origin NOT allowed ----------
-  |                              |
-  |<---- 403 Forbidden ---------|
-  |   {"error":"CORS origin     |
-  |      not allowed"}           |
-```
+| Case | Status | Body |
+|---|---|---|
+| Preflight from a disallowed origin | `403` | `{"error":"CORS origin not allowed"}` |
+| Preflight requesting a disallowed method | `403` | `{"error":"CORS method not allowed"}` |
+| Actual request from a disallowed origin | `403` | `{"error":"CORS origin not allowed"}` |
+
+Other configurations behave differently. With `preflight_continue: true`, allowed preflights are forwarded and keep the backend's status and body (see [Example 6](#example-6-backend-handles-options)). An Istio-translated policy forwards an unmatched actual request without CORS authorization fields (see [Istio translation semantics](#istio-translation-semantics)). Composed policies can also refuse a requested header with `403 CORS header not allowed` (see [Multiple instances](#multiple-instances)).
 
 ## Response Headers Reference
 
@@ -430,7 +418,8 @@ Browser                    Gateway (CORS Plugin)
 | `Access-Control-Allow-Headers` | Preflight only | Comma-separated list from `allowed_headers` |
 | `Access-Control-Max-Age` | Preflight only | Seconds from `max_age` |
 | `Access-Control-Allow-Credentials` | When `allow_credentials: true` | `true` |
-| `Access-Control-Expose-Headers` | When `exposed_headers` is non-empty | Comma-separated list |
+| `Access-Control-Expose-Headers` | When `exposed_headers` is non-empty | Comma-separated list (the composed intersection when several policies apply) |
+| `Access-Control-Allow-Private-Network` | Preflight only, when `allow_private_network: true` and the preflight sent `Access-Control-Request-Private-Network: true` | `true` |
 | `Vary` | Always on allowed responses | Actual: `Origin`. Preflight: `Origin`, `Access-Control-Request-Method`, and `Access-Control-Request-Headers` (including when the last header is absent, so a cached headerless approval cannot satisfy a later header-bearing preflight). Existing backend `Vary` tokens are preserved. |
 
 ## Testing
@@ -481,11 +470,15 @@ curl -v http://localhost:8000/api/users
 
 1. **403 "CORS origin not allowed"**
 
-   The `Origin` header value does not match any entry in `allowed_origins`. Exact origins must include the scheme (e.g., `https://example.com`, not `example.com`). Origin matching is case-insensitive. If using wildcard subdomain patterns (e.g., `*.company.com`), note that the bare domain (`https://company.com`) does not match — add it as a separate exact entry if needed.
+   The `Origin` header value does not match any entry in `allowed_origins`. Exact origins must include the scheme (e.g., `https://example.com`, not `example.com`). Native plain-string exact origins and `*.suffix` wildcard subdomains match case-insensitively; object `exact` and `prefix` matchers are byte-for-byte and case-sensitive, and `regex` is case-sensitive unless the pattern uses `(?i)`. If using wildcard subdomain patterns (e.g., `*.company.com`), note that the bare domain (`https://company.com`) does not match — add it as a separate exact entry if needed.
 
 2. **403 "CORS method not allowed" / "CORS header not allowed"**
 
-   The preflight's `Access-Control-Request-Method` names a method not in `allowed_methods`, or `Access-Control-Request-Headers` names a header not in `allowed_headers`. Add it to the list or check the client request.
+   `CORS method not allowed`: the preflight's `Access-Control-Request-Method` names a method not in `allowed_methods`. Add it to the list or check the client request.
+
+   `CORS header not allowed` appears only when several CORS policies compose: `Access-Control-Request-Headers` names a header that at least one policy allows but the intersection of all of them does not. Add the header to every policy, or remove the stricter one.
+
+   A header that no policy allows is not refused with 403: the preflight succeeds with the configured `Access-Control-Allow-Headers` list, and the browser then blocks the actual request. If the browser console reports a header missing from `Access-Control-Allow-Headers`, add it to `allowed_headers`.
 
 3. **Credentials not working with wildcard origins**
 

@@ -104,7 +104,10 @@ fn mixed_istio_snapshot_emits_update_per_supported_kind() {
             "security.istio.io/v1",
             "RequestAuthentication",
             "jwt",
-            json!({ "jwtRules": [{ "issuer": "https://issuer.example.com" }] }),
+            json!({ "jwtRules": [{
+                "issuer": "https://issuer.example.com",
+                "jwksUri": "https://issuer.example.com/jwks"
+            }] }),
         ),
         object(
             "networking.istio.io/v1",
@@ -205,7 +208,10 @@ fn newly_covered_kinds_report_accepted_on_valid_input() {
             "security.istio.io/v1",
             "RequestAuthentication",
             "ra-ok",
-            json!({ "jwtRules": [{ "issuer": "https://issuer.example.com" }] }),
+            json!({ "jwtRules": [{
+                "issuer": "https://issuer.example.com",
+                "jwksUri": "https://issuer.example.com/jwks"
+            }] }),
         ),
         object(
             "networking.istio.io/v1",
@@ -1233,11 +1239,12 @@ fn sidecar_outbound_policy_enforced_flag_is_resource_local_not_workload_selectio
     );
 }
 
-/// A REJECTED Sidecar is dropped from the translation entirely, so it enforces
-/// nothing. Its detail block must carry the explicit `false` qualifier — an
-/// `outbound_traffic_policy` with no sibling flag reads as enforced.
+/// A REJECTED Sidecar is no longer dropped (GHSA-2r85-85hh-23mw): it is
+/// published as a fail-closed marker, so its detail block reports what that
+/// marker enforces. An untranslatable `ingress` becomes `ingress: []`, while an
+/// omitted `egress` and a translatable `outboundTrafficPolicy` are kept.
 #[test]
-fn rejected_sidecar_reports_outbound_policy_as_not_enforced() {
+fn rejected_sidecar_reports_its_fail_closed_marker() {
     let obj = object(
         "networking.istio.io/v1",
         "Sidecar",
@@ -1256,16 +1263,68 @@ fn rejected_sidecar_reports_outbound_policy_as_not_enforced() {
         Some("False"),
         "the fixture must actually be rejected, or the assertion below is vacuous"
     );
+    assert!(
+        condition["message"]
+            .as_str()
+            .unwrap()
+            .contains("fail closed"),
+        "the status must state the fail-closed consequence: {condition}"
+    );
     let translation = sidecar_translation(&updates, "sc-rejected");
+    assert_eq!(translation["enforcement"], json!("fail_closed"));
     assert_eq!(
         translation["outbound_traffic_policy"],
-        json!("REGISTRY_ONLY"),
-        "the classified mode is still reported for diagnosis"
+        json!("REGISTRY_ONLY")
     );
     assert_eq!(
         translation["outbound_traffic_policy_enforced"],
+        json!(true),
+        "the marker is enforced under the same gate as an accepted Sidecar"
+    );
+    assert_eq!(translation["ingress_blocked"], json!(true));
+    assert_eq!(
+        translation["egress_blocked"],
         json!(false),
-        "a dropped resource enforces nothing; the qualifier must be explicit"
+        "an omitted egress block still inherits the namespace default"
+    );
+}
+
+/// An untranslatable `egress` block blocks all egress with REGISTRY_ONLY,
+/// whatever `outboundTrafficPolicy` asked for; with the rollout gate off the
+/// marker is reported but not enforced.
+#[test]
+fn rejected_sidecar_egress_reports_block_all_registry_only() {
+    let obj = || {
+        object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "sc-bad-egress",
+            json!({
+                "egress": [{ "hosts": "not-an-array" }],
+                "outboundTrafficPolicy": { "mode": "ALLOW_ANY" },
+            }),
+        )
+    };
+    let updates =
+        plan_istio_status_updates(&[obj()], options().with_mesh_sidecar_ingress_enforced(true));
+    assert_eq!(
+        sidecar_condition(&updates, "sc-bad-egress")["status"].as_str(),
+        Some("False")
+    );
+    let translation = sidecar_translation(&updates, "sc-bad-egress");
+    assert_eq!(
+        translation["outbound_traffic_policy"],
+        json!("REGISTRY_ONLY")
+    );
+    assert_eq!(translation["outbound_traffic_policy_enforced"], json!(true));
+    assert_eq!(translation["egress_blocked"], json!(true));
+    assert_eq!(translation["ingress_blocked"], json!(false));
+
+    let gated_off = plan_istio_status_updates(&[obj()], options());
+    assert_eq!(
+        sidecar_translation(&gated_off, "sc-bad-egress")["outbound_traffic_policy_enforced"],
+        json!(false),
+        "without FERRUM_MESH_SIDECAR_ENFORCED the marker is not applied"
     );
 }
 
@@ -1616,4 +1675,130 @@ fn service_entry_static_wildcard_host_with_endpoints_is_not_deferred() {
         !deferred.iter().any(|f| f.starts_with("spec.hosts[]:")),
         "a STATIC wildcard entry with endpoints materializes and must not be deferred: {deferred:?}"
     );
+}
+
+/// Issue #7243: `spec.workloadSelector` is carried but not consumed (no
+/// endpoint selection from the selected workloads), so status must report it
+/// as deferred instead of presenting the entry as fully effective.
+#[test]
+fn service_entry_workload_selector_is_reported_deferred() {
+    let deferred_for = |spec: Value| -> Vec<String> {
+        let obj = object("networking.istio.io/v1", "ServiceEntry", "selected", spec);
+        let updates = plan_istio_status_updates(&[obj], options());
+        let condition = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(condition["status"].as_str(), Some("True"));
+        updates[0].ferrum_detail.as_ref().unwrap()["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    };
+    let base = json!({
+        "hosts": ["api.example.com"],
+        "resolution": "DNS",
+        "location": "MESH_EXTERNAL",
+        "ports": [{"number": 443, "name": "https", "protocol": "TLS"}]
+    });
+    let mut selected = base.clone();
+    selected["workloadSelector"] = json!({"labels": {"app": "vm"}});
+
+    assert!(
+        deferred_for(selected)
+            .iter()
+            .any(|field| field.starts_with("spec.workloadSelector")),
+        "a ServiceEntry workloadSelector must be reported deferred"
+    );
+    assert!(
+        !deferred_for(base)
+            .iter()
+            .any(|field| field.starts_with("spec.workloadSelector")),
+        "an entry without workloadSelector must not report it"
+    );
+}
+
+/// Issue #7390: a mesh-bound VirtualService's `http[]` routes are applied only
+/// by NodeWaypoint data planes, so its status must say so instead of reporting
+/// the route count alone. A VirtualService bound only to an ingress gateway,
+/// or one with no `http[]` routes, carries no such note.
+#[test]
+fn mesh_bound_virtual_service_status_reports_where_http_routes_apply() {
+    use ferrum_edge::k8s_controller::istio_status::{
+        VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE, VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE,
+    };
+    let http = json!([{
+        "route": [{"destination": {
+            "host": "reviews.default.svc.cluster.local",
+            "port": {"number": 8080}
+        }}]
+    }]);
+    let report = |name: &str, spec: Value| -> (String, Value) {
+        let obj = object("networking.istio.io/v1", "VirtualService", name, spec);
+        let updates = plan_istio_status_updates(&[obj], options());
+        let update = update_for(&updates, "VirtualService", name);
+        let condition = find_condition(
+            update.status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(condition["status"].as_str(), Some("True"), "{name}");
+        (
+            condition["message"].as_str().unwrap().to_string(),
+            update.ferrum_detail.as_ref().unwrap()["translation"]["mesh_http_routes"].clone(),
+        )
+    };
+
+    for (name, gateways) in [
+        ("omitted-gateways", None),
+        ("explicit-mesh", Some(json!(["mesh", "ingress-gw"]))),
+    ] {
+        let mut spec = json!({"hosts": ["reviews.default.svc.cluster.local"], "http": http});
+        if let Some(gateways) = gateways {
+            spec["gateways"] = gateways;
+        }
+        let (message, scope) = report(name, spec);
+        assert_eq!(
+            scope,
+            json!(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE),
+            "{name}: the status records that only NodeWaypoint applies the routes"
+        );
+        assert!(
+            message.contains(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE),
+            "{name}: the condition message names the topologies that ignore them: {message}"
+        );
+    }
+
+    let (message, scope) = report(
+        "ingress-only",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "gateways": ["ingress-gw"],
+            "http": http
+        }),
+    );
+    assert_eq!(
+        scope,
+        Value::Null,
+        "an ingress-only VirtualService binds no mesh"
+    );
+    assert!(!message.contains(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE));
+
+    let (message, scope) = report(
+        "tcp-only",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "tcp": [{
+                "match": [{"port": 9000}],
+                "route": [{"destination": {
+                    "host": "reviews.default.svc.cluster.local",
+                    "port": {"number": 9000}
+                }}]
+            }]
+        }),
+    );
+    assert_eq!(scope, Value::Null, "no http[] routes, nothing to qualify");
+    assert!(!message.contains(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE));
 }

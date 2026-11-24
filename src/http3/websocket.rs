@@ -101,11 +101,11 @@
 //! accounting as the H1/H2 path so backend isolation and target-level
 //! connection counts stay consistent across frontends:
 //!
-//! - Backend connect failure → `record_failure(502, is_pre_wire, is_half_open_probe)`
+//! - Backend connect failure → `settle(ticket, Failure { 502, is_pre_wire })`
 //!   using the same `request_reached_wire` boundary as the H1/H2 retry
 //!   loop. A backend that received the upgrade and rejected it (post-wire)
 //!   does NOT charge passive health as a connect-class failure.
-//! - Successful 200 upgrade response → `record_success(is_half_open_probe)`
+//! - Successful 200 upgrade response → `settle(ticket, Success)`
 //!   so a half-open probe that bootstraps a WebSocket counts as a
 //!   recovery sample.
 //! - Pre-wire backend connect failures honor the proxy retry policy and
@@ -174,38 +174,96 @@ const H3_WS_DUPLEX_BUFFER_BYTES: usize = 64 * 1024;
 /// while still batching small frames.
 const H3_WS_SEND_PUMP_READ_BUFFER_BYTES: usize = 16 * 1024;
 const H3_WS_PUMP_DRAIN_GRACE: Duration = Duration::from_secs(30);
+/// Bound on the receive pump's own exit after teardown signals it (issue
+/// #7188). The pump halts the client's request direction synchronously on the
+/// signal, so this only bounds a pump parked in a duplex write.
+const H3_WS_RECV_PUMP_HALT_GRACE: Duration = Duration::from_secs(1);
 
-struct AbortOnDropJoinHandle {
-    handle: Option<tokio::task::JoinHandle<()>>,
+struct AbortOnDropJoinHandle<T = ()> {
+    handle: Option<tokio::task::JoinHandle<T>>,
 }
 
-impl AbortOnDropJoinHandle {
-    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+impl<T> AbortOnDropJoinHandle<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
         Self {
             handle: Some(handle),
         }
     }
+}
 
-    fn abort(&self) {
-        if let Some(handle) = &self.handle {
-            handle.abort();
-        }
-    }
+/// Client-side transport verdict of the H3 WebSocket send pump: `None` when
+/// every byte the framer produced was handed to QUIC and the stream finished,
+/// otherwise the class of the first failed DATA write or FIN.
+type H3WsSendPumpOutcome = Option<retry::ErrorClass>;
 
-    async fn abort_and_wait(mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-            let _ = handle.await;
-        }
+/// Classify a failed send-pump write (DATA or FIN) toward the client with the
+/// same evidence rules the request-read path uses: a peer reset /
+/// `STOP_SENDING` or a client-closed connection is the client going away, an
+/// H3 framing violation is a protocol error, and anything gateway-side or
+/// unobservable is a closed connection.
+fn classify_h3_ws_send_error(error: &h3::error::StreamError) -> retry::ErrorClass {
+    use crate::http3::stream_util::{H3RequestReadFailure, classify_h3_request_read_error};
+    match classify_h3_request_read_error(error) {
+        H3RequestReadFailure::ClientAbort => retry::ErrorClass::ClientDisconnect,
+        H3RequestReadFailure::Malformed => retry::ErrorClass::ProtocolError,
+        H3RequestReadFailure::GatewayTerminated => retry::ErrorClass::ConnectionClosed,
     }
 }
 
-async fn wait_for_h3_ws_send_pump(
+/// Settle the send pump for the shared relay's disconnect record.
+///
+/// Awaited by the framed relay after it dropped the client duplex (the pump's
+/// end-of-stream signal) and before `on_ws_disconnect`, so a QUIC write/FIN
+/// failure after the framer accepted the final Close is attributed to the
+/// session instead of being lost behind a clean terminal record. Bounded by
+/// `drain_grace`: a pump still blocked (for example in client flow control)
+/// when the grace expires is aborted and recorded as a write timeout, which
+/// keeps it distinguishable from a transport error. Every attribution is
+/// `BackendToClient` + `Write`: the pump only carries gateway→client bytes.
+/// Takes the handle out of `send_pump` once it resolves, so the caller's
+/// later [`wait_for_h3_ws_pump`] is a no-op instead of a second grace.
+async fn settle_h3_ws_send_pump(
     proxy_id: &str,
-    mut send_pump: AbortOnDropJoinHandle,
+    send_pump: &mut AbortOnDropJoinHandle<H3WsSendPumpOutcome>,
+    drain_grace: Duration,
+) -> Option<crate::proxy::WsRelayFailure> {
+    let waited = match send_pump.handle.as_mut() {
+        Some(handle) => tokio::time::timeout(drain_grace, handle).await,
+        None => return None,
+    };
+    let class = match waited {
+        // A cancelled/panicked pump task carries no transport evidence.
+        Ok(joined) => {
+            send_pump.handle = None;
+            joined.ok().flatten()
+        }
+        Err(_) => {
+            warn!(
+                proxy_id = %proxy_id,
+                drain_grace_seconds = drain_grace.as_secs(),
+                "H3 WS send pump drain grace expired; aborting pump"
+            );
+            if let Some(handle) = send_pump.handle.take() {
+                handle.abort();
+                let _ = handle.await;
+            }
+            Some(retry::ErrorClass::ReadWriteTimeout)
+        }
+    }?;
+    Some((
+        crate::plugins::Direction::BackendToClient,
+        class,
+        Some(crate::proxy::tcp_proxy::StreamIoSide::Write),
+    ))
+}
+
+async fn wait_for_h3_ws_pump<T>(
+    proxy_id: &str,
+    pump: &'static str,
+    mut pump_handle: AbortOnDropJoinHandle<T>,
     drain_grace: Duration,
 ) {
-    let Some(mut handle) = send_pump.handle.take() else {
+    let Some(mut handle) = pump_handle.handle.take() else {
         return;
     };
     if tokio::time::timeout(drain_grace, &mut handle)
@@ -214,27 +272,21 @@ async fn wait_for_h3_ws_send_pump(
     {
         warn!(
             proxy_id = %proxy_id,
-            drain_grace_seconds = drain_grace.as_secs(),
-            "H3 WS send pump drain grace expired; aborting pump"
+            pump,
+            drain_grace_ms = drain_grace.as_millis() as u64,
+            "H3 WS pump drain grace expired; aborting pump"
         );
         handle.abort();
         let _ = handle.await;
     }
 }
 
-impl Drop for AbortOnDropJoinHandle {
+impl<T> Drop for AbortOnDropJoinHandle<T> {
     fn drop(&mut self) {
         if let Some(handle) = &self.handle {
             handle.abort();
         }
     }
-}
-
-/// Listen-port label for the `WsSessionMeta` that backs on_ws_disconnect.
-/// H3 always lands on the HTTPS port (port 0 disables H3 entirely; the
-/// listener wouldn't be running).
-fn h3_listen_port(state: &ProxyState) -> u16 {
-    state.env_config.proxy_https_port
 }
 
 /// Convert any `h3::quic::RecvStream` `impl Buf` chunk into an owned
@@ -248,36 +300,22 @@ fn buf_into_bytes<B: Buf>(mut buf: B) -> Bytes {
 }
 
 /// Strip hop-by-hop headers and HTTP/1.1 WebSocket handshake artefacts
-/// before forwarding the WebSocket request to the backend. Identical
-/// list to `crate::proxy::collect_forwardable_headers` — duplicated
-/// here because the H3 frontend has `proxy_headers: HashMap` while the
-/// H1/H2 path has `hyper::HeaderMap` and the same predicate doesn't
-/// directly reuse.
-fn collect_forwardable_h3_headers(
+/// before forwarding the WebSocket request to the backend.
+///
+/// The shared predicate is the one the H1/H2 collector
+/// (`crate::proxy::collect_forwardable_websocket_headers`) also applies:
+/// `headers::is_websocket_backend_request_strip_header` (the canonical backend
+/// request strip set, the WebSocket handshake set, and the consumer-assertion
+/// namespace). The H3-only arms stay here: a client `early-data` is replaced by the gateway's
+/// own value on 0-RTT, and H3 pseudo-headers never become HTTP/1.1 fields. The
+/// H1/H2 `Connection`-nomination strip does not apply: `Connection` is
+/// malformed on H3 (RFC 9114 §4.2) and ingress confinement runs first.
+pub(crate) fn collect_forwardable_h3_headers(
     headers: &HashMap<String, String>,
     is_early_data: bool,
 ) -> Vec<(String, String)> {
-    /// hop-by-hop per RFC 9110 §7.6.1 + WS handshake.
-    const SKIP_HEADERS: &[&str] = &[
-        "connection",
-        "upgrade",
-        "sec-websocket-key",
-        "sec-websocket-version",
-        "sec-websocket-accept",
-        // The WebSocket bridge cannot encode/decode permessage-deflate, so the
-        // client's extension offer must not reach the backend (it would set
-        // rsv1 and the session would be torn down). Mirrors the H1/H2 strip in
-        // proxy::is_websocket_backend_strip_header. A passthrough proxy re-adds
-        // only the permessage-deflate elements (issue #5769).
-        "sec-websocket-extensions",
-        "host",
-        "transfer-encoding",
-        "te",
-        "trailer",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
+    /// H3-only names: never forwarded from the client.
+    const H3_ONLY: &[&str] = &[
         // RFC 8470 §5.2: clients do not set this. The gateway strips any
         // inbound value and injects its authoritative value below.
         "early-data",
@@ -289,17 +327,14 @@ fn collect_forwardable_h3_headers(
         ":path",
         ":protocol",
         ":status",
-        // Reserved gateway assertion header. Consumer assertions are matched
-        // by prefix below; GeoIP remains an exact-name assertion.
-        "x-geo-country",
     ];
 
     let mut out: Vec<(String, String)> = headers
         .iter()
         .filter_map(|(name, value)| {
             let lower = name.to_ascii_lowercase();
-            if SKIP_HEADERS.contains(&lower.as_str())
-                || crate::proxy::headers::is_consumer_assertion_header(&lower)
+            if crate::proxy::headers::is_websocket_backend_request_strip_header(&lower)
+                || H3_ONLY.contains(&lower.as_str())
             {
                 return None;
             }
@@ -346,6 +381,57 @@ pub(crate) async fn send_h3_error_body<S>(
     .await;
 }
 
+/// [`send_h3_error_body`] for a failed backend dial/handshake: after the
+/// header policies run, stamps the authoritative `X-Gateway-Error` for the
+/// classified failure, as the HTTP/1.1-HTTP/2 WebSocket path does.
+async fn send_h3_backend_failure_body<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    status: StatusCode,
+    body: &'static str,
+    connection_error: bool,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) where
+    S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
+{
+    let mut headers = HashMap::new();
+    ensure_h3_reject_content_type(&mut headers);
+    crate::plugins::apply_initial_response_header_policies(
+        initial_response_header_policy_plugins,
+        &mut headers,
+    );
+    crate::proxy::insert_x_gateway_error_for_backend_failure(
+        &mut headers,
+        connection_error,
+        status.as_u16(),
+    );
+    write_h3_finalized_reject_body(stream, status, Bytes::from_static(body.as_bytes()), headers)
+        .await;
+}
+
+/// Relay a backend's own `3xx`-`5xx` refusal of the WebSocket upgrade
+/// (GHSA-7x2j-3389-2h35) on the H3 stream: the backend's status, its headers
+/// under the initial response header policy and the WebSocket transport strip,
+/// and its complete body (or an empty one) with an authoritative length. No
+/// `X-Gateway-Error`: the backend answered.
+async fn send_h3_backend_refusal<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    refusal: crate::proxy::WebSocketBackendRefusal,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) where
+    S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
+{
+    let crate::proxy::WebSocketBackendRefusal {
+        status,
+        mut headers,
+        body,
+    } = refusal;
+    crate::plugins::apply_initial_response_header_policies(
+        initial_response_header_policy_plugins,
+        &mut headers,
+    );
+    write_h3_finalized_reject_body(stream, status, body, headers).await;
+}
+
 pub(crate) async fn send_h3_reject_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
@@ -356,10 +442,31 @@ pub(crate) async fn send_h3_reject_body<S>(
     S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
 {
     ensure_h3_reject_content_type(&mut headers);
+    // A gateway `401` keeps its `WWW-Authenticate` challenge through the
+    // initial response header policy (RFC 9110 §15.5.2, issue #6774): a policy
+    // may replace it with another well-formed challenge, never remove it.
+    let seeded_challenge = (status == StatusCode::UNAUTHORIZED).then(|| {
+        let mut challenges = Vec::new();
+        for value in crate::plugins::utils::auth_flow::response_authentication_challenges(&headers)
+        {
+            crate::plugins::utils::auth_flow::push_authentication_challenge(&mut challenges, value);
+        }
+        crate::plugins::utils::auth_flow::render_authentication_challenges(&challenges)
+    });
     crate::plugins::apply_initial_response_header_policies(
         initial_response_header_policy_plugins,
         &mut headers,
     );
+    if let Some(seeded_challenge) = seeded_challenge
+        && !crate::plugins::utils::auth_flow::response_authentication_challenges(&headers)
+            .into_iter()
+            .any(crate::plugins::utils::auth_flow::is_valid_authentication_challenge)
+    {
+        crate::plugins::utils::auth_flow::set_response_authentication_challenge(
+            &mut headers,
+            seeded_challenge,
+        );
+    }
     write_h3_finalized_reject_body(stream, status, body, headers).await;
 }
 
@@ -497,6 +604,32 @@ fn h3_websocket_deadline_rejection(
     }
 }
 
+/// Send [`h3_websocket_deadline_rejection`]'s refusal. The credential-expiry
+/// `401` names the committing mechanism's challenge (RFC 9110 §15.5.2, issue
+/// #6774), exactly as the H1/H2 path does.
+async fn send_h3_deadline_rejection<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &RequestContext,
+    status: StatusCode,
+    body: &'static str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) where
+    S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
+{
+    let mut headers = HashMap::new();
+    if status == StatusCode::UNAUTHORIZED {
+        crate::proxy::insert_reauthentication_challenge(&mut headers, ctx);
+    }
+    send_h3_reject_body(
+        stream,
+        status,
+        Bytes::from_static(body.as_bytes()),
+        headers,
+        initial_response_header_policy_plugins,
+    )
+    .await;
+}
+
 /// H3 WebSocket entry point. Called from `handle_h3_request` when
 /// `HttpFlavor::WebSocket` is detected on an HTTP/3 request and
 /// `FERRUM_HTTP3_WEBSOCKET_ENABLED` is true.
@@ -530,7 +663,7 @@ pub(crate) async fn handle_h3_websocket(
     // Ownership of the HALF_OPEN circuit-breaker probe slot admitted for this
     // upgrade, moved in from the H3 dispatcher. Dropping it releases the slot
     // NEUTRALLY (GHSA-4cq4-3f3f-mq76).
-    mut cb_probe: crate::proxy::HalfOpenProbeGuard,
+    cb_probe: crate::proxy::HalfOpenProbeGuard,
     backend_url: String,
     query_string: String,
     proxy_headers: HashMap<String, String>,
@@ -603,8 +736,9 @@ pub(crate) async fn handle_h3_websocket(
             Some(&original_request_path),
         )
         .await;
-        send_h3_error_body(
+        send_h3_deadline_rejection(
             &mut stream,
+            &ctx,
             status,
             body,
             &initial_response_header_policy_plugins,
@@ -768,9 +902,11 @@ pub(crate) async fn handle_h3_websocket(
     // constrain either framer (issue #3734). Memoized on the upgrade context.
     let ws_size_limit_plugins =
         crate::proxy::collect_websocket_size_limit_plugins(&plugins, &mut ctx);
+    // The backend framer reads backend frames: backend->client ceilings.
     let ws_size_limits = crate::proxy::EffectiveWsSizeLimits::from_plugins(
         state.max_websocket_frame_size_bytes,
         &ws_size_limit_plugins,
+        crate::plugins::WebSocketFrameDirection::BackendToClient,
     );
     // Mesh WS client Host: same source as H1/H2 — the materialized
     // `ctx.headers` map, which already back-fills a missing Host from the H3
@@ -845,7 +981,7 @@ pub(crate) async fn handle_h3_websocket(
                 502,
                 false,
                 Some(retry::ErrorClass::DispatchPolicyRejected),
-                cb_probe.take_slot(),
+                cb_probe.settle(),
                 false,
                 start_time.elapsed(),
             );
@@ -860,8 +996,9 @@ pub(crate) async fn handle_h3_websocket(
                 start_time,
                 &current_backend_url,
                 crate::proxy::websocket_dns_resolution_host(&proxy, current_target.as_deref()),
-                retry::ErrorClass::DispatchPolicyRejected,
+                Some(retry::ErrorClass::DispatchPolicyRejected),
                 &original_request_path,
+                502,
             )
             .await;
             let reason_headers =
@@ -1087,6 +1224,10 @@ pub(crate) async fn handle_h3_websocket(
                     state.websocket_write_buffer_size,
                     ws_idle_tracker.clone(),
                     Some(&state.dns_cache),
+                    crate::proxy::websocket_preserved_backend_host(
+                        proxy.preserve_host_header,
+                        ws_client_host.as_deref(),
+                    ),
                 )
                 .await
                 .map(|handshake| crate::proxy::WsBackendHandshake::Direct(Box::new(handshake))),
@@ -1121,6 +1262,20 @@ pub(crate) async fn handle_h3_websocket(
                 let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
                 let is_ws_dns_error = ws_error_class == retry::ErrorClass::DnsLookupError;
                 let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
+                // One status for the wire response, metrics, the transaction
+                // log, the circuit breaker and backend admission: a connect or
+                // handshake timeout is 504 (#6770), everything else 502.
+                let (ws_failure_status, ws_failure_body) =
+                    crate::proxy::websocket_backend_failure_status_and_body(ws_error_class);
+                // A backend that answered the upgrade with its own 3xx-5xx
+                // (GHSA-7x2j-3389-2h35) is relayed with its real status, and
+                // every outcome below is charged with that status and no error
+                // class, exactly as on the H1/H2 path.
+                let ws_backend_refusal = crate::proxy::websocket_backend_refusal(e.as_ref());
+                let ws_failure_status = ws_backend_refusal
+                    .as_ref()
+                    .map_or(ws_failure_status, |refusal| refusal.status);
+                let ws_outcome_error_class = ws_backend_refusal.is_none().then_some(ws_error_class);
                 // A gateway-side egress-policy denial (denied literal/rebound H3
                 // WebSocket backend) never reached a backend: non-retryable AND
                 // neutral to backend health (no CB trip, no backend-admission
@@ -1130,7 +1285,13 @@ pub(crate) async fn handle_h3_websocket(
                 // Every failed handshake ends its attempt, retried or not. A
                 // dial refused before its attempt began has none (issue #5875).
                 if ws_attempt_dispatched {
-                    ctx.record_backend_attempt(Some(ws_error_class), !ws_is_pre_wire, None);
+                    ctx.record_backend_attempt(
+                        ws_outcome_error_class,
+                        !ws_is_pre_wire,
+                        ws_backend_refusal
+                            .as_ref()
+                            .map(|refusal| refusal.status.as_u16()),
+                    );
                 }
                 let retry_delay = proxy.retry.as_ref().and_then(|retry_config| {
                     let route_retry_ceiling =
@@ -1157,21 +1318,26 @@ pub(crate) async fn handle_h3_websocket(
                         crate::proxy::route_retry_ceiling(&proxy).unwrap_or(0);
                     if let Some(permits) = backend_admission_permits.take() {
                         permits.record_backend_outcome(BackendAdmissionOutcome {
-                            response_status: 502,
+                            response_status: ws_failure_status.as_u16(),
                             connection_error: ws_is_pre_wire,
                             error_class: Some(ws_error_class),
                             backend_elapsed: backend_admission_start.elapsed(),
                         });
                         backend_outcome_already_recorded = true;
                     }
-                    if let Some(cb_config) = &proxy.circuit_breaker {
-                        let cb = state.circuit_breaker_cache.get_or_create(
-                            &proxy.namespace,
-                            &proxy.id,
-                            current_cb_target_key.as_deref(),
-                            cb_config,
+                    if let Some(cb) = cb_probe.current_breaker(
+                        &state.circuit_breaker_cache,
+                        &proxy.namespace,
+                        &proxy.id,
+                        current_cb_target_key.as_deref(),
+                    ) {
+                        cb.settle(
+                            cb_probe.take_slot(),
+                            crate::circuit_breaker::BreakerOutcome::Failure {
+                                status_code: ws_failure_status.as_u16(),
+                                connection_error: ws_is_pre_wire,
+                            },
                         );
-                        cb.record_failure(502, ws_is_pre_wire, cb_probe.take_slot());
                         cb_failure_already_recorded = true;
                     }
 
@@ -1272,11 +1438,11 @@ pub(crate) async fn handle_h3_websocket(
                             retry_cb_target_key.as_deref(),
                             cb_config,
                         ) {
-                            Ok((cb, is_half_open_probe, admission_generation)) => {
+                            Ok((cb, probe_ticket, _admission_generation)) => {
                                 // Re-point the probe guard at the rotated target's
                                 // breaker: the prior target's slot was taken by the
                                 // intermediate failure record above.
-                                cb_probe.rearm(&cb, is_half_open_probe, admission_generation);
+                                cb_probe.rearm(&cb, probe_ticket);
                             }
                             Err(_) => {
                                 retry_admitted_by_cb = false;
@@ -1305,44 +1471,74 @@ pub(crate) async fn handle_h3_websocket(
                     }
                 }
 
-                error!(
-                    proxy_id = %proxy.id,
-                    backend_url = %current_backend_url,
-                    error_kind = retry::error_class_log_kind(ws_error_class),
-                    error_class = %ws_error_class,
-                    error = %e,
-                    "H3 WebSocket backend connection failed"
-                );
+                if ws_backend_refusal.is_some() {
+                    debug!(
+                        proxy_id = %proxy.id,
+                        backend_url = %crate::proxy::strip_query_params(&current_backend_url),
+                        status = ws_failure_status.as_u16(),
+                        "H3 WebSocket backend refused the upgrade; relaying its response"
+                    );
+                } else {
+                    error!(
+                        proxy_id = %proxy.id,
+                        backend_url = %crate::proxy::strip_query_params(&current_backend_url),
+                        error_kind = retry::error_class_log_kind(ws_error_class),
+                        error_class = %ws_error_class,
+                        error = %e,
+                        "H3 WebSocket backend connection failed"
+                    );
+                }
                 if !backend_outcome_already_recorded
                     && !ws_egress_denied
                     && let Some(permits) = backend_admission_permits.take()
                 {
                     permits.record_backend_outcome(BackendAdmissionOutcome {
-                        response_status: 502,
+                        response_status: ws_failure_status.as_u16(),
                         connection_error: ws_is_pre_wire,
-                        error_class: Some(ws_error_class),
+                        error_class: ws_outcome_error_class,
                         backend_elapsed: backend_admission_start.elapsed(),
                     });
                 }
 
-                if !cb_failure_already_recorded && let Some(cb_config) = &proxy.circuit_breaker {
-                    let cb = state.circuit_breaker_cache.get_or_create(
+                if !cb_failure_already_recorded
+                    && let Some(cb) = cb_probe.current_breaker(
+                        &state.circuit_breaker_cache,
                         &proxy.namespace,
                         &proxy.id,
                         current_cb_target_key.as_deref(),
-                        cb_config,
-                    );
-                    if ws_egress_denied {
+                    )
+                {
+                    if ws_backend_refusal.is_some() {
+                        // The backend answered: classify its status against
+                        // `failure_status_codes` exactly as the HTTP path does,
+                        // so a 401/403/404/429 refusal can never open the breaker.
+                        crate::proxy::backend_dispatch::apply_circuit_breaker_outcome(
+                            &cb,
+                            ws_failure_status.as_u16(),
+                            false,
+                            None,
+                            cb_probe.take_slot(),
+                        );
+                    } else if ws_egress_denied {
                         // Gateway-side egress denial dialed no backend: release any
                         // admitted HALF_OPEN probe slot NEUTRALLY so the breaker can
                         // recover, rather than leaking it by skipping the record.
-                        cb.record_neutral(cb_probe.take_slot());
+                        cb.settle(
+                            cb_probe.take_slot(),
+                            crate::circuit_breaker::BreakerOutcome::Neutral,
+                        );
                     } else {
-                        cb.record_failure(502, ws_is_pre_wire, cb_probe.take_slot());
+                        cb.settle(
+                            cb_probe.take_slot(),
+                            crate::circuit_breaker::BreakerOutcome::Failure {
+                                status_code: ws_failure_status.as_u16(),
+                                connection_error: ws_is_pre_wire,
+                            },
+                        );
                     }
                 }
 
-                crate::proxy::record_request(&state, 502);
+                crate::proxy::record_request(&state, ws_failure_status.as_u16());
 
                 // Emit the TransactionSummary for the failed upgrade so
                 // log plugins see the rejection.
@@ -1360,21 +1556,41 @@ pub(crate) async fn handle_h3_websocket(
                             &proxy,
                             current_target.as_deref(),
                         ),
-                        ws_error_class,
+                        ws_outcome_error_class,
                         &original_request_path,
+                        ws_failure_status.as_u16(),
                     )
                     .await;
                 }
 
+                if let Some(refusal) = ws_backend_refusal {
+                    // Boxed trampoline: this future is polled inside
+                    // `handle_h3_request`'s stack budget, so the writer's
+                    // future must be built inside the heap-allocated block
+                    // rather than as a stack temporary of this frame
+                    // (`Box::pin(writer(..))` would still materialize it here).
+                    Box::pin(async {
+                        send_h3_backend_refusal(
+                            &mut stream,
+                            refusal,
+                            &initial_response_header_policy_plugins,
+                        )
+                        .await;
+                    })
+                    .await;
+                    drop(ws_connection_permit);
+                    return Ok(());
+                }
                 let ws_body = if is_ws_dns_error {
                     r#"{"error":"DNS resolution for backend failed"}"#
                 } else {
-                    r#"{"error":"Backend WebSocket connection failed"}"#
+                    ws_failure_body
                 };
-                send_h3_error_body(
+                send_h3_backend_failure_body(
                     &mut stream,
-                    StatusCode::BAD_GATEWAY,
+                    ws_failure_status,
                     ws_body,
+                    ws_is_pre_wire && !ws_egress_denied,
                     &initial_response_header_policy_plugins,
                 )
                 .await;
@@ -1387,14 +1603,16 @@ pub(crate) async fn handle_h3_websocket(
     // Backend handshake succeeded. If this request was admitted as a
     // half-open probe, record the success so the breaker can close.
     // Matches the H1/H2 path's behavior on the successful upgrade hop.
-    if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state.circuit_breaker_cache.get_or_create(
-            &proxy.namespace,
-            &proxy.id,
-            current_cb_target_key.as_deref(),
-            cb_config,
+    if let Some(cb) = cb_probe.current_breaker(
+        &state.circuit_breaker_cache,
+        &proxy.namespace,
+        &proxy.id,
+        current_cb_target_key.as_deref(),
+    ) {
+        cb.settle(
+            cb_probe.take_slot(),
+            crate::circuit_breaker::BreakerOutcome::Success,
         );
-        cb.record_success(cb_probe.take_slot());
     }
 
     if ws_session_deadline.at <= tokio::time::Instant::now() {
@@ -1411,8 +1629,9 @@ pub(crate) async fn handle_h3_websocket(
             Some(&original_request_path),
         )
         .await;
-        send_h3_error_body(
+        send_h3_deadline_rejection(
             &mut stream,
+            &ctx,
             status,
             body,
             &initial_response_header_policy_plugins,
@@ -1438,6 +1657,17 @@ pub(crate) async fn handle_h3_websocket(
                     reason,
                     "H3 WS: rejecting upgrade: invalid backend permessage-deflate answer"
                 );
+                // A backend protocol fault, as on the H1/H2 WebSocket path:
+                // settle the admission permit as a failure before it drops so
+                // the adaptive limiter backs off.
+                if let Some(permits) = backend_admission_permits.as_ref() {
+                    permits.record_backend_outcome(BackendAdmissionOutcome {
+                        response_status: 502,
+                        connection_error: false,
+                        error_class: Some(retry::ErrorClass::ProtocolError),
+                        backend_elapsed: backend_admission_start.elapsed(),
+                    });
+                }
                 // Boxed: this future is polled inside `handle_h3_request`'s
                 // stack budget, so the reject ladder must not add inline slots.
                 Box::pin(async {
@@ -1492,7 +1722,11 @@ pub(crate) async fn handle_h3_websocket(
     // No Upgrade / Connection / Sec-WebSocket-Accept headers (those
     // are HTTP/1.1 only). The QUIC stream becomes the WebSocket
     // transport as soon as the client sees the 200.
-    let mut response_headers = HashMap::new();
+    // Seed the client handshake response from the backend's own end-to-end
+    // handshake headers (issue #7391), as on H1/H2, then let response policy
+    // govern them.
+    let mut backend_handshake = backend_handshake;
+    let mut response_headers = backend_handshake.take_backend_response_headers();
     crate::proxy::finalize_successful_websocket_response_headers(
         &plugins,
         &ctx,
@@ -1612,21 +1846,41 @@ pub(crate) async fn handle_h3_websocket(
     // shared tungstenite framer inside `run_websocket_proxy`, which unmasks
     // compliant frames and rejects unmasked ones with the same 1002 close every
     // frontend emits.
+    //
+    // The gateway ends the session cleanly (a WebSocket close, the idle
+    // window, a drain) while the client's request direction may still be
+    // open. Teardown signals `recv_close` and the pump halts that direction
+    // with `STOP_SENDING(H3_NO_ERROR)` itself (issue #7188): dropping the half
+    // instead surfaces as `STOP_SENDING(0)`, which is not an HTTP/3 code, so
+    // the client would log a reset on a successful session. A cancelled
+    // `recv_data` leaves the stream halt-able (`stream_util::halt_request_body`).
+    let (recv_close_tx, mut recv_close_rx) = tokio::sync::oneshot::channel::<()>();
     let recv_pump = AbortOnDropJoinHandle::new(tokio::spawn(async move {
-        loop {
-            match h3_recv.recv_data().await {
+        let gateway_closed = loop {
+            let received = tokio::select! {
+                biased;
+                _ = &mut recv_close_rx => break true,
+                received = h3_recv.recv_data() => received,
+            };
+            match received {
                 Ok(Some(chunk)) => {
                     let bytes = buf_into_bytes(chunk);
                     if bytes.is_empty() {
                         continue;
                     }
-                    if let Err(e) = pump_write.write_all(&bytes).await {
+                    let written = tokio::select! {
+                        biased;
+                        _ = &mut recv_close_rx => break true,
+                        written = pump_write.write_all(&bytes) => written,
+                    };
+                    if let Err(e) = written {
                         debug!(
                             proxy_id = %proxy_id_for_pumps,
                             "H3 WS recv pump: duplex write closed: {}",
                             e
                         );
-                        break;
+                        // The framer is gone: the session ended gateway-side.
+                        break true;
                     }
                 }
                 Ok(None) => {
@@ -1634,7 +1888,7 @@ pub(crate) async fn handle_h3_websocket(
                         proxy_id = %proxy_id_for_pumps,
                         "H3 WS recv pump: end of stream"
                     );
-                    break;
+                    break false;
                 }
                 Err(e) => {
                     debug!(
@@ -1642,9 +1896,12 @@ pub(crate) async fn handle_h3_websocket(
                         "H3 WS recv pump: stream error: {}",
                         e
                     );
-                    break;
+                    break false;
                 }
             }
+        };
+        if gateway_closed {
+            crate::http3::stream_util::halt_request_body(&mut h3_recv);
         }
         // Dropping pump_write signals EOF to the WS framer reading
         // from the other duplex half.
@@ -1652,9 +1909,12 @@ pub(crate) async fn handle_h3_websocket(
 
     let proxy_id_for_send_pump = proxy.id.clone();
 
-    // pump_read → h3_send : WS framer's encoded bytes flow back over QUIC
-    let send_pump = AbortOnDropJoinHandle::new(tokio::spawn(async move {
+    // pump_read → h3_send : WS framer's encoded bytes flow back over QUIC.
+    // Resolves to the first DATA/FIN failure (see `H3WsSendPumpOutcome`) so the
+    // shared relay can attribute it on the disconnect record.
+    let mut send_pump = AbortOnDropJoinHandle::new(tokio::spawn(async move {
         let mut buf = vec![0u8; H3_WS_SEND_PUMP_READ_BUFFER_BYTES];
+        let mut failure: H3WsSendPumpOutcome = None;
         loop {
             // Every server-bound close — including the 1002 a client protocol
             // violation earns — is encoded by the shared relay's framer and
@@ -1679,6 +1939,7 @@ pub(crate) async fn handle_h3_websocket(
                     "H3 WS send pump: h3 send_data error: {}",
                     e
                 );
+                failure = Some(classify_h3_ws_send_error(&e));
                 break;
             }
         }
@@ -1688,7 +1949,13 @@ pub(crate) async fn handle_h3_websocket(
                 "H3 WS send pump: h3 finish error: {}",
                 e
             );
+            // Keep the first failure: a FIN error after a failed DATA write is
+            // a consequence of it.
+            if failure.is_none() {
+                failure = Some(classify_h3_ws_send_error(&e));
+            }
         }
+        failure
     }));
 
     // ── Collect parsed-relay and disconnect plugin lists ────────────
@@ -1714,9 +1981,10 @@ pub(crate) async fn handle_h3_websocket(
         http_method: "CONNECT".to_string(),
         request_path: original_request_path.clone(),
         handshake_status_code: 200,
-        listen_port: h3_listen_port(&state),
+        listen_port: crate::proxy::websocket_session_listen_port(&ctx, true, &state.env_config),
         connection_id: ws_conn_id,
         consumer_username: ctx.effective_identity().map(str::to_owned),
+        principal_origin: ctx.principal_origin(),
         auth_method: ctx.auth_method,
         metadata: crate::proxy::clone_log_metadata(&ctx),
         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
@@ -1744,6 +2012,9 @@ pub(crate) async fn handle_h3_websocket(
     let relay_result = match backend_handshake {
         crate::proxy::WsBackendHandshake::Direct(handshake) => {
             let handshake = *handshake;
+            let pump_settle: crate::proxy::WsClientTransportSettle<'_> = Box::pin(
+                settle_h3_ws_send_pump(&proxy.id, &mut send_pump, H3_WS_PUMP_DRAIN_GRACE),
+            );
             crate::proxy::run_websocket_session(
                 client_io,
                 handshake.stream,
@@ -1766,11 +2037,15 @@ pub(crate) async fn handle_h3_websocket(
                 &adaptive_buf,
                 ws_client_trust_session,
                 ws_deflate_session,
+                Some(pump_settle),
             )
             .await
         }
         crate::proxy::WsBackendHandshake::Mesh(handshake) => {
             let handshake = *handshake;
+            let pump_settle: crate::proxy::WsClientTransportSettle<'_> = Box::pin(
+                settle_h3_ws_send_pump(&proxy.id, &mut send_pump, H3_WS_PUMP_DRAIN_GRACE),
+            );
             crate::proxy::run_websocket_session(
                 client_io,
                 handshake.stream,
@@ -1793,6 +2068,7 @@ pub(crate) async fn handle_h3_websocket(
                 &adaptive_buf,
                 ws_client_trust_session,
                 ws_deflate_session,
+                Some(pump_settle),
             )
             .await
         }
@@ -1822,11 +2098,13 @@ pub(crate) async fn handle_h3_websocket(
     // ── Tear down pump tasks ─────────────────────────────────────────
     //
     // The send pump exits naturally when its duplex half (`pump_read`)
-    // sees EOF — which happens as soon as `run_websocket_proxy`
-    // returns and drops `client_io` (the other end of the duplex
-    // pair). Awaiting it ensures the H3 send side calls `finish()` so
-    // the peer sees a clean FIN rather than a force-drop / protocol
-    // abort.
+    // sees EOF — which happens as soon as the relay drops `client_io`
+    // (the other end of the duplex pair). Awaiting it ensures the H3
+    // send side calls `finish()` so the peer sees a clean FIN rather
+    // than a force-drop / protocol abort. On the framed relay path the
+    // shared relay already settled the pump before `on_ws_disconnect`
+    // (`settle_h3_ws_send_pump`), so this wait returns immediately; it
+    // still bounds the raw tunnel path and any early relay exit.
     //
     // The recv pump, however, is blocked in
     // `h3_recv.recv_data().await`. For a cooperative client this
@@ -1835,14 +2113,14 @@ pub(crate) async fn handle_h3_websocket(
     // that exchanges close frames without closing the QUIC stream
     // would leave the recv pump pinned until quinn's idle timeout
     // expires (worst case: tens of seconds). We have no more user
-    // data to forward (the WS framer is gone), so abort the pump
-    // explicitly to release the QUIC stream resources promptly.
-    // `JoinHandle::abort()` is safe — the task owns only the recv
-    // half of the QUIC stream + the duplex write half; both will be
-    // dropped cleanly.
-    recv_pump.abort();
-    recv_pump.abort_and_wait().await;
-    wait_for_h3_ws_send_pump(&proxy.id, send_pump, H3_WS_PUMP_DRAIN_GRACE).await;
+    // data to forward (the WS framer is gone), so signal the pump to halt
+    // the client's request direction with `H3_NO_ERROR` and release the
+    // QUIC stream resources promptly (issue #7188). The abort stays as the
+    // bounded fallback, so a pump that cannot observe the signal still
+    // cannot outlive the session.
+    let _ = recv_close_tx.send(());
+    wait_for_h3_ws_pump(&proxy.id, "recv", recv_pump, H3_WS_RECV_PUMP_HALT_GRACE).await;
+    wait_for_h3_ws_pump(&proxy.id, "send", send_pump, H3_WS_PUMP_DRAIN_GRACE).await;
 
     // Drop guards explicitly so their `Drop` impl runs before the
     // info!() below — keeps the "session ended" log adjacent to the
@@ -1864,7 +2142,7 @@ pub(crate) async fn handle_h3_websocket(
 }
 
 /// Emit a `TransactionSummary` describing the successful WebSocket
-/// upgrade. Mirrors the H1/H2 path at `proxy/mod.rs` line ~4300 so log
+/// upgrade. Mirrors the H1/H2 summary in `handle_websocket_request_authenticated` so log
 /// plugins see a consistent shape across frontends.
 ///
 /// `proxy_headers` is the source of truth for the backend-bound header
@@ -1916,6 +2194,7 @@ async fn emit_successful_upgrade_summary(
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
         consumer_username: ctx.effective_identity().map(str::to_owned),
+        principal_origin: ctx.principal_origin(),
         auth_method: ctx.auth_method,
         // RFC 9220 Extended CONNECT uses :method=CONNECT, mirroring the
         // H2 RFC 8441 path's "CONNECT" label.
@@ -1964,11 +2243,15 @@ async fn emit_failed_upgrade_summary(
     start_time: Instant,
     backend_url: &str,
     resolve_host: &str,
-    error_class: retry::ErrorClass,
+    // `None` for a relayed backend refusal (GHSA-7x2j-3389-2h35): the backend
+    // answered, so the transaction carries its status and no error class.
+    error_class: Option<retry::ErrorClass>,
     // The client-requested path before any VirtualService `rewrite.uri` was
     // applied. Logged as `request_path` so access logs record what the client
     // sent, not the backend-rewritten path in `ctx.path`.
     original_request_path: &str,
+    // The status the client actually receives for this failed upgrade.
+    response_status: u16,
 ) {
     if plugins.is_empty() {
         return;
@@ -1991,16 +2274,19 @@ async fn emit_failed_upgrade_summary(
         .map(|ip| ip.to_string());
 
     let mut metadata = crate::proxy::clone_log_metadata(ctx);
-    metadata.insert(
-        "rejection_phase".to_string(),
-        "websocket_backend_error".to_string(),
-    );
+    if error_class.is_some() {
+        metadata.insert(
+            "rejection_phase".to_string(),
+            "websocket_backend_error".to_string(),
+        );
+    }
 
     let summary = TransactionSummary {
         namespace: proxy.namespace.clone(),
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
         consumer_username: ctx.effective_identity().map(str::to_owned),
+        principal_origin: ctx.principal_origin(),
         auth_method: ctx.auth_method,
         http_method: "CONNECT".to_string(),
         // Record the path the client sent, not the VirtualService-rewritten
@@ -2010,7 +2296,7 @@ async fn emit_failed_upgrade_summary(
         proxy_name: proxy.name.clone(),
         backend_target: Some(crate::proxy::strip_query_params(backend_url).to_string()),
         backend_resolved_ip: resolved_ip,
-        response_status_code: 502,
+        response_status_code: response_status,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: total_ms,
         latency_backend_ttfb_ms: -1.0,
@@ -2019,7 +2305,7 @@ async fn emit_failed_upgrade_summary(
         latency_plugin_external_io_ms: plugin_external_io_ms,
         latency_gateway_overhead_ms: gateway_overhead_ms,
         request_user_agent: proxy_headers.get("user-agent").cloned(),
-        error_class: Some(error_class),
+        error_class,
         metadata,
         ai_usage_export: ctx.ai_usage_export.clone(),
         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
@@ -2113,12 +2399,11 @@ mod tests {
             );
         }
         // Subprotocol IS forwarded — the backend WS client re-negotiates it
-        // with the upstream server. Extensions (e.g. permessage-deflate) are
-        // NOT forwarded: the gateway's WebSocket bridge cannot encode/decode
-        // compressed frames, so a deflate-capable backend that accepted the
-        // offer would set rsv1 and the session would be torn down with a
-        // protocol error. Mirrors the H1/H2 strip in
-        // proxy::is_websocket_backend_strip_header.
+        // with the upstream server. The client's extension offer is stripped
+        // here (mirroring the H1/H2 strip in
+        // proxy::headers::is_websocket_handshake_strip_header);
+        // `forward_permessage_deflate_offer` / `begin_permessage_deflate_termination`
+        // re-add it per the proxy's `websocket_permessage_deflate` mode.
         assert_eq!(value_for(&out, "sec-websocket-protocol"), Some("chat"));
     }
 
@@ -2191,33 +2476,8 @@ mod tests {
     }
 
     #[test]
-    fn user_agent_lookup_lives_on_proxy_headers_not_ctx() {
-        // Regression guard: the H3 dispatcher in `src/http3/server.rs`
-        // builds `proxy_headers` by either cloning `ctx.headers` (when
-        // identity injection is needed) or `std::mem::take`-ing it (the
-        // common case). In the take-path `ctx.headers` is empty by the
-        // time `handle_h3_websocket` runs, so the TransactionSummary
-        // helpers MUST read `request_user_agent` from `proxy_headers`,
-        // not from `ctx.headers`. This test pins the expected source of
-        // truth so a future refactor doesn't silently re-introduce the
-        // bug (which was caught in PR 784 review).
-        let proxy_headers = make_headers(&[("user-agent", "ferrum-test/1.0")]);
-        let ctx_headers_after_take: HashMap<String, String> = HashMap::new();
-        assert_eq!(
-            proxy_headers.get("user-agent").map(String::as_str),
-            Some("ferrum-test/1.0"),
-            "proxy_headers must carry user-agent (the post-take source)"
-        );
-        assert!(
-            !ctx_headers_after_take.contains_key("user-agent"),
-            "ctx.headers is moved-out and empty in the common dispatch path"
-        );
-    }
-
-    #[test]
     fn h3_ws_send_pump_buffer_is_smaller_than_duplex_capacity() {
-        assert_eq!(H3_WS_DUPLEX_BUFFER_BYTES, 64 * 1024);
-        assert_eq!(H3_WS_SEND_PUMP_READ_BUFFER_BYTES, 16 * 1024);
+        const _: () = assert!(H3_WS_SEND_PUMP_READ_BUFFER_BYTES < H3_WS_DUPLEX_BUFFER_BYTES);
     }
 
     #[test]
@@ -2293,7 +2553,7 @@ mod tests {
         let guard = AbortOnDropJoinHandle::new(handle);
         started_rx.await.expect("task started");
 
-        wait_for_h3_ws_send_pump("test-proxy", guard, Duration::from_millis(5)).await;
+        wait_for_h3_ws_pump("test-proxy", "send", guard, Duration::from_millis(5)).await;
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
         while std::time::Instant::now() < deadline {

@@ -27,13 +27,49 @@ Selecting both, or neither, is a `compile_error!`.
 
 | Profile | Build command | Backend | `BUILD_CAPABLE` |
 |---|---|---|---|
-| Ordinary (default) | `cargo build --release` | `ring` + `rustls/ring` | `false` |
+| Ordinary (default) | `cargo build --release` | `ring` + `rustls/ring`, with rustls's AWS-LC cipher suites linked beside them for the TLS record layer (see below) | `false` |
 | FIPS | `cargo build --release --no-default-features --features fips` | `aws-lc-fips-sys` via `aws-lc-rs/fips` + `rustls/fips` | `true` |
 
-The ordinary profile retains Ferrum's existing Ring-backed behavior; the
-existence of the FIPS profile does not opt an ordinary deployment into a new
-provider. `FERRUM_FIPS_MODE=enforce` on an ordinary build refuses to start, with
+The ordinary profile retains Ferrum's existing Ring-backed behavior for TLS,
+QUIC, and every other provider-selected path; the existence of the FIPS profile
+does not opt an ordinary deployment into a new TLS provider. JWT signing and
+verification are the one exception: `jsonwebtoken` selects its `aws_lc_rs`
+backend inline on **both** profiles. On a `fips` build that `aws-lc-rs` is the
+validated module (through `aws-lc-rs/fips`). On the ordinary build it is
+AWS-LC, which dimpl, rcgen, and x509-parser already compile in. The RustCrypto
+`rust_crypto` backend is never compiled: it signed ES256 JWT-SVIDs and
+ES256/ES384/RS* `private_key_jwt` assertions on `p256`/`p384` 0.13
+(`crypto-bigint` 0.5, RUSTSEC-2026-0387) and the RustCrypto `rsa`
+(RUSTSEC-2023-0071). jsonwebtoken 12 needs exactly one backend compiled to
+choose its provider, and one inline selection keeps that true for every
+feature combination. AWS-LC accepts RSA keys of 2048–8192 bits only, for
+verification as well as signing. The JWKS paths (`jwks_auth`, OIDC, mesh
+`RequestAuthentication`) and JWT-SVID authorities already enforced that range.
+CP/DP trust-bundle RSA public keys and DPoP proof keys now check it too
+(`fips::keys::check_jwt_rsa_verification_modulus`), so an out-of-range key is
+refused by size instead of failing every signature. `FERRUM_FIPS_MODE=enforce` on an ordinary build refuses to start, with
 a diagnostic that names the missing module. It never downgrades to `ring`.
+
+The ordinary profile has one more AWS-LC edge, and it is a performance
+selection rather than a provider switch. `crypto-ring` enables
+`rustls/aws_lc_rs`, which compiles rustls's AWS-LC cipher suites next to its
+`ring` ones, and `src/fips/aead_backend.rs` installs one set or the other for
+the record layer of TLS over TCP when the provider is bootstrapped: AWS-LC's on
+the x86-64 CPUs where its AVX-512 AES-GCM measurably beats `ring`'s AVX2 one,
+`ring`'s everywhere else, or whichever `FERRUM_TLS_AEAD_BACKEND` names
+([details](frontend_tls.md#record-layer-cipher-suite-backend)). Key exchange,
+signature verification, the key provider, QUIC packet protection and every
+dependency's own provider arm stay on `ring`, and no library is added: `aws-lc-sys` was already in this
+profile through jsonwebtoken and dimpl. None of this is a validated-module
+claim. It is non-FIPS AWS-LC on a build whose `BUILD_CAPABLE` is `false`, and
+`FERRUM_FIPS_MODE=enforce` is refused on it exactly as before.
+
+**The FIPS profile is unchanged by that edge.** It still declares no `ring` arm
+on any dependency, its resolved graph is still audited for one, every cipher
+suite still comes from the AWS-LC FIPS module, QUIC packet protection
+included, and there is no second implementation to select between. `FERRUM_TLS_AEAD_BACKEND=auto` and `aws-lc`
+are no-ops on a FIPS build; `ring` is refused at startup and by `validate`
+rather than ignored, because the build cannot honour it.
 
 Exclusivity is not stylistic. `sqlx-core`, `quinn-proto`, `tonic`, `ldap3`, and
 `hyper-rustls` each gate their aws-lc arm on the *absence* of their ring arm, so
@@ -43,6 +79,29 @@ pair at compile time and
 [`.github/scripts/check_fips_feature_policy.py`](../.github/scripts/check_fips_feature_policy.py)
 re-checks the **resolved** feature graph in CI, because a transitive edge can
 re-enable `rustls/ring` without this crate's feature list ever mentioning it.
+
+That hazard runs one way: `ring` surviving in a build that claims the
+validated module. The checker therefore treats the two profiles differently,
+and says so in its tables:
+
+- **`fips`** may select no feature named for `ring` on any dependency, whether
+  or not that dependency has a row in the paired-arm table, and its resolved
+  graph may carry none of the ring selections in `FORBIDDEN_RESOLVED_FIPS`.
+- **`crypto-ring`** may link AWS-LC only through the single allow-listed edge
+  `rustls/aws_lc_rs` (`RING_PROFILE_ALLOWED_AWS_LC_EDGES`). Any other AWS-LC or
+  FIPS-module feature in the list is refused by name. In the resolved graph
+  `rustls/ring` and `rustls/aws_lc_rs` must both be present, every dependency
+  that has a provider arm must still be on its ring arm
+  (`FORBIDDEN_RESOLVED_RING` lists each dependency's aws-lc arm), and
+  `aws-lc-rs/fips` must be absent.
+
+`--manifest-check` also runs a synthetic self-test (`--self-test` runs it
+alone): each case is one mutation of the real manifest or of a resolved
+selection set, such as a ring arm added to `fips` or a second AWS-LC edge added
+to `crypto-ring`, and the gate fails if any mutation is accepted. The
+resolved-graph rows are written out a second time inside the self-test and
+cross-checked against the manifest pair table, so a row deleted from a policy
+table is reported instead of taking its test case with it.
 
 ### Building the FIPS profile
 
@@ -79,168 +138,37 @@ the module certificate's tested-platform list (see §"The module boundary").
 ### CI gate and caches
 
 `.github/workflows/fips-build.yml` is the hosted FIPS gate. `FIPS Feature Policy`
-always audits the resolved feature graph. `FIPS Build & Test` compiles the
+always audits the resolved feature graph, and the `FIPS Build & Test` aggregate
+fails unless that audit succeeded, including when the expensive jobs are skipped
+as irrelevant. `FIPS Build & Test` compiles the
 locked `fips` binary, every claimed feature combination, clippy `-D warnings`,
 and the policy, key-admission, and frontend/backend/CP-DP handshake tests.
 
-`FIPS Build & Test` is **merge-blocking and publish-blocking** (issue #4445).
-It is one of the nine contexts branch protection and ruleset `20208307` require
-on `main`, so a red FIPS gate blocks the pull request and the merge queue, and
-it is an entry in `.github/required-publication-checks.json`, so every
-immutable `v*` tag artifact fails closed unless it succeeded for the exact
-product SHA. The `latest` / `main-<sha>` development images are gated on the
-`CI` workflow's push run only, not on this inventory (see
-[ci_cd.md → Main latest image](ci_cd.md#main-latest-image)).
-The workflow runs unconditionally on every push to `main` with no `paths:`
-filter, and on that event `fips-plan` force-runs the full gate, so each product
-commit carries its own exact-SHA evidence. See `docs/ci_cd.md` ->
-"Required checks and merge queue" and "Publish-blocking required checks".
-Its relevance job validates the trusted-base planner blob's mode, size, path,
-and object ID, materializes those bytes at the literal checked-out planner
-path, and invokes only that statically inspectable path. It never executes a
-variable-named temporary program.
+`FIPS Build & Test` is **merge-blocking and publish-blocking** (issue #4445): it
+is a required check on `main` and in `.github/required-publication-checks.json`,
+so every immutable `v*` tag artifact fails closed unless it succeeded for the
+exact product SHA. It runs on every push to `main` with no `paths:` filter, and
+on that event `fips-plan` force-runs the full gate, so each product commit
+carries its own exact-SHA evidence. Its relevance job validates the trusted-base
+planner blob's mode, size, path, and object ID, materializes those bytes at the
+literal checked-out planner path, and invokes only that statically inspectable
+path; it never executes a variable-named temporary program. The
+`latest` / `main-<sha>` development images are gated on the `CI` workflow's push
+run only (see [ci_cd.md → Main latest image](ci_cd.md#main-latest-image)). Compile
+caches, the immutable producer and test-binary handoffs, and the cache trust
+boundary are documented in
+[ci_cd.md → CI runtime caching](ci_cd.md#ci-runtime-caching-production-images-and-fips).
 
-Compile artifacts use one cache layer plus one immutable run-artifact handoff
-through the local checksum-pinned `setup-sccache` action,
-`Swatinem/rust-cache`, and `actions/upload-artifact`; the repository
-`actions/cache` is deliberately not part of the producer channel.
-rust-cache's `shared-key` is `ci-fips-contract-${{ hashFiles(...) }}` over
-`Cargo.toml`, `Cargo.lock`, `.cargo/config.toml`, the root `build.rs`, the
-FIPS workflow, the claimed-profile/FIPS feature-policy checker, `src/fips/**`,
-and `vendor/**`. That input is the one the pinned action actually uses; a
-sibling `key:` value is ignored whenever `shared-key` is set and is not
-wired. Automatic toolchain/environment/manifest/lock hashing stays enabled,
-and this layer is not SHA-scoped, so dependency/compiler work remains a warm
-inter-commit fallback. The stable layer does not trust AWS-LC's runner-local
-CMake incremental tree across runners: after every non-cold rust-cache restore
-attempt, `fips-compile` validates any restored `target/` root and removes matching
-`*/build/aws-lc-fips-sys-*/out/build` directories before Cargo can rerun the
-upstream build script. Installed AWS-LC libraries and Rust outputs stay warm,
-while any required CMake work starts clean instead of reparsing a restored
-`libbcm_c_generated_asm.a` archive. An explicitly requested exact handoff is
-promoted after this quarantine and replaces the stable target tree.
-
-That compile job is build-only: complete FIPS
-`unit_tests` and
-`integration_tests` executables are compiled by the parallel `fips-test-build`
-consumer so claimed-profile shards and clippy do not wait on test-binary
-precompile. `fips-test-build` publishes digest-bound copies through an
-immutable artifact scoped to that workflow run and attempt. After a successful
-locked `fips` profile build, the
-build-only producer packages its exact `target/` + `.cache/sccache` tree, the
-checkout's Git tree identity, and a `fips-producer-identity` member as a
-zstd tar, preserving executable modes that artifact ZIP extraction would
-normalize, and publishes it as the one-day immutable artifact
-`fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
-The fallback expression deliberately uses the pull-request head SHA instead of
-the synthetic pull-request merge SHA, so a later manual run of that head can
-name the same source artifact; non-PR events continue to use `github.sha`.
-This artifact is both the same-run compile-to-consumer channel and the
-inter-run warm source. It is deliberately not a repository cache:
-concurrent CI writers empirically evicted a 4.15 GB late cache handoff within
-three minutes, and the former run-attempt-scoped `actions/cache` producer key
-was repeatedly LRU-evicted out of the shared repository quota between the
-producer's save and the consumers' restores, while a failed-job rerun looked
-for an attempt-scoped key the skipped producer had never saved. The filtered
-test consumer rejects unexpected names, symlinks, path escapes, and SHA-256
-mismatches before executing those binaries directly. It does not ask Cargo to
-revalidate fresh-checkout source mtimes and repeat test-only compile/link work.
-GitHub deletes a workflow run's artifacts when that run is fully rerun, so warm
-evidence chains separate `workflow_dispatch` runs. Each dispatch names an exact
-source run ID and attempt, and the pinned download action requests only the
-same-SHA artifact from that run in the current repository. A promoted handoff,
-same-run or explicitly requested,
-must contain a real tar payload and pass extracted-directory validation or the
-consuming job fails closed. The archive also carries the producer checkout's
-Git tree
-identity. Promotion requires that identity to equal the current checkout tree
-and requires both checkouts to remain clean, so a pull-request synthetic merge
-cannot be reused as its branch head after the base tree changes. Checkout
-assigns fresh mtimes even when its source bytes match the archived tree, so
-Cargo would otherwise treat exact restored outputs as stale and relink them.
-Only after the tree identity, real target directory, and nonsymlink executable
-are validated does the promoting job refresh regular files under `target/`.
-All files receive one reference timestamp so Cargo cannot see one restored
-dependency as newer than a dependent merely because separate `touch` batches
-ran in a different order.
-
-Cargo hashes the resolved `RUSTC_WRAPPER` identity into compiled artifacts.
-The checksum-pinned sccache action uses a fresh runner-private install path, so
-every FIPS Cargo job stops that wrapper and clears its two Cargo environment
-variables before cache restore or compilation. The exact target handoff, not a
-runner-unique compiler wrapper, is the FIPS compiler cache. Cold, fork,
-mismatched-tree, untrusted-prefix, and unstable-wrapper paths cannot claim an
-exact warm restore.
-Telemetry records explicit inter-run hits and ordinary runs as no-source
-misses; it does not fabricate a hit.
-The three ordinal `fips-claimed-checks` shards, `fips-clippy`, and
-`fips-test-build` download the producer handoff with the attempt-independent
-pattern `fips-producer-handoff-<sha>-<run_id>-*` and `merge-multiple: false`.
-The pinned download action flattens a single matching artifact's payload
-directly into the channel directory and, when two or more attempts exist,
-extracts each into an artifact-named child directory. Promotion admits both
-layouts, binds the attempt from the `fips-producer-identity` member packaged
-inside the tar (never from the consumer's `github.run_attempt`), requires
-child directory names and payload identity to agree, and never publishes that
-channel — a failed-job rerun therefore
-reuses the artifact the skipped producer published at an earlier attempt.
-Each
-claimed shard selects profiles from the policy checker's single inventory by
-ordinal modulo three and fails closed if it selects none. The ten claimed
-combinations therefore remain checker-owned while running in parallel with
-clippy and test-binary compile after the shorter build-only producer.
-Non-cold consumers, fork runs included, fail closed if no producer handoff
-for their source SHA/run_id was published. `fips-test` consumes only immutable
-test artifacts from its workflow run and never restores a build cache. It
-downloads `fips-test-binaries-<run_id>-*` with the same one-match flattened /
-multi-match child-directory layout, binds the attempt from `fips-test-identity`
-inside the bundle, and selects the newest attempt before validating the
-bundle, so a failed-job rerun can reuse the successful test-build
-prerequisite's earlier artifact. The required `FIPS Build & Test` aggregate depends on
-`fips-test-build` and fails closed if that producer does not succeed. It runs
-with `if: always()`, so it reports `success` or `failure` on every pull
-request, merge-group, `main` push, and manual run and can never be skipped into
-success; `.github/scripts/verify_required_ci.py` pins its complete `needs` set
-and every fail-closed step.
-The pinned cache and artifact actions hold their GitHub Actions service
-credentials inside the action process;
-PR-controlled `run:` steps never receive those credentials. `setup-sccache`
-installs sccache from a checksum-pinned GitHub release and never invokes
-`mozilla-actions/sccache-action` (which would export `ACTIONS_RUNTIME_TOKEN`
-into `GITHUB_ENV`). It activates only the checksum-verified executable by
-exact path (`FERRUM_SCCACHE_BIN` / `RUSTC_WRAPPER`) and persists
-`SCCACHE_GHA_ENABLED` empty. rust-cache `save-if`
-is false when `github.event.pull_request.head.repo.fork` is true on the
-compile producer, and always false on claimed checks, clippy, and
-`fips-test-build`, so fork pull requests restore and cannot save shared caches.
-Run-scoped immutable artifacts remain available to fork runs, so the producer
-handoff gives fork pull requests the same exact compile-to-consumer reuse
-without letting them populate another ref's cache.
-Trusted compile runs keep `cache-on-failure`
-so ordinary failing jobs can publish stable dependency work when post-job
-cleanup still runs. The successful compile producer publishes before claimed
-checks, clippy, and test-binary compile start, so a downstream runner-loss retry
-can reuse it; abrupt loss of the producer cannot publish that producer's
-unsaved artifact state. A `workflow_dispatch` input
-`force_cold_cache` skips shared-cache restore/save and the producer-handoff
-download, packaging, and upload so a hosted cold-cache run still proves every
-live assertion. Its `fips-test-build` job still publishes exact test binaries
-under its attempt-scoped artifact name; the test job selects the newest bundle
-for that workflow run. That same-run transport
-does not warm or publish a shared cache. Path planning is fail-closed: a missing or unknown trusted
-planner runs the compile gate rather than skipping it. Path planning reads a
-NUL-delimited `git diff --name-only --no-renames -z` listing so a hostile
-filename cannot evade a sensitive prefix. Every compiled `tests/` input is
-sensitive (`cargo clippy --lib --tests` and the handshake binaries). Paths
-that are neither sensitive nor on the explicit non-sensitive allowlist
-force-run; empty, truncated, or unavailable diffs run or fail closed rather
-than skipping. Job summaries record rust-cache hit/miss as stable fallback,
-the same-run producer handoff as an evidence-backed hit (a missing handoff
-fails the consumer instead of recording a fabricated miss), and the explicit
-inter-run
-handoff artifact as hit/miss. Measured restored bytes are the sccache-directory
-subset for rust-cache and the on-disk `target/` directory for the promoted
-producer handoff. Total rust-cache archive bytes are not exposed.
+One FIPS-specific cache rule is not covered there: the stable rust-cache layer
+does not trust AWS-LC's runner-local CMake incremental tree across runners.
+After every non-cold rust-cache restore, `fips-compile` validates any restored
+`target/` root and removes matching `*/build/aws-lc-fips-sys-*/out/build`
+directories before Cargo can rerun the upstream build script. Installed AWS-LC
+libraries and Rust outputs stay warm, while any required CMake work starts clean
+instead of reparsing a restored `libbcm_c_generated_asm.a` archive. An
+explicitly requested exact handoff is promoted after this quarantine and
+replaces the stable target tree (see the `Quarantine restored AWS-LC FIPS CMake
+state` step in `.github/workflows/fips-build.yml`).
 
 ## Current capability
 
@@ -249,9 +177,10 @@ producer handoff. Total rust-cache archive bytes are not exposed.
 | Mutually exclusive `crypto-ring` / `fips` build profiles | **Shipped** |
 | AWS-LC FIPS module integration linked by the `fips` profile | **Shipped** |
 | Resolved-feature-graph audit in CI (both profiles, and every claimed optional combination) | **Shipped** |
+| Checker self-test: mutated manifests and resolved graphs must be rejected | **Shipped** |
 | Hosted compile lane for every claimed optional FIPS combination | **Shipped** |
 | Approved key-strength/form admission for certificates and JWKS keys | **Shipped** (`src/fips/keys.rs`) |
-| Fail-closed gate on every independently configurable peer-verification opt-out | **Shipped** |
+| Fail-closed gate on the independently configurable peer-verification opt-outs (exceptions listed under §"What FIPS mode enforces") | **Shipped** |
 | Request surface (`--fips-mode`, `FERRUM_FIPS_MODE`, `FERRUM_FIPS_REQUIRED_PROVIDER`) | **Shipped** |
 | Fail-closed bootstrap, including the module's power-on self-test | **Shipped** |
 | Single crypto-provider seam (`crate::fips`) across all rustls construction | **Shipped** |
@@ -342,9 +271,10 @@ reload, which rebuilds through the same constructor.
   an approved FIPS 186-5 scheme, but the `jsonwebtoken/aws_lc_rs` backend this
   profile selects exposes no P-521 JWS path at all, so admitting it would be an
   allow-list entry that fails at first use rather than at admission.
-- `FERRUM_ADMIN_JWT_SECRET`, `FERRUM_CP_DP_GRPC_JWT_SECRET`,
-  `FERRUM_BASIC_AUTH_HMAC_SECRET`, and `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET`
-  must be at least 32 bytes (SP 800-107 HMAC key strength). A shorter
+- `FERRUM_ADMIN_JWT_SECRET`, `FERRUM_ADMIN_JWT_VIEWER_SECRET`,
+  `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`,
+  `FERRUM_CP_DP_GRPC_JWT_SECRET`, `FERRUM_BASIC_AUTH_HMAC_SECRET`, and
+  `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` must be at least 32 bytes (SP 800-107 HMAC key strength). A shorter
   `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` fails `ferrum-edge validate` and
   startup; the diagnostic names the variable and does not report the value or
   its length. An unset or empty value is not a FIPS key-length failure: it
@@ -387,7 +317,11 @@ policy itself, at admission:
   enforcement. `P-521` is refused here because its only JWS use is `ES512`,
   which is refused above; admitting the curve while refusing every algorithm
   that could use it would only move the failure later. Padding on `n` contrary
-  to RFC 7518 §6.3.1.1 is not credited toward the floor.
+  to RFC 7518 §6.3.1.1 is not credited toward the floor. `OKP` (Ed25519 /
+  `EdDSA`) JWKS keys and `EdDSA` DPoP proofs, which `jwks_auth` and
+  `oidc_relying_party` accept on the default profile, are refused for the same
+  reason `EdDSA` JWTs are. RSASSA-PSS (`PS256`/`PS384`/`PS512`) JWKS keys are
+  admitted under the same RSA key-form rules as PKCS#1 v1.5 keys.
 - The upper RSA bound is not a security floor but a denial-of-service bound: an
   oversized modulus costs every handshake that touches it, and no approved
   profile needs one.
@@ -398,7 +332,7 @@ flow through the existing secure loading boundary (`parse_pem_private_key`) and
 are never parsed, copied, or logged by this gate. Diagnostics name the surface,
 the algorithm family, and the observed bit length, and nothing else.
 
-**Peer verification — every independently configurable opt-out**
+**Peer verification — independently configurable opt-outs**
 
 An unverified peer defeats the point of an approved key exchange: the module can
 perform a perfect ECDHE and it is still a key agreement with whoever answered.
@@ -427,8 +361,8 @@ walks through, so all of the following are refused:
 | `ai_federation` | `providers[].allow_plaintext: true` |
 | `ai_stream_router` | `providers[].allow_plaintext: true` |
 
-Two entries are deliberately absent, each with a test that keeps the reasoning
-honest rather than leaving it as a comment:
+Four settings are deliberately absent from that table. The first three each
+have a test that keeps the reasoning honest rather than leaving it as a comment:
 
 - `FERRUM_DP_GRPC_TLS_NO_VERIFY` is already refused **unconditionally**, on every
   build and in every mode, by the ordinary validator. A FIPS rule for it would
@@ -437,6 +371,24 @@ honest rather than leaving it as a comment:
 - `kafka_logging`'s `ssl_no_verify` is covered by the refusal of the whole
   plugin (below). A test pins that relationship so removing the plugin-level
   rejection cannot orphan the key.
+- `FERRUM_VAULT_ALLOW_PLAINTEXT` can never take effect in an enforcing
+  process, because the whole Vault provider (`_VAULT` and `vault://`) is
+  refused before any provider client is built (§"External secret providers:
+  why they are refused"). A test pins that both refusals run before startup
+  secret resolution and TLS material loading resolve anything, and that
+  `VaultClientWrapper::new` is the only code that reads the key.
+  `ferrum-edge health` never enforces FIPS mode, so a `_VAULT` source on one
+  of its endpoint settings still resolves under the key's ordinary rules.
+
+The fourth is not FIPS-gated and no FIPS test pins it:
+
+- `FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT` is **not** refused by FIPS enforce
+  mode. It is a development switch for unauthenticated h2c to a stock xDS
+  control plane: loopback hosts only (`127.0.0.0/8`, `::1`, `localhost`), never
+  combined with a bearer credential (`FERRUM_MESH_STOCK_XDS_TOKEN_FILE`), and
+  refused outright under `FERRUM_MESH_PRODUCTION_MODE=true`. Those mesh
+  transport rules are tested; the FIPS gate does not add to them. For a FIPS
+  deployment, leave it unset and set `FERRUM_MESH_PRODUCTION_MODE=true`.
 
 `backend_tls_verify_server_cert: false` is refused **even where it is currently
 inert** — for example on a plaintext backend. That is a deliberate decision, not
@@ -501,6 +453,11 @@ the entry and discloses nothing.
   nothing. They are computed through the provider seam, and the inventory
   records them as `outside-boundary` for exactly the same reason as the RFC 6455
   handshake value. Do not read them as SHA-1 signature verification.
+- JWT-SVID authorities (local and federated) follow the same key policy as the
+  plugin JWKS path while `FERRUM_FIPS_MODE=enforce` is in effect: an RSA
+  authority's public exponent must be odd and greater than 65536, and an EC
+  authority must use P-256 or P-384 (`fips::keys`). On the default profile the
+  RFC 8017 floor (odd, at least 3) still applies.
 - JWT-SVID trust material admits an EC authority only after proving
   the published point actually lies on its named curve. That proof is a bounded
   ephemeral ECDH agreement at the provider seam (`fips::ec_point_on_named_curve`
@@ -657,7 +614,7 @@ than being allowed to run outside the boundary:
 | ChaCha20-Poly1305, X25519 | not an approved AEAD / not an approved SP 800-56A scheme | AES-GCM suites, secp256r1 / secp384r1 |
 | RSA below 2048 bits; DSA, GOST, Ed25519/Ed448/X25519 certificates | SP 800-131A Rev. 2 / FIPS 186-5 | RSA 2048–8192, ECDSA P-256/P-384/P-521 |
 | Stapled OCSP responses signed with `sha1WithRSAEncryption` or Ed25519, and responses carrying a non-approved responder certificate key | SHA-1 is disallowed for signature verification (SP 800-131A Rev. 2); Ed25519 is not routed through the selected module; an embedded responder certificate bypasses the PEM bundle key gate | a response signed with SHA-2 RSA (PKCS#1 or PSS) or ECDSA P-256/P-384, carrying only approved responder certificates |
-| Any peer-verification opt-out | an unauthenticated peer defeats the approved key exchange | pin the peer's CA (see the table in §"What FIPS mode enforces") |
+| A gated peer-verification opt-out | an unauthenticated peer defeats the approved key exchange | pin the peer's CA (see the table in §"What FIPS mode enforces") |
 | **External secret providers** (`_VAULT`, `_AWS`, `_AZURE`, `_GCP`, and `vault://`, `aws://`, `azure://`, or `gcp://` TLS-material sources) | their SDKs resolve secrets over their own TLS stacks, which are not built from Ferrum's provider seam and are not selected by the `crypto-ring` / `fips` feature pair | a local file or direct value backed by an operator-validated delivery mechanism (mounted secret, init container, KMS-backed volume) |
 
 ### DTLS: why the whole transport is refused
@@ -729,6 +686,12 @@ each, then compiles each against the real module:
 | `fips,bench-h1-profile,bench-udp-profile` | Supported — the combined diagnostic features retain the existing allocator and selected crypto provider under the same hosted gates |
 | `fips,acme,pkcs11,ebpf` | Supported — the combined operational features, under the same resolved-graph audit and hosted compile gate |
 | `fips,cloud-secrets` | **Builds, refused at runtime** (above) |
+
+`fuzzing` and `test-support` are exempt from that inventory: neither compiles
+cryptography and neither ships. `test-support` (test-only fault injection and
+hooks, issue #7122) is enabled only through the crate's self dev-dependency, so
+`cargo test --no-default-features --features fips` gets it on the FIPS backend
+while a FIPS `cargo build --release` never does.
 
 ## Verifying a deployment
 

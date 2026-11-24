@@ -316,3 +316,57 @@ fn over_long_viewer_namespace_entry_is_refused_at_startup() {
         assert!(error.contains("1-254 characters"), "{error}");
     });
 }
+
+// ── FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET (GHSA-crqx-mp2f-v8c8) ──
+
+const FINGERPRINT_SECRET: &str = "export-fingerprint-secret-padding-32c";
+
+fn with_fingerprint_secret(fingerprint: &str) -> Vec<(&str, &str)> {
+    let mut vars = database_mode_env(ADMIN_SECRET, VIEWER_SECRET);
+    vars.push(("FERRUM_CP_DP_GRPC_JWT_SECRET", CP_DP_SECRET));
+    vars.push(("FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET", fingerprint));
+    vars
+}
+
+#[test]
+fn config_export_fingerprint_secret_reusing_any_signing_secret_is_refused() {
+    for reused in [ADMIN_SECRET, VIEWER_SECRET, CP_DP_SECRET] {
+        with_env_vars(&with_fingerprint_secret(reused), || {
+            let error =
+                EnvConfig::from_env().expect_err("a reused signing secret must fail closed");
+            assert!(
+                error.contains("FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET"),
+                "{error}"
+            );
+            assert!(error.contains("must differ"), "{error}");
+            assert!(
+                !error.contains(reused),
+                "startup error must never include secret material"
+            );
+        });
+    }
+}
+
+#[test]
+fn short_config_export_fingerprint_secret_is_refused() {
+    with_env_vars(&with_fingerprint_secret("short-fingerprint"), || {
+        let error = EnvConfig::from_env().expect_err("short fingerprint secret must fail");
+        assert!(
+            error.contains("FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET"),
+            "{error}"
+        );
+        assert!(error.contains("at least"), "{error}");
+        assert!(!error.contains("short-fingerprint"), "{error}");
+    });
+}
+
+#[test]
+fn distinct_config_export_fingerprint_secret_is_accepted() {
+    with_env_vars(&with_fingerprint_secret(FINGERPRINT_SECRET), || {
+        let config = EnvConfig::from_env().expect("a distinct fingerprint secret is accepted");
+        assert_eq!(
+            config.admin_config_export_fingerprint_secret.as_deref(),
+            Some(FINGERPRINT_SECRET)
+        );
+    });
+}

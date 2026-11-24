@@ -23,8 +23,8 @@ use regex::bytes::RegexSet as BytesRegexSet;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 
+use super::config_values::{optional_bool, optional_string, parse_severity};
 use super::rules::{RuleAction, Severity, parse_rule_action};
-use super::{optional_bool, optional_string, parse_severity};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Fixed-shape `stream` block keys.
@@ -58,8 +58,12 @@ pub(super) struct CompiledStreamSignatures {
 
 impl CompiledStreamSignatures {
     /// Metadata for every signature matching `data`.
+    ///
+    /// Clean traffic (the common case: every UDP datagram and TCP first-bytes
+    /// scan) is decided by `is_match` alone, which neither builds the per-set
+    /// match list nor allocates; only a matching payload pays for both.
     pub(super) fn matches<'a>(&'a self, data: &[u8]) -> Vec<&'a StreamSignatureMeta> {
-        if self.meta.is_empty() {
+        if self.meta.is_empty() || !self.set.is_match(data) {
             return Vec::new();
         }
         self.set
@@ -214,7 +218,7 @@ fn compile_stream_signatures(
                     )
                 })?;
                 let severity = match optional_string(obj, "severity")? {
-                    Some(s) => parse_severity(&s).ok_or_else(|| {
+                    Some(s) => parse_severity(&s).map_err(|_| {
                         format!("waf: stream signature {id:?} has invalid `severity` {s:?}")
                     })?,
                     None => Severity::Medium,

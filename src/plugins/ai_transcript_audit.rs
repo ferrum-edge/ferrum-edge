@@ -68,15 +68,14 @@
 //!
 //! This plugin is **not** a security boundary on its own — it observes and
 //! redacts, it does not enforce. Pair it with `ai_prompt_shield`,
-//! `ai_semantic_firewall`, `ai_response_guard`, and the tool governance in
-//! `ai_semantic_firewall` for enforcement.
+//! `ai_semantic_firewall`, `ai_response_guard`, and `ai_tool_governor` for
+//! enforcement.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::IpAddr;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -98,11 +97,15 @@ use serde_json::Value;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
+use super::request_representation;
 use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::byte_budget::{ByteBudget, ByteLease};
+use super::utils::grpc_method::{canonical_grpc_method, resolve_grpc_method_path};
 use super::utils::mcp_jsonrpc;
-use super::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
+use super::utils::metadata_redaction::{
+    REDACTED_PLACEHOLDER, is_sensitive_header_name, metadata_value_is_redacted,
+};
 use super::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, read_response_body_bounded,
 };
@@ -433,6 +436,13 @@ const OMIT_REASON_RETAINED_BYTE_BUDGET: &str = "retained_byte_budget";
 /// The aggregate `limits.max_request_bytes` budget for MCP argument excerpts
 /// was already spent by earlier calls of the same request.
 const OMIT_REASON_MCP_ARGUMENTS_BUDGET: &str = "mcp_arguments_budget";
+/// A redacted excerpt of a JSON document (a request candidate, a JSON
+/// response, or an object/array-shaped payload) was withheld because no
+/// structural parse could read it — a non-UTF-8 encoding, `NaN`, comments, or a
+/// batch past the whole-document nesting limit — so the sensitive-member-name
+/// policy could not be applied. Pattern-only redaction of such a document would
+/// export generic credentials (`password`, `token`, …) verbatim.
+const OMIT_REASON_UNPARSEABLE_DOCUMENT: &str = "unparseable_document";
 /// Enrolled gRPC method whose descriptor dependency is unavailable on this node.
 const OMIT_REASON_GRPC_DESCRIPTOR_UNAVAILABLE: &str = "grpc_descriptor_unavailable";
 /// Framed gRPC body was malformed, truncated, or used an unsupported encoding.
@@ -1098,19 +1108,9 @@ struct StreamSlot {
     revoked: AtomicBool,
     /// True only after the response inspector reaches its drop boundary.
     inspector_dropped: AtomicBool,
-    /// Set after expiry removes the live slot from the global map. A revoked
-    /// fallback handoff may be published only after this transition, otherwise
-    /// a concurrent remove could erase the newly published marker.
-    detached_after_revocation: AtomicBool,
-    /// Single-fire guard for the tiny drop-time fallback handoff.
-    fallback_published: AtomicBool,
-    /// Production inspectors publish into request-owned completion state.
-    /// `false` exists only for external tests that call the plugin factory
-    /// directly without the core response-stream wrapper.
-    uses_request_handoff: bool,
     /// Bounds entries while they are reachable from the process-global live
-    /// map. Production expiry/terminal claim removes the entry before releasing
-    /// this permit; request-owned terminal handoffs need no global capacity.
+    /// map. Expiry and terminal claim remove the entry before releasing this
+    /// permit; the request-owned terminal handoff needs no global capacity.
     pending_permit: Mutex<Option<OwnedSemaphorePermit>>,
 }
 
@@ -1128,9 +1128,9 @@ impl StreamSlot {
         }
     }
 
-    /// Revoke audit work before reservation accounting is released. Returns
-    /// false when the terminal hook already claimed the slot.
-    fn revoke(&self) -> bool {
+    /// Revoke audit work before reservation accounting is released. No-op when
+    /// the terminal hook already claimed the slot or it was already revoked.
+    fn revoke(&self) {
         let prior = {
             let mut capture = self.lock_capture();
             let hashed_bytes = match &*capture {
@@ -1138,7 +1138,7 @@ impl StreamSlot {
                 StreamCaptureLifecycle::Complete(Some(captured)) => captured.response_hash_bytes,
                 StreamCaptureLifecycle::Complete(None) => 0,
                 StreamCaptureLifecycle::Revoked { .. } | StreamCaptureLifecycle::Claimed => {
-                    return false;
+                    return;
                 }
             };
             std::mem::replace(
@@ -1150,7 +1150,6 @@ impl StreamSlot {
         // caller removes staging and releases any byte/queue reservations.
         drop(prior);
         self.revoked.store(true, Ordering::Release);
-        true
     }
 
     fn finish_abnormally(&self) {
@@ -1170,10 +1169,9 @@ impl StreamSlot {
             if matches!(&*capture, StreamCaptureLifecycle::Active(_))
                 && !self.inspector_dropped.load(Ordering::Acquire)
             {
-                // Production terminal hooks wait for inspector completion.
-                // Preserve that ownership boundary for direct callers too: an
-                // inspector that is still live and never saw on_end has not
-                // produced a terminal result to claim.
+                // Terminal hooks wait for inspector completion: an inspector
+                // that is still live and never saw on_end has not produced a
+                // terminal result to claim.
                 return None;
             }
             if matches!(&*capture, StreamCaptureLifecycle::Claimed) {
@@ -1224,7 +1222,6 @@ impl StreamSlot {
         lease.take()
     }
 
-    #[allow(dead_code)] // used only by external tests; dead in binary target
     fn capture_snapshot(&self) -> AuditStreamCaptureSnapshot {
         let capture = self.lock_capture();
         match &*capture {
@@ -1266,14 +1263,13 @@ impl StreamSlot {
 /// Read-only test probe for one inspector-owned capture lifecycle. It holds a
 /// weak reference so tests cannot extend the production state lifetime.
 #[doc(hidden)]
-#[allow(dead_code)] // constructed only by external tests; dead in binary target
+#[allow(dead_code)] // constructed only by external tests
 pub struct AuditStreamCaptureProbe {
     slot: Weak<StreamSlot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
-#[allow(dead_code)] // constructed only by external tests; dead in binary target
 pub struct AuditStreamCaptureSnapshot {
     pub retained_capture_bytes: u64,
     pub hashed_bytes: u64,
@@ -1283,43 +1279,9 @@ pub struct AuditStreamCaptureSnapshot {
 
 impl AuditStreamCaptureProbe {
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary target
     pub fn snapshot(&self) -> Option<AuditStreamCaptureSnapshot> {
         self.slot.upgrade().map(|slot| slot.capture_snapshot())
     }
-}
-
-fn publish_revoked_fallback_if_ready(
-    record_id: &str,
-    slot: &Arc<StreamSlot>,
-    pending_streams: &DashMap<String, Arc<StreamSlot>>,
-) {
-    if slot.uses_request_handoff
-        || !slot.revoked.load(Ordering::Acquire)
-        || !slot.inspector_dropped.load(Ordering::Acquire)
-        || !slot.detached_after_revocation.load(Ordering::Acquire)
-        || slot
-            .fallback_published
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
-        return;
-    }
-    // Serialize publication with `claim_terminal`: without this lifecycle
-    // guard, a direct-factory terminal caller could claim/remove the slot
-    // between the compare-exchange above and this insert, leaving a claimed
-    // tombstone in the bounded global map. Production uses request handoff,
-    // but the compatibility path must retain the same single-consumer rule.
-    let capture = slot.lock_capture();
-    if !matches!(&*capture, StreamCaptureLifecycle::Revoked { .. }) {
-        return;
-    }
-    // This marker owns no transcript bytes, hash state, staging lease, or
-    // commit permit. It is published only at actual inspector drop and is
-    // consumed immediately after the completion signal. This direct-factory
-    // compatibility path retains its live-map permit until terminal claim.
-    pending_streams.insert(record_id.to_string(), Arc::clone(slot));
-    drop(capture);
 }
 
 fn expire_stream_reservation(
@@ -1357,21 +1319,16 @@ fn expire_stream_reservation(
         .map(|entry| Arc::clone(entry.value()));
     if let Some(slot) = slot.as_ref() {
         // Synchronously drop the live Vec, completed excerpt/hash, and HMAC
-        // before releasing any staging, queue, or retained-byte owner.
-        let revoked = slot.revoke() || slot.revoked.load(Ordering::Acquire);
+        // before releasing any staging, queue, or retained-byte owner. The
+        // terminal hook still reaches the revoked slot through the
+        // request-owned handoff the inspector publishes when it drops.
+        slot.revoke();
         pending_streams.remove_if(record_id, |_, current| Arc::ptr_eq(current, slot));
-        if slot.uses_request_handoff {
-            slot.release_pending_permit();
-        }
+        slot.release_pending_permit();
         // Fail-open streams own their retained-record reservation in the slot;
         // fail-closed streams release the equivalent staging-owned reservation
         // below. Both happen only after capture/HMAC revocation.
         drop(slot.take_record_lease());
-        if revoked {
-            slot.detached_after_revocation
-                .store(true, Ordering::Release);
-            publish_revoked_fallback_if_ready(record_id, slot, pending_streams);
-        }
     }
 
     // If a normal terminal consumer removed the entry after expiry won the
@@ -1990,8 +1947,6 @@ pub struct AiTranscriptAudit {
     stream_handoff_id: u64,
     rate_limiter: Arc<RecordsPerMinute>,
     sink_healthy: Arc<AtomicBool>,
-    /// `true` when at least one capture path is enabled (validated in `new`).
-    active: bool,
     staging_ttl: Duration,
     /// Amortization interval between staging sweeps. Normally
     /// [`STAGING_SWEEP_INTERVAL_SECS`], but never longer than half the
@@ -2201,14 +2156,15 @@ impl AiTranscriptAudit {
         // Counted in CHARACTERS, not UTF-8 bytes, so the admitted contract is
         // the one the documentation, the diagnostic, and the JSON Schema
         // `minLength` all state (JSON Schema counts code points, and a
-        // byte-counted minimum would silently admit an 8-character secret that
-        // the published component refuses). 16 characters is never fewer than
-        // 16 bytes, so this is the stricter of the two readings.
+        // byte-counted minimum would silently admit a 16-character secret that
+        // the published component refuses). 32 characters is never fewer than
+        // 32 bytes, so this is the stricter of the two readings. 32 is the same
+        // floor the OIDC session encryption secret uses.
         if let Some(secret) = hash_secret
-            && secret.chars().count() < 16
+            && secret.chars().count() < 32
         {
             return Err(
-                "ai_transcript_audit: `redaction.hash_secret` must be at least 16 characters"
+                "ai_transcript_audit: `redaction.hash_secret` must be at least 32 characters"
                     .to_string(),
             );
         }
@@ -2295,10 +2251,15 @@ impl AiTranscriptAudit {
             http_client.backend_allow_ips(),
         )?;
         let allow_insecure_loopback = cfg_bool(sink_obj, "allow_insecure_loopback", false, "sink")?;
-        if endpoint_url
-            .get(..7)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
-        {
+        // Decide the scheme from the URL the transport will use, not from
+        // the configured spelling: the URL parser ignores leading/trailing
+        // whitespace and embedded tabs/newlines, so a prefix test on the raw
+        // string let ` http://...` skip this guard entirely.
+        let cleartext = match url::Url::parse(&endpoint_url) {
+            Ok(url) => url.scheme() == "http",
+            Err(_) => true,
+        };
+        if cleartext {
             if !allow_insecure_loopback {
                 return Err(
                     "ai_transcript_audit: `sink.endpoint_url` must use https://; \
@@ -2306,14 +2267,15 @@ impl AiTranscriptAudit {
                         .to_string(),
                 );
             }
-            let loopback = endpoint_hostname.eq_ignore_ascii_case("localhost")
-                || endpoint_hostname
-                    .parse::<IpAddr>()
-                    .is_ok_and(|address| address.is_loopback());
+            // Only a loopback IP literal proves the transcript stays on this
+            // machine: DNS overrides and the resolver decide where a name —
+            // `localhost` included — connects (the #6659 rule).
+            let loopback =
+                super::utils::socket_host::is_loopback_ip_literal_host(&endpoint_hostname);
             if !loopback {
                 return Err(
                     "ai_transcript_audit: `sink.allow_insecure_loopback` permits http:// only \
-                     for localhost or a loopback IP address"
+                     for a loopback IP literal"
                         .to_string(),
                 );
             }
@@ -2409,7 +2371,6 @@ impl AiTranscriptAudit {
         let staging_sweep_interval_secs = STAGING_SWEEP_INTERVAL_SECS
             .min(limits.max_stream_reservation.as_secs() / 2)
             .max(1);
-        let active = capture.request || capture.response || streaming != StreamingCapture::Off;
         let namespace = crate::config::conf_file::resolve_ferrum_var("FERRUM_NAMESPACE")
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| crate::config::types::DEFAULT_NAMESPACE.to_string());
@@ -2444,7 +2405,6 @@ impl AiTranscriptAudit {
             stream_handoff_id: allocate_response_stream_handoff_id(),
             rate_limiter: Arc::new(RecordsPerMinute::new(sampling.max_records_per_minute)),
             sink_healthy,
-            active,
             staging_ttl: Duration::from_secs(60 * 60),
             staging_sweep_interval_secs,
             next_staging_sweep_at: AtomicU64::new(0),
@@ -2456,7 +2416,6 @@ impl AiTranscriptAudit {
     }
 
     /// `(captures_performed, captures_skipped)` — see [`Self::request_captures`].
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn capture_counters(&self) -> (u64, u64) {
         (
             self.request_captures.load(Ordering::Relaxed),
@@ -2465,7 +2424,6 @@ impl AiTranscriptAudit {
     }
 
     /// Effective admitted capture ceilings for authenticated status / tests.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn status_snapshot(&self) -> AiTranscriptAuditSnapshot {
         self.status_snapshot_for_id(self.status_id.get().copied().unwrap_or(0))
     }
@@ -2473,7 +2431,6 @@ impl AiTranscriptAudit {
     /// Obtain a weak, read-only probe for focused external lifecycle tests.
     /// Production code never calls this and the probe cannot retain the slot.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary target
     pub fn stream_capture_probe(&self, ctx: &RequestContext) -> Option<AuditStreamCaptureProbe> {
         let record_id = ctx.metadata.get(MD_RECORD_ID)?;
         self.pending_streams
@@ -2818,12 +2775,7 @@ impl AiTranscriptAudit {
         }
     }
 
-    fn stream_commit_selected(
-        &self,
-        ctx: &RequestContext,
-        _response_status: u16,
-        _content_type: Option<&str>,
-    ) -> bool {
+    fn stream_commit_selected(&self, ctx: &RequestContext) -> bool {
         if self.capture.streaming == StreamingCapture::Off || !flag(&ctx.metadata, MD_CANDIDATE) {
             return false;
         }
@@ -2864,14 +2816,8 @@ impl AiTranscriptAudit {
             || (response_status >= 400 && (self.sampling.always_on_error || sample_hit))
     }
 
-    fn stream_fail_closed_rejection(
-        &self,
-        ctx: &mut RequestContext,
-        response_status: u16,
-        response_headers: &HashMap<String, String>,
-    ) -> PluginResult {
-        let content_type = response_headers.get("content-type").map(String::as_str);
-        if !self.stream_commit_selected(ctx, response_status, content_type) {
+    fn stream_fail_closed_rejection(&self, ctx: &mut RequestContext) -> PluginResult {
+        if !self.stream_commit_selected(ctx) {
             return PluginResult::Continue;
         }
 
@@ -2979,21 +2925,32 @@ impl AiTranscriptAudit {
     /// entry-count gate would let the leak the bound exists to stop pass
     /// through untouched. Every scan is bounded by [`MAX_STAGING_ENTRIES`].
     fn sweep_staging(&self) {
-        if self.staging.is_empty() {
-            return;
-        }
+        // Check the relaxed atomic cooldown FIRST so high-RPS requests do not
+        // acquire every DashMap shard lock via `self.staging.is_empty()` on
+        // every request.
         let now_seconds = process_monotonic_seconds();
         let next = self.next_staging_sweep_at.load(Ordering::Relaxed);
-        if now_seconds < next
-            || self
-                .next_staging_sweep_at
-                .compare_exchange(
-                    next,
-                    now_seconds.saturating_add(self.staging_sweep_interval_secs),
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
-                .is_err()
+        if now_seconds < next {
+            return;
+        }
+        if self.staging.is_empty() {
+            let _ = self.next_staging_sweep_at.compare_exchange(
+                next,
+                now_seconds.saturating_add(self.staging_sweep_interval_secs),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            return;
+        }
+        if self
+            .next_staging_sweep_at
+            .compare_exchange(
+                next,
+                now_seconds.saturating_add(self.staging_sweep_interval_secs),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
         {
             return;
         }
@@ -3049,22 +3006,63 @@ impl AiTranscriptAudit {
         }
     }
 
-    fn shape_body(&self, raw: &[u8], max_bytes: usize) -> ShapedBody {
+    /// Whether either fail-closed sink policy is configured, so audited
+    /// traffic must stop rather than flow unaudited.
+    fn fails_closed(&self) -> bool {
+        self.on_buffer_full == BufferFullPolicy::Reject
+            || self.on_sink_error == SinkErrorPolicy::Reject
+    }
+
+    /// Whether a candidate-typed body that no structural parse could read must
+    /// still be audited as a possible AI request.
+    ///
+    /// Callers reach this only for a body on the candidate surface
+    /// (a POST whose media type is JSON-ish, or a Content-Type-less body the
+    /// MCP prefilter flagged). Any such body strict parsing refuses can still
+    /// be executed by a lenient upstream — UTF-16 / UTF-32, a leading `//` or
+    /// `/* */` comment, a non-ASCII whitespace prefix, `NaN`, trailing commas —
+    /// and no byte heuristic enumerates every dialect. So under a fail-closed
+    /// policy every unreadable candidate body is conservatively in scope,
+    /// exactly like a body past the redaction scan ceiling and independent of
+    /// `capture.mcp_tool_calls`: it is staged, admitted, and recorded (its
+    /// excerpt withheld as `unparseable_document`), never silently forwarded
+    /// unaudited. Fail-open policies keep the heuristic classification.
+    fn unreadable_document_in_scope(&self, body: &[u8], parsed: Option<&Value>) -> bool {
+        // An empty body carries no request at all, so it is never "unreadable".
+        !body.is_empty() && parsed.is_none() && self.fails_closed()
+    }
+
+    fn shape_body(
+        &self,
+        raw: &[u8],
+        max_bytes: usize,
+        representation: PayloadRepresentation,
+        pre_parsed: PreParsed,
+    ) -> ShapedBody {
         shape_bytes(
             self.mode,
             &self.redactor,
             raw,
             max_bytes,
             self.limits.max_redaction_scan_bytes,
+            representation,
+            pre_parsed,
         )
     }
 
     /// The method view available to the CALLING hook, which is not always the
     /// backend-effective one.
     ///
-    /// Prefers the finalized `grpc_full_method` published by
-    /// `grpc_method_router` (which reflects a method rewrite) and falls back
-    /// to the request path.
+    /// The backend-effective path the proxy bound at the backend-path boundary
+    /// (`RequestContext::authorized_backend_path`, bound for every request on a
+    /// `grpc`-enrolled instance because it opts into
+    /// `requires_backend_path_resolution`) is authoritative and is never
+    /// outranked by plugin-writable `grpc_full_method` metadata; before it is
+    /// bound, the metadata and then the request path stand in. Without the
+    /// bound path an audit-only proxy with `strip_listen_path` or a
+    /// `backend_path` would decide enrollment on the client path, which the
+    /// backend never receives. The key is the trailing `/Service/Method`, the
+    /// same resolution `body_validator` uses ([`resolve_grpc_method_path`]).
     ///
     /// `grpc_method_router` publishes this key twice: provisionally from the
     /// CLIENT path in `on_request_received`, then authoritatively from the
@@ -3084,8 +3082,21 @@ impl AiTranscriptAudit {
     /// normalization would make the metadata value unable to match any enrolled
     /// key while still suppressing the `ctx.path` fallback — every enrolled gRPC
     /// call would silently escape capture whenever `grpc_method_router` is also
-    /// configured. Empty metadata still falls back to the request path.
+    /// configured. Empty metadata falls back to the request path.
+    ///
+    /// Intentional difference from `body_validator` / `ai_response_guard`:
+    /// only the BOUND path goes through the shared canonical resolution. The
+    /// pre-bind view stays exact (slash-normalized metadata, then the verbatim
+    /// request path) because a provisional enrollment here reaches REJECTING
+    /// request admission in `before_proxy` (sink health, staging capacity
+    /// under a fail-closed policy). Canonicalizing `/api/pkg.Service/Method`
+    /// before routing could refuse a call whose backend-effective method is
+    /// not enrolled at all; the final hook re-decides on the bound path, but a
+    /// `before_proxy` rejection never reaches it.
     fn grpc_method_path(ctx: &RequestContext) -> Cow<'_, str> {
+        if ctx.authorized_backend_path().is_some() {
+            return resolve_grpc_method_path(ctx);
+        }
         match ctx.metadata.get("grpc_full_method") {
             Some(method) if method.starts_with('/') => Cow::Borrowed(method.as_str()),
             Some(method) if !method.is_empty() => {
@@ -3663,9 +3674,17 @@ impl AiTranscriptAudit {
     /// ([`AuditStaging::captured`]) — so the common no-transform path performs a
     /// single keyed HMAC pass instead of hashing once at staging and again to
     /// discover the final body was unchanged.
+    ///
+    /// `document` is the caller's own parse of these exact bytes (`None` when
+    /// it was refused or skipped by the scan ceiling). It is consumed here:
+    /// model/tool metadata is read from it first (only when
+    /// `extract_metadata`; an MCP candidate's final body names neither), and
+    /// the same tree is then redacted in place for the excerpt, so one hook
+    /// never parses the same document twice.
     fn capture_request(
         &self,
-        parsed: Option<&Value>,
+        document: Option<Value>,
+        extract_metadata: bool,
         body: &[u8],
         sample_hit: bool,
         excerpt_budget: usize,
@@ -3691,6 +3710,7 @@ impl AiTranscriptAudit {
         // `hash_only` exports no model/provider/tool metadata at all
         // (`build_record` discards it), so do not extract or redact it.
         let harvests = self.mode.harvests_metadata();
+        let parsed = document.as_ref().filter(|_| extract_metadata);
         let model = if harvests {
             parsed
                 .map(|json| extract_model_bounded(json, &self.redactor, redact_before_bound))
@@ -3706,7 +3726,18 @@ impl AiTranscriptAudit {
             BoundedToolNames::default()
         };
         let shaped = if self.capture.request {
-            self.shape_body(body, excerpt_budget)
+            // Every request capture is a classified JSON / MCP candidate, and
+            // the caller already parsed (or failed to parse) these bytes.
+            let pre_parsed = match document {
+                Some(document) => PreParsed::Document(document),
+                None => PreParsed::Unparseable,
+            };
+            self.shape_body(
+                body,
+                excerpt_budget,
+                PayloadRepresentation::JsonDocument,
+                pre_parsed,
+            )
         } else {
             ShapedBody::default()
         };
@@ -3775,9 +3806,16 @@ impl AiTranscriptAudit {
         let parsed: Option<Value> = if scan_limited {
             None
         } else {
-            serde_json::from_slice(body).ok()
+            parse_json_document(body)
         };
-        let is_ai = scan_limited || parsed.as_ref().is_some_and(json_looks_like_ai_request);
+        // A candidate body no structural parse can read is, under a
+        // fail-closed policy, conservatively a possible AI request — like a
+        // scan-limited one — so it cannot bypass fail-closed admission.
+        let unreadable_document =
+            !scan_limited && self.unreadable_document_in_scope(body, parsed.as_ref());
+        let is_ai = scan_limited
+            || unreadable_document
+            || parsed.as_ref().is_some_and(json_looks_like_ai_request);
         // Whenever no `Value` is available — the redaction scan ceiling, or a
         // body the whole-document parse refuses — read the bytes with the
         // bounded recognizer. `mcp_gateway` admits batch members one at a time,
@@ -3788,8 +3826,9 @@ impl AiTranscriptAudit {
         let raw_scan = scan_limited || parsed.is_none();
         let bounded_mcp_scan = (raw_scan && self.capture.mcp_tool_calls)
             .then(|| mcp_jsonrpc::scan_request_bytes(body));
-        // A body the whole-document parse refused may still be accepted by a
-        // lenient upstream decoder (a BOM, UTF-16 / UTF-32 or other non-UTF-8
+        // A body the whole-document parse refused (a leading UTF-8 BOM is
+        // already stripped) may still be accepted by a lenient upstream
+        // decoder (a UTF-16 / UTF-32 BOM, UTF-16 / UTF-32 or other non-UTF-8
         // bytes, `NaN`, comments, trailing commas) that the strict recognizer
         // cannot read. Like `ai_prompt_shield`, err toward auditing: a body
         // `mcp_jsonrpc::may_carry_tool_call` flags stays an MCP candidate (with
@@ -3837,6 +3876,7 @@ impl AiTranscriptAudit {
         // succeeds so a refused retained-byte lease cannot leave
         // `MD_STREAM_REQUEST` without an owning staging entry.
         let stream_requested = scan_limited
+            || unreadable_document
             || parsed
                 .as_ref()
                 .and_then(|json| json.get("stream"))
@@ -3887,7 +3927,8 @@ impl AiTranscriptAudit {
             // from it, and its excerpt shares the request budget with the
             // argument excerpts.
             BodyPhase::Final => self.capture_request(
-                parsed.as_ref().filter(|_| mcp_section.is_none()),
+                parsed,
+                mcp_section.is_none(),
                 body,
                 sample_hit,
                 max_request_bytes.saturating_sub(mcp_arguments_bytes),
@@ -4022,8 +4063,12 @@ impl AiTranscriptAudit {
         let parsed: Option<Value> = if scan_limited {
             None
         } else {
-            serde_json::from_slice(body).ok()
+            parse_json_document(body)
         };
+        // Mirror `stage_candidate`'s conservative fail-closed scope for a
+        // candidate body no structural parse can read.
+        let unreadable_document =
+            !scan_limited && self.unreadable_document_in_scope(body, parsed.as_ref());
         // An MCP candidate was classified from the client's JSON-RPC body when
         // it was staged. Its backend-visible body is the gateway's
         // upstream-named envelope or an OpenAPI bridge's REST request, which
@@ -4034,6 +4079,7 @@ impl AiTranscriptAudit {
             .get(&record_id)
             .and_then(|staging| staging.mcp_charges());
         if !scan_limited
+            && !unreadable_document
             && staged_mcp.is_none()
             && !parsed.as_ref().is_some_and(json_looks_like_ai_request)
         {
@@ -4049,6 +4095,7 @@ impl AiTranscriptAudit {
         // directions. This is cheap and runs even when capture is skipped,
         // because stream-vs-buffer correctness is not a capture concern.
         if scan_limited
+            || unreadable_document
             || parsed
                 .as_ref()
                 .and_then(|json| json.get("stream"))
@@ -4077,12 +4124,13 @@ impl AiTranscriptAudit {
         let max_request_bytes = self.limits.max_request_bytes;
         let mut capture = match staged_mcp {
             Some((mcp_arguments_bytes, _)) => self.capture_request(
-                None,
+                parsed,
+                false,
                 body,
                 sample_hit,
                 max_request_bytes.saturating_sub(mcp_arguments_bytes),
             ),
-            None => self.capture_request(parsed.as_ref(), body, sample_hit, max_request_bytes),
+            None => self.capture_request(parsed, true, body, sample_hit, max_request_bytes),
         };
         self.publish_request_capture(ctx, &capture);
         if let Some(mut staged) = self.staging.get_mut(&record_id) {
@@ -4156,7 +4204,10 @@ impl AiTranscriptAudit {
         }
     }
 
-    fn has_staged_candidate(&self, metadata: &HashMap<String, String>) -> bool {
+    fn has_staged_candidate<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &HashMap<String, String, MS>,
+    ) -> bool {
         metadata
             .get(MD_RECORD_ID)
             .is_some_and(|record_id| self.staging.contains_key(record_id))
@@ -4168,7 +4219,10 @@ impl AiTranscriptAudit {
     /// no `MD_SAMPLE_HIT` fallback: that key is shared and peer-writable, so
     /// falling back to it would let a peer's roll drive this instance's stream
     /// selection, commit admission, and client-visible fail-closed 503.
-    fn owned_sample_hit(&self, metadata: &HashMap<String, String>) -> Option<bool> {
+    fn owned_sample_hit<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &HashMap<String, String, MS>,
+    ) -> Option<bool> {
         metadata
             .get(MD_RECORD_ID)
             .and_then(|record_id| self.staging.get(record_id))
@@ -4195,7 +4249,10 @@ impl AiTranscriptAudit {
     /// emit is pure amplification: `emit_decision` / `enqueue` would discard
     /// the result. This also keeps the mode off the reqwest-pinned dispatch
     /// path, since `forces_reqwest_dispatch` shares this predicate.
-    fn stream_tee_wanted(&self, metadata: &HashMap<String, String>) -> bool {
+    fn stream_tee_wanted<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &HashMap<String, String, MS>,
+    ) -> bool {
         if self.capture.streaming == StreamingCapture::Off {
             return false;
         }
@@ -4301,7 +4358,10 @@ impl AiTranscriptAudit {
         }
     }
 
-    fn harvest_metadata(&self, metadata: &HashMap<String, String>) -> Harvest {
+    fn harvest_metadata<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &HashMap<String, String, MS>,
+    ) -> Harvest {
         let mut harvest = Harvest::default();
         // `ai_federation` publishes both `ai_provider` (the provider type) and
         // `ai_federation_provider` (the configured federation name). Resolve them
@@ -4309,13 +4369,13 @@ impl AiTranscriptAudit {
         // does not flip with HashMap iteration order.
         let mut federation_provider: Option<String> = None;
         for (key, value) in metadata {
-            if key.starts_with("ai_transcript_audit.") {
+            if key.starts_with("ai_transcript_audit.") || is_argument_digest_key(key) {
                 continue;
             }
             // Audit records bypass the transaction-log redaction layer, so apply
             // the same key predicate defensively before copying any value out.
             let safe = |raw: &String| {
-                if is_sensitive_metadata_key(key) {
+                if metadata_value_is_redacted(key) {
                     REDACTED_PLACEHOLDER.to_string()
                 } else {
                     raw.clone()
@@ -4363,14 +4423,13 @@ impl AiTranscriptAudit {
         // `BTreeMap` keeps the retained set stable for a given input.
         //
         // Only the per-instance `ai_semantic_cache.<id>.*` entries are
-        // truncated. The fixed-name producer keys (legacy `ai_cache_*` and
-        // `request_deduplication.replayed`) are a closed set of four and are
-        // not a cardinality axis, but they sort around the namespaced block —
-        // `request_deduplication.replayed` sorts after all of it — so a plain
-        // sorted truncation would discard the documented replay marker first
-        // while keeping an eleventh cache instance's status. Retaining them
-        // first keeps the cap at 32 total entries and keeps the record's
-        // per-request signals present regardless of chain width.
+        // truncated. The one fixed-name producer key,
+        // `request_deduplication.replayed`, is not a cardinality axis, but it
+        // sorts after the whole namespaced block, so a plain sorted truncation
+        // would discard the documented replay marker first while keeping an
+        // eleventh cache instance's status. Retaining it first keeps the cap at
+        // 32 total entries and keeps the record's per-request signal present
+        // regardless of chain width.
         if harvest.cache.len() > MAX_CACHE_TELEMETRY_ENTRIES {
             let fixed_name_entries = harvest
                 .cache
@@ -4399,11 +4458,11 @@ impl AiTranscriptAudit {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_record(
+    fn build_record<MS: std::hash::BuildHasher>(
         &self,
         record_id: &str,
         envelope: EnvelopeOwned,
-        metadata: &HashMap<String, String>,
+        metadata: &HashMap<String, String, MS>,
         staging: Option<&AuditStaging>,
         response: ResponseCapture,
         sampled: bool,
@@ -4625,7 +4684,12 @@ impl AiTranscriptAudit {
             entry.arguments_omitted_reason = Some(OMIT_REASON_MCP_ARGUMENTS_BUDGET);
             return;
         }
-        let shaped = self.shape_body(serialized.as_bytes(), budget);
+        let shaped = self.shape_body(
+            serialized.as_bytes(),
+            budget,
+            PayloadRepresentation::JsonDocument,
+            PreParsed::NotAttempted,
+        );
         let excerpt_bytes = shaped.excerpt.as_deref().map_or(0, str::len);
         *arguments_bytes = arguments_bytes.saturating_add(excerpt_bytes);
         entry.arguments = shaped.excerpt;
@@ -4715,14 +4779,17 @@ impl AiTranscriptAudit {
     }
 
     /// The bounded `mcp_gateway` decisions recorded beside an MCP call.
-    fn mcp_gateway_metadata(&self, metadata: &HashMap<String, String>) -> BTreeMap<String, String> {
+    fn mcp_gateway_metadata<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &HashMap<String, String, MS>,
+    ) -> BTreeMap<String, String> {
         let redact_names = self.mode != AuditMode::FullBody;
         let mut gateway = BTreeMap::new();
         for key in MCP_GATEWAY_METADATA_KEYS {
             let Some(value) = metadata.get(*key) else {
                 continue;
             };
-            let value = if is_sensitive_metadata_key(key) {
+            let value = if metadata_value_is_redacted(key) {
                 REDACTED_PLACEHOLDER.to_string()
             } else if MCP_GATEWAY_NAME_METADATA_KEYS.contains(key) {
                 let bounded = bound_model_str(value, &self.redactor, redact_names);
@@ -4824,8 +4891,19 @@ impl Plugin for AiTranscriptAudit {
         "ai_transcript_audit"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::AI_TRANSCRIPT_AUDIT
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+            | crate::plugins::PluginHooks::AFTER_PROXY
+            | crate::plugins::PluginHooks::LOG
+            | crate::plugins::PluginHooks::ON_RESPONSE_STREAM_TERMINATED
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
@@ -4841,6 +4919,113 @@ impl Plugin for AiTranscriptAudit {
 
     fn enforces_finalized_request_policy(&self) -> bool {
         true
+    }
+
+    /// Claim the finalized backend-visible representation of a candidate-shaped
+    /// HTTP request when a fail-closed sink policy is configured, so the shared
+    /// request representation gate decodes a `Content-Encoding` into the staged
+    /// plaintext view before the final hook classifies it — or refuses the
+    /// request when it cannot (`GHSA-3973-47g5-4mcx`). Without the claim a
+    /// gzip/deflate/br AI request would be classified on its coded octets,
+    /// never staged, and so never reach the `on_buffer_full: reject` /
+    /// `on_sink_error: reject` admission gates.
+    ///
+    /// Fail-open policies never claim: they cannot refuse anything, so a body
+    /// they merely fail to observe must not become a `400`. They still read
+    /// the decoded view whenever another enforcing plugin claimed the request.
+    /// Native gRPC is framed per message (`grpc-encoding`) and is never claimed.
+    /// Decided from configuration and request state only, never by decoding.
+    fn enforces_final_request_body_policy(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> bool {
+        if !self.fails_closed() || ctx.is_native_grpc_request() {
+            return false;
+        }
+        ctx.method.eq_ignore_ascii_case("POST")
+            && self.candidate_content_type(ctx, headers.get("content-type").map(String::as_str))
+    }
+
+    /// Enrolled native-gRPC instances subscribe to the backend-path boundary,
+    /// so the proxy binds the backend-effective path (after route override,
+    /// listen-path stripping, and upstream target path assembly) on the
+    /// request. That bound path is this instance's authoritative enrollment
+    /// witness, never outranked by `grpc_full_method`, so an audit-only proxy does not
+    /// depend on `grpc_method_router` to decide enrollment on the method the
+    /// backend actually receives.
+    fn requires_backend_path_resolution(&self) -> bool {
+        self.grpc.is_some()
+    }
+
+    /// Stage a native-gRPC call whose BACKEND-EFFECTIVE method is enrolled
+    /// although its client-path method was not, at the moment that method
+    /// becomes authoritative.
+    ///
+    /// The selected path is pinned here and this hook runs before any deferred
+    /// `before_proxy` hook (`fault_injection`, `response_mock`, …) can
+    /// short-circuit. Staging only in the final request-body hook would lose
+    /// the call whenever such a deferred hook answers first: no final hook
+    /// runs, and the reject-path and log fallbacks capture only a candidate
+    /// that is already staged. A call `before_proxy` already staged for its
+    /// enrolled client path is left alone; the final hook (or the reject-path
+    /// refresh) re-decides it against the bound path.
+    ///
+    /// Enrollment is decided from `backend_path` itself, the authoritative
+    /// value at this boundary. `grpc_full_method` is NOT consulted here: it may
+    /// still hold `grpc_method_router`'s provisional client-path value, because
+    /// priorities are configurable and the router's own boundary callback can
+    /// run after this one.
+    ///
+    /// No header map is available at this boundary, so the framing witness is
+    /// the `grpc-encoding` this instance recorded from the live `before_proxy`
+    /// header map (never `RequestContext::headers`, which may be the original
+    /// inbound map). Without one the witness is `Unsupported`, so a
+    /// short-circuit capture withholds the excerpt rather than misreading the
+    /// frames. Ordinary dispatch still captures from the final hook's own
+    /// backend-visible header map.
+    async fn on_backend_path_resolved(
+        &self,
+        ctx: &mut RequestContext,
+        backend_path: &str,
+    ) -> PluginResult {
+        if !ctx.is_native_grpc_request() {
+            return PluginResult::Continue;
+        }
+        let Some(grpc) = self.grpc.as_ref() else {
+            return PluginResult::Continue;
+        };
+        if flag(&ctx.metadata, MD_CANDIDATE) && self.has_staged_candidate(&ctx.metadata) {
+            return PluginResult::Continue;
+        }
+        if !grpc.enrolls(canonical_grpc_method(backend_path)) {
+            return PluginResult::Continue;
+        }
+        let encoding = ctx
+            .plugin_state()
+            .and_then(|state| state.ai_transcript_audit_grpc_request_encoding)
+            .unwrap_or(GrpcMessageEncoding::Unsupported);
+        let stage_result = if let Some(body) = ctx.metadata.remove("request_body") {
+            let staged =
+                self.stage_grpc_candidate(ctx, body.as_bytes(), encoding, BodyPhase::Provisional);
+            ctx.metadata.insert("request_body".to_string(), body);
+            staged
+        } else if let Some(body) = ctx.request_body_bytes.clone() {
+            // `Bytes::clone` shares the already-bounded buffer.
+            self.stage_grpc_candidate(ctx, &body, encoding, BodyPhase::Provisional)
+        } else {
+            return PluginResult::Continue;
+        };
+        // Fail-closed commit admission is deliberately NOT taken here: the
+        // proxy binds the backend path only after this boundary accepts, and
+        // every later admission point — the final request-body hook on
+        // ordinary dispatch, `after_proxy` on a deferred short circuit — runs
+        // with that bound path, so it captures the call under the enrolled
+        // method. A refusal here would be finalized before the bind and the
+        // reject-path refresh would see only the unenrolled client method.
+        // `stage_result` still carries a staging-saturation refusal.
+        stage_result
     }
 
     fn start_background_tasks(&self) -> Result<(), String> {
@@ -4902,7 +5087,8 @@ impl Plugin for AiTranscriptAudit {
     // ---- request body capture ----
 
     fn requires_request_body_buffering(&self) -> bool {
-        self.active
+        // The constructor refuses an instance with no capture path enabled.
+        true
     }
 
     /// The request body must be prebuffered before `before_proxy` so the
@@ -4916,7 +5102,7 @@ impl Plugin for AiTranscriptAudit {
     /// - the final `forces_reqwest_dispatch` preference is evaluated (it checks
     ///   this instance's bounded staging entry).
     fn requires_request_body_before_before_proxy(&self) -> bool {
-        self.active
+        true
     }
 
     /// Native protobuf routinely contains non-UTF-8 bytes, so the UTF-8-only
@@ -4939,7 +5125,7 @@ impl Plugin for AiTranscriptAudit {
     /// to be enrolled only after backend-path resolution is indistinguishable
     /// from one that does not, at the point this flag is read.
     fn needs_request_body_bytes(&self) -> bool {
-        self.active && self.grpc.is_some()
+        self.grpc.is_some()
     }
 
     /// Native gRPC selects buffering CONSERVATIVELY, before enrollment is
@@ -4963,9 +5149,6 @@ impl Plugin for AiTranscriptAudit {
     /// gRPC-enrolled instance: HTTP requests here, and every request on an
     /// instance without a `grpc` block, keep the JSON-POST fast path unchanged.
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        if !self.active {
-            return false;
-        }
         if self.grpc_enrollment_owns_request(ctx) {
             return true;
         }
@@ -4978,9 +5161,6 @@ impl Plugin for AiTranscriptAudit {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.active {
-            return PluginResult::Continue;
-        }
         // Staging here is deliberately keyed on the PROVISIONAL (client-path)
         // method, because that is the only view a pre-routing short circuit
         // will ever have: a `before_proxy` reject or synthetic response never
@@ -4993,6 +5173,15 @@ impl Plugin for AiTranscriptAudit {
         // method view does not select must not fall through to the JSON
         // candidate path below — `application/grpc+json` would otherwise
         // satisfy its content-type test.
+        if self.grpc_enrollment_owns_request(ctx) {
+            // Record the framing witness from this LIVE header map even when
+            // the provisional method is not enrolled: the backend-effective
+            // method can still enroll the call at the backend-path boundary,
+            // where no header map is available, and a deferred short circuit
+            // after that boundary never reaches the final request-body hook.
+            ctx.plugin_state_mut()
+                .ai_transcript_audit_grpc_request_encoding = Some(grpc_message_encoding(headers));
+        }
         if self.request_capture_route(ctx) == RequestCaptureRoute::GrpcNotEnrolled {
             return PluginResult::Continue;
         }
@@ -5069,15 +5258,16 @@ impl Plugin for AiTranscriptAudit {
     /// advertise it; without this the context-free default would run instead
     /// and no metadata/staging would ever be written on the H1/H2 path.
     fn needs_final_request_body_context(&self) -> bool {
-        self.active
+        true
     }
 
     /// The AUTHORITATIVE gRPC enrollment decision for ordinary backend-dispatched
     /// traffic.
     ///
-    /// This hook runs after `on_backend_path_resolved`, so `grpc_full_method` now
-    /// names the backend-effective method. Both transitions are decided here and
-    /// only here:
+    /// This hook runs after `on_backend_path_resolved`, so `grpc_full_method`
+    /// (when `grpc_method_router` publishes it) or the backend path the proxy
+    /// bound for this instance now names the backend-effective method. Both
+    /// transitions are decided here and only here:
     ///
     /// - provisional unenrolled/invalid -> final enrolled: nothing staged in
     ///   `before_proxy`, so the candidate is staged and captured now from these
@@ -5092,9 +5282,6 @@ impl Plugin for AiTranscriptAudit {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.active {
-            return PluginResult::Continue;
-        }
         // Mark that the backend-visible request was captured, so the reject-path
         // `after_proxy` refresh knows this was NOT a `before_proxy` short-circuit.
         ctx.metadata
@@ -5109,6 +5296,19 @@ impl Plugin for AiTranscriptAudit {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;
         }
+        // HTTP bodies are classified and captured on the plaintext the shared
+        // request representation gate staged when a content coding is present
+        // and an enforcing plugin (this one under a fail-closed policy) claimed
+        // it. Reading the coded octets would classify a gzip AI request as
+        // non-AI and let it bypass fail-closed admission. `Bytes` is an `O(1)`
+        // share of the gate's charged allocation, never a copy. Native gRPC is
+        // framed per message and keeps the raw body.
+        let decoded_view = if route == RequestCaptureRoute::Http {
+            ctx.inspectable_final_request_body_owned()
+        } else {
+            None
+        };
+        let http_body: &[u8] = decoded_view.as_deref().unwrap_or(body);
         // Staged (cheaply) in `before_proxy`: these are the backend-visible
         // bytes, so this is where the transaction's single capture pass runs.
         if flag(&ctx.metadata, MD_CANDIDATE) && self.has_staged_candidate(&ctx.metadata) {
@@ -5122,7 +5322,7 @@ impl Plugin for AiTranscriptAudit {
                     GrpcRequestFraming::Header(grpc_message_encoding(headers)),
                 );
             } else {
-                self.capture_staged_request(ctx, body);
+                self.capture_staged_request(ctx, http_body);
             }
             // Capture may flip `MD_STREAM_REQUEST`. Re-evaluate whether a later
             // response/stream gate will reserve, or whether request-time
@@ -5148,6 +5348,20 @@ impl Plugin for AiTranscriptAudit {
         }
         // Fallback for paths where the body was not available before
         // `before_proxy` (e.g. non-UTF-8 metadata skip above).
+        if decoded_view.is_none()
+            && headers
+                .get("content-encoding")
+                .is_some_and(|encoding| request_representation::requires_decode_judgment(encoding))
+        {
+            // Still content-coded and nothing decoded it. A fail-closed
+            // instance claims every candidate-shaped POST, so the gate has
+            // already decoded or refused such a request before this hook;
+            // reaching here means a fail-open instance or an unclaimed shape.
+            // The coded octets are not a JSON document, so there is nothing to
+            // classify from them.
+            self.discard_staged_candidate(ctx);
+            return PluginResult::Continue;
+        }
         let is_json =
             self.candidate_content_type(ctx, headers.get("content-type").map(String::as_str));
         if !is_json {
@@ -5157,12 +5371,12 @@ impl Plugin for AiTranscriptAudit {
         if skip_content_type_less_non_mcp(
             headers.get("content-type").map(String::as_str),
             self.capture.mcp_tool_calls,
-            body,
+            http_body,
         ) {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;
         }
-        let stage_result = self.stage_candidate(ctx, body, BodyPhase::Final);
+        let stage_result = self.stage_candidate(ctx, http_body, BodyPhase::Final);
         if !matches!(stage_result, PluginResult::Continue) {
             return stage_result;
         }
@@ -5172,11 +5386,11 @@ impl Plugin for AiTranscriptAudit {
     // ---- reject-path request refresh ----
 
     fn applies_after_proxy_on_reject(&self) -> bool {
-        self.active
+        true
     }
 
     fn may_replace_rejection_response(&self) -> bool {
-        self.active
+        true
     }
 
     /// On a `before_proxy` short-circuit (no backend dispatch, so no final
@@ -5201,13 +5415,10 @@ impl Plugin for AiTranscriptAudit {
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        response_status: u16,
-        response_headers: &mut HashMap<String, String>,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.active
-            || !flag(&ctx.metadata, MD_CANDIDATE)
-            || !self.has_staged_candidate(&ctx.metadata)
-        {
+        if !flag(&ctx.metadata, MD_CANDIDATE) || !self.has_staged_candidate(&ctx.metadata) {
             return PluginResult::Continue;
         }
         if !flag(&ctx.metadata, MD_FINAL_REQ_SEEN) {
@@ -5257,8 +5468,7 @@ impl Plugin for AiTranscriptAudit {
             return PluginResult::Continue;
         }
         if self.capture.streaming != StreamingCapture::Off {
-            let stream_admission =
-                self.stream_fail_closed_rejection(ctx, response_status, response_headers);
+            let stream_admission = self.stream_fail_closed_rejection(ctx);
             if !matches!(stream_admission, PluginResult::Continue) {
                 return stream_admission;
             }
@@ -5515,7 +5725,22 @@ impl Plugin for AiTranscriptAudit {
                     GrpcBodyDirection::Response,
                 )
             } else {
-                self.shape_body(body, self.limits.max_response_bytes)
+                // A JSON-typed buffered response is one document; an event
+                // stream keeps its frame-by-frame redaction.
+                let representation = if response_headers
+                    .get("content-type")
+                    .is_some_and(|content_type| is_json_content_type(content_type))
+                {
+                    PayloadRepresentation::JsonDocument
+                } else {
+                    PayloadRepresentation::MaybeEventStream
+                };
+                self.shape_body(
+                    body,
+                    self.limits.max_response_bytes,
+                    representation,
+                    PreParsed::NotAttempted,
+                )
             }
         } else {
             ShapedBody::default()
@@ -5589,7 +5814,7 @@ impl Plugin for AiTranscriptAudit {
             && self.staging.get(record_id).is_some_and(|staging| {
                 staging.commit_permit.is_some() && staging.commit_lease.is_some()
             });
-        if self.stream_commit_selected(ctx, response_status, content_type)
+        if self.stream_commit_selected(ctx)
             || self.stream_inspector_selected(ctx, response_status, content_type)
             || fallback_reservation
         {
@@ -5638,13 +5863,17 @@ impl Plugin for AiTranscriptAudit {
                     .map(|owner| Arc::clone(&owner.control)),
             )
         };
+        // The terminal hook reads this stream's capture only through the
+        // request-owned handoff that the core response-stream wrapper attaches
+        // before invoking factories. Without it there is nowhere to publish
+        // the result, so decline before reserving anything.
+        let request_handoff = ctx.response_stream_handoff()?;
         let record_lease = if staging_has_record_lease {
             None
         } else {
             Some(self.reserve_commit_lease()?)
         };
 
-        let request_handoff = ctx.response_stream_handoff();
         let now = Instant::now();
         let max_reservation = self.limits.max_stream_reservation;
         let reservation_deadline = reservation_started
@@ -5670,9 +5899,6 @@ impl Plugin for AiTranscriptAudit {
             downstream_terminated: AtomicBool::new(false),
             revoked: AtomicBool::new(false),
             inspector_dropped: AtomicBool::new(false),
-            detached_after_revocation: AtomicBool::new(false),
-            fallback_published: AtomicBool::new(false),
-            uses_request_handoff: request_handoff.is_some(),
             pending_permit: Mutex::new(Some(pending_permit)),
         });
         // Register before the first chunk. An idle stream can expire without
@@ -5738,23 +5964,17 @@ impl Plugin for AiTranscriptAudit {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return;
         };
-        let slot = ctx
+        let Some(slot) = ctx
             .response_stream_handoff()
             .and_then(|handoff| handoff.take::<StreamSlot>(self.stream_handoff_id))
-            .or_else(|| {
-                self.pending_streams
-                    .get(&record_id)
-                    .map(|slot| Arc::clone(slot.value()))
-            });
-        let Some(slot) = slot else {
+        else {
             return; // not a stream we teed
         };
         let Some(claimed) = slot.claim_terminal() else {
             return;
         };
-        // A sweeper can publish the revoked handoff between the first remove
-        // and the terminal claim. Clear that same-slot marker as part of the
-        // claim so no lost duplicate remains in the bounded handoff map.
+        // The live-map entry stays until this claim so the reservation sweep
+        // can still revoke a completed slot whose terminal hook was lost.
         self.pending_streams
             .remove_if(&record_id, |_, current| Arc::ptr_eq(current, &slot));
         slot.release_pending_permit();
@@ -5904,9 +6124,6 @@ impl Plugin for AiTranscriptAudit {
     // ---- fallback emission ----
 
     async fn log(&self, summary: &TransactionSummary) {
-        if !self.active {
-            return;
-        }
         let Some(record_id) = summary.metadata.get(MD_RECORD_ID).cloned() else {
             return;
         };
@@ -6003,7 +6220,7 @@ struct AuditStreamInspector {
     /// `Some(limit)` stops keyed hashing after `limit` bytes; `None` hashes the
     /// whole stream (explicit `capture.stream_hash: full` opt-in).
     hash_budget: Option<usize>,
-    request_handoff: Option<ResponseStreamHandoff>,
+    request_handoff: ResponseStreamHandoff,
     stream_handoff_id: u64,
     reservation_deadline: Instant,
     max_reservation: Duration,
@@ -6038,16 +6255,13 @@ impl AuditStreamInspector {
             self.slot.finish_abnormally();
         }
         self.slot.inspector_dropped.store(true, Ordering::Release);
-        if let Some(handoff) = self.request_handoff.as_ref() {
-            // Keep the live-map reference until the terminal hook consumes it.
-            // If that hook is lost, the reservation sweep can still find and
-            // revoke this completed/abnormal slot before releasing accounting.
-            // An already-expired slot was detached by its deadline owner or the
-            // repair sweep and exists only in this request-owned handoff.
-            handoff.publish(self.stream_handoff_id, Arc::clone(&self.slot));
-        } else {
-            publish_revoked_fallback_if_ready(&self.record_id, &self.slot, &self.pending_streams);
-        }
+        // Keep the live-map reference until the terminal hook consumes it. If
+        // that hook is lost, the reservation sweep can still find and revoke
+        // this completed/abnormal slot before releasing accounting. An
+        // already-expired slot was detached by its deadline owner or the repair
+        // sweep and exists only in this request-owned handoff.
+        self.request_handoff
+            .publish(self.stream_handoff_id, Arc::clone(&self.slot));
     }
 }
 
@@ -6059,9 +6273,9 @@ impl Drop for AuditStreamInspector {
 
 #[async_trait]
 impl ResponseStreamInspector for AuditStreamInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         if self.revoke_if_expired() {
-            return ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk));
+            return ResponseStreamAction::Forward(chunk.clone());
         }
         let mut capture = self.slot.lock_capture();
         if let StreamCaptureLifecycle::Active(work) = &mut *capture {
@@ -6116,7 +6330,7 @@ impl ResponseStreamInspector for AuditStreamInspector {
         }
         drop(capture);
         // Tee: forward the bytes exactly as received, never altering the stream.
-        ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk))
+        ResponseStreamAction::Forward(chunk.clone())
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
@@ -6147,6 +6361,8 @@ impl ResponseStreamInspector for AuditStreamInspector {
                         &work.accumulated,
                         self.max_bytes,
                         self.max_scan_bytes,
+                        PayloadRepresentation::MaybeEventStream,
+                        PreParsed::NotAttempted,
                     )
                 };
                 *capture = StreamCaptureLifecycle::Complete(Some(StreamCaptured {
@@ -6208,7 +6424,7 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: &[QueuedAuditRecord]) -> Resul
         .execute_redacted(request, "ai_transcript_audit", &cfg.endpoint_url_for_logs)
         .await;
     // Sink health is derived from the raw collector response, NOT from the
-    // shared `handle_http_batch_response` result: that helper treats a
+    // shared `handle_http_batch_response_redacted` result: that helper treats a
     // non-retryable non-2xx (401/403/413, e.g. an expired sink token) as a
     // discarded-but-Ok batch so the other logging sinks do not retry it, but
     // for this plugin every record in that batch was silently lost — under
@@ -6443,7 +6659,9 @@ fn classify_batch_delivery(
 
 // ---- free helpers ----
 
-pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String>) {
+pub(crate) fn redact_internal_log_metadata<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+) {
     let candidate = flag(metadata, MD_CANDIDATE);
     let saturation_outcome = metadata
         .get(MD_SINK_STATUS)
@@ -6452,7 +6670,6 @@ pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String
     metadata.remove(MD_SAMPLE_HIT);
     metadata.remove(MD_STREAM_REQUEST);
     metadata.remove(MD_FINAL_REQ_SEEN);
-    metadata.retain(|key, _| !key.starts_with("ai_transcript_audit.stream_marker"));
     if !candidate {
         metadata.remove(MD_RECORD_ID);
         metadata.remove(MD_SAMPLED);
@@ -6595,7 +6812,10 @@ fn jsonrpc_event_stream_responses(body: &[u8]) -> Vec<Value> {
     };
     let mut responses = Vec::new();
     let mut data = String::new();
-    for line in text.lines() {
+    // Same BOM policy and CR/LF/CRLF line splitting as the shared SSE parser:
+    // `str::lines` keeps a lone CR inside the line, so a CR-framed stream
+    // would otherwise parse as one unterminated event (issue #7134).
+    for line in sse_lines(strip_sse_boms(text)) {
         if line.is_empty() {
             push_event_stream_message(&mut data, &mut responses);
         } else if let Some(value) = line.strip_prefix("data:") {
@@ -6695,12 +6915,19 @@ impl ShapedBody {
 ///
 /// (`full_body` is the deliberate raw-capture opt-in, so it caps first — on a
 /// UTF-8 boundary — and never scans beyond the cap at all.)
+///
+/// `representation` tells the redactor what the caller already knows the
+/// payload is. A [`PayloadRepresentation::JsonDocument`] that no structural
+/// parse can read is withheld rather than pattern-redacted: see
+/// [`redact_body_decoded_json_strings`].
 fn shape_bytes(
     mode: AuditMode,
     redactor: &PiiRedactor,
     raw: &[u8],
     max_bytes: usize,
     max_scan_bytes: usize,
+    representation: PayloadRepresentation,
+    pre_parsed: PreParsed,
 ) -> ShapedBody {
     if !mode.captures_body() {
         return ShapedBody::default();
@@ -6710,7 +6937,10 @@ fn shape_bytes(
         if raw.len() > max_scan_bytes {
             return ShapedBody::omitted(OMIT_REASON_REDACTION_SCAN_LIMIT);
         }
-        redact_body_decoded_json_strings(redactor, raw)
+        match redact_body_decoded_json_strings(redactor, raw, representation, pre_parsed) {
+            Some(redacted) => redacted,
+            None => return ShapedBody::omitted(OMIT_REASON_UNPARSEABLE_DOCUMENT),
+        }
     } else {
         // Cut the raw bytes on a UTF-8 boundary so the capped excerpt stays
         // valid text instead of ending in a replacement character.
@@ -6753,25 +6983,118 @@ fn utf8_prefix(raw: &[u8], max_bytes: usize) -> &[u8] {
     }
 }
 
-fn redact_body_decoded_json_strings(redactor: &PiiRedactor, raw: &[u8]) -> String {
-    if let Ok(mut json) = serde_json::from_slice::<Value>(raw) {
+/// What a captured payload is known to be, which decides how a payload that
+/// no structural parse can read is treated in `redacted_body` mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PayloadRepresentation {
+    /// A single JSON document: a classified request candidate (JSON media
+    /// type, or a Content-Type-less MCP call), a JSON-typed buffered response,
+    /// or serialized MCP arguments. Unreadable means withheld.
+    JsonDocument,
+    /// A payload that may legitimately be an event stream or other text (a
+    /// streamed response). SSE events are redacted event by event; anything
+    /// that still looks like a JSON document is withheld; only genuinely
+    /// non-JSON text falls back to pattern redaction.
+    MaybeEventStream,
+}
+
+/// Whether the caller already parsed a payload's exact bytes with
+/// [`parse_json_document`], so redaction can reuse that result instead of
+/// parsing the same document again.
+enum PreParsed {
+    /// No parse of these bytes is available; redaction parses them itself.
+    NotAttempted,
+    /// The caller's parse of these exact bytes, handed over to be redacted in
+    /// place.
+    Document(Value),
+    /// The caller's parse of these exact bytes failed.
+    Unparseable,
+}
+
+/// Strip one leading UTF-8 byte-order mark. Strict JSON refuses it, while
+/// lenient readers (and the upstream that will execute the request) skip it,
+/// so structural parsing must see the document behind it.
+fn strip_utf8_bom(raw: &[u8]) -> &[u8] {
+    raw.strip_prefix(b"\xEF\xBB\xBF".as_slice()).unwrap_or(raw)
+}
+
+/// Parse a whole JSON document after stripping a leading UTF-8 BOM. Request
+/// classification and extraction, and every excerpt redaction, go through this
+/// one helper so they all read the same document.
+fn parse_json_document(raw: &[u8]) -> Option<Value> {
+    serde_json::from_slice::<Value>(strip_utf8_bom(raw)).ok()
+}
+
+/// Whether `raw` is shaped like a JSON object/array document that some reader
+/// could accept even though strict parsing refused it: a UTF-16 / UTF-32 BOM,
+/// or (after a UTF-8 BOM, ASCII whitespace, and the NUL bytes of a UTF-16 /
+/// UTF-32 encoding) a `{` or `[` first character. Byte checks only; nothing is
+/// parsed or allocated.
+fn looks_like_json_document(raw: &[u8]) -> bool {
+    const WIDE_BYTE_ORDER_MARKS: [&[u8]; 3] = [b"\xFE\xFF", b"\xFF\xFE", b"\x00\x00\xFE\xFF"];
+    if WIDE_BYTE_ORDER_MARKS.iter().any(|bom| raw.starts_with(bom)) {
+        return true;
+    }
+    let lead = strip_utf8_bom(raw)
+        .iter()
+        .copied()
+        .find(|byte| !matches!(byte, 0 | b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C));
+    matches!(lead, Some(b'{' | b'['))
+}
+
+/// Redact a captured payload for a `redacted_body` excerpt, or `None` when it
+/// must be withheld.
+///
+/// Sensitive-member-name redaction (`password`, `token`, …) exists only in the
+/// structural JSON visitor; the regex table cannot recognize an arbitrary
+/// value beside such a key. A payload that is a JSON document but that no
+/// structural parse can read — a UTF-16 body, `NaN`, comments, a batch past
+/// serde_json's nesting limit — is therefore withheld instead of being
+/// pattern-redacted, because pattern-only redaction would export those
+/// credentials verbatim. A leading UTF-8 BOM is stripped before parsing, so a
+/// BOM-prefixed document is redacted structurally.
+fn redact_body_decoded_json_strings(
+    redactor: &PiiRedactor,
+    raw: &[u8],
+    representation: PayloadRepresentation,
+    pre_parsed: PreParsed,
+) -> Option<String> {
+    // An empty payload (a bridged GET, an empty response) carries nothing to
+    // redact or withhold.
+    if raw.is_empty() {
+        return Some(String::new());
+    }
+    let document = match pre_parsed {
+        PreParsed::NotAttempted => parse_json_document(raw),
+        PreParsed::Document(document) => Some(document),
+        PreParsed::Unparseable => None,
+    };
+    if let Some(mut json) = document {
         redact_json_value_strings(redactor, &mut json);
-        serde_json::to_string(&json)
-            .map(|serialized| redactor.redact(&serialized))
-            .unwrap_or_else(|_| redactor.redact(&String::from_utf8_lossy(raw)))
-    } else if let Some(mut reassembled) = reassemble_openai_sse_deltas(raw) {
+        // Serializing a `Value` does not fail in practice; if it ever did, the
+        // only fallback would be the raw bytes, so withhold instead.
+        return serde_json::to_string(&json)
+            .ok()
+            .map(|serialized| redactor.redact(&serialized));
+    }
+    if representation == PayloadRepresentation::JsonDocument {
+        return None;
+    }
+    if let Some(mut reassembled) = reassemble_openai_sse_deltas(raw) {
         // OpenAI-chunk SSE capture: per-frame redaction would miss PII split
         // across `delta.content` fragments (each frame carries an unmatched
         // piece), so the exported excerpt is the redaction of the REASSEMBLED
         // per-choice completion text, not the raw frames.
         redact_json_value_strings(redactor, &mut reassembled);
         serde_json::to_string(&reassembled)
+            .ok()
             .map(|serialized| redactor.redact(&serialized))
-            .unwrap_or_else(|_| redactor.redact(&String::from_utf8_lossy(raw)))
     } else if let Some(redacted_sse) = redact_sse_json_frames(redactor, raw) {
-        redacted_sse
+        Some(redacted_sse)
+    } else if looks_like_json_document(raw) {
+        None
     } else {
-        redactor.redact(&String::from_utf8_lossy(raw))
+        Some(redactor.redact(&String::from_utf8_lossy(raw)))
     }
 }
 
@@ -7407,7 +7730,9 @@ fn redact_json_value_strings_at_depth(
 }
 
 fn sensitive_json_field(key: &str) -> bool {
-    if is_sensitive_metadata_key(key) {
+    // A body field name is caller data, never a gateway outcome signal, so the
+    // metadata-only outcome-key exemption does not apply.
+    if is_sensitive_header_name(key) {
         return true;
     }
     // Collapse case and separators, including zero-width/non-ASCII separators,
@@ -7470,30 +7795,98 @@ fn redact_sse_json_frames(redactor: &PiiRedactor, raw: &[u8]) -> Option<String> 
     // Leading BOMs are copied through unchanged; only the lines after them are
     // rewritten, each keeping its original terminator.
     out.push_str(&text[..text.len() - body.len()]);
+    // The lines (terminators included) of the event being accumulated. An
+    // event ends at a blank line; its payload is all of its `data:` lines
+    // joined with `\n`, exactly as `utils::sse` (and every client) reads it.
+    let mut event: Vec<&str> = Vec::new();
     for line in sse_lines_inclusive(body) {
-        let (line_no_newline, newline) = split_sse_line_terminator(line);
-        if let Some(rest) = line_no_newline
-            .strip_prefix("data: ")
-            .or_else(|| line_no_newline.strip_prefix("data:"))
-        {
-            let trimmed = rest.trim();
-            if !trimmed.is_empty()
-                && trimmed != "[DONE]"
-                && let Ok(mut json) = serde_json::from_str::<Value>(trimmed)
-            {
-                redact_json_value_strings(redactor, &mut json);
-                if let Ok(serialized) = serde_json::to_string(&json) {
-                    out.push_str("data: ");
-                    out.push_str(&redactor.redact(&serialized));
-                    out.push_str(newline);
-                    changed = true;
-                    continue;
-                }
-            }
+        if split_sse_line_terminator(line).0.is_empty() {
+            changed |= redact_sse_event(redactor, &event, &mut out);
+            event.clear();
+            out.push_str(line);
+        } else {
+            event.push(line);
         }
-        out.push_str(line);
     }
+    changed |= redact_sse_event(redactor, &event, &mut out);
     changed.then(|| redactor.redact(&out))
+}
+
+/// The value of an SSE `data` field line, or `None` for any other line. Per
+/// the event-stream grammar the value follows the first `:` minus one optional
+/// leading space, and a bare `data` line is a data field with an empty value.
+fn sse_data_value(line: &str) -> Option<&str> {
+    if line == "data" {
+        return Some("");
+    }
+    let value = line.strip_prefix("data:")?;
+    Some(value.strip_prefix(' ').unwrap_or(value))
+}
+
+/// Append one SSE event (its non-blank lines, terminators included) to `out`,
+/// redacting its payload as a whole. Returns whether the payload was replaced.
+///
+/// The payload is every `data:` line of the event joined with `\n`, so a JSON
+/// document a provider spreads over several `data:` lines is parsed — and
+/// redacted by member name — as the one document a client reads, never line
+/// by line. A JSON payload is re-emitted as one redacted `data:` line at the
+/// position of the event's first data line; a JSON-shaped payload the parser
+/// refuses is replaced by one `data: [UNPARSEABLE]` line, withholding every
+/// continuation line with it. Non-data fields (`event:`, `id:`, comments) stay
+/// in place. A payload that is not JSON at all (plain text) is copied through
+/// for the caller's pattern pass, as before.
+fn redact_sse_event(redactor: &PiiRedactor, lines: &[&str], out: &mut String) -> bool {
+    let mut data = String::new();
+    let mut data_lines = 0usize;
+    for line in lines {
+        if let Some(value) = sse_data_value(split_sse_line_terminator(line).0) {
+            if data_lines > 0 {
+                data.push('\n');
+            }
+            data.push_str(value);
+            data_lines += 1;
+        }
+    }
+    let trimmed = data.trim();
+    let replacement = if data_lines == 0 || trimmed.is_empty() || trimmed == "[DONE]" {
+        None
+    } else {
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(mut json) => {
+                redact_json_value_strings(redactor, &mut json);
+                // Serializing a `Value` does not fail in practice; if it ever
+                // did, the payload is withheld rather than copied raw.
+                Some(
+                    serde_json::to_string(&json)
+                        .map(|serialized| redactor.redact(&serialized))
+                        .unwrap_or_else(|_| "[UNPARSEABLE]".to_string()),
+                )
+            }
+            Err(_) if looks_like_json_document(trimmed.as_bytes()) => {
+                Some("[UNPARSEABLE]".to_string())
+            }
+            Err(_) => None,
+        }
+    };
+    let Some(replacement) = replacement else {
+        for line in lines {
+            out.push_str(line);
+        }
+        return false;
+    };
+    let mut emitted = false;
+    for line in lines {
+        let (content, newline) = split_sse_line_terminator(line);
+        if sse_data_value(content).is_none() {
+            out.push_str(line);
+        } else if !emitted {
+            out.push_str("data: ");
+            out.push_str(&replacement);
+            out.push_str(newline);
+            emitted = true;
+        }
+    }
+    true
 }
 
 fn response_body_capture_allowed(
@@ -7534,7 +7927,8 @@ fn redact_headers(headers: &HashMap<String, String>) -> BTreeMap<String, String>
     headers
         .iter()
         .map(|(name, value)| {
-            let value = if is_sensitive_metadata_key(name) {
+            // Header names are caller/upstream data: no metadata exemption.
+            let value = if is_sensitive_header_name(name) {
                 REDACTED_PLACEHOLDER.to_string()
             } else {
                 value.clone()
@@ -7565,8 +7959,8 @@ fn redact_headers(headers: &HashMap<String, String>) -> BTreeMap<String, String>
 /// (`metadata.grpc_status_unreadable`) is `None`, both matching
 /// [`TransactionSummary::grpc_status`], so an unreadable status never triggers
 /// `always_capture_on_error`.
-fn final_grpc_status(
-    metadata: &HashMap<String, String>,
+fn final_grpc_status<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     response_headers: Option<&HashMap<String, String>>,
 ) -> Option<u32> {
     if let Some(status) = metadata.get("grpc_status") {
@@ -7594,8 +7988,8 @@ fn final_grpc_status(
 /// Whether this transaction ended as a FAILED gRPC call, which
 /// `always_capture_on_error` must retain exactly like an HTTP error status.
 /// `false` for every non-gRPC transaction, so HTTP retention is unchanged.
-fn grpc_call_failed(
-    metadata: &HashMap<String, String>,
+fn grpc_call_failed<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     response_headers: Option<&HashMap<String, String>>,
 ) -> bool {
     final_grpc_status(metadata, response_headers).is_some_and(|status| status != 0)
@@ -7604,7 +7998,7 @@ fn grpc_call_failed(
 /// Whether any guard plugin fired on this transaction (drives
 /// `always_capture_on_guardrail`). A curated heuristic over the metadata other
 /// AI plugins publish.
-fn guardrail_fired(metadata: &HashMap<String, String>) -> bool {
+fn guardrail_fired<MS: std::hash::BuildHasher>(metadata: &HashMap<String, String, MS>) -> bool {
     const FIRED_TRUE_KEYS: &[&str] = &[
         "ai_semantic_firewall_rejected",
         "ai_semantic_firewall_response_blocked",
@@ -7688,9 +8082,9 @@ fn fired_metadata_value(value: &str) -> bool {
 /// widening the record and the collector's key space without bound. Truncation
 /// runs after the scan against the sorted `BTreeMap`, so the surviving subset
 /// is stable rather than `HashMap`-iteration-order dependent, and it applies
-/// only to the per-instance axis: the four fixed-name producer keys are
-/// retained first so a wide cache chain cannot displace the record's
-/// `request_deduplication.replayed` marker.
+/// only to the per-instance axis: the fixed-name
+/// `request_deduplication.replayed` marker is retained first so a wide cache
+/// chain cannot displace it.
 const MAX_CACHE_TELEMETRY_ENTRIES: usize = 32;
 
 /// Longest cache-telemetry value retained. Every admitted value is already
@@ -7768,13 +8162,6 @@ fn cache_telemetry_suffix(key: &str) -> Option<&'static str> {
     if key == DEDUP_REPLAYED_KEY {
         return Some("replayed");
     }
-    // Legacy `ai_cache_status` is the namespaced `cache_status` field with an
-    // `ai_` prefix, so the two spellings share one value domain.
-    if let Some(legacy) = key.strip_prefix("ai_")
-        && let Some(suffix) = cache_telemetry_field(legacy)
-    {
-        return Some(suffix);
-    }
     semantic_cache_telemetry_suffix(key)
 }
 
@@ -7814,6 +8201,21 @@ fn cache_similarity_value_admitted(value: &str) -> bool {
         b'1' => &bytes[2..] == b"000000",
         _ => false,
     }
+}
+
+/// Producer metadata keys whose values are UNKEYED digests of tool-call
+/// arguments. `ai_tool_governor.arguments_hashes` is a plain SHA-256 of each
+/// call's raw arguments: exported into a record it is an offline guessing
+/// oracle for small argument spaces (a PIN, an account number) that neither
+/// `redaction.hash_secret` nor disabling `capture.mcp_arguments` would close,
+/// so it is never harvested. The audit's own `mcp.calls[].arguments_hash` is
+/// the keyed replacement. The metadata-redaction allowlist marks the key safe
+/// for transaction logs only by name; that says nothing about the digest's
+/// strength, so the exclusion is by key here.
+const ARGUMENT_DIGEST_METADATA_KEYS: &[&str] = &["ai_tool_governor.arguments_hashes"];
+
+fn is_argument_digest_key(key: &str) -> bool {
+    ARGUMENT_DIGEST_METADATA_KEYS.contains(&key)
 }
 
 fn is_guardrail_key(key: &str) -> bool {
@@ -8218,7 +8620,7 @@ fn sample_from_record_id(record_id: &str) -> f64 {
     (u64::from_be_bytes(buffer) as f64) / (u64::MAX as f64 + 1.0)
 }
 
-fn flag(metadata: &HashMap<String, String>, key: &str) -> bool {
+fn flag<MS: std::hash::BuildHasher>(metadata: &HashMap<String, String, MS>, key: &str) -> bool {
     metadata.get(key).is_some_and(|value| value == "true")
 }
 
@@ -8643,8 +9045,8 @@ struct GrpcFrame<'a> {
 }
 
 /// Message encoding negotiated for this body, from `grpc-encoding`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GrpcMessageEncoding {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrpcMessageEncoding {
     Identity,
     Gzip,
     /// An encoding this plugin cannot decode. Only reachable when a frame

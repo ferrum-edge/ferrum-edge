@@ -69,6 +69,14 @@ pub struct BodyOutcome {
     /// `auth_lifetime::StreamAuthTermination`; never a token, claim, identity,
     /// provider name, or absolute expiry.
     pub authorization_termination: Option<&'static str>,
+    /// True when the matched route rule's deadline — the earlier of its total
+    /// request deadline and the committed attempt's budget — cut this body:
+    /// the exact fired flag proxy core itself uses to settle the cut
+    /// health-neutrally (H1/H2 body wrapper, native HTTP/3 relays, and the
+    /// HTTP/3 cross-protocol bridge). The cut keeps its `read_write_timeout`
+    /// class in the log, so this typed bit is the only provenance that tells
+    /// it apart from a backend read timeout.
+    pub route_policy_cut: bool,
 }
 
 impl BodyOutcome {
@@ -82,6 +90,7 @@ impl BodyOutcome {
             grpc_status: None,
             grpc_status_unreadable: None,
             authorization_termination: None,
+            route_policy_cut: false,
         }
     }
 
@@ -96,6 +105,7 @@ impl BodyOutcome {
             grpc_status: None,
             grpc_status_unreadable: None,
             authorization_termination: None,
+            route_policy_cut: false,
         }
     }
 
@@ -110,7 +120,15 @@ impl BodyOutcome {
             grpc_status: None,
             grpc_status_unreadable: None,
             authorization_termination: None,
+            route_policy_cut: false,
         }
+    }
+
+    /// Record that the route rule's total request deadline cut this body
+    /// (see [`Self::route_policy_cut`]).
+    pub fn with_route_policy_cut(mut self, route_policy_cut: bool) -> Self {
+        self.route_policy_cut = route_policy_cut;
+        self
     }
 
     pub fn with_grpc_status(mut self, grpc_status: Option<u32>) -> Self {
@@ -154,7 +172,11 @@ pub async fn run_response_stream_termination_hooks(
     crate::plugins::wait_for_response_stream_inspector(ctx).await;
     for deferred in [false, true] {
         for plugin in plugins.iter().filter(|plugin| {
-            plugin.defers_response_stream_termination_until_after_peers() == deferred
+            (plugin
+                .lifecycle_hooks()
+                .contains(crate::plugins::PluginHooks::ON_RESPONSE_STREAM_TERMINATED)
+                || !crate::plugins::is_builtin_plugin(plugin.as_ref()))
+                && plugin.defers_response_stream_termination_until_after_peers() == deferred
         }) {
             plugin
                 .on_response_stream_terminated(ctx, response_status, outcome)
@@ -170,23 +192,27 @@ pub async fn run_response_stream_termination_hooks(
 /// Single-fire: the first call to [`fire`](Self::fire) wins; subsequent
 /// calls (e.g. a Drop safety net running after an explicit fire) are no-ops.
 pub struct DeferredTransactionLogger {
-    state: Mutex<Option<Captured>>,
+    state: Captured,
     fired: AtomicBool,
+    /// Set when the response this logger was attached to never reached the
+    /// transport (a response-builder failure replaced it), so the terminal
+    /// record observed no delivery boundary (issue #6769).
+    response_not_handed_off: AtomicBool,
     // Test-only owned delivery lifecycle. Production paths leave this unset and
     // dispatch through the process-global structured lifecycle.
     #[cfg(test)]
     delivery: Option<crate::observability_delivery::OwnedDeliveryLifecycle>,
 }
 
-/// What the logger captured at header commit. Held inside a [`Mutex`] so
-/// [`fire`](DeferredTransactionLogger::fire) can `take()` it. After the first
-/// fire the slot is `None`, but the `fired` CAS already prevents a second fire
-/// so the `None` state is only visible to no-op callers.
+/// What the logger captured at header commit. The full variant sits behind a
+/// [`Mutex`] so [`fire`](DeferredTransactionLogger::fire) can move the owned
+/// summary and context into the spawned delivery task; the compact variant is
+/// lock-free and guarded solely by the single-fire [`AtomicBool`] CAS.
 enum Captured {
     /// A full summary, the plugin chain, and a context clone: everything a
     /// plugin `log` / termination hook / mirror can ask for. Boxed so the
     /// compact variant's allocation is not sized for it.
-    Full(Box<LogState>),
+    Full(Mutex<Option<Box<LogState>>>),
     /// Runtime-metrics accounting alone, for a response no plugin observes.
     Compact(CompactTerminal),
 }
@@ -257,8 +283,8 @@ struct LogState {
 /// The gRPC terminal-status classification a deferred logger captures at
 /// header commit. `summary_metadata` is the projection the caller put on the
 /// summary, which may be empty when that caller defers it to fire time.
-pub(crate) fn request_protocol_is_grpc(
-    summary_metadata: &std::collections::HashMap<String, String>,
+pub(crate) fn request_protocol_is_grpc<MS: std::hash::BuildHasher>(
+    summary_metadata: &std::collections::HashMap<String, String, MS>,
     ctx: &RequestContext,
 ) -> bool {
     summary_metadata
@@ -280,8 +306,8 @@ pub(crate) fn request_protocol_is_grpc(
 ///
 /// It deliberately differs from [`native_grpc_request_protocol_is_grpc`]; see
 /// that function for why the two defaults are opposites.
-pub fn streaming_request_protocol_is_grpc(
-    request_metadata: &std::collections::HashMap<String, String>,
+pub fn streaming_request_protocol_is_grpc<MS: std::hash::BuildHasher>(
+    request_metadata: &std::collections::HashMap<String, String, MS>,
 ) -> bool {
     request_metadata
         .get("request_protocol")
@@ -303,8 +329,8 @@ pub fn streaming_request_protocol_is_grpc(
 /// HTTP 200 and drop its UNKNOWN terminal status; using this function on the
 /// generic arm would stamp `grpc_status: 2` on every streamed non-gRPC
 /// response. Keep the two apart.
-pub fn native_grpc_request_protocol_is_grpc(
-    request_metadata: &std::collections::HashMap<String, String>,
+pub fn native_grpc_request_protocol_is_grpc<MS: std::hash::BuildHasher>(
+    request_metadata: &std::collections::HashMap<String, String, MS>,
 ) -> bool {
     request_metadata
         .get("request_protocol")
@@ -324,7 +350,6 @@ impl DeferredTransactionLogger {
     /// Retained as public API surface for external callers (tests and future
     /// non-streaming deferred-log sites). The production HTTP/gRPC streaming
     /// paths use `new_with_start_time` exclusively.
-    #[allow(dead_code)]
     pub fn new(
         summary: TransactionSummary,
         plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -332,7 +357,7 @@ impl DeferredTransactionLogger {
     ) -> Arc<Self> {
         let request_protocol_is_grpc = request_protocol_is_grpc(&summary.metadata, &ctx);
         Arc::new(Self {
-            state: Mutex::new(Some(Captured::Full(Box::new(LogState {
+            state: Captured::Full(Mutex::new(Some(Box::new(LogState {
                 summary,
                 plugins,
                 ctx,
@@ -341,36 +366,40 @@ impl DeferredTransactionLogger {
                 request_protocol_is_grpc,
             })))),
             fired: AtomicBool::new(false),
+            response_not_handed_off: AtomicBool::new(false),
             #[cfg(test)]
             delivery: None,
         })
     }
 
     /// Build a logger that records only the runtime-metrics terminal
-    /// accounting, for a streaming response with **no plugin** on the proxy.
+    /// accounting, for a streaming response with **no terminal consumer**
+    /// (no plugin declaring `LOG` / `ON_RESPONSE_STREAM_TERMINATED` / stream
+    /// hooks, no mirror, and no diagnostic detail capture).
     ///
-    /// Without a plugin there is no `log`, no response-stream termination
+    /// Without a consumer there is no `log`, no response-stream termination
     /// hook, no inspector, and no mirror to serve, so the full path's
-    /// `TransactionSummary`, `RequestContext` clone, and spawned delivery task
+    /// `TransactionSummary`, `RequestContext` move, and spawned delivery task
     /// would exist only to reach
     /// [`RuntimeMetrics::record_transaction`](crate::runtime_metrics::RuntimeMetrics::record_transaction).
     /// This captures exactly the fields that call reads and records them
     /// synchronously at the terminal — the recording is a handful of atomic
-    /// increments, so it needs no task — through the same single-fire latch
-    /// and Drop safety net, so client disconnects and body errors are counted
-    /// exactly once, exactly as the full path counts them.
+    /// increments, so it needs no task and no mutex — through the same
+    /// single-fire latch and Drop safety net, so client disconnects and body
+    /// errors are counted exactly once, exactly as the full path counts them.
     ///
     /// `grpc` is the request's protocol classification at header commit
     /// (see [`crate::runtime_metrics::terminal_metadata_is_grpc`]);
     /// `error_class` is the response's class as the summary would carry it.
     pub fn compact(proxy_id: String, grpc: bool, error_class: Option<ErrorClass>) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(Some(Captured::Compact(CompactTerminal {
+            state: Captured::Compact(CompactTerminal {
                 proxy_id,
                 grpc,
                 error_class,
-            }))),
+            }),
             fired: AtomicBool::new(false),
+            response_not_handed_off: AtomicBool::new(false),
             #[cfg(test)]
             delivery: None,
         })
@@ -405,7 +434,7 @@ impl DeferredTransactionLogger {
         request_protocol_is_grpc: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(Some(Captured::Full(Box::new(LogState {
+            state: Captured::Full(Mutex::new(Some(Box::new(LogState {
                 summary,
                 plugins,
                 ctx,
@@ -414,6 +443,7 @@ impl DeferredTransactionLogger {
                 request_protocol_is_grpc,
             })))),
             fired: AtomicBool::new(false),
+            response_not_handed_off: AtomicBool::new(false),
             #[cfg(test)]
             delivery: None,
         })
@@ -428,18 +458,27 @@ impl DeferredTransactionLogger {
         self: Arc<Self>,
         latch: Option<Arc<DirectH2BytesLatch>>,
     ) -> Arc<Self> {
-        if let Some(latch) = latch {
-            let mut guard = match self.state.lock() {
+        if let Some(latch) = latch
+            && let Captured::Full(mutex) = &self.state
+        {
+            let mut guard = match mutex.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            // A compact terminal records no byte counts, so it has nothing to
-            // wait for.
-            if let Some(Captured::Full(state)) = guard.as_mut() {
+            if let Some(state) = guard.as_deref_mut() {
                 state.request_bytes_latch = Some(latch);
             }
         }
         self
+    }
+
+    /// Record that the response this logger was attached to never reached the
+    /// transport: the response builder failed and a fallback replaced it. The
+    /// terminal record then reports `response_delivery: not_observed` instead
+    /// of describing a body boundary the transport never saw (issue #6769).
+    /// Call before firing.
+    pub fn mark_response_not_handed_off(&self) {
+        self.response_not_handed_off.store(true, Ordering::Release);
     }
 
     /// Fire the deferred log with the given outcome. Only the first call
@@ -460,24 +499,44 @@ impl DeferredTransactionLogger {
         {
             return;
         }
-        self.fire_once(outcome);
+        self.fire_once(outcome, None);
     }
 
-    fn fire_once(&self, outcome: BodyOutcome) {
-        let state = match self.state.lock() {
-            Ok(mut guard) => guard.take(),
-            // A poisoned mutex means another thread panicked while holding
-            // the guard. The state is still valid data, so recover it and
-            // proceed — losing a log entry is worse than propagating poison.
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        let state = match state {
-            Some(Captured::Full(state)) => *state,
-            Some(Captured::Compact(terminal)) => {
+    /// [`Self::fire`] for a terminal whose client-visible status is no longer
+    /// the one captured at header commit: the response the summary describes
+    /// was never sent and the gateway answered with `response_status` instead
+    /// (the response-builder failure fallback, #6775). Same single-fire
+    /// semantics.
+    pub fn fire_with_response_status(&self, outcome: BodyOutcome, response_status: u16) {
+        if self
+            .fired
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.fire_once(outcome, Some(response_status));
+    }
+
+    fn fire_once(&self, outcome: BodyOutcome, response_status_override: Option<u16>) {
+        let state = match &self.state {
+            Captured::Compact(terminal) => {
                 terminal.record(&outcome);
                 return;
             }
-            None => return,
+            Captured::Full(mutex) => {
+                let taken = match mutex.lock() {
+                    Ok(mut guard) => guard.take(),
+                    // A poisoned mutex means another thread panicked while holding
+                    // the guard. The state is still valid data, so recover it and
+                    // proceed — losing a log entry is worse than propagating poison.
+                    Err(poisoned) => poisoned.into_inner().take(),
+                };
+                match taken {
+                    Some(state) => *state,
+                    None => return,
+                }
+            }
         };
         let LogState {
             mut summary,
@@ -487,9 +546,19 @@ impl DeferredTransactionLogger {
             request_bytes_latch,
             request_protocol_is_grpc,
         } = state;
+        if let Some(status) = response_status_override {
+            summary.response_status_code = status;
+        }
         summary.body_completed = outcome.body_completed;
         summary.body_error_class = outcome.body_error_class;
         summary.client_disconnected = outcome.client_disconnected;
+        // This record is finalized at the body's transport terminal, so the
+        // fields above describe what the transport consumed (issue #6769).
+        summary.response_delivery = if self.response_not_handed_off.load(Ordering::Acquire) {
+            crate::plugins::ResponseDelivery::NotObserved
+        } else {
+            crate::plugins::ResponseDelivery::Observed
+        };
         // Streaming responses only learn their final byte count when the
         // body wrapper finishes or is dropped. Buffered responses populate
         // `bytes_received` synchronously and never reach the deferred logger.
@@ -579,7 +648,18 @@ impl DeferredTransactionLogger {
             if summary.timestamp_received.is_empty() {
                 summary.timestamp_received = ctx.timestamp_received.to_rfc3339();
             }
-            summary.metadata = crate::proxy::clone_log_metadata(&ctx);
+            // This task owns the context and drops it after delivery, which
+            // reads only typed context state, so the map is moved rather than
+            // cloned (issue #6793). Nothing below may read `ctx.metadata`.
+            summary.metadata = crate::proxy::take_log_metadata(&mut ctx);
+            // The typed AI usage snapshot is finalized the same way: a stream
+            // observer publishes its usage from a terminal hook, after the
+            // header-commit skeleton captured the (then empty) snapshot. The
+            // context still holds everything staged before header commit, so
+            // it only ever extends what the skeleton carried.
+            if ctx.ai_usage_export.is_some() {
+                summary.ai_usage_export = ctx.ai_usage_export.clone();
+            }
             log_with_mirror(plugins.as_slice(), &summary, &ctx).await;
         };
         #[cfg(test)]
@@ -605,7 +685,7 @@ impl Drop for DeferredTransactionLogger {
         // — callers that care about partial-byte accuracy should call
         // `fire` explicitly with the observed count.
         if !self.fired.swap(true, Ordering::AcqRel) {
-            self.fire_once(BodyOutcome::client_disconnect(0));
+            self.fire_once(BodyOutcome::client_disconnect(0), None);
         }
     }
 }
@@ -622,7 +702,7 @@ impl DeferredTransactionLogger {
     ) -> Arc<Self> {
         let request_protocol_is_grpc = request_protocol_is_grpc(&summary.metadata, &ctx);
         Arc::new(Self {
-            state: Mutex::new(Some(Captured::Full(Box::new(LogState {
+            state: Captured::Full(Mutex::new(Some(Box::new(LogState {
                 summary,
                 plugins,
                 ctx,
@@ -631,6 +711,7 @@ impl DeferredTransactionLogger {
                 request_protocol_is_grpc,
             })))),
             fired: AtomicBool::new(false),
+            response_not_handed_off: AtomicBool::new(false),
             delivery: Some(delivery),
         })
     }

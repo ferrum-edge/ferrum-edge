@@ -62,8 +62,8 @@ use crate::modes::mesh::config::{
     MeshInboundTcpRoute, MeshJwtRule, MeshLoadBalancer, MeshLocalityLbSetting,
     MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig,
     MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyScope, Resolution, ServiceEntry,
-    ServiceEntryLocation, ServiceTargetPort, destination_rule_exported_to_namespace,
-    destination_rule_lookup_tier, resolve_target_port, service_entry_exported_to_namespace,
+    ServiceEntryLocation, destination_rule_exported_to_namespace, destination_rule_lookup_tier,
+    resolve_target_port, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::stock_xds_client::StockXdsClientConfig;
@@ -120,6 +120,25 @@ pub const MESH_SPIFFE_IDENTITY_PLUGIN_ID: &str = "__mesh_spiffe_identity";
 pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
 pub const MESH_WORKLOAD_METRICS_PLUGIN_ID: &str = "__mesh_workload_metrics";
 pub const MESH_REQUEST_AUTH_PLUGIN_ID: &str = "__mesh_request_auth";
+/// Reserved id of the `request_termination` instance that refuses every HTTP
+/// request to a workload selected by a RequestAuthentication Ferrum refused
+/// (issue #6656).
+pub const MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID: &str = "__mesh_request_auth_refused";
+/// Id prefix of the additional refusal instances a refusal too large for one
+/// execution trigger is split across.
+pub const MESH_REQUEST_AUTH_REFUSED_PARTITION_ID_PREFIX: &str = "__mesh_request_auth_refused_";
+/// Id prefix of the proxy-group `jwks_auth` instances that enforce a
+/// NodeWaypoint route's destination RequestAuthentications (issue #6670).
+pub const MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX: &str = "__mesh_request_auth_dst_";
+
+/// Whether `id` names a mesh-managed RequestAuthentication `jwks_auth`
+/// instance (the global one or a NodeWaypoint destination one).
+pub fn is_mesh_request_auth_plugin_id(id: &str) -> bool {
+    id == MESH_REQUEST_AUTH_PLUGIN_ID
+        || id.starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX)
+}
+/// Body of the fail-closed refusal. Fixed text: it names no resource.
+pub(crate) const MESH_REQUEST_AUTH_REFUSED_MESSAGE: &str = "RequestAuthentication for this workload was rejected by the gateway; requests are refused until it is fixed";
 pub const MESH_ACCESS_LOG_PLUGIN_ID: &str = "__mesh_access_log";
 pub const MESH_OUTBOUND_REGISTRY_PLUGIN_ID: &str = "__mesh_outbound_registry";
 pub const MESH_BPF_METRICS_PLUGIN_ID: &str = "__mesh_bpf_metrics";
@@ -205,7 +224,7 @@ pub enum MeshListenerKind {
     /// UDP TPROXY capture listener (F3 §3.3 Stage 3). Plaintext; bound to the
     /// Stage-2 `FERRUM_MESH_CAPTURE_UDP_PORT`. Receives TPROXY-diverted UDP
     /// datagrams, recovers per-datagram orig-dst from the `IP_RECVORIGDSTADDR`
-    /// cmsg, and (Stage 3) drops them — the egress relay is Stage 4. Only
+    /// cmsg, and hands them to the datagram-over-mesh egress relay. Only
     /// emitted when `FERRUM_MESH_CAPTURE_UDP_ENABLED` is set (default-off).
     PlaintextUdpCapture,
     /// NodeWaypoint **transparent inbound capture** listener (issue #3287).
@@ -302,25 +321,11 @@ impl MeshTopology {
         }
     }
 
-    /// Whether this topology terminates HBONE inbound on the shared waypoint
-    /// listener (port 15008 by default). True for `Ambient`, `NodeWaypoint`,
-    /// and `ServiceWaypoint`. Used by listener spawning and by validation
-    /// paths that require HBONE-specific config.
-    #[inline]
-    #[allow(dead_code)]
-    pub fn terminates_hbone(self) -> bool {
-        matches!(
-            self,
-            Self::Ambient | Self::NodeWaypoint | Self::ServiceWaypoint
-        )
-    }
-
     /// Whether this topology is a waypoint flavor (node or service scope).
     /// Used by slice-filter and admin-endpoint dispatch to identify the
     /// shared-listener topologies that need extra scoping beyond Ambient's
     /// single-workload identity.
     #[inline]
-    #[allow(dead_code)]
     pub fn is_waypoint(self) -> bool {
         matches!(self, Self::NodeWaypoint | Self::ServiceWaypoint)
     }
@@ -347,6 +352,24 @@ impl MeshTopology {
     #[inline]
     fn uses_node_waypoint_capture_scoping(self) -> bool {
         matches!(self, Self::NodeWaypoint)
+    }
+
+    /// Whether this topology serves the VirtualService `http[]` routes a mesh
+    /// slice carries (`MeshSlice::http_routes`, issues #7233 and #7423): the
+    /// NodeWaypoint capture listener and the Sidecar outbound capture
+    /// listener. Ambient is the L4 data plane and does no L7 routing (as in
+    /// Istio); ServiceWaypoint projection is a documented follow-up.
+    #[inline]
+    pub(crate) fn serves_virtual_service_http_routes(self) -> bool {
+        matches!(self, Self::NodeWaypoint | Self::Sidecar)
+    }
+
+    /// Whether this topology asks the control plane for the VirtualService
+    /// `http[]` routes on a Sidecar slice (`MeshSliceRequest::sidecar_http_routes`).
+    /// NodeWaypoint gets them through its own capture-scoping request.
+    #[inline]
+    fn requests_sidecar_http_routes(self) -> bool {
+        matches!(self, Self::Sidecar)
     }
 }
 
@@ -613,7 +636,7 @@ pub struct MeshRuntimeConfig {
     /// When `true`, and only when `sidecar_enforced` is also true, per-workload
     /// slices filter `workloads` down to identities referenced by admitted
     /// services. Sourced from `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING`
-    /// (default `false`).
+    /// (default `true`; `false` turns it off).
     pub sidecar_identity_narrowing: bool,
     /// Opt-in for stream-family (TCP/UDP) egress proxy materialization.
     /// Default `false`. When enabled, the materialized per-port stream egress
@@ -662,7 +685,7 @@ impl MeshRuntimeConfig {
 
     pub fn from_env_config(env_config: &EnvConfig) -> Result<Self, String> {
         let config_protocol = MeshConfigProtocol::parse(&env_config.mesh_config_protocol)?;
-        let cp_urls = env_config.resolved_dp_cp_grpc_urls();
+        let cp_urls = env_config.dp_cp_grpc_urls.clone();
         if config_protocol.requires_control_plane() && cp_urls.is_empty() {
             return Err("FERRUM_DP_CP_GRPC_URLS is required in mesh mode".into());
         }
@@ -883,9 +906,13 @@ impl MeshRuntimeConfig {
         let unix_socket_allowed_roots = env_config.mesh_unix_socket_allowed_roots.clone();
         let unix_socket_allowed_uids = env_config.mesh_unix_socket_allowed_uids.clone();
 
-        let dns_enabled = resolve_ferrum_var("FERRUM_MESH_DNS_PROXY_ENABLED")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or(DEFAULT_DNS_ENABLED);
+        // Strict like every sibling mesh bool: a typo such as `yes` fails
+        // startup instead of silently disabling the DNS proxy.
+        let dns_enabled = match resolve_ferrum_var("FERRUM_MESH_DNS_PROXY_ENABLED") {
+            None => DEFAULT_DNS_ENABLED,
+            Some(raw) if raw.trim().is_empty() => DEFAULT_DNS_ENABLED,
+            Some(raw) => bool::parse_env(raw.trim(), "FERRUM_MESH_DNS_PROXY_ENABLED")?,
+        };
         let dns_listen_addr = parse_socket_addr(
             "FERRUM_MESH_DNS_LISTEN_ADDR",
             resolve_ferrum_var("FERRUM_MESH_DNS_LISTEN_ADDR")
@@ -1008,6 +1035,7 @@ impl MeshRuntimeConfig {
             waypoint_name: self.service_waypoint_name(),
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
             node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
+            sidecar_http_routes: self.topology.requests_sidecar_http_routes(),
             labels: self.workload_labels.clone(),
             // Same `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` interval the xDS
             // client uses — the knob is protocol-agnostic failover/failback.
@@ -1060,6 +1088,7 @@ impl MeshRuntimeConfig {
             waypoint_name: self.service_waypoint_name(),
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
             node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
+            sidecar_http_routes: self.topology.requests_sidecar_http_routes(),
             stream_channel_capacity: self.xds_stream_channel_capacity,
             primary_retry_secs: self.xds_primary_retry_secs,
             connect_timeout_seconds: self.xds_connect_timeout_seconds,
@@ -1095,7 +1124,8 @@ impl MeshRuntimeConfig {
                 ));
                 // Sidecar relays captured UDP over a mesh-mTLS datagram tunnel
                 // (#1808), so the helper emits the `PlaintextUdpCapture` listener
-                // here when the capture flag is set (gated to Ambient | Sidecar).
+                // here when the capture flag is set (Sidecar only; Ambient uses
+                // the per-pod-netns producer instead).
                 listeners.extend(self.udp_capture_listener());
                 listeners
             }
@@ -1376,9 +1406,7 @@ impl MeshRuntimeConfig {
         if self.topology != MeshTopology::NodeWaypoint {
             return Ok(());
         }
-        if node_waypoint_udp_listeners_enabled_from_env()?
-            && node_waypoint_udp_local_node_name_from_env().is_none()
-        {
+        if node_waypoint_udp_listeners_enabled_from_env()? && k8s_node_name_from_env().is_none() {
             return Err(
                 "FERRUM_K8S_NODE_NAME must be set to the current Kubernetes node when \
                  FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true"
@@ -1388,13 +1416,14 @@ impl MeshRuntimeConfig {
         Ok(())
     }
 
-    /// The optional UDP TPROXY capture listener (F3 §3.3), emitted on the two
-    /// topologies that actually **relay** captured UDP — **Ambient** (datagram
-    /// over HBONE `:15008`) and **Sidecar** (datagram over mesh-mTLS `:15006`).
-    /// UDP egress materialization is dual-transport
+    /// The optional current-netns UDP TPROXY capture listener (F3 §3.3),
+    /// emitted for **Sidecar only** (datagram over mesh-mTLS `:15006`). UDP
+    /// egress materialization is dual-transport
     /// (`materialize_mesh_outbound_udp_upstreams` gates `Ambient => HBONE,
-    /// Sidecar => SidecarMtls, _ => return`), so this listener is gated to the
-    /// SAME two topologies. Emitting it for a topology with NO UDP relay
+    /// Sidecar => SidecarMtls, _ => return`), but **Ambient** relays captured
+    /// UDP from the per-pod-netns producer (`NetnsUdpCaptureManager`, #2013),
+    /// which binds its capture sockets inside each enrolled pod netns, so it
+    /// gets no listener here. Emitting it for a topology with NO UDP relay
     /// (EastWestGateway / EgressGateway / waypoints) would divert the pod's UDP
     /// into a listener with no relay and **black-hole every captured datagram**
     /// (codex r1 P2); leaving those un-captured (UDP passes through) is the
@@ -1402,16 +1431,10 @@ impl MeshRuntimeConfig {
     /// no outbound capture listener (and UDP stays mesh-wide-only there per the
     /// per-pod-scope notes).
     ///
-    /// **End-to-end status (tracked in #1808): the FIRST working end-to-end UDP
-    /// path is SIDECAR** — the injector's pod-netns TPROXY producer (re-enabled
-    /// via `injector::sidecar_udp_capture_supported()`) feeds this listener, the
+    /// On Sidecar (#1808) the injector's pod-netns TPROXY producer (enabled via
+    /// `injector::sidecar_udp_capture_supported()`) feeds this listener, the
     /// egress datapath relays the datagram over a mesh-mTLS CONNECT, and the
-    /// destination unframes it into a local `UdpSocket`. **Ambient still has NO
-    /// UDP capture *producer*** feeding this listener — the node-agent host-netns
-    /// path emits no UDP TPROXY rules (the same per-pod-scope blocker that defers
-    /// F4.3 / #1803) and eBPF capture is `connect()`-hooked / TCP-only — so
-    /// Ambient end-to-end UDP capture→relay is **not yet active in production**
-    /// (its relay/transport is implemented and unit-tested, awaiting a producer).
+    /// destination unframes it into a local `UdpSocket`.
     ///
     /// NOTE: the injector/init TPROXY-rule emission for a Sidecar pod is gated to
     /// MATCH this runtime listener gate: `injector::sidecar_udp_capture_supported()`
@@ -1545,6 +1568,7 @@ impl MeshRuntimeConfig {
             enforce_sidecar_identity_narrowing: self.sidecar_identity_narrowing,
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
             node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
+            sidecar_http_routes: self.topology.requests_sidecar_http_routes(),
         }
     }
 
@@ -1557,56 +1581,112 @@ impl MeshRuntimeConfig {
     }
 }
 
-/// Prepare a gateway snapshot for mesh-mode serving.
+/// Prepare a gateway snapshot the way a mesh data plane receives it.
 ///
-/// Mesh mode is the only caller. The mutation is cold-path: it runs before
-/// `ProxyState` builds router/plugin caches, so non-mesh modes and ordinary
-/// requests never pay for mesh plugin injection.
-#[allow(dead_code)] // Used by tests and future xDS bootstrap wiring.
-pub fn prepare_gateway_config_for_mesh(
+/// Test-only (`test-support`); no serving path calls this. It is the test
+/// convenience for the two halves
+/// production runs on either side of the wire. The snapshot is admitted and
+/// projected into this runtime's [`MeshSlice`] exactly as a control plane
+/// does ([`MeshSlice::from_gateway_config`] with
+/// [`MeshRuntimeConfig::mesh_slice_request`]), and that slice is materialized
+/// through the data-plane path, [`prepare_gateway_config_from_mesh_slice`].
+/// Anything a slice does not carry (operator proxies, upstreams, plugin
+/// configs, consumers, gateway settings) does not reach the result, just as it
+/// never reaches a mesh data plane (issue #7233).
+#[cfg(any(test, feature = "test-support"))]
+pub fn prepare_gateway_config_via_mesh_slice(
     mut config: GatewayConfig,
     runtime: &MeshRuntimeConfig,
 ) -> Result<GatewayConfig, anyhow::Error> {
     config.normalize_fields();
     config.normalize_mesh_fields();
-    let mesh_slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
-    // Back-project the slice's narrowed `services` view BEFORE preparation so
-    // every consumer of the prepared config sees exactly what materialization
-    // consumes — CP parity: on the CP-driven paths `gateway_config_from_mesh_slice`
-    // builds `config.mesh` FROM the slice, so a DP never carries un-narrowed
-    // services. Without this, a Sidecar egress scope that narrows a
-    // multi-port service's ports would leave the raw declaration in
-    // `config.mesh.services`, and the router's outbound sibling grouping
-    // (declared-HTTP-port fail-closed) would demand orig-dst for a service
-    // the slice narrowed to a single port.
-    if let Some(mesh) = config.mesh.as_deref_mut() {
-        mesh.services = mesh_slice.services.clone();
+    if let Err(errors) = config.validate_resource_ids() {
+        return Err(anyhow::anyhow!(
+            "Mesh input resource ID validation failed: {}",
+            errors.join("; ")
+        ));
     }
-    prepare_normalized_gateway_config_for_mesh(config, runtime, &mesh_slice)
+    let mesh_errors = config.validate_mesh_fields();
+    if !mesh_errors.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Mesh configuration validation failed: {}",
+            mesh_errors.join("; ")
+        ));
+    }
+    let mesh_slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+    prepare_gateway_config_from_mesh_slice(&mesh_slice, runtime)
+}
+
+/// [`prepare_gateway_config_via_mesh_slice`] for component tests that need
+/// gateway resources no mesh slice carries.
+///
+/// The mesh view is exactly the production one: `config` is projected into
+/// this runtime's slice and decoded from it. The operator proxies, upstreams,
+/// plugin configs and consumers in `config` are then added as fixtures beside
+/// the slice-built resources before materialization, so a test can drive a
+/// shared materializer (DestinationRule overlay, HBONE admission, dispatch
+/// policy) over a resource it controls. Translator-owned route resources
+/// (`istio-vs-*`, `gwapi-route-*`) are never added: whether a data plane gets
+/// one is the slice's decision (issue #7233). No serving path calls this.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn prepare_gateway_config_via_mesh_slice_with_fixtures(
+    mut config: GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+) -> Result<GatewayConfig, anyhow::Error> {
+    config.normalize_fields();
+    config.normalize_mesh_fields();
+    if let Err(errors) = config.validate_resource_ids() {
+        return Err(anyhow::anyhow!(
+            "Mesh input resource ID validation failed: {}",
+            errors.join("; ")
+        ));
+    }
+    let mesh_errors = config.validate_mesh_fields();
+    if !mesh_errors.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Mesh configuration validation failed: {}",
+            mesh_errors.join("; ")
+        ));
+    }
+    let mesh_slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+    let (mut prepared, merged_slice) =
+        unprepared_gateway_config_from_mesh_slice(&mesh_slice, runtime, None, None)?;
+    let route_owned = |id: &str| id.starts_with("istio-vs-") || id.starts_with("gwapi-route-");
+    prepared.proxies.extend(
+        config
+            .proxies
+            .into_iter()
+            .filter(|proxy| !route_owned(&proxy.id)),
+    );
+    prepared.upstreams.extend(
+        config
+            .upstreams
+            .into_iter()
+            .filter(|upstream| !route_owned(&upstream.id)),
+    );
+    prepared.plugin_configs.extend(
+        config
+            .plugin_configs
+            .into_iter()
+            .filter(|plugin| !route_owned(&plugin.id)),
+    );
+    prepared.consumers.extend(config.consumers);
+    let materialization_slice = merged_slice.as_ref().unwrap_or(&mesh_slice);
+    prepare_gateway_config_for_native_slice(prepared, runtime, materialization_slice)
 }
 
 /// Prepare a gateway snapshot from an already-projected [`MeshSlice`].
 ///
-/// This is the CP-driven materialization path: the slice *is* the serving
-/// inventory. File-mode [`prepare_gateway_config_for_mesh`] additionally
-/// filters `MeshConfig` to `runtime.namespace` before this step, which is
-/// why a document that names Services in other namespaces never reaches the
-/// NodeWaypoint UDP materializer on that path.
-#[allow(dead_code)] // Used by tests.
+/// This is the materialization path every mesh config source (native, xDS,
+/// file) uses: the slice *is* the serving inventory, so a document that names
+/// Services in other namespaces never reaches the NodeWaypoint UDP
+/// materializer.
 pub fn prepare_gateway_config_from_mesh_slice(
     slice: &MeshSlice,
     runtime: &MeshRuntimeConfig,
 ) -> Result<GatewayConfig, anyhow::Error> {
-    gateway_config_from_mesh_slice_with_federation(
-        slice,
-        runtime,
-        None,
-        None,
-        FederationActivation {
-            fail_open: false,
-            poll_enabled: false,
-        },
-    )
+    gateway_config_from_mesh_slice_with_federation(slice, runtime, None, None)
 }
 
 fn prepare_gateway_config_for_native_slice(
@@ -1624,6 +1704,15 @@ fn prepare_normalized_gateway_config_for_mesh(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) -> Result<GatewayConfig, anyhow::Error> {
+    // A capture inventory whose destination AuthorizationPolicy set was never
+    // resolved by its producer would authorize captured connections against
+    // an incomplete policy set. Refuse the candidate before anything is
+    // materialized: at startup no capture-serving generation is built, and on
+    // reload the previous complete generation keeps serving. Every slice
+    // source (native, xDS, file) converges here.
+    mesh_slice
+        .validate_node_waypoint_capture_inventory()
+        .map_err(|error| anyhow::anyhow!("Mesh slice validation failed: {error}"))?;
     // This is the untrusted/operator boundary. Reserved mesh IDs are invalid
     // here exactly like every other leading-underscore ID. Only after this
     // strict gate succeeds may the trusted materializers below create reserved
@@ -1655,6 +1744,13 @@ fn prepare_normalized_gateway_config_for_mesh(
     // under the service-port key or dial-port key their dispatch path uses.
     // Topology-aware: Ambient emits HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
+    bind_carried_http_routes_to_node_waypoint_transport(&mut config, runtime, mesh_slice)?;
+    // After rebinding, so each candidate names the destination route dispatch
+    // actually selects (the Service port's upstream, not its DNS name).
+    thread_node_waypoint_route_branches_to_authz(&mut config, runtime);
+    let refused_destination_routes =
+        scope_request_auth_to_node_waypoint_destinations(&mut config, runtime, mesh_slice);
+    scope_request_auth_refusal_to_inbound_routes(&mut config, runtime, &refused_destination_routes);
     // VirtualService-derived CORS attaches to the just-materialized outbound
     // routes (issue #1973) — after materialization so the proxy ids exist,
     // before DR application like every other route-policy overlay.
@@ -1673,6 +1769,9 @@ fn prepare_normalized_gateway_config_for_mesh(
     fail_closed_node_waypoint_udp_dtls_scoped_policies(&mut config, runtime);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
     project_mesh_source_locality(&mut config, runtime, mesh_slice);
+    // After DestinationRules and locality, so the route-scoped clones carry
+    // the same projected policy as the Service upstreams they copy.
+    clone_sidecar_carried_destination_upstreams(&mut config, runtime, mesh_slice);
     // Project slice-filtered ServiceEntries back into the prepared mesh
     // block so introspection consumers (admin diagnostics, projected-config
     // snapshots, future helpers) see the same `export_to` / sidecar-narrowed
@@ -1703,6 +1802,21 @@ fn prepare_normalized_gateway_config_for_mesh(
         mesh.node_waypoint_capture_peer_authentications = mesh_slice
             .node_waypoint_capture_peer_authentications
             .clone();
+        // The destination AuthorizationPolicy inventory rides along under the
+        // same unconditional-assignment rule, so a withdrawn destination's
+        // policies leave with it. `mesh_authz` reads the slice copy; this
+        // back-projection keeps the prepared config's capture view complete.
+        mesh.node_waypoint_capture_mesh_policies =
+            mesh_slice.node_waypoint_capture_mesh_policies.clone();
+        // The prepared config's capture inventory IS the slice's; record its
+        // provenance so nothing ever rebuilds an inventory from this config's
+        // narrowed routing views.
+        mesh.node_waypoint_capture_inventory_state =
+            if mesh_slice.node_waypoint_capture_mesh_policies_resolved {
+                crate::modes::mesh::config::NodeWaypointCaptureInventoryState::Resolved
+            } else {
+                crate::modes::mesh::config::NodeWaypointCaptureInventoryState::NotResolved
+            };
         // Back-project the slice's narrowed LOCAL-INBOUND service view (kept
         // SEPARATE from the egress-narrowed `services` — never folded in, per
         // the egress-scope security rule) so the router's inbound per-port
@@ -1909,9 +2023,29 @@ fn prepare_normalized_gateway_config_for_mesh(
                             .iter()
                             .map(|(key, value)| (key.clone(), value.clone()))
                             .collect();
-                        mesh_slice
-                            .workloads
+                        // `workloads` is the egress/routing view. Sidecar
+                        // identity narrowing (on by default) drops this
+                        // proxy's OWN record from it whenever its own service
+                        // is outside the Sidecar egress scope, and an empty
+                        // owned view refuses every inbound relay with
+                        // `PortNotDeclared`. Inbound serving must not depend
+                        // on egress scope, so the un-narrowed local-inbound
+                        // view the slice builder preserved is scanned too.
+                        // Its records are copies of `workloads` entries, so a
+                        // record already in `workloads` is skipped: counting
+                        // one pod twice on its address would make the
+                        // own-address projection treat it as ambiguous. The
+                        // same predicate below applies to both views, and the
+                        // local view never reaches the outbound routing view.
+                        let routing_records = mesh_slice.workloads.iter();
+                        let local_inbound_records = mesh_slice
+                            .local_inbound_workloads
+                            .as_deref()
+                            .unwrap_or_default()
                             .iter()
+                            .filter(|local| !mesh_slice.workloads.contains(local));
+                        routing_records
+                            .chain(local_inbound_records)
                             .filter(|workload| {
                                 // `mesh_slice` here is the MULTICLUSTER-MERGED
                                 // materialization slice, and
@@ -2240,15 +2374,21 @@ pub(crate) fn node_waypoint_udp_listeners_enabled_from_env() -> Result<bool, Str
     }
 }
 
-/// Exact Kubernetes node whose local workloads this NodeWaypoint may reach.
+/// This process's Kubernetes node name (`FERRUM_K8S_NODE_NAME`, downward API
+/// `spec.nodeName`), trimmed; `None` when unset or blank.
 ///
-/// The UDP relay's eBPF authorization mark is socket-local metadata and does
-/// not cross a node boundary. A listener must therefore never select a backing
-/// workload owned by another node, even when that workload is in the same
-/// cluster. The serving path rejects an enabled listener surface when this
-/// downward-API value is absent; read-only materialization remains infallible
-/// and emits no listeners in that state.
-fn node_waypoint_udp_local_node_name_from_env() -> Option<String> {
+/// Read from the process environment only, never `ferrum.conf`: the value
+/// names the machine the process runs on, so a settings-file copy could name
+/// another node. It is the one reader for both consumers (issue #7237):
+///
+/// - NodeWaypoint UDP/DTLS listeners, which must never select a backing
+///   workload owned by another node (the UDP relay's eBPF authorization mark
+///   is socket-local and does not cross a node boundary). The serving path
+///   rejects an enabled listener surface when this is absent; read-only
+///   materialization remains infallible and emits no listeners in that state.
+/// - `ferrum-edge ambient-udp-preflight`, which binds its `get nodes` lookup
+///   to this node.
+pub fn k8s_node_name_from_env() -> Option<String> {
     std::env::var("FERRUM_K8S_NODE_NAME")
         .ok()
         .map(|value| value.trim().to_string())
@@ -2452,7 +2592,7 @@ fn materialize_node_waypoint_udp_listeners(
         config.node_waypoint_udp_destination_routes.clear();
         return;
     }
-    let Some(local_node_name) = node_waypoint_udp_local_node_name_from_env() else {
+    let Some(local_node_name) = k8s_node_name_from_env() else {
         config.node_waypoint_udp_steer_destinations.clear();
         config.node_waypoint_udp_destination_routes.clear();
         warn!(
@@ -2767,7 +2907,6 @@ fn materialize_node_waypoint_udp_listeners(
                             candidate.proxy.namespace.clone(),
                             candidate.proxy.id.clone(),
                         ),
-                        candidate.terminates_dtls,
                     ),
                 );
             }
@@ -2857,7 +2996,7 @@ fn node_waypoint_udp_listener_proxy(
         hosts: Vec::new(),
         listen_path: None,
         backend_scheme: Some(BackendScheme::Udp),
-        dispatch_kind: Default::default(),
+        dispatch_kind: DispatchKind::from(BackendScheme::Udp),
         backend_host: String::new(),
         backend_port: 0,
         backend_path: None,
@@ -2890,7 +3029,6 @@ fn node_waypoint_udp_listener_proxy(
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
@@ -2964,6 +3102,7 @@ fn node_waypoint_udp_listener_upstream(
         created_at: now,
         updated_at: now,
         k8s_service_uid,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -3029,7 +3168,7 @@ fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
 
     // Both UDP upstream families: the egress relay upstreams and — since issue
     // #3286 — the NodeWaypoint UDP/DTLS LISTENER upstreams. Their proxies are
-    // removed above, so leaving the upstreams behind would keep dead endpoint
+    // removed below, so leaving the upstreams behind would keep dead endpoint
     // state in the applied generation.
     let udp_upstreams: Vec<String> = config
         .upstreams
@@ -3123,6 +3262,10 @@ fn mesh_authz_config_policies(config: &serde_json::Value) -> Vec<MeshPolicy> {
         return crate::util::deserialization::from_json_value::<
             crate::util::json_object::JsonObject<MeshSlice>,
         >(value.clone())
+        // Ordinary policies only: like `mesh_authz`'s source-scope census, the
+        // NodeWaypoint capture-destination inventory governs connections TO
+        // its destinations, not the source-attributed UDP/DTLS sessions this
+        // census decides about.
         .map(|object| object.0.mesh_policies)
         .unwrap_or_else(|_| {
             warn!(
@@ -3887,20 +4030,13 @@ fn upstream_content_eq(a: &Upstream, b: &Upstream) -> bool {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 fn gateway_config_from_mesh_slice(
     slice: &MeshSlice,
     runtime: &MeshRuntimeConfig,
     federation: Option<&federation::FederationSnapshot>,
     remote_endpoints: Option<&multicluster::RemoteEndpointSnapshot>,
 ) -> Result<GatewayConfig, anyhow::Error> {
-    gateway_config_from_mesh_slice_with_federation(
-        slice,
-        runtime,
-        federation,
-        remote_endpoints,
-        FederationActivation::disabled(),
-    )
+    gateway_config_from_mesh_slice_with_federation(slice, runtime, federation, remote_endpoints)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3960,8 +4096,22 @@ fn gateway_config_from_mesh_slice_with_federation(
     runtime: &MeshRuntimeConfig,
     federation: Option<&federation::FederationSnapshot>,
     remote_endpoints: Option<&multicluster::RemoteEndpointSnapshot>,
-    _activation: FederationActivation,
 ) -> Result<GatewayConfig, anyhow::Error> {
+    let (config, merged_slice) =
+        unprepared_gateway_config_from_mesh_slice(slice, runtime, federation, remote_endpoints)?;
+    let materialization_slice = merged_slice.as_ref().unwrap_or(slice);
+    prepare_gateway_config_for_native_slice(config, runtime, materialization_slice)
+}
+
+/// The config a mesh slice decodes to, before materialization, plus the
+/// remote-merged slice materialization must read when remote endpoints were
+/// merged in (`None` means materialize from `slice` itself).
+fn unprepared_gateway_config_from_mesh_slice(
+    slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+    federation: Option<&federation::FederationSnapshot>,
+    remote_endpoints: Option<&multicluster::RemoteEndpointSnapshot>,
+) -> Result<(GatewayConfig, Option<MeshSlice>), anyhow::Error> {
     let loaded_at = chrono::DateTime::parse_from_rfc3339(&slice.version)
         .map(|ts| ts.with_timezone(&chrono::Utc))
         .unwrap_or_else(|_| chrono::Utc::now());
@@ -4023,17 +4173,23 @@ fn gateway_config_from_mesh_slice_with_federation(
         services: services.clone(),
         ..slice.clone()
     });
-    let materialization_slice = merged_slice.as_ref().unwrap_or(slice);
 
-    let proxies = decode_virtual_service_l4_proxies(slice)?;
-    let upstreams = decode_virtual_service_l4_upstreams(slice)?;
+    let mut proxies = decode_virtual_service_l4_proxies(slice)?;
+    let mut upstreams = decode_virtual_service_l4_upstreams(slice)?;
+    let (route_proxies, route_upstreams, plugin_configs) = decode_http_route_set(slice, runtime)?;
+    proxies.extend(route_proxies);
+    upstreams.extend(route_upstreams);
     let config = GatewayConfig {
         proxies,
         upstreams,
+        plugin_configs,
         mesh: Some(Box::new(MeshConfig {
             workloads,
             services,
             mesh_policies: slice.mesh_policies.clone(),
+            // The providers CUSTOM policies bind to. Without them mesh
+            // validation refuses every slice that carries a CUSTOM policy.
+            ext_authz_providers: slice.ext_authz_providers.clone(),
             peer_authentications: slice.peer_authentications.clone(),
             service_entries: slice.service_entries.clone(),
             request_authentications: slice.request_authentications.clone(),
@@ -4059,7 +4215,7 @@ fn gateway_config_from_mesh_slice_with_federation(
         loaded_at,
         ..GatewayConfig::default()
     };
-    prepare_gateway_config_for_native_slice(config, runtime, materialization_slice)
+    Ok((config, merged_slice))
 }
 
 fn decode_virtual_service_l4_proxies(slice: &MeshSlice) -> Result<Vec<Proxy>, anyhow::Error> {
@@ -4126,7 +4282,9 @@ fn decode_virtual_service_l4_upstreams(
                         )
                     })?;
             if upstream.namespace != slice.namespace
-                || !upstream.id.starts_with("istio-vs-l4-upstream-")
+                || !upstream
+                    .id
+                    .starts_with(crate::proxy::stream_match::ISTIO_VS_L4_UPSTREAM_ID_PREFIX)
                 || !referenced.contains(upstream.id.as_str())
                 || upstream.targets.is_empty()
             {
@@ -4137,6 +4295,2256 @@ fn decode_virtual_service_l4_upstreams(
             Ok(upstream)
         })
         .collect()
+}
+
+type DecodedHttpRouteSet = (
+    Vec<Proxy>,
+    Vec<crate::config::types::Upstream>,
+    Vec<crate::config::types::PluginConfig>,
+);
+
+/// Decode the VirtualService HTTP routes a slice carries (issue #7233).
+///
+/// The set is producer input, so it is re-checked here before anything is
+/// materialized: only a NodeWaypoint or a Sidecar serves it (issue #7423);
+/// every element is an object of
+/// its resource type in the slice namespace with a translator-owned id; every
+/// plugin association resolves to a carried plugin config owned by that
+/// proxy; every carried plugin-config record is a translator kind with its
+/// reserved id, in exactly the translator's record shape
+/// (`carried_route_plugin_record_is_translator_shaped`); every carried
+/// `mesh_route_dispatch` config is one the plugin constructor accepts; every
+/// other carried config body has exactly its builder's emitted shape
+/// (`carried_route_plugin_body_is_translator_shaped`) and passes its plugin
+/// constructor where that needs no network client
+/// (`carried_route_plugin_body_constructs`); and every upstream id a proxy or
+/// `mesh_route_dispatch` rule names resolves to a carried upstream (and every
+/// carried upstream is named). Any
+/// violation refuses the slice, so the previous generation keeps serving.
+/// Diagnostics name the element by ordinal and never echo a supplied id.
+fn decode_http_route_set(
+    slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+) -> Result<DecodedHttpRouteSet, anyhow::Error> {
+    use crate::config::types::{PluginConfig, Upstream};
+    let set = &slice.http_routes;
+    if set.is_empty() {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+    if !runtime.topology.serves_virtual_service_http_routes() {
+        return Err(anyhow::anyhow!(
+            "Mesh slice carries VirtualService HTTP routes, which only a NodeWaypoint or a \
+             Sidecar serves"
+        ));
+    }
+    let proxies: Vec<Proxy> = set
+        .proxies
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let proxy: Proxy = crate::util::json_object::from_json_object_value(value.clone())
+                .map_err(|_| anyhow::anyhow!("Mesh slice HTTP route proxy {index} is malformed"))?;
+            if proxy.namespace != slice.namespace
+                || !config::is_virtual_service_http_route_proxy_id(&proxy.id)
+                || proxy.dispatch_kind.is_stream()
+                || proxy
+                    .backend_scheme
+                    .is_some_and(|scheme| scheme.is_stream())
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route proxy {index} has invalid ownership"
+                ));
+            }
+            Ok(proxy)
+        })
+        .collect::<Result<_, _>>()?;
+    let plugin_configs: Vec<PluginConfig> = set
+        .plugin_configs
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let plugin: PluginConfig =
+                crate::util::json_object::from_json_object_value(value.clone()).map_err(|_| {
+                    anyhow::anyhow!("Mesh slice HTTP route plugin config {index} is malformed")
+                })?;
+            let owned = plugin.namespace == slice.namespace
+                && plugin
+                    .id
+                    .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_PLUGIN_PREFIX)
+                && plugin
+                    .proxy_id
+                    .as_deref()
+                    .is_some_and(|proxy_id| proxies.iter().any(|proxy| proxy.id == proxy_id));
+            if !owned {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route plugin config {index} has invalid ownership"
+                ));
+            }
+            // Leg-by-leg dispatch of a weighted split (issue #7387) is decided
+            // by the data plane from its own slice view, never carried.
+            if plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.config.get("weighted_splits").is_some()
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route plugin config {index} carries data-plane-owned \
+                     `weighted_splits`"
+                ));
+            }
+            // Every carried dispatch instance is validated by the plugin's own
+            // constructor here, once, on every topology, before binding,
+            // `sourceNamespace` filtering or detachment can rewrite or drop it
+            // (issue #7440). Otherwise a malformed instance on a route the
+            // binding refuses would be dropped with the route, handing its
+            // host to the plain Service route (which serves requests the
+            // instance's match gate answers with 404), or have its offending
+            // destination rewritten into a valid one. A refusal rejects the
+            // slice, so the last accepted generation keeps serving. The
+            // record around the config is checked below, after the proxy
+            // associations are resolved.
+            if plugin.plugin_name == "mesh_route_dispatch"
+                && crate::plugins::mesh_route_dispatch::MeshRouteDispatch::new(&plugin.config)
+                    .is_err()
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route plugin config {index} is not a valid \
+                     `mesh_route_dispatch` configuration"
+                ));
+            }
+            Ok(plugin)
+        })
+        .collect::<Result<_, _>>()?;
+    let upstreams: Vec<Upstream> = set
+        .upstreams
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let upstream: Upstream =
+                crate::util::json_object::from_json_object_value(value.clone()).map_err(|_| {
+                    anyhow::anyhow!("Mesh slice HTTP route upstream {index} is malformed")
+                })?;
+            if upstream.namespace != slice.namespace
+                || !upstream
+                    .id
+                    .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+                || upstream.targets.is_empty()
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route upstream {index} has invalid ownership"
+                ));
+            }
+            Ok(upstream)
+        })
+        .collect::<Result<_, _>>()?;
+    // Every carried record is a namespaced resource whose id must be unique
+    // within its kind (all share the slice namespace). Two records with one id
+    // would make every later id-keyed step act on the wrong one or on both:
+    // the route binding finds and rebinds only the first split upstream while
+    // the load balancer keeps the last, Sidecar refusal and instance
+    // detachment remove every record of an id, and the route index keeps one
+    // proxy. Refused here, before any binding or filtering, for all three
+    // kinds.
+    refuse_duplicate_carried_ids("proxy", proxies.iter().map(|proxy| proxy.id.as_str()))?;
+    refuse_duplicate_carried_ids(
+        "plugin config",
+        plugin_configs.iter().map(|plugin| plugin.id.as_str()),
+    )?;
+    refuse_duplicate_carried_ids(
+        "upstream",
+        upstreams.iter().map(|upstream| upstream.id.as_str()),
+    )?;
+
+    let carried_upstreams: BTreeSet<&str> = upstreams
+        .iter()
+        .map(|upstream| upstream.id.as_str())
+        .collect();
+    let mut referenced_upstreams: BTreeSet<&str> = BTreeSet::new();
+    for (index, proxy) in proxies.iter().enumerate() {
+        for association in &proxy.plugins {
+            let resolves = plugin_configs.iter().any(|plugin| {
+                plugin.id == association.plugin_config_id
+                    && plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+            });
+            if !resolves {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route proxy {index} references a plugin config the slice \
+                     does not carry"
+                ));
+            }
+        }
+        referenced_upstreams.extend(proxy.upstream_id.as_deref());
+    }
+    // EVERY carried route plugin-config record, whatever its `plugin_name`,
+    // must be one of the kinds the translator attaches to a route, with that
+    // kind's reserved id, in exactly the translator's record shape (issue
+    // #7440): see `carried_route_plugin_record_is_translator_shaped`.
+    // Anything else rejects the slice. A dispatch config body is checked
+    // separately, by the plugin constructor above.
+    for (index, plugin) in plugin_configs.iter().enumerate() {
+        if !carried_route_plugin_record_is_translator_shaped(plugin, &proxies) {
+            return Err(anyhow::anyhow!(
+                "Mesh slice HTTP route plugin config {index} is a record the translator does \
+                 not emit"
+            ));
+        }
+        // The config BODY of every non-dispatch kind is pinned the same way:
+        // to the keys and constrained values its builder emits
+        // (`carried_route_plugin_body_is_translator_shaped`), and then to the
+        // plugin's own constructor where that builds no network client
+        // (`carried_route_plugin_body_constructs`). A dispatch body was
+        // already checked by its constructor above. Any deviation rejects the
+        // slice, before binding or detachment could drop the record with its
+        // route.
+        if plugin.plugin_name != "mesh_route_dispatch"
+            && (!carried_route_plugin_body_is_translator_shaped(
+                &plugin.plugin_name,
+                &plugin.config,
+            ) || !carried_route_plugin_body_constructs(&plugin.plugin_name, &plugin.config))
+        {
+            return Err(anyhow::anyhow!(
+                "Mesh slice HTTP route plugin config {index} carries a config body the \
+                 translator does not emit"
+            ));
+        }
+    }
+    for plugin in &plugin_configs {
+        if plugin.plugin_name == "mesh_route_dispatch" {
+            referenced_upstreams
+                .extend(slice::mesh_route_dispatch_rule_upstream_ids(&plugin.config));
+        }
+    }
+    if referenced_upstreams != carried_upstreams {
+        return Err(anyhow::anyhow!(
+            "Mesh slice HTTP route upstreams do not match the upstreams its routes reference"
+        ));
+    }
+    Ok((proxies, upstreams, plugin_configs))
+}
+
+/// The plugin kinds the VirtualService translator attaches to a carried HTTP
+/// route, each with its reserved id prefix (`<prefix><proxy id>`). Derived
+/// from the translator (issue #7440):
+/// * `istio-vs-mrd-`: `mesh_route_dispatch`, from
+///   `mesh_route_dispatch_plugin_from_rules` (`src/config_sources/k8s/mod.rs`);
+/// * `istio-vs-req-xform-` / `istio-vs-resp-xform-`: `request_transformer` /
+///   `response_transformer`, from `route_request_transformer_plugin_for_proxy`
+///   / `route_response_transformer_plugin_for_proxy` (same file), emitted
+///   when dispatch rules carry header transforms;
+/// * `istio-vs-rt-`: `request_termination`, from
+///   `request_termination_plugin_for_proxy` (same file), for a route that must
+///   refuse every request;
+/// * `istio-vs-mirror-`: `request_mirror`, from `route_mirror_plugin`
+///   (`src/config_sources/k8s/istio.rs`);
+/// * `istio-vs-cors-`: `cors`, from `route_cors_plugin` (same file).
+///
+/// `materialize_route_candidate` and its caller in `istio.rs` attach exactly
+/// these to the route with `attach_route_plugins_to_proxy`. Faults, rewrites,
+/// redirects and header transforms ride the dispatch rules, not their own
+/// plugins. No prefix is a prefix of another, so an id names one kind.
+const CARRIED_ROUTE_PLUGIN_KINDS: &[(&str, &str)] = &[
+    ("istio-vs-mrd-", "mesh_route_dispatch"),
+    ("istio-vs-req-xform-", "request_transformer"),
+    ("istio-vs-resp-xform-", "response_transformer"),
+    ("istio-vs-rt-", "request_termination"),
+    ("istio-vs-mirror-", "request_mirror"),
+    ("istio-vs-cors-", "cors"),
+];
+
+/// Whether a carried route plugin-config record has exactly the record-level
+/// shape the VirtualService translator emits (issue #7440).
+///
+/// This is an allowlist, applied to EVERY carried record whatever its
+/// `plugin_name`. The kind must be one of [`CARRIED_ROUTE_PLUGIN_KINDS`]. Every
+/// builder listed there sets the same record shape:
+/// * `id`: exactly that kind's prefix plus `proxy_id`, so a reserved prefix
+///   always matches its kind and names its own route;
+/// * `labels`: empty;
+/// * `scope`: `Proxy`, with `proxy_id` naming the route, which lists the
+///   instance in its `plugins`;
+/// * `enabled`: `true`;
+/// * `priority_override`, `trigger`, `api_spec_id`: `None`;
+/// * `config`: kind-specific, and also checked in `decode_http_route_set`.
+///   A dispatch body goes through the plugin constructor, and
+///   `weighted_splits` is refused. Every other body is pinned by
+///   `carried_route_plugin_body_is_translator_shaped` and
+///   `carried_route_plugin_body_constructs`.
+/// * `namespace`: the route namespace, checked against the slice namespace in
+///   `decode_http_route_set`;
+/// * `created_at` / `updated_at`: wall clock, which carries no behavior.
+///
+/// Any other value changes how, whether, or as what the instance runs:
+/// * A disabled, non-proxy-scoped or unassociated instance is never built by
+///   `PluginCache::build_cache`.
+/// * A trigger can skip it per request, and a priority override reorders it.
+/// * A reserved dispatch id on another kind leaves the route with no dispatch
+///   instance, and still occupies the id the binding reserves for one.
+///
+/// For a dispatch instance, each of these would leave the route serving its
+/// default destination without the match gate that answers a miss with 404,
+/// or without leg selection. So anything outside the allowlist rejects the
+/// slice. The struct is destructured without `..`, so a new `PluginConfig`
+/// field fails to compile here until it is classified.
+fn carried_route_plugin_record_is_translator_shaped(
+    plugin: &crate::config::types::PluginConfig,
+    proxies: &[Proxy],
+) -> bool {
+    let crate::config::types::PluginConfig {
+        labels,
+        id,
+        plugin_name,
+        namespace: _,
+        config: _,
+        scope,
+        proxy_id,
+        enabled,
+        priority_override,
+        trigger,
+        api_spec_id,
+        created_at: _,
+        updated_at: _,
+    } = plugin;
+    let Some(&(prefix, _)) = CARRIED_ROUTE_PLUGIN_KINDS
+        .iter()
+        .find(|(_, kind)| *kind == plugin_name.as_str())
+    else {
+        return false;
+    };
+    let Some(proxy_id) = proxy_id.as_deref() else {
+        return false;
+    };
+    // A reserved prefix must belong to this record's kind. The exact id check
+    // below implies it, but a reserved id on the wrong kind is refused here
+    // explicitly.
+    if CARRIED_ROUTE_PLUGIN_KINDS
+        .iter()
+        .any(|&(other, kind)| kind != plugin_name.as_str() && id.starts_with(other))
+    {
+        return false;
+    }
+    let associated = proxies.iter().any(|proxy| {
+        proxy.id == proxy_id
+            && proxy
+                .plugins
+                .iter()
+                .any(|association| association.plugin_config_id == *id)
+    });
+    labels.is_empty()
+        && id.strip_prefix(prefix) == Some(proxy_id)
+        && *scope == PluginScope::Proxy
+        && associated
+        && *enabled
+        && priority_override.is_none()
+        && trigger.is_none()
+        && api_spec_id.is_none()
+}
+
+/// Whether a carried route plugin's config BODY has exactly the shape its
+/// translator builder emits (issue #7440). These are the keys and
+/// constrained values each builder in [`CARRIED_ROUTE_PLUGIN_KINDS`] sets:
+/// * `request_transformer` / `response_transformer`
+///   (`route_request_transformer_plugin_for_proxy` /
+///   `route_response_transformer_plugin_for_proxy`,
+///   `src/config_sources/k8s/mod.rs`): exactly
+///   `{"rules": [], "apply_route_overrides": true}`. No static rules, only
+///   the dispatch rules' per-request transforms.
+/// * `request_termination` (`request_termination_plugin_for_proxy`, same
+///   file, called from `materialize_route_candidate` in
+///   `src/config_sources/k8s/istio.rs`): exactly `status_code` 404 and
+///   `message` `VIRTUAL_SERVICE_UNSUPPORTED_MATCH_TERMINATION_MESSAGE`. No
+///   plugin-local `trigger` or other key that could make the unconditional
+///   refusal conditional.
+/// * `request_mirror` (`route_mirror_plugin`, `istio.rs`): exactly
+///   `mirror_host`, `mirror_port` and `percentage`, as follows.
+///   - The host is a loopback IP literal, the same
+///     `is_loopback_ip_literal_host` predicate as
+///     `virtual_service_route_mirror_is_deferred`, which omits every other
+///     mirror.
+///   - The port is in 1..=65535.
+///   - The percentage is in (0, 100], since a zero mirror is omitted.
+///
+///   No `allow_plaintext`, `mirror_protocol` or other key that could send
+///   the mirrored request somewhere else.
+/// * `cors` (`route_cors_plugin`, `istio.rs`): only `allowed_origins`, a
+///   non-empty list of single-operator `exact` / `prefix` / `regex` string
+///   matchers; `allowed_methods`, `allowed_headers` and `exposed_headers`,
+///   string lists; `unmatched_preflights`, `forward` or `ignore`; and the
+///   optional `max_age` and `allow_credentials` (boolean).
+///   - `max_age` is an unsigned integer no larger than
+///     `ISTIO_DURATION_SECS_MAX`, the largest `parse_istio_duration_secs`
+///     output.
+///   - The origin list stays within the plugin's matcher-count and
+///     per-matcher byte bounds, checked before any regex is compiled.
+///   - Credentials are never combined with a non-strict origin (exact `*`,
+///     opaque `null`, an effectively universal prefix or regex). This is the
+///     same `allowed_origin_entry_is_non_strict` rule as the translator's
+///     `cors_policy_translatable`, which defers such a policy. The plugin
+///     constructor would accept a credentialed exact `*` and silently drop
+///     the credentials.
+///
+/// `mesh_route_dispatch` bodies are checked by the plugin constructor (and the
+/// `weighted_splits` refusal) in `decode_http_route_set`. Any other kind is
+/// not a translator kind. The caller then also runs each body through
+/// `carried_route_plugin_body_constructs`.
+fn carried_route_plugin_body_is_translator_shaped(
+    plugin_name: &str,
+    config: &serde_json::Value,
+) -> bool {
+    use serde_json::Value;
+    let Some(body) = config.as_object() else {
+        return false;
+    };
+    let only = |allowed: &[&str]| body.keys().all(|key| allowed.contains(&key.as_str()));
+    let string_list = |key: &str| {
+        body.get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().all(Value::is_string))
+    };
+    match plugin_name {
+        "mesh_route_dispatch" => true,
+        "request_transformer" | "response_transformer" => {
+            *config == serde_json::json!({"rules": [], "apply_route_overrides": true})
+        }
+        "request_termination" => {
+            only(&["status_code", "message"])
+                && body.get("status_code").and_then(Value::as_u64) == Some(404)
+                && body.get("message").and_then(Value::as_str)
+                    == Some(
+                        crate::config_sources::k8s::VIRTUAL_SERVICE_UNSUPPORTED_MATCH_TERMINATION_MESSAGE,
+                    )
+        }
+        "request_mirror" => {
+            only(&["mirror_host", "mirror_port", "percentage"])
+                && body
+                    .get("mirror_host")
+                    .and_then(Value::as_str)
+                    .is_some_and(|host| {
+                        crate::plugins::utils::socket_host::is_loopback_ip_literal_host(
+                            host.trim(),
+                        )
+                    })
+                && body
+                    .get("mirror_port")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|port| (1..=65535).contains(&port))
+                && body
+                    .get("percentage")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|percentage| percentage > 0.0 && percentage <= 100.0)
+        }
+        "cors" => {
+            only(&[
+                "allowed_origins",
+                "allowed_methods",
+                "allowed_headers",
+                "exposed_headers",
+                "max_age",
+                "allow_credentials",
+                "unmatched_preflights",
+            ]) && body
+                .get("allowed_origins")
+                .and_then(Value::as_array)
+                .is_some_and(|origins| {
+                    // The plugin's own matcher-count and per-matcher byte
+                    // bounds come first, before anything below compiles a
+                    // regex (the credentialed-origin check does), so regex
+                    // work stays within the plugin's budget.
+                    !origins.is_empty()
+                        && crate::plugins::cors::validate_origin_matcher_count(origins.len())
+                            .is_ok()
+                        && origins.iter().all(|origin| {
+                            origin.as_object().is_some_and(|matcher| {
+                                matcher.len() == 1
+                                    && matcher.iter().all(|(operator, value)| {
+                                        matches!(operator.as_str(), "exact" | "prefix" | "regex")
+                                            && value.as_str().is_some_and(|value| {
+                                                crate::plugins::cors::validate_origin_matcher_len(
+                                                    "`allowed_origins` matcher",
+                                                    value,
+                                                )
+                                                .is_ok()
+                                            })
+                                    })
+                            })
+                        })
+                })
+                && string_list("allowed_methods")
+                && string_list("allowed_headers")
+                && string_list("exposed_headers")
+                && body.get("max_age").is_none_or(|max_age| {
+                    max_age.as_u64().is_some_and(|seconds| {
+                        seconds <= crate::config_sources::k8s::ISTIO_DURATION_SECS_MAX
+                    })
+                })
+                && body.get("allow_credentials").is_none_or(Value::is_boolean)
+                && !(body.get("allow_credentials") == Some(&Value::Bool(true))
+                    && body
+                        .get("allowed_origins")
+                        .and_then(Value::as_array)
+                        .is_some_and(|origins| {
+                            origins
+                                .iter()
+                                .any(crate::plugins::cors::allowed_origin_entry_is_non_strict)
+                        }))
+                && matches!(
+                    body.get("unmatched_preflights").and_then(Value::as_str),
+                    Some("forward" | "ignore")
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Run a carried non-dispatch config body through its plugin's own
+/// constructor, without building any network client (issue #7440).
+///
+/// The transformer, termination and CORS constructors take only the JSON
+/// config. `request_mirror`'s constructor needs a `PluginHttpClient`, which
+/// means a DNS cache and several reqwest clients. Building that for every
+/// record on every slice decode, on the apply task, is the per-record cost
+/// issue #4116 removed from config sweeps. So a carried mirror is not
+/// constructed here. Its body is pinned exhaustively by
+/// `carried_route_plugin_body_is_translator_shaped` (three keys, a loopback IP
+/// literal host, bounded port and percentage), and the plugin cache
+/// constructs it with the node's own client when it builds the generation.
+fn carried_route_plugin_body_constructs(plugin_name: &str, config: &serde_json::Value) -> bool {
+    use crate::plugins::{
+        cors::CorsPlugin, request_termination::RequestTermination,
+        request_transformer::RequestTransformer, response_transformer::ResponseTransformer,
+    };
+    match plugin_name {
+        "request_transformer" => RequestTransformer::new(config).is_ok(),
+        "response_transformer" => ResponseTransformer::new(config).is_ok(),
+        "request_termination" => RequestTermination::new(config).is_ok(),
+        "cors" => CorsPlugin::new(config).is_ok(),
+        "request_mirror" => true,
+        _ => false,
+    }
+}
+
+/// Refuse a carried route set in which two records of one `kind` share an id.
+/// The diagnostic names the record by ordinal and never echoes the id.
+fn refuse_duplicate_carried_ids<'a>(
+    kind: &str,
+    ids: impl Iterator<Item = &'a str>,
+) -> Result<(), anyhow::Error> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (index, id) in ids.enumerate() {
+        if !seen.insert(id) {
+            return Err(anyhow::anyhow!(
+                "Mesh slice HTTP route {kind} {index} reuses the id of an earlier {kind}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Where a carried VirtualService destination host lives, from the NodeWaypoint's
+/// own slice view.
+enum CarriedRouteHost {
+    /// A Service in the slice: `(namespace, name)`.
+    Service(String, String),
+    /// A cluster Service host (`*.svc[.<cluster domain>]`, or a short name) the
+    /// slice does not model.
+    UnmodeledService,
+    /// Anything else: an external host.
+    External,
+}
+
+/// Index of the Service host names a NodeWaypoint slice models.
+struct CarriedRouteHostIndex {
+    qualified: HashMap<String, (String, String)>,
+    short: HashSet<(String, String)>,
+    svc_suffix: String,
+}
+
+impl CarriedRouteHostIndex {
+    fn new(mesh_slice: &MeshSlice, cluster_domain: &str) -> Self {
+        let cluster_domain = cluster_domain.trim_matches('.').to_ascii_lowercase();
+        let mut qualified = HashMap::new();
+        let mut short = HashSet::new();
+        for service in &mesh_slice.services {
+            short.insert((service.namespace.clone(), service.name.to_ascii_lowercase()));
+            for host in
+                mesh_service_host_variants(&service.name, &service.namespace, &cluster_domain)
+                    .into_iter()
+                    .skip(1)
+            {
+                qualified.insert(
+                    host.to_ascii_lowercase(),
+                    (service.namespace.clone(), service.name.clone()),
+                );
+            }
+        }
+        Self {
+            qualified,
+            short,
+            svc_suffix: format!(".svc.{cluster_domain}"),
+        }
+    }
+
+    /// Classify `host` as written on a route in `namespace`.
+    fn classify(&self, namespace: &str, host: &str) -> CarriedRouteHost {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !host.contains('.') {
+            return if self.short.contains(&(namespace.to_string(), host.clone())) {
+                CarriedRouteHost::Service(namespace.to_string(), host)
+            } else {
+                CarriedRouteHost::UnmodeledService
+            };
+        }
+        if let Some((namespace, name)) = self.qualified.get(&host) {
+            return CarriedRouteHost::Service(namespace.clone(), name.clone());
+        }
+        // Every Service alias form the translator recognises
+        // (`service_host_components`: `<svc>.<ns>`, `<svc>.<ns>.svc`,
+        // `<svc>.<ns>.svc.<domain>`) is a Service, so an absent one is refused
+        // rather than dialed as an external host. Cluster DNS search domains
+        // resolve a two-label name in-cluster too.
+        if host.matches('.').count() == 1
+            || host.ends_with(".svc")
+            || host.ends_with(&self.svc_suffix)
+        {
+            CarriedRouteHost::UnmodeledService
+        } else {
+            CarriedRouteHost::External
+        }
+    }
+}
+
+/// Whether a visible DestinationRule names this Service's host. A weighted
+/// split dials the Service's workloads through its own upstream, which a
+/// Service-host DestinationRule does not match, so a split naming such a
+/// Service is dispatched leg by leg through each Service's own (rule-bearing)
+/// upstream instead (issue #7387). Over-matching only sends more splits leg
+/// by leg, which applies the same policy.
+fn service_has_destination_rule(
+    mesh_slice: &MeshSlice,
+    namespace: &str,
+    name: &str,
+    cluster_domain: &str,
+) -> bool {
+    let fqdn = format!(
+        "{name}.{namespace}.svc.{}",
+        cluster_domain.trim_matches('.')
+    );
+    mesh_slice
+        .destination_rules
+        .iter()
+        .any(|rule| destination_rule_host_specificity(&rule.host, &rule.namespace, &fqdn).is_some())
+}
+
+/// The visible DestinationRules that name `host` (exactly, as a Service
+/// alias, or by a wildcard), through the same
+/// [`destination_rule_host_specificity`] that DestinationRule application
+/// uses (issue #7395). Every naming rule is returned, whatever its tier or
+/// specificity: over-matching is the safe direction for every caller (it
+/// only sends more splits leg by leg or refuses more routes).
+fn destination_rules_naming_host<'a>(
+    mesh_slice: &'a MeshSlice,
+    host: &str,
+) -> impl Iterator<Item = &'a MeshDestinationRule> + use<'a> {
+    let host = host.to_string();
+    mesh_slice.destination_rules.iter().filter(move |rule| {
+        destination_rule_host_specificity(&rule.host, &rule.namespace, &host).is_some()
+    })
+}
+
+/// Whether a wildcard DestinationRule (`*`, `*.example.com`) names external
+/// `host`. A carried route dials a DIRECT external backend (its own, or a
+/// `mesh_route_dispatch` rule's) through no upstream, so no rule can apply
+/// to it; a wildcard covering such a backend therefore refuses the route
+/// (issue #7387, kept by #7395) rather than letting its connection pool,
+/// timeout, load balancer or outlier policy be silently bypassed. Exact rules
+/// keep their documented behaviour (only a TLS-originating one refuses).
+/// Over-matching only refuses more.
+fn wildcard_destination_rule_names_direct_backend(mesh_slice: &MeshSlice, host: &str) -> bool {
+    destination_rules_naming_host(mesh_slice, host).any(|rule| {
+        matches!(
+            destination_rule_host_specificity(&rule.host, &rule.namespace, host),
+            Some(DestinationRuleHostSpecificity::Wildcard(_))
+        )
+    })
+}
+
+/// Whether a visible DestinationRule for external `host` asks the client to
+/// originate TLS on `port` (its `portLevelSettings` entry's `tls`, else its
+/// top-level `tls`, is `SIMPLE`, `MUTUAL` or `ISTIO_MUTUAL`). A carried route
+/// dials such a host directly over plain HTTP and no DestinationRule applies
+/// to a direct backend, so the route is refused instead (see
+/// [`bind_carried_http_routes_to_node_waypoint_transport`]). Over-matching
+/// (any naming rule) only refuses more.
+fn destination_rule_originates_tls_for_host(mesh_slice: &MeshSlice, host: &str, port: u16) -> bool {
+    destination_rules_naming_host(mesh_slice, host).any(|rule| {
+        let mode = rule
+            .port_level_settings
+            .get(&port)
+            .and_then(|policy| policy.tls.as_ref())
+            .or_else(|| {
+                rule.traffic_policy
+                    .as_ref()
+                    .and_then(|policy| policy.tls.as_ref())
+            })
+            .map(|tls| tls.mode);
+        client_tls_mode_originates(mode)
+    })
+}
+
+/// Rebind the VirtualService HTTP routes a NodeWaypoint (issue #7233) or
+/// Sidecar (issue #7423) slice carries onto that topology's mesh transport.
+///
+/// The translator's routes dial Service DNS names over plain HTTP. Served as
+/// they are, a carried route would replace the materialized Service route's
+/// pinned mesh targets (node-to-node HBONE on a NodeWaypoint, per-workload
+/// SVID-mTLS on a Sidecar) with a plaintext dial. So every in-mesh
+/// destination is rebound onto the Service port's materialized upstream
+/// (`materialize_mesh_outbound_proxies` keeps those upstreams even when a
+/// carried route shadows the Service's own route):
+///
+/// * a direct backend (the route's own, or a `mesh_route_dispatch` rule's)
+///   becomes that upstream's id;
+/// * a weighted-split upstream's Service targets become the Service's
+///   workload targets, each leg's weight divided across its workloads, with
+///   the Service attribution kept on every target;
+/// * a weighted split that names a Service a DestinationRule governs is
+///   dispatched leg by leg instead (issue #7387): the route's
+///   `mesh_route_dispatch` instance gets the split's legs
+///   (`weighted_splits`), each the Service port's materialized upstream (which
+///   carries the DestinationRule) or, for an external host, a residual
+///   upstream holding only that host, and the dispatch finalizer picks a leg by weight
+///   once routing is final, so each leg gets exactly its own Service's policy.
+///   The split upstream keeps only its Service legs' workload targets, as the
+///   route's own destination identity; no request is dispatched through it,
+///   and RequestAuthentication scoping and authorization expand it into its
+///   legs. A split whose external host a DestinationRule names is dispatched
+///   leg by leg too, so that rule (its TLS origination included, see
+///   [`project_node_waypoint_leg_origination`]) applies to that host's
+///   residual leg alone instead of to the whole split.
+///
+/// A route with a destination that is an in-cluster Service the slice does not
+/// model, or a modeled Service port with no materialized upstream, is dropped
+/// with its plugins, fail-closed; its host then gets the materialized Service
+/// route. So is a leg-dispatched route that cannot be represented (more legs
+/// or candidate destinations than authorization tracks, or a residual
+/// upstream id already in use), and a route with a direct external backend
+/// (its own, or a dispatch rule's) whose DestinationRule asks to originate
+/// TLS on that port: no DestinationRule applies to a direct backend, and the
+/// carried route would dial it in plaintext. A wildcard DestinationRule
+/// (issue #7395) counts like an exact one for split legs: a split leg it
+/// covers is dispatched on its own residual leg, where the winning rule (TLS
+/// origination included) applies. A direct external backend it covers is
+/// refused whatever the rule sets, since no rule can apply to a direct
+/// backend ([`wildcard_destination_rule_names_direct_backend`]). Other
+/// external hosts are left as they are.
+///
+/// Refusal versus rejection (issue #7440). Every refusal above, and the
+/// Sidecar ones (a direct or rule destination in another namespace, a route
+/// claiming the local inbound slot, an authority rewrite its destination
+/// cannot route, a route whose `sourceNamespace` conditions all name another
+/// namespace while it serves matched requests only), concerns a well-formed
+/// route this data plane cannot or should not serve: the route is dropped and
+/// its host keeps the materialized Service route. Malformed input never takes
+/// that path, because the Service route would serve requests the carried
+/// route's match gate answers with 404: a carried set with malformed,
+/// duplicate or dangling records, or a dispatch instance the plugin
+/// constructor refuses, fails decode (`decode_http_route_set`, every instance
+/// on every topology, before this binding can drop or rewrite it). The slice
+/// update is rejected and the last accepted generation keeps serving.
+fn bind_carried_http_routes_to_node_waypoint_transport(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) -> Result<(), anyhow::Error> {
+    if !runtime.topology.serves_virtual_service_http_routes() || mesh_slice.http_routes.is_empty() {
+        return Ok(());
+    }
+    let hosts = CarriedRouteHostIndex::new(mesh_slice, &runtime.cluster_domain);
+    let sidecar = runtime.topology == MeshTopology::Sidecar;
+    // Routes whose every dispatch rule named another source namespace.
+    let source_namespace_refused = if sidecar {
+        resolve_sidecar_carried_route_source_namespaces(config, runtime, mesh_slice)
+    } else {
+        HashSet::new()
+    };
+    // Sidecar (issue #7423): the local workload's own inbound and `ingress[]`
+    // routes share the route table with the carried routes. A carried route
+    // that claims one of their (namespace, port, path) slots on an
+    // overlapping host would be a listen-path conflict that refuses the whole
+    // slice, so it is refused instead and the local route keeps the slot
+    // (self-calls keep their loopback route, as for the Service route the
+    // outbound materializer yields).
+    let local_inbound_routes: Vec<Proxy> = if sidecar {
+        config
+            .proxies
+            .iter()
+            .filter(|proxy| is_mesh_inbound_route_id(&proxy.id) && !proxy.dispatch_kind.is_stream())
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // The materialized upstream for a modeled Service port, if any.
+    let service_upstream = |config: &GatewayConfig, namespace: &str, name: &str, port: u16| {
+        let id = mesh_outbound_upstream_id(namespace, name, port);
+        config
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.namespace == namespace && upstream.id == id)
+            .then_some(id)
+    };
+
+    // 1. Weighted splits. Each leg is resolved to its dial targets first, then
+    // ONE scale is applied to every leg (external legs included) so the
+    // configured ratios survive, and each leg's share is divided across its
+    // targets. A split naming a DestinationRule-governed Service also gets
+    // its legs for leg-by-leg dispatch.
+    let split_ids: Vec<(String, String)> = config
+        .upstreams
+        .iter()
+        .filter(|upstream| {
+            upstream
+                .id
+                .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+        })
+        .map(|upstream| (upstream.namespace.clone(), upstream.id.clone()))
+        .collect();
+    let mut failed_splits: HashSet<(String, String)> = HashSet::new();
+    // (namespace, split id) -> legs `(leg upstream id, weight)`.
+    let mut leg_dispatched: HashMap<(String, String), WeightedSplitLegs> = HashMap::new();
+    let mut residual_upstreams: Vec<Upstream> = Vec::new();
+    let mut unrepresentable_splits = 0usize;
+    for (namespace, id) in split_ids {
+        let Some(split) = config
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == namespace && upstream.id == id)
+        else {
+            continue;
+        };
+        // (leg weight, dial targets for that leg)
+        let mut legs: Vec<(u32, Vec<UpstreamTarget>)> = Vec::new();
+        // Leg-by-leg dispatch: each Service port's upstream with its summed
+        // weight, and the external targets.
+        let mut service_legs: WeightedSplitLegs = Vec::new();
+        let mut external_targets: Vec<UpstreamTarget> = Vec::new();
+        // The Service legs' rebound targets alone: what a leg-dispatched
+        // split upstream keeps (see below).
+        let mut service_targets: Vec<(u32, Vec<UpstreamTarget>)> = Vec::new();
+        let mut rebound = true;
+        let mut governed_by_destination_rule = false;
+        let mut cross_namespace_leg = false;
+        for target in &split.targets {
+            match hosts.classify(&namespace, &target.host) {
+                CarriedRouteHost::External => {
+                    // An external host's own DestinationRule, exact or
+                    // wildcard (TLS origination included), applies only to
+                    // an upstream holding that host alone: its residual leg.
+                    if destination_rules_naming_host(mesh_slice, &target.host)
+                        .next()
+                        .is_some()
+                    {
+                        governed_by_destination_rule = true;
+                    }
+                    legs.push((target.weight, vec![target.clone()]));
+                    external_targets.push(target.clone());
+                }
+                CarriedRouteHost::UnmodeledService => rebound = false,
+                CarriedRouteHost::Service(service_namespace, service_name) => {
+                    if service_has_destination_rule(
+                        mesh_slice,
+                        &service_namespace,
+                        &service_name,
+                        &runtime.cluster_domain,
+                    ) {
+                        governed_by_destination_rule = true;
+                    }
+                    let Some(service_upstream_id) =
+                        service_upstream(config, &service_namespace, &service_name, target.port)
+                    else {
+                        rebound = false;
+                        continue;
+                    };
+                    let Some(service_upstream) = config.upstreams.iter().find(|upstream| {
+                        upstream.namespace == service_namespace.as_str()
+                            && upstream.id == service_upstream_id
+                    }) else {
+                        rebound = false;
+                        continue;
+                    };
+                    let leg_targets = service_upstream
+                        .targets
+                        .iter()
+                        .map(|workload_target| {
+                            let mut rebound_target = workload_target.clone();
+                            rebound_target.service_port_policy_key = Some(target.port);
+                            rebound_target.tags.insert(
+                                UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG.to_string(),
+                                service_namespace.clone(),
+                            );
+                            rebound_target.tags.insert(
+                                UPSTREAM_TARGET_SERVICE_NAME_TAG.to_string(),
+                                service_name.clone(),
+                            );
+                            rebound_target.tags.insert(
+                                UPSTREAM_TARGET_SERVICE_PORT_TAG.to_string(),
+                                target.port.to_string(),
+                            );
+                            if sidecar {
+                                stamp_sidecar_destination_authority(
+                                    &mut rebound_target,
+                                    &service_namespace,
+                                    &service_name,
+                                    target.port,
+                                    true,
+                                );
+                            }
+                            rebound_target
+                        })
+                        .collect::<Vec<_>>();
+                    if leg_targets.is_empty() {
+                        rebound = false;
+                        continue;
+                    }
+                    // A leg is dispatched through its Service upstream by a
+                    // namespace-local route override, so a Service in another
+                    // namespace cannot be a leg.
+                    cross_namespace_leg |= service_namespace != namespace;
+                    match service_legs
+                        .iter_mut()
+                        .find(|(leg_id, _)| *leg_id == service_upstream_id)
+                    {
+                        Some(leg) => leg.1 = leg.1.saturating_add(target.weight),
+                        None => service_legs.push((service_upstream_id, target.weight)),
+                    }
+                    service_targets.push((target.weight, leg_targets.clone()));
+                    legs.push((target.weight, leg_targets));
+                }
+            }
+        }
+        if !rebound || legs.is_empty() {
+            failed_splits.insert((namespace, id));
+            continue;
+        }
+        if governed_by_destination_rule {
+            let first_external = external_targets.first().cloned();
+            let legs_for_dispatch = if cross_namespace_leg {
+                None
+            } else {
+                weighted_split_legs(config, split, service_legs, external_targets)
+            };
+            match legs_for_dispatch {
+                Some((split_legs, residuals)) => {
+                    residual_upstreams.extend(residuals);
+                    leg_dispatched.insert((namespace.clone(), id.clone()), split_legs);
+                    // A leg-dispatched split is never dialed: it is only the
+                    // route's own destination identity. It keeps the Service
+                    // legs' workload targets (for the destination indexes) and
+                    // drops its external hosts, which each residual upstream
+                    // carries alone. Left in place, they would make
+                    // DestinationRule application see one upstream spanning
+                    // hosts with different winning rules and refuse the whole
+                    // slice. A split with no Service leg keeps only its first
+                    // external host (an upstream needs a target; one host has
+                    // one winning rule set).
+                    legs = if service_targets.is_empty() {
+                        first_external
+                            .map(|target| vec![(target.weight, vec![target])])
+                            .unwrap_or_default()
+                    } else {
+                        service_targets
+                    };
+                }
+                None => {
+                    unrepresentable_splits += 1;
+                    failed_splits.insert((namespace, id));
+                    continue;
+                }
+            }
+        }
+        let targets = split_targets_with_common_scale(legs);
+        let weighted = targets
+            .first()
+            .is_some_and(|first| targets.iter().any(|target| target.weight != first.weight));
+        if let Some(split) = config
+            .upstreams
+            .iter_mut()
+            .find(|upstream| upstream.namespace == namespace && upstream.id == id)
+        {
+            split.targets = targets;
+            if weighted {
+                split.algorithm = LoadBalancerAlgorithm::WeightedRoundRobin;
+            }
+        }
+    }
+    config.upstreams.extend(residual_upstreams);
+
+    // 2. Route proxies and their dispatch rules.
+    let mut dropped: HashSet<(String, String)> = HashSet::new();
+    let mut upstream_updates: Vec<(usize, String)> = Vec::new();
+    let mut rule_updates: Vec<(usize, usize, String)> = Vec::new();
+    // Routes that dispatch a weighted split leg by leg: (proxy index, the
+    // route's first `mesh_route_dispatch` instance if any, split ids).
+    let mut weighted_routes: Vec<(usize, Option<usize>, Vec<String>)> = Vec::new();
+    let mut oversized_weighted_routes = 0usize;
+    // Direct external backends a DestinationRule asks to dial over TLS.
+    let mut tls_origination_refused = 0usize;
+    // Direct external backends a wildcard DestinationRule names (no rule
+    // can apply to a direct backend).
+    let mut wildcard_direct_backend_refused = 0usize;
+    // Sidecar routes that claim the local workload's own inbound route slot.
+    let mut local_inbound_route_conflicts = 0usize;
+    // Direct or dispatch-rule destinations in another namespace.
+    let mut cross_namespace_refused = 0usize;
+    // Sidecar `rewrite.authority` that does not name the selected destination.
+    let mut authority_rewrite_refused = 0usize;
+    for index in 0..config.proxies.len() {
+        let proxy = &config.proxies[index];
+        if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
+            continue;
+        }
+        let namespace = proxy.namespace.clone();
+        let proxy_id = proxy.id.clone();
+        let backend_host = proxy.backend_host.clone();
+        let backend_port = proxy.backend_port;
+        let mut keep = !source_namespace_refused.contains(&(namespace.clone(), proxy_id.clone()));
+        if !local_inbound_routes.is_empty() {
+            let claimed_hosts = carried_route_claimed_hosts(proxy, &hosts, &runtime.cluster_domain);
+            if local_inbound_routes.iter().any(|local| {
+                local.namespace == proxy.namespace
+                    && local.listen_port == proxy.listen_port
+                    && local.listen_path == proxy.listen_path
+                    && crate::config::types::hosts_overlap(&claimed_hosts, &local.hosts)
+            }) {
+                local_inbound_route_conflicts += 1;
+                keep = false;
+            }
+        }
+        let mut proxy_upstream: Option<String> = None;
+        // Every destination the route can reach, as authorization lists
+        // candidates: the own destination, each weighted split's legs (never
+        // the split itself), and each rule destination.
+        let mut candidates: HashSet<String> = HashSet::new();
+        let mut route_splits: Vec<String> = Vec::new();
+        let note_split =
+            |split_id: &str, candidates: &mut HashSet<String>, route_splits: &mut Vec<String>| {
+                if let Some(legs) = leg_dispatched.get(&(namespace.clone(), split_id.to_string())) {
+                    candidates.extend(legs.iter().map(|(leg, _)| leg.clone()));
+                    if !route_splits.iter().any(|known| known == split_id) {
+                        route_splits.push(split_id.to_string());
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+        match proxy.upstream_id.as_deref() {
+            Some(upstream_id) => {
+                if failed_splits.contains(&(namespace.clone(), upstream_id.to_string())) {
+                    keep = false;
+                }
+                candidates.insert(upstream_id.to_string());
+                note_split(upstream_id, &mut candidates, &mut route_splits);
+            }
+            None if !backend_host.is_empty() && backend_port != 0 => {
+                match hosts.classify(&namespace, &backend_host) {
+                    CarriedRouteHost::External => {
+                        if wildcard_destination_rule_names_direct_backend(mesh_slice, &backend_host)
+                        {
+                            wildcard_direct_backend_refused += 1;
+                            keep = false;
+                        } else if destination_rule_originates_tls_for_host(
+                            mesh_slice,
+                            &backend_host,
+                            backend_port,
+                        ) {
+                            tls_origination_refused += 1;
+                            keep = false;
+                        }
+                        candidates.insert(format!("{backend_host}|{backend_port}"));
+                    }
+                    CarriedRouteHost::UnmodeledService => keep = false,
+                    // A Service upstream lives in its own namespace while the
+                    // route and its references resolve in the route's, so a
+                    // cross-namespace destination would leave a dangling
+                    // reference that refuses the whole generation: refuse the
+                    // route instead (the host keeps its Service route).
+                    CarriedRouteHost::Service(service_namespace, _)
+                        if service_namespace != namespace =>
+                    {
+                        cross_namespace_refused += 1;
+                        keep = false;
+                    }
+                    CarriedRouteHost::Service(service_namespace, service_name) => {
+                        match service_upstream(
+                            config,
+                            &service_namespace,
+                            &service_name,
+                            backend_port,
+                        ) {
+                            Some(id) => {
+                                candidates.insert(id.clone());
+                                proxy_upstream = Some(id);
+                            }
+                            None => keep = false,
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+        let dispatch_ids: Vec<String> = proxy
+            .plugins
+            .iter()
+            .map(|association| association.plugin_config_id.clone())
+            .collect();
+        let mut route_dispatch_plugin: Option<usize> = None;
+        let mut rule_rewrites: Vec<(usize, usize, String)> = Vec::new();
+        for plugin_index in 0..config.plugin_configs.len() {
+            let plugin = &config.plugin_configs[plugin_index];
+            if plugin.plugin_name != "mesh_route_dispatch"
+                || plugin.namespace != namespace
+                || !dispatch_ids.contains(&plugin.id)
+            {
+                continue;
+            }
+            if route_dispatch_plugin.is_none() && plugin.scope == PluginScope::Proxy {
+                route_dispatch_plugin = Some(plugin_index);
+            }
+            for (rule_index, rule) in plugin
+                .config
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let Some(destination) = rule.get("destination") else {
+                    continue;
+                };
+                // Sidecar: an explicit `rewrite.authority` is forwarded as the
+                // `:authority` the destination Sidecar routes by, so it must
+                // name the selected destination Service (checked below).
+                let rewrite_authority = sidecar
+                    .then(|| {
+                        rule.get("rewrite")
+                            .and_then(|rewrite| rewrite.get("authority"))
+                            .and_then(serde_json::Value::as_str)
+                    })
+                    .flatten();
+                if let Some(upstream_id) = destination
+                    .get("upstream_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if failed_splits.contains(&(namespace.clone(), upstream_id.to_string())) {
+                        keep = false;
+                    }
+                    // A split spans Services: one rewritten authority cannot
+                    // name every in-mesh leg's destination.
+                    if rewrite_authority.is_some()
+                        && config.upstreams.iter().any(|upstream| {
+                            upstream.namespace == namespace
+                                && upstream.id == upstream_id
+                                && upstream
+                                    .targets
+                                    .iter()
+                                    .any(crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled)
+                        })
+                    {
+                        authority_rewrite_refused += 1;
+                        keep = false;
+                    }
+                    if !note_split(upstream_id, &mut candidates, &mut route_splits) {
+                        candidates.insert(upstream_id.to_string());
+                    }
+                    continue;
+                }
+                let host = destination
+                    .get("backend_host")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(backend_host.as_str());
+                let port = destination
+                    .get("backend_port")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok())
+                    .unwrap_or(backend_port);
+                if host.is_empty() || port == 0 {
+                    continue;
+                }
+                match hosts.classify(&namespace, host) {
+                    CarriedRouteHost::External => {
+                        if wildcard_destination_rule_names_direct_backend(mesh_slice, host) {
+                            wildcard_direct_backend_refused += 1;
+                            keep = false;
+                        } else if destination_rule_originates_tls_for_host(mesh_slice, host, port) {
+                            tls_origination_refused += 1;
+                            keep = false;
+                        }
+                        candidates.insert(format!("{host}|{port}"));
+                    }
+                    CarriedRouteHost::UnmodeledService => keep = false,
+                    CarriedRouteHost::Service(service_namespace, _)
+                        if service_namespace != namespace =>
+                    {
+                        cross_namespace_refused += 1;
+                        keep = false;
+                    }
+                    CarriedRouteHost::Service(service_namespace, service_name) => {
+                        if let Some(authority) = rewrite_authority
+                            && !authority_names_service(
+                                authority,
+                                &service_namespace,
+                                &service_name,
+                                port,
+                                mesh_slice.services.iter().any(|service| {
+                                    service.namespace == service_namespace
+                                        && service.name == service_name
+                                        && service_http_family_ports(service).len() > 1
+                                }),
+                                &runtime.cluster_domain,
+                            )
+                        {
+                            authority_rewrite_refused += 1;
+                            keep = false;
+                        }
+                        match service_upstream(config, &service_namespace, &service_name, port) {
+                            Some(id) => {
+                                candidates.insert(id.clone());
+                                rule_rewrites.push((plugin_index, rule_index, id));
+                            }
+                            None => keep = false,
+                        }
+                    }
+                }
+            }
+        }
+        if keep && !route_splits.is_empty() {
+            // Leg-by-leg dispatch is authorized per leg, so every candidate
+            // must fit the verdict table, and every split must fit the one
+            // dispatch instance's table; otherwise the route is refused (the
+            // host keeps its Service route) instead of the generated instance
+            // failing construction and refusing the whole generation.
+            if candidates.len() > crate::plugins::mesh::authz::MAX_NODE_WAYPOINT_ROUTE_BRANCHES
+                || route_splits.len() > crate::plugins::mesh_route_dispatch::MAX_WEIGHTED_SPLITS
+            {
+                oversized_weighted_routes += 1;
+                keep = false;
+            }
+            // A route without a dispatch instance gets one under the
+            // translator's id; refuse rather than reuse an id in use.
+            if route_dispatch_plugin.is_none() {
+                let carrier_id = weighted_split_dispatch_plugin_id(&proxy_id);
+                if config
+                    .plugin_configs
+                    .iter()
+                    .any(|plugin| plugin.namespace == namespace && plugin.id == carrier_id)
+                {
+                    keep = false;
+                    unrepresentable_splits += 1;
+                }
+            }
+        }
+        if !keep {
+            dropped.insert((namespace, proxy_id));
+            continue;
+        }
+        if let Some(upstream_id) = proxy_upstream {
+            upstream_updates.push((index, upstream_id));
+        }
+        rule_updates.extend(rule_rewrites);
+        if !route_splits.is_empty() {
+            weighted_routes.push((index, route_dispatch_plugin, route_splits));
+        }
+    }
+    for (index, upstream_id) in upstream_updates {
+        if let Some(proxy) = config.proxies.get_mut(index) {
+            proxy.upstream_id = Some(upstream_id);
+        }
+    }
+    for (plugin_index, rule_index, upstream_id) in rule_updates {
+        let Some(destination) = config
+            .plugin_configs
+            .get_mut(plugin_index)
+            .and_then(|plugin| plugin.config.get_mut("rules"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|rules| rules.get_mut(rule_index))
+            .and_then(|rule| rule.get_mut("destination"))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        destination.remove("backend_host");
+        destination.remove("backend_port");
+        destination.remove("backend_tls");
+        destination.insert(
+            "upstream_id".to_string(),
+            serde_json::Value::String(upstream_id),
+        );
+    }
+    // Give each leg-dispatched route its legs, on its own dispatch instance
+    // (or a new one under the translator's id), so the dispatch finalizer of
+    // that route's chain resolves the split.
+    for (proxy_index, route_dispatch_plugin, route_splits) in weighted_routes {
+        let Some(proxy) = config.proxies.get(proxy_index) else {
+            continue;
+        };
+        let namespace = proxy.namespace.clone();
+        let proxy_id = proxy.id.clone();
+        let entries: Vec<serde_json::Value> = route_splits
+            .iter()
+            .filter_map(|split_id| {
+                let legs = leg_dispatched.get(&(namespace.clone(), split_id.clone()))?;
+                Some(serde_json::json!({
+                    "upstream_id": split_id,
+                    "legs": legs
+                        .iter()
+                        .map(|(leg, weight)| serde_json::json!({
+                            "upstream_id": leg,
+                            "weight": weight,
+                        }))
+                        .collect::<Vec<_>>(),
+                }))
+            })
+            .collect();
+        match route_dispatch_plugin.and_then(|index| config.plugin_configs.get_mut(index)) {
+            Some(plugin) => {
+                if let Some(plugin_config) = plugin.config.as_object_mut() {
+                    plugin_config.insert(
+                        "weighted_splits".to_string(),
+                        serde_json::Value::Array(entries),
+                    );
+                }
+            }
+            None => {
+                let now = chrono::Utc::now();
+                let plugin_id = weighted_split_dispatch_plugin_id(&proxy_id);
+                config.plugin_configs.push(PluginConfig {
+                    labels: Default::default(),
+                    id: plugin_id.clone(),
+                    plugin_name: "mesh_route_dispatch".to_string(),
+                    namespace: namespace.clone(),
+                    config: serde_json::json!({
+                        "rules": [],
+                        "weighted_splits": entries,
+                    }),
+                    scope: PluginScope::Proxy,
+                    proxy_id: Some(proxy_id),
+                    enabled: true,
+                    priority_override: None,
+                    trigger: None,
+                    api_spec_id: None,
+                    created_at: now,
+                    updated_at: now,
+                });
+                if let Some(proxy) = config.proxies.get_mut(proxy_index) {
+                    proxy.plugins.push(PluginAssociation {
+                        plugin_config_id: plugin_id,
+                    });
+                }
+            }
+        }
+    }
+    if !dropped.is_empty() {
+        warn!(
+            routes = dropped.len(),
+            unrepresentable_weighted_splits = unrepresentable_splits,
+            oversized_weighted_routes,
+            tls_origination_refused,
+            wildcard_direct_backend_refused,
+            local_inbound_route_conflicts,
+            source_namespace_refused = source_namespace_refused.len(),
+            cross_namespace_refused,
+            authority_rewrite_refused,
+            "Mesh VirtualService routes refused: a destination is an in-cluster Service \
+             this data plane cannot reach over its mesh transport (one in another namespace \
+             included), a weighted split that must \
+             be dispatched leg by leg cannot be represented, a direct external backend's \
+             DestinationRule asks for TLS origination a direct backend cannot carry, a \
+             wildcard DestinationRule names a direct external backend no rule can apply to, \
+             or (Sidecar) a route claims the local workload's own inbound route, applies \
+             only to other source namespaces, or rewrites the authority to a host its \
+             destination does not answer; their hosts use the materialized Service routes"
+        );
+        config
+            .proxies
+            .retain(|proxy| !dropped.contains(&(proxy.namespace.clone(), proxy.id.clone())));
+        config.plugin_configs.retain(|plugin| {
+            plugin.proxy_id.as_deref().is_none_or(|proxy_id| {
+                !dropped.contains(&(plugin.namespace.clone(), proxy_id.to_string()))
+            })
+        });
+    }
+    // Prune carried split upstreams (and residual external legs) no surviving
+    // route, dispatch rule or weighted split names (failed splits included):
+    // a leftover still names Service DNS hosts and would reach
+    // DestinationRule application.
+    let mut referenced_splits: HashSet<(String, String)> = config
+        .proxies
+        .iter()
+        .filter_map(|proxy| {
+            proxy
+                .upstream_id
+                .as_ref()
+                .map(|id| (proxy.namespace.clone(), id.clone()))
+        })
+        .collect();
+    for plugin in &config.plugin_configs {
+        if plugin.plugin_name == "mesh_route_dispatch" {
+            for id in slice::mesh_route_dispatch_rule_upstream_ids(&plugin.config) {
+                referenced_splits.insert((plugin.namespace.clone(), id.to_string()));
+            }
+        }
+    }
+    config.upstreams.retain(|upstream| {
+        !upstream
+            .id
+            .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+            || referenced_splits.contains(&(upstream.namespace.clone(), upstream.id.clone()))
+    });
+    // A carried route declaring a modeled Service's host (`reviews`, or its
+    // FQDN) stands for that Service under every name a client can use, like
+    // the Service route it shadows, so it answers all of the Service's host
+    // spellings. A spelling another carried route already declares on the
+    // same path stays with that route.
+    expand_carried_route_service_hosts(config, &hosts, &runtime.cluster_domain);
+    if !dropped.is_empty() {
+        // Re-run materialization so the hosts the dropped routes shadowed
+        // get their Service routes back.
+        materialize_mesh_outbound_proxies(config, runtime, mesh_slice);
+    }
+    Ok(())
+}
+
+/// Pin the destination Service authority on a Sidecar mesh-mTLS target a
+/// carried VirtualService route dials (issue #7423).
+///
+/// The destination Sidecar routes an inbound request by its `:authority`,
+/// against that Service's host variants and, when the request names one, its
+/// port. A carried route does not preserve the client `Host` (and on a split or
+/// a dispatch branch the client `Host` names the VirtualService host, not the
+/// selected Service), so without this the authority falls back to the pod dial
+/// address and the destination answers 404. With `stamp_host` on, the
+/// destination host and the selected Service port are stamped (the port
+/// always: the source's egress-narrowed view can hide the destination's other
+/// ports, and the destination needs it to pick among them). With `stamp_host`
+/// off (a rule whose admitted `rewrite.authority` the binding checked) both
+/// tags are removed, so the rewritten authority is forwarded verbatim, port or
+/// no port. Only route-scoped targets are stamped (split clones and
+/// [`clone_sidecar_carried_destination_upstreams`]); the shared Service
+/// upstream keeps the client `Host`. Non-mesh-mTLS targets are left alone.
+fn stamp_sidecar_destination_authority(
+    target: &mut UpstreamTarget,
+    service_namespace: &str,
+    service_name: &str,
+    service_port: u16,
+    stamp_host: bool,
+) {
+    if !crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target) {
+        return;
+    }
+    if stamp_host {
+        target.tags.insert(
+            crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG.to_string(),
+            format!("{service_name}.{service_namespace}.svc"),
+        );
+        target.tags.insert(
+            crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG.to_string(),
+            service_port.to_string(),
+        );
+    } else {
+        target
+            .tags
+            .remove(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG);
+        target
+            .tags
+            .remove(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG);
+    }
+}
+
+/// Whether an explicit `rewrite.authority` names the selected destination
+/// Service in a form its Sidecar can route when forwarded verbatim: one of its
+/// host variants with its selected port, or with no port when the Service has
+/// a single HTTP port (`multi_port` is false). A port-less authority cannot
+/// pick among a multi-port Service's ports. Anything else would reach a
+/// destination Sidecar that cannot route it.
+fn authority_names_service(
+    authority: &str,
+    service_namespace: &str,
+    service_name: &str,
+    service_port: u16,
+    multi_port: bool,
+    cluster_domain: &str,
+) -> bool {
+    let authority = authority.trim();
+    let (host, port) = match split_carried_authority(authority) {
+        Some(parts) => parts,
+        None => return false,
+    };
+    match port {
+        Some(port) if port != service_port => return false,
+        None if multi_port => return false,
+        _ => {}
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    mesh_service_host_variants(service_name, service_namespace, cluster_domain)
+        .iter()
+        .any(|variant| variant.eq_ignore_ascii_case(&host))
+}
+
+/// Split `host[:port]`; `None` for an empty host or an unparsable port.
+fn split_carried_authority(authority: &str) -> Option<(&str, Option<u16>)> {
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port.parse::<u16>().ok()?)),
+        None => (authority, None),
+    };
+    (!host.is_empty()).then_some((host, port))
+}
+
+/// Upstream id of the route-scoped clone of a Sidecar Service upstream that
+/// carried routes dial (see [`clone_sidecar_carried_destination_upstreams`]).
+fn sidecar_carried_destination_upstream_id(service_upstream_id: &str, stamp_host: bool) -> String {
+    let rest = service_upstream_id
+        .strip_prefix(MESH_OUTBOUND_UPSTREAM_ID_PREFIX)
+        .unwrap_or(service_upstream_id);
+    if stamp_host {
+        format!("__mesh-out-vs-upstream-{rest}")
+    } else {
+        format!("__mesh-out-vs-rw-upstream-{rest}")
+    }
+}
+
+/// Give a Sidecar's carried VirtualService routes their own clones of the
+/// Service upstreams they dial (issue #7423), after DestinationRules applied.
+///
+/// A carried route's direct destination, each `mesh_route_dispatch` rule
+/// destination and each leg of a leg-dispatched split name a Service port's
+/// materialized upstream. That upstream is shared with the Service's own
+/// route, which must keep presenting the client `Host`. So each such
+/// reference is moved to a route-scoped clone (same targets, same
+/// DestinationRule projection, its own load-balancer and health state) whose
+/// targets carry the destination Service authority
+/// ([`stamp_sidecar_destination_authority`]). The clone keeps the Service
+/// upstream's admission identity (`Upstream::admission_upstream_id`), so the
+/// destination's `http2MaxRequests` and `http1MaxPendingRequests` lanes are
+/// shared with the Service route. A rule that rewrites the authority
+/// (admitted by the binding only when the destination can route it verbatim)
+/// gets a clone with no authority tags, so the rewritten authority is
+/// forwarded unchanged. The Service and port are read forward from the slice's
+/// Service inventory, never parsed from ids.
+fn clone_sidecar_carried_destination_upstreams(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    if runtime.topology != MeshTopology::Sidecar {
+        return;
+    }
+    let mut owners: HashMap<(String, String), (String, String, u16)> = HashMap::new();
+    for service in &mesh_slice.services {
+        for service_port in service_http_family_ports(service) {
+            owners.insert(
+                (
+                    service.namespace.clone(),
+                    mesh_outbound_upstream_id(&service.namespace, &service.name, service_port.port),
+                ),
+                (
+                    service.namespace.clone(),
+                    service.name.clone(),
+                    service_port.port,
+                ),
+            );
+        }
+    }
+    let carried: HashSet<(String, String)> = config
+        .proxies
+        .iter()
+        .filter(|proxy| config::is_virtual_service_http_route_proxy_id(&proxy.id))
+        .map(|proxy| (proxy.namespace.clone(), proxy.id.clone()))
+        .collect();
+    if carried.is_empty() {
+        return;
+    }
+    // (namespace, Service upstream id, stamp host)
+    let mut needed: BTreeSet<(String, String, bool)> = BTreeSet::new();
+    let mut redirect = |namespace: &str, id: &mut String, stamp_host: bool| {
+        if owners.contains_key(&(namespace.to_string(), id.clone())) {
+            needed.insert((namespace.to_string(), id.clone(), stamp_host));
+            *id = sidecar_carried_destination_upstream_id(id, stamp_host);
+        }
+    };
+    for proxy in &mut config.proxies {
+        if !carried.contains(&(proxy.namespace.clone(), proxy.id.clone())) {
+            continue;
+        }
+        if let Some(upstream_id) = proxy.upstream_id.as_mut() {
+            redirect(&proxy.namespace, upstream_id, true);
+        }
+    }
+    for plugin in &mut config.plugin_configs {
+        if plugin.plugin_name != "mesh_route_dispatch"
+            || !plugin.proxy_id.as_ref().is_some_and(|proxy_id| {
+                carried.contains(&(plugin.namespace.clone(), proxy_id.clone()))
+            })
+        {
+            continue;
+        }
+        let namespace = plugin.namespace.clone();
+        if let Some(rules) = plugin
+            .config
+            .get_mut("rules")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for rule in rules {
+                let rewrites_authority = rule
+                    .get("rewrite")
+                    .and_then(|rewrite| rewrite.get("authority"))
+                    .is_some_and(serde_json::Value::is_string);
+                if let Some(serde_json::Value::String(upstream_id)) = rule
+                    .get_mut("destination")
+                    .and_then(|destination| destination.get_mut("upstream_id"))
+                {
+                    redirect(&namespace, upstream_id, !rewrites_authority);
+                }
+            }
+        }
+        if let Some(splits) = plugin
+            .config
+            .get_mut("weighted_splits")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for split in splits {
+                for leg in split
+                    .get_mut("legs")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(serde_json::Value::String(upstream_id)) = leg.get_mut("upstream_id")
+                    {
+                        redirect(&namespace, upstream_id, true);
+                    }
+                }
+            }
+        }
+    }
+    for (namespace, service_upstream_id, stamp_host) in needed {
+        let Some((service_namespace, service_name, service_port)) =
+            owners.get(&(namespace.clone(), service_upstream_id.clone()))
+        else {
+            continue;
+        };
+        let clone_id = sidecar_carried_destination_upstream_id(&service_upstream_id, stamp_host);
+        if config
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.namespace == namespace && upstream.id == clone_id)
+        {
+            continue;
+        }
+        let Some(service_upstream) = config
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == namespace && upstream.id == service_upstream_id)
+        else {
+            continue;
+        };
+        let mut clone = service_upstream.clone();
+        clone.id = clone_id.clone();
+        // A distinct name: upstream names are unique per namespace, and
+        // DestinationRules have already been applied by host.
+        clone.name = Some(clone_id);
+        // Admitted as the Service upstream it copies, so the destination's
+        // active-request and pending lanes are shared with the Service route.
+        clone.admission_upstream_id = Some(service_upstream_id.clone());
+        for target in &mut clone.targets {
+            stamp_sidecar_destination_authority(
+                target,
+                service_namespace,
+                service_name,
+                *service_port,
+                stamp_host,
+            );
+        }
+        config.upstreams.push(clone);
+    }
+}
+
+/// Resolve `match.source_namespace` on the carried VirtualService routes a
+/// Sidecar serves (issue #7423).
+///
+/// `mesh_route_dispatch` judges `source_namespace` against the peer SVID, but
+/// a Sidecar serves carried routes only on its outbound capture listener,
+/// where the peer is the co-located application over plaintext and has no
+/// SVID: the predicate could never match. The source of every request there
+/// is this Sidecar's own workload, so the predicate is decided here from the
+/// trusted local workload (the same evidence `materialize_sidecar_l4_source_selectors`
+/// uses for L4 routes).
+///
+/// Istio `match[]` entries are ORed. The translator emits one rule per
+/// in-scope entry with a non-URI predicate. An unguarded URI-only entry can be
+/// represented by the route's `listen_path` and default destination instead
+/// (it turns `reject_unmatched` off, so unclaimed requests reach the route's
+/// own destination), but a URI-only entry still gets a rule when it needs a
+/// URI guard on a broader listen path, when it is a case-insensitive
+/// (`ignoreUriCase`) exact or prefix match, or when its `http[]` entry carries
+/// route-local actions (header transforms, fault, rewrite, redirect). So
+/// `sourceNamespace` is decided per rule (one match condition): a
+/// rule naming the local namespace drops the predicate (keeping its other
+/// predicates, or matching every path when it had none), and any other rule,
+/// or every such rule when the local workload is not unambiguously resolved,
+/// is removed, fail-closed. Only that condition goes: its OR siblings, later
+/// rules and the route's own destination are kept, and a removed condition
+/// never turns into a broader match. Rule order is kept.
+///
+/// Every carried dispatch instance was validated with the plugin's own
+/// constructor (`MeshRouteDispatch::new`) by `decode_http_route_set`, before
+/// binding or filtering: a config the plugin would refuse rejects the whole
+/// slice update, so the last accepted generation keeps serving with the
+/// route's match gate intact, and filtering can neither hide nor heal it. A
+/// valid object that omits `reject_unmatched` keeps its default. A
+/// `source_namespace` of `null` is an absent predicate. Instances without a
+/// `sourceNamespace` condition are left exactly as carried.
+///
+/// When every rule of an instance is removed (issue #7440):
+/// * with `reject_unmatched` the route serves only matched requests, so it now
+///   applies to no request from this workload: it is returned
+///   (`(namespace, proxy id)`) for the binding to refuse, and its host keeps
+///   the Service route;
+/// * without it the route still has a fallback (a URI-only OR sibling or a
+///   later unconditional `http[]` entry, both served by the route's own
+///   destination), so only the empty instance is removed, from the plugin
+///   configs and from the route's associations (an instance with neither rules
+///   nor weighted splits cannot be constructed).
+fn resolve_sidecar_carried_route_source_namespaces(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) -> HashSet<(String, String)> {
+    let local_namespace = authoritative_sidecar_l4_source(runtime, mesh_slice)
+        .map(|source| source.namespace.to_string());
+    let mut removed = 0usize;
+    let mut emptied: HashSet<(String, String)> = HashSet::new();
+    // `(namespace, plugin id)` of emptied instances whose route keeps serving
+    // its fallback destination.
+    let mut detached: HashSet<(String, String)> = HashSet::new();
+    for plugin in &mut config.plugin_configs {
+        if plugin.plugin_name != "mesh_route_dispatch"
+            || !plugin
+                .proxy_id
+                .as_deref()
+                .is_some_and(config::is_virtual_service_http_route_proxy_id)
+        {
+            continue;
+        }
+        // Only instances with a `sourceNamespace` condition are resolved
+        // here; every other instance reaches the plugin constructor exactly as
+        // carried.
+        let has_source_namespace = plugin
+            .config
+            .get("rules")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|rules| {
+                rules.iter().any(|rule| {
+                    rule.get("match")
+                        .and_then(|criteria| criteria.get("source_namespace"))
+                        .is_some_and(|value| !value.is_null())
+                })
+            });
+        let Some(proxy_id) = plugin.proxy_id.clone() else {
+            continue;
+        };
+        if !has_source_namespace {
+            continue;
+        }
+        // The miss policy. `decode_http_route_set` already validated every
+        // carried dispatch instance with the plugin constructor, so
+        // `reject_unmatched` is either a boolean or absent; absent keeps the
+        // plugin default (`false`). It is read here rather than constructing
+        // the instance a second time.
+        let reject_unmatched = plugin
+            .config
+            .get("reject_unmatched")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let Some(rules) = plugin
+            .config
+            .get_mut("rules")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        let before = rules.len();
+        rules.retain_mut(|rule| {
+            let Some(criteria) = rule
+                .get_mut("match")
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                return true;
+            };
+            // `null` is an absent predicate (the plugin deserializes it to
+            // `None`), never a namespace that fails to match.
+            let Some(expected) = criteria
+                .get("source_namespace")
+                .filter(|value| !value.is_null())
+            else {
+                return true;
+            };
+            let applies = local_namespace
+                .as_deref()
+                .is_some_and(|local| expected.as_str() == Some(local));
+            if !applies {
+                removed += 1;
+                return false;
+            }
+            criteria.remove("source_namespace");
+            if criteria.is_empty() {
+                criteria.insert("uri".to_string(), serde_json::json!({ "prefix": "/" }));
+            }
+            true
+        });
+        if before > 0 && rules.is_empty() {
+            // A validated instance that serves unmatched requests is detached
+            // (its route keeps its fallback); a matched-only one refuses the
+            // route.
+            if reject_unmatched {
+                emptied.insert((plugin.namespace.clone(), proxy_id));
+            } else {
+                detached.insert((plugin.namespace.clone(), plugin.id.clone()));
+            }
+        }
+    }
+    if !detached.is_empty() {
+        config
+            .plugin_configs
+            .retain(|plugin| !detached.contains(&(plugin.namespace.clone(), plugin.id.clone())));
+        for proxy in &mut config.proxies {
+            let namespace = proxy.namespace.clone();
+            proxy.plugins.retain(|association| {
+                !detached.contains(&(namespace.clone(), association.plugin_config_id.clone()))
+            });
+        }
+    }
+    if removed > 0 {
+        debug!(
+            removed,
+            "Sidecar VirtualService dispatch rules whose sourceNamespace does not name the local \
+             workload's namespace were removed"
+        );
+    }
+    emptied
+}
+
+/// The hosts a carried route answers once
+/// [`expand_carried_route_service_hosts`] has run: its declared hosts plus
+/// every host spelling of each modeled Service it declares. Over-approximates
+/// (it ignores spellings another carried route keeps), which only refuses
+/// more on a conflict check.
+fn carried_route_claimed_hosts(
+    proxy: &Proxy,
+    hosts: &CarriedRouteHostIndex,
+    cluster_domain: &str,
+) -> Vec<String> {
+    let mut claimed = proxy.hosts.clone();
+    for host in &proxy.hosts {
+        if let CarriedRouteHost::Service(namespace, name) = hosts.classify(&proxy.namespace, host) {
+            for variant in mesh_service_host_variants(&name, &namespace, cluster_domain) {
+                if !variant.contains('.') && namespace != proxy.namespace {
+                    continue;
+                }
+                claimed.push(variant);
+            }
+        }
+    }
+    claimed
+}
+
+/// A leg-dispatched split's legs: `(leg upstream id, weight)` (issue #7387).
+type WeightedSplitLegs = Vec<(String, u32)>;
+
+/// The `mesh_route_dispatch` instance id a leg-dispatched carried route gets
+/// when it has none: the translator's own id for that route's instance.
+fn weighted_split_dispatch_plugin_id(proxy_id: &str) -> String {
+    format!("istio-vs-mrd-{proxy_id}")
+}
+
+/// The residual upstream holding external host `index` of a leg-dispatched
+/// split (issue #7387). A clash with any existing id refuses the split.
+fn weighted_split_external_upstream_id(split_id: &str, index: usize) -> String {
+    format!("{split_id}-external-{index}")
+}
+
+/// The legs of a weighted split dispatched leg by leg (issue #7387): each
+/// Service port's materialized upstream with its configured weight (summed
+/// when several split targets name one Service port), plus one residual
+/// upstream per external host, a copy of the split holding only that target
+/// (so it keeps the split's upstream settings, a DestinationRule for that
+/// host applies to it, and authorization judges it on that host's own port).
+/// `None` when the split cannot be represented: too many legs, or a residual
+/// id already in use.
+fn weighted_split_legs(
+    config: &GatewayConfig,
+    split: &Upstream,
+    mut legs: WeightedSplitLegs,
+    external_targets: Vec<UpstreamTarget>,
+) -> Option<(WeightedSplitLegs, Vec<Upstream>)> {
+    let mut residuals = Vec::with_capacity(external_targets.len());
+    for (index, target) in external_targets.into_iter().enumerate() {
+        let residual_id = weighted_split_external_upstream_id(&split.id, index);
+        if config
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.namespace == split.namespace && upstream.id == residual_id)
+        {
+            return None;
+        }
+        legs.push((residual_id.clone(), target.weight));
+        let mut upstream = split.clone();
+        upstream.id = residual_id.clone();
+        upstream.name = Some(residual_id);
+        upstream.targets = vec![target];
+        residuals.push(upstream);
+    }
+    if legs.is_empty()
+        || legs.len() > crate::plugins::mesh_route_dispatch::MAX_WEIGHTED_SPLIT_LEGS
+        || legs.iter().any(|(_, weight)| *weight == 0)
+    {
+        return None;
+    }
+    Some((legs, residuals))
+}
+
+/// Give the managed `mesh_authz` instance every carried VirtualService route's
+/// candidate destinations (`node_waypoint_route_branches`, issue #7383).
+///
+/// A route the translator merged carries `mesh_route_dispatch` rules that can
+/// send a request to a destination other than the route's own. Authorization
+/// runs before dispatch picks a rule, so `mesh_authz` evaluates every
+/// candidate's own destination policy and the destination the request finally
+/// reaches is admitted only on its own verdict. Each entry lists the route's
+/// own destination first, then each distinct rule destination (an upstream id,
+/// or a direct backend for an external host); a rule with no destination keeps
+/// the route's own. Only routes with at least one other candidate are listed:
+/// every other route keeps the single-destination decision and its blanket
+/// override refusal. A route with more than
+/// [`crate::plugins::mesh::authz::MAX_NODE_WAYPOINT_ROUTE_BRANCHES`] candidates
+/// is left out too, so its other branches stay refused (fail closed).
+///
+/// A weighted split dispatched leg by leg (`weighted_splits`, issue #7387) is
+/// never a candidate itself: each of its legs is, so the leg the dispatch
+/// finalizer selects is judged on its own verdict. Such a route is always
+/// listed (`weighted_split`), and when the split is the route's own
+/// destination, candidate 0 is marked never reachable
+/// (`own_is_weighted_split`).
+///
+/// Without the managed instance (an operator global `mesh_authz` replaced
+/// it) nothing is threaded and the blanket refusal stays: a selected leg is
+/// then held to the same single-destination guard as a matched rule.
+fn thread_node_waypoint_route_branches_to_authz(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+) {
+    if runtime.topology != MeshTopology::NodeWaypoint {
+        return;
+    }
+    let route_dispatch_rules: HashMap<(&str, &str), &serde_json::Value> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.enabled && plugin.plugin_name == "mesh_route_dispatch")
+        .map(|plugin| {
+            (
+                (plugin.namespace.as_str(), plugin.id.as_str()),
+                &plugin.config,
+            )
+        })
+        .collect();
+    // A global dispatch instance runs on every route without an association.
+    let global_route_dispatch: Vec<&serde_json::Value> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| {
+            plugin.enabled
+                && plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.scope == PluginScope::Global
+        })
+        .map(|plugin| &plugin.config)
+        .collect();
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    // Residual external legs of leg-dispatched splits (issue #7387): route
+    // upstreams created after `node_waypoint_route_upstreams` was written.
+    let mut route_upstream_legs: HashSet<(String, String)> = HashSet::new();
+    let mut oversized_routes = 0usize;
+    for proxy in &config.proxies {
+        if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
+            continue;
+        }
+        let own = match proxy.upstream_id.as_deref() {
+            Some(upstream_id) => serde_json::json!({ "upstream_id": upstream_id }),
+            None if !proxy.backend_host.trim().is_empty() && proxy.backend_port != 0 => {
+                serde_json::json!({
+                    "backend_host": proxy.backend_host,
+                    "backend_port": proxy.backend_port,
+                })
+            }
+            None => continue,
+        };
+        let mut destinations = vec![own];
+        let dispatch_configs: Vec<&serde_json::Value> = proxy
+            .plugins
+            .iter()
+            .filter_map(|association| {
+                route_dispatch_rules
+                    .get(&(
+                        proxy.namespace.as_str(),
+                        association.plugin_config_id.as_str(),
+                    ))
+                    .copied()
+            })
+            .chain(global_route_dispatch.iter().copied())
+            .collect();
+        // The weighted splits these instances dispatch leg by leg.
+        let weighted_splits: Vec<&serde_json::Value> = dispatch_configs
+            .iter()
+            .copied()
+            .flat_map(|dispatch| {
+                dispatch
+                    .get("weighted_splits")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .collect();
+        let split_legs = |upstream_id: &str| {
+            weighted_splits
+                .iter()
+                .find(|split| {
+                    split.get("upstream_id").and_then(serde_json::Value::as_str)
+                        == Some(upstream_id)
+                })
+                .map(|split| {
+                    split
+                        .get("legs")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|leg| {
+                            leg.get("upstream_id").and_then(serde_json::Value::as_str)
+                        })
+                        .map(|leg| serde_json::json!({ "upstream_id": leg }))
+                        .collect::<Vec<_>>()
+                })
+        };
+        let own_is_weighted_split =
+            proxy
+                .upstream_id
+                .as_deref()
+                .is_some_and(|upstream_id| match split_legs(upstream_id) {
+                    Some(legs) => {
+                        for leg in legs {
+                            if !destinations.contains(&leg) {
+                                destinations.push(leg);
+                            }
+                        }
+                        true
+                    }
+                    None => false,
+                });
+        let mut weighted_split = own_is_weighted_split;
+        for leg in destinations.iter().skip(1) {
+            if let Some(leg) = leg.get("upstream_id").and_then(serde_json::Value::as_str)
+                && leg.starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+            {
+                route_upstream_legs.insert((proxy.namespace.clone(), leg.to_string()));
+            }
+        }
+        for dispatch in dispatch_configs {
+            for destination in dispatch
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|rule| rule.get("destination"))
+            {
+                let upstream_id = destination
+                    .get("upstream_id")
+                    .and_then(serde_json::Value::as_str);
+                let backend_host = destination
+                    .get("backend_host")
+                    .and_then(serde_json::Value::as_str);
+                let backend_port = destination
+                    .get("backend_port")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok());
+                // A weighted split is reached only through its legs.
+                if let Some(legs) = upstream_id.and_then(split_legs) {
+                    weighted_split = true;
+                    for leg in legs {
+                        if let Some(id) = leg.get("upstream_id").and_then(serde_json::Value::as_str)
+                            && id.starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+                        {
+                            route_upstream_legs.insert((proxy.namespace.clone(), id.to_string()));
+                        }
+                        if !destinations.contains(&leg) {
+                            destinations.push(leg);
+                        }
+                    }
+                    continue;
+                }
+                // `mesh_route_dispatch` refuses any other shape at
+                // construction; an empty destination keeps the route's own.
+                let candidate = match (upstream_id, backend_host, backend_port) {
+                    (Some(upstream_id), None, None) => {
+                        serde_json::json!({ "upstream_id": upstream_id })
+                    }
+                    (None, Some(host), Some(port)) => serde_json::json!({
+                        "backend_host": host,
+                        "backend_port": port,
+                    }),
+                    _ => continue,
+                };
+                if !destinations.contains(&candidate) {
+                    destinations.push(candidate);
+                }
+            }
+        }
+        if destinations.len() < 2 && !weighted_split {
+            continue;
+        }
+        if destinations.len() > crate::plugins::mesh::authz::MAX_NODE_WAYPOINT_ROUTE_BRANCHES {
+            oversized_routes += 1;
+            continue;
+        }
+        let mut entry = serde_json::json!({
+            "namespace": proxy.namespace,
+            "proxy_id": proxy.id,
+            "destinations": destinations,
+        });
+        if weighted_split {
+            entry["weighted_split"] = serde_json::Value::Bool(true);
+        }
+        if own_is_weighted_split {
+            entry["own_is_weighted_split"] = serde_json::Value::Bool(true);
+        }
+        entries.push(entry);
+    }
+    if oversized_routes > 0 {
+        warn!(
+            routes = oversized_routes,
+            limit = crate::plugins::mesh::authz::MAX_NODE_WAYPOINT_ROUTE_BRANCHES,
+            "NodeWaypoint VirtualService routes name more mesh_route_dispatch destinations than \
+             per-destination authorization tracks; a rule on those routes that selects a \
+             destination other than the route's own is refused (fail closed)"
+        );
+    }
+    let Some(authz) = config.plugin_configs.iter_mut().find(|plugin| {
+        plugin.scope == PluginScope::Global
+            && plugin.plugin_name == "mesh_authz"
+            && plugin.namespace == runtime.namespace
+            && plugin.id == MESH_AUTHZ_PLUGIN_ID
+    }) else {
+        return;
+    };
+    let Some(authz_config) = authz.config.as_object_mut() else {
+        return;
+    };
+    // Index each residual external leg like every other route upstream, so
+    // its candidate is judged on its own host and port.
+    if !route_upstream_legs.is_empty()
+        && let Some(route_upstreams) = authz_config
+            .get_mut("node_waypoint_route_upstreams")
+            .and_then(serde_json::Value::as_array_mut)
+    {
+        for upstream in &config.upstreams {
+            if !route_upstream_legs.contains(&(upstream.namespace.clone(), upstream.id.clone())) {
+                continue;
+            }
+            let listed = route_upstreams.iter().any(|entry| {
+                entry.get("id").and_then(serde_json::Value::as_str) == Some(upstream.id.as_str())
+                    && entry.get("namespace").and_then(serde_json::Value::as_str)
+                        == Some(upstream.namespace.as_str())
+            });
+            if !listed {
+                route_upstreams.push(node_waypoint_authz_route_upstream(upstream));
+            }
+        }
+    }
+    if entries.is_empty() {
+        authz_config.remove("node_waypoint_route_branches");
+    } else {
+        authz_config.insert(
+            "node_waypoint_route_branches".to_string(),
+            serde_json::Value::Array(entries),
+        );
+    }
+}
+
+/// Spread every leg's share over its targets with one common scale, so the
+/// effective ratio between legs is the configured one: a target's weight is
+/// `leg_weight / leg_targets`, scaled so the largest target weight is
+/// `MAX_TARGET_WEIGHT`. Every target keeps a weight of at least 1.
+fn split_targets_with_common_scale(
+    legs: Vec<(u32, Vec<crate::config::types::UpstreamTarget>)>,
+) -> Vec<crate::config::types::UpstreamTarget> {
+    let per_target = |weight: u32, targets: usize| f64::from(weight) / targets.max(1) as f64;
+    let largest = legs
+        .iter()
+        .map(|(weight, targets)| per_target(*weight, targets.len()))
+        .fold(0.0_f64, f64::max);
+    let scale = if largest > 0.0 {
+        f64::from(crate::config::types::MAX_TARGET_WEIGHT) / largest
+    } else {
+        1.0
+    };
+    let mut out = Vec::new();
+    for (weight, targets) in legs {
+        let scaled = (per_target(weight, targets.len()) * scale).round();
+        let target_weight = if scaled.is_finite() {
+            (scaled as u32).clamp(1, crate::config::types::MAX_TARGET_WEIGHT)
+        } else {
+            1
+        };
+        for mut target in targets {
+            target.weight = target_weight;
+            out.push(target);
+        }
+    }
+    out
+}
+
+/// Give each carried route that declares a modeled Service's host all of that
+/// Service's host spellings (see `bind_carried_http_routes_to_node_waypoint_transport`).
+fn expand_carried_route_service_hosts(
+    config: &mut GatewayConfig,
+    hosts: &CarriedRouteHostIndex,
+    cluster_domain: &str,
+) {
+    let mut claimed: HashSet<(String, Option<String>)> = HashSet::new();
+    for proxy in &config.proxies {
+        if config::is_virtual_service_http_route_proxy_id(&proxy.id) {
+            for host in &proxy.hosts {
+                claimed.insert((host.to_ascii_lowercase(), proxy.listen_path.clone()));
+            }
+        }
+    }
+    for proxy in &mut config.proxies {
+        if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
+            continue;
+        }
+        let mut added = Vec::new();
+        for host in &proxy.hosts {
+            if let CarriedRouteHost::Service(namespace, name) =
+                hosts.classify(&proxy.namespace, host)
+            {
+                for variant in mesh_service_host_variants(&name, &namespace, cluster_domain) {
+                    // A bare name means a Service in the route's own namespace.
+                    if !variant.contains('.') && namespace != proxy.namespace {
+                        continue;
+                    }
+                    let key = (variant.to_ascii_lowercase(), proxy.listen_path.clone());
+                    if claimed.insert(key) {
+                        added.push(variant);
+                    }
+                }
+            }
+        }
+        proxy.hosts.extend(added);
+    }
 }
 
 /// Resolve Istio `sourceLabels` / `sourceNamespace` as Sidecar-applicability
@@ -4266,7 +6674,6 @@ fn authoritative_sidecar_l4_source<'a>(
 async fn wait_for_initial_mesh_config(
     mesh_state: &MeshRuntimeState,
     runtime: &MeshRuntimeConfig,
-    activation: FederationActivation,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<
     (
@@ -4292,7 +6699,6 @@ async fn wait_for_initial_mesh_config(
                         runtime,
                         Some(&federation_snapshot),
                         Some(&remote_snapshot),
-                        activation,
                     )
                     .map(|config| (config, token))
                 });
@@ -4623,7 +7029,7 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         hosts: gateway.sni_hosts.clone(),
         listen_path: None,
         backend_scheme: Some(BackendScheme::Tcp),
-        dispatch_kind: Default::default(),
+        dispatch_kind: DispatchKind::from(BackendScheme::Tcp),
         backend_host: gateway.host.clone(),
         backend_port: gateway.port,
         backend_path: None,
@@ -4656,7 +7062,6 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -4794,7 +7199,13 @@ fn build_east_west_service_proxies_and_upstreams(
             let upstream = Upstream {
                 labels: Default::default(),
                 id: upstream_id.clone(),
-                name: Some(upstream_id.clone()),
+                // The Service host is the upstream's logical destination name,
+                // so DestinationRule selection (exact and wildcard, Istio
+                // precedence) looks the rule up by Service hostname as Istio's
+                // AUTO_PASSTHROUGH SNI-DNAT clusters do (issue #7424). Only the
+                // passthrough-safe part of the rule applies; see
+                // `sni_passthrough_destination_rule_view`.
+                name: Some(cross_cluster_service_base_fqdn(service, cluster_domain)),
                 namespace: namespace.to_string(),
                 targets,
                 algorithm: LoadBalancerAlgorithm::RoundRobin,
@@ -4824,6 +7235,7 @@ fn build_east_west_service_proxies_and_upstreams(
                 created_at: now,
                 updated_at: now,
                 k8s_service_uid: None,
+                admission_upstream_id: None,
                 pending_limit_scope: None,
             };
             upstreams.push(upstream);
@@ -5086,7 +7498,7 @@ pub(crate) fn cross_cluster_service_sni(
 /// Matches workloads by SPIFFE ID against the service's `WorkloadRef` list. Each
 /// workload address + the resolved container port for `service_port` produces one
 /// `UpstreamTarget`. When a workload has no addresses, it is skipped (pod IP not
-/// yet assigned). One passthrough proxy is materialized per HTTP-family service
+/// yet assigned). One passthrough proxy is materialized per declared service
 /// port (multi-port east-west, issue #2010 phase 3), each keyed by the port's SNI
 /// alias ([`cross_cluster_service_sni`]).
 fn build_east_west_service_targets(
@@ -5151,14 +7563,8 @@ where
         // (rollout skew / typo like `targetPort: "http"` with no matching
         // container port) doesn't silently publish a target on the wrong port.
         // Only an ABSENT targetPort falls back to the service port.
-        let target_port = match service_port.target_port.as_ref() {
-            Some(_) => {
-                match resolve_target_port(service_port.target_port.as_ref(), &workload.ports) {
-                    Some(p) if p != 0 => p,
-                    _ => continue,
-                }
-            }
-            None => service_port.port,
+        let Some(target_port) = service_port.backend_port_for(&workload.ports) else {
+            continue;
         };
 
         for address in &workload.addresses {
@@ -5213,7 +7619,7 @@ fn east_west_service_proxy(
         hosts: vec![sni_hostname.to_string()],
         listen_path: None,
         backend_scheme: Some(BackendScheme::Tcp),
-        dispatch_kind: Default::default(),
+        dispatch_kind: DispatchKind::from(BackendScheme::Tcp),
         backend_host: String::new(),
         backend_port: 0,
         backend_path: None,
@@ -5246,7 +7652,6 @@ fn east_west_service_proxy(
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -5278,55 +7683,114 @@ fn east_west_service_proxy(
     }
 }
 
-/// Sanitize one namespace/name component of an internal east-west id. These ids
-/// are purely internal registry keys (a `Proxy.id`/`Upstream.id`, never emitted
-/// to Kubernetes, DNS, SNI/TLS, or any wire protocol — the SNI is built
-/// independently by [`cross_cluster_service_sni`]), so the only requirement is
-/// intra-component uniqueness. `/` and `.` are folded to `-` so a hostile or
-/// malformed component cannot smuggle the reserved `.` port-marker separator
-/// (see [`mesh_east_west_service_proxy_id`]) into the middle of an id. A
-/// well-formed Kubernetes namespace/service name (DNS-1035/1123 label) contains
-/// neither character, so this is a no-op for real inputs.
-fn sanitize_mesh_id_component(component: &str) -> String {
-    component.replace(['/', '.'], "-")
-}
-
 /// East-west per-service proxy id. `sni_label` is the port's alias label from
 /// [`cross_cluster_service_sni_label`] (`p<port>`, or `p<port>-udp` for a UDP
 /// port), matching the SNI scheme where every port takes an explicit
 /// `<label>.<fqdn>` alias.
 ///
-/// The port marker is joined with `.` — a character DNS-1035/1123 labels forbid,
-/// so it CANNOT appear in a Kubernetes namespace or service name (codex #2040
-/// Finding B). This makes the per-port id `__mesh-ew-svc-<ns>-<name>.p<port>`
-/// unambiguous: a distinct service literally named `<name>-p<port>` yields
-/// `__mesh-ew-svc-<ns>-<name>-p<port>` (no dot) and a service named `<name>.p<port>`
-/// is not a valid k8s name (impossible), so neither can collide in the
-/// materializer's id-keyed upsert map. The ns/name components are individually
-/// sanitized (`/`,`.` → `-`) BEFORE the `.p<port>` marker is appended so a
-/// malformed component can never forge the structural separator, while the
-/// intentional marker dot is preserved (never collapsed).
+/// These ids are purely internal registry keys (a `Proxy.id`/`Upstream.id`,
+/// never emitted to Kubernetes, DNS, SNI/TLS, or any wire protocol — the SNI is
+/// built independently by [`cross_cluster_service_sni`]) and are forward-derived,
+/// never parsed. Every materialized proxy/upstream is stamped with the GATEWAY's
+/// namespace, so services from different namespaces share one id space: the
+/// namespace and name are each encoded with the injective
+/// [`sanitize_egress_host_id_part`], whose output contains neither `-` nor `.`.
+/// The `-` between them is therefore an unambiguous separator (`a`/`b-c` and
+/// `a-b`/`c` stay distinct, issue #7235), and the `.` before the port marker
+/// cannot be forged by a component: a service literally named `<name>-p<port>`
+/// yields `__mesh-ew-svc-<ns>-<name>_dash_p<port>.p<port>` (codex #2040 Finding
+/// B).
 fn mesh_east_west_service_proxy_id(namespace: &str, name: &str, sni_label: &str) -> String {
-    let namespace = sanitize_mesh_id_component(namespace);
-    let name = sanitize_mesh_id_component(name);
+    let namespace = sanitize_egress_host_id_part(namespace);
+    let name = sanitize_egress_host_id_part(name);
     format!("__mesh-ew-svc-{namespace}-{name}.{sni_label}")
 }
 
-/// East-west per-service upstream id; `sni_label` semantics and the
+/// East-west per-service upstream id; component encoding and the
 /// collision-free `.p<port>` marker mirror [`mesh_east_west_service_proxy_id`].
 fn mesh_east_west_service_upstream_id(namespace: &str, name: &str, sni_label: &str) -> String {
-    let namespace = sanitize_mesh_id_component(namespace);
-    let name = sanitize_mesh_id_component(name);
+    let namespace = sanitize_egress_host_id_part(namespace);
+    let name = sanitize_egress_host_id_part(name);
     format!("__mesh-ew-upstream-{namespace}-{name}.{sni_label}")
+}
+
+/// The `(namespace, id)` of every SNI-passthrough Service upstream an
+/// EastWestGateway data plane materializes from `mesh_slice`
+/// ([`build_east_west_service_proxies_and_upstreams`]), with the owning Service
+/// port each one serves. Empty on every other topology.
+///
+/// Forward-derived with the materializer's own label and id helpers, so a
+/// port the materializer skips (an ambiguous alias) is never listed; a port it
+/// skips for having no targets or for yielding to an explicit
+/// `EastWestGateway` entry is listed but names no upstream, which is harmless.
+fn east_west_sni_passthrough_upstream_owner_ports(
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) -> Vec<(NamespacedResourceId, u16)> {
+    if runtime.topology != MeshTopology::EastWestGateway {
+        return Vec::new();
+    }
+    mesh_slice
+        .services
+        .iter()
+        .flat_map(|service| {
+            service.ports.iter().filter_map(move |service_port| {
+                let label = cross_cluster_service_sni_label(service, service_port)?;
+                Some((
+                    NamespacedResourceId::new(
+                        runtime.namespace.as_str(),
+                        mesh_east_west_service_upstream_id(
+                            &service.namespace,
+                            &service.name,
+                            &label,
+                        ),
+                    ),
+                    service_port.port,
+                ))
+            })
+        })
+        .collect()
+}
+
+/// The part of a DestinationRule that governs an EastWestGateway
+/// SNI-passthrough Service upstream (issue #7424).
+///
+/// Istio builds the AUTO_PASSTHROUGH gateway's clusters in
+/// `buildOutboundSniDnatClusters` (`pilot/pkg/networking/core/cluster.go`):
+/// it looks the rule up by Service hostname
+/// (`SidecarScope.DestinationRule(TrafficDirectionOutbound, proxy,
+/// service.Hostname)`) and applies it with `SniDnatClusterMode`, under which
+/// `applyTrafficPolicy` (`pilot/pkg/networking/core/cluster_traffic_policy.go`)
+/// keeps the connection pool, outlier detection and load balancer (locality
+/// included) but skips upstream TLS and PROXY protocol (`if opts.clusterMode
+/// != SniDnatClusterMode`): the gateway forwards the client's end-to-end mTLS
+/// bytes and must never originate TLS of its own.
+///
+/// So the view drops `tls` at every scope (top level, `portLevelSettings`,
+/// subsets). That also keeps a mesh-wide `ISTIO_MUTUAL` rule from failing the
+/// slice closed on a gateway that has no SVID to present, since it never
+/// needs one on this leg. Subsets are dropped too: Ferrum's east-west alias
+/// SNI (`p<port>.<fqdn>`) carries no subset, so no passthrough route can
+/// select one.
+fn sni_passthrough_destination_rule_view(dr: &MeshDestinationRule) -> MeshDestinationRule {
+    let mut view = dr.clone();
+    if let Some(policy) = view.traffic_policy.as_mut() {
+        policy.tls = None;
+    }
+    for policy in view.port_level_settings.values_mut() {
+        policy.tls = None;
+    }
+    view.subsets.clear();
+    view
 }
 
 // ── Sidecar inbound route materialization ─────────────────────────────────
 
 /// True for application protocols routed through the HTTP-family proxy chain.
 /// Stream protocols (raw TCP/TLS and the DB protocols) need an L4 stream proxy;
-/// `Udp` is a distinct L4 transport whose capture/egress arrives in a later
-/// stage. Neither is HTTP-family — only `Udp` is also excluded from the
-/// raw-TCP stream lane (see [`service_udp_stream_ports`]).
+/// `Udp` is a distinct L4 transport with its own datagram capture/egress lane.
+/// Neither is HTTP-family — only `Udp` is also excluded from the raw-TCP
+/// stream lane (see [`service_udp_stream_ports`]).
 fn is_http_family_mesh_protocol(protocol: AppProtocol) -> bool {
     matches!(
         protocol,
@@ -5401,20 +7865,23 @@ pub(crate) fn is_mesh_ingress_bind_route_id(id: &str) -> bool {
     id.starts_with(MESH_INGRESS_BIND_PROXY_ID_PREFIX)
 }
 
-/// LATENT-COLLISION HAZARD (shared by this whole `mesh_*_id` family —
-/// `mesh_ingress_proxy_id`, `mesh_outbound_proxy_id`,
-/// `mesh_outbound_upstream_id`, `mesh_outbound_tcp_upstream_id`,
-/// `mesh_east_west_*_id`, etc.): the `{namespace}-{name}-{port}` join uses `-`
-/// as the field separator, but `replace(['/', '.'], "-")` ALSO emits `-`, so
-/// `(ns="a-b", name="c")` and `(ns="a", name="b-c")` would map to the same id.
-/// SAFE TODAY because every in-scope materializer consumes a SINGLE-namespace
-/// service set (the slice is scoped to one namespace), so the `namespace`
-/// segment is constant and only `name`+`port` vary — and a `name` cannot
-/// borrow a `-` from a fixed `namespace`. Dedicated Sidecar ingress bind ids
-/// (`mesh_ingress_bind_proxy_id`) are the exception: they already use the
-/// reversible `sanitize_egress_host_id_part` scheme so the id space stays
-/// injective across namespaces. Before any MULTI-namespace caller is added to
-/// the rest of this family, switch those constructors the same way. See #1727.
+/// LOSSY JOIN (shared by the `mesh_inbound_proxy_id`, `mesh_ingress_proxy_id`,
+/// `mesh_outbound_proxy_id`, `mesh_outbound_upstream_id`,
+/// `mesh_outbound_tcp_upstream_id` family): the `{namespace}-{name}-{port}` join
+/// uses `-` as the field separator, but `replace(['/', '.'], "-")` ALSO emits
+/// `-`, so `(ns="a-b", name="c")` and `(ns="a", name="b-c")` map to the same
+/// id string. The service sets are NOT single-namespace (an enforced `Sidecar`
+/// or a ServiceWaypoint carries services from every namespace); these ids stay
+/// distinct only because each materialized resource is stamped with its OWNING
+/// service's namespace and every consumer keys on `(namespace, id)`, so two
+/// services can share an id string only inside one namespace, where their names
+/// differ. Never parse these ids back into namespace/name (see
+/// `mesh_outbound_service_groups`), and never stamp them with a namespace other
+/// than the owning service's. Families that ARE stamped with a shared namespace
+/// encode each component with the injective `sanitize_egress_host_id_part`
+/// instead: dedicated Sidecar ingress bind ids (`mesh_ingress_bind_proxy_id`)
+/// and the east-west per-service ids (`mesh_east_west_service_proxy_id`, stamped
+/// with the gateway's namespace). See #1727 and #7235.
 fn mesh_inbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
     format!("{MESH_INBOUND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
@@ -5461,6 +7928,30 @@ pub(crate) fn mesh_route_direction(id: &str) -> Option<MeshTrafficDirection> {
         Some(MeshTrafficDirection::Outbound)
     } else {
         None
+    }
+}
+
+/// Whether a route may serve a request accepted on a listener of direction
+/// `request_direction` (`None` = a non-mesh listener).
+///
+/// A direction-scoped mesh route ([`mesh_route_direction`]) serves only its
+/// own direction. A carried VirtualService HTTP route (issues #7233, #7423)
+/// is CLIENT-side routing: it serves the outbound capture leg (Sidecar
+/// `:15001`, the NodeWaypoint capture backend) and never an INBOUND mesh
+/// listener. Served there, a peer (or, under PERMISSIVE, a plaintext client)
+/// could name a routed host and have this proxy dial it onward with its own
+/// mesh identity. Gateway-bound VirtualService routes share the id space and
+/// keep serving non-mesh listeners. Every other route is unscoped.
+pub(crate) fn mesh_route_admitted_for_direction(
+    id: &str,
+    request_direction: Option<MeshTrafficDirection>,
+) -> bool {
+    match mesh_route_direction(id) {
+        Some(route_direction) => request_direction == Some(route_direction),
+        None => {
+            request_direction != Some(MeshTrafficDirection::Inbound)
+                || !config::is_virtual_service_http_route_proxy_id(id)
+        }
     }
 }
 
@@ -5558,9 +8049,9 @@ pub(crate) fn mesh_outbound_service_groups(
 
 /// True when a (override-resolved) protocol is the distinct UDP L4 transport.
 /// `Udp` is NEITHER HTTP-family NOR raw-TCP-stream — it forms the third leg of
-/// the port partition. Capture/egress for UDP arrives in a later F3 §3.3 stage;
-/// today this only keeps UDP ports out of the other two lanes (they were
-/// previously mis-classified as HTTP via `Unknown`).
+/// the port partition, which keeps UDP ports out of the other two lanes (they
+/// were previously mis-classified as HTTP via `Unknown`) and routes them to the
+/// datagram-over-mesh egress lane (F3 §3.3).
 fn is_udp_mesh_protocol(protocol: AppProtocol) -> bool {
     // `Dtls` is the SAME L4 transport as `Udp`; only the NodeWaypoint listener
     // materializer distinguishes them (it terminates frontend DTLS on a `Dtls`
@@ -5613,11 +8104,12 @@ pub(crate) fn service_tcp_stream_ports(
 
 /// UDP service ports of an in-mesh service, with `protocol_overrides` applied:
 /// the third leg of the HTTP-family / raw-TCP-stream / UDP port partition.
-/// Consumed by the Ambient UDP egress materializer
-/// (`materialize_mesh_outbound_udp_upstreams`, F3 §3.3 Stage 4) and the route
-/// table's `mesh_udp_egress` index — a captured UDP datagram whose orig-dst
-/// matches `(service VIP, UDP service port)` is tunnelled over a `udp`-marked
-/// HBONE CONNECT. Mirrors [`service_http_family_ports`] and
+/// Consumed by the UDP egress materializer
+/// (`materialize_mesh_outbound_udp_upstreams`, F3 §3.3 Stage 4; Ambient and
+/// Sidecar), the NodeWaypoint UDP listener materializer, and the route table's
+/// `mesh_udp_egress` index — a captured UDP datagram whose orig-dst matches
+/// `(service VIP, UDP service port)` is tunnelled over a `udp`-marked mesh
+/// CONNECT (HBONE on Ambient, mesh-mTLS on Sidecar). Mirrors [`service_http_family_ports`] and
 /// [`service_tcp_stream_ports`]; the SINGLE forward-derivation source the
 /// materializer, the route table, and the capability enrollment share.
 pub(crate) fn service_udp_stream_ports(
@@ -5952,19 +8444,9 @@ pub(crate) fn mesh_outbound_http_bywl_upstreams<'a>(
             let mut seen: std::collections::HashSet<(std::net::IpAddr, u16)> =
                 std::collections::HashSet::new();
             for workload in matched_local_service_workloads(service, workloads, multi_cluster) {
-                let app_port = match service_port.target_port.as_ref() {
-                    Some(_) => match crate::modes::mesh::config::resolve_target_port(
-                        service_port.target_port.as_ref(),
-                        &workload.ports,
-                    ) {
-                        Some(p) if p != 0 => p,
-                        _ => continue,
-                    },
-                    None => service_port.port,
-                };
-                if app_port == 0 {
+                let Some(app_port) = service_port.backend_port_for(&workload.ports) else {
                     continue;
-                }
+                };
                 for address in &workload.addresses {
                     if address.is_empty() {
                         continue;
@@ -6049,20 +8531,10 @@ pub(crate) fn mesh_outbound_tcp_bywl_upstreams<'a>(
             for workload in matched_local_service_workloads(service, workloads, multi_cluster) {
                 // Same app-port resolution as `build_outbound_mesh_targets`:
                 // a DECLARED targetPort is authoritative (resolve or SKIP);
-                // only an ABSENT one falls back to the service port.
-                let app_port = match service_port.target_port.as_ref() {
-                    Some(_) => match crate::modes::mesh::config::resolve_target_port(
-                        service_port.target_port.as_ref(),
-                        &workload.ports,
-                    ) {
-                        Some(p) if p != 0 => p,
-                        _ => continue,
-                    },
-                    None => service_port.port,
-                };
-                if app_port == 0 {
+                // only an ABSENT one means the service port.
+                let Some(app_port) = service_port.backend_port_for(&workload.ports) else {
                     continue;
-                }
+                };
                 for address in &workload.addresses {
                     if address.is_empty() {
                         continue;
@@ -6124,36 +8596,6 @@ pub(crate) fn mesh_outbound_tcp_bywl_upstreams<'a>(
 /// before Hyper parses the connection. The emitted HTTP proxies carry the
 /// [`MESH_INBOUND_PROXY_ID_PREFIX`] so the request path keeps them off the
 /// outbound listener.
-fn resolve_sidecar_inbound_backend_port(
-    service_port: &crate::modes::mesh::config::ServicePort,
-    workload: &crate::modes::mesh::config::Workload,
-) -> Option<u16> {
-    match service_port.target_port.as_ref() {
-        Some(ServiceTargetPort::Number(n)) => Some(*n),
-        Some(ServiceTargetPort::Name(name)) => workload
-            .ports
-            .iter()
-            .find(|wp| wp.name.as_deref() == Some(name.as_str()))
-            .map(|wp| wp.port),
-        None if workload.ports.is_empty() => Some(service_port.port),
-        None => workload
-            .ports
-            .iter()
-            .find(|wp| wp.name.is_some() && wp.name == service_port.name)
-            .or_else(|| {
-                workload
-                    .ports
-                    .iter()
-                    .find(|wp| wp.port == service_port.port)
-            })
-            .or(match workload.ports.as_slice() {
-                [only] => Some(only),
-                _ => None,
-            })
-            .map(|wp| wp.port),
-    }
-}
-
 fn materialize_sidecar_inbound_proxies(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -6344,33 +8786,23 @@ fn materialize_sidecar_inbound_proxies(
                 .collect();
             for service_port in &http_ports {
                 // Backend = the workload's app (container) port this service port
-                // forwards to. A declared `targetPort` is Kubernetes' AUTHORITATIVE
-                // service-port→container-port binding, so honor it exclusively — no
-                // heuristic fallback: a numeric targetPort IS the container port; a
-                // named one resolves against the workload's container-port names, and
-                // an unresolved name (typo / rollout skew) SKIPS rather than guessing
-                // a different port. Only when NO targetPort is declared do we fall
-                // back to the heuristic over the signals we have, in declining order
-                // of confidence:
-                //   1. a shared port NAME — the canonical Service↔container linkage,
-                //   2. an equal port NUMBER — `targetPort` defaulting to the port,
-                //   3. the workload's sole container port — single-port pod.
-                // A workload that declares no ports defaults to the service port
-                // (Kubernetes' `targetPort`-defaults-to-`port` rule). Otherwise the
-                // target is genuinely ambiguous: skip and warn rather than misroute.
-                let backend_port = resolve_sidecar_inbound_backend_port(service_port, workload);
-                // Reject a 0 backend (invalid targetPort/port; config validation also
-                // rejects it for non-xDS slices) defensively rather than route to :0.
-                let Some(backend_port) = backend_port.filter(|&p| p != 0) else {
+                // forwards to, by the ONE Kubernetes rule every mesh path shares
+                // (`ServicePort::backend_port_for`, issue #7236): a declared
+                // `targetPort` is authoritative (a numeric one IS the container
+                // port; a named one resolves against the workload's container-port
+                // names, and an unresolved name SKIPS rather than guessing), and an
+                // absent `targetPort` means the service port. A zero port (invalid;
+                // config validation also rejects it for non-xDS slices) skips too.
+                let Some(backend_port) = service_port.backend_port_for(&workload.ports) else {
                     warn!(
                         service = %sanitize_startup_scalar(service.name.to_string()),
                         namespace = %sanitize_startup_scalar(service.namespace.to_string()),
                         service_port = %sanitize_startup_scalar(service_port.port.to_string()),
                         target_port = %sanitize_startup_scalar(format!("{:?}", service_port.target_port)),
                         "Cannot resolve a usable local backend port for an inbound mesh route \
-                         (no resolvable Service targetPort, and no port name/number match among \
-                         multiple container ports). Set targetPort, name the ports consistently, \
-                         or define an explicit proxy. Skipping this route."
+                         (the declared Service targetPort names no container port of this \
+                         workload). Fix targetPort or define an explicit proxy. Skipping this \
+                         route."
                     );
                     continue;
                 };
@@ -6415,9 +8847,13 @@ fn materialize_sidecar_inbound_proxies(
                 // but ONLY its own: another local service's inbound route on an
                 // overlapping bare-name host variant still wins first-materialized,
                 // exactly as before per-port siblings existed.
+                // A carried VirtualService route (issue #7423) never claims a
+                // local inbound slot: it is outbound-only, and the route binding
+                // refuses one that collides with the inbound route kept here.
                 if config.proxies.iter().any(|p| {
                     if (p.namespace == service.namespace && sibling_ids.contains(p.id.as_str()))
                         || p.dispatch_kind.is_stream()
+                        || config::is_virtual_service_http_route_proxy_id(&p.id)
                     {
                         return false;
                     }
@@ -6448,17 +8884,15 @@ fn materialize_sidecar_inbound_proxies(
             }
 
             for service_port in service_tcp_stream_ports(service) {
-                let backend_port = resolve_sidecar_inbound_backend_port(service_port, workload);
-                let Some(backend_port) = backend_port.filter(|&p| p != 0) else {
+                let Some(backend_port) = service_port.backend_port_for(&workload.ports) else {
                     warn!(
                         service = %sanitize_startup_scalar(service.name.to_string()),
                         namespace = %sanitize_startup_scalar(service.namespace.to_string()),
                         service_port = %sanitize_startup_scalar(service_port.port.to_string()),
                         target_port = %sanitize_startup_scalar(format!("{:?}", service_port.target_port)),
                         "Cannot resolve a usable local backend port for an inbound raw-TCP mesh \
-                         route (no resolvable Service targetPort, and no port name/number match \
-                         among multiple container ports). Set targetPort or name ports \
-                         consistently. Skipping this route."
+                         route (the declared Service targetPort names no container port of this \
+                         workload). Fix targetPort. Skipping this route."
                     );
                     continue;
                 };
@@ -6994,9 +9428,12 @@ fn materialize_sidecar_ingress_listener_proxies(
         // exactly like the default inbound path. Exclude this workload's OWN
         // ingress siblings (grouped by the router); another proxy still wins
         // first-materialized.
+        // Carried VirtualService routes never claim an inbound slot (issue
+        // #7423); see the default inbound path.
         if config.proxies.iter().any(|p| {
             if (p.namespace == listener.owner_namespace && sibling_ids.contains(p.id.as_str()))
                 || p.dispatch_kind.is_stream()
+                || config::is_virtual_service_http_route_proxy_id(&p.id)
             {
                 return false;
             }
@@ -7343,6 +9780,7 @@ fn mesh_ingress_unix_upstream(
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -7412,7 +9850,6 @@ fn mesh_inbound_loopback_proxy_to(
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -7476,7 +9913,7 @@ pub(crate) fn mesh_inbound_tcp_relay_proxy(route: &MeshInboundTcpRoute) -> Proxy
         hosts: Vec::new(),
         listen_path: None,
         backend_scheme: Some(BackendScheme::Tcp),
-        dispatch_kind: Default::default(),
+        dispatch_kind: DispatchKind::from(BackendScheme::Tcp),
         backend_host: route.backend_addr.ip().to_string(),
         backend_port: route.backend_addr.port(),
         backend_path: None,
@@ -7509,7 +9946,6 @@ pub(crate) fn mesh_inbound_tcp_relay_proxy(route: &MeshInboundTcpRoute) -> Proxy
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -7641,7 +10077,6 @@ fn mesh_inbound_connect_relay_proxy(id: &str, host: &str, port: u16) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -7711,9 +10146,13 @@ enum MeshEgressTransport {
 ///   destination's `:15008`): `mesh.hbone`-tagged targets light up
 ///   `current_dispatch_hbone` → `HboneConnectionPool`.
 /// - **NodeWaypoint** captured HTTP Service traffic materializes host-routed
-///   service routes with no mesh transport tag: the in-pod-netns listener has
-///   already attributed the source pod, `mesh_authz` runs on the normal plugin
-///   chain, and dispatch dials the selected backing pod app port directly.
+///   service routes: the in-pod-netns listener has already attributed the
+///   source pod and `mesh_authz` runs on the normal plugin chain. In an
+///   identity-backed posture each target is `mesh.hbone`-tagged for the
+///   destination NodeWaypoint (dial host and pinned NodeWaypoint SVID from
+///   `Workload.node_waypoint`), with the backing pod app endpoint as the
+///   CONNECT authority; only the explicit no-CA/dev posture keeps the untagged
+///   plaintext target (see `MeshEgressTransport`).
 ///   Direct Pod-IP/headless HTTP routes remain fail-closed because the current
 ///   eBPF path must not synthesize unreachable pod-IP HBONE targets.
 /// - **Sidecar** egress uses plain **SVID-mTLS HTTP/2** to the peer sidecar's
@@ -7761,6 +10200,12 @@ fn materialize_mesh_outbound_proxies(
     // `Some(local_cluster)`, or a cluster the config does not list as remote;
     // a remote one carries a configured remote cluster's name.
     let multi_cluster = mesh_slice.multi_cluster.as_ref();
+    // Whether this config serves carried VirtualService routes (issue #7423):
+    // a Sidecar then keeps every Service upstream a carried route may dial.
+    let carries_http_routes = config
+        .proxies
+        .iter()
+        .any(|proxy| config::is_virtual_service_http_route_proxy_id(&proxy.id));
     let mut materialized = 0usize;
     for service in &mesh_slice.services {
         // HTTP-family routability is read from the SERVICE port protocol
@@ -7837,25 +10282,45 @@ fn materialize_mesh_outbound_proxies(
             // this service's own per-port siblings, grouped by the router) and
             // are skipped only for re-materialization idempotency. Stream proxies
             // route by `listen_port` and are skipped.
-            if config.proxies.iter().any(|p| {
+            //
+            // A NodeWaypoint still materializes the shadowed Service's UPSTREAM
+            // (not its route): the VirtualService routes its slice carries are
+            // rebound onto these secured per-workload targets
+            // (`bind_carried_http_routes_to_node_waypoint_transport`, #7233).
+            // A Sidecar does the same whenever it carries VirtualService
+            // routes (issue #7423): a carried route can name a Service whose
+            // own route yields to a carried route or to the local inbound
+            // route, and it still needs that Service's secured upstream.
+            let mut shadowed = false;
+            for p in &config.proxies {
                 if (p.namespace == proxy.namespace && p.id == proxy.id)
                     || p.dispatch_kind.is_stream()
                     || is_mesh_outbound_route_id(&p.id)
                 {
-                    return false;
+                    continue;
                 }
                 let shadows_or_collides = p.listen_path == proxy.listen_path
                     || p.listen_path.is_none()
                     || p.listen_path
                         .as_deref()
                         .is_some_and(|lp| lp.starts_with('~'));
-                shadows_or_collides && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
-            }) {
+                if shadows_or_collides
+                    && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
+                {
+                    shadowed = true;
+                    break;
+                }
+            }
+            if shadowed {
                 debug!(
                     proxy_id = %sanitize_startup_scalar(proxy.id.to_string()),
                     "Skipping outbound route materialization; an existing operator proxy already routes this host/path"
                 );
-                continue;
+                let keep_upstream = transport == MeshEgressTransport::NodeWaypointCapturedService
+                    || (transport == MeshEgressTransport::SidecarMtls && carries_http_routes);
+                if !keep_upstream {
+                    continue;
+                }
             }
             // Name the upstream with the service FQDN (not the internal id) so a
             // DestinationRule keyed on the service host matches it
@@ -7886,6 +10351,9 @@ fn materialize_mesh_outbound_proxies(
                 *existing = upstream;
             } else {
                 config.upstreams.push(upstream);
+            }
+            if shadowed {
+                continue;
             }
             if let Some(existing) = config
                 .proxies
@@ -8002,10 +10470,11 @@ fn materialize_mesh_outbound_proxies(
 /// CONNECT tunnel to the peer's `:15006`; the destination sidecar's inbound
 /// listener recognizes a bare H2 CONNECT and relays it like HBONE does) — but
 /// the materialization is identical: per-port upstreams keyed to the service
-/// VIP. Headless / VIP-less services materialize nothing routable and warn (raw
-/// streams carry no Host, so captured dials are matched strictly by `(VIP,
-/// port)`). NodeWaypoint skips this materialization until the eBPF datapath can
-/// deliver HBONE to a reachable peer address.
+/// VIP. Headless / VIP-less services get no VIP upstream (raw streams carry no
+/// Host, so captured dials are matched strictly by `(VIP, port)`); their direct
+/// pod-IP dials are still routed through the per-workload upstreams built at the
+/// end of this function. NodeWaypoint skips this materialization until the eBPF
+/// datapath can deliver HBONE to a reachable peer address.
 fn materialize_mesh_outbound_tcp_upstreams(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -8034,15 +10503,16 @@ fn materialize_mesh_outbound_tcp_upstreams(
             continue;
         }
         if service.cluster_ips.is_empty() {
-            warn!(
+            // Headless services land here on every apply, and their direct
+            // pod-IP dials are routed by the per-workload index below, so this
+            // is not an operator-actionable warning.
+            debug!(
                 service = %sanitize_startup_scalar(service.name.to_string()),
                 namespace = %sanitize_startup_scalar(service.namespace.to_string()),
                 tcp_ports = tcp_ports.len(),
-                "In-mesh service declares stream-family (TCP) ports but carries no cluster_ips; \
-                 raw-TCP egress maps captured original destinations to services strictly by \
-                 service VIP (a raw stream has no Host header and a bare port number is \
-                 ambiguous), so these ports cannot be egress-routed. Headless services are \
-                 expected here; otherwise populate cluster_ips."
+                "In-mesh service declares stream-family (TCP) ports but carries no cluster_ips \
+                 (headless or VIP-less); no VIP route is materialized for them. Direct pod-IP \
+                 dials are routed by workload address."
             );
             continue;
         }
@@ -8216,7 +10686,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
 }
 
 /// Materialize per-port UDP egress upstreams for the UDP service ports of
-/// in-mesh services (F3 §3.3 Stage 4). **Ambient-only.**
+/// in-mesh services (F3 §3.3 Stage 4), on Ambient and Sidecar.
 ///
 /// Like raw-TCP egress, NO route proxy enters the config: a UDP datagram has no
 /// Host header to route by. Instead the captured datagram's original
@@ -8262,7 +10732,8 @@ fn materialize_mesh_outbound_udp_upstreams(
             continue;
         }
         if service.cluster_ips.is_empty() {
-            warn!(
+            // Sampled: a headless service repeats this on every slice apply.
+            crate::warn_sampled!(
                 service = %sanitize_startup_scalar(service.name.to_string()),
                 namespace = %sanitize_startup_scalar(service.namespace.to_string()),
                 udp_ports = udp_ports.len(),
@@ -8361,6 +10832,133 @@ pub(crate) fn mesh_external_udp_upstream_id(
 ) -> String {
     format!("{MESH_EXTERNAL_UDP_UPSTREAM_ID_PREFIX}{namespace}-{service_entry}-{port}-{dest_ip}")
         .replace(['/', '.', ':'], "-")
+}
+
+/// Where a DestinationRule's top-level `connectTimeout` is projected onto
+/// upstream port slots instead of onto the referencing proxies (issue #7387).
+///
+/// A route override (a `mesh_route_dispatch` rule destination or a
+/// weighted-split leg) changes the request's upstream but keeps the route
+/// proxy's own connect timeout, and re-resolves only the destination's
+/// `port_overrides`. So, for every upstream a route can reach that way (and
+/// the own upstream of every route that carries a proxy-scoped dispatch
+/// instance), the timeout lands on the upstream's port slots, and those
+/// routes keep their route-owned connect timeout: each destination then
+/// carries exactly its own rule's timeout, and a destination whose rule sets
+/// none falls back to the route's own value, never to another destination's
+/// rule. An upstream a subset-bound proxy references keeps the proxy-level
+/// projection (a port slot would outrank that subset's own connect timeout).
+struct RouteOverrideConnectTimeouts {
+    upstreams: HashMap<String, HashSet<String>>,
+    proxies: HashMap<String, HashSet<String>>,
+}
+
+impl RouteOverrideConnectTimeouts {
+    fn new(config: &GatewayConfig) -> Self {
+        let mut upstreams: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut proxies: HashMap<String, HashSet<String>> = HashMap::new();
+        for plugin in &config.plugin_configs {
+            if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+                continue;
+            }
+            let named = slice::mesh_route_dispatch_rule_upstream_ids(&plugin.config);
+            for id in &named {
+                upstreams
+                    .entry(plugin.namespace.clone())
+                    .or_default()
+                    .insert((*id).to_string());
+            }
+            // Every route the instance effectively runs on, resolved as the
+            // plugin cache resolves it: a proxy-scoped instance names its
+            // proxy; a global or proxy-group instance reaches every proxy it
+            // attaches to and that no same-type scoped instance replaces.
+            let effective: Vec<&Proxy> = match plugin.scope {
+                PluginScope::Proxy => plugin
+                    .proxy_id
+                    .as_deref()
+                    .and_then(|proxy_id| {
+                        config.proxies.iter().find(|proxy| {
+                            proxy.namespace == plugin.namespace && proxy.id == proxy_id
+                        })
+                    })
+                    .into_iter()
+                    .collect(),
+                PluginScope::Global | PluginScope::ProxyGroup => config
+                    .proxies
+                    .iter()
+                    .filter(|proxy| {
+                        crate::plugin_cache::plugin_config_effectively_applies_to_proxy(
+                            plugin, proxy, config,
+                        )
+                    })
+                    .collect(),
+            };
+            for proxy in effective {
+                // An override resolves in the reached route's namespace.
+                let reachable = upstreams.entry(proxy.namespace.clone()).or_default();
+                reachable.extend(named.iter().map(|id| (*id).to_string()));
+                if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+                    upstreams
+                        .entry(proxy.namespace.clone())
+                        .or_default()
+                        .insert(upstream_id.to_string());
+                }
+                proxies
+                    .entry(proxy.namespace.clone())
+                    .or_default()
+                    .insert(proxy.id.clone());
+            }
+        }
+        for proxy in &config.proxies {
+            if proxy.upstream_subset.is_some() {
+                if let Some(upstream_id) = proxy.upstream_id.as_deref()
+                    && let Some(ids) = upstreams.get_mut(proxy.namespace.as_str())
+                {
+                    ids.remove(upstream_id);
+                }
+                if let Some(ids) = proxies.get_mut(proxy.namespace.as_str()) {
+                    ids.remove(proxy.id.as_str());
+                }
+            }
+        }
+        Self { upstreams, proxies }
+    }
+
+    /// Whether `upstream_id` carries the rule's top-level timeout on its port
+    /// slots.
+    fn projects_onto(&self, namespace: &str, upstream_id: &str) -> bool {
+        self.upstreams
+            .get(namespace)
+            .is_some_and(|ids| ids.contains(upstream_id))
+    }
+
+    /// Whether `proxy` keeps its route-owned connect timeout: it can reach
+    /// other destinations through a route override, and its own upstream
+    /// carries the rule's timeout on its port slots instead.
+    fn keeps_route_timeout(&self, proxy: &Proxy) -> bool {
+        self.proxies
+            .get(proxy.namespace.as_str())
+            .is_some_and(|ids| ids.contains(proxy.id.as_str()))
+            && proxy
+                .upstream_id
+                .as_deref()
+                .is_some_and(|upstream_id| self.projects_onto(&proxy.namespace, upstream_id))
+    }
+}
+
+/// True for the mesh egress upstream families that no `config.proxies` entry
+/// references: each is dialed only through a relay proxy the router table
+/// synthesizes, which reads per-port DestinationRule policy from its
+/// `dispatch_port_overrides`. Covers raw TCP by VIP
+/// ([`mesh_outbound_tcp_upstream_id`]), raw TCP by workload
+/// ([`mesh_outbound_tcp_bywl_upstream_id`]), in-mesh UDP
+/// ([`mesh_outbound_udp_upstream_id`]) and external UDP
+/// ([`mesh_external_udp_upstream_id`]).
+fn is_proxyless_mesh_relay_upstream_id(id: &str) -> bool {
+    id.starts_with("__mesh-out-tcp-upstream-")
+        || id.starts_with("__mesh-out-tcp-bywl-upstream-")
+        || id.starts_with(MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX)
+        || id.starts_with(MESH_EXTERNAL_UDP_UPSTREAM_ID_PREFIX)
 }
 
 /// Build the synthesized relay proxy backing one SOURCE-side external UDP egress
@@ -8841,7 +11439,6 @@ fn mesh_outbound_tcp_relay_proxy_with_id(
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -8927,18 +11524,9 @@ fn build_outbound_mesh_targets(
         // than fall back to the service port — an unresolved named targetPort
         // (rollout skew / typo) must not dial the wrong port. Only an ABSENT
         // targetPort falls back to the service port.
-        let app_port = match service_port.target_port.as_ref() {
-            Some(_) => {
-                match resolve_target_port(service_port.target_port.as_ref(), &workload.ports) {
-                    Some(p) if p != 0 => p,
-                    _ => continue,
-                }
-            }
-            None => service_port.port,
-        };
-        if app_port == 0 {
+        let Some(app_port) = service_port.backend_port_for(&workload.ports) else {
             continue;
-        }
+        };
 
         let mut tags = match transport {
             MeshEgressTransport::Hbone => crate::service_discovery::mesh::mesh_hbone_target_tags(
@@ -9084,7 +11672,7 @@ fn build_outbound_mesh_targets(
 ///
 /// The service's remote workloads are first REACHABILITY-FILTERED (codex r2
 /// [R2-2]): a remote workload is kept only if it has ≥1 address AND its
-/// first-service-port target port resolves — MIRRORING
+/// target port for this `service_port` resolves — MIRRORING
 /// [`build_east_west_service_targets`]'s skip conditions on the GATEWAY side, so
 /// a workload the destination cluster's east-west materializer would itself drop
 /// (no pod IP / unresolved named targetPort) never produces a dead gateway path
@@ -9515,12 +12103,7 @@ fn append_cross_cluster_sidecar_l4_targets(
             );
             continue;
         }
-        let app_port = match service_port.target_port.as_ref() {
-            Some(_) => resolve_target_port(service_port.target_port.as_ref(), &workload.ports)
-                .filter(|port| *port != 0),
-            None => (service_port.port != 0).then_some(service_port.port),
-        };
-        let Some(app_port) = app_port else {
+        let Some(app_port) = service_port.backend_port_for(&workload.ports) else {
             continue;
         };
 
@@ -9696,7 +12279,7 @@ fn cross_cluster_hbone_synthetic_host(
 /// DESTINATION-SIDE FORWARDING (why the dest east-west gateway forwards to the
 /// app port, not `:15008`): the remote cluster's east-west gateway is a SNI
 /// passthrough that forwards the opaque outer TLS to the destination workload's
-/// APP PORT (`build_east_west_service_targets` resolves the first service port's
+/// APP PORT (`build_east_west_service_targets` resolves each service port's
 /// `targetPort` / container port, NOT a mesh terminator port). The destination
 /// pod's INBOUND CAPTURE then redirects that app-port traffic to the mesh
 /// terminator — iptables REDIRECT app-port → `:15008` for Ambient (an HBONE
@@ -9804,16 +12387,7 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
     // resolve (skip the workload otherwise — never fall back to the service
     // port); an ABSENT one uses the service port.
     let resolve_app_port = |workload: &crate::modes::mesh::config::Workload| -> Option<u16> {
-        match service_port.target_port.as_ref() {
-            Some(_) => {
-                match resolve_target_port(service_port.target_port.as_ref(), &workload.ports) {
-                    Some(p) if p != 0 => Some(p),
-                    _ => None,
-                }
-            }
-            None if service_port.port != 0 => Some(service_port.port),
-            None => None,
-        }
+        service_port.backend_port_for(&workload.ports)
     };
 
     // Build each pod's target into a local list first, tagging it with the
@@ -10008,14 +12582,8 @@ fn east_west_workload_is_reachable(
     if workload.addresses.is_empty() {
         return false;
     }
-    match service_port.target_port.as_ref() {
-        Some(_) => matches!(
-            resolve_target_port(service_port.target_port.as_ref(), &workload.ports),
-            Some(p) if p != 0
-        ),
-        // Absent targetPort falls back to the service port — always usable.
-        None => true,
-    }
+    // Absent targetPort means the service port; a declared one must resolve.
+    service_port.backend_port_for(&workload.ports).is_some()
 }
 
 /// The SNIs a client will ACCEPT an east-west gateway for: the base service FQDN
@@ -10222,7 +12790,6 @@ fn mesh_outbound_route_proxy(
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -10331,6 +12898,7 @@ fn mesh_outbound_route_upstream(
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         k8s_service_uid,
+        admission_upstream_id: None,
         pending_limit_scope: None,
         created_at: now,
         updated_at: now,
@@ -10363,7 +12931,8 @@ fn mesh_sd_selected_service_port(upstream: &Upstream, mesh_slice: &MeshSlice) ->
 /// so the policy attaches to the egress routes; application is HOST-LEVEL
 /// (materialized routes are host-routed `/`). Policy hosts resolve against
 /// each service's FQDN with DestinationRule host semantics
-/// (`destination_rule_host_matches`: bare name, `name.namespace`, FQDN).
+/// (`destination_rule_host_specificity`, exact matches only: bare name,
+/// `name.namespace`, FQDN; a wildcard VirtualService host attaches nothing).
 ///
 /// Determinism + conflict handling mirror `apply_destination_rules`: policies
 /// are sorted by `(namespace, name)` and the FIRST match per service wins
@@ -10389,9 +12958,9 @@ fn synthesize_mesh_outbound_cors_plugins(
     }
     // Normalize the host MATCH KEY here, not just in `MeshConfig::normalize()`:
     // a slice arriving over the native/xDS carriers never passes config-source
-    // normalization on this DP, and `destination_rule_host_matches` lowercases
-    // and strips trailing dots but does NOT trim whitespace — a padded carried
-    // host would silently match no service and synthesize no plugin.
+    // normalization on this DP; normalizing once here keeps the match key
+    // canonical for `destination_rule_host_specificity` and the policy's own
+    // recorded host alike.
     let client_namespace = mesh_slice.namespace.as_str();
     let mut sorted_policies: Vec<(String, &config::MeshVirtualServiceCorsPolicy)> = mesh_slice
         .virtual_service_cors_policies
@@ -10421,7 +12990,8 @@ fn synthesize_mesh_outbound_cors_plugins(
         let matching: Vec<&(String, &config::MeshVirtualServiceCorsPolicy)> = sorted_policies
             .iter()
             .filter(|(host, policy)| {
-                destination_rule_host_matches(host, &policy.namespace, &service_fqdn)
+                destination_rule_host_specificity(host, &policy.namespace, &service_fqdn)
+                    == Some(DestinationRuleHostSpecificity::Exact)
             })
             .collect();
         let Some((_, policy)) = matching.first() else {
@@ -10543,7 +13113,7 @@ fn apply_destination_rules(
 }
 
 /// [`apply_destination_rules`] against an explicit tenant TLS file root list.
-fn apply_destination_rules_with_tenant_file_roots(
+pub(crate) fn apply_destination_rules_with_tenant_file_roots(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
@@ -10562,6 +13132,13 @@ fn apply_destination_rules_with_tenant_file_roots(
         .collect();
     sorted_destination_rules
         .sort_by(|a, b| (&a.namespace, &a.name, &a.host).cmp(&(&b.namespace, &b.name, &b.host)));
+    let route_override_timeouts = RouteOverrideConnectTimeouts::new(config);
+    // Top-level `connectTimeout` projected onto port slots, by upstream index:
+    // the LAST matching rule's value (the sorted application order, like the
+    // proxy-level projection), seeded once every rule has applied so an
+    // earlier rule's seed never shadows a later one, and only onto slots no
+    // `portLevelSettings.connectTimeout` set.
+    let mut seeded_connect_timeouts: HashMap<usize, u64> = HashMap::new();
 
     // Owning Service port per materialized per-port outbound upstream
     // (forward-derived from the slice, like `mesh_outbound_service_groups`).
@@ -10636,6 +13213,18 @@ fn apply_destination_rules_with_tenant_file_roots(
             spec.service_port.port,
         );
     }
+    // EastWestGateway SNI-passthrough Service upstreams (issue #7424) join the
+    // same map under their owning Service port: each serves exactly one port's
+    // alias, so a `portLevelSettings` entry for a sibling port must not land on
+    // it, and the owner entry's selection-time fields govern the whole
+    // upstream. Forward-derived from the slice with the materializer's own id
+    // and label helpers, never parsed out of an id. They are also recorded
+    // apart so only the passthrough-safe part of a rule reaches them.
+    let mut sni_passthrough_upstream_keys: HashSet<NamespacedResourceId> = HashSet::new();
+    for (key, port) in east_west_sni_passthrough_upstream_owner_ports(runtime, mesh_slice) {
+        outbound_upstream_owner_port.insert(key.clone(), port);
+        sni_passthrough_upstream_keys.insert(key);
+    }
 
     // Target-service ownership evidence for the matched destination host, built
     // once per apply from the SAME indexes the slice builder's admission pass
@@ -10659,7 +13248,8 @@ fn apply_destination_rules_with_tenant_file_roots(
         .iter()
         .filter(|entry| service_entry_exported_to_namespace(entry, client_namespace))
         .collect();
-    let service_entry_hosts = index_service_entry_host_owners(visible_service_entries);
+    let service_entry_hosts =
+        index_service_entry_host_owners(visible_service_entries.iter().copied());
 
     // Istio resolves the DestinationRule for a destination HOST, so tier
     // arbitration is per destination host, not per upstream. Arbitrating per
@@ -10678,6 +13268,7 @@ fn apply_destination_rules_with_tenant_file_roots(
         cluster_domain: runtime.cluster_domain.trim_matches('.'),
         mesh_service_identities: &service_identities,
         service_entry_hosts: &service_entry_hosts,
+        host_exclusions: &mesh_slice.destination_rule_host_exclusions,
     };
     // The pass ALSO decides representability. An `Upstream` is ONE object: every
     // field a winning rule projects — load balancer, hash keys, backend TLS,
@@ -10692,11 +13283,50 @@ fn apply_destination_rules_with_tenant_file_roots(
     // service because `beta` sorts later — so this refuses instead, before any
     // upstream is mutated. See `docs/mesh.md` "An upstream that spans two
     // destinations".
-    let mut winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleLookupTier>>> =
+    //
+    // Within the winning tier, Istio's most-specific-host rule picks the rules
+    // (issue #7395, `destination_rule_host_specificity`): an exact host or
+    // Service alias beats any wildcard, and a longer wildcard suffix beats a
+    // shorter one. The winner per host is therefore `(tier, specificity)`.
+    //
+    // Materialized Service upstreams and other mesh-generated upstreams named
+    // with a destination host are arbitrated on that logical host alone
+    // (`is_logical_destination_upstream`, `upstream_destination_rule_match_hosts`).
+    let logical_service_upstreams: Vec<bool> = config
+        .upstreams
+        .iter()
+        .map(|upstream| {
+            is_logical_destination_upstream(
+                upstream,
+                &outbound_upstream_owner_port,
+                &visible_service_entries,
+            )
+        })
+        .collect();
+    let sni_passthrough_upstreams: Vec<bool> = config
+        .upstreams
+        .iter()
+        .map(|upstream| {
+            !sni_passthrough_upstream_keys.is_empty()
+                && sni_passthrough_upstream_keys.contains(&NamespacedResourceId::new(
+                    upstream.namespace.as_str(),
+                    upstream.id.as_str(),
+                ))
+        })
+        .collect();
+    let is_sni_passthrough =
+        |idx: usize| sni_passthrough_upstreams.get(idx).copied().unwrap_or(false);
+    let mut winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleWinner>>> =
         Vec::with_capacity(config.upstreams.len());
-    for upstream in &config.upstreams {
-        let hosts = upstream_destination_rule_match_hosts(upstream);
-        let mut winners: Vec<Option<DestinationRuleLookupTier>> = Vec::with_capacity(hosts.len());
+    for (upstream_idx, upstream) in config.upstreams.iter().enumerate() {
+        let hosts = upstream_destination_rule_match_hosts(
+            upstream,
+            logical_service_upstreams
+                .get(upstream_idx)
+                .copied()
+                .unwrap_or(false),
+        );
+        let mut winners: Vec<Option<DestinationRuleWinner>> = Vec::with_capacity(hosts.len());
         // The winning rule SET (indexes into `sorted_destination_rules`, which
         // is deterministically ordered) for each host that resolved one. Hosts
         // with NO winner contribute nothing: a destination no visible rule
@@ -10705,28 +13335,27 @@ fn apply_destination_rules_with_tenant_file_roots(
         // shape that has always inherited the upstream-wide policy.
         let mut winning_rule_sets: Vec<Vec<usize>> = Vec::new();
         for host in hosts {
-            let mut winner: Option<DestinationRuleLookupTier> = None;
+            let mut winner: Option<DestinationRuleWinner> = None;
             for dr in sorted_destination_rules.iter().copied() {
-                if !destination_rule_host_matches(&dr.host, &dr.namespace, host) {
-                    continue;
-                }
-                let Some(tier) = tier_scope.eligible_tier(dr, upstream, host) else {
+                let Some(candidate) =
+                    destination_rule_winner_candidate(&tier_scope, dr, upstream, host)
+                else {
                     continue;
                 };
                 winner = Some(match winner {
-                    Some(current) => current.min(tier),
-                    None => tier,
+                    Some(current) if current.outranks_or_ties(candidate) => current,
+                    _ => candidate,
                 });
             }
-            if let Some(tier) = winner {
+            if let Some(winner) = winner {
                 winning_rule_sets.push(
                     sorted_destination_rules
                         .iter()
                         .copied()
                         .enumerate()
                         .filter(|&(_, dr)| {
-                            destination_rule_host_matches(&dr.host, &dr.namespace, host)
-                                && tier_scope.eligible_tier(dr, upstream, host) == Some(tier)
+                            destination_rule_winner_candidate(&tier_scope, dr, upstream, host)
+                                == Some(winner)
                         })
                         .map(|(idx, _)| idx)
                         .collect(),
@@ -10765,6 +13394,9 @@ fn apply_destination_rules_with_tenant_file_roots(
     // refused after every rule has applied, so every TLS build for those
     // destinations fails while the rest of the slice applies.
     let mut tls_file_refused_upstreams: HashSet<usize> = HashSet::new();
+    // Client TLS modes the winning rules applied, per upstream index, for the
+    // EgressGateway origination decision (issue #7236).
+    let mut applied_client_tls_modes: HashMap<usize, AppliedClientTlsModes> = HashMap::new();
 
     for dr in sorted_destination_rules.iter().copied() {
         let mut matched_any_host = false;
@@ -10775,21 +13407,35 @@ fn apply_destination_rules_with_tenant_file_roots(
             .enumerate()
             .filter_map(|(idx, upstream)| {
                 let winners = winning_tier_by_upstream_host.get(idx)?;
-                let hosts = upstream_destination_rule_match_hosts(upstream);
+                let hosts = upstream_destination_rule_match_hosts(
+                    upstream,
+                    logical_service_upstreams.get(idx).copied().unwrap_or(false),
+                );
                 let mut wins_a_host = false;
                 for (host_idx, host) in hosts.into_iter().enumerate() {
-                    if !destination_rule_host_matches(&dr.host, &dr.namespace, host) {
+                    if host.specificity(dr).is_none() {
                         continue;
                     }
                     matched_any_host = true;
                     // A rule outside the lookup path is refused outright; a
-                    // rule from a lower-priority tier must not overwrite the
-                    // winning tier's policy for THIS host.
-                    let Some(tier) = tier_scope.eligible_tier(dr, upstream, host) else {
+                    // rule from a lower-priority tier, or a less specific
+                    // host in the winning tier, must not overwrite the
+                    // winning rules' policy for THIS host.
+                    // The lookup-path refusal count ignores shadowing: a
+                    // shadowed rule is in the lookup path.
+                    if host.specificity(dr).is_some_and(|specificity| {
+                        tier_scope
+                            .eligible_tier(dr, upstream, host.host, specificity)
+                            .is_some()
+                    }) {
+                        eligible_any_host = true;
+                    }
+                    let Some(candidate) =
+                        destination_rule_winner_candidate(&tier_scope, dr, upstream, host)
+                    else {
                         continue;
                     };
-                    eligible_any_host = true;
-                    if winners.get(host_idx).copied().flatten() == Some(tier) {
+                    if winners.get(host_idx).copied().flatten() == Some(candidate) {
                         wins_a_host = true;
                     }
                 }
@@ -10812,22 +13458,33 @@ fn apply_destination_rules_with_tenant_file_roots(
 
         // Slice validation admitted this rule's local TLS files lexically.
         // This node is about to project them onto its upstreams, so re-check
-        // each one after symlink resolution. Only rules that reach a local
+        // and bind each reference to confined loading. Only rules that reach a local
         // upstream are checked: a file's presence is per-node state, so one
         // tenant's missing or escaping file must fail only the destinations
         // that rule governs, never the whole slice.
-        let escape = crate::modes::mesh::config::destination_rule_tls_file_escape_error(
+        let prepared = crate::modes::mesh::config::bind_destination_rule_tls_files(
             dr,
             &mesh_slice.istio_root_namespace,
             tenant_file_roots,
         );
-        if let Some(error) = escape {
+        // An EastWestGateway SNI-passthrough upstream never receives the
+        // rule's TLS (see `sni_passthrough_destination_rule_view`), so a
+        // refused TLS file neither fails it closed nor counts toward the
+        // warnings below.
+        let tls_bearing_indices: Vec<usize> = matching_upstream_indices
+            .iter()
+            .copied()
+            .filter(|&idx| !is_sni_passthrough(idx))
+            .collect();
+        if let Err(error) = &prepared
+            && !tls_bearing_indices.is_empty()
+        {
             // HBONE and Sidecar mesh-mTLS dispatch never reads backend TLS
             // material: those transports run only for plaintext-scheme proxies
             // and authenticate with the gateway SVID. Refusing the material
             // therefore leaves their traffic on the mesh identity, so the
             // warning must not claim it fails closed.
-            let mesh_transport_upstreams = matching_upstream_indices
+            let mesh_transport_upstreams = tls_bearing_indices
                 .iter()
                 .filter(|&&idx| {
                     config
@@ -10836,7 +13493,7 @@ fn apply_destination_rules_with_tenant_file_roots(
                         .is_some_and(upstream_uses_mesh_transport)
                 })
                 .count();
-            let tls_upstreams = matching_upstream_indices.len() - mesh_transport_upstreams;
+            let tls_upstreams = tls_bearing_indices.len() - mesh_transport_upstreams;
             let reason = sanitize_startup_scalar(error);
             if tls_upstreams > 0 {
                 warn!(
@@ -10861,8 +13518,14 @@ fn apply_destination_rules_with_tenant_file_roots(
                      identity, which never uses that material"
                 );
             }
-            tls_file_refused_upstreams.extend(matching_upstream_indices.iter().copied());
+            tls_file_refused_upstreams.extend(tls_bearing_indices.iter().copied());
         }
+        let dr = prepared.as_ref().map_or(dr, |prepared| prepared.as_ref());
+        // Built once per rule, only when it governs a passthrough upstream.
+        let passthrough_view = matching_upstream_indices
+            .iter()
+            .any(|&idx| is_sni_passthrough(idx))
+            .then(|| sni_passthrough_destination_rule_view(dr));
 
         let connect_timeout_ms = dr
             .traffic_policy
@@ -10870,9 +13533,16 @@ fn apply_destination_rules_with_tenant_file_roots(
             .and_then(|tp| tp.connect_timeout_ms);
 
         for idx in matching_upstream_indices {
+            let dr = match passthrough_view.as_ref() {
+                Some(view) if is_sni_passthrough(idx) => view,
+                _ => dr,
+            };
             let upstream = &mut config.upstreams[idx];
             if let Some(ref policy) = dr.traffic_policy {
                 apply_traffic_policy_to_upstream(upstream, policy, runtime)?;
+                if let Some(ref tls) = policy.tls {
+                    applied_client_tls_modes.entry(idx).or_default().top_level = Some(tls.mode);
+                }
             }
             // Capture this DR's settled top-level passive tier before an
             // owner-gated port policy is also projected onto the upstream for
@@ -11049,6 +13719,12 @@ fn apply_destination_rules_with_tenant_file_roots(
                     .outlier_detection
                     .as_ref()
                     .and_then(|_| top_level_passive.clone());
+                if let Some(ref port_tls) = port_policy.tls {
+                    let modes = applied_client_tls_modes.entry(idx).or_default();
+                    for store_port in &store_ports {
+                        modes.per_port.insert(*store_port, port_tls.mode);
+                    }
+                }
                 for store_port in store_ports {
                     let override_slot = upstream.port_overrides.entry(store_port).or_default();
                     if override_slot.passive_health_check.is_none()
@@ -11175,39 +13851,40 @@ fn apply_destination_rules_with_tenant_file_roots(
                 upstream.resolved_subset_tls.clear();
             }
 
-            // Top-level `trafficPolicy.connectTimeout` for a UDP egress upstream
-            // (codex r6 P2). The top-level timeout is applied to `config.proxies`
-            // below, but a UDP egress upstream (`__mesh-out-udp-upstream-*`) is
-            // referenced by NO config proxy — it materializes a synthesized relay
-            // proxy in the router table that dials via
-            // `hbone_pool::get_datagram_tunnel`, which reads the connect timeout
-            // from `dispatch_port_overrides` (projected from `port_overrides`) and
-            // otherwise falls back to the relay proxy's hardcoded default. Seed the
-            // top-level value onto each materialized target policy port carrying no
-            // per-port `portLevelSettings.connectTimeout`, so the UDP relay honors
-            // the operator's top-level connectTimeout instead of the 5s default.
+            // Top-level `trafficPolicy.connectTimeout` for a proxy-less relay
+            // upstream (codex r6 P2, issue #7232). The top-level timeout is
+            // applied to `config.proxies` below, but the raw-TCP
+            // (`__mesh-out-tcp-upstream-*`, `__mesh-out-tcp-bywl-upstream-*`) and
+            // UDP (`__mesh-out-udp-upstream-*`, `__mesh-out-udp-ext-upstream-*`)
+            // egress upstreams are referenced by NO config proxy. Each
+            // materializes a synthesized relay proxy in the router table whose
+            // `dispatch_port_overrides` are projected from `port_overrides`; the
+            // relay dials (`HboneConnectionPool::get_tunnel_via`,
+            // `MeshMtlsConnectionPool::open_connect_tunnel`,
+            // `hbone_pool::get_datagram_tunnel`) read the per-port connect
+            // timeout from there and otherwise fall back to the relay proxy's
+            // hardcoded default. Seed the top-level value onto each materialized
+            // target policy port carrying no per-port
+            // `portLevelSettings.connectTimeout`, so the relay honors the
+            // operator's top-level connectTimeout instead of the 5s default.
             // Per-port entries written above already win (only unset slots are
-            // seeded); other lanes are unaffected — raw-TCP relay proxies do not
-            // read `dispatch_port_overrides`, and HTTP upstreams reach config
-            // proxies. Keyed by the selected target's policy port because
-            // `get_datagram_tunnel` receives both the dial app port and the owning
-            // Service-port policy key for targetPort-remapped UDP services.
+            // seeded). HTTP upstreams are deliberately not seeded: they reach
+            // config proxies below, and a seeded port slot would outrank a
+            // selected subset's `connectTimeout` there. The exception is an
+            // upstream a request reaches through a route override (a
+            // `mesh_route_dispatch` rule destination or weighted-split leg,
+            // issue #7387) and no subset-bound proxy references: the override
+            // keeps the route proxy's own connect timeout and re-resolves only
+            // the destination's `port_overrides`, so without the seed the
+            // top-level connectTimeout would not follow the request there.
+            // Keyed by the selected target's policy port because the relay
+            // dials receive both the dial app port and the owning Service-port
+            // policy key for targetPort-remapped services.
             if let Some(timeout_ms) = connect_timeout_ms
-                && upstream.id.starts_with("__mesh-out-udp-upstream-")
+                && (is_proxyless_mesh_relay_upstream_id(&upstream.id)
+                    || route_override_timeouts.projects_onto(&upstream.namespace, &upstream.id))
             {
-                let mut target_policy_ports: Vec<u16> = upstream
-                    .targets
-                    .iter()
-                    .map(UpstreamTarget::dispatch_policy_port)
-                    .collect();
-                target_policy_ports.sort_unstable();
-                target_policy_ports.dedup();
-                for port in target_policy_ports {
-                    let slot = upstream.port_overrides.entry(port).or_default();
-                    if slot.connect_timeout_ms.is_none() {
-                        slot.connect_timeout_ms = Some(timeout_ms);
-                    }
-                }
+                seeded_connect_timeouts.insert(idx, timeout_ms);
             }
 
             // Per-subset `connectionPool.tcp.connectTimeout` overrides the DR
@@ -11239,6 +13916,10 @@ fn apply_destination_rules_with_tenant_file_roots(
                 for proxy in &mut config.proxies {
                     if proxy.upstream_id.as_deref() != Some(upstream_id.as_str())
                         || proxy.namespace != upstream_namespace
+                        // A route that can reach other destinations keeps its
+                        // own timeout; its upstream's port slots carry this
+                        // rule's (issue #7387).
+                        || route_override_timeouts.keeps_route_timeout(proxy)
                     {
                         continue;
                     }
@@ -11330,6 +14011,30 @@ fn apply_destination_rules_with_tenant_file_roots(
         }
     }
 
+    // Seed each projected top-level `connectTimeout` (see
+    // `seeded_connect_timeouts`) onto every target policy port without an
+    // explicit per-port timeout. Keyed by the selected target's policy port
+    // because the dials receive both the dial app port and the owning
+    // Service-port policy key for targetPort-remapped services.
+    for (idx, timeout_ms) in seeded_connect_timeouts {
+        let Some(upstream) = config.upstreams.get_mut(idx) else {
+            continue;
+        };
+        let mut target_policy_ports: Vec<u16> = upstream
+            .targets
+            .iter()
+            .map(UpstreamTarget::dispatch_policy_port)
+            .collect();
+        target_policy_ports.sort_unstable();
+        target_policy_ports.dedup();
+        for port in target_policy_ports {
+            let slot = upstream.port_overrides.entry(port).or_default();
+            if slot.connect_timeout_ms.is_none() {
+                slot.connect_timeout_ms = Some(timeout_ms);
+            }
+        }
+    }
+
     if refused_out_of_lookup_path > 0 {
         // Bounded and value-free: only the count and the subscriber's own
         // namespace. A slice-built path refuses these at admission, so
@@ -11357,7 +14062,88 @@ fn apply_destination_rules_with_tenant_file_roots(
         }
     }
 
+    project_egress_gateway_origination(config, runtime, mesh_slice, &applied_client_tls_modes);
+    project_node_waypoint_leg_origination(config, runtime, &applied_client_tls_modes);
+
     Ok(())
+}
+
+/// Let the DestinationRule drive the backend scheme of every external
+/// weighted-split leg a NodeWaypoint or Sidecar carried route dispatches
+/// (issues #7387, #7423, Istio semantics).
+///
+/// A leg-dispatched split sends each external host through its own residual
+/// upstream (`<split>-external-<n>`, one target), where that host's
+/// DestinationRule applied its TLS material. Carried routes are plain HTTP,
+/// so once rules have applied, a residual whose effective `tls.mode` on its
+/// target's port (the `portLevelSettings` entry, else the top-level `tls`) is
+/// `SIMPLE`, `MUTUAL` or `ISTIO_MUTUAL` gets `originate_tls` on every leg
+/// naming it: when the dispatch finalizer selects that leg it publishes the
+/// `https` scheme beside the upstream override, so the request originates TLS
+/// with the residual's own backend TLS. `DISABLE` or no `tls` keeps the leg
+/// plaintext. Service legs are never marked: they ride the mesh transport.
+fn project_node_waypoint_leg_origination(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    applied: &HashMap<usize, AppliedClientTlsModes>,
+) {
+    if !runtime.topology.serves_virtual_service_http_routes() || applied.is_empty() {
+        return;
+    }
+    let originating: HashSet<(String, String)> = applied
+        .iter()
+        .filter_map(|(idx, modes)| {
+            let upstream = config.upstreams.get(*idx)?;
+            if !upstream
+                .id
+                .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+            {
+                return None;
+            }
+            let [target] = upstream.targets.as_slice() else {
+                return None;
+            };
+            modes
+                .originates_tls(target.dispatch_policy_port())
+                .then(|| (upstream.namespace.clone(), upstream.id.clone()))
+        })
+        .collect();
+    if originating.is_empty() {
+        return;
+    }
+    for plugin in &mut config.plugin_configs {
+        if plugin.plugin_name != "mesh_route_dispatch" {
+            continue;
+        }
+        let namespace = plugin.namespace.clone();
+        let Some(splits) = plugin
+            .config
+            .get_mut("weighted_splits")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for leg in splits
+            .iter_mut()
+            .filter_map(|split| split.get_mut("legs"))
+            .filter_map(serde_json::Value::as_array_mut)
+            .flatten()
+        {
+            let Some(leg) = leg.as_object_mut() else {
+                continue;
+            };
+            let Some(leg_id) = leg.get("upstream_id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if originating.contains(&(namespace.clone(), leg_id.to_string())) {
+                debug!(
+                    upstream = %sanitize_startup_scalar(leg_id),
+                    "DestinationRule tls.mode originates TLS for a weighted split's external leg"
+                );
+                leg.insert("originate_tls".to_string(), serde_json::Value::Bool(true));
+            }
+        }
+    }
 }
 
 /// Fail an upstream's backend TLS closed at every scope (upstream, per-port,
@@ -11489,8 +14275,8 @@ fn resolve_subset_traffic_policy(
 
 /// Project a `MeshTrafficPolicy` onto a per-port `UpstreamPortOverride` slot.
 ///
-/// Per-port `tls` is intentionally not applied here today because backend TLS
-/// posture is stored at upstream scope (`backend_tls_*`), not per-port.
+/// Per-port `tls` is not applied here: the `portLevelSettings` caller resolves
+/// it separately and stores it on the slot's `tls` field.
 fn apply_traffic_policy_to_port_override(
     slot: &mut UpstreamPortOverride,
     policy: &MeshTrafficPolicy,
@@ -11648,9 +14434,27 @@ struct MaterializationTierScope<'a> {
     /// evidence an external host has — it pins no namespace syntactically, and
     /// the upstream carrying it need not live in the owning namespace.
     service_entry_hosts: &'a std::collections::BTreeMap<String, ServiceEntryHostOwner>,
+    /// Control-plane-resolved host exclusions (issue #7395,
+    /// `MeshSlice::destination_rule_host_exclusions`): a visible wildcard rule
+    /// that Istio's exported-rule host selection does not apply to a host
+    /// because a rule hidden from this subscriber is more specific there.
+    host_exclusions: &'a [slice::DestinationRuleHostExclusion],
 }
 
 impl MaterializationTierScope<'_> {
+    /// Whether the control plane resolved that `dr` does not apply to this
+    /// destination host (Istio falls through to the next tier there; see
+    /// `slice::destination_rule_host_exclusions`).
+    fn excluded_for_host(
+        &self,
+        dr: &MeshDestinationRule,
+        host: DestinationRuleMatchHost<'_>,
+    ) -> bool {
+        self.host_exclusions
+            .iter()
+            .any(|exclusion| exclusion.excludes(dr, host.host))
+    }
+
     /// Istio lookup tier for a `(DestinationRule, Upstream, destination host)`
     /// triple, or `None` when the rule must be refused outright.
     ///
@@ -11697,11 +14501,18 @@ impl MaterializationTierScope<'_> {
     /// so a reverse-translated xDS carrier — which never passes
     /// `admit_destination_rules` — cannot land an arbitrary namespace's rule
     /// on this workload's routes.
+    ///
+    /// A WILDCARD rule (issue #7395) reaches the service tier exactly for the
+    /// matched destinations its own namespace owns by that resolved evidence,
+    /// as at admission (`slice::admit_destination_rules`): the upstream-
+    /// namespace fallback in (2) never applies to it, so a wildcard can never
+    /// claim the service tier for a host whose owner is unknown.
     fn eligible_tier(
         &self,
         dr: &MeshDestinationRule,
         upstream: &Upstream,
         matched_host: &str,
+        specificity: DestinationRuleHostSpecificity,
     ) -> Option<DestinationRuleLookupTier> {
         let host_owner = destination_host_owner(
             matched_host,
@@ -11711,13 +14522,21 @@ impl MaterializationTierScope<'_> {
         );
         let service_namespace = match host_owner.as_ref() {
             Some(owner) => Some(owner.namespace()),
-            None => {
+            // Only a concrete exact host may borrow the upstream's
+            // namespace: a rule spelled like a wildcard ServiceEntry host
+            // is an `Exact` match too, but owns nothing without the
+            // ServiceEntry index (admission refuses it the same way).
+            None if specificity == DestinationRuleHostSpecificity::Exact
+                && !matched_host.contains('*')
+                && !dr.host.contains('*') =>
+            {
                 let upstream_namespace = upstream.namespace.trim();
                 (!upstream_namespace.is_empty()).then_some(upstream_namespace)
             }
+            None => None,
         };
         let tier = destination_rule_lookup_tier(
-            &dr.namespace,
+            dr,
             self.client_namespace,
             service_namespace,
             self.root_namespace,
@@ -11730,18 +14549,122 @@ impl MaterializationTierScope<'_> {
 /// on, in a STABLE order: target hosts first, then the upstream `name`, then
 /// the upstream `id`.
 ///
+/// A materialized Service upstream (`logical_service_upstream`: one the
+/// slice's Service inventory forward-derives, named with the Service FQDN) is
+/// arbitrated on its LOGICAL Service host alone, as Istio looks a
+/// DestinationRule up by Service hostname (issue #7395): its targets are
+/// workload addresses, east-west gateway endpoints, or opaque cross-cluster
+/// transport identities, none of which is a destination host a rule names.
+/// Matching them would let a wildcard win a gateway endpoint while an exact
+/// rule wins the Service name, and refuse the upstream as spanning two
+/// destinations.
+///
 /// A DR matches the upstream iff it matches at least one of these. Order is
 /// load-bearing — `apply_destination_rules` indexes its precomputed per-host
 /// winning tiers against this list, and calls this helper again during
 /// application, so the two must enumerate identically.
-fn upstream_destination_rule_match_hosts(upstream: &Upstream) -> Vec<&str> {
-    let mut hosts: Vec<&str> = Vec::with_capacity(upstream.targets.len() + 2);
-    hosts.extend(upstream.targets.iter().map(|target| target.host.as_str()));
-    if let Some(name) = upstream.name.as_deref() {
-        hosts.push(name);
+fn upstream_destination_rule_match_hosts(
+    upstream: &Upstream,
+    logical_service_upstream: bool,
+) -> Vec<DestinationRuleMatchHost<'_>> {
+    let mut hosts: Vec<DestinationRuleMatchHost<'_>> =
+        Vec::with_capacity(upstream.targets.len() + 2);
+    if !logical_service_upstream {
+        hosts.extend(
+            upstream
+                .targets
+                .iter()
+                .map(|target| DestinationRuleMatchHost {
+                    host: target.host.as_str(),
+                    wildcard_eligible: true,
+                }),
+        );
     }
-    hosts.push(upstream.id.as_str());
+    if let Some(name) = upstream.name.as_deref() {
+        hosts.push(DestinationRuleMatchHost {
+            host: name,
+            // A name that merely repeats the id is a synthetic identifier
+            // (UDP listener upstreams), not a destination host.
+            wildcard_eligible: name != upstream.id,
+        });
+    }
+    hosts.push(DestinationRuleMatchHost {
+        host: upstream.id.as_str(),
+        wildcard_eligible: false,
+    });
     hosts
+}
+
+/// One candidate destination host of an upstream for DestinationRule
+/// matching (issue #7395). Every candidate matches an exact rule host or
+/// Service alias as before; only `wildcard_eligible` ones (destination hosts,
+/// never an upstream id or a name that repeats it) can be named by a wildcard,
+/// so a catch-all `*` never latches onto a synthetic dotted identifier.
+#[derive(Debug, Clone, Copy)]
+struct DestinationRuleMatchHost<'a> {
+    host: &'a str,
+    wildcard_eligible: bool,
+}
+
+impl DestinationRuleMatchHost<'_> {
+    /// How specifically `dr` names this candidate, honouring
+    /// `wildcard_eligible`.
+    fn specificity(&self, dr: &MeshDestinationRule) -> Option<DestinationRuleHostSpecificity> {
+        destination_rule_host_specificity(&dr.host, &dr.namespace, self.host).filter(
+            |specificity| {
+                self.wildcard_eligible || *specificity == DestinationRuleHostSpecificity::Exact
+            },
+        )
+    }
+}
+
+/// Whether an upstream is arbitrated on its logical destination host alone
+/// (see [`upstream_destination_rule_match_hosts`]). Every case is
+/// forward-derived from the slice or the reserved mesh id space, never parsed
+/// out of an operator id:
+///
+/// * a materialized per-port Service upstream (`outbound_upstream_owner_port`),
+///   EastWestGateway SNI-passthrough Service upstreams included (issue #7424);
+/// * an EgressGateway ServiceEntry upstream: its id is exactly
+///   `mesh_egress_upstream_id` of a visible ServiceEntry, one of that entry's
+///   hosts (the upstream's `name`) and one of its ports;
+/// * any other mesh-generated upstream (reserved `__mesh` id, the provenance
+///   [`TrustedMeshGeneratedResourceIds`] trusts) named with a destination host
+///   distinct from its id, such as a source-side external UDP upstream named
+///   with its ServiceEntry host.
+///
+/// Their targets are transport endpoints (workload or STATIC endpoint
+/// addresses, DNS endpoints, gateway endpoints, cross-cluster transport
+/// identities), never independent destinations a rule names.
+fn is_logical_destination_upstream(
+    upstream: &Upstream,
+    outbound_upstream_owner_port: &HashMap<NamespacedResourceId, u16>,
+    service_entries: &[&ServiceEntry],
+) -> bool {
+    if outbound_upstream_owner_port.contains_key(&NamespacedResourceId::new(
+        upstream.namespace.as_str(),
+        upstream.id.as_str(),
+    )) {
+        return true;
+    }
+    let Some(name) = upstream.name.as_deref() else {
+        return false;
+    };
+    if name == upstream.id {
+        return false;
+    }
+    let is_egress_service_entry_upstream = service_entries.iter().any(|entry| {
+        entry.hosts.iter().any(|host| host == name)
+            && entry.ports.iter().any(|port| {
+                mesh_egress_upstream_id(&entry.namespace, &entry.name, name, port.port)
+                    == upstream.id
+            })
+    });
+    if is_egress_service_entry_upstream {
+        return true;
+    }
+    upstream.id.starts_with("__mesh")
+        && is_wildcard_matchable_host(&name.trim().trim_end_matches('.').to_ascii_lowercase())
 }
 
 /// True when EVERY target of this upstream dispatches through an SVID-backed
@@ -11785,27 +14708,139 @@ fn upstream_uses_mesh_transport(upstream: &Upstream) -> bool {
     }
 }
 
-fn destination_rule_host_matches(rule_host: &str, namespace: &str, candidate: &str) -> bool {
-    let rule_host = rule_host.trim_end_matches('.').to_ascii_lowercase();
-    let candidate = candidate.trim_end_matches('.').to_ascii_lowercase();
-    if candidate == rule_host {
-        return true;
-    }
+/// How specifically a DestinationRule `host` names a destination host, for
+/// Istio's most-specific-host precedence (issue #7395): an exact host or one
+/// of its Service aliases beats every wildcard, and a longer wildcard suffix
+/// beats a shorter one (`*.svc.cluster.local` beats `*.cluster.local` beats
+/// `*`). Derived `Ord` follows that ranking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DestinationRuleHostSpecificity {
+    /// `*` (suffix length 0) or `*.<suffix>`, by suffix length in bytes.
+    Wildcard(usize),
+    /// The exact host, or a Service alias of it (short name, `<svc>.<ns>`,
+    /// `<svc>.<ns>.svc[.<domain>]`).
+    Exact,
+}
 
-    if !rule_host.contains('.') {
-        let namespaced = format!("{rule_host}.{namespace}");
-        return candidate == namespaced || candidate.starts_with(&format!("{namespaced}.svc."));
-    }
+/// Whether `candidate` (already trimmed and lowercased) is a DNS host name a
+/// wildcard DestinationRule host may name: dotted, every label non-empty and
+/// made of letters, digits, `-` or `_`, and not an IP literal. A wildcard
+/// ServiceEntry host (`*.example.com`) qualifies too, as in Istio (a broader
+/// wildcard rule such as `*` or `*.com` names it). That excludes IP-literal
+/// targets, dotless upstream ids, and opaque transport identities such as the
+/// cross-cluster HBONE synthetic host (`mesh-xc-hbone|<gateway>|<port>|<pod>`),
+/// which no Istio host lookup sees.
+fn is_wildcard_matchable_host(candidate: &str) -> bool {
+    // A wildcard ServiceEntry declaration is a DNS name even when its suffix
+    // is a single label (`*.internal`, `*.com`; Istio's `*` names them); only a
+    // concrete name must be dotted, which keeps dotless upstream ids out.
+    let (wildcard_declaration, candidate) = match candidate.strip_prefix("*.") {
+        Some(suffix) => (true, suffix),
+        None => (false, candidate),
+    };
+    (wildcard_declaration || candidate.contains('.'))
+        && candidate.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+        && candidate.parse::<std::net::IpAddr>().is_err()
+}
 
-    let dot_count = rule_host.bytes().filter(|byte| *byte == b'.').count();
-    if dot_count == 1 {
-        return candidate.starts_with(&format!("{rule_host}.svc."));
+/// Whether, and how specifically, DestinationRule `rule_host` (declared in
+/// `namespace`) names destination host `candidate`. The ONE DestinationRule
+/// host matcher (issue #7395): rule application (`apply_destination_rules`),
+/// the NodeWaypoint carried-route binding (`destination_rules_naming_host`)
+/// and the ServiceWaypoint slice narrowing
+/// (`slice::destination_rule_matches_admitted_service`) all select through
+/// it, so they agree by construction.
+///
+/// Exact arm: the host itself, or, for a short host, a Service alias resolved
+/// in the RULE's namespace (`reviews` ⇒ `reviews.<ns>`,
+/// `reviews.<ns>.svc.<domain>`), a two-label `<svc>.<ns>` or `<svc>.<ns>.svc`
+/// host ⇒ its `.svc.<domain>` form.
+///
+/// Wildcard arm (Istio semantics): `*.example.com` names `api.example.com` and
+/// `a.b.example.com`, never `example.com`; `*` names every host. A wildcard
+/// names DNS host names only ([`is_wildcard_matchable_host`]).
+pub(crate) fn destination_rule_host_specificity(
+    rule_host: &str,
+    namespace: &str,
+    candidate: &str,
+) -> Option<DestinationRuleHostSpecificity> {
+    let rule_host = rule_host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let candidate = candidate.trim().trim_end_matches('.').to_ascii_lowercase();
+    if candidate.is_empty() {
+        return None;
     }
-    if rule_host.ends_with(".svc") {
-        return candidate.starts_with(&format!("{rule_host}."));
+    if let Some(suffix) = rule_host.strip_prefix('*') {
+        // A wildcard ServiceEntry host the rule spells identically is an
+        // exact match, as Istio's exact-host lookup finds it first.
+        if candidate == rule_host {
+            return Some(DestinationRuleHostSpecificity::Exact);
+        }
+        if !is_wildcard_matchable_host(&candidate) {
+            return None;
+        }
+        if suffix.is_empty() {
+            return Some(DestinationRuleHostSpecificity::Wildcard(0));
+        }
+        // `*` must stand for whole leading labels.
+        if !suffix.starts_with('.') {
+            return None;
+        }
+        return (candidate.len() > suffix.len() && candidate.ends_with(suffix))
+            .then_some(DestinationRuleHostSpecificity::Wildcard(suffix.len()));
     }
+    let exact = if candidate == rule_host {
+        true
+    } else if !rule_host.contains('.') {
+        let namespaced = format!("{rule_host}.{}", namespace.trim());
+        candidate == namespaced || candidate.starts_with(&format!("{namespaced}.svc."))
+    } else if rule_host.bytes().filter(|byte| *byte == b'.').count() == 1 {
+        candidate.starts_with(&format!("{rule_host}.svc."))
+    } else if rule_host.ends_with(".svc") {
+        candidate.starts_with(&format!("{rule_host}."))
+    } else {
+        false
+    };
+    exact.then_some(DestinationRuleHostSpecificity::Exact)
+}
 
-    false
+/// The rules that win one destination host (issue #7395): the most specific
+/// lookup tier first (client, then target service, then root namespace, see
+/// [`destination_rule_lookup_tier`]), then, within that tier, the most
+/// specific host match. Rules tied on both apply together, in the sorted
+/// application order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DestinationRuleWinner {
+    tier: DestinationRuleLookupTier,
+    specificity: DestinationRuleHostSpecificity,
+}
+
+impl DestinationRuleWinner {
+    /// True when `self` wins over, or ties with, `other`.
+    fn outranks_or_ties(self, other: Self) -> bool {
+        self.tier < other.tier || (self.tier == other.tier && self.specificity >= other.specificity)
+    }
+}
+
+/// `dr`'s claim on destination host `host` of `upstream`: its lookup tier and
+/// host specificity, or `None` when it does not name the host or is outside
+/// the lookup path.
+fn destination_rule_winner_candidate(
+    tier_scope: &MaterializationTierScope<'_>,
+    dr: &MeshDestinationRule,
+    upstream: &Upstream,
+    host: DestinationRuleMatchHost<'_>,
+) -> Option<DestinationRuleWinner> {
+    let specificity = host.specificity(dr)?;
+    let tier = tier_scope.eligible_tier(dr, upstream, host.host, specificity)?;
+    if tier_scope.excluded_for_host(dr, host) {
+        return None;
+    }
+    Some(DestinationRuleWinner { tier, specificity })
 }
 
 /// Apply a `MeshTrafficPolicy` onto a Ferrum `Upstream`.
@@ -11822,9 +14857,11 @@ fn apply_traffic_policy_to_upstream(
 ) -> Result<(), anyhow::Error> {
     if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
         upstream.algorithm = algorithm;
-    }
-    if let Some(hash_on) = mesh_hash_on_to_ferrum(&policy.load_balancer) {
-        upstream.hash_on = Some(hash_on);
+        // Unconditional, like the per-port slot: switching the upstream to a
+        // non-hash algorithm clears a stale hash key, which
+        // `HashOnStrategy::parse` would otherwise still turn into a
+        // per-request hash strategy.
+        upstream.hash_on = mesh_hash_on_to_ferrum(&policy.load_balancer);
     }
 
     // Outlier detection -> passive health check.
@@ -11891,7 +14928,7 @@ fn apply_traffic_policy_tls_to_upstream(
 ///
 /// Shared overlay used by both the upstream-level apply
 /// ([`apply_traffic_policy_tls_to_upstream`]) and the per-subset apply
-/// ([`apply_subset_traffic_policy_tls`]), so subset TLS overrides cannot drift
+/// (`resolve_subset_traffic_policy`), so subset TLS overrides cannot drift
 /// from the upstream-level translation. `identity` is used only for log /
 /// error context (the upstream id, or `<upstream>/<subset>`).
 ///
@@ -12025,7 +15062,7 @@ fn apply_traffic_policy_tls_to_backend_config(
         // PeerAuthentication-side modes are rejected at translate time;
         // an in-memory slice that still carries one is a programming
         // error. Treat as a no-op rather than panic on the cold path.
-        MtlsMode::Strict | MtlsMode::Permissive => {
+        MtlsMode::Strict | MtlsMode::Permissive | MtlsMode::Unset => {
             warn!(
                 identity = %sanitize_startup_scalar(identity.to_string()),
                 mode = %sanitize_startup_scalar(format!("{:?}", tls.mode)),
@@ -12885,14 +15922,23 @@ fn build_http_egress_for_entry(
             continue;
         }
 
-        materialized_http_hosts.insert(host.clone());
-
         let upstream_id =
             mesh_egress_upstream_id(&entry.namespace, &entry.name, host, port_spec.port);
-
-        upstreams.push(build_egress_upstream(&upstream_id, namespace, targets, now));
-
         let proxy_id = mesh_egress_proxy_id(&entry.namespace, &entry.name, host, port_spec.port);
+        if !egress_resource_ids_fit(entry, &proxy_id, &upstream_id) {
+            continue;
+        }
+
+        materialized_http_hosts.insert(host.clone());
+
+        upstreams.push(build_egress_upstream(
+            &upstream_id,
+            host,
+            namespace,
+            targets,
+            now,
+        ));
+
         let proxy = egress_gateway_proxy(
             &proxy_id,
             host,
@@ -12905,14 +15951,14 @@ fn build_http_egress_for_entry(
     }
 }
 
-/// Stream-family (TCP / UDP) egress materialization branch. One stream proxy
+/// Stream-family (TCP-based) egress materialization branch. One stream proxy
 /// per ServiceEntry port, listening on the entry's own port number so that
 /// sidecar outbound capture routes traffic to the same destination port the
 /// workload was already dialing. The proxy chooses the first host in the
 /// entry's `hosts` list as the upstream target identity (DNS resolution
 /// flow) or every endpoint address (static resolution flow). Additional
 /// hosts on the same entry / port are ignored — a raw L4 listener cannot
-/// distinguish hosts (no SNI for plain TCP/UDP), so operators should split
+/// distinguish hosts (no SNI for plain TCP), so operators should split
 /// multi-host external services into one ServiceEntry per host.
 #[allow(clippy::too_many_arguments)]
 fn build_stream_egress_for_entry(
@@ -13030,22 +16076,34 @@ fn build_stream_egress_for_entry(
         return;
     }
 
-    materialized_stream_ports.insert(port_spec.port);
-
     let upstream_id = mesh_egress_upstream_id(
         &entry.namespace,
         &entry.name,
         representative_host,
         port_spec.port,
     );
-    upstreams.push(build_egress_upstream(&upstream_id, namespace, targets, now));
-
     let proxy_id = mesh_egress_proxy_id(
         &entry.namespace,
         &entry.name,
         representative_host,
         port_spec.port,
     );
+    // Checked before the port is claimed, so a skipped entry does not block a
+    // valid ServiceEntry on the same listen_port.
+    if !egress_resource_ids_fit(entry, &proxy_id, &upstream_id) {
+        return;
+    }
+
+    materialized_stream_ports.insert(port_spec.port);
+
+    upstreams.push(build_egress_upstream(
+        &upstream_id,
+        representative_host,
+        namespace,
+        targets,
+        now,
+    ));
+
     let proxy = stream_egress_gateway_proxy(
         &proxy_id,
         representative_host,
@@ -13063,8 +16121,19 @@ fn build_stream_egress_for_entry(
 /// Shared upstream constructor used by both HTTP- and stream-family egress
 /// materialization. Keeps the proxy/upstream pair fields in sync — any new
 /// upstream field added here flows to both materialization paths.
+///
+/// The upstream is NAMED with the ServiceEntry host it serves, like the
+/// outbound mesh upstreams are named with their service FQDN, so a
+/// DestinationRule keyed on that host matches it whatever the resolution
+/// (`upstream_destination_rule_match_hosts` enumerates target host / upstream
+/// NAME / id). Under `resolution: STATIC` the targets are the declared
+/// endpoint addresses and the id is an escaped token, so without the host as
+/// the name no DestinationRule for the ServiceEntry host could ever reach the
+/// upstream: its load balancer, outlier and TLS policy (including the TLS
+/// origination [`project_egress_gateway_origination`] reads) were dropped.
 fn build_egress_upstream(
     upstream_id: &str,
+    service_entry_host: &str,
     namespace: &str,
     targets: Vec<UpstreamTarget>,
     now: chrono::DateTime<chrono::Utc>,
@@ -13072,7 +16141,7 @@ fn build_egress_upstream(
     Upstream {
         labels: Default::default(),
         id: upstream_id.to_string(),
-        name: Some(upstream_id.to_string()),
+        name: Some(service_entry_host.to_string()),
         namespace: namespace.to_string(),
         targets,
         algorithm: LoadBalancerAlgorithm::RoundRobin,
@@ -13099,6 +16168,7 @@ fn build_egress_upstream(
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -13172,14 +16242,20 @@ fn build_egress_upstream_targets(
     }
 }
 
-/// Determine the backend scheme from the ServiceEntry port protocol.
+/// Determine the DEFAULT backend scheme from the ServiceEntry port protocol.
 ///
 /// HTTP-family protocols (`Http`, `Https/Tls`, `Http2`, `Grpc`, `Unknown`) map
 /// to `Http` / `Https` so the egress gateway terminates inbound mTLS and
-/// re-emits HTTP-family traffic to the external backend. Stream-family
-/// protocols (`Tcp`, `Udp`, `Mongo`, `Redis`, `Mysql`, `Postgres`) map to
-/// `BackendScheme::Tcp` / `BackendScheme::Udp` and are materialized as raw L4
-/// stream proxies via [`build_stream_egress_for_entry`]; protocol-aware
+/// re-emits HTTP-family traffic to the external backend. The plaintext ones
+/// (`Http`, `Http2`, `Grpc`, `Unknown`) only start at `Http`: a
+/// DestinationRule `tls.mode` decides their final scheme after DestinationRule
+/// application ([`project_egress_gateway_origination`]). TCP-based
+/// stream-family protocols (`Tcp`, `Mongo`, `Redis`, `Mysql`, `Postgres`) map
+/// to `BackendScheme::Tcp` and are materialized as raw L4 stream proxies via
+/// [`build_stream_egress_for_entry`]. `Udp` has no scheme here: the
+/// materializer sends a `protocol: UDP` port down the datagram-over-mesh
+/// branch (`build_udp_egress_destinations_for_entry`, issue #3263) before it
+/// asks for a scheme, so no UDP stream proxy is ever built; protocol-aware
 /// mediation (e.g., Mongo / Redis wire decode) is intentionally out of scope
 /// and tracked separately as T5-C.
 ///
@@ -13195,11 +16271,19 @@ fn build_egress_upstream_targets(
 /// re-encryption) is not an egress-gateway capability today; if that is ever
 /// needed it would be a distinct stream-family egress mode, not a remap of this
 /// scheme. See #1727.
+///
+/// `Http2` and `Grpc` map to `Http`, as in Istio: these ports are plaintext
+/// (gRPC dials h2c) unless a DestinationRule `tls.mode` of `SIMPLE`, `MUTUAL`
+/// or `ISTIO_MUTUAL` asks the gateway to originate TLS (issue #7236).
 fn egress_backend_scheme(protocol: AppProtocol) -> Option<BackendScheme> {
     match protocol {
-        AppProtocol::Tls | AppProtocol::Http2 | AppProtocol::Grpc => Some(BackendScheme::Https),
-        AppProtocol::Http | AppProtocol::Unknown => Some(BackendScheme::Http),
-        AppProtocol::Udp => Some(BackendScheme::Udp),
+        AppProtocol::Tls => Some(BackendScheme::Https),
+        AppProtocol::Http | AppProtocol::Http2 | AppProtocol::Grpc | AppProtocol::Unknown => {
+            Some(BackendScheme::Http)
+        }
+        // `Udp` never reaches here: the materializer routes it to the
+        // datagram-over-mesh branch first (no listener, no upstream).
+        AppProtocol::Udp => None,
         // The EgressGateway is a terminate-and-re-originate boundary and has no
         // DTLS origination path to an external backend, so a `Dtls` ServiceEntry
         // port materializes NO egress proxy rather than being silently
@@ -13215,15 +16299,128 @@ fn egress_backend_scheme(protocol: AppProtocol) -> Option<BackendScheme> {
     }
 }
 
-/// True when the ServiceEntry protocol should materialize a stream-family
-/// (TCP / UDP) egress proxy rather than an HTTP-family one. Stream proxies
+/// True when an EgressGateway ServiceEntry port's backend scheme follows the
+/// DestinationRule (issue #7236): the plaintext HTTP-family protocols. Istio
+/// treats `HTTP`, `HTTP2` and `GRPC` ports as plaintext and originates TLS only
+/// when a DestinationRule asks for it. `TLS` stays a terminate-and-re-originate
+/// port whatever the DestinationRule says (see [`egress_backend_scheme`]).
+fn egress_scheme_follows_destination_rule(protocol: AppProtocol) -> bool {
+    matches!(
+        protocol,
+        AppProtocol::Http | AppProtocol::Http2 | AppProtocol::Grpc | AppProtocol::Unknown
+    )
+}
+
+/// The DestinationRule client TLS modes the winning rules applied to one
+/// upstream: the top-level `trafficPolicy.tls` and each `portLevelSettings`
+/// entry's `tls`, in rule application order (a later rule overwrites, as it
+/// does for every upstream-wide field). Recorded by
+/// [`apply_destination_rules_with_tenant_file_roots`] for
+/// [`project_egress_gateway_origination`].
+#[derive(Debug, Default)]
+struct AppliedClientTlsModes {
+    top_level: Option<MtlsMode>,
+    per_port: HashMap<u16, MtlsMode>,
+}
+
+impl AppliedClientTlsModes {
+    /// True when the effective mode for `service_port` (a per-port entry, else
+    /// the top-level one) asks the client to originate TLS. `DISABLE`, an
+    /// absent `tls`, and a server-side mode (ignored with a warning when the
+    /// rule applied) all leave the port plaintext.
+    fn originates_tls(&self, service_port: u16) -> bool {
+        client_tls_mode_originates(self.per_port.get(&service_port).copied().or(self.top_level))
+    }
+}
+
+/// True for a DestinationRule client TLS mode that asks the client to
+/// originate TLS: `SIMPLE`, `MUTUAL` or `ISTIO_MUTUAL`.
+fn client_tls_mode_originates(mode: Option<MtlsMode>) -> bool {
+    matches!(
+        mode,
+        Some(MtlsMode::Simple | MtlsMode::Mutual | MtlsMode::IstioMutual)
+    )
+}
+
+/// Let the DestinationRule drive the EgressGateway backend scheme of every
+/// plaintext HTTP-family `ServiceEntry` port (issue #7236, Istio semantics).
+///
+/// [`materialize_egress_gateway_proxies`] builds those proxies with
+/// `BackendScheme::Http`. Once DestinationRules have applied, a port whose
+/// effective `tls.mode` is `SIMPLE`, `MUTUAL` or `ISTIO_MUTUAL` switches to
+/// `Https`, so the gateway originates TLS with the material the rule projected
+/// onto the upstream. `DISABLE` or no `tls` keeps it plaintext: HTTP/1.1 for
+/// ordinary requests and h2c for gRPC.
+///
+/// The proxy and upstream ids are forward-derived from the slice's
+/// ServiceEntries with the same id helpers the materializer used, never parsed
+/// back from ids.
+fn project_egress_gateway_origination(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+    applied: &HashMap<usize, AppliedClientTlsModes>,
+) {
+    if runtime.topology != MeshTopology::EgressGateway || applied.is_empty() {
+        return;
+    }
+    let namespace = runtime.namespace.as_str();
+    let applied_by_upstream: HashMap<String, &AppliedClientTlsModes> = applied
+        .iter()
+        .filter_map(|(idx, modes)| {
+            let upstream = config.upstreams.get(*idx)?;
+            (upstream.namespace == namespace).then(|| (upstream.id.clone(), modes))
+        })
+        .collect();
+    if applied_by_upstream.is_empty() {
+        return;
+    }
+    for entry in &mesh_slice.service_entries {
+        if entry.location != ServiceEntryLocation::MeshExternal
+            || !service_entry_exported_to_namespace(entry, namespace)
+        {
+            continue;
+        }
+        for port_spec in &entry.ports {
+            if !egress_scheme_follows_destination_rule(port_spec.protocol) {
+                continue;
+            }
+            for host in &entry.hosts {
+                let upstream_id =
+                    mesh_egress_upstream_id(&entry.namespace, &entry.name, host, port_spec.port);
+                if !applied_by_upstream
+                    .get(&upstream_id)
+                    .is_some_and(|modes| modes.originates_tls(port_spec.port))
+                {
+                    continue;
+                }
+                let proxy_id =
+                    mesh_egress_proxy_id(&entry.namespace, &entry.name, host, port_spec.port);
+                if let Some(proxy) = config.proxies.iter_mut().find(|proxy| {
+                    proxy.namespace == namespace
+                        && proxy.id == proxy_id
+                        && proxy.upstream_id.as_deref() == Some(upstream_id.as_str())
+                }) {
+                    debug!(
+                        proxy = %sanitize_startup_scalar(&proxy.id),
+                        "DestinationRule tls.mode originates TLS for an EgressGateway port"
+                    );
+                    proxy.backend_scheme = Some(BackendScheme::Https);
+                }
+            }
+        }
+    }
+}
+
+/// True when the ServiceEntry protocol should materialize a TCP-based
+/// stream-family egress proxy rather than an HTTP-family one (`Udp` takes the
+/// datagram-over-mesh branch before this is asked). Stream proxies
 /// route on `listen_port` rather than `hosts`, so the materializer uses a
 /// distinct port-dedup path and binds one listener per ServiceEntry port.
 fn egress_is_stream_protocol(protocol: AppProtocol) -> bool {
     matches!(
         protocol,
         AppProtocol::Tcp
-            | AppProtocol::Udp
             | AppProtocol::Mongo
             | AppProtocol::Redis
             | AppProtocol::Mysql
@@ -13305,7 +16502,6 @@ fn egress_gateway_proxy(
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -13341,8 +16537,7 @@ fn egress_gateway_proxy(
 /// proxy. Unlike `egress_gateway_proxy` (HTTP-family, host-routed off the
 /// shared 15090 listener), the stream variant routes by `listen_port`, owns
 /// its own listener bound to the ServiceEntry's destination port, and has
-/// `hosts: []` / `listen_path: None` per the stream-family proxy contract
-/// (CLAUDE.md "Proxy hosts/listen_path/listen_port contract").
+/// `hosts: []` / `listen_path: None` per the stream-family proxy contract.
 ///
 /// The protocol tag is stamped onto `Proxy.name` for observability (transaction
 /// logs surface the proxy name); the wire-level dispatch is identical for all
@@ -13375,7 +16570,7 @@ fn stream_egress_gateway_proxy(
         hosts: Vec::new(),
         listen_path: None,
         backend_scheme: Some(backend_scheme),
-        dispatch_kind: Default::default(),
+        dispatch_kind: DispatchKind::from(backend_scheme),
         backend_host: String::new(),
         backend_port: 0,
         backend_path: None,
@@ -13408,7 +16603,6 @@ fn stream_egress_gateway_proxy(
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -13463,6 +16657,29 @@ fn stream_egress_gateway_proxy(
         updated_at: now,
         pending_limit_scope: None,
     }
+}
+
+/// Whether an EgressGateway proxy/upstream id pair fits the runtime resource-id
+/// bound. The ids embed the ServiceEntry namespace, name and host through an
+/// expanding encoder and do not start with `__mesh`, so
+/// `validate_runtime_resource_ids` applies `MAX_ID_LENGTH` to them: one
+/// over-long id would fail the whole slice apply. An entry host/port whose ids
+/// do not fit is skipped with a warning instead, like an over-long
+/// NodeWaypoint UDP listener id.
+fn egress_resource_ids_fit(entry: &ServiceEntry, proxy_id: &str, upstream_id: &str) -> bool {
+    let max = crate::config::types::MAX_ID_LENGTH;
+    if proxy_id.len() <= max && upstream_id.len() <= max {
+        return true;
+    }
+    warn!(
+        service_entry = %sanitize_startup_scalar(entry.name.to_string()),
+        namespace = %sanitize_startup_scalar(entry.namespace.to_string()),
+        field = "hosts[]",
+        "Skipping egress ServiceEntry host/port: its generated EgressGateway proxy/upstream id \
+         would exceed the resource id length limit. Shorten the ServiceEntry namespace, name \
+         or host"
+    );
+    false
 }
 
 fn mesh_egress_proxy_id(namespace: &str, name: &str, host: &str, port: u16) -> String {
@@ -13628,6 +16845,62 @@ fn mirror_mesh_authz_baggage_gate_fields(target: &mut serde_json::Value, gate: &
     }
 }
 
+/// The VirtualService / Gateway API route upstreams a NodeWaypoint
+/// destination index resolves (`node_waypoint_route_upstreams`), with each
+/// target's Service identity. Shared by `mesh_authz` and RequestAuthentication
+/// destination selection so both resolve a route to the same workloads.
+///
+/// On a NodeWaypoint the slice carries the VirtualService HTTP routes it
+/// serves (`MeshSlice::http_routes`, issue #7233), and
+/// `gateway_config_from_mesh_slice_with_federation` decodes their
+/// `istio-vs-upstream-*` weighted-split upstreams into the config, so this
+/// returns those upstreams. `gwapi-route-upstream-*` ids stay admitted for
+/// parity with `mesh_authz`, but Gateway API HTTPRoute routes bind Gateway
+/// listeners and never ride a mesh slice. Every other topology returns
+/// nothing, since its slice carries no HTTP route.
+fn node_waypoint_authz_route_upstreams(config: &GatewayConfig) -> Vec<serde_json::Value> {
+    config
+        .upstreams
+        .iter()
+        .filter(|upstream| node_waypoint_route_upstream_for_authz(&upstream.id))
+        .map(node_waypoint_authz_route_upstream)
+        .collect()
+}
+
+/// One `node_waypoint_route_upstreams` entry.
+fn node_waypoint_authz_route_upstream(upstream: &Upstream) -> serde_json::Value {
+    serde_json::json!({
+                "id": upstream.id.clone(),
+                "namespace": upstream.namespace.clone(),
+                "targets": upstream.targets.iter().map(|target| {
+                    let service_port = target.service_port_policy_key.or_else(|| {
+                        target
+                            .tags
+                            .get(UPSTREAM_TARGET_SERVICE_PORT_TAG)
+                            .and_then(|value| value.parse::<u16>().ok())
+                            .filter(|port| *port != 0)
+                    });
+                    let mut target_config = serde_json::json!({
+                        "host": target.host.clone(),
+                        "port": target.port,
+                    });
+                    if let Some(service_port) = service_port {
+                        target_config["service_port"] = serde_json::json!(service_port);
+                    }
+                    if let Some(namespace) =
+                        target.tags.get(UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG)
+                    {
+                        target_config["service_namespace"] =
+                            serde_json::json!(namespace.clone());
+                    }
+                    if let Some(name) = target.tags.get(UPSTREAM_TARGET_SERVICE_NAME_TAG) {
+                        target_config["service_name"] = serde_json::json!(name.clone());
+                    }
+                    target_config
+                }).collect::<Vec<_>>(),
+    })
+}
+
 fn inject_mesh_global_plugins(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -13653,47 +16926,21 @@ fn inject_mesh_global_plugins(
         "per_pod_policy_scoping": runtime.topology == MeshTopology::NodeWaypoint,
         "ambient_udp_source_scoping": runtime.topology.uses_ambient_udp_source_scoping(),
     });
+    // The carried HTTP routes (issue #7233) are materialized as ordinary
+    // proxies, upstreams and plugin configs; authorization reads them through
+    // `node_waypoint_route_upstreams`. Their route plugin configs (header
+    // values included) must not be copied into this plugin's config.
+    if let Some(embedded) = mesh_authz_config
+        .get_mut("mesh_slice")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        embedded.remove("http_routes");
+    }
     if runtime.topology == MeshTopology::NodeWaypoint {
         mesh_authz_config["cluster_domains"] =
             serde_json::json!(node_waypoint_authz_cluster_domains(&runtime.cluster_domain));
-        let route_upstreams: Vec<_> = config
-            .upstreams
-            .iter()
-            .filter(|upstream| node_waypoint_route_upstream_for_authz(&upstream.id))
-            .map(|upstream| {
-                serde_json::json!({
-                    "id": upstream.id.clone(),
-                    "namespace": upstream.namespace.clone(),
-                    "targets": upstream.targets.iter().map(|target| {
-                        let service_port = target.service_port_policy_key.or_else(|| {
-                            target
-                                .tags
-                                .get(UPSTREAM_TARGET_SERVICE_PORT_TAG)
-                                .and_then(|value| value.parse::<u16>().ok())
-                                .filter(|port| *port != 0)
-                        });
-                        let mut target_config = serde_json::json!({
-                            "host": target.host.clone(),
-                            "port": target.port,
-                        });
-                        if let Some(service_port) = service_port {
-                            target_config["service_port"] = serde_json::json!(service_port);
-                        }
-                        if let Some(namespace) =
-                            target.tags.get(UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG)
-                        {
-                            target_config["service_namespace"] =
-                                serde_json::json!(namespace.clone());
-                        }
-                        if let Some(name) = target.tags.get(UPSTREAM_TARGET_SERVICE_NAME_TAG) {
-                            target_config["service_name"] = serde_json::json!(name.clone());
-                        }
-                        target_config
-                    }).collect::<Vec<_>>(),
-                })
-            })
-            .collect();
-        mesh_authz_config["node_waypoint_route_upstreams"] = serde_json::json!(route_upstreams);
+        mesh_authz_config["node_waypoint_route_upstreams"] =
+            serde_json::json!(node_waypoint_authz_route_upstreams(config));
     }
     // Only thread the mesh-managed assertor list when it is explicit or when
     // an identity-backed NodeWaypoint received the CP-derived exact assertor
@@ -13795,7 +17042,7 @@ fn inject_mesh_global_plugins(
     // trigger makes request applicability unknowable, so requiring that gate
     // is the fail-closed direction. Direct/user-created workload_metrics
     // without this internal field keep their own single-gate config.
-    let effective_authz_gates: Vec<serde_json::Value> = config
+    let mut effective_authz_gates: Vec<serde_json::Value> = config
         .plugin_configs
         .iter()
         .filter(|plugin| {
@@ -13805,13 +17052,26 @@ fn inject_mesh_global_plugins(
         })
         .map(|plugin| mesh_authz_baggage_gate_config(&plugin.config))
         .collect();
+    // A proxy- or proxy-group-scoped mesh_authz REPLACES the global instance
+    // on its routes (PluginCache `remove_shadowed_globals`), so on those
+    // routes it is the gate authorization actually runs. This global
+    // telemetry instance cannot vary per proxy, so every enabled scoped gate
+    // joins the conjunction too: requiring it everywhere is the fail-closed
+    // direction, exactly like a triggered global gate.
+    let scoped_authz_gates: Vec<serde_json::Value> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| {
+            plugin.enabled
+                && plugin.scope != PluginScope::Global
+                && plugin.plugin_name == "mesh_authz"
+        })
+        .map(|plugin| mesh_authz_baggage_gate_config(&plugin.config))
+        .collect();
     if !effective_authz_gates.is_empty() {
         if let [single_gate] = effective_authz_gates.as_slice() {
             mirror_mesh_authz_baggage_gate_fields(&mut workload_metrics_config, single_gate);
         }
-        let gates_key =
-            crate::plugins::mesh::workload_metrics::EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY;
-        workload_metrics_config[gates_key] = serde_json::Value::Array(effective_authz_gates);
     } else {
         // No enabled global mesh_authz. Do not copy a disabled operator
         // config. Thread the mesh-managed list only when no operator global
@@ -13827,6 +17087,31 @@ fn inject_mesh_global_plugins(
             workload_metrics_config["trusted_hbone_assertors"] =
                 serde_json::Value::Array(assertors.clone());
         }
+    }
+    if !scoped_authz_gates.is_empty() {
+        if effective_authz_gates.is_empty() {
+            // Routes without a scoped mesh_authz keep the gate this instance
+            // would otherwise apply on its own (defaults, or the mesh-managed
+            // list threaded above).
+            effective_authz_gates.push(mesh_authz_baggage_gate_config(&workload_metrics_config));
+        }
+        for gate in scoped_authz_gates {
+            if !effective_authz_gates.contains(&gate) {
+                effective_authz_gates.push(gate);
+            }
+        }
+        // More distinct gates than the conjunction admits: honor no baggage
+        // at all rather than fail construction and lose workload telemetry.
+        if effective_authz_gates.len()
+            > crate::plugins::mesh::workload_metrics::MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES
+        {
+            effective_authz_gates = vec![serde_json::json!({ "trusted_hbone_assertors": [] })];
+        }
+    }
+    if !effective_authz_gates.is_empty() {
+        let gates_key =
+            crate::plugins::mesh::workload_metrics::EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY;
+        workload_metrics_config[gates_key] = serde_json::Value::Array(effective_authz_gates);
     }
     // Apply ProxyConfig sampling as a baseline. The more granular Telemetry
     // resource below may override on the `sampling_percentage` key.
@@ -13850,6 +17135,10 @@ fn inject_mesh_global_plugins(
         if !tracing.custom_env_tags.is_empty() {
             workload_metrics_config["custom_env_tags"] = serde_json::json!(tracing.custom_env_tags);
         }
+        if !tracing.safe_tag_sources.is_empty() {
+            workload_metrics_config["safe_tag_sources"] =
+                serde_json::json!(tracing.safe_tag_sources);
+        }
         if tracing.disable_span_reporting.unwrap_or(false) {
             workload_metrics_config["span_reporting_disabled"] = serde_json::json!(true);
         }
@@ -13857,6 +17146,14 @@ fn inject_mesh_global_plugins(
             // Keep provider config visible for introspection and propagation even
             // when span_reporting_disabled makes WorkloadMetrics skip exporters.
             workload_metrics_config["tracing_providers"] = serde_json::json!(tracing.providers);
+            // In-cluster collectors are routinely cleartext (`http://zipkin:9411`).
+            // Exporters refuse an `http://` endpoint off a loopback IP literal
+            // unless the config opts in, so mesh injection opts in explicitly —
+            // and only when a provider actually uses cleartext — keeping the
+            // posture visible in the injected plugin config.
+            if crate::plugins::otel_tracing::trace_providers_use_plaintext(&tracing.providers) {
+                workload_metrics_config["allow_plaintext"] = serde_json::json!(true);
+            }
         }
         // GAP-3F: project `Telemetry.tracing[].match.mode` into the plugin's
         // `direction_emit` so a single auto-injected workload_metrics instance
@@ -14062,6 +17359,7 @@ fn merge_tracing_config(
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
         custom_env_tags: HashMap::new(),
+        safe_tag_sources: Vec::new(),
         providers: Vec::new(),
     });
 
@@ -14079,6 +17377,9 @@ fn merge_tracing_config(
         &next.custom_header_tags,
         &next.custom_env_tags,
     );
+    if !next.safe_tag_sources.is_empty() {
+        current.safe_tag_sources.clone_from(&next.safe_tag_sources);
+    }
     if !next.providers.is_empty() {
         current.providers.clone_from(&next.providers);
     }
@@ -14091,36 +17392,102 @@ fn merge_tracing_config(
 /// which JWTs are *valid*, not which are *required*. A request with no JWT
 /// passes through. An invalid JWT is rejected. Enforcement (requiring a
 /// JWT) comes from AuthorizationPolicy. So the plugin is configured with
-/// `anonymous_on_missing_token: true`.
+/// `allow_missing_token: true`.
+///
+/// The global instance carries the resources that select THIS proxy's own
+/// identity. On a NodeWaypoint, routes that reach a modeled destination are
+/// re-scoped to that destination's resources afterwards by
+/// [`scope_request_auth_to_node_waypoint_destinations`].
 fn inject_mesh_request_auth_plugin(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
+    let applicable: Vec<&MeshRequestAuthentication> =
+        own_request_authentications(mesh_slice, runtime.topology)
+            .into_iter()
+            .map(|index| &mesh_slice.request_authentications[index])
+            .collect();
+
+    // FAIL CLOSED on a refused RequestAuthentication (issue #6656). Kubernetes
+    // translation publishes a resource it could not translate as a rule-less
+    // `refused` marker instead of dropping it, because dropping it would leave
+    // this workload with no JWT validation, no token stripping and no
+    // gateway-owned claim headers. Its intended providers are unknown, so the
+    // only safe answer is to refuse every HTTP request until it is fixed. The
+    // refusal is forced over any operator `request_termination` global, which
+    // would otherwise suppress a non-forced mesh-managed instance.
+    if applicable.iter().any(|ra| ra.refused) {
+        // The refusal supersedes JWT validation for this workload: drop the
+        // managed `jwks_auth` so a sibling rule set that cannot construct
+        // (for example an oversized provider union) cannot veto the reload
+        // that installs the refusal and leave the previous configuration in
+        // force.
+        remove_mesh_managed_plugin(config, MESH_REQUEST_AUTH_PLUGIN_ID, &runtime.namespace);
+        warn!(
+            "mesh RequestAuthentication: a RequestAuthentication selecting this workload was \
+             rejected by translation; refusing every HTTP request to this workload (fail \
+             closed) until it is fixed. See the resource's FerrumAccepted status"
+        );
+        force_ensure_global_plugin(
+            config,
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+            "request_termination",
+            mesh_request_auth_refusal_config(),
+            &runtime.namespace,
+        );
+        return;
+    }
+    remove_mesh_managed_plugin(
+        config,
+        MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+        &runtime.namespace,
+    );
+
+    match mesh_request_auth_jwks_config(&applicable, runtime) {
+        Some(jwks_config) => ensure_global_plugin(
+            config,
+            MESH_REQUEST_AUTH_PLUGIN_ID,
+            "jwks_auth",
+            jwks_config,
+            &runtime.namespace,
+        ),
+        // No applicable RequestAuthentication with a usable JWT rule — remove
+        // any previously injected mesh request auth plugin so it doesn't
+        // persist across config updates.
+        None => remove_mesh_managed_plugin(config, MESH_REQUEST_AUTH_PLUGIN_ID, &runtime.namespace),
+    }
+}
+
+/// Indices into `mesh_slice.request_authentications` of the resources that
+/// select this proxy's OWN identity.
+///
+/// FAIL CLOSED on an ambiguous shared-SPIFFE slice. When `labels_ambiguous`
+/// is set, `mesh_slice.labels` is only the partial intersection of the
+/// divergent candidates sharing this SPIFFE, NOT this workload's
+/// authoritative labels, and `request_authentications` carries the
+/// candidate-any superset (a JWT RequestAuthentication that matches only ONE
+/// candidate rode in). Filtering solely by the partial intersection would
+/// silently DROP such a selector-scoped RA, so a forged token for that issuer
+/// would pass unvalidated — a fail-OPEN. Since we cannot prove the selector
+/// does NOT apply to this workload, INCLUDE candidate-any selector-scoped RAs
+/// the intersection cannot resolve so their JWT providers are still installed
+/// (Istio RequestAuthentication stays permissive: a request with no token
+/// passes; only a forged/invalid token for that issuer is rejected). A
+/// non-ambiguous slice (unique SPIFFE / concrete labels / a DP that resolved
+/// its authoritative labels) is enforcement-IDENTICAL: only the partial-
+/// intersection branch runs. The operator pins
+/// `FERRUM_MESH_WORKLOAD_LABELS` / `mesh_slice.labels` to clear the marker and
+/// re-filter the superset deterministically.
+fn own_request_authentications(mesh_slice: &MeshSlice, topology: MeshTopology) -> BTreeSet<usize> {
     use crate::modes::mesh::config::scope_applies_to_workload;
 
-    // FAIL CLOSED on an ambiguous shared-SPIFFE slice. When `labels_ambiguous`
-    // is set, `mesh_slice.labels` is only the partial intersection of the
-    // divergent candidates sharing this SPIFFE, NOT this workload's
-    // authoritative labels, and `request_authentications` carries the
-    // candidate-any superset (a JWT RequestAuthentication that matches only ONE
-    // candidate rode in). Filtering solely by the partial intersection would
-    // silently DROP such a selector-scoped RA, so a forged token for that issuer
-    // would pass unvalidated — a fail-OPEN. Since we cannot prove the selector
-    // does NOT apply to this workload, INCLUDE candidate-any selector-scoped RAs
-    // the intersection cannot resolve so their JWT providers are still installed
-    // (Istio RequestAuthentication stays permissive: a request with no token
-    // passes; only a forged/invalid token for that issuer is rejected). A
-    // non-ambiguous slice (unique SPIFFE / concrete labels / a DP that resolved
-    // its authoritative labels) is enforcement-IDENTICAL: only the partial-
-    // intersection branch runs. The operator pins
-    // `FERRUM_MESH_WORKLOAD_LABELS` / `mesh_slice.labels` to clear the marker and
-    // re-filter the superset deterministically.
     let mut included_fail_closed = false;
-    let applicable: Vec<&MeshRequestAuthentication> = mesh_slice
+    let applicable: BTreeSet<usize> = mesh_slice
         .request_authentications
         .iter()
-        .filter(|ra| {
+        .enumerate()
+        .filter(|(_, ra)| {
             if scope_applies_to_workload(&ra.scope, &mesh_slice.namespace, &mesh_slice.labels) {
                 return true;
             }
@@ -14131,7 +17498,14 @@ fn inject_mesh_request_auth_plugin(
             // selector whose NAMESPACE does not match is also authoritatively
             // non-applicable (namespace is never ambiguous), so escalate ONLY on
             // label divergence within this workload's namespace.
+            //
+            // A waypoint is exempt: its slice also carries the resources that
+            // select the destinations it fronts, and those must not become
+            // waypoint-wide merely because the waypoint's own replicas carry
+            // divergent labels. A waypoint pod is never a request destination,
+            // so no resource selecting it is left unenforced.
             let unresolvable_selector = mesh_slice.labels_ambiguous
+                && !topology.is_waypoint()
                 && match &ra.scope {
                     crate::modes::mesh::config::PolicyScope::WorkloadSelector { selector } => {
                         selector
@@ -14146,6 +17520,7 @@ fn inject_mesh_request_auth_plugin(
             }
             unresolvable_selector
         })
+        .map(|(index, _)| index)
         .collect();
 
     if included_fail_closed {
@@ -14157,31 +17532,57 @@ fn inject_mesh_request_auth_plugin(
              workload's identity for deterministic resolution"
         );
     }
+    applicable
+}
 
-    if applicable.is_empty() {
-        // No applicable RequestAuthentication — remove any previously injected
-        // mesh request auth plugin so it doesn't persist across config updates.
-        remove_mesh_managed_plugin(config, MESH_REQUEST_AUTH_PLUGIN_ID, &runtime.namespace);
-        return;
-    }
+/// The `request_termination` config that answers a refused
+/// RequestAuthentication (issue #6656).
+fn mesh_request_auth_refusal_config() -> serde_json::Value {
+    serde_json::json!({
+        "status_code": 503,
+        "content_type": "application/json",
+        "message": MESH_REQUEST_AUTH_REFUSED_MESSAGE,
+    })
+}
 
-    let mut providers = Vec::new();
-    for ra in &applicable {
+/// The `jwks_auth` config enforcing `applicable`, or `None` when no resource
+/// carries a usable JWT rule.
+fn mesh_request_auth_jwks_config(
+    applicable: &[&MeshRequestAuthentication],
+    runtime: &MeshRuntimeConfig,
+) -> Option<serde_json::Value> {
+    // Several applicable RequestAuthentications are combined into one
+    // `jwks_auth` instance. Identical rules are installed once: verifying the
+    // same provider twice is pointless and would count twice against the
+    // per-token verification bound. Nothing else is dropped, so every
+    // extraction location and claim-output header stays owned. A union that
+    // still exceeds the bound fails plugin construction, and the data plane
+    // keeps its last accepted configuration (fail closed).
+    // Collection stops one past the provider cap, so dedupe work stays
+    // bounded and the oversized union still fails construction.
+    let mut providers: Vec<serde_json::Value> = Vec::new();
+    'collect: for ra in applicable {
         for rule in &ra.jwt_rules {
-            if let Some(provider) = build_jwks_provider_config(rule) {
+            if providers.len() > crate::plugins::jwks_auth::MAX_JWKS_PROVIDERS {
+                break 'collect;
+            }
+            if let Some(provider) = build_jwks_provider_config(rule)
+                && !providers.contains(&provider)
+            {
                 providers.push(provider);
             }
         }
     }
 
     if providers.is_empty() {
-        remove_mesh_managed_plugin(config, MESH_REQUEST_AUTH_PLUGIN_ID, &runtime.namespace);
-        return;
+        return None;
     }
 
-    // jwks_auth already passes through requests with no token
-    // (ExtractedCredential::Missing -> PluginResult::Continue), which matches
-    // Istio's permissive RequestAuthentication semantics. No extra flag needed.
+    // Istio RequestAuthentication is permissive: a request with no token
+    // passes (only a forged/invalid token is rejected) and AuthorizationPolicy
+    // decides whether a principal is required. `jwks_auth` only grants that
+    // through the explicit `allow_missing_token` opt-in; the metadata flag
+    // alone never relaxes authentication.
     //
     // `require_exp` defaults to the secure posture (true): tokens that omit
     // `exp` are rejected so they cannot live forever, satisfying the
@@ -14189,19 +17590,785 @@ fn inject_mesh_request_auth_plugin(
     // `exp`, so operators can relax this with
     // `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP=false`. Expiry *validation* stays
     // on regardless — a present-but-expired `exp` is always rejected.
-    let jwks_config = serde_json::json!({
+    Some(serde_json::json!({
         "providers": providers,
         "require_exp": runtime.request_auth_require_exp,
         "emit_mesh_request_principal_metadata": true,
-    });
+        "allow_missing_token": true,
+    }))
+}
 
-    ensure_global_plugin(
+/// Re-scope RequestAuthentication on a NodeWaypoint's routes to the
+/// workloads each route reaches (issue #6670).
+///
+/// A NodeWaypoint is shared: its own identity says nothing about the captured
+/// pods it terminates HTTP for, so a selector RequestAuthentication naming a
+/// destination (`app=api`) never matched the waypoint and its JWT validation,
+/// token stripping, claim-header ownership, and #6656 refusal were all absent
+/// on the Layer-7 Service routes the waypoint serves for that destination.
+///
+/// Each HTTP route is resolved to its destination workloads through the same
+/// index `mesh_authz` uses for destination policy (including every
+/// `mesh_route_dispatch` override destination it may be rewritten to after
+/// authentication), and receives exactly the resources that select those
+/// workloads:
+///
+/// * a set that differs from the waypoint's own set gets a proxy-group
+///   `jwks_auth` instance (`__mesh_request_auth_dst_*`) attached to its routes,
+///   which replaces the global `__mesh_request_auth` there, so one
+///   destination's providers and claim headers never apply to another;
+/// * a set that contains a refused resource returns the route for the scoped
+///   refusal instead (see [`scope_request_auth_refusal_to_inbound_routes`]).
+///
+/// A destination that cannot be resolved contributes the waypoint's own set,
+/// and a route with no modeled destination keeps the global instance
+/// unchanged. The inbound HBONE relay is Layer 4 and is handled by
+/// `mesh_authz`. Returns the refused routes as `(namespace, proxy id)`.
+fn scope_request_auth_to_node_waypoint_destinations(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) -> Vec<(String, String)> {
+    use crate::modes::mesh::config::scope_applies_to_workload;
+
+    // Every prepare re-derives the destination instances from scratch.
+    config.plugin_configs.retain(|plugin| {
+        !plugin
+            .id
+            .starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX)
+    });
+    for proxy in &mut config.proxies {
+        proxy.plugins.retain(|association| {
+            !association
+                .plugin_config_id
+                .starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX)
+        });
+    }
+    if runtime.topology != MeshTopology::NodeWaypoint
+        || mesh_slice.request_authentications.is_empty()
+    {
+        return Vec::new();
+    }
+
+    let index_config = serde_json::json!({
+        "cluster_domain": runtime.cluster_domain,
+        "cluster_domains": node_waypoint_authz_cluster_domains(&runtime.cluster_domain),
+        "node_waypoint_route_upstreams": node_waypoint_authz_route_upstreams(config),
+    });
+    let index = match crate::plugins::mesh::authz::node_waypoint_destination_scope_index(
+        mesh_slice,
+        &index_config,
+    ) {
+        Ok(index) => index,
+        Err(error) => {
+            // `mesh_authz` rejects the same input, so this generation is not
+            // published; nothing is re-scoped here.
+            warn!(
+                error = %sanitize_startup_cause(error, &[]),
+                "mesh RequestAuthentication: NodeWaypoint destination index could not be built; \
+                 routes keep the waypoint's own RequestAuthentication set"
+            );
+            return Vec::new();
+        }
+    };
+
+    let resources = &mesh_slice.request_authentications;
+    let own = own_request_authentications(mesh_slice, runtime.topology);
+    let route_dispatch_rules: HashMap<(&str, &str), &serde_json::Value> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.enabled && plugin.plugin_name == "mesh_route_dispatch")
+        .map(|plugin| {
+            (
+                (plugin.namespace.as_str(), plugin.id.as_str()),
+                &plugin.config,
+            )
+        })
+        .collect();
+    // A global dispatch instance runs on every route without an association.
+    let global_route_dispatch: Vec<&serde_json::Value> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| {
+            plugin.enabled
+                && plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.scope == PluginScope::Global
+        })
+        .map(|plugin| &plugin.config)
+        .collect();
+    // Resources this waypoint carries only for its destinations. While any
+    // exist, a route that reaches a modeled destination this index cannot
+    // resolve cannot be shown to be outside them.
+    let carries_destination_resources = (0..resources.len()).any(|index| !own.contains(&index));
+    let secured_transport = runtime.node_waypoint_secured_transport_required();
+    // The workloads each mesh Service upstream can actually dial, keyed by
+    // `(namespace, id)` and derived with the same rules as
+    // `build_outbound_mesh_targets`: the Service's LOCAL members, with a
+    // resolvable app port and an address, and (on a secured NodeWaypoint)
+    // NodeWaypoint metadata. RA sets are compared over exactly these. An
+    // upstream with no local member at all (a Service whose workloads are all
+    // in a remote cluster, which enforces its own resources) is absent, so it
+    // is not an unresolved destination here.
+    let mut dialable_upstream_workloads: HashMap<(&str, String), Vec<&config::Workload>> =
+        HashMap::new();
+    for service in &mesh_slice.services {
+        let local = matched_local_service_workloads(
+            service,
+            &mesh_slice.workloads,
+            mesh_slice.multi_cluster.as_ref(),
+        );
+        if local.is_empty() {
+            continue;
+        }
+        for port in &service.ports {
+            let dialable = local
+                .iter()
+                .copied()
+                .filter(|workload| {
+                    !workload.addresses.is_empty()
+                        && (!secured_transport || workload.node_waypoint.is_some())
+                        && port.backend_port_for(&workload.ports).is_some()
+                })
+                .collect();
+            dialable_upstream_workloads.insert(
+                (
+                    service.namespace.as_str(),
+                    mesh_outbound_upstream_id(&service.namespace, &service.name, port.port),
+                ),
+                dialable,
+            );
+        }
+    }
+
+    let mut refused_routes: Vec<(String, String)> = Vec::new();
+    let mut divergent_routes = 0usize;
+    let mut unresolved_routes = 0usize;
+    let mut groups: BTreeMap<(String, BTreeSet<usize>), Vec<usize>> = BTreeMap::new();
+    for (proxy_index, proxy) in config.proxies.iter().enumerate() {
+        if proxy
+            .backend_scheme
+            .is_some_and(|scheme| scheme.is_stream())
+            || is_mesh_inbound_route_id(&proxy.id)
+        {
+            continue;
+        }
+        let mut destinations: Vec<(Option<&str>, &str, u16)> = vec![(
+            proxy.upstream_id.as_deref(),
+            proxy.backend_host.as_str(),
+            proxy.backend_port,
+        )];
+        let dispatch_configs: Vec<&serde_json::Value> = proxy
+            .plugins
+            .iter()
+            .filter_map(|association| {
+                route_dispatch_rules
+                    .get(&(
+                        proxy.namespace.as_str(),
+                        association.plugin_config_id.as_str(),
+                    ))
+                    .copied()
+            })
+            .chain(global_route_dispatch.iter().copied())
+            .collect();
+        for &dispatch in &dispatch_configs {
+            for rule in dispatch
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(destination) = rule.get("destination") else {
+                    continue;
+                };
+                let upstream_id = destination
+                    .get("upstream_id")
+                    .and_then(serde_json::Value::as_str);
+                let backend_host = destination
+                    .get("backend_host")
+                    .and_then(serde_json::Value::as_str);
+                let backend_port = destination
+                    .get("backend_port")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok());
+                match (upstream_id, backend_host) {
+                    (None, None) if backend_port.is_none() => continue,
+                    // A port-only rewrite keeps the route's own destination.
+                    (None, None) => destinations.push((
+                        proxy.upstream_id.as_deref(),
+                        proxy.backend_host.as_str(),
+                        backend_port.unwrap_or(proxy.backend_port),
+                    )),
+                    (upstream_id, backend_host) => destinations.push((
+                        upstream_id,
+                        backend_host.unwrap_or(proxy.backend_host.as_str()),
+                        backend_port.unwrap_or(proxy.backend_port),
+                    )),
+                }
+            }
+        }
+
+        // A weighted split dispatched leg by leg (issue #7387) is reached only
+        // through its legs: each Service leg's workloads and each residual
+        // external leg (which stands for the waypoint's own set, like any
+        // external destination) must carry the route's one set.
+        let weighted_splits: Vec<&serde_json::Value> = dispatch_configs
+            .iter()
+            .copied()
+            .flat_map(|dispatch| {
+                dispatch
+                    .get("weighted_splits")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .collect();
+        let destinations: Vec<(Option<&str>, &str, u16)> = destinations
+            .into_iter()
+            .flat_map(|(upstream_id, backend_host, backend_port)| {
+                let legs: Vec<&str> = upstream_id
+                    .and_then(|id| {
+                        weighted_splits.iter().find(|split| {
+                            split.get("upstream_id").and_then(serde_json::Value::as_str) == Some(id)
+                        })
+                    })
+                    .map(|split| {
+                        split
+                            .get("legs")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|leg| {
+                                leg.get("upstream_id").and_then(serde_json::Value::as_str)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if legs.is_empty() {
+                    vec![(upstream_id, backend_host, backend_port)]
+                } else {
+                    legs.into_iter()
+                        .map(|leg| (Some(leg), backend_host, backend_port))
+                        .collect()
+                }
+            })
+            .collect();
+
+        // Every workload the route can reach must carry the SAME set: the
+        // backend is chosen after authentication, so a union would let one
+        // destination's providers mint principals and claim headers for
+        // another. A destination that cannot be resolved stands for the
+        // waypoint's own set.
+        let mut route_set: Option<BTreeSet<usize>> = None;
+        let mut divergent = false;
+        let mut resolved = false;
+        let mut admit = |set: BTreeSet<usize>| match &route_set {
+            None => route_set = Some(set),
+            Some(existing) if *existing != set => divergent = true,
+            Some(_) => {}
+        };
+        let mut unresolved_modeled = false;
+        let resources_selecting = |namespace: &str, labels: &HashMap<String, String>| {
+            resources
+                .iter()
+                .enumerate()
+                .filter(|(_, resource)| {
+                    scope_applies_to_workload(&resource.scope, namespace, labels)
+                })
+                .map(|(index, _)| index)
+                .collect::<BTreeSet<usize>>()
+        };
+        for (upstream_id, backend_host, backend_port) in destinations {
+            if let Some(dialable) = upstream_id
+                .filter(|id| id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX))
+                .and_then(|id| {
+                    dialable_upstream_workloads.get(&(proxy.namespace.as_str(), id.to_string()))
+                })
+            {
+                resolved = true;
+                for workload in dialable {
+                    admit(resources_selecting(
+                        &workload.namespace,
+                        &workload.selector.labels,
+                    ));
+                }
+                continue;
+            }
+            let Some(scopes) =
+                index.scopes_for_target(&proxy.namespace, upstream_id, backend_host, backend_port)
+            else {
+                // A mesh Service upstream with local members was handled
+                // above, so a missing one here has none locally.
+                unresolved_modeled |=
+                    index.target_requires_scope(&proxy.namespace, upstream_id, backend_host)
+                        && upstream_id
+                            .is_none_or(|id| !id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX));
+                admit(own.clone());
+                continue;
+            };
+            resolved = true;
+            for scope in scopes {
+                admit(resources_selecting(&scope.namespace, &scope.labels));
+            }
+        }
+        if unresolved_modeled && carries_destination_resources {
+            // Mirrors `mesh_authz`'s `destination_scope_missing` refusal.
+            unresolved_routes += 1;
+            refused_routes.push((proxy.namespace.clone(), proxy.id.clone()));
+            continue;
+        }
+        if !resolved {
+            continue;
+        }
+        let selected = route_set.unwrap_or_default();
+        if divergent {
+            divergent_routes += 1;
+            refused_routes.push((proxy.namespace.clone(), proxy.id.clone()));
+            continue;
+        }
+        if selected.iter().any(|&index| resources[index].refused) {
+            refused_routes.push((proxy.namespace.clone(), proxy.id.clone()));
+            continue;
+        }
+        if selected == own {
+            continue;
+        }
+        groups
+            .entry((proxy.namespace.clone(), selected))
+            .or_default()
+            .push(proxy_index);
+    }
+
+    if unresolved_routes > 0 {
+        warn!(
+            routes = unresolved_routes,
+            "mesh RequestAuthentication: NodeWaypoint routes reach modeled destinations whose \
+             workloads cannot be resolved while destination RequestAuthentications exist; \
+             refusing them (fail closed)"
+        );
+    }
+    if divergent_routes > 0 {
+        warn!(
+            routes = divergent_routes,
+            "mesh RequestAuthentication: NodeWaypoint routes reach workloads selected by \
+             different RequestAuthentication sets; refusing them (fail closed) because the \
+             backend is chosen after authentication. Align the RequestAuthentications of the \
+             workloads behind each Service and route"
+        );
+    }
+
+    // An operator global `jwks_auth` suppresses mesh RequestAuthentication
+    // injection (see `ensure_global_plugin`); a proxy-group instance would
+    // replace it on the routes it attaches to.
+    let operator_jwks_override = config.plugin_configs.iter().any(|plugin| {
+        plugin.scope == PluginScope::Global
+            && plugin.plugin_name == "jwks_auth"
+            && plugin.id != MESH_REQUEST_AUTH_PLUGIN_ID
+    });
+    if operator_jwks_override {
+        return refused_routes;
+    }
+
+    let now = chrono::Utc::now();
+    let mut without_jwt_rules: Vec<(String, String)> = Vec::new();
+    for ((namespace, selected), proxy_indices) in groups {
+        let applicable: Vec<&MeshRequestAuthentication> =
+            selected.iter().map(|&index| &resources[index]).collect();
+        // A destination selected by no usable JWT rule gets no instance; the
+        // global one is gated off its routes below.
+        let jwks_config = mesh_request_auth_jwks_config(&applicable, runtime);
+        if let Some(jwks_config) = &jwks_config
+            && jwks_config["providers"]
+                .as_array()
+                .and_then(|providers| {
+                    crate::plugins::jwks_auth::jwks_provider_bound_error(providers.iter().map(
+                        |provider| {
+                            provider["issuer"]
+                                .as_str()
+                                .filter(|issuer| !issuer.is_empty())
+                        },
+                    ))
+                })
+                .is_some()
+        {
+            // An instance that cannot construct would veto the whole
+            // generation; refuse only these routes instead.
+            warn!(
+                routes = proxy_indices.len(),
+                "mesh RequestAuthentication: a NodeWaypoint destination is selected by more JWT \
+                 providers than one instance can verify (in total or for one issuer); refusing \
+                 its routes (fail closed)"
+            );
+            refused_routes.extend(
+                proxy_indices
+                    .iter()
+                    .map(|&index| (namespace.clone(), config.proxies[index].id.clone())),
+            );
+            continue;
+        }
+        let Some(jwks_config) = jwks_config else {
+            without_jwt_rules.extend(
+                proxy_indices
+                    .iter()
+                    .map(|&index| (namespace.clone(), config.proxies[index].id.clone())),
+            );
+            continue;
+        };
+        let id = mesh_request_auth_destination_plugin_id(&namespace, &applicable, &jwks_config);
+        for proxy_index in proxy_indices {
+            config.proxies[proxy_index].plugins.push(PluginAssociation {
+                plugin_config_id: id.clone(),
+            });
+        }
+        config.plugin_configs.push(PluginConfig {
+            labels: Default::default(),
+            id,
+            plugin_name: "jwks_auth".to_string(),
+            namespace,
+            config: jwks_config,
+            scope: PluginScope::ProxyGroup,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+    // The waypoint's own providers must not govern a destination no resource
+    // selects; a route the global instance cannot be gated off is refused.
+    refused_routes.extend(exclude_routes_from_global_request_auth(
         config,
-        MESH_REQUEST_AUTH_PLUGIN_ID,
-        "jwks_auth",
-        jwks_config,
-        &runtime.namespace,
-    );
+        runtime,
+        &without_jwt_rules,
+    ));
+    refused_routes
+}
+
+/// Gate the global `__mesh_request_auth` off `routes`, NodeWaypoint routes
+/// whose destination workloads no RequestAuthentication with a usable JWT rule
+/// selects. A proxy-group instance cannot replace it there (it needs at least
+/// one provider), and the waypoint's own providers must not reject or claim
+/// tokens on a destination they do not govern.
+///
+/// Returns the routes that could not be excluded, so the caller refuses them:
+/// every route when the exclusion does not fit one trigger.
+fn exclude_routes_from_global_request_auth(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    routes: &[(String, String)],
+) -> Vec<(String, String)> {
+    if routes.is_empty()
+        || !config.plugin_configs.iter().any(|plugin| {
+            plugin.namespace == runtime.namespace && plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID
+        })
+    {
+        return Vec::new();
+    }
+    let mut namespaces_by_id: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+    for proxy in &config.proxies {
+        namespaces_by_id
+            .entry(proxy.id.as_str())
+            .or_default()
+            .insert(proxy.namespace.as_str());
+    }
+    // A `proxy_id` leaf cannot pin a namespace, so an id that also names a
+    // route in another namespace gets an `all[namespace, proxy_id]` leaf.
+    let mut unique_ids: Vec<&str> = Vec::new();
+    let mut colliding: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (namespace, id) in routes {
+        if namespaces_by_id
+            .get(id.as_str())
+            .is_none_or(|namespaces| namespaces.len() == 1)
+        {
+            unique_ids.push(id.as_str());
+        } else {
+            colliding
+                .entry(namespace.as_str())
+                .or_default()
+                .push(id.as_str());
+        }
+    }
+    unique_ids.sort_unstable();
+    unique_ids.dedup();
+    let mut leaves = proxy_id_trigger_leaves(&unique_ids);
+    for (namespace, mut ids) in colliding {
+        ids.sort_unstable();
+        ids.dedup();
+        leaves.extend(proxy_id_trigger_leaves(&ids).into_iter().map(|leaf| {
+            serde_json::json!({
+                "all": [{ "match": { "namespace": [namespace] } }, leaf]
+            })
+        }));
+    }
+    // `not`, an outer `any`, and up to two inner `any` nodes leave 124 of the
+    // 128 trigger nodes for leaves, each `any` within the child limit. A plain
+    // `proxy_id` leaf costs one node and a namespace-pinned one three, so
+    // about 42 colliding leaves already exhaust the budget. A set that does
+    // not fit fails compilation below and is refused (fail closed).
+    const INNER_LEAVES: usize = 62;
+    let excluded = match leaves.len() {
+        1 => leaves.into_iter().next().unwrap_or_default(),
+        count if count <= crate::config::plugin_trigger::MAX_TRIGGER_LIST_LEN => {
+            serde_json::json!({ "any": leaves })
+        }
+        _ => serde_json::json!({
+            "any": leaves
+                .chunks(INNER_LEAVES)
+                .map(|chunk| serde_json::json!({ "any": chunk }))
+                .collect::<Vec<_>>()
+        }),
+    };
+    let Some(global) = config.plugin_configs.iter_mut().find(|plugin| {
+        plugin.namespace == runtime.namespace && plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID
+    }) else {
+        return Vec::new();
+    };
+    match compile_mesh_trigger(serde_json::json!({ "not": excluded })) {
+        Ok(trigger) => {
+            global.trigger = Some(trigger);
+            Vec::new()
+        }
+        Err(error) => {
+            warn!(
+                error = %sanitize_startup_cause(error, &[]),
+                routes = routes.len(),
+                "mesh RequestAuthentication: the waypoint's own JWT providers could not be \
+                 scoped off routes whose destination has none; refusing those routes (fail \
+                 closed)"
+            );
+            routes.to_vec()
+        }
+    }
+}
+
+/// Stable id for the destination `jwks_auth` instance enforcing `applicable`
+/// in `namespace` with `jwks_config`: an unchanged set keeps one id across
+/// generations.
+fn mesh_request_auth_destination_plugin_id(
+    namespace: &str,
+    applicable: &[&MeshRequestAuthentication],
+    jwks_config: &serde_json::Value,
+) -> String {
+    // FNV-1a 64-bit: stable across Rust versions unlike DefaultHasher. Each
+    // field is terminated so adjacent fields cannot run together.
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+    let mut hash = FNV_OFFSET;
+    // The provider config is folded in so two different provider sets can
+    // never share one id, whatever the resource names.
+    let providers = jwks_config.to_string();
+    let fields = std::iter::once(namespace)
+        .chain(
+            applicable
+                .iter()
+                .flat_map(|resource| [resource.namespace.as_str(), resource.name.as_str()]),
+        )
+        .chain(std::iter::once(providers.as_str()));
+    for field in fields {
+        for byte in field
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(std::iter::once(0xFF))
+        {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    format!("{MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX}{hash:016x}")
+}
+
+/// Restrict the RequestAuthentication refusal (issue #6656) to requests
+/// entering this workload. RequestAuthentication governs requests to the
+/// selected workload, so its outbound requests to healthy peers must keep
+/// flowing. Runs after inbound and outbound routes are materialized: the
+/// refusal is gated by a trigger on exactly the inbound execution ids.
+///
+/// Inbound execution is wider than the materialized Sidecar inbound
+/// routes: on Ambient, NodeWaypoint, and ServiceWaypoint (and Sidecar
+/// ingress remaps), inbound HTTP arrives as an HBONE CONNECT whose
+/// route miss synthesizes a relay proxy with a fixed id
+/// ([`MESH_INBOUND_HBONE_RELAY_PROXY_ID`] /
+/// [`MESH_INGRESS_HBONE_RELAY_PROXY_ID`]) and runs the global HTTP
+/// plugin chain before opening the tunnel, so `request_termination`
+/// refuses the CONNECT there. Those synthesized ids are therefore part
+/// of the inbound set on every topology with an HBONE inbound listener
+/// (all but EastWestGateway's SNI passthrough). Without them the
+/// refusal fell back to unscoped on Ambient and refused the workload's
+/// *outbound* requests instead (issue #6736).
+///
+/// `refused_destination_routes` are NodeWaypoint Service routes whose
+/// destination workloads a refused resource selects (issue #6670). They are
+/// refused too, and install the refusal on their own when the waypoint's own
+/// identity is not refused.
+fn scope_request_auth_refusal_to_inbound_routes(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    refused_destination_routes: &[(String, String)],
+) {
+    // Every prepare re-derives the partition instances from scratch.
+    config.plugin_configs.retain(|plugin| {
+        !plugin
+            .id
+            .starts_with(MESH_REQUEST_AUTH_REFUSED_PARTITION_ID_PREFIX)
+    });
+    let own_refused = config.plugin_configs.iter().any(|plugin| {
+        plugin.namespace == runtime.namespace && plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID
+    });
+    if !own_refused && refused_destination_routes.is_empty() {
+        return;
+    }
+    // A `proxy_id` leaf holds at most `MAX_TRIGGER_LIST_LEN` ids; a workload
+    // with more inbound routes gets an `any` of chunked leaves.
+    let mut leaves: Vec<serde_json::Value> = Vec::new();
+    // On a waypoint, the managed `mesh_authz` refuses relays per destination
+    // (`refused_request_auth_relay_rejection`), so the waypoint's own refusal
+    // must not refuse every relay: a destination its resource does not select
+    // keeps flowing. Without the managed instance (an operator override) the
+    // blanket relay refusal stays (fail closed).
+    let relays_refused_per_destination = runtime.topology.is_waypoint()
+        && config.plugin_configs.iter().any(|plugin| {
+            plugin.enabled
+                && plugin.scope == PluginScope::Global
+                && plugin.plugin_name == "mesh_authz"
+                && plugin.namespace == runtime.namespace
+                && plugin.id == MESH_AUTHZ_PLUGIN_ID
+        });
+    if own_refused && relays_refused_per_destination {
+        if refused_destination_routes.is_empty() {
+            remove_mesh_managed_plugin(
+                config,
+                MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+                &runtime.namespace,
+            );
+            return;
+        }
+    } else if own_refused {
+        let mut inbound: Vec<String> = config
+            .proxies
+            .iter()
+            .filter(|proxy| {
+                proxy.namespace == runtime.namespace
+                    && (is_mesh_inbound_route_id(&proxy.id)
+                        // An EgressGateway's materialized `mesh-egress-*` HTTP
+                        // proxies are its inbound HTTP execution routes.
+                        || (runtime.topology == MeshTopology::EgressGateway
+                            && proxy.id.starts_with("mesh-egress-")))
+            })
+            .map(|proxy| proxy.id.clone())
+            .collect();
+        if runtime.topology.has_inbound_tls_termination_listener() {
+            inbound.push(MESH_INBOUND_HBONE_RELAY_PROXY_ID.to_string());
+            inbound.push(MESH_INGRESS_HBONE_RELAY_PROXY_ID.to_string());
+        }
+        inbound.sort();
+        inbound.dedup();
+        if inbound.is_empty() {
+            // No mesh inbound route identifies this workload's ingress, so the
+            // refusal stays on every route (fail closed).
+            return;
+        }
+        let inbound: Vec<&str> = inbound.iter().map(String::as_str).collect();
+        leaves.extend(proxy_id_trigger_leaves(&inbound));
+    } else {
+        warn!(
+            routes = refused_destination_routes.len(),
+            "mesh RequestAuthentication: a RequestAuthentication selecting a NodeWaypoint \
+             destination was rejected by translation; refusing every HTTP request on the \
+             waypoint routes to it (fail closed) until it is fixed. See the resource's \
+             FerrumAccepted status"
+        );
+        force_ensure_global_plugin(
+            config,
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+            "request_termination",
+            mesh_request_auth_refusal_config(),
+            &runtime.namespace,
+        );
+    }
+    // Destination leaves name route ids only: one node per 64 routes keeps a
+    // large refusal inside the trigger budget, so it is not pushed into the
+    // unscoped fallback that would refuse healthy destinations too. Route ids
+    // are namespace-qualified by construction; a cross-namespace id collision
+    // can only widen the refusal.
+    let mut destination_ids: Vec<&str> = refused_destination_routes
+        .iter()
+        .map(|(_, id)| id.as_str())
+        .collect();
+    destination_ids.sort_unstable();
+    destination_ids.dedup();
+    leaves.extend(proxy_id_trigger_leaves(&destination_ids));
+    // One trigger holds at most `MAX_TRIGGER_LIST_LEN` leaves under an `any`,
+    // inside both the child and node budgets. Larger refusals are split across
+    // additional forced instances rather than pushed into the unscoped
+    // fallback, which would refuse healthy destinations too.
+    let partitions: Vec<Vec<serde_json::Value>> = leaves
+        .chunks(crate::config::plugin_trigger::MAX_TRIGGER_LIST_LEN)
+        .map(<[serde_json::Value]>::to_vec)
+        .collect();
+    for (partition_index, partition) in partitions.into_iter().enumerate() {
+        let id = if partition_index == 0 {
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID.to_string()
+        } else {
+            format!("{MESH_REQUEST_AUTH_REFUSED_PARTITION_ID_PREFIX}{partition_index}")
+        };
+        if partition_index > 0 {
+            force_ensure_global_plugin(
+                config,
+                &id,
+                "request_termination",
+                mesh_request_auth_refusal_config(),
+                &runtime.namespace,
+            );
+        }
+        let Some(refusal) = config
+            .plugin_configs
+            .iter_mut()
+            .find(|plugin| plugin.namespace == runtime.namespace && plugin.id == id)
+        else {
+            continue;
+        };
+        // The trigger is compiled here so one the plugin cache would reject
+        // (which would veto the whole reload and keep the previous, possibly
+        // fail-open, configuration) falls back to the unscoped refusal instead.
+        let when = if partition.len() == 1 {
+            partition.into_iter().next().unwrap_or_default()
+        } else {
+            serde_json::json!({ "any": partition })
+        };
+        match compile_mesh_trigger(when) {
+            Ok(trigger) => refusal.trigger = Some(trigger),
+            Err(error) => {
+                // Fail closed: an unrepresentable trigger leaves the refusal on
+                // every route rather than dropping it.
+                warn!(
+                    error = %sanitize_startup_cause(error, &[]),
+                    "mesh RequestAuthentication refusal could not be scoped to its routes; \
+                     refusing on every route"
+                );
+            }
+        }
+    }
+}
+
+/// Parse and validate a mesh-generated execution trigger exactly as the plugin
+/// cache will, so an unrepresentable one is caught here.
+fn compile_mesh_trigger(
+    when: serde_json::Value,
+) -> Result<crate::config::plugin_trigger::PluginTrigger, String> {
+    serde_json::from_value::<crate::config::plugin_trigger::PluginTrigger>(
+        serde_json::json!({ "when": when }),
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|trigger| trigger.validate().map(|()| trigger))
+}
+
+/// `proxy_id` trigger leaves naming `ids`, `MAX_TRIGGER_LIST_LEN` per leaf.
+fn proxy_id_trigger_leaves(ids: &[&str]) -> Vec<serde_json::Value> {
+    ids.chunks(crate::config::plugin_trigger::MAX_TRIGGER_LIST_LEN)
+        .map(|chunk| serde_json::json!({ "match": { "proxy_id": chunk } }))
+        .collect()
 }
 
 /// Build a single `jwks_auth` provider configuration from a [`MeshJwtRule`].
@@ -14334,7 +18501,7 @@ fn remove_mesh_managed_plugin(config: &mut GatewayConfig, id: &str, namespace: &
 
 pub async fn run(
     mut env_config: EnvConfig,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<(), anyhow::Error> {
     // Normalize once before either the arming decision or any filesystem
     // reader sees the path. A whitespace-padded configured value must not arm
@@ -14345,7 +18512,6 @@ pub async fn run(
         .to_string();
     let runtime = MeshRuntimeConfig::from_env_config(&env_config)
         .map_err(|e| anyhow::anyhow!("invalid mesh runtime configuration: {e}"))?;
-    ensure_runtime_config_protocol_supported(&runtime)?;
 
     // Issue #4249: arm the authoritative node-local enrolled-pod registry
     // BEFORE the bootstrap config is built, so the very first applied
@@ -14413,7 +18579,6 @@ pub async fn run(
     mesh_state.set_revision_policy(crate::modes::mesh::revision::MeshRevisionPolicy {
         foreign_authority_adopt_secs: env_config.mesh_config_revision_adopt_secs,
     });
-    let federation_activation = FederationActivation::from_env_config(&env_config);
     // Localized mesh file / stock-xDS policy reload rejection signal (issue
     // #3776). Shared recovery handshake clears sticky health only after the
     // exact current recovery is accepted by the proxy apply lifecycle.
@@ -14453,7 +18618,6 @@ pub async fn run(
             &runtime,
             Some(&empty_federation_snapshot),
             None,
-            federation_activation,
         )
         .with_context(|| {
             format!("localized mesh config {file_path:?} failed runtime preparation")
@@ -14651,14 +18815,7 @@ pub async fn run(
         }
     }
     let (bootstrap_config, initial_applied_mesh_slice, initial_revision_apply_token) =
-        match wait_for_initial_mesh_config(
-            &mesh_state,
-            &runtime,
-            federation_activation,
-            shutdown_tx.subscribe(),
-        )
-        .await
-        {
+        match wait_for_initial_mesh_config(&mesh_state, &runtime, shutdown_tx.subscribe()).await {
             Ok(v) => v,
             Err(err) => {
                 // Config-consumer / gRPC TLS watcher tasks are already running.
@@ -14740,17 +18897,6 @@ fn arm_inbound_relay_enrolled_destinations(
     Some(enrolled_destinations::InstalledEnrolledDestinationsGuard::install(index))
 }
 
-fn ensure_runtime_config_protocol_supported(
-    runtime: &MeshRuntimeConfig,
-) -> Result<(), anyhow::Error> {
-    match runtime.config_protocol {
-        MeshConfigProtocol::Native
-        | MeshConfigProtocol::Xds
-        | MeshConfigProtocol::File
-        | MeshConfigProtocol::StockXds => Ok(()),
-    }
-}
-
 struct MeshRuntimeBackgroundOwnership {
     handles: Vec<JoinHandle<()>>,
     // External rollback probes share a process with unrelated plugin tests and
@@ -14767,7 +18913,7 @@ async fn serve_mesh_runtime(
     env_config: EnvConfig,
     runtime: MeshRuntimeConfig,
     config: GatewayConfig,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
     mesh_state: MeshRuntimeState,
     initial_apply: Option<(Arc<MeshSlice>, revision::MeshRevisionApplyToken)>,
     background_ownership: MeshRuntimeBackgroundOwnership,
@@ -14884,7 +19030,7 @@ fn prepare_mesh_runtime_before_owner(
     env_config: &EnvConfig,
     runtime: &MeshRuntimeConfig,
     config: GatewayConfig,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     initial_applied_mesh_slice: Option<&Arc<MeshSlice>>,
 ) -> Result<PreparedMeshRuntimeBeforeOwner, anyhow::Error> {
     // Fail closed on malformed UDP capture settings (codex r2 P2 / r3 P2),
@@ -15012,6 +19158,7 @@ fn prepare_mesh_runtime_before_owner(
         Some(shutdown_tx.subscribe()),
         bpf_metrics_state.clone(),
     )?;
+    proxy_state.overload.attach_shutdown(shutdown_tx);
     // Proxy hop limit (issue #6109): publish this generation's listener ports
     // before any listener binds, so the mesh inbound exemption never forwards
     // an unchanged count to another gateway listener.
@@ -15118,16 +19265,8 @@ async fn arm_mesh_runtime_startup(
             env_config.pool_shard_amount,
         ));
         if let Some(initial_slice) = initial_applied_mesh_slice.as_ref() {
-            let snapshot =
-                resolver.build_policy_scope_snapshot_from_workloads(&initial_slice.workloads);
+            let snapshot = resolver.build_policy_scope_snapshot_from_slice(initial_slice);
             resolver.install_policy_scope_snapshot(snapshot);
-        }
-        if let Some(handle) = node_waypoint::spawn_cgroup_sweep_task(
-            resolver.clone(),
-            env_config.mesh_node_waypoint_cgroup_sweep_interval_secs,
-            shutdown_tx.subscribe(),
-        ) {
-            owner.push_mesh_background(handle);
         }
         if let Some(handle) = node_waypoint::spawn_idle_identity_gc_task(
             resolver.clone(),
@@ -15157,10 +19296,10 @@ async fn arm_mesh_runtime_startup(
         // the snapshot installed above seeds BOTH policy scopes AND a
         // workload_spiffe_hash → SPIFFE index, so `resolve_record` lazily
         // enrolls `pod_uid` → identity by hash-join against the eBPF-stamped
-        // records (no separate enrollment channel). The path is complete in
-        // code and CI-verified at the load/attach level (`ebpf-live`); it stays
-        // unexercised on a live multi-pod datapath, where a tuple/byte-order or
-        // enrollment miss fails closed (never misattributes).
+        // records (no separate enrollment channel). It is CI-verified at the
+        // load/attach level (`ebpf-live`) and on a live multi-pod datapath
+        // (`node-waypoint-ebpf-live`); a tuple/byte-order or enrollment miss
+        // fails closed (never misattributes).
         owner.push_mesh_background(spawn_orig_dst_bridge_task(resolver.clone(), &shutdown_tx));
         // NodeWaypoint UDP/DTLS per-datagram source-workload attribution
         // (issue #3286). A UDP listener has one shared frontend socket and no
@@ -15266,15 +19405,16 @@ async fn arm_mesh_runtime_startup(
         proxy_state
     };
     owner.set_proxy_state(proxy_state.clone());
-    // Node-waypoint in-netns outbound capture listeners (opt-in). The default
-    // outbound listener binds in the HOST netns, which a pod's loopback-rewritten
-    // capture (`connect4` → 127.0.0.1:15001, `connect6` → [::1]:15001) can never
-    // reach; with this enabled the proxy additionally opens dual-family loopback
-    // listeners INSIDE each enrolled pod's network namespace, so captured
-    // connections are accepted there and the GAP-2M sock_ops same-netns cookie
-    // bridge resolves their source identity. Pods are discovered from the registry
-    // the node-agent publishes. Linux-only; the full pod-loopback datapath is
-    // verified only on a live multi-pod node (see `src/proxy/netns_capture.rs`).
+    // Node-waypoint in-netns outbound capture listeners (always on for
+    // NodeWaypoint). The default outbound listener binds in the HOST netns,
+    // which a pod's loopback-rewritten capture (`connect4` → 127.0.0.1:15001,
+    // `connect6` → [::1]:15001) can never reach; so the proxy additionally
+    // opens dual-family loopback listeners INSIDE each enrolled pod's network
+    // namespace, so captured connections are accepted there and the GAP-2M
+    // sock_ops same-netns cookie bridge resolves their source identity. Pods
+    // are discovered from the registry the node-agent publishes. Linux-only;
+    // the full pod-loopback datapath is verified only on a live multi-pod node
+    // (see `src/proxy/netns_capture.rs`).
     if runtime.topology == MeshTopology::NodeWaypoint {
         // The connect hooks rewrite captured pod egress to loopback inside the
         // POD netns, taking only the port from FERRUM_MESH_OUTBOUND_LISTEN_ADDR.
@@ -15287,8 +19427,8 @@ async fn arm_mesh_runtime_startup(
         let capture_port = runtime.outbound_listen_addr.port();
         if capture_port == 0 {
             info!(
-                "Node-waypoint in-netns capture listeners requested, but the outbound listen \
-                 port is 0 (disabled); not starting in-netns capture"
+                "Node-waypoint outbound listen port is 0 (disabled); not starting in-netns \
+                 capture listeners"
             );
         } else {
             let capture_addr = std::net::SocketAddr::new(
@@ -15907,6 +20047,7 @@ async fn arm_mesh_runtime_startup(
             runtime.dns_max_concurrent_queries,
             runtime.dns_response_cache_max_entries,
             runtime.cluster_domain.clone(),
+            env_config.pool_shard_amount,
         ));
         // Build initial resolution table from the applied slice
         if let Some(ref slice) = initial_applied_mesh_slice {
@@ -15958,7 +20099,8 @@ async fn arm_mesh_runtime_startup(
         Ok(None) => {}
         Err(error) => {
             return Err(error.context(
-                "failed to start the mesh application-probe rewrite server; kubelet probes                  rewritten by the injector would fail closed",
+                "failed to start the mesh application-probe rewrite server; kubelet probes \
+                 rewritten by the injector would fail closed",
             ));
         }
     }
@@ -16391,17 +20533,14 @@ async fn arm_mesh_runtime_startup(
     let mut startup_signals = admin_startup_signals;
     let mesh_topology = runtime.topology;
     for listener in runtime.listener_plan() {
-        let uses_mesh_inbound_tls = uses_mesh_inbound_tls_kind(listener.kind);
-        let tls_config = if uses_mesh_inbound_tls {
-            None
-        } else {
-            listener_tls_config_for_mtls_mode(&listener, frontend_tls.clone(), inbound_mtls_mode)
-        };
-        let listener_has_tls = if uses_mesh_inbound_tls {
+        // Termination listeners resolve their `ServerConfig` per connection
+        // from the live PeerAuthentication policy. Every other planned kind is
+        // a plaintext capture listener and terminates no TLS: the captured
+        // stream may itself be application TLS, which must be relayed
+        // byte-for-byte and never mistaken for mesh TLS.
+        let listener_has_tls = uses_mesh_inbound_tls_kind(listener.kind) && {
             let policy = proxy_state.mesh_inbound_tls_policy.load();
             policy.default.is_some() || policy.by_port.values().any(Option::is_some)
-        } else {
-            tls_config.is_some()
         };
         if !listener_has_tls
             && uses_mesh_inbound_tls_kind(listener.kind)
@@ -16459,8 +20598,7 @@ async fn arm_mesh_runtime_startup(
                 // the original destination from `getsockname()` rather than
                 // SO_ORIGINAL_DST (the redirect performs no NAT), gates on the
                 // live PeerAuthentication posture for the recovered app port,
-                // and relays opaquely at L4. `tls_config` is always None — this
-                // listener terminates nothing.
+                // and relays opaquely at L4. This listener terminates nothing.
                 proxy::node_waypoint_ingress_capture::start_listener(
                     addr,
                     state,
@@ -16469,31 +20607,28 @@ async fn arm_mesh_runtime_startup(
                 )
                 .await
             } else if matches!(kind, MeshListenerKind::PlaintextUdpCapture) {
-                // UDP TPROXY capture listener (F3 §3.3 Stage 3) — plaintext,
-                // distinct from the TCP capture/HTTP path: it binds a transparent
-                // UDP socket, recovers per-datagram orig-dst from cmsg, and drops
-                // (egress is Stage 4). `tls_config` is always None here.
+                // UDP TPROXY capture listener (F3 §3.3) — plaintext, distinct
+                // from the TCP capture/HTTP path: it binds a transparent UDP
+                // socket, recovers per-datagram orig-dst from cmsg, and hands
+                // each datagram to the mesh UDP egress relay. It terminates no
+                // TLS.
                 proxy::start_mesh_udp_capture_listener_with_signal(
                     addr,
                     state,
                     shutdown,
-                    tls_config,
+                    None,
                     Some(direction),
                     Some(started_tx),
                 )
                 .await
             } else {
-                // Outbound capture (plaintext) — non-mTLS mesh listener. Use the
-                // generic listener entry but stamp direction by routing through
-                // the mesh mTLS variant with `record_mesh_mtls_metric=false`.
-                // We accomplish that by constructing the underlying call
-                // directly so we can pass `mesh_direction` even though TLS
-                // termination is disabled.
+                // Outbound capture (plaintext): non-mTLS mesh listener that
+                // still stamps `mesh_direction`.
                 proxy::start_mesh_plaintext_listener_with_signal(
                     addr,
                     state,
                     shutdown,
-                    tls_config,
+                    None,
                     Some(direction),
                     dual_stack,
                     Some(started_tx),
@@ -16561,7 +20696,7 @@ struct MeshServingSignals {
 #[allow(clippy::too_many_arguments)]
 fn start_mesh_admin_listeners(
     env_config: &EnvConfig,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     proxy_state: ProxyState,
     mesh_state: MeshRuntimeState,
     config_rejected: Arc<AtomicBool>,
@@ -16590,6 +20725,10 @@ fn start_mesh_admin_listeners(
             return Err(anyhow::anyhow!("Invalid admin JWT configuration: {}", err));
         }
     };
+    // No configuration database in this mode: durable admin audit records are
+    // retained in the bounded local retention file (issue #7200). Start the
+    // worker that adopts and drains the spool into it before admin traffic.
+    crate::admin::audit::start_local_retention_delivery(env_config.admin_audit_enabled);
     let admin_state = AdminState {
         db: None,
         jwt_manager,
@@ -16628,7 +20767,6 @@ fn start_mesh_admin_listeners(
             crate::admin::api_specs::DefaultExternalDocumentLoader {
                 egress: env_config.backend_allow_ips.clone(),
                 dns_cache: None,
-                fixtures: std::collections::HashMap::new(),
             },
         ),
         runtime_config_apply: None,
@@ -16799,10 +20937,7 @@ fn start_mesh_admin_listeners(
 /// Resolve the workload-level mTLS fallback for the inbound TLS-terminating
 /// listener. App-port overrides are published separately in the per-port
 /// table; a mesh transport port must never select one as the listener fallback.
-fn resolve_inbound_mtls_mode(
-    initial_slice: Option<&MeshSlice>,
-    _runtime: &MeshRuntimeConfig,
-) -> config::MtlsMode {
+fn resolve_inbound_mtls_mode(initial_slice: Option<&MeshSlice>) -> config::MtlsMode {
     let Some(slice) = initial_slice else {
         return config::MtlsMode::Permissive;
     };
@@ -16896,9 +21031,7 @@ fn selectable_inbound_peer_auth_ports(
                     .any(|candidate| candidate.spiffe_id == workload.spiffe_id)
         }) {
             for service_port in &service.ports {
-                if let Some(app_port) = resolve_sidecar_inbound_backend_port(service_port, workload)
-                    .filter(|port| *port != 0)
-                {
+                if let Some(app_port) = service_port.backend_port_for(&workload.ports) {
                     ports.insert(app_port);
                 }
             }
@@ -17094,7 +21227,7 @@ fn startup_inbound_mtls_mode(
     initial_slice: Option<&MeshSlice>,
     runtime: &MeshRuntimeConfig,
 ) -> Result<config::MtlsMode, anyhow::Error> {
-    let resolved = resolve_inbound_mtls_mode(initial_slice, runtime);
+    let resolved = resolve_inbound_mtls_mode(initial_slice);
     validate_inbound_mtls_mode_for_topology(runtime, resolved)?;
     for (port, mode) in resolve_inbound_mtls_modes_by_port(initial_slice, runtime) {
         validate_inbound_mtls_mode_for_topology(runtime, mode).with_context(|| {
@@ -17108,7 +21241,7 @@ fn live_reload_inbound_mtls_mode(
     slice: &MeshSlice,
     runtime: &MeshRuntimeConfig,
 ) -> Option<config::MtlsMode> {
-    let resolved = resolve_inbound_mtls_mode(Some(slice), runtime);
+    let resolved = resolve_inbound_mtls_mode(Some(slice));
     if let Err(error) = validate_inbound_mtls_mode_for_topology(runtime, resolved) {
         warn!(
             mesh_slice_version = %sanitize_startup_scalar(slice.version.to_string()),
@@ -17973,7 +22106,6 @@ struct MeshInboundTlsReloadState {
 /// bundle is retained. See `build_mesh_inbound_spiffe_slot`'s F2 comment for
 /// the precise per-caller disposition.
 #[cfg(test)]
-#[allow(dead_code)]
 fn build_mesh_inbound_spiffe_slot(
     env_config: &EnvConfig,
     slice: Option<&MeshSlice>,
@@ -18020,10 +22152,11 @@ fn build_mesh_inbound_spiffe_slot_with_federation(
     //     for the identical condition. So a configured SVID that fails to load —
     //     including an expired/mid-rotation leaf — aborts startup; it does not
     //     silently degrade to chain-only.
-    //   - Live reload: `stage_mesh_inbound_spiffe_bundle` keeps the PREVIOUS trust
-    //     bundle (the running verifier is retained, not dropped to chain-only), so
-    //     a transient mid-rotation failure does not drop inbound trust-domain
-    //     enforcement.
+    //   - Live reload: slice applies never rebuild this slot from files; they
+    //     stage only the trust overlay (`stage_gateway_runtime_spiffe_bundle_with_federation`)
+    //     and republish from the runtime SVID, so the running verifier is
+    //     retained and a transient mid-rotation failure does not drop inbound
+    //     trust-domain enforcement.
     // We intentionally do not load only the trust bundle here: the gateway leaf
     // must also be currently valid for the listener to present a usable server
     // identity, so an expired leaf is a real fault, not a reason to half-load.
@@ -18143,88 +22276,7 @@ fn merge_trust_overlay_into_svid_bundle(
         .or_insert_with(|| runtime.local.clone());
 }
 
-/// Rebuild the inbound SPIFFE trust-bundle from the gateway SVID material plus
-/// the current slice's federated bundles, returning it STAGED (not yet stored
-/// into the live slot). The caller publishes it into the live slot only after
-/// the candidate proxy config is accepted, so a rejected slice cannot leave new
-/// federated trust domains active for inbound handshakes. A rebuild failure
-/// returns `None` (logged) and the caller leaves the previous trust bundles in
-/// place — this never fails the slice.
 #[cfg(test)]
-#[allow(dead_code)]
-fn stage_mesh_inbound_spiffe_bundle(
-    proxy_state: &ProxyState,
-    slot: Option<&tls::SharedBundleSlot>,
-    runtime_trust_overlay_slot: Option<&SharedMeshInboundTrustOverlaySlot>,
-    env_config: &EnvConfig,
-    slice: &MeshSlice,
-) -> Option<StagedSpiffeBundle> {
-    stage_mesh_inbound_spiffe_bundle_with_federation(
-        proxy_state,
-        slot,
-        runtime_trust_overlay_slot,
-        env_config,
-        slice,
-        None,
-        FederationActivation::disabled(),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn stage_mesh_inbound_spiffe_bundle_with_federation(
-    proxy_state: &ProxyState,
-    slot: Option<&tls::SharedBundleSlot>,
-    runtime_trust_overlay_slot: Option<&SharedMeshInboundTrustOverlaySlot>,
-    env_config: &EnvConfig,
-    slice: &MeshSlice,
-    federation: Option<&federation::FederationSnapshot>,
-    activation: FederationActivation,
-) -> Option<StagedSpiffeBundle> {
-    let slot = slot?;
-    if runtime_trust_overlay_slot.is_some() {
-        return stage_gateway_runtime_spiffe_bundle_with_federation(
-            proxy_state,
-            Some(slot),
-            runtime_trust_overlay_slot,
-            slice,
-            federation,
-            activation,
-        );
-    }
-    if !gateway_svid_material_configured(env_config) {
-        return stage_gateway_runtime_spiffe_bundle_with_federation(
-            proxy_state,
-            Some(slot),
-            runtime_trust_overlay_slot,
-            slice,
-            federation,
-            activation,
-        );
-    }
-    match build_mesh_inbound_spiffe_slot_with_federation(
-        env_config,
-        Some(slice),
-        federation,
-        activation,
-        None,
-    ) {
-        Some(rebuilt) => Some(StagedSpiffeBundle::DirectSlot {
-            slot: slot.clone(),
-            bundle: rebuilt.load_full(),
-        }),
-        None => {
-            warn!(
-                mesh_slice_version = %sanitize_startup_scalar(slice.version.to_string()),
-                "Unable to rebuild mesh inbound SPIFFE trust-bundle slot from slice; \
-                 keeping previous trust bundles"
-            );
-            None
-        }
-    }
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
 fn stage_gateway_runtime_spiffe_bundle(
     proxy_state: &ProxyState,
     slot: Option<&tls::SharedBundleSlot>,
@@ -18241,6 +22293,15 @@ fn stage_gateway_runtime_spiffe_bundle(
     )
 }
 
+/// Stage the inbound SPIFFE trust update for the current slice: the accepted
+/// slice/federation trust overlay, published into the live slot (re-read from
+/// the latest runtime SVID) only after the candidate proxy config is accepted,
+/// so a rejected slice cannot leave new federated trust domains active for
+/// inbound handshakes. Every inbound SPIFFE slot has a runtime trust overlay
+/// slot (both exist exactly when gateway SVID material or a CA backend is
+/// configured), so this is the only staging path. A staging failure returns
+/// `None` (logged) and the caller leaves the previous trust bundles in place —
+/// this never fails the slice.
 fn stage_gateway_runtime_spiffe_bundle_with_federation(
     proxy_state: &ProxyState,
     slot: Option<&tls::SharedBundleSlot>,
@@ -18277,7 +22338,7 @@ fn stage_gateway_runtime_spiffe_bundle_with_federation(
         );
         return None;
     }
-    Some(StagedSpiffeBundle::RuntimeSlot {
+    Some(StagedSpiffeBundle {
         slot: slot.clone(),
         trust_overlay_slot: runtime_trust_overlay_slot.clone(),
         trust_overlay,
@@ -18539,7 +22600,11 @@ fn resolve_mesh_inbound_client_auth(
 ) -> MeshClientAuthDecision {
     let is_egress_gateway = topology == MeshTopology::EgressGateway;
     match mtls_mode {
-        config::MtlsMode::Strict => MeshClientAuthDecision::Resolved(tls::MeshClientAuth::Required),
+        // `Unset` never survives the canonical PeerAuthentication resolver; a
+        // leaked inherit marker fails closed to required client auth.
+        config::MtlsMode::Strict | config::MtlsMode::Unset => {
+            MeshClientAuthDecision::Resolved(tls::MeshClientAuth::Required)
+        }
         config::MtlsMode::Permissive if has_client_ca_bundle || has_spiffe_verifier => {
             // EgressGateway is a security boundary onto external networks: a
             // cert-less client must NOT be admitted to the external backend.
@@ -18600,7 +22665,10 @@ fn load_mesh_frontend_tls(
     let Some(server_identity) = server_identity else {
         if mtls_mode == config::MtlsMode::Strict {
             return Err(anyhow::anyhow!(
-                "Mesh PeerAuthentication STRICT requires FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH"
+                "Mesh PeerAuthentication STRICT requires a TLS server identity: set \
+                 FERRUM_GATEWAY_SVID_CERT_PATH / KEY_PATH / TRUST_BUNDLE_PATH, \
+                 FERRUM_MESH_CA_BACKEND, or FERRUM_FRONTEND_TLS_CERT_PATH and \
+                 FERRUM_FRONTEND_TLS_KEY_PATH"
             ));
         }
         return Ok(None);
@@ -18825,6 +22893,21 @@ fn decide_mesh_inbound_fail_closed(trigger: bool, production: bool) -> MeshInbou
     }
 }
 
+/// Why a mesh inbound termination listener resolved to no `ServerConfig`
+/// (plaintext). Only DISABLE is a PeerAuthentication choice; any other mode got
+/// here because `load_mesh_frontend_tls` had no server identity to serve.
+fn mesh_inbound_plaintext_reason(mode: config::MtlsMode) -> &'static str {
+    if mode == config::MtlsMode::Disable {
+        "PeerAuthentication resolved to DISABLE, so the inbound mTLS/HBONE termination \
+         listener would accept unauthenticated plaintext"
+    } else {
+        "the inbound mTLS/HBONE termination listener resolved to no usable TLS server identity \
+         (set FERRUM_GATEWAY_SVID_CERT_PATH / KEY_PATH / TRUST_BUNDLE_PATH, \
+         FERRUM_MESH_CA_BACKEND, or FERRUM_FRONTEND_TLS_CERT_PATH / KEY_PATH), so it would \
+         accept unauthenticated plaintext"
+    }
+}
+
 fn mesh_inbound_mode_accepts_plaintext(mode: config::MtlsMode) -> bool {
     matches!(
         mode,
@@ -18902,17 +22985,12 @@ fn enforce_mesh_inbound_fail_closed(
     // config. PERMISSIVE with a valid config historically starts in production
     // and remains TLS-only there; do not turn its optional client certificate
     // posture into a new startup failure.
-    let reason: &str = if mtls_mode == config::MtlsMode::Disable {
-        "PeerAuthentication resolved to DISABLE, so the inbound mTLS/HBONE termination \
-         listener would accept unauthenticated plaintext"
-    } else if mtls_mode == config::MtlsMode::Permissive {
-        "PeerAuthentication resolved to PERMISSIVE, so the inbound mTLS/HBONE termination \
-         listener would accept unauthenticated plaintext alongside TLS"
-    } else {
-        "the inbound mTLS/HBONE termination listener resolved to no usable TLS server identity \
-         (set FERRUM_GATEWAY_SVID_CERT_PATH / KEY_PATH / TRUST_BUNDLE_PATH, or \
-         FERRUM_FRONTEND_TLS_CERT_PATH / KEY_PATH), so it would accept unauthenticated plaintext"
-    };
+    //
+    // The reason follows the cause. `load_mesh_frontend_tls` returns no
+    // `ServerConfig` only for DISABLE or when no server identity is available
+    // (STRICT without one is already a hard error there), so every non-DISABLE
+    // trigger here is a missing identity, whatever the mode.
+    let reason = mesh_inbound_plaintext_reason(mtls_mode);
     match decide_mesh_inbound_fail_closed(frontend_tls.is_none(), production) {
         MeshInboundFailClosed::Ok => {
             crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(false);
@@ -18991,39 +23069,6 @@ fn uses_mesh_inbound_tls_kind(kind: MeshListenerKind) -> bool {
     )
 }
 
-fn listener_tls_config(
-    listener: &MeshListener,
-    frontend_tls: Option<Arc<rustls::ServerConfig>>,
-) -> Option<Arc<rustls::ServerConfig>> {
-    match listener.kind {
-        // The plaintext listeners (TCP outbound capture, the UDP TPROXY capture
-        // listener, and the NodeWaypoint transparent inbound capture listener)
-        // terminate no TLS. For the last of those it is load-bearing, not
-        // incidental: the captured stream may itself be application TLS, which
-        // must be relayed byte-for-byte and never mistaken for mesh TLS.
-        MeshListenerKind::PlaintextCapture
-        | MeshListenerKind::PlaintextUdpCapture
-        | MeshListenerKind::TransparentInboundCapture => None,
-        MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination => frontend_tls,
-    }
-}
-
-/// Resolve the per-listener TLS config, respecting PeerAuthentication mTLS mode.
-///
-/// - `Disable` mode: all listeners run plaintext (no TLS config).
-/// - `Strict` / `Permissive`: mTLS/HBONE listeners get the frontend TLS config;
-///   plaintext-capture listeners stay plaintext.
-fn listener_tls_config_for_mtls_mode(
-    listener: &MeshListener,
-    frontend_tls: Option<Arc<rustls::ServerConfig>>,
-    mtls_mode: config::MtlsMode,
-) -> Option<Arc<rustls::ServerConfig>> {
-    if mtls_mode == config::MtlsMode::Disable {
-        return None;
-    }
-    listener_tls_config(listener, frontend_tls)
-}
-
 fn mesh_inbound_spiffe_verifier_active(
     has_termination_listener: bool,
     tls_configured: bool,
@@ -19057,28 +23102,18 @@ enum MeshInboundTlsReloadPlan {
 
 /// A staged inbound SPIFFE trust update. Staging keeps the live verifier
 /// reading the previous trust bundles until the candidate proxy config is
-/// accepted.
-enum StagedSpiffeBundle {
-    /// File-backed SVID path: replace the dedicated inbound verifier slot.
-    DirectSlot {
-        slot: tls::SharedBundleSlot,
-        bundle: Arc<Option<crate::identity::SvidBundle>>,
-    },
-    /// Runtime-backed SVID path: update the dedicated inbound verifier slot
-    /// from the latest raw SVID plus the accepted slice trust overlay. The
-    /// SVID itself is intentionally not captured at staging time because a
-    /// file/CA rotation can complete while the candidate slice is still being
-    /// planned.
-    RuntimeSlot {
-        slot: tls::SharedBundleSlot,
-        trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
-        trust_overlay: Option<crate::identity::TrustBundleSet>,
-    },
+/// accepted. Publishing updates the dedicated inbound verifier slot from the
+/// latest raw SVID plus the accepted slice trust overlay. The SVID itself is
+/// intentionally not captured at staging time because a file/CA rotation can
+/// complete while the candidate slice is still being planned.
+struct StagedSpiffeBundle {
+    slot: tls::SharedBundleSlot,
+    trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
+    trust_overlay: Option<crate::identity::TrustBundleSet>,
 }
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
-#[allow(dead_code)]
 fn plan_mesh_inbound_tls_reload(
     proxy_state: &ProxyState,
     runtime: &MeshRuntimeConfig,
@@ -19160,11 +23195,10 @@ fn plan_mesh_inbound_tls_reload_with_federation(
     // when the operator client CA bundle and mTLS mode are otherwise unchanged.
     // Only the accepted slice trust overlay is recomputed; the SVID cert/key
     // and local roots stay anchored to the current file or CA runtime source.
-    let staged_spiffe = stage_mesh_inbound_spiffe_bundle_with_federation(
+    let staged_spiffe = stage_gateway_runtime_spiffe_bundle_with_federation(
         proxy_state,
         spiffe_bundle_slot,
         runtime_trust_overlay_slot,
-        &proxy_state.env_config,
         slice,
         federation,
         activation,
@@ -19386,11 +23420,8 @@ async fn apply_mesh_inbound_tls_reload(
             proxy_state.publish_mesh_inbound_tls_policy(crate::proxy::MeshInboundTlsPolicy {
                 default: tls_config.clone(),
                 by_port: tls_by_port,
-                default_mode: effective_inbound_mtls_mode_for_topology(mtls_mode, topology),
-                modes_by_port: effective_inbound_mtls_modes_for_topology(
-                    &snapshot.port_modes,
-                    topology,
-                ),
+                default_mode: effective_mode,
+                modes_by_port: effective_port_modes,
                 app_port_by_orig_dst_port: snapshot.app_port_by_orig_dst_port.clone(),
             });
             proxy_state.mesh_inbound_spiffe_verifier_active.store(
@@ -19565,7 +23596,9 @@ pub fn build_node_waypoint_dtls_owner_configs(
             let mode =
                 effective_node_waypoint_dtls_peer_auth_mode(slice, service, service_port.port);
             let route_client_ca = match mode {
-                config::MtlsMode::Strict => match client_ca {
+                // `Unset` never survives the canonical resolver; a leaked
+                // inherit marker is served as STRICT (fail closed).
+                config::MtlsMode::Strict | config::MtlsMode::Unset => match client_ca {
                     Some(path) => Some(path),
                     None => {
                         // STRICT without a client CA cannot be served. Returning
@@ -19697,7 +23730,9 @@ fn effective_node_waypoint_dtls_peer_auth_mode(
 ) -> config::MtlsMode {
     fn rank(mode: config::MtlsMode) -> u8 {
         match mode {
-            config::MtlsMode::Strict => 2,
+            // `Unset` never survives the canonical resolver; rank a leaked
+            // inherit marker as STRICT so it can only tighten the mixed set.
+            config::MtlsMode::Strict | config::MtlsMode::Unset => 2,
             config::MtlsMode::Permissive => 1,
             config::MtlsMode::Disable => 0,
             // Client-side DestinationRule modes are invalid in this server-side
@@ -19859,31 +23894,28 @@ fn start_remote_cluster_discovery_reconcile_task(
 /// The verifier holds an `Arc` to this slot and observes the new bundle on its
 /// next handshake.
 ///
-/// Both arms publish through `ProxyState::publish_mesh_inbound_trust_bundle`
-/// (issue #5568), so every accepted change to inbound trust re-judges live
+/// It publishes through `publish_runtime_svid_to_inbound_slot` and so
+/// `ProxyState::publish_mesh_inbound_trust_bundle` (issue #5568), so every
+/// accepted change to inbound trust re-judges live
 /// HBONE tunnels against it. A republish that carries the same X.509 material
 /// costs one coalesced sweep and no certificate path building, because the
 /// slot's trust revision does not move.
 fn publish_staged_spiffe_bundle(proxy_state: &ProxyState, staged: Option<StagedSpiffeBundle>) {
-    match staged {
-        Some(StagedSpiffeBundle::DirectSlot { slot, bundle }) => {
-            proxy_state.publish_mesh_inbound_trust_bundle(&slot, bundle);
-        }
-        Some(StagedSpiffeBundle::RuntimeSlot {
-            slot,
-            trust_overlay_slot,
-            trust_overlay,
-        }) => {
-            // Publish the accepted trust overlay, then republish the inbound slot
-            // from the LATEST runtime SVID under the rotation lock (a CA rotation
-            // may have landed since this slice was staged). `publish_runtime_svid_to_inbound_slot`
-            // re-reads `gateway_file_svid_bundle` itself, so a rotation cannot be
-            // clobbered by a stale staged snapshot.
-            trust_overlay_slot.store(Arc::new(trust_overlay));
-            publish_runtime_svid_to_inbound_slot(proxy_state, &slot, &trust_overlay_slot);
-        }
-        None => {}
-    }
+    let Some(StagedSpiffeBundle {
+        slot,
+        trust_overlay_slot,
+        trust_overlay,
+    }) = staged
+    else {
+        return;
+    };
+    // Publish the accepted trust overlay, then republish the inbound slot from
+    // the LATEST runtime SVID under the rotation lock (a CA rotation may have
+    // landed since this slice was staged). `publish_runtime_svid_to_inbound_slot`
+    // re-reads `gateway_file_svid_bundle` itself, so a rotation cannot be
+    // clobbered by a stale staged snapshot.
+    trust_overlay_slot.store(Arc::new(trust_overlay));
+    publish_runtime_svid_to_inbound_slot(proxy_state, &slot, &trust_overlay_slot);
 }
 
 /// Stage the exact effective mesh/federation gateway trust decision before any
@@ -19920,9 +23952,7 @@ fn stage_gateway_active_trust_bundles(
 /// the staging contract (a deep-invalid bundle rejects the whole generation and
 /// mutates no live state) against the PRODUCTION helper rather than a copy.
 ///
-/// Reached only from `tests/`; the `ferrum-edge` bin target compiles this module
-/// without any such caller.
-#[allow(dead_code)]
+/// Reached only from `tests/`.
 pub fn stage_gateway_active_trust_bundles_unfederated_for_test(
     proxy_state: &ProxyState,
     slice: &MeshSlice,
@@ -20050,11 +24080,10 @@ async fn apply_mesh_slice_generation(
     let staged_inbound_spiffe = if live_reload_enabled {
         None
     } else {
-        stage_mesh_inbound_spiffe_bundle_with_federation(
+        stage_gateway_runtime_spiffe_bundle_with_federation(
             proxy_state,
             inbound_tls_reload.spiffe_bundle_slot.as_ref(),
             inbound_tls_reload.runtime_trust_overlay_slot.as_ref(),
-            &proxy_state.env_config,
             base_slice,
             Some(federation_snapshot),
             federation_activation,
@@ -20065,7 +24094,6 @@ async fn apply_mesh_slice_generation(
         runtime,
         Some(federation_snapshot),
         Some(remote_snapshot),
-        federation_activation,
     ) {
         Ok(mut config) => {
             let trusted_mesh_ids =
@@ -20137,8 +24165,7 @@ async fn apply_mesh_slice_generation(
                     .map(|resolver| {
                         (
                             Arc::clone(resolver),
-                            resolver
-                                .build_policy_scope_snapshot_from_workloads(&base_slice.workloads),
+                            resolver.build_policy_scope_snapshot_from_slice(base_slice),
                         )
                     })
             } else {
@@ -20575,7 +24602,7 @@ struct MeshBackgroundTasks {
 /// created so any later initialization error can signal shared shutdown and
 /// run bounded teardown before returning the original cause (issue #2372).
 struct MeshStartupOwner {
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
     proxy_state: ProxyState,
     tasks: MeshBackgroundTasks,
     listener_handles: Vec<JoinHandle<()>>,
@@ -20590,7 +24617,7 @@ struct MeshStartupOwner {
 
 impl MeshStartupOwner {
     fn new(
-        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        shutdown_tx: crate::overload::ShutdownSender,
         proxy_state: ProxyState,
         health_check_handles: Vec<JoinHandle<()>>,
         mesh_background_handles: Vec<JoinHandle<()>>,
@@ -20710,7 +24737,7 @@ impl MeshStartupOwner {
                 "SPIFFE Workload API server terminated unexpectedly; initiating mesh shutdown \
                  rather than serving traffic with no identity endpoint"
             );
-            let _ = shutdown_tx.send(true);
+            shutdown_tx.shutdown();
         });
         self.tasks.mesh_background_handles.push(handle);
     }
@@ -20721,7 +24748,7 @@ impl MeshStartupOwner {
             "Mesh runtime startup failed after spawning tasks: {}; draining before returning",
             sanitize_startup_scalar(&err)
         );
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.shutdown();
         // Stop the Workload API first so its socket artifact is gone before the
         // process exits: a rollback that leaves the socket behind makes the
         // operator's next attempt fail to bind for a different reason than the
@@ -20789,7 +24816,7 @@ const MESH_STARTUP_LISTENER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// tasks after a failure that precedes [`MeshStartupOwner`] (initial-config wait
 /// or pre-`ProxyState` preparation). Preserves `err` as the returned cause.
 async fn fail_mesh_pre_owner(
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     handles: Vec<JoinHandle<()>>,
     err: anyhow::Error,
 ) -> anyhow::Error {
@@ -20797,7 +24824,7 @@ async fn fail_mesh_pre_owner(
         "Mesh runtime startup failed after spawning config consumers: {}; draining before returning",
         sanitize_startup_scalar(&err)
     );
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     join_mesh_background_handles(handles, MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT).await;
     err
 }
@@ -20831,7 +24858,7 @@ fn peek_mesh_startup_fault_inject() -> MeshStartupFaultInject {
 
 async fn await_mesh_listener_handles(
     listener_handles: Vec<JoinHandle<()>>,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
     reason: &str,
 ) -> Result<(), tokio::task::JoinError> {
     if listener_handles.is_empty() {
@@ -20848,7 +24875,7 @@ async fn await_mesh_listener_handles(
         Ok(())
     } else {
         let shutdown_on_panic = move || {
-            let _ = shutdown_tx.send(true);
+            shutdown_tx.shutdown();
         };
         crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic).await
     }
@@ -20918,6 +24945,9 @@ async fn shutdown_and_join_mesh(
         crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))
             .await;
     }
+    // Shutdown now closes whatever is still pending, while observability
+    // delivery is open, so those requests settle their terminals (issue #6768).
+    crate::overload::end_shutdown_drain_wait(&proxy_state.overload).await;
     // Release backend transport pools that hold kernel objects (issue #3731).
     // On a sidecar this is the pool of admitted connections to the co-located
     // application's Unix ingress sockets; leaving one idle keeps the app's
@@ -20938,6 +24968,10 @@ async fn shutdown_and_join_mesh(
 
     join_mesh_background_handles(tasks.handles, MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT).await;
     if finalize_global_plugins {
+        crate::admin::audit::shutdown_local_retention_delivery(Duration::from_secs(
+            proxy_state.env_config.shutdown_drain_seconds.clamp(5, 60),
+        ))
+        .await;
         crate::observability_delivery::shutdown(Duration::from_millis(
             proxy_state.env_config.log_shutdown_drain_timeout_ms,
         ))
@@ -20948,11 +24982,6 @@ async fn shutdown_and_join_mesh(
 }
 
 /// External coverage seams for issue #2372 mesh startup rollback.
-///
-/// `src/main.rs` re-declares modules without the `_test_support` bridge, so this
-/// module is unused in the binary target — hence the module-scoped
-/// `allow(dead_code)`. Production code is not suppressed.
-#[allow(dead_code)]
 #[doc(hidden)]
 pub mod startup_rollback_test_seams {
     use super::*;
@@ -21057,7 +25086,7 @@ pub mod startup_rollback_test_seams {
     /// Spawn a netns-manager-shaped sentinel: wait for shutdown, then run an
     /// async teardown step before exiting. Rollback must await this completion.
     fn spawn_netns_style_sentinel(
-        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        shutdown_tx: &crate::overload::ShutdownSender,
         shutdown_observed: Arc<AtomicBool>,
         teardown_completed: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
@@ -21084,13 +25113,15 @@ pub mod startup_rollback_test_seams {
         ensure_crypto_provider();
         let env = probe_env_config();
         let runtime = probe_runtime_config();
-        let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
-        let mesh_state = MeshRuntimeState::new();
-        mesh_state.install_slice(MeshSlice {
+        let slice = MeshSlice {
             version: chrono::Utc::now().to_rfc3339(),
             ..MeshSlice::default()
-        });
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        };
+        let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime).unwrap();
+        let mesh_state = MeshRuntimeState::new();
+        mesh_state.install_slice(slice);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let shutdown_observed = Arc::new(AtomicBool::new(false));
         let teardown_completed = Arc::new(AtomicBool::new(false));
         let sentinel = spawn_netns_style_sentinel(
@@ -21177,11 +25208,6 @@ pub mod startup_rollback_test_seams {
 /// private, so external coverage of the config-revision watermark lifecycle
 /// ACROSS that stage reaches it through this seam rather than through an
 /// in-source test.
-///
-/// `src/main.rs` re-declares modules without the `_test_support` bridge, so
-/// this module is unused in the binary target — hence the module-scoped
-/// `allow(dead_code)`. Production code is not suppressed.
-#[allow(dead_code)]
 #[doc(hidden)]
 pub mod initial_config_wait_test_seams {
     use super::*;
@@ -21208,11 +25234,7 @@ pub mod initial_config_wait_test_seams {
         let mut runtime = startup_rollback_test_seams::probe_runtime_config();
         runtime.node_id = PROBE_NODE_ID.to_string();
         runtime.namespace = PROBE_NAMESPACE.to_string();
-        let activation = FederationActivation {
-            fail_open: false,
-            poll_enabled: false,
-        };
-        wait_for_initial_mesh_config(&mesh_state, &runtime, activation, shutdown_rx)
+        wait_for_initial_mesh_config(&mesh_state, &runtime, shutdown_rx)
             .await
             .map(|(_, slice, _)| slice.version.clone())
             .map_err(|error| error.to_string())
@@ -21908,7 +25930,7 @@ fn parse_stock_xds_credential_policy() -> Result<StockCredentialLifetimePolicy, 
 /// — the plugin still emits zero counters via the empty `BpfMetricsState`.
 fn spawn_sock_ops_consumer_task(
     state: std::sync::Arc<crate::ebpf::bpf_metrics::BpfMetricsState>,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
 ) -> Option<tokio::task::JoinHandle<()>> {
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     {
@@ -21945,7 +25967,7 @@ fn spawn_sock_ops_consumer_task(
 /// re-open logic in `crate::ebpf::orig_dst_bridge`.
 fn spawn_orig_dst_bridge_task(
     resolver: std::sync::Arc<crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
 ) -> tokio::task::JoinHandle<()> {
     let shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(async move {
@@ -22251,7 +26273,8 @@ mod tests {
         let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
             registry.path(),
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let task = tokio::spawn(run_ambient_udp_placement_cleanup(
             context,
             source,
@@ -22280,7 +26303,7 @@ mod tests {
         }
         assert_eq!(snapshot().phase, UdpMigrationStatusPhase::CleanupComplete);
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         task.await.expect("cleanup supervisor task");
     }
     use crate::config::EnvConfig;
@@ -22497,7 +26520,10 @@ mod tests {
                 );
                 assert_eq!(runtime.cluster_domain, dns_proxy::DEFAULT_CLUSTER_DOMAIN);
                 assert_eq!(runtime.outbound_registry_reject_status, 502);
-                assert!(!runtime.sidecar_identity_narrowing);
+                assert!(
+                    runtime.sidecar_identity_narrowing,
+                    "identity narrowing is on by default (issue #7243)"
+                );
             },
         );
     }
@@ -22512,13 +26538,16 @@ mod tests {
                     "FERRUM_CP_DP_GRPC_JWT_SECRET",
                     "secret-padding-for-32-char-min!!",
                 ),
-                ("FERRUM_MESH_SIDECAR_IDENTITY_NARROWING", "true"),
+                ("FERRUM_MESH_SIDECAR_IDENTITY_NARROWING", "false"),
             ],
             || {
                 let env = EnvConfig::from_env().expect("mesh env config");
                 let runtime =
                     MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
-                assert!(runtime.sidecar_identity_narrowing);
+                assert!(
+                    !runtime.sidecar_identity_narrowing,
+                    "`false` is the explicit off switch for the default-on narrowing"
+                );
                 assert!(
                     !runtime.sidecar_enforced,
                     "identity narrowing is parsed independently but only takes effect during slicing when Sidecar enforcement is also enabled"
@@ -22612,7 +26641,6 @@ mod tests {
                 let xds_config = runtime.xds_client_config();
 
                 assert_eq!(runtime.config_protocol, MeshConfigProtocol::Xds);
-                assert!(ensure_runtime_config_protocol_supported(&runtime).is_ok());
                 assert_eq!(xds_config.cp_urls, vec!["http://cp:50051"]);
                 assert_eq!(xds_config.node_id, "node-x");
                 assert_eq!(xds_config.cluster, "cluster-a");
@@ -22646,7 +26674,6 @@ mod tests {
 
                 assert_eq!(runtime.config_protocol, MeshConfigProtocol::File);
                 assert!(!runtime.config_protocol.requires_control_plane());
-                assert!(ensure_runtime_config_protocol_supported(&runtime).is_ok());
                 assert_eq!(
                     runtime.file_config_path.as_deref(),
                     Some("/etc/ferrum/mesh.yaml")
@@ -23074,13 +27101,15 @@ mod tests {
             request_auth_require_exp: true,
             locality_lb_strict: false,
         };
-        let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
-        let mesh_state = MeshRuntimeState::new();
-        mesh_state.install_slice(MeshSlice {
+        let slice = MeshSlice {
             version: chrono::Utc::now().to_rfc3339(),
             ..MeshSlice::default()
-        });
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        };
+        let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime).unwrap();
+        let mesh_state = MeshRuntimeState::new();
+        mesh_state.install_slice(slice);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let task_shutdown = shutdown_tx.clone();
         let task = tokio::spawn(async move {
             serve_mesh_runtime(
@@ -23104,7 +27133,7 @@ mod tests {
             !task.is_finished(),
             "mesh runtime should keep serving until shutdown"
         );
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
 
         let result = tokio::time::timeout(Duration::from_secs(5), task)
             .await
@@ -23500,12 +27529,12 @@ mod tests {
     #[test]
     fn sidecar_inbound_proxies_use_workload_port_and_own_service_only() {
         // The local workload backs service "reviews" with a TCP *container* port
-        // 9090 (the app/target port); the Service declares the port as HTTP on 80.
-        // A different service "ratings" merely shares the SPIFFE id. The inbound
-        // route must (a) key on the workload's OWN service ("reviews", not
-        // "ratings"), (b) be routable from the SERVICE port's HTTP protocol
-        // despite the workload port being TCP, and (c) target the workload's app
-        // port 9090 (not the service port 80).
+        // 9090 (the app/target port); the Service declares the port as HTTP on 80
+        // with a named `targetPort` pointing at it. A different service "ratings"
+        // merely shares the SPIFFE id. The inbound route must (a) key on the
+        // workload's OWN service ("reviews", not "ratings"), (b) be routable from
+        // the SERVICE port's HTTP protocol despite the workload port being TCP,
+        // and (c) target the workload's app port 9090 (not the service port 80).
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
         let runtime = MeshRuntimeConfig {
             workload_spiffe_id: Some(spiffe.to_string()),
@@ -23525,7 +27554,7 @@ mod tests {
                 port: 80,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
-                target_port: None,
+                target_port: Some(ServiceTargetPort::Name("http".to_string())),
             }],
             workloads: vec![crate::modes::mesh::config::WorkloadRef {
                 spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -24076,7 +28105,8 @@ mod tests {
         };
         let runtime = test_mesh_runtime_config();
         assert_eq!(runtime.namespace, "default");
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh prepare");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh prepare");
         let mesh = prepared.mesh.expect("mesh block survives preparation");
         assert_eq!(
             mesh.services
@@ -24091,8 +28121,8 @@ mod tests {
     #[test]
     fn mesh_runtime_resource_id_allowlist_is_exact_and_materialization_scoped() {
         let runtime = test_mesh_runtime_config();
-        let prepared =
-            prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).expect("prepare");
+        let prepared = prepare_gateway_config_via_mesh_slice(GatewayConfig::default(), &runtime)
+            .expect("prepare");
         assert!(
             prepared
                 .plugin_configs
@@ -24401,17 +28431,15 @@ mod tests {
     }
 
     #[test]
-    fn udp_egress_backend_scheme_and_label() {
-        // The egress-gateway scheme/label mappings must classify Udp as its own
-        // UDP L4 transport (BackendScheme::Udp, "udp"), stream-family.
-        assert_eq!(
-            egress_backend_scheme(AppProtocol::Udp),
-            Some(BackendScheme::Udp)
-        );
+    fn udp_egress_has_no_stream_scheme() {
+        // A `protocol: UDP` ServiceEntry port takes the datagram-over-mesh
+        // branch (issue #3263), never a UDP stream proxy, so the stream-egress
+        // classifiers give it no scheme. The label still names it.
+        assert_eq!(egress_backend_scheme(AppProtocol::Udp), None);
         assert_eq!(egress_app_protocol_label(AppProtocol::Udp), "udp");
         assert!(
-            egress_is_stream_protocol(AppProtocol::Udp),
-            "Udp must classify as stream-family for egress"
+            !egress_is_stream_protocol(AppProtocol::Udp),
+            "Udp must not classify as a stream-egress proxy protocol"
         );
     }
 
@@ -24542,7 +28570,7 @@ mod tests {
     }
 
     #[test]
-    fn mesh_outbound_udp_upstreams_materialize_ambient_only() {
+    fn mesh_outbound_udp_upstreams_materialize_for_ambient() {
         // UDP egress (F3 §3.3 Stage 4): Ambient materializes one per-port UDP
         // upstream with `mesh.hbone`-tagged, identity-pinned targets dialing the
         // resolved targetPort; NO route proxy (datagrams carry no Host). Distinct
@@ -25682,8 +29710,8 @@ mod tests {
         // DestinationRule portLevelSettings authored on a UDP SERVICE port
         // (`port: 53, targetPort: 5353`) stay under the targets' owning service
         // policy port while the target still dials the resolved workload port.
-        // Ambient-only: the UDP egress materializer stamps HBONE and only runs
-        // under Ambient topology.
+        // Exercised on Ambient (HBONE); the Sidecar mesh-mTLS materialization
+        // is covered by `mesh_outbound_udp_materializes_sidecar_mtls_upstream`.
         let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
         let mut svc = http_mesh_service("dns", 53, spiffe);
         svc.ports[0].protocol = AppProtocol::Udp;
@@ -26108,7 +30136,6 @@ mod tests {
                 && !upstream.port_overrides.contains_key(&8081),
             "the entry must not fan out to heterogeneous dial ports"
         );
-        // SELECTION-TIME policy must also land at the UPSTREAM level: with
         // Selection-time policy must also land at the upstream level so the
         // owning service port's policy applies before any target is selected.
         assert_eq!(
@@ -26950,49 +30977,63 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_inbound_proxies_skip_when_backend_port_is_ambiguous() {
-        // The service port shares neither a name nor a number with any of the
-        // workload's *multiple unnamed* container ports, and the model does not
-        // carry the Service's targetPort. The backend is genuinely ambiguous, so
-        // the route is skipped — never silently routed to an arbitrary port.
+    fn sidecar_inbound_proxies_absent_target_port_uses_service_port() {
+        // Issue #7236: an ABSENT targetPort means the service port on every
+        // path, Sidecar inbound included (the Kubernetes default). The
+        // workload's container ports are never consulted: not a shared port
+        // NAME, not the workload's sole port, not "ambiguous" among several.
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
         let runtime = MeshRuntimeConfig {
             workload_spiffe_id: Some(spiffe.to_string()),
             ..test_mesh_runtime_config()
         };
-        let mut local = workload("reviews", "reviews");
-        local.ports = vec![
-            WorkloadPort {
-                port: 8081,
-                protocol: AppProtocol::Tcp,
-                name: None,
-            },
-            WorkloadPort {
-                port: 8082,
-                protocol: AppProtocol::Tcp,
-                name: None,
-            },
-        ];
-        // Service port 80, unnamed: no name match, no number match (80 ∉ {8081,8082}).
-        let mut service = http_mesh_service("reviews", 80, spiffe);
-        service.ports[0].name = None;
-        let slice = MeshSlice {
-            node_id: "node-a".to_string(),
-            namespace: "default".to_string(),
-            version: "test".to_string(),
-            workloads: vec![local],
-            services: vec![service],
-            ..MeshSlice::default()
-        };
-
-        let config =
-            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
-        assert!(
-            !config
+        let inbound_backend = |container_ports: Vec<WorkloadPort>| {
+            let mut local = workload("reviews", "reviews");
+            local.ports = container_ports;
+            let slice = MeshSlice {
+                node_id: "node-a".to_string(),
+                namespace: "default".to_string(),
+                version: "test".to_string(),
+                workloads: vec![local],
+                // Service port 80 named "http", no targetPort.
+                services: vec![http_mesh_service("reviews", 80, spiffe)],
+                ..MeshSlice::default()
+            };
+            let config = gateway_config_from_mesh_slice(&slice, &runtime, None, None)
+                .expect("slice → config");
+            config
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-inbound-")),
-            "an ambiguous backend port must not materialize a (mis)routed inbound proxy"
+                .filter(|p| p.id.starts_with("__mesh-inbound-"))
+                .map(|p| (p.id.clone(), p.backend_port))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![("__mesh-inbound-default-reviews-80".to_string(), 80)];
+        let port = |port: u16, name: Option<&str>| WorkloadPort {
+            port,
+            protocol: AppProtocol::Http,
+            name: name.map(str::to_string),
+        };
+
+        assert_eq!(
+            inbound_backend(vec![port(8080, Some("http"))]),
+            expected,
+            "a same-named container port must not replace the service port"
+        );
+        assert_eq!(
+            inbound_backend(vec![port(9090, None)]),
+            expected,
+            "the workload's sole container port must not replace the service port"
+        );
+        assert_eq!(
+            inbound_backend(vec![port(8081, None), port(8082, None)]),
+            expected,
+            "several unnamed container ports are not ambiguous: the service port wins"
+        );
+        assert_eq!(
+            inbound_backend(Vec::new()),
+            expected,
+            "a workload with no declared ports uses the service port"
         );
     }
 
@@ -28122,6 +32163,29 @@ mod tests {
         assert!(!runtime.xds_client_config().node_waypoint_capture_scoping);
         assert!(!runtime.mesh_slice_request().node_waypoint_capture_scoping);
 
+        // Issue #7423: only a Sidecar asks the CP to carry VirtualService
+        // `http[]` routes on its own flag (a NodeWaypoint gets them through
+        // its capture scoping); Ambient and ServiceWaypoint ask for none.
+        for (topology, expected) in [
+            (MeshTopology::Sidecar, true),
+            (MeshTopology::Ambient, false),
+            (MeshTopology::NodeWaypoint, false),
+            (MeshTopology::ServiceWaypoint, false),
+        ] {
+            let mut scoped = runtime.clone();
+            scoped.topology = topology;
+            assert_eq!(scoped.native_client_config().sidecar_http_routes, expected);
+            assert_eq!(scoped.xds_client_config().sidecar_http_routes, expected);
+            assert_eq!(scoped.mesh_slice_request().sidecar_http_routes, expected);
+            assert_eq!(
+                scoped
+                    .native_client_config()
+                    .subscribe_request("test")
+                    .sidecar_http_routes,
+                expected
+            );
+        }
+
         let mut config = GatewayConfig::default();
         inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
         let authz = config
@@ -28205,6 +32269,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             k8s_service_uid: None,
+            admission_upstream_id: None,
             pending_limit_scope: None,
         }
     }
@@ -28591,8 +32656,11 @@ mod tests {
             ..test_mesh_runtime_config()
         };
 
-        let config =
-            prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        // Component test of the materialization step: a mesh slice never
+        // carries an operator upstream, so inject it beside the slice.
+        let slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+        let config = prepare_gateway_config_for_native_slice(config, &runtime, &slice)
+            .expect("mesh preparation succeeds");
 
         assert_eq!(
             config.upstreams[0].algorithm,
@@ -29302,39 +33370,6 @@ mod tests {
     }
 
     #[test]
-    fn dr_tls_sni_and_sans_project_onto_upstream() {
-        let mut upstream =
-            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
-        let policy = MeshTrafficPolicy {
-            tls: Some(MeshTrafficPolicyTls {
-                mode: MtlsMode::Simple,
-                sni: Some("reviews.mesh.internal".to_string()),
-                subject_alt_names: vec![
-                    "reviews.mesh.internal".to_string(),
-                    "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
-                ],
-                ..MeshTrafficPolicyTls::default()
-            }),
-            ..MeshTrafficPolicy::default()
-        };
-
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
-            .expect("traffic policy applies");
-
-        assert_eq!(
-            upstream.backend_tls_sni.as_deref(),
-            Some("reviews.mesh.internal")
-        );
-        assert_eq!(
-            upstream.backend_tls_san_allow_list,
-            vec![
-                "reviews.mesh.internal".to_string(),
-                "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
-            ]
-        );
-    }
-
-    #[test]
     fn dr_tls_drops_invalid_sni_and_sans_before_projection() {
         let mut upstream =
             destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
@@ -29608,8 +33643,13 @@ mod tests {
         let reviews = &config.upstreams[0];
         assert_eq!(
             reviews.backend_tls_server_ca_cert_path.as_deref(),
-            Some(present.as_str()),
-            "the valid rule's destination keeps its TLS"
+            crate::tls::source::bind_tenant_file_reference(
+                &present,
+                crate::tls::source::MaterialKind::CaBundle
+            )
+            .expect("valid reference")
+            .as_deref(),
+            "the valid rule's destination keeps confined, refreshable TLS"
         );
         assert!(reviews.backend_tls_client_cert_path.is_none());
         assert!(reviews.backend_tls_verify_server_cert);
@@ -30424,13 +34464,15 @@ mod tests {
             .expect("port 8080 override");
         assert_eq!(port_8080.connect_timeout_ms, Some(2222));
         assert_eq!(port_8080.algorithm, Some(LoadBalancerAlgorithm::Random));
-
-        // Proof that the override is actually consulted at dispatch time via
-        // the helper the hot path uses — port 8080 wins, other ports fall
-        // back to the proxy default.
-        let upstream = &config.upstreams[0];
-        assert_eq!(upstream.effective_connect_timeout_ms(8080, 1111), 2222);
-        assert_eq!(upstream.effective_connect_timeout_ms(9090, 1111), 1111);
+        // Other ports carry no connect-timeout override, so dispatch keeps the
+        // proxy default.
+        assert!(
+            config.upstreams[0]
+                .port_overrides
+                .get(&9090)
+                .and_then(|ovr| ovr.connect_timeout_ms)
+                .is_none()
+        );
     }
 
     #[test]
@@ -30514,14 +34556,14 @@ mod tests {
             Some(LoadBalancerAlgorithm::ConsistentHashing)
         );
         assert_eq!(p9090.hash_on.as_deref(), Some("header:x-user"));
-
-        // Effective-timeout helper is what the dispatch hot path consults.
-        // Each port's own override wins; an unrelated port falls back to the
-        // proxy default (here passed in as 5000ms).
-        let upstream = &config.upstreams[0];
-        assert_eq!(upstream.effective_connect_timeout_ms(8080, 5000), 750);
-        assert_eq!(upstream.effective_connect_timeout_ms(9090, 5000), 3000);
-        assert_eq!(upstream.effective_connect_timeout_ms(7777, 5000), 5000);
+        // An unrelated port carries no connect-timeout override.
+        assert!(
+            config.upstreams[0]
+                .port_overrides
+                .get(&7777)
+                .and_then(|ovr| ovr.connect_timeout_ms)
+                .is_none()
+        );
     }
 
     #[test]
@@ -30680,6 +34722,7 @@ mod tests {
             labels_ambiguous: false,
             virtual_service_l4_proxies: Vec::new(),
             virtual_service_l4_upstreams: Vec::new(),
+            http_routes: slice::MeshHttpRouteSet::default(),
             version: "test".to_string(),
             revision: None,
             workloads: Vec::new(),
@@ -30687,6 +34730,8 @@ mod tests {
             node_waypoint_assertors: Vec::new(),
             node_waypoint_capture_destinations: Vec::new(),
             node_waypoint_capture_peer_authentications: Vec::new(),
+            node_waypoint_capture_mesh_policies: Vec::new(),
+            node_waypoint_capture_mesh_policies_resolved: false,
             services: Vec::new(),
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,
@@ -30711,6 +34756,7 @@ mod tests {
                             custom_tags: HashMap::new(),
                             custom_header_tags: HashMap::new(),
                             custom_env_tags: HashMap::new(),
+                            safe_tag_sources: Vec::new(),
                             providers: Vec::new(),
                         }),
                         ..MeshTelemetryConfig::default()
@@ -30736,6 +34782,7 @@ mod tests {
                                 "x-tenant".to_string(),
                             )]),
                             custom_env_tags: HashMap::new(),
+                            safe_tag_sources: Vec::new(),
                             providers: Vec::new(),
                         }),
                         ..MeshTelemetryConfig::default()
@@ -30743,6 +34790,7 @@ mod tests {
                 },
             ],
             destination_rules: Vec::new(),
+            destination_rule_host_exclusions: Vec::new(),
             virtual_service_cors_policies: Vec::new(),
             proxy_configs: Vec::new(),
             trust_bundles: None,
@@ -30801,6 +34849,7 @@ mod tests {
                                 "cluster".to_string(),
                                 "ISTIO_META_CLUSTER_ID".to_string(),
                             )]),
+                            safe_tag_sources: Vec::new(),
                             providers: vec![TracingProvider::Zipkin {
                                 url: "http://zipkin:9411/api/v2/spans".to_string(),
                             }],
@@ -30834,6 +34883,7 @@ mod tests {
                                 "region".to_string(),
                                 "FERRUM_REGION".to_string(),
                             )]),
+                            safe_tag_sources: Vec::new(),
                             providers: vec![TracingProvider::OpenTelemetry {
                                 endpoint: "http://otel:4318/v1/traces".to_string(),
                             }],
@@ -31434,6 +35484,23 @@ mod tests {
                 "bpf_metrics must NOT be auto-injected for topology {topology:?}"
             );
         }
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_skips_bpf_metrics_on_service_waypoint() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.topology = MeshTopology::ServiceWaypoint;
+        let mut config = GatewayConfig::default();
+
+        inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_BPF_METRICS_PLUGIN_ID),
+            "bpf_metrics must NOT be auto-injected for a ServiceWaypoint"
+        );
     }
 
     #[test]
@@ -32141,6 +36208,97 @@ mod tests {
     }
 
     #[test]
+    fn inject_mesh_global_plugins_conjoins_scoped_authz_gates_into_workload_metrics() {
+        // A proxy-scoped mesh_authz lockdown replaces the global instance on
+        // its route, so the global telemetry instance must refuse what it
+        // refuses (it cannot vary per proxy).
+        let mut scoped = global_mesh_authz_plugin(
+            "proxy-mesh-authz",
+            serde_json::json!({ "trusted_hbone_assertors": [] }),
+        );
+        scoped.scope = PluginScope::Proxy;
+        scoped.proxy_id = Some("payments".to_string());
+        let mut disabled_group = global_mesh_authz_plugin(
+            "group-mesh-authz",
+            serde_json::json!({ "trusted_hbone_assertors": ["waypoint"] }),
+        );
+        disabled_group.scope = PluginScope::ProxyGroup;
+        disabled_group.enabled = false;
+        let mut config = GatewayConfig {
+            plugin_configs: vec![scoped, disabled_group],
+            ..GatewayConfig::default()
+        };
+        inject_mesh_global_plugins(
+            &mut config,
+            &test_mesh_runtime_config(),
+            &MeshSlice::default(),
+        );
+        let gates = injected_effective_authz_gates(&config);
+        assert_eq!(
+            gates.len(),
+            2,
+            "managed global gate plus the enabled scoped gate: {gates:?}"
+        );
+        assert!(
+            gates[0].get("trusted_hbone_assertors").is_none(),
+            "the managed global gate stays first with shared defaults"
+        );
+        assert_eq!(
+            gates[1].get("trusted_hbone_assertors"),
+            Some(&serde_json::json!([])),
+            "the scoped lockdown joins the conjunction"
+        );
+        assert!(
+            !gates.iter().any(|gate| gate.get("trusted_hbone_assertors")
+                == Some(&serde_json::json!(["waypoint"]))),
+            "a disabled scoped row never constrains the set"
+        );
+        crate::plugins::mesh::workload_metrics::WorkloadMetrics::new(
+            injected_workload_metrics_config(&config),
+        )
+        .expect("injected scoped conjunction constructs");
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_scoped_authz_gates_over_bound_lock_baggage() {
+        let plugin_configs = (0
+            ..crate::plugins::mesh::workload_metrics::MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES + 1)
+            .map(|index| {
+                let mut scoped = global_mesh_authz_plugin(
+                    &format!("proxy-mesh-authz-{index}"),
+                    serde_json::json!({
+                        "trusted_hbone_assertors": [
+                            format!("spiffe://cluster.local/ns/istio-system/sa/assertor-{index}")
+                        ]
+                    }),
+                );
+                scoped.scope = PluginScope::Proxy;
+                scoped.proxy_id = Some(format!("proxy-{index}"));
+                scoped
+            })
+            .collect();
+        let mut config = GatewayConfig {
+            plugin_configs,
+            ..GatewayConfig::default()
+        };
+        inject_mesh_global_plugins(
+            &mut config,
+            &test_mesh_runtime_config(),
+            &MeshSlice::default(),
+        );
+        let gates = injected_effective_authz_gates(&config);
+        assert_eq!(
+            gates,
+            [serde_json::json!({ "trusted_hbone_assertors": [] })],
+            "an over-bound conjunction must lock baggage, not fail construction"
+        );
+        crate::plugins::mesh::workload_metrics::WorkloadMetrics::new(
+            injected_workload_metrics_config(&config),
+        )
+        .expect("locked-down injected config constructs");
+    }
+
+    #[test]
     fn inject_mesh_global_plugins_copies_custom_env_tags_into_workload_metrics() {
         let runtime = test_mesh_runtime_config();
         let mut mesh_slice = MeshSlice {
@@ -32171,6 +36329,7 @@ mod tests {
                             "cluster".to_string(),
                             "ISTIO_META_CLUSTER_ID".to_string(),
                         )]),
+                        safe_tag_sources: Vec::new(),
                         providers: Vec::new(),
                     }),
                     ..MeshTelemetryConfig::default()
@@ -32207,6 +36366,7 @@ mod tests {
             )]),
             custom_header_tags: HashMap::new(),
             custom_env_tags: HashMap::new(),
+            safe_tag_sources: Vec::new(),
             providers: Vec::new(),
         });
         let updated = gateway_config_from_mesh_slice(&mesh_slice, &runtime, None, None)
@@ -32268,6 +36428,7 @@ mod tests {
                         custom_tags: HashMap::new(),
                         custom_header_tags: HashMap::new(),
                         custom_env_tags: HashMap::new(),
+                        safe_tag_sources: Vec::new(),
                         providers: vec![TracingProvider::Zipkin {
                             url: "http://zipkin.istio-system:9411/api/v2/spans".to_string(),
                         }],
@@ -32302,6 +36463,12 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("http://zipkin.istio-system:9411/api/v2/spans")
         );
+        // An in-cluster cleartext collector is admitted through an explicit,
+        // visible opt-in written by injection.
+        assert_eq!(
+            workload_metrics.config["allow_plaintext"],
+            serde_json::json!(true)
+        );
         // Sampling percentage from the same Telemetry block is still applied.
         assert_eq!(
             workload_metrics.config["sampling_percentage"],
@@ -32334,6 +36501,7 @@ mod tests {
                         custom_tags: HashMap::new(),
                         custom_header_tags: HashMap::new(),
                         custom_env_tags: HashMap::new(),
+                        safe_tag_sources: Vec::new(),
                         providers: vec![TracingProvider::Zipkin {
                             url: "http://zipkin.istio-system:9411/api/v2/spans".to_string(),
                         }],
@@ -32712,11 +36880,9 @@ mod tests {
                     capture.addr.ip().is_unspecified(),
                     "bpf_sk_assign resolves the capture listener with a wildcard lookup"
                 );
-                // It terminates nothing: `listener_tls_config` maps this kind to
-                // the plaintext arm, so a frontend ServerConfig is never given
-                // to it. Feeding application bytes to a TLS terminator would
-                // both fail and mistake application TLS for mesh TLS.
-                assert!(listener_tls_config(capture, None).is_none());
+                // It terminates nothing: only the mesh inbound TLS kinds get a
+                // ServerConfig. Feeding application bytes to a TLS terminator
+                // would both fail and mistake application TLS for mesh TLS.
                 assert!(
                     !uses_mesh_inbound_tls_kind(capture.kind),
                     "the capture listener must never take the mesh inbound TLS path"
@@ -32892,7 +37058,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
                 let proxy = prepared
                     .proxies
                     .iter()
@@ -32965,7 +37131,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
                 // Verify service proxy was materialized.
                 let proxy = prepared
@@ -33073,7 +37239,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
                 // The explicit gateway proxy owns the SNI.
                 let explicit = prepared
@@ -33180,7 +37346,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
                 assert!(
                     prepared
@@ -33241,7 +37407,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
                 assert!(
                     !prepared
@@ -33335,7 +37501,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
                 // Both services should produce proxies.
                 let reviews_proxy = prepared
@@ -33478,6 +37644,7 @@ mod tests {
             created_at: loaded_at,
             updated_at: loaded_at,
             k8s_service_uid: None,
+            admission_upstream_id: None,
             pending_limit_scope: None,
         });
         let mesh_slice = MeshSlice {
@@ -33710,6 +37877,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             k8s_service_uid: None,
+            admission_upstream_id: None,
             pending_limit_scope: None,
         }
     }
@@ -34193,6 +38361,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
+            admission_upstream_id: None,
             pending_limit_scope: None,
         });
         let mut config_b = config_a.clone();
@@ -34462,7 +38631,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
                 let upstream = prepared
                     .upstreams
                     .iter()
@@ -34599,7 +38768,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
                 let by_id = |id: &str| {
                     prepared
                         .plugin_configs
@@ -34636,16 +38805,17 @@ mod tests {
                     .get("mesh_policies")
                     .and_then(|policies| policies.as_array())
                     .expect("mesh policies array");
-                // Ambient preparation deliberately carries the pre-filter policy
-                // candidates for the UDP source/destination authorization union.
-                // `MeshAuthz::from_config` keeps that superset for UDP, then
-                // cold-path filters its ordinary destination policy slice.
+                // A Sidecar slice carries only the selector policies that apply
+                // to its own workload (`app=api`). The `app=worker` neighbour's
+                // policy belongs to topologies that authorize other workloads
+                // (Ambient/ServiceWaypoint UDP, NodeWaypoint per-pod), not here
+                // (issue #7241).
                 assert_eq!(
                     policies
                         .iter()
                         .filter_map(|policy| policy.get("name").and_then(|name| name.as_str()))
                         .collect::<Vec<_>>(),
-                    vec!["api-only", "worker-only"]
+                    vec!["api-only"]
                 );
                 assert_eq!(
                     mesh_slice
@@ -34843,7 +39013,8 @@ mod tests {
         let runtime = test_mesh_runtime_config();
         let mesh_state = MeshRuntimeState::new();
         let proxy_state = make_test_proxy_state(GatewayConfig::default());
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let apply_task = start_mesh_slice_apply_task(
             mesh_state.clone(),
             proxy_state.clone(),
@@ -34875,7 +39046,7 @@ mod tests {
         });
         wait_for_mesh_authz_label(&proxy_state, "app", "worker").await;
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(2), apply_task)
             .await
             .expect("apply task should stop")
@@ -34894,7 +39065,8 @@ mod tests {
         let runtime = test_mesh_runtime_config();
         let mesh_state = MeshRuntimeState::new();
         let proxy_state = make_test_proxy_state(GatewayConfig::default());
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let apply_task = start_mesh_slice_apply_task(
             mesh_state.clone(),
             proxy_state.clone(),
@@ -35033,7 +39205,276 @@ mod tests {
             "rejected slice must not become the live config; only its remote overlay re-applies onto the accepted slice"
         );
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), apply_task)
+            .await
+            .expect("apply task should stop")
+            .expect("apply task should join");
+    }
+
+    /// Issue #7440 (sol F1 on #7447, dsf F1 on #7449), through the real apply
+    /// loop: a Sidecar serves a header-gated carried VirtualService route, then
+    /// receives a replacement slice whose dispatch instance the plugin
+    /// constructor refuses. The apply loop must reject the replacement and
+    /// keep the previous generation live, so a request without the header
+    /// still gets the route's 404 instead of reaching the plain Service route.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mesh_runtime_apply_task_keeps_the_gate_when_a_carried_dispatch_is_malformed() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.workload_spiffe_id = Some("spiffe://cluster.local/ns/default/sa/details".into());
+        runtime.workload_labels = HashMap::from([("app".to_string(), "details".to_string())]);
+
+        let virtual_service: crate::config_sources::k8s::K8sObject =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "networking.istio.io/v1",
+                "kind": "VirtualService",
+                "metadata": {"name": "gated", "namespace": "default"},
+                "spec": {
+                    "hosts": ["reviews.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/api"}, "sourceNamespace": "other-ns"},
+                            {"uri": {"prefix": "/api"}, "headers": {"x-version": {"exact": "v2"}}}
+                        ],
+                        "route": [{"destination": {
+                            "host": "ratings.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}]
+                    }]
+                }
+            }))
+            .expect("VirtualService object");
+        let mut config = crate::config_sources::k8s::translate_k8s_objects(
+            &[virtual_service],
+            crate::config_sources::k8s::K8sTranslationOptions::new(
+                "default".to_string(),
+                TrustDomain::new("cluster.local").unwrap(),
+            ),
+        )
+        .expect("VirtualService translates")
+        .config;
+        let workloads = vec![
+            workload_with_address("reviews", "reviews", "10.0.0.11"),
+            workload_with_address("ratings", "ratings", "10.0.0.12"),
+            workload_with_address("details", "details", "10.0.0.13"),
+        ];
+        let services = workloads
+            .iter()
+            .map(|workload| MeshService {
+                cluster_ips: Vec::new(),
+                name: workload.service_name.clone(),
+                namespace: "default".to_string(),
+                ports: vec![ServicePort {
+                    port: 8080,
+                    protocol: AppProtocol::Http,
+                    name: Some("http".to_string()),
+                    target_port: None,
+                }],
+                workloads: vec![WorkloadRef {
+                    spiffe_id: workload.spiffe_id.clone(),
+                }],
+                protocol_overrides: HashMap::new(),
+                uid: None,
+                allow_path_parameters: false,
+            })
+            .collect();
+        let mesh = config.mesh.get_or_insert_with(Box::default);
+        mesh.workloads = workloads;
+        mesh.services = services;
+        config.normalize_fields();
+        config.normalize_mesh_fields();
+        let good = MeshSlice {
+            version: "gated-good".to_string(),
+            ..MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request())
+        };
+        assert!(
+            !good.http_routes.is_empty(),
+            "the Sidecar slice carries the route"
+        );
+
+        let mesh_state = MeshRuntimeState::new();
+        let proxy_state = make_test_proxy_state(GatewayConfig::default());
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
+        let apply_task = start_mesh_slice_apply_task(
+            mesh_state.clone(),
+            proxy_state.clone(),
+            runtime,
+            None,
+            MeshInboundTlsReloadState {
+                server_identity: None,
+                last_snapshot: None,
+                spiffe_bundle_slot: None,
+                runtime_trust_overlay_slot: None,
+                production: false,
+            },
+            shutdown_rx,
+            None,
+            None,
+        );
+
+        // The served /api route and the outcome of one request through its
+        // dispatch chain on the live generation (no peer: outbound capture).
+        let live_gate = |proxy_state: &ProxyState, with_header: bool| {
+            let config = proxy_state.current_config();
+            let route = config
+                .proxies
+                .iter()
+                .find(|proxy| {
+                    config::is_virtual_service_http_route_proxy_id(&proxy.id)
+                        && proxy.listen_path.as_deref() == Some("/api")
+                })
+                .cloned();
+            let plugins: Vec<Arc<dyn crate::plugins::Plugin>> = route
+                .iter()
+                .flat_map(|route| route.plugins.iter())
+                .filter_map(|association| {
+                    config.plugin_configs.iter().find(|plugin| {
+                        plugin.id == association.plugin_config_id
+                            && plugin.plugin_name == "mesh_route_dispatch"
+                    })
+                })
+                .map(|plugin| {
+                    crate::plugins::create_plugin("mesh_route_dispatch", &plugin.config)
+                        .expect("live dispatch config constructs")
+                        .expect("built-in plugin")
+                })
+                .collect();
+            (route, plugins, with_header)
+        };
+        let dispatch = |(route, mut plugins, with_header): (
+            Option<Proxy>,
+            Vec<Arc<dyn crate::plugins::Plugin>>,
+            bool,
+        )| async move {
+            let route = route.expect("the carried /api route is live");
+            crate::_test_support::install_plugin_finalizers_for_test(&mut plugins)
+                .expect("chain assembles");
+            let mut ctx = crate::plugins::RequestContext::new(
+                "127.0.0.1".to_string(),
+                "GET".to_string(),
+                "/api/users".to_string(),
+            );
+            ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
+            ctx.matched_proxy = Some(Arc::new(route));
+            let mut headers = HashMap::from([(
+                "host".to_string(),
+                "reviews.default.svc.cluster.local".to_string(),
+            )]);
+            if with_header {
+                headers.insert("x-version".to_string(), "v2".to_string());
+            }
+            ctx.headers = headers.clone();
+            match crate::_test_support::run_before_proxy_hooks_for_test(
+                &plugins,
+                &mut ctx,
+                &mut headers,
+            )
+            .await
+            {
+                crate::plugins::PluginResult::Continue => None,
+                crate::plugins::PluginResult::Reject { status_code, .. }
+                | crate::plugins::PluginResult::RejectBinary { status_code, .. } => {
+                    Some(status_code)
+                }
+            }
+        };
+
+        // Generation 1: the good slice becomes live.
+        mesh_state.install_slice(good.clone());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while live_gate(&proxy_state, false).0.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the good slice becomes live");
+        assert_eq!(dispatch(live_gate(&proxy_state, true)).await, None);
+        assert_eq!(
+            dispatch(live_gate(&proxy_state, false)).await,
+            Some(404),
+            "a header miss gets the route's 404"
+        );
+        // The live /api route and its dispatch configs, to compare after the
+        // rejected reload.
+        let live_route_state = |proxy_state: &ProxyState| {
+            let config = proxy_state.current_config();
+            let route = config
+                .proxies
+                .iter()
+                .find(|proxy| {
+                    config::is_virtual_service_http_route_proxy_id(&proxy.id)
+                        && proxy.listen_path.as_deref() == Some("/api")
+                })
+                .map(|proxy| (proxy.id.clone(), proxy.upstream_id.clone()));
+            let dispatch_configs: Vec<serde_json::Value> = config
+                .plugin_configs
+                .iter()
+                .filter(|plugin| {
+                    plugin.plugin_name == "mesh_route_dispatch"
+                        && plugin
+                            .proxy_id
+                            .as_deref()
+                            .is_some_and(config::is_virtual_service_http_route_proxy_id)
+                })
+                .map(|plugin| plugin.config.clone())
+                .collect();
+            (route, dispatch_configs)
+        };
+        let live_before = live_route_state(&proxy_state);
+
+        // Generation 2: a replacement whose dispatch instance the plugin
+        // constructor refuses (zero port on the foreign-namespace rule).
+        let mut malformed = good.clone();
+        malformed.version = "gated-malformed".to_string();
+        for plugin in &mut malformed.http_routes.plugin_configs {
+            if plugin["plugin_name"] == serde_json::json!("mesh_route_dispatch") {
+                for rule in plugin["config"]["rules"]
+                    .as_array_mut()
+                    .expect("dispatch rules")
+                {
+                    if rule["match"].get("source_namespace").is_some() {
+                        rule["match"]["port"] = serde_json::json!(0);
+                    }
+                }
+            }
+        }
+        let mut verdicts = mesh_state.subscribe_runtime_verdict();
+        mesh_state.install_slice(malformed);
+        let verdict = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                verdicts
+                    .changed()
+                    .await
+                    .expect("runtime verdict publisher is alive");
+                let latest = verdicts.borrow_and_update().clone();
+                if let Some(verdict) = latest.filter(|verdict| verdict.version == "gated-malformed")
+                {
+                    break verdict;
+                }
+            }
+        })
+        .await
+        .expect("the apply task must judge the malformed slice");
+        assert!(
+            !verdict.outcome.accepted(),
+            "the malformed slice must be rejected, got {:?}",
+            verdict.outcome
+        );
+
+        // The previous generation is still the live one, gate intact.
+        assert_eq!(
+            live_route_state(&proxy_state),
+            live_before,
+            "the rejected slice must not replace the live route or its gate"
+        );
+        assert_eq!(
+            dispatch(live_gate(&proxy_state, false)).await,
+            Some(404),
+            "the header miss still gets 404 after the rejected reload"
+        );
+
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(2), apply_task)
             .await
             .expect("apply task should stop")
@@ -35064,7 +39505,8 @@ mod tests {
         )
         .expect("initial snapshot");
         let mesh_state = MeshRuntimeState::new();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let apply_task = start_mesh_slice_apply_task(
             mesh_state.clone(),
             proxy_state.clone(),
@@ -35109,7 +39551,7 @@ mod tests {
         });
         wait_for_mesh_inbound_tls(&proxy_state, false).await;
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(2), apply_task)
             .await
             .expect("apply task should stop")
@@ -35145,7 +39587,8 @@ mod tests {
         )
         .expect("initial snapshot");
         let mesh_state = MeshRuntimeState::new();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let apply_task = start_mesh_slice_apply_task(
             mesh_state.clone(),
             proxy_state.clone(),
@@ -35247,7 +39690,7 @@ mod tests {
             "PeerAuthentication reload must not invent a DTLS listener"
         );
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(2), apply_task)
             .await
             .expect("apply task should stop")
@@ -35466,7 +39909,8 @@ mod tests {
         )
         .expect("initial snapshot");
         let mesh_state = MeshRuntimeState::new();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let apply_task = start_mesh_slice_apply_task(
             mesh_state.clone(),
             proxy_state.clone(),
@@ -35493,12 +39937,34 @@ mod tests {
         });
         wait_for_mesh_authz_label(&proxy_state, "app", "good-baseline").await;
 
+        // Wait for the apply task's own verdict on the bad slice, so the
+        // "nothing changed" assertions below cannot pass merely because the
+        // task never reached it.
+        let mut verdicts = mesh_state.subscribe_runtime_verdict();
         mesh_state.install_slice(MeshSlice {
             version: "bad-strict".to_string(),
             labels: [("app".to_string(), "bad-tls".to_string())].into(),
             ..slice_with_peer_auths(vec![peer_auth_with_workload_mode(config::MtlsMode::Strict)])
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let verdict = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                verdicts
+                    .changed()
+                    .await
+                    .expect("runtime verdict publisher is alive");
+                let latest = verdicts.borrow_and_update().clone();
+                if let Some(verdict) = latest.filter(|verdict| verdict.version == "bad-strict") {
+                    break verdict;
+                }
+            }
+        })
+        .await
+        .expect("the apply task must judge the bad-strict slice");
+        assert_eq!(
+            verdict.outcome,
+            MeshSliceRuntimeOutcome::Rejected(MeshSliceRuntimeRejectReason::TlsReload),
+            "the failed inbound TLS rebuild must reject the slice"
+        );
 
         assert!(
             proxy_state.mesh_inbound_tls.load_full().is_none(),
@@ -35517,7 +39983,7 @@ mod tests {
             "a rejected PeerAuthentication slice must not seed or reject ordinary DTLS generation"
         );
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(2), apply_task)
             .await
             .expect("apply task should stop")
@@ -35626,13 +40092,7 @@ mod tests {
         let state = mesh_state.clone();
 
         let wait = tokio::spawn(async move {
-            wait_for_initial_mesh_config(
-                &state,
-                &runtime,
-                FederationActivation::disabled(),
-                shutdown_rx,
-            )
-            .await
+            wait_for_initial_mesh_config(&state, &runtime, shutdown_rx).await
         });
 
         mesh_state.install_slice(MeshSlice {
@@ -35701,8 +40161,11 @@ mod tests {
                     ..GatewayConfig::default()
                 };
 
-                let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                // Component test of the injection step: no mesh slice carries
+                // a global plugin, so inject the operator instance beside it.
+                let slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+                let prepared = prepare_gateway_config_for_native_slice(config, &runtime, &slice)
+                    .expect("mesh config");
                 let mesh_authz: Vec<_> = prepared
                     .plugin_configs
                     .iter()
@@ -35775,6 +40238,7 @@ mod tests {
 
     fn test_request_authentication(name: &str, scope: PolicyScope) -> MeshRequestAuthentication {
         MeshRequestAuthentication {
+            refused: false,
             name: name.to_string(),
             namespace: "default".to_string(),
             scope,
@@ -35813,7 +40277,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let jwks = prepared
             .plugin_configs
             .iter()
@@ -35832,6 +40297,407 @@ mod tests {
             providers[0].get("issuer").and_then(|v| v.as_str()),
             Some("https://api-jwt.example.com")
         );
+    }
+
+    /// Issue #6656: a RequestAuthentication that translation refused is
+    /// carried as a rule-less `refused` marker; the workloads it selects get a
+    /// forced refusal plugin instead of silently losing JWT validation.
+    #[test]
+    fn refused_request_authentication_refuses_every_request_to_the_workload() {
+        let runtime = MeshRuntimeConfig {
+            workload_labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            ..test_mesh_runtime_config()
+        };
+        let mut refused = test_request_authentication(
+            "broken-jwt",
+            PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                    namespace: Some("default".to_string()),
+                },
+            },
+        );
+        refused.jwt_rules.clear();
+        refused.refused = true;
+        // A valid sibling RA for the same workload: its jwks_auth must not be
+        // installed beside the refusal (it could veto the reload).
+        let sibling = test_request_authentication(
+            "valid-jwt",
+            PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                    namespace: Some("default".to_string()),
+                },
+            },
+        );
+        // An operator-managed global of the same type must not suppress it.
+        let now = chrono::Utc::now();
+        let operator_termination = crate::config::types::PluginConfig {
+            labels: Default::default(),
+            id: "operator-termination".to_string(),
+            plugin_name: "request_termination".to_string(),
+            namespace: runtime.namespace.clone(),
+            config: serde_json::json!({
+                "status_code": 404,
+                "trigger": {"path_prefix": "/never-matched"}
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                request_authentications: vec![refused, sibling],
+                ..MeshConfig::default()
+            })),
+            plugin_configs: vec![operator_termination],
+            ..GatewayConfig::default()
+        };
+
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
+        let refusal = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID)
+            .expect("refusal plugin injected");
+        assert_eq!(refusal.plugin_name, "request_termination");
+        assert_eq!(refusal.scope, PluginScope::Global);
+        assert!(refusal.enabled);
+        assert_eq!(refusal.config["status_code"], 503);
+        crate::plugins::validate_plugin_config("request_termination", &refusal.config)
+            .expect("refusal config must construct");
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_REQUEST_AUTH_PLUGIN_ID),
+            "the refusal supersedes the managed jwks_auth"
+        );
+
+        // A workload the refused resource does not select is unaffected.
+        let other_runtime = MeshRuntimeConfig {
+            workload_labels: HashMap::from([("app".to_string(), "web".to_string())]),
+            ..test_mesh_runtime_config()
+        };
+        let mut other = test_request_authentication(
+            "broken-jwt",
+            PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                    namespace: Some("default".to_string()),
+                },
+            },
+        );
+        other.jwt_rules.clear();
+        other.refused = true;
+        let unaffected = prepare_gateway_config_via_mesh_slice(
+            GatewayConfig {
+                mesh: Some(Box::new(MeshConfig {
+                    request_authentications: vec![other],
+                    ..MeshConfig::default()
+                })),
+                ..GatewayConfig::default()
+            },
+            &other_runtime,
+        )
+        .expect("mesh config");
+        assert!(
+            unaffected
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID)
+        );
+    }
+
+    /// The refusal applies only to requests entering the workload: it is
+    /// gated to the mesh inbound route ids, so the workload's own outbound
+    /// requests keep flowing; the managed `jwks_auth` is removed.
+    #[test]
+    fn request_auth_refusal_is_scoped_to_inbound_routes() {
+        let runtime = test_mesh_runtime_config();
+        let now = chrono::Utc::now();
+        let mut config = GatewayConfig::default();
+        for id in ["__mesh-inbound-api-8080", "__mesh-outbound-reviews-9080"] {
+            config.proxies.push(node_waypoint_udp_listener_proxy(
+                id,
+                &runtime.namespace,
+                "upstream",
+                18080,
+                false,
+                "udp",
+                now,
+            ));
+        }
+        force_ensure_global_plugin(
+            &mut config,
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+            "request_termination",
+            serde_json::json!({"status_code": 503}),
+            &runtime.namespace,
+        );
+        scope_request_auth_refusal_to_inbound_routes(&mut config, &runtime, &[]);
+        let refusal = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID)
+            .expect("refusal plugin");
+        let trigger = serde_json::to_value(refusal.trigger.as_ref().expect("scoped trigger"))
+            .expect("trigger serializes");
+        assert_eq!(
+            trigger["when"]["match"]["proxy_id"],
+            serde_json::json!([
+                "__mesh-inbound-api-8080",
+                MESH_INBOUND_HBONE_RELAY_PROXY_ID,
+                MESH_INGRESS_HBONE_RELAY_PROXY_ID,
+            ])
+        );
+        assert!(refusal.enabled);
+
+        let mut bare = GatewayConfig::default();
+        force_ensure_global_plugin(
+            &mut bare,
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+            "request_termination",
+            serde_json::json!({"status_code": 503}),
+            &runtime.namespace,
+        );
+        scope_request_auth_refusal_to_inbound_routes(&mut bare, &runtime, &[]);
+        // Even with no materialized inbound route, a Sidecar still serves
+        // inbound HBONE through the synthesized relays, so the refusal is
+        // scoped to exactly those ids rather than left unscoped.
+        assert!(bare.plugin_configs[0].enabled);
+        let trigger = serde_json::to_value(
+            bare.plugin_configs[0]
+                .trigger
+                .as_ref()
+                .expect("scoped trigger"),
+        )
+        .expect("trigger serializes");
+        assert_eq!(
+            trigger["when"]["match"]["proxy_id"],
+            serde_json::json!([
+                MESH_INBOUND_HBONE_RELAY_PROXY_ID,
+                MESH_INGRESS_HBONE_RELAY_PROXY_ID,
+            ])
+        );
+
+        // More inbound routes than one `proxy_id` leaf may list: the trigger
+        // is an `any` of chunked leaves that the plugin cache accepts.
+        let mut wide = GatewayConfig::default();
+        let route_count = crate::config::plugin_trigger::MAX_TRIGGER_LIST_LEN + 5;
+        for index in 0..route_count {
+            wide.proxies.push(node_waypoint_udp_listener_proxy(
+                &format!("__mesh-inbound-api-{index}"),
+                &runtime.namespace,
+                "upstream",
+                18080,
+                false,
+                "udp",
+                now,
+            ));
+        }
+        force_ensure_global_plugin(
+            &mut wide,
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+            "request_termination",
+            serde_json::json!({"status_code": 503}),
+            &runtime.namespace,
+        );
+        scope_request_auth_refusal_to_inbound_routes(&mut wide, &runtime, &[]);
+        let trigger = wide.plugin_configs[0]
+            .trigger
+            .as_ref()
+            .expect("chunked scoped trigger");
+        trigger.validate().expect("chunked trigger compiles");
+        let trigger = serde_json::to_value(trigger).expect("trigger serializes");
+        let leaves = trigger["when"]["any"].as_array().expect("any of leaves");
+        assert_eq!(leaves.len(), 2);
+        let listed: usize = leaves
+            .iter()
+            .map(|leaf| leaf["match"]["proxy_id"].as_array().expect("ids").len())
+            .sum();
+        assert_eq!(listed, route_count + 2);
+    }
+
+    /// Issue #6736: Ambient and the other HBONE-relay topologies
+    /// materialize no inbound HTTP routes, but their inbound CONNECTs
+    /// synthesize a relay proxy and run the global HTTP chain, so the
+    /// refusal scopes to the synthesized relay ids there — refusing
+    /// inbound CONNECTs without touching the workload's outbound routes.
+    /// EastWestGateway (SNI passthrough, no HBONE listener) keeps the
+    /// unscoped fail-closed fallback. The config here carries no managed
+    /// `__mesh_authz`, so the NodeWaypoint/ServiceWaypoint arms cover the
+    /// operator-override fallback; with the managed instance, waypoint relays
+    /// are refused per destination by `mesh_authz` instead (issue #6670).
+    #[test]
+    fn request_auth_refusal_scopes_to_synthesized_hbone_relays() {
+        let now = chrono::Utc::now();
+        for topology in [
+            MeshTopology::Ambient,
+            MeshTopology::NodeWaypoint,
+            MeshTopology::ServiceWaypoint,
+            MeshTopology::EgressGateway,
+        ] {
+            let runtime = MeshRuntimeConfig {
+                topology,
+                ..test_mesh_runtime_config()
+            };
+            let mut config = GatewayConfig::default();
+            config.proxies.push(node_waypoint_udp_listener_proxy(
+                "__mesh-outbound-reviews-9080",
+                &runtime.namespace,
+                "upstream",
+                18080,
+                false,
+                "udp",
+                now,
+            ));
+            if topology == MeshTopology::EgressGateway {
+                // Its materialized HTTP proxies are its inbound execution
+                // routes and must carry the refusal too.
+                config.proxies.push(node_waypoint_udp_listener_proxy(
+                    "mesh-egress-default-ext-api_dot_example_dot_com-443",
+                    &runtime.namespace,
+                    "upstream",
+                    18080,
+                    false,
+                    "tcp",
+                    now,
+                ));
+            }
+            force_ensure_global_plugin(
+                &mut config,
+                MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+                "request_termination",
+                serde_json::json!({"status_code": 503}),
+                &runtime.namespace,
+            );
+            scope_request_auth_refusal_to_inbound_routes(&mut config, &runtime, &[]);
+            let refusal = config
+                .plugin_configs
+                .iter()
+                .find(|plugin| plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID)
+                .unwrap_or_else(|| panic!("{topology:?} keeps the refusal"));
+            let trigger = serde_json::to_value(
+                refusal
+                    .trigger
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{topology:?} scopes the refusal")),
+            )
+            .expect("trigger serializes");
+            let ids = trigger["when"]["match"]["proxy_id"]
+                .as_array()
+                .expect("proxy_id leaf");
+            let ids: Vec<&str> = ids.iter().filter_map(|id| id.as_str()).collect();
+            assert!(
+                ids.contains(&MESH_INBOUND_HBONE_RELAY_PROXY_ID)
+                    && ids.contains(&MESH_INGRESS_HBONE_RELAY_PROXY_ID)
+                    && !ids.contains(&"__mesh-outbound-reviews-9080"),
+                "{topology:?}: {ids:?}"
+            );
+            if topology == MeshTopology::EgressGateway {
+                assert!(
+                    ids.contains(&"mesh-egress-default-ext-api_dot_example_dot_com-443"),
+                    "{ids:?}"
+                );
+            }
+        }
+
+        let runtime = MeshRuntimeConfig {
+            topology: MeshTopology::EastWestGateway,
+            ..test_mesh_runtime_config()
+        };
+        let mut config = GatewayConfig::default();
+        force_ensure_global_plugin(
+            &mut config,
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+            "request_termination",
+            serde_json::json!({"status_code": 503}),
+            &runtime.namespace,
+        );
+        scope_request_auth_refusal_to_inbound_routes(&mut config, &runtime, &[]);
+        assert!(config.plugin_configs[0].enabled);
+        assert!(config.plugin_configs[0].trigger.is_none());
+    }
+
+    #[tokio::test]
+    async fn mesh_runtime_request_auth_union_dedupes_identical_rules() {
+        let runtime = MeshRuntimeConfig {
+            workload_labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            ..test_mesh_runtime_config()
+        };
+        let scope = || PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                namespace: Some("default".to_string()),
+            },
+        };
+        // Two resources share one issuer: five rules each, with one rule
+        // identical across both.
+        let rules = |prefix: &str| -> Vec<MeshJwtRule> {
+            (0..5)
+                .map(|i| {
+                    let source = if i == 0 {
+                        "shared".to_string()
+                    } else {
+                        format!("{prefix}{i}")
+                    };
+                    MeshJwtRule {
+                        issuer: "https://idp.example.com".to_string(),
+                        audiences: vec!["test-app".to_string()],
+                        jwks_uri: Some(format!("https://idp.example.com/{source}/jwks")),
+                        jwks: None,
+                        from_headers: Vec::new(),
+                        from_params: Vec::new(),
+                        forward_original_token: false,
+                        output_claim_to_headers: Vec::new(),
+                    }
+                })
+                .collect()
+        };
+        let mut first = test_request_authentication("ra-a", scope());
+        first.jwt_rules = rules("a");
+        let mut second = test_request_authentication("ra-b", scope());
+        second.jwt_rules = rules("b");
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                request_authentications: vec![first, second],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
+        let jwks = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)
+            .expect("jwks_auth plugin injected");
+        let providers = jwks
+            .config
+            .get("providers")
+            .and_then(|v| v.as_array())
+            .expect("providers array");
+        // 10 rules, the shared one installed once: 9 providers, all kept so
+        // every extraction location and claim-output header stays owned.
+        assert_eq!(providers.len(), 9);
+        // Nine providers for one issuer exceed the per-token bound, so the
+        // fail-closed plugin refuses the union and the last accepted
+        // configuration keeps serving.
+        let err = crate::plugins::jwks_auth::JwksAuth::new(
+            &jwks.config,
+            crate::plugins::PluginHttpClient::default(),
+        )
+        .err()
+        .expect("an over-bound union must fail construction");
+        assert!(err.contains("sharing one `issuer`"), "{err}");
     }
 
     #[test]
@@ -35895,7 +40761,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         assert!(
             !prepared
                 .plugin_configs
@@ -36046,7 +40913,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let jwks = prepared
             .plugin_configs
             .iter()
@@ -36071,6 +40939,7 @@ mod tests {
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 request_authentications: vec![MeshRequestAuthentication {
+                    refused: false,
                     name: "empty".to_string(),
                     namespace: "default".to_string(),
                     scope: PolicyScope::MeshWide,
@@ -36081,7 +40950,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         assert!(
             !prepared
                 .plugin_configs
@@ -36097,6 +40967,7 @@ mod tests {
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 request_authentications: vec![MeshRequestAuthentication {
+                    refused: false,
                     name: "with-aud".to_string(),
                     namespace: "default".to_string(),
                     scope: PolicyScope::MeshWide,
@@ -36116,7 +40987,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let jwks = prepared
             .plugin_configs
             .iter()
@@ -36145,6 +41017,7 @@ mod tests {
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 request_authentications: vec![MeshRequestAuthentication {
+                    refused: false,
                     name: "with-inline".to_string(),
                     namespace: "default".to_string(),
                     scope: PolicyScope::MeshWide,
@@ -36173,7 +41046,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let jwks = prepared
             .plugin_configs
             .iter()
@@ -36208,6 +41082,7 @@ mod tests {
         GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 request_authentications: vec![MeshRequestAuthentication {
+                    refused: false,
                     name: "exp-test".to_string(),
                     namespace: "default".to_string(),
                     scope: PolicyScope::MeshWide,
@@ -36265,67 +41140,6 @@ mod tests {
         assert!(disabled.is_none(), "DISABLE has no TLS, so no verifier");
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn staged_spiffe_bundle_publishes_only_on_apply() {
-        // F4: a rebuilt inbound SPIFFE trust-bundle must NOT reach the live slot
-        // until the slice is accepted. `publish_staged_spiffe_bundle` is the
-        // post-accept publish step; until it runs the live slot keeps its
-        // previous value, and `None` (rejected/no-slot) leaves it untouched.
-        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
-
-        let state = make_test_proxy_state(GatewayConfig::default());
-        let td = TrustDomain::new("td.stage-test").unwrap();
-        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
-        let original = Arc::new(Some(SvidBundle {
-            spiffe_id: id.clone(),
-            cert_chain_der: vec![vec![1, 2, 3]],
-            private_key_pkcs8_der: Vec::new().into(),
-            trust_bundles: TrustBundleSet::local_only(TrustBundle {
-                trust_domain: td.clone(),
-                x509_authorities: vec![vec![4, 5, 6]],
-                jwt_authorities: Vec::new(),
-                refresh_hint_seconds: None,
-            }),
-        }));
-        let slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(original.clone()));
-
-        // A `None` staged bundle (rejected slice or no SVID slot) is a no-op.
-        publish_staged_spiffe_bundle(&state, None);
-        assert!(
-            Arc::ptr_eq(&slot.load_full(), &original),
-            "publishing None must leave the live slot untouched"
-        );
-
-        // Build a replacement bundle and stage it. Staging must NOT mutate the
-        // live slot.
-        let replacement = Arc::new(Some(SvidBundle {
-            spiffe_id: id,
-            cert_chain_der: vec![vec![7, 8, 9]],
-            private_key_pkcs8_der: Vec::new().into(),
-            trust_bundles: TrustBundleSet::local_only(TrustBundle {
-                trust_domain: td,
-                x509_authorities: vec![vec![10, 11, 12]],
-                jwt_authorities: Vec::new(),
-                refresh_hint_seconds: None,
-            }),
-        }));
-        let staged = Some(StagedSpiffeBundle::DirectSlot {
-            slot: slot.clone(),
-            bundle: replacement.clone(),
-        });
-        assert!(
-            Arc::ptr_eq(&slot.load_full(), &original),
-            "merely holding a staged bundle must not change the live slot"
-        );
-
-        // Publishing (post-accept) swaps the slot to the staged bundle.
-        publish_staged_spiffe_bundle(&state, staged);
-        assert!(
-            Arc::ptr_eq(&slot.load_full(), &replacement),
-            "publish must store the staged bundle into the live slot"
-        );
-    }
-
     #[test]
     fn gateway_config_validation_keeps_fail_closed_federation_bootstrap_bundle() {
         use base64::Engine;
@@ -36362,17 +41176,12 @@ mod tests {
             }),
             ..MeshSlice::default()
         };
-        let activation = FederationActivation {
-            fail_open: false,
-            poll_enabled: true,
-        };
 
         gateway_config_from_mesh_slice_with_federation(
             &slice,
             &test_mesh_runtime_config(),
             Some(&federation::FederationSnapshot::default()),
             None,
-            activation,
         )
         .expect(
             "validation must accept CP bootstrap bundle even when fail-closed keeps it inactive",
@@ -36460,7 +41269,7 @@ mod tests {
         let mut clusters = HashMap::new();
         clusters.insert(
             "east".to_string(),
-            multicluster::RemoteClusterEntry::new(
+            Arc::new(multicluster::RemoteClusterEntry::new(
                 "east".to_string(),
                 remote_td,
                 Some("net-b".to_string()),
@@ -36471,17 +41280,13 @@ mod tests {
                     services: vec![svc_remote],
                 },
                 1,
-            ),
+            )),
         );
         let snapshot = multicluster::RemoteEndpointSnapshot { clusters };
 
         let mut runtime = test_mesh_runtime_config();
         runtime.workload_spiffe_id =
             Some("spiffe://cluster.local/ns/default/sa/client".to_string());
-        let activation = FederationActivation {
-            fail_open: false,
-            poll_enabled: true,
-        };
 
         let cross_cluster_to_gateway = |config: &GatewayConfig| {
             config.upstreams.iter().any(|upstream| {
@@ -36503,7 +41308,6 @@ mod tests {
             &runtime,
             Some(&federation::FederationSnapshot::default()),
             Some(&snapshot),
-            activation,
         )
         .expect("prepared with snapshot");
         assert!(
@@ -36517,7 +41321,6 @@ mod tests {
             &runtime,
             Some(&federation::FederationSnapshot::default()),
             None,
-            activation,
         )
         .expect("prepared without snapshot");
         assert!(
@@ -36669,7 +41472,8 @@ mod tests {
             }),
         });
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let apply_task = start_mesh_slice_apply_task(
             mesh_state.clone(),
             proxy_state.clone(),
@@ -36736,7 +41540,7 @@ mod tests {
             .expect("federated trust published");
         assert_eq!(remote.x509_authorities, vec![expected_partner_root]);
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(2), apply_task)
             .await
             .expect("apply task should stop")
@@ -36882,7 +41686,8 @@ mod tests {
         publish_staged_spiffe_bundle(&state, staged);
 
         let (revision_tx, revision_rx) = tokio::sync::watch::channel(0u64);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let republisher = start_mesh_inbound_svid_rotation_republisher(
             state.clone(),
             inbound_slot.clone(),
@@ -36919,7 +41724,7 @@ mod tests {
             "accepted federated overlay must survive file-backed SVID republish"
         );
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(1), republisher)
             .await
             .expect("republisher observed shutdown")
@@ -36962,7 +41767,8 @@ mod tests {
         // Old roots in place when the republisher subscribes.
         state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![1]]));
         let (revision_tx, revision_rx) = tokio::sync::watch::channel(0u64);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let republisher = start_mesh_inbound_svid_rotation_republisher(
             state.clone(),
             inbound_slot.clone(),
@@ -36990,7 +41796,7 @@ mod tests {
         .await
         .expect("republisher must pin the inbound verifier to the new roots");
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(1), republisher)
             .await
             .expect("republisher observed shutdown")
@@ -37008,7 +41814,7 @@ mod tests {
             "test runtime should carry the secure default"
         );
         let prepared =
-            prepare_gateway_config_for_mesh(request_auth_config_for_require_exp(), &runtime)
+            prepare_gateway_config_via_mesh_slice(request_auth_config_for_require_exp(), &runtime)
                 .expect("mesh config");
         let jwks = prepared
             .plugin_configs
@@ -37030,7 +41836,7 @@ mod tests {
         let mut runtime = test_mesh_runtime_config();
         runtime.request_auth_require_exp = false;
         let prepared =
-            prepare_gateway_config_for_mesh(request_auth_config_for_require_exp(), &runtime)
+            prepare_gateway_config_via_mesh_slice(request_auth_config_for_require_exp(), &runtime)
                 .expect("mesh config");
         let jwks = prepared
             .plugin_configs
@@ -37503,7 +42309,7 @@ mod tests {
         let file_svid_env = EnvConfig {
             gateway_svid_cert_path: Some("tests/certs/server.crt".to_string()),
             gateway_svid_key_path: Some("tests/certs/server.key".to_string()),
-            gateway_svid_trust_bundle_path: Some("tests/certs/ca.crt".to_string()),
+            gateway_svid_trust_bundle_path: Some("tests/certs/server.crt".to_string()),
             ..EnvConfig::default()
         };
         validate_egress_gateway_mtls_config(&file_svid_runtime, &file_svid_env)
@@ -37528,10 +42334,18 @@ mod tests {
         )
         .expect_err("strict mTLS must require cert and key material");
 
-        assert!(
-            err.to_string()
-                .contains("PeerAuthentication STRICT requires")
-        );
+        let msg = err.to_string();
+        assert!(msg.contains("PeerAuthentication STRICT requires"), "{msg}");
+        for remedy in [
+            "FERRUM_GATEWAY_SVID_CERT_PATH",
+            "FERRUM_MESH_CA_BACKEND",
+            "FERRUM_FRONTEND_TLS_CERT_PATH",
+        ] {
+            assert!(
+                msg.contains(remedy),
+                "STRICT error must name {remedy}: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -37864,6 +42678,40 @@ mod tests {
             false, // dev
         )
         .expect("dev tolerates a plaintext inbound listener with a warning");
+    }
+
+    #[test]
+    fn enforce_mesh_inbound_fail_closed_blames_missing_identity_not_permissive_mode() {
+        // `load_mesh_frontend_tls` returns no ServerConfig for a non-DISABLE mode
+        // only when there is no server identity, so a PERMISSIVE trigger must name
+        // the identity remedies (including the CA backend), not claim TLS is being
+        // served alongside plaintext.
+        let runtime = test_mesh_runtime_config();
+        let err = enforce_mesh_inbound_fail_closed(
+            &runtime,
+            &EnvConfig::default(),
+            config::MtlsMode::Permissive,
+            None,
+            None,
+            true,
+        )
+        .expect_err("production must refuse a no-identity inbound termination listener");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no usable TLS server identity")
+                && msg.contains("FERRUM_GATEWAY_SVID_CERT_PATH")
+                && msg.contains("FERRUM_MESH_CA_BACKEND")
+                && msg.contains("FERRUM_FRONTEND_TLS_CERT_PATH"),
+            "refusal must name the missing identity and its remedies: {msg}"
+        );
+        assert!(
+            !msg.contains("PERMISSIVE") && !msg.contains("alongside TLS"),
+            "refusal must not blame the PeerAuthentication mode: {msg}"
+        );
+        assert!(
+            mesh_inbound_plaintext_reason(config::MtlsMode::Disable).contains("DISABLE"),
+            "DISABLE keeps its mode-specific reason"
+        );
     }
 
     #[test]
@@ -38292,10 +43140,12 @@ mod tests {
         runtime
     }
 
-    fn reviews_peer_auth_selector() -> config::WorkloadSelector {
-        config::WorkloadSelector {
-            labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
-            namespace: None,
+    fn reviews_peer_auth_scope() -> config::PolicyScope {
+        config::PolicyScope::WorkloadSelector {
+            selector: config::WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+                namespace: Some("default".to_string()),
+            },
         }
     }
 
@@ -38306,8 +43156,7 @@ mod tests {
         config::PeerAuthentication {
             name: "ns-policy".to_string(),
             namespace: "default".to_string(),
-            scope: None,
-            selector: Some(reviews_peer_auth_selector()),
+            scope: reviews_peer_auth_scope(),
             mtls_mode: config::MtlsMode::Permissive,
             port_overrides: HashMap::from([(port, mode)]),
         }
@@ -38317,8 +43166,9 @@ mod tests {
         config::PeerAuthentication {
             name: "ns-policy".to_string(),
             namespace: "default".to_string(),
-            scope: None,
-            selector: None,
+            scope: config::PolicyScope::Namespace {
+                namespace: "default".to_string(),
+            },
             mtls_mode: mode,
             port_overrides: HashMap::new(),
         }
@@ -38360,8 +43210,7 @@ mod tests {
             ..slice_with_peer_auths(vec![config::PeerAuthentication {
                 name: "mixed".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(reviews_peer_auth_selector()),
+                scope: reviews_peer_auth_scope(),
                 mtls_mode: config::MtlsMode::Permissive,
                 port_overrides: HashMap::from([
                     (8080, config::MtlsMode::Strict),
@@ -38388,8 +43237,7 @@ mod tests {
             ..slice_with_peer_auths(vec![config::PeerAuthentication {
                 name: "selector-scoped".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(reviews_peer_auth_selector()),
+                scope: reviews_peer_auth_scope(),
                 mtls_mode: config::MtlsMode::Strict,
                 port_overrides: HashMap::from([
                     (8080, config::MtlsMode::Strict),
@@ -38419,8 +43267,7 @@ mod tests {
             peer_authentications: vec![config::PeerAuthentication {
                 name: "service-port-is-not-an-app-port".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(reviews_peer_auth_selector()),
+                scope: reviews_peer_auth_scope(),
                 mtls_mode: config::MtlsMode::Permissive,
                 port_overrides: HashMap::from([
                     (80, config::MtlsMode::Disable),
@@ -38447,8 +43294,7 @@ mod tests {
             ..slice_with_peer_auths(vec![config::PeerAuthentication {
                 name: "ingress".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(reviews_peer_auth_selector()),
+                scope: reviews_peer_auth_scope(),
                 mtls_mode: config::MtlsMode::Permissive,
                 port_overrides: HashMap::from([
                     (8080, config::MtlsMode::Strict),
@@ -38588,10 +43434,9 @@ mod tests {
         let slice = slice_with_peer_auths(vec![config::PeerAuthentication {
             name: "namespace-strict".to_string(),
             namespace: "default".to_string(),
-            scope: Some(config::PolicyScope::WorkloadSelector {
-                selector: empty_selector.clone(),
-            }),
-            selector: Some(empty_selector),
+            scope: config::PolicyScope::WorkloadSelector {
+                selector: empty_selector,
+            },
             mtls_mode: config::MtlsMode::Strict,
             port_overrides: HashMap::from([(8080, config::MtlsMode::Disable)]),
         }]);
@@ -38635,8 +43480,7 @@ mod tests {
             let slice = slice_with_peer_auths(vec![config::PeerAuthentication {
                 name: "transport-port-collision".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(reviews_peer_auth_selector()),
+                scope: reviews_peer_auth_scope(),
                 mtls_mode: config::MtlsMode::Strict,
                 port_overrides: HashMap::from([(transport_port, config::MtlsMode::Permissive)]),
             }]);
@@ -38644,7 +43488,7 @@ mod tests {
             runtime.workload_spiffe_id = slice.workload_spiffe_id.clone();
 
             assert_eq!(
-                resolve_inbound_mtls_mode(Some(&slice), &runtime),
+                resolve_inbound_mtls_mode(Some(&slice)),
                 config::MtlsMode::Strict,
                 "{topology:?} transport port must not become the listener-wide app-port fallback",
             );
@@ -38673,6 +43517,16 @@ mod tests {
             .expect_err("Disable on NodeWaypoint must be rejected");
 
         assert!(err.to_string().contains("node_waypoint"));
+        assert!(err.to_string().contains("HBONE"));
+    }
+
+    #[test]
+    fn validate_inbound_mtls_mode_rejects_disable_on_service_waypoint() {
+        let runtime = runtime_with_topology(MeshTopology::ServiceWaypoint);
+        let err = validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Disable)
+            .expect_err("Disable on ServiceWaypoint must be rejected");
+
+        assert!(err.to_string().contains("service_waypoint"));
         assert!(err.to_string().contains("HBONE"));
     }
 
@@ -38828,51 +43682,6 @@ mod tests {
     }
 
     #[test]
-    fn mesh_inbound_tls_slot_swaps_atomically() {
-        ensure_crypto_provider();
-        let env = EnvConfig {
-            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
-            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
-            ..EnvConfig::default()
-        };
-        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
-        let mesh_frontend_identity =
-            load_mesh_frontend_server_identity(&env, &test_svid_slot_from_env(&env))
-                .expect("mesh frontend identity");
-        let tls_config = load_mesh_frontend_tls(
-            &env,
-            &tls_policy,
-            &[],
-            &no_enforced_crls(),
-            config::MtlsMode::Permissive,
-            MeshTopology::Sidecar,
-            mesh_frontend_identity.as_deref(),
-            None,
-            None,
-        )
-        .expect("TLS config builds")
-        .expect("TLS config present");
-        let slot: crate::proxy::SharedMeshInboundTls =
-            Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
-
-        slot.store(Arc::new(Some(tls_config.clone())));
-        let loaded = slot.load_full();
-        assert!(
-            loaded
-                .as_ref()
-                .as_ref()
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, &tls_config)),
-            "load_full should observe the swapped TLS config"
-        );
-
-        slot.store(Arc::new(None));
-        assert!(
-            slot.load_full().is_none(),
-            "load_full should observe the plaintext swap"
-        );
-    }
-
-    #[test]
     fn validate_inbound_mtls_mode_accepts_disable_on_east_west_gateway() {
         // East-west gateways do SNI passthrough — there is no TLS-terminating
         // listener to fail closed. The resolved mode is structurally unused.
@@ -38887,6 +43696,7 @@ mod tests {
             MeshTopology::Sidecar,
             MeshTopology::Ambient,
             MeshTopology::NodeWaypoint,
+            MeshTopology::ServiceWaypoint,
             MeshTopology::EastWestGateway,
             MeshTopology::EgressGateway,
         ] {
@@ -39685,9 +44495,11 @@ mod tests {
     /// A wildcard host IS materializable when the operator declared concrete
     /// endpoints (`resolution: STATIC`) — the dial targets are those endpoints
     /// and the wildcard is only the route selector. Pins the #1727 injective id
-    /// encoding for the wildcard host alongside the supported shape; the
-    /// unresolvable variant (`DNS`/`NONE`, no endpoints) is refused instead and
-    /// is covered in `tests/conformance/istio_service_entry_egress.rs`.
+    /// encoding for the wildcard host alongside the supported shape. The
+    /// `DNS`/`NONE` HTTP-family variant also materializes (next test); a
+    /// `STATIC` wildcard with no endpoints, and a stream-family wildcard without
+    /// `STATIC` endpoints, are refused and covered in
+    /// `tests/conformance/istio_service_entry_egress.rs`.
     #[test]
     fn egress_sanitizes_wildcard_host_ids_but_preserves_route_host() {
         let mut entry = test_external_service_entry(
@@ -40153,7 +44965,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
         // Should have the egress proxy
         let egress_proxy = prepared
@@ -40213,7 +45026,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
         // No egress proxies should be materialized for sidecar topology
         assert!(
@@ -40231,13 +45045,15 @@ mod tests {
             egress_backend_scheme(AppProtocol::Tls),
             Some(BackendScheme::Https)
         );
+        // Issue #7236: HTTP2/GRPC are plaintext by default, as in Istio; a
+        // DestinationRule `tls.mode` decides origination afterwards.
         assert_eq!(
             egress_backend_scheme(AppProtocol::Http2),
-            Some(BackendScheme::Https)
+            Some(BackendScheme::Http)
         );
         assert_eq!(
             egress_backend_scheme(AppProtocol::Grpc),
-            Some(BackendScheme::Https)
+            Some(BackendScheme::Http)
         );
         assert_eq!(
             egress_backend_scheme(AppProtocol::Http),
@@ -40446,7 +45262,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
         let egress_proxies: Vec<_> = prepared
             .proxies
@@ -41240,7 +46057,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
         assert!(
             !prepared
@@ -41253,7 +46071,7 @@ mod tests {
 
     #[test]
     fn egress_stream_in_egress_gateway_topology_passes_full_validation() {
-        // Full end-to-end materialization via `prepare_gateway_config_for_mesh`
+        // Full end-to-end materialization via `prepare_gateway_config_via_mesh_slice`
         // exercises the validation pipeline that runs after materialization.
         // A stream egress proxy with a valid listen_port must pass
         // `validate_stream_proxies()` (each stream proxy needs listen_port,
@@ -41278,7 +46096,7 @@ mod tests {
         };
 
         let prepared =
-            prepare_gateway_config_for_mesh(config, &runtime).expect("prepared mesh config");
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared mesh config");
 
         let stream_proxy = prepared
             .proxies
@@ -41379,7 +46197,7 @@ mod tests {
         };
 
         let prepared =
-            prepare_gateway_config_for_mesh(config, &runtime).expect("prepared mesh config");
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared mesh config");
 
         assert!(
             !prepared
@@ -42961,6 +47779,8 @@ mod tests {
                 name: "reviews".to_string(),
             }],
             node_waypoint_capture_destinations: vec![enrolled],
+            // A capture-scoped producer always stamps the completeness marker.
+            node_waypoint_capture_mesh_policies_resolved: true,
             ..MeshSlice::default()
         };
         let pod_ip = "10.244.1.7"

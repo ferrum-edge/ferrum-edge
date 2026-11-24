@@ -27,6 +27,64 @@ fn create_plugin_default() -> std::sync::Arc<dyn Plugin> {
     create_plugin("grpc_web", &json!({})).unwrap().unwrap()
 }
 
+/// The gRPC-Web request media type that selects `mode` (`text` or `binary`).
+fn grpc_web_request_content_type(mode: &str) -> &'static str {
+    match mode {
+        "text" => "application/grpc-web-text",
+        "binary" => "application/grpc-web",
+        other => panic!("unknown gRPC-Web mode {other}"),
+    }
+}
+
+/// Run the production request-header hooks (`on_request_received`, then
+/// `before_proxy`) for one request and return the context together with the
+/// outgoing header map `before_proxy` produced. For a gRPC-Web media type the
+/// context then names this instance as translation owner, which is what the
+/// owner-scoped body hooks require.
+async fn claimed_grpc_web_request(
+    plugin: &Arc<dyn Plugin>,
+    content_type: &str,
+) -> (
+    ferrum_edge::plugins::RequestContext,
+    HashMap<String, String>,
+) {
+    let mut ctx = create_grpc_web_context(content_type);
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    (ctx, headers)
+}
+
+/// Translate one backend response body the way the owning instance does in
+/// production: a fresh request claimed with the gRPC-Web media type the
+/// response is labelled with, then `transform_response_body_with_context`.
+async fn translate_owned_response_body(
+    plugin: &Arc<dyn Plugin>,
+    body: &[u8],
+    content_type: Option<&str>,
+    response_headers: &HashMap<String, String>,
+) -> Option<Vec<u8>> {
+    let request_content_type = response_headers
+        .get("content-type")
+        .map(String::as_str)
+        .filter(|ct| ct.starts_with("application/grpc-web"))
+        .unwrap_or("application/grpc-web");
+    let mut ctx = create_grpc_web_context(request_content_type);
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    plugin
+        .transform_response_body_with_context(&mut ctx, body, content_type, response_headers)
+        .await
+}
+
 fn grpc_web_trailer_payload(body: &[u8]) -> String {
     assert!(
         body.len() >= 5,
@@ -616,11 +674,9 @@ async fn test_strips_client_supplied_x_grpc_web_mode_for_non_grpc_web() {
 
 // Regression: end-to-end verification that a spoofed `x-grpc-web-mode: text`
 // on a non-gRPC-Web content-type does NOT trigger base64-decoding of the
-// request body in `transform_request_body`. Even if a client plants the
-// internal marker alongside an `application/json` body, the strip in
-// `on_request_received` must ensure the header never reaches downstream
-// phases, so base64 is never attempted on non-gRPC-Web bodies (which would
-// turn them into garbage that backends would reject or mis-parse).
+// request body. The strip in `on_request_received` keeps the reserved header
+// out of every later phase, and the body hook decodes only for a request this
+// instance claimed from its content type.
 #[tokio::test]
 async fn test_spoofed_x_grpc_web_mode_does_not_base64_decode_non_grpc_web_body() {
     use base64::Engine;
@@ -640,31 +696,37 @@ async fn test_spoofed_x_grpc_web_mode_does_not_base64_decode_non_grpc_web_body()
     assert!(!ctx.headers.contains_key("x-grpc-web-mode"));
     assert!(!ctx.metadata.contains_key("grpc_web_mode"));
 
-    // Simulate the downstream dispatch: `before_proxy` sees no
-    // `grpc_web_mode` in metadata, so it doesn't re-inject the header.
     let mut outgoing = ctx.headers.clone();
     plugin.before_proxy(&mut ctx, &mut outgoing).await;
-    assert!(
-        !outgoing.contains_key("x-grpc-web-mode"),
-        "before_proxy must not re-inject the marker for non-gRPC-Web requests"
-    );
+    assert!(!outgoing.contains_key("x-grpc-web-mode"));
 
-    // `transform_request_body` receives the outgoing headers — with the
-    // marker absent, it must NOT attempt base64 decoding.
+    // The unclaimed request must reach the backend undecoded, and the final
+    // hook must not judge it as gRPC-Web framing.
     let decoded = plugin
-        .transform_request_body(base64_body.as_bytes(), Some("application/json"), &outgoing)
+        .transform_request_body_with_context(
+            &mut ctx,
+            base64_body.as_bytes(),
+            Some("application/json"),
+            &outgoing,
+        )
         .await;
     assert!(
         decoded.is_none(),
-        "transform_request_body must leave non-gRPC-Web bodies untouched, got: {decoded:?}"
+        "the body hook must leave non-gRPC-Web bodies untouched, got: {decoded:?}"
     );
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &outgoing, base64_body.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
 }
 
 #[tokio::test]
 async fn test_strips_client_supplied_x_grpc_web_mode_then_redetects() {
     // Client sends a real grpc-web-text request AND a misleading marker — plugin
-    // should ignore the client's marker, detect via content-type, and re-inject
-    // its own marker in before_proxy.
+    // should drop the client's marker, detect via content-type, and keep the
+    // mode in owner-scoped metadata only.
     let plugin = create_plugin_default();
     let mut ctx = create_grpc_web_context("application/grpc-web-text");
     ctx.headers
@@ -674,13 +736,10 @@ async fn test_strips_client_supplied_x_grpc_web_mode_then_redetects() {
     // Content-type-based detection wins
     assert_eq!(ctx.metadata.get("grpc_web_mode").unwrap(), "text");
 
-    let mut headers = HashMap::new();
-    headers.insert(
-        "content-type".to_string(),
-        "application/grpc-web-text".to_string(),
-    );
+    let mut headers = ctx.headers.clone();
     plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_eq!(headers.get("x-grpc-web-mode").unwrap(), "text");
+    assert!(!headers.contains_key("x-grpc-web-mode"));
+    assert_eq!(headers.get("content-type").unwrap(), "application/grpc");
 }
 
 // ── before_proxy — outgoing header rewriting ──
@@ -703,12 +762,13 @@ async fn test_before_proxy_rewrites_headers() {
     assert_eq!(headers.get("content-type").unwrap(), "application/grpc");
     // x-grpc-web request header stripped
     assert!(!headers.contains_key("x-grpc-web"));
-    // Mode marker injected for transform_request_body
-    assert_eq!(headers.get("x-grpc-web-mode").unwrap(), "binary");
+    // The mode stays in owner-scoped metadata; no wire marker is planted.
+    assert!(!headers.contains_key("x-grpc-web-mode"));
+    assert_eq!(ctx.metadata.get("grpc_web_mode").unwrap(), "binary");
 }
 
 #[tokio::test]
-async fn test_before_proxy_injects_text_mode_marker() {
+async fn test_before_proxy_keeps_text_mode_out_of_backend_headers() {
     let plugin = create_plugin_default();
     let mut ctx = create_grpc_web_context("application/grpc-web-text");
     plugin.on_request_received(&mut ctx).await;
@@ -716,7 +776,8 @@ async fn test_before_proxy_injects_text_mode_marker() {
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(headers.get("x-grpc-web-mode").unwrap(), "text");
+    assert!(!headers.contains_key("x-grpc-web-mode"));
+    assert_eq!(ctx.metadata.get("grpc_web_mode").unwrap(), "text");
 }
 
 #[tokio::test]
@@ -768,7 +829,7 @@ fn test_no_buffer_request_body_no_metadata() {
     assert!(!plugin.should_buffer_request_body(&ctx));
 }
 
-// ── transform_request_body — base64 decoding ──
+// ── transform_request_body_with_context — base64 decoding ──
 
 #[tokio::test]
 async fn test_transform_request_body_base64_decode() {
@@ -785,16 +846,17 @@ async fn test_transform_request_body_base64_decode() {
     // Base64-encode it (simulating gRPC-Web text mode)
     let encoded = BASE64.encode(&grpc_frame);
 
-    // Mode marker from before_proxy tells transform_request_body it's text mode
-    let mut headers = HashMap::new();
-    headers.insert("x-grpc-web-mode".to_string(), "text".to_string());
-
+    let (mut ctx, headers) = claimed_grpc_web_request(&plugin, "application/grpc-web-text").await;
     let result = plugin
-        .transform_request_body(encoded.as_bytes(), Some("application/grpc"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            encoded.as_bytes(),
+            Some("application/grpc"),
+            &headers,
+        )
         .await;
 
-    assert!(result.is_some());
-    assert_eq!(result.unwrap(), grpc_frame);
+    assert_eq!(result.expect("text mode must decode"), grpc_frame);
 }
 
 #[tokio::test]
@@ -806,11 +868,14 @@ async fn test_transform_request_body_binary_passthrough() {
     grpc_frame.extend_from_slice(&5u32.to_be_bytes());
     grpc_frame.extend_from_slice(b"hello");
 
-    let mut headers = HashMap::new();
-    headers.insert("x-grpc-web-mode".to_string(), "binary".to_string());
-
+    let (mut ctx, headers) = claimed_grpc_web_request(&plugin, "application/grpc-web").await;
     let result = plugin
-        .transform_request_body(&grpc_frame, Some("application/grpc"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &grpc_frame,
+            Some("application/grpc"),
+            &headers,
+        )
         .await;
 
     // Binary mode: no transformation
@@ -818,14 +883,18 @@ async fn test_transform_request_body_binary_passthrough() {
 }
 
 #[tokio::test]
-async fn test_transform_request_body_no_mode_header() {
+async fn test_transform_request_body_unclaimed_request() {
     let plugin = create_plugin_default();
 
-    let body = b"some data";
-    let headers = HashMap::new(); // No x-grpc-web-mode header
-
+    // Native gRPC: no instance claims translation.
+    let (mut ctx, headers) = claimed_grpc_web_request(&plugin, "application/grpc").await;
     let result = plugin
-        .transform_request_body(body, Some("application/grpc"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            b"some data",
+            Some("application/grpc"),
+            &headers,
+        )
         .await;
 
     // Not a gRPC-Web request — no transformation
@@ -833,30 +902,34 @@ async fn test_transform_request_body_no_mode_header() {
 }
 
 #[tokio::test]
-async fn test_transform_request_body_invalid_base64_returns_none() {
+async fn test_transform_request_body_invalid_base64_is_rejected_by_the_final_hook() {
     let plugin = create_plugin_default();
 
     // Invalid base64 data in text mode
     let body = b"not!!!valid===base64";
-    let mut headers = HashMap::new();
-    headers.insert("x-grpc-web-mode".to_string(), "text".to_string());
+    let (mut ctx, headers) = claimed_grpc_web_request(&plugin, "application/grpc-web-text").await;
 
     let result = plugin
-        .transform_request_body(body, Some("application/grpc"), &headers)
+        .transform_request_body_with_context(&mut ctx, body, Some("application/grpc"), &headers)
         .await;
-
-    // Returns None — on_final_request_body will catch the invalid framing
     assert!(result.is_none());
+
+    // The decode failure is latched, so the final hook rejects the raw body.
+    assert_grpc_web_request_rejected(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await,
+        "undecodable text body",
+    );
 }
 
 #[tokio::test]
 async fn test_transform_request_body_empty() {
     let plugin = create_plugin_default();
-    let mut headers = HashMap::new();
-    headers.insert("x-grpc-web-mode".to_string(), "text".to_string());
+    let (mut ctx, headers) = claimed_grpc_web_request(&plugin, "application/grpc-web-text").await;
 
     let result = plugin
-        .transform_request_body(&[], Some("application/grpc"), &headers)
+        .transform_request_body_with_context(&mut ctx, &[], Some("application/grpc"), &headers)
         .await;
 
     assert!(result.is_none());
@@ -870,12 +943,6 @@ fn request_frame(flag: u8, payload: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     frame.extend_from_slice(payload);
     frame
-}
-
-fn request_mode_headers(mode: &str) -> HashMap<String, String> {
-    let mut headers = HashMap::new();
-    headers.insert("x-grpc-web-mode".to_string(), mode.to_string());
-    headers
 }
 
 fn assert_grpc_web_request_rejected(result: PluginResult, case: &str) {
@@ -905,10 +972,13 @@ async fn test_final_request_body_accepts_complete_single_and_multiple_frames_in_
     multiple.extend_from_slice(&request_frame(0x00, b"two"));
 
     for mode in ["text", "binary"] {
-        let headers = request_mode_headers(mode);
+        let (mut ctx, headers) =
+            claimed_grpc_web_request(&plugin, grpc_web_request_content_type(mode)).await;
         for body in [&single, &multiple] {
             assert!(matches!(
-                plugin.on_final_request_body(&headers, body).await,
+                plugin
+                    .on_final_request_body_with_context(&mut ctx, &headers, body)
+                    .await,
                 PluginResult::Continue
             ));
         }
@@ -921,10 +991,14 @@ async fn test_final_request_body_compressed_flag_requires_declared_non_identity_
     let body = request_frame(0x01, b"compressed-payload");
 
     for mode in ["text", "binary"] {
-        let mut valid = request_mode_headers(mode);
+        let (mut ctx, claimed_headers) =
+            claimed_grpc_web_request(&plugin, grpc_web_request_content_type(mode)).await;
+        let mut valid = claimed_headers.clone();
         valid.insert("Grpc-Encoding".to_string(), "gzip".to_string());
         assert!(matches!(
-            plugin.on_final_request_body(&valid, &body).await,
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &valid, &body)
+                .await,
             PluginResult::Continue
         ));
 
@@ -935,21 +1009,25 @@ async fn test_final_request_body_compressed_flag_requires_declared_non_identity_
             ("list", Some("gzip, br")),
             ("invalid token", Some("gzip br")),
         ] {
-            let mut invalid = request_mode_headers(mode);
+            let mut invalid = claimed_headers.clone();
             if let Some(encoding) = encoding {
                 invalid.insert("grpc-encoding".to_string(), encoding.to_string());
             }
             assert_grpc_web_request_rejected(
-                plugin.on_final_request_body(&invalid, &body).await,
+                plugin
+                    .on_final_request_body_with_context(&mut ctx, &invalid, &body)
+                    .await,
                 case,
             );
         }
 
-        let mut duplicate = request_mode_headers(mode);
+        let mut duplicate = claimed_headers.clone();
         duplicate.insert("grpc-encoding".to_string(), "gzip".to_string());
         duplicate.insert("Grpc-Encoding".to_string(), "br".to_string());
         assert_grpc_web_request_rejected(
-            plugin.on_final_request_body(&duplicate, &body).await,
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &duplicate, &body)
+                .await,
             "duplicate grpc-encoding",
         );
     }
@@ -1002,10 +1080,13 @@ async fn test_final_request_body_rejects_every_malformed_envelope_boundary() {
     }
 
     for mode in ["text", "binary"] {
-        let headers = request_mode_headers(mode);
+        let (mut ctx, headers) =
+            claimed_grpc_web_request(&plugin, grpc_web_request_content_type(mode)).await;
         for (case, body) in &cases {
             assert_grpc_web_request_rejected(
-                plugin.on_final_request_body(&headers, body).await,
+                plugin
+                    .on_final_request_body_with_context(&mut ctx, &headers, body)
+                    .await,
                 case,
             );
         }
@@ -1037,7 +1118,7 @@ async fn run_grpc_web_request_pipeline(
         .transform_request_body_with_context(&mut ctx, wire_body, None, &headers)
         .await
         .unwrap_or_else(|| wire_body.to_vec());
-    let staged = ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx.metadata);
+    let staged = ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx);
     let outcome = plugin
         .on_final_request_body_with_context(&mut ctx, &headers, &transformed)
         .await;
@@ -1392,10 +1473,14 @@ async fn translated_response_messages_count_the_backend_body_not_the_client_wire
         let mut response_headers = HashMap::new();
         response_headers.insert("content-type".to_string(), content_type.to_string());
         response_headers.insert("grpc-status".to_string(), "0".to_string());
-        let translated = plugin
-            .transform_response_body(&backend_body, Some(content_type), &response_headers)
-            .await
-            .unwrap_or_else(|| panic!("{label}: gRPC-Web response translation must apply"));
+        let translated = translate_owned_response_body(
+            &plugin,
+            &backend_body,
+            Some(content_type),
+            &response_headers,
+        )
+        .await
+        .unwrap_or_else(|| panic!("{label}: gRPC-Web response translation must apply"));
         assert_eq!(
             count_grpc_length_prefixed_messages(&translated),
             expected_client_wire_count,
@@ -1500,8 +1585,8 @@ async fn staged_request_trailers_reject_a_tampered_staging_block() {
             base64::engine::general_purpose::STANDARD.encode(staged),
         );
         assert!(
-            ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx.metadata).is_none(),
-            "{case}: plugin-writable staging must be re-validated at dispatch"
+            ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx).is_none(),
+            "{case}: plugin-writable metadata must never forge dispatched request trailers"
         );
     }
 }
@@ -1510,10 +1595,11 @@ async fn staged_request_trailers_reject_a_tampered_staging_block() {
 async fn test_final_request_body_skips_non_grpc_web() {
     let plugin = create_plugin_default();
 
-    let body = b"anything";
-    let headers = HashMap::new(); // No mode header
-
-    let result = plugin.on_final_request_body(&headers, body).await;
+    // Native gRPC: this instance never claimed translation.
+    let (mut ctx, headers) = claimed_grpc_web_request(&plugin, "application/grpc").await;
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, b"anything")
+        .await;
     assert!(matches!(result, PluginResult::Continue));
 }
 
@@ -1728,9 +1814,13 @@ async fn test_transform_response_body_binary() {
     response_headers.insert("grpc-status".to_string(), "0".to_string());
     response_headers.insert("grpc-message".to_string(), "OK".to_string());
 
-    let result = plugin
-        .transform_response_body(&body, Some("application/grpc-web"), &response_headers)
-        .await;
+    let result = translate_owned_response_body(
+        &plugin,
+        &body,
+        Some("application/grpc-web"),
+        &response_headers,
+    )
+    .await;
 
     assert!(result.is_some());
     let output = result.unwrap();
@@ -1767,9 +1857,13 @@ async fn test_transform_response_body_text() {
     );
     response_headers.insert("grpc-status".to_string(), "0".to_string());
 
-    let result = plugin
-        .transform_response_body(&body, Some("application/grpc-web-text"), &response_headers)
-        .await;
+    let result = translate_owned_response_body(
+        &plugin,
+        &body,
+        Some("application/grpc-web-text"),
+        &response_headers,
+    )
+    .await;
 
     assert!(result.is_some());
     let output = result.unwrap();
@@ -1792,25 +1886,41 @@ async fn test_transform_response_body_noop_for_non_grpc_web() {
     let mut response_headers = HashMap::new();
     response_headers.insert("content-type".to_string(), "application/grpc".to_string());
 
+    // Native gRPC: this instance never claimed translation.
+    let (mut ctx, _) = claimed_grpc_web_request(&plugin, "application/grpc").await;
     let result = plugin
-        .transform_response_body(body, Some("application/grpc"), &response_headers)
+        .transform_response_body_with_context(
+            &mut ctx,
+            body,
+            Some("application/grpc"),
+            &response_headers,
+        )
         .await;
 
     assert!(result.is_none());
+    assert!(
+        !take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+        "an unclaimed response is left alone, not failed closed"
+    );
 }
 
 #[tokio::test]
-async fn test_transform_response_body_no_content_type() {
+async fn test_transform_response_body_no_content_type_fails_closed_for_the_owner() {
     let plugin = create_plugin_default();
 
     let body = b"some response";
     let response_headers = HashMap::new();
 
+    let (mut ctx, _) = claimed_grpc_web_request(&plugin, "application/grpc-web").await;
     let result = plugin
-        .transform_response_body(body, None, &response_headers)
+        .transform_response_body_with_context(&mut ctx, body, None, &response_headers)
         .await;
 
     assert!(result.is_none());
+    assert!(
+        take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+        "an owned translation without a gRPC-Web content type must fail closed"
+    );
 }
 
 // ── Protocol support ──
@@ -1855,7 +1965,7 @@ async fn test_full_roundtrip_binary() {
     plugin.on_request_received(&mut ctx).await;
     assert_eq!(ctx.headers.get("content-type").unwrap(), "application/grpc");
 
-    // 2. before_proxy sets outgoing headers and injects mode marker
+    // 2. before_proxy rewrites the outgoing content type
     let mut headers = HashMap::new();
     headers.insert(
         "content-type".to_string(),
@@ -1863,7 +1973,7 @@ async fn test_full_roundtrip_binary() {
     );
     plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_eq!(headers.get("content-type").unwrap(), "application/grpc");
-    assert_eq!(headers.get("x-grpc-web-mode").unwrap(), "binary");
+    assert!(!headers.contains_key("x-grpc-web-mode"));
 
     // 3. Response comes back from backend
     let mut response_headers = HashMap::new();
@@ -1885,7 +1995,12 @@ async fn test_full_roundtrip_binary() {
     body.extend_from_slice(b"abc");
 
     let result = plugin
-        .transform_response_body(&body, Some("application/grpc-web+proto"), &response_headers)
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc-web+proto"),
+            &response_headers,
+        )
         .await;
     assert!(result.is_some());
     let output = result.unwrap();
@@ -1914,13 +2029,15 @@ async fn test_full_roundtrip_text() {
     plugin.on_request_received(&mut ctx).await;
     assert_eq!(ctx.metadata.get("grpc_web_mode").unwrap(), "text");
 
-    // 3. before_proxy injects mode marker, then request body gets base64-decoded
+    // 3. before_proxy rewrites the outgoing headers, then the request body is
+    // base64-decoded from the owner's metadata
     let mut headers = HashMap::new();
     plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_eq!(headers.get("x-grpc-web-mode").unwrap(), "text");
+    assert!(!headers.contains_key("x-grpc-web-mode"));
 
     let decoded = plugin
-        .transform_request_body(
+        .transform_request_body_with_context(
+            &mut ctx,
             encoded_request.as_bytes(),
             Some("application/grpc"),
             &headers,
@@ -1938,7 +2055,8 @@ async fn test_full_roundtrip_text() {
     response_headers.insert("grpc-status".to_string(), "0".to_string());
 
     let response_body = plugin
-        .transform_response_body(
+        .transform_response_body_with_context(
+            &mut ctx,
             &grpc_frame,
             Some("application/grpc-web-text"),
             &response_headers,
@@ -2249,10 +2367,14 @@ async fn test_transform_response_body_binary_and_text_embed_custom_trailers() {
     response_headers.insert("request-id-dup".to_string(), "one\ntwo".to_string());
     response_headers.insert("proxy-authenticate".to_string(), "Basic x".to_string());
 
-    let binary = plugin
-        .transform_response_body(&body, Some("application/grpc-web"), &response_headers)
-        .await
-        .expect("binary transform");
+    let binary = translate_owned_response_body(
+        &plugin,
+        &body,
+        Some("application/grpc-web"),
+        &response_headers,
+    )
+    .await
+    .expect("binary transform");
     let binary_payload = grpc_web_trailer_payload(&binary[body.len()..]);
     assert!(binary_payload.contains("grpc-status: 0"));
     assert!(binary_payload.contains("request-id: abc-123"));
@@ -2265,10 +2387,14 @@ async fn test_transform_response_body_binary_and_text_embed_custom_trailers() {
         "content-type".to_string(),
         "application/grpc-web-text".to_string(),
     );
-    let text = plugin
-        .transform_response_body(&body, Some("application/grpc-web-text"), &response_headers)
-        .await
-        .expect("text transform");
+    let text = translate_owned_response_body(
+        &plugin,
+        &body,
+        Some("application/grpc-web-text"),
+        &response_headers,
+    )
+    .await
+    .expect("text transform");
     let decoded = BASE64.decode(&text).expect("text body is base64");
     assert_eq!(&decoded[..body.len()], &body[..]);
     let text_payload = grpc_web_trailer_payload(&decoded[body.len()..]);
@@ -3339,10 +3465,14 @@ async fn test_transform_response_body_missing_grpc_status_reports_unknown() {
         "application/grpc-web".to_string(),
     );
 
-    let output = plugin
-        .transform_response_body(body, Some("application/grpc-web"), &response_headers)
-        .await
-        .expect("gRPC-Web response body should be transformed");
+    let output = translate_owned_response_body(
+        &plugin,
+        body,
+        Some("application/grpc-web"),
+        &response_headers,
+    )
+    .await
+    .expect("gRPC-Web response body should be transformed");
 
     assert_eq!(output[0], 0x80);
     let trailer_len = u32::from_be_bytes([output[1], output[2], output[3], output[4]]) as usize;
@@ -3688,14 +3818,13 @@ async fn run_two_instance_response_chain(
         second.before_proxy(&mut ctx, &mut outgoing).await,
         PluginResult::Continue
     ));
-    // Only the owner plants shared request staging.
-    assert_eq!(
-        outgoing.get("x-grpc-web-mode").map(String::as_str),
-        Some(if request_ct.contains("grpc-web-text") {
-            "text"
-        } else {
-            "binary"
-        })
+    // Mode stays in owner-scoped metadata: no instance plants a wire marker,
+    // and the owner rewrites the outgoing content type to native gRPC.
+    assert!(!outgoing.contains_key("x-grpc-web-mode"));
+    assert!(
+        outgoing
+            .get("content-type")
+            .is_some_and(|ct| ct.starts_with("application/grpc") && !ct.contains("grpc-web"))
     );
 
     let mut response_headers =
@@ -4046,19 +4175,27 @@ async fn test_text_mode_streamed_armouring_equals_base64_of_the_binary_framing()
             "content-type".to_string(),
             "application/grpc-web".to_string(),
         );
-        let binary = plugin
-            .transform_response_body(&body, Some("application/grpc-web"), &response_headers)
-            .await
-            .expect("binary transform");
+        let binary = translate_owned_response_body(
+            &plugin,
+            &body,
+            Some("application/grpc-web"),
+            &response_headers,
+        )
+        .await
+        .expect("binary transform");
 
         response_headers.insert(
             "content-type".to_string(),
             "application/grpc-web-text".to_string(),
         );
-        let text = plugin
-            .transform_response_body(&body, Some("application/grpc-web-text"), &response_headers)
-            .await
-            .expect("text transform");
+        let text = translate_owned_response_body(
+            &plugin,
+            &body,
+            Some("application/grpc-web-text"),
+            &response_headers,
+        )
+        .await
+        .expect("text transform");
 
         assert_eq!(
             String::from_utf8(text).expect("armoured body is ASCII"),
@@ -4173,22 +4310,22 @@ async fn test_large_trailer_block_frames_identically_in_binary_and_text() {
     body.extend_from_slice(&5u32.to_be_bytes());
     body.extend_from_slice(b"hello");
 
-    let binary = plugin
-        .transform_response_body(
-            &body,
-            Some("application/grpc-web"),
-            &large_trailer_headers("application/grpc-web"),
-        )
-        .await
-        .expect("binary transform");
-    let text = plugin
-        .transform_response_body(
-            &body,
-            Some("application/grpc-web-text"),
-            &large_trailer_headers("application/grpc-web-text"),
-        )
-        .await
-        .expect("text transform");
+    let binary = translate_owned_response_body(
+        &plugin,
+        &body,
+        Some("application/grpc-web"),
+        &large_trailer_headers("application/grpc-web"),
+    )
+    .await
+    .expect("binary transform");
+    let text = translate_owned_response_body(
+        &plugin,
+        &body,
+        Some("application/grpc-web-text"),
+        &large_trailer_headers("application/grpc-web-text"),
+    )
+    .await
+    .expect("text transform");
 
     // The declared frame length must match the payload the writing pass
     // produced — the counting pass is only correct if these agree.
@@ -4836,12 +4973,12 @@ async fn staged_request_trailers_are_omitted_from_transaction_summaries() {
     // Backend dispatch still gets the native trailers: this is omission from the
     // log projection, not removal of the transport contract.
     assert_eq!(
-        ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx.metadata),
+        ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx),
         Some(vec![("x-app-session".to_string(), CANARY.to_string())]),
         "native trailer delivery must be unaffected"
     );
 
-    let log_metadata = ferrum_edge::_test_support::clone_log_metadata_for_test(&ctx);
+    let log_metadata = ferrum_edge::_test_support::clone_log_metadata(&ctx);
     assert!(
         !log_metadata.contains_key("grpc_web.request_trailers"),
         "the staging container must not reach a transaction summary"
@@ -4850,7 +4987,7 @@ async fn staged_request_trailers_are_omitted_from_transaction_summaries() {
     // Serialize the real summary the way every logger sink does, and prove the
     // canary is absent even if a producer put the container back.
     let mut summary = TransactionSummary {
-        metadata: log_metadata,
+        metadata: log_metadata.into_iter().collect(),
         ..TransactionSummary::default()
     };
     summary.metadata.insert(
@@ -4963,5 +5100,655 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
             assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
         }
+    }
+}
+
+// ── Production-launch review fixes ──────────────────────────────────────────
+
+fn rejection_body(result: &PluginResult) -> &str {
+    match result {
+        PluginResult::Reject { body, .. } => body.as_str(),
+        other => panic!("expected rejection, got {other:?}"),
+    }
+}
+
+/// grpc_web-SOL-1: raw binary frames sent under a TEXT media type are not
+/// base64, so they must be refused rather than reach the backend undecoded just
+/// because they happen to be valid native framing.
+#[tokio::test]
+async fn text_mode_request_carrying_raw_binary_frames_is_rejected() {
+    // A complete native DATA frame with a two-byte protobuf payload: seven
+    // bytes, so not even a whole number of base64 groups.
+    let seven_bytes = vec![0x00, 0x00, 0x00, 0x00, 0x02, 0x08, 0x01];
+    // A complete native DATA frame whose length IS a multiple of four, so the
+    // decoder must refuse it on the alphabet rather than on the length.
+    let eight_bytes = request_frame(0x00, b"abc");
+    assert!(eight_bytes.len().is_multiple_of(4));
+    let mut with_trailer = request_frame(0x00, b"ok");
+    with_trailer.extend_from_slice(&request_frame(0x80, b"x-app-id: 42\r\n"));
+
+    for (case, raw) in [
+        ("seven-byte frame", seven_bytes),
+        ("eight-byte frame", eight_bytes),
+        ("frame plus trailer frame", with_trailer),
+    ] {
+        let (_, staged, outcome) =
+            run_grpc_web_request_pipeline("application/grpc-web-text+proto", &raw).await;
+        assert!(
+            rejection_body(&outcome).contains("not valid base64"),
+            "{case}: got {outcome:?}"
+        );
+        assert_grpc_web_request_rejected(outcome, case);
+        assert!(staged.is_none(), "{case}: nothing may be staged");
+
+        // The correctly armoured counterpart still dispatches.
+        let (transformed, _, outcome) = run_grpc_web_request_pipeline(
+            "application/grpc-web-text+proto",
+            &grpc_web_text_body(&raw),
+        )
+        .await;
+        assert!(
+            matches!(outcome, PluginResult::Continue),
+            "{case}: base64 counterpart must be accepted, got {outcome:?}"
+        );
+        assert!(
+            raw.starts_with(&transformed),
+            "{case}: the decoded (trailer-stripped) frames reach the backend"
+        );
+    }
+}
+
+/// grpc_web-MUSE-1: an owner whose staging was removed or corrupted must
+/// actually reject on every request hook, not log "fail closed" and continue.
+#[tokio::test]
+async fn owner_with_corrupted_mode_staging_rejects_on_every_request_hook() {
+    let plugin = create_plugin_default();
+    let body = request_frame(0x00, b"hello");
+    let wire = grpc_web_text_body(&body);
+
+    // before_proxy: the namespaced owner key is gone.
+    let mut ctx = create_grpc_web_context("application/grpc-web-text");
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    let owner_id = ctx.metadata.get("grpc_web.owner").cloned().unwrap();
+    let mode_key = format!("grpc_web.instance.{owner_id}.mode");
+    ctx.metadata.remove(&mode_key);
+    let mut headers = ctx.headers.clone();
+    assert_grpc_web_request_rejected(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        "before_proxy without owner staging",
+    );
+
+    // Body transform: the shared mode is corrupted after before_proxy. The
+    // claimed request must still buffer, and the refusal must be latched so a
+    // later restore of the staging cannot readmit the untranslated body.
+    let mut ctx = create_grpc_web_context("application/grpc-web-text");
+    plugin.on_request_received(&mut ctx).await;
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    ctx.metadata
+        .insert("grpc_web_mode".to_string(), "not-a-mode".to_string());
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "a claimed request must buffer so its final hook can fail closed"
+    );
+    assert!(
+        plugin
+            .transform_request_body_with_context(&mut ctx, &wire, None, &headers)
+            .await
+            .is_none(),
+        "no speculative decode without valid staging"
+    );
+    ctx.metadata
+        .insert("grpc_web_mode".to_string(), "text".to_string());
+    let outcome = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &wire)
+        .await;
+    assert!(
+        rejection_body(&outcome).contains("translation state"),
+        "got {outcome:?}"
+    );
+    assert_grpc_web_request_rejected(outcome, "latched transform refusal");
+
+    // Final hook: staging disappears after a successful transform.
+    let mut ctx = create_grpc_web_context("application/grpc-web-text");
+    plugin.on_request_received(&mut ctx).await;
+    let mut headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let decoded = plugin
+        .transform_request_body_with_context(&mut ctx, &wire, None, &headers)
+        .await
+        .expect("valid text body decodes");
+    assert_eq!(decoded, body);
+    ctx.metadata.remove(&mode_key);
+    assert_grpc_web_request_rejected(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &decoded)
+            .await,
+        "final hook without owner staging",
+    );
+
+    // A non-owner sibling is still a no-op on the same corrupted request.
+    let follower = create_plugin_default();
+    assert!(matches!(
+        follower
+            .on_final_request_body_with_context(&mut ctx, &headers, &decoded)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+/// Route credential names must be removed behaviorally in both wire modes,
+/// including a trailer block whose only field is the credential.
+#[tokio::test]
+async fn custom_credential_request_trailers_are_stripped_before_native_dispatch() {
+    const CREDENTIAL: &str = "x-private-api-key";
+    let message = request_frame(0x00, b"hello");
+    for (block, expected) in [
+        (
+            "X-Private-Api-Key: test-credential-canary\r\nx-app-id: keep\r\n",
+            Some(vec![("x-app-id".to_string(), "keep".to_string())]),
+        ),
+        ("X-Private-Api-Key: test-credential-canary\r\n", None),
+    ] {
+        let mut binary = message.clone();
+        binary.extend_from_slice(&request_frame(0x80, block.as_bytes()));
+        for (content_type, wire) in [
+            ("application/grpc-web+proto", binary.clone()),
+            (
+                "application/grpc-web-text+proto",
+                grpc_web_text_body(&binary),
+            ),
+        ] {
+            // The control proves the name is ordinary metadata without the
+            // route's credential plan, rather than a globally forbidden name.
+            let (_, control, outcome) = run_grpc_web_request_pipeline(content_type, &wire).await;
+            assert!(matches!(outcome, PluginResult::Continue));
+            assert!(control.unwrap().iter().any(|(name, _)| name == CREDENTIAL));
+
+            let plugin = create_plugin_default();
+            let mut ctx = create_grpc_web_context(content_type);
+            ferrum_edge::_test_support::set_request_headers_to_redact_for_test(
+                &mut ctx,
+                vec![CREDENTIAL.to_string()],
+            );
+            assert!(matches!(
+                plugin.on_request_received(&mut ctx).await,
+                PluginResult::Continue
+            ));
+            let mut headers = ctx.headers.clone();
+            assert!(matches!(
+                plugin.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ));
+            let transformed = plugin
+                .transform_request_body_with_context(&mut ctx, &wire, None, &headers)
+                .await
+                .expect("trailer frame is removed");
+            assert_eq!(
+                transformed, message,
+                "{content_type}: preserve message bytes"
+            );
+            assert_eq!(
+                ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx),
+                expected,
+                "{content_type}: credential must not reach native trailers"
+            );
+            assert!(
+                matches!(
+                    plugin
+                        .on_final_request_body_with_context(&mut ctx, &headers, &transformed)
+                        .await,
+                    PluginResult::Continue
+                ),
+                "a credential-only block must not cause a staging failure"
+            );
+        }
+    }
+}
+
+/// A route's owned claim destinations (`claim_headers` on an auth plugin) are
+/// gateway assertions: a client may not restate one in a gRPC-Web request
+/// trailer, in any case or `_` spelling, while unrelated metadata survives.
+#[tokio::test]
+async fn owned_claim_destination_request_trailers_are_stripped_before_native_dispatch() {
+    let message = request_frame(0x00, b"hello");
+    let block =
+        "X-User-Email: ceo@corp.example\r\nx_user_email: ceo@corp.example\r\nx-app-id: keep\r\n";
+    let mut binary = message.clone();
+    binary.extend_from_slice(&request_frame(0x80, block.as_bytes()));
+    for (content_type, wire) in [
+        ("application/grpc-web+proto", binary.clone()),
+        (
+            "application/grpc-web-text+proto",
+            grpc_web_text_body(&binary),
+        ),
+    ] {
+        let plugin = create_plugin_default();
+        let mut ctx = create_grpc_web_context(content_type);
+        ferrum_edge::_test_support::set_request_trailer_strip_headers_for_test(
+            &mut ctx,
+            vec!["x-user-email".to_string()],
+        );
+        assert!(matches!(
+            plugin.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let mut headers = ctx.headers.clone();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        let transformed = plugin
+            .transform_request_body_with_context(&mut ctx, &wire, None, &headers)
+            .await
+            .expect("trailer frame is removed");
+        assert_eq!(
+            transformed, message,
+            "{content_type}: preserve message bytes"
+        );
+        assert_eq!(
+            ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx),
+            Some(vec![("x-app-id".to_string(), "keep".to_string())]),
+            "{content_type}: a claim destination must not reach native trailers"
+        );
+    }
+}
+
+/// grpc_web-SOL-2: a request trailer block that admission accepted at the
+/// 8 KiB boundary, written without the optional space after each colon, must
+/// reach dispatch intact rather than be dropped by a stricter re-measure.
+#[tokio::test]
+async fn full_size_request_trailer_block_without_optional_whitespace_is_delivered() {
+    let max = ferrum_edge::_test_support::MAX_GRPC_WEB_REQUEST_TRAILER_BLOCK_BYTES;
+    let first = "x".repeat(4090);
+    let second = "y".repeat(4090);
+    let block = format!("x-a:{first}\r\nx-b:{second}\r\n");
+    assert_eq!(
+        block.len(),
+        max,
+        "fixture sits exactly on the admitted bound"
+    );
+
+    let message = request_frame(0x00, b"hello");
+    let mut body = message.clone();
+    body.extend_from_slice(&request_frame(0x80, block.as_bytes()));
+
+    for (content_type, wire) in [
+        ("application/grpc-web+proto", body.clone()),
+        ("application/grpc-web-text+proto", grpc_web_text_body(&body)),
+    ] {
+        let (transformed, staged, outcome) =
+            run_grpc_web_request_pipeline(content_type, &wire).await;
+        assert!(
+            matches!(outcome, PluginResult::Continue),
+            "{content_type}: got {outcome:?}"
+        );
+        assert_eq!(transformed, message, "{content_type}");
+        assert_eq!(
+            staged,
+            Some(vec![
+                ("x-a".to_string(), first.clone()),
+                ("x-b".to_string(), second.clone()),
+            ]),
+            "{content_type}: both admitted trailers must survive staging"
+        );
+    }
+
+    // One byte over the bound is still refused at admission.
+    let oversized = format!("x-a:{first}z\r\nx-b:{second}\r\n");
+    assert_eq!(oversized.len(), max + 1);
+    let mut body = message.clone();
+    body.extend_from_slice(&request_frame(0x80, oversized.as_bytes()));
+    let (_, staged, outcome) =
+        run_grpc_web_request_pipeline("application/grpc-web+proto", &body).await;
+    assert_grpc_web_request_rejected(outcome, "oversized trailer block");
+    assert!(staged.is_none());
+}
+
+/// PR6826-SOL-1: the split trailer block is request-private typed state, so a
+/// later hook deleting, forging, or clearing gRPC-Web metadata — between the
+/// transform and the owner's final hook, or after it — can neither drop nor
+/// replace the trailers dispatch sends. Driven through the H1/H2 hook-context
+/// round trip so the typed state must also survive adoption onto the live
+/// context.
+#[tokio::test]
+async fn split_request_trailers_survive_later_hooks_rewriting_metadata() {
+    use base64::Engine;
+    use ferrum_edge::plugins::RequestContext;
+
+    #[derive(Clone, Copy)]
+    enum Tamper {
+        Forge,
+        ClearGrpcWebMetadata,
+    }
+
+    fn tamper(ctx: &mut RequestContext, how: Tamper) {
+        match how {
+            Tamper::Forge => {
+                ctx.metadata.insert(
+                    "grpc_web.request_trailers".to_string(),
+                    base64::engine::general_purpose::STANDARD.encode(r#"[["x-app-id","forged"]]"#),
+                );
+            }
+            Tamper::ClearGrpcWebMetadata => {
+                ctx.metadata.retain(|key, _| !key.starts_with("grpc_web"));
+            }
+        }
+    }
+
+    struct MetadataTamperer {
+        on_transform: Option<Tamper>,
+        on_final: Option<Tamper>,
+    }
+
+    #[async_trait::async_trait]
+    impl Plugin for MetadataTamperer {
+        fn name(&self) -> &str {
+            "metadata_tamperer"
+        }
+
+        fn modifies_request_body(&self) -> bool {
+            true
+        }
+
+        fn needs_final_request_body_context(&self) -> bool {
+            true
+        }
+
+        async fn transform_request_body_with_context(
+            &self,
+            ctx: &mut RequestContext,
+            _body: &[u8],
+            _content_type: Option<&str>,
+            _request_headers: &HashMap<String, String>,
+        ) -> Option<Vec<u8>> {
+            if let Some(how) = self.on_transform {
+                tamper(ctx, how);
+            }
+            None
+        }
+
+        async fn on_final_request_body_with_context(
+            &self,
+            ctx: &mut RequestContext,
+            _headers: &HashMap<String, String>,
+            _body: &[u8],
+        ) -> PluginResult {
+            if let Some(how) = self.on_final {
+                tamper(ctx, how);
+            }
+            PluginResult::Continue
+        }
+    }
+
+    let message = request_frame(0x00, b"hello");
+    let mut with_trailer = message.clone();
+    with_trailer.extend_from_slice(&request_frame(0x80, b"x-app-id: 42\r\n"));
+
+    let compositions = [
+        (
+            "forged between transform and final",
+            Some(Tamper::Forge),
+            None,
+        ),
+        (
+            "forged after the owner's final hook",
+            None,
+            Some(Tamper::Forge),
+        ),
+        (
+            "gRPC-Web metadata cleared after the owner's final hook",
+            None,
+            Some(Tamper::ClearGrpcWebMetadata),
+        ),
+    ];
+    for (case, on_transform, on_final) in compositions {
+        for (content_type, wire) in [
+            ("application/grpc-web+proto", with_trailer.clone()),
+            (
+                "application/grpc-web-text+proto",
+                grpc_web_text_body(&with_trailer),
+            ),
+        ] {
+            let grpc_web = create_plugin_default();
+            let plugins: Vec<Arc<dyn Plugin>> = vec![
+                grpc_web.clone(),
+                Arc::new(MetadataTamperer {
+                    on_transform,
+                    on_final,
+                }),
+            ];
+            let mut ctx = create_grpc_web_context(content_type);
+            assert!(matches!(
+                grpc_web.on_request_received(&mut ctx).await,
+                PluginResult::Continue
+            ));
+            let mut headers = ctx.headers.clone();
+            assert!(matches!(
+                grpc_web.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ));
+
+            let (transformed, outcome) =
+                ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+                    &plugins, &mut ctx, &headers, wire,
+                )
+                .await;
+            assert!(
+                matches!(outcome, PluginResult::Continue),
+                "{case} ({content_type}): got {outcome:?}"
+            );
+            assert_eq!(transformed, message, "{case} ({content_type})");
+            assert_eq!(
+                ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx),
+                Some(vec![("x-app-id".to_string(), "42".to_string())]),
+                "{case} ({content_type}): dispatch must send exactly the validated block"
+            );
+        }
+    }
+
+    // A genuine request without a trailer frame still dispatches, with no
+    // trailers — even when a later hook plants a forged staging value.
+    let grpc_web = create_plugin_default();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        grpc_web.clone(),
+        Arc::new(MetadataTamperer {
+            on_transform: Some(Tamper::Forge),
+            on_final: Some(Tamper::Forge),
+        }),
+    ];
+    let mut ctx = create_grpc_web_context("application/grpc-web+proto");
+    grpc_web.on_request_received(&mut ctx).await;
+    let mut headers = ctx.headers.clone();
+    grpc_web.before_proxy(&mut ctx, &mut headers).await;
+    let (transformed, outcome) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &plugins,
+            &mut ctx,
+            &headers,
+            message.clone(),
+        )
+        .await;
+    assert!(matches!(outcome, PluginResult::Continue), "got {outcome:?}");
+    assert_eq!(transformed, message);
+    assert!(ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx).is_none());
+}
+
+/// grpc_web-SOL-3: segmented text decoding writes every segment into one
+/// output buffer. Pin equivalence for the worst case (one padded segment per
+/// decoded byte) and for mixed segment sizes, plus continued strictness.
+#[tokio::test]
+async fn text_request_decoding_accepts_one_padded_segment_per_byte() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    let payload: Vec<u8> = (0..=255u8).cycle().take(16 * 1024).collect();
+    let frame = request_frame(0x00, &payload);
+
+    let per_byte: String = frame.iter().map(|byte| STANDARD.encode([*byte])).collect();
+    assert_eq!(per_byte.len(), frame.len() * 4);
+    assert!(
+        per_byte
+            .as_bytes()
+            .chunks(4)
+            .all(|group| group.ends_with(b"=="))
+    );
+
+    let mut mixed = String::new();
+    let mut rest = frame.as_slice();
+    for size in [1usize, 2, 3, 4, 5, 6, 7, 64, 3000].iter().cycle() {
+        if rest.is_empty() {
+            break;
+        }
+        let take = (*size).min(rest.len());
+        mixed.push_str(&STANDARD.encode(&rest[..take]));
+        rest = &rest[take..];
+    }
+
+    for (case, wire) in [
+        ("single segment", STANDARD.encode(&frame)),
+        ("one segment per byte", per_byte),
+        ("mixed segment sizes", mixed),
+    ] {
+        let (transformed, _, outcome) =
+            run_grpc_web_request_pipeline("application/grpc-web-text", wire.as_bytes()).await;
+        assert!(matches!(outcome, PluginResult::Continue), "{case}");
+        assert_eq!(transformed, frame, "{case}");
+    }
+
+    for (case, wire) in [
+        ("padding in the third position only", "QQ=A"),
+        ("character outside the alphabet", "QQ!="),
+        ("partial group", "QUJDRA="),
+        ("garbage after a padded segment", "QQ==-A=="),
+    ] {
+        let (_, _, outcome) =
+            run_grpc_web_request_pipeline("application/grpc-web-text", wire.as_bytes()).await;
+        // A strict total parse refuses the body; the final hook rejects it.
+        assert_grpc_web_request_rejected(outcome, case);
+    }
+}
+
+/// grpc_web-MUSE-2: the text-mode identity check resumes decoding at the group
+/// the trailer suffix starts in. Pin it where that group is mid-run (one
+/// whole-body encode), right after a flush boundary, and inside one-byte
+/// padded segments, plus a tampered suffix and a real rewrite.
+#[test]
+fn text_trailer_identity_check_resumes_at_the_recorded_suffix_group() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use ferrum_edge::_test_support::{
+        build_trailer_frame, sync_translated_body_trailer_frame_into_for_test,
+    };
+
+    let original = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "abc".to_string()),
+    ]);
+    let mutated = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "xyz".to_string()),
+    ]);
+    let message = request_frame(0x00, b"pong!");
+    let trailer = build_trailer_frame(&original);
+    let mut binary = message.clone();
+    binary.extend_from_slice(&trailer);
+
+    let whole = BASE64.encode(&binary);
+    let flushed = format!("{}{}", BASE64.encode(&message), BASE64.encode(&trailer));
+    let per_byte: String = binary.iter().map(|byte| BASE64.encode([*byte])).collect();
+
+    for (case, text) in [
+        ("whole-body encode", whole),
+        ("flush before the trailer frame", flushed),
+        ("one padded segment per byte", per_byte),
+    ] {
+        let text = text.into_bytes();
+        assert!(
+            sync_translated_body_trailer_frame_into_for_test(
+                &text,
+                Some("application/grpc-web-text"),
+                &original,
+                Some(200),
+                text.len(),
+                false,
+            )
+            .unwrap_or_else(|err| panic!("{case}: identity check failed ({err})"))
+            .is_none(),
+            "{case}: an identical trailer suffix must short-circuit"
+        );
+
+        let rebuilt = sync_translated_body_trailer_frame_into_for_test(
+            &text,
+            Some("application/grpc-web-text"),
+            &mutated,
+            Some(200),
+            text.len() + 128,
+            true,
+        )
+        .unwrap_or_else(|err| panic!("{case}: rebuild failed ({err})"))
+        .unwrap_or_else(|| panic!("{case}: changed trailers must rebuild"));
+        let decoded = BASE64.decode(&rebuilt).expect("rebuilt text is one run");
+        assert!(decoded.starts_with(&message), "{case}");
+        let payload = trailing_grpc_web_trailer_payload(&decoded);
+        assert!(payload.contains("request-id: xyz\r\n"), "{case}: {payload}");
+    }
+
+    // Same length, one payload byte different: not an identity match.
+    let mut tampered = binary.clone();
+    let last_value_byte = tampered.len() - 3;
+    tampered[last_value_byte] = b'd';
+    let tampered_text = BASE64.encode(&tampered).into_bytes();
+    let rebuilt = sync_translated_body_trailer_frame_into_for_test(
+        &tampered_text,
+        Some("application/grpc-web-text"),
+        &original,
+        Some(200),
+        tampered_text.len() + 128,
+        true,
+    )
+    .expect("tampered suffix rebuilds")
+    .expect("a differing suffix must not short-circuit");
+    assert_eq!(BASE64.decode(&rebuilt).expect("valid"), binary);
+}
+
+/// grpc_web-MUSE-3: the trailer field plan normalizes mixed-case keys and
+/// keeps deterministic name order across its counting and writing passes.
+#[tokio::test]
+async fn trailer_frame_plan_normalizes_names_and_keeps_order_in_both_modes() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let plugin = create_plugin_default();
+    let body = request_frame(0x00, b"hello");
+    for content_type in ["application/grpc-web", "application/grpc-web-text"] {
+        let response_headers = HashMap::from([
+            ("content-type".to_string(), content_type.to_string()),
+            ("Zebra-Meta".to_string(), "z".to_string()),
+            ("grpc-status".to_string(), "0".to_string()),
+            ("Alpha-Meta".to_string(), "a".to_string()),
+            ("request-id".to_string(), "first\nsecond".to_string()),
+        ]);
+        let translated =
+            translate_owned_response_body(&plugin, &body, Some(content_type), &response_headers)
+                .await
+                .unwrap_or_else(|| panic!("{content_type}: must translate"));
+        let binary = if content_type.ends_with("-text") {
+            BASE64.decode(&translated).expect("text output is base64")
+        } else {
+            translated
+        };
+        assert!(binary.starts_with(&body), "{content_type}");
+        assert_eq!(
+            grpc_web_trailer_payload(&binary[body.len()..]),
+            "alpha-meta: a\r\ngrpc-status: 0\r\nrequest-id: first\r\nrequest-id: second\r\nzebra-meta: z\r\n",
+            "{content_type}"
+        );
     }
 }

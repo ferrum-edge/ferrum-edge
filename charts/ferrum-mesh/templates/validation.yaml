@@ -7,11 +7,7 @@
 {{- if .Values.controlPlane.enabled -}}
 {{- include "ferrum-mesh.validateResources" (dict "component" "controlPlane" "resources" .Values.controlPlane.resources) -}}
 {{- include "ferrum-mesh.validatePlaintextAdmin" (dict "component" "controlPlane" "resolved" (include "ferrum-mesh.resolveComponentAdmin" (dict "component" "controlPlane" "env" (.Values.controlPlane.env | default dict) "admin" (.Values.controlPlane.admin | default dict)) | fromYaml) "hardFail" true "probes" .Values.controlPlane.probes) -}}
-{{- end -}}
-{{- if .Values.ca.enabled -}}
-{{- include "ferrum-mesh.validateResources" (dict "component" "ca" "resources" .Values.ca.resources) -}}
-{{- include "ferrum-mesh.validatePlaintextAdmin" (dict "component" "ca" "resolved" (include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ca" "env" (.Values.ca.env | default dict) "admin" (.Values.ca.admin | default dict)) | fromYaml) "hardFail" true "probes" .Values.ca.probes) -}}
-{{- include "ferrum-mesh.failReservedEnv" (dict "label" "ca.env" "env" .Values.ca.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" "FERRUM_METRICS_BEARER_TOKEN" "FERRUM_METRICS_ALLOWED_CIDRS")) -}}
+{{- include "ferrum-mesh.validateCpGrpcTransport" (dict "label" "controlPlane.env" "env" .Values.controlPlane.env "defaultListenAddr" (printf "0.0.0.0:%v" .Values.controlPlane.grpcPort)) -}}
 {{- end -}}
 {{- if .Values.eastWest.enabled -}}
 {{- include "ferrum-mesh.validateResources" (dict "component" "eastWest" "resources" .Values.eastWest.resources) -}}
@@ -25,10 +21,10 @@
        literal and the allowlist are still parsed strictly: the runtime rejects a
        malformed FERRUM_ADMIN_ALLOWED_CIDRS entry in every mode. */ -}}
 {{- include "ferrum-mesh.validatePlaintextAdmin" (dict "component" "ambient" "resolved" (include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ambient" "env" (.Values.ambient.env | default dict) "admin" (.Values.ambient.admin | default dict)) | fromYaml) "hardFail" false "probes" .Values.ambient.probes) -}}
-{{- include "ferrum-mesh.failReservedEnv" (dict "label" "ambient.env" "env" .Values.ambient.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" "FERRUM_METRICS_BEARER_TOKEN" "FERRUM_METRICS_ALLOWED_CIDRS")) -}}
+{{- include "ferrum-mesh.failReservedEnv" (dict "label" "ambient.env" "env" .Values.ambient.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" "FERRUM_METRICS_BEARER_TOKEN" "FERRUM_METRICS_ALLOWED_CIDRS" "FERRUM_MESH_CAPTURE_MODE")) -}}
 {{- end -}}
 {{- if .Values.injector.enabled -}}
-{{- include "ferrum-mesh.failReservedEnv" (dict "label" "injector.env" "env" .Values.injector.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS")) -}}
+{{- include "ferrum-mesh.failReservedEnv" (dict "label" "injector.env" "env" .Values.injector.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" "FERRUM_INJECTOR_LISTEN_ADDR" "FERRUM_INJECTOR_REQUIRE_ANNOTATION" "FERRUM_INJECTOR_TLS_CERT_PATH" "FERRUM_INJECTOR_TLS_KEY_PATH")) -}}
 {{- end -}}
 {{- if .Values.nodeAgent.enabled -}}
 {{- include "ferrum-mesh.validateAdminBind" (dict "component" "nodeAgent" "bind" (.Values.nodeAgent.admin.bindAddress | default "127.0.0.1")) -}}

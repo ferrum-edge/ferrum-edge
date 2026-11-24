@@ -14,8 +14,8 @@
 use base64::Engine;
 use chrono::Utc;
 use ferrum_edge::config::db_backend::{
-    FullConfigLoadPurpose, IncrementalFullReloadReason, gateway_trust_bundle_revision_conflict,
-    is_incremental_full_reload_required,
+    FullConfigLoadPurpose, IncrementalFullReloadReason, IncrementalResult,
+    gateway_trust_bundle_revision_conflict, is_incremental_full_reload_required,
 };
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::gateway_trust::GatewayTrustBundleRecord;
@@ -1119,10 +1119,30 @@ async fn every_scope_publishes_replace_for_a_record_and_clear_for_none() {
 async fn an_ordinary_resource_delta_leaves_applied_trust_untouched() {
     use ferrum_edge::config::gateway_trust::GatewayTrustPublication;
 
+    let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        sequence_cursor: 0,
+        poll_timestamp: Utc::now(),
+    };
+    let version = delta.poll_timestamp.to_rfc3339();
+    assert!(CpGrpcServer::broadcast_delta_with_trust_bundles(
+        &tx,
+        &delta,
+        &version,
+        GatewayTrustPublication::Unchanged,
+    ));
     assert_eq!(
-        GatewayTrustPublication::Unchanged
-            .to_side_channel_json()
-            .expect("unchanged encodes"),
+        rx.try_recv()
+            .expect("the delta reaches the subscriber channel")
+            .trust_bundles_json,
         "",
         "an unrelated delta must encode as an EMPTY side channel"
     );

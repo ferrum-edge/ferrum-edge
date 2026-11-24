@@ -57,6 +57,16 @@ patches 002–004 and later local corrections. Apply the complete
 see [the baseline record](../README.md). The historical PR artifact alone
 is not sufficient to reconstruct the shipped crate.
 
+Like the PR, the effective timeout (per-request override, else the client
+default) is applied twice: the outer connect deadline bounds the whole dial, and
+`ConnectorService::request_connect_timeout()` hands it to every
+`HttpConnector` the connector uses (`set_connect_timeout` on the direct, HTTPS
+tunnel and SOCKS arms), which spreads it across the resolved addresses. The
+0.13.3 rebase (e59281dc3) had dropped those connector calls and left the field
+always `None`; they were restored for issue #7308 and are pinned by
+`test_per_request_connect_timeout_bounds_each_resolved_address`
+(`tests/integration/connection_pool_tests.rs`).
+
 ## Files copied into `vendor/reqwest-0.13.4-ferrum-patched/`
 
 - `src/` — the entire crate source (with the patch applied)
@@ -80,10 +90,15 @@ from the vendored source.
 
 1. **Bump the registry version of reqwest** (`Cargo.toml` `[dependencies]`)
    to whatever release contains the merged PR.
-2. **Remove the `reqwest` line** from the `[patch.crates-io]` block in the
-   workspace `Cargo.toml` and its mirror in `tests/performance/mesh/Cargo.toml`.
+2. **Remove the `reqwest` line** from every `[patch.crates-io]` mirror —
+   the workspace `Cargo.toml`, `fuzz/Cargo.toml` and
+   `tests/performance/mesh/Cargo.toml` — and regenerate `Cargo.lock`,
+   `fuzz/Cargo.lock` and `tests/performance/mesh/Cargo.lock` while the vendor
+   directory still exists. The root/fuzz parity test
+   (`fuzz_workspace_patches_every_vendored_crate_the_root_patches`) must stay green.
 3. **Delete the vendor directory**: `git rm -r vendor/reqwest-0.13.4-ferrum-patched/`,
-   then regenerate the drift manifest (`scripts/update_vendor_integrity.sh`).
+   then regenerate the drift manifest (`scripts/update_vendor_integrity.sh`) and
+   remove the reqwest vendor paths from `.github/workflows/ci.yml`.
 4. **Retire the governance records**: remove the inventory row in
    `docs/dependency-policy.md` and the entry in
    `docs/vendored-patch-lifecycle.json`, and delete or retire this docs directory
@@ -95,9 +110,11 @@ from the vendored source.
    the call sites need no further changes.
 6. **Update any docs** that still reference the vendored patch with a note
    that per-request `connect_timeout` landed upstream in reqwest vX.Y.Z.
-7. **Run the regression tests**: `cargo test --test integration_tests
-   test_connect_timeout_does_not_fragment_pool
-   test_pooled_client_exposes_per_request_connect_timeout`
+7. **Run the regression tests** (Cargo takes one test-name filter per
+   invocation, so run them separately):
+   `cargo test --test integration_tests test_connect_timeout_does_not_fragment_pool`
+   and
+   `cargo test --test integration_tests test_pooled_client_exposes_per_request_connect_timeout`
    (`tests/integration/connection_pool_tests.rs`) — these stay valid and
    continue to guard the contract.
 

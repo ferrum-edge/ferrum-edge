@@ -270,3 +270,111 @@ async fn assert_backend_not_hit(hits: &AtomicUsize) {
         "oversized request reached the backend despite Content-Length fast-path rejection"
     );
 }
+
+/// Issue #7163: a body refused while an early collector buffers it (here the
+/// `before_proxy` collector a `body_validator` route needs) runs the same
+/// reject pipeline as the terminal collector: the client gets the `413`, the
+/// backend is never reached, and the transaction log records the refusal under
+/// the collector's own phase instead of omitting it.
+#[ignore]
+#[tokio::test]
+async fn functional_request_body_limits_early_collector_refusal_is_logged() {
+    use crate::scaffolding::harness::GatewayHarness;
+    use futures_util::stream;
+
+    let (backend_port, backend_hits, backend_task) = spawn_counting_backend().await;
+    let config = serde_json::json!({
+        "version": "1",
+        "proxies": [{
+            "id": "early-body-refusal",
+            "listen_path": "/body",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": false,
+            "pool_enable_http2": false,
+            "plugins": [{"plugin_config_id": "early-body-validator"}]
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "access-log",
+                "plugin_name": "stdout_logging",
+                "config": {},
+                "scope": "global",
+                "enabled": true
+            },
+            {
+                "id": "early-body-validator",
+                "plugin_name": "body_validator",
+                "config": {"required_fields": ["name"]},
+                "scope": "proxy",
+                "proxy_id": "early-body-refusal",
+                "enabled": true
+            }
+        ]
+    });
+    let harness = GatewayHarness::builder()
+        .file_config(serde_yaml::to_string(&config).expect("serialize early refusal config"))
+        .log_level("info")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "16")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    // Chunked, so no declared Content-Length lets the frontend refuse it
+    // before the collector reads it.
+    let chunks = [
+        Bytes::from_static(br#"{"name":"#),
+        Bytes::from_static(br#""0123456789abcdef0123456789"}"#),
+    ];
+    let body = reqwest::Body::wrap_stream(stream::iter(
+        chunks.into_iter().map(Ok::<Bytes, std::io::Error>),
+    ));
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("http1 client");
+    let response = client
+        .post(format!("{}/body", harness.proxy_base_url()))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("send chunked upload");
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    assert_eq!(
+        status.as_u16(),
+        413,
+        "unexpected status/body: {status} {text}"
+    );
+    assert!(
+        text.contains("Request body exceeds maximum size"),
+        "unexpected body: {text}"
+    );
+    assert_backend_not_hit(&backend_hits).await;
+
+    let phase_of = |logs: &str| -> Vec<serde_json::Value> {
+        logs.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|entry| entry["proxy_id"] == "early-body-refusal")
+            .map(|entry| entry["metadata"]["rejection_phase"].clone())
+            .collect()
+    };
+    let logs = harness
+        .wait_for_log_contains(|logs| !phase_of(logs).is_empty(), Duration::from_secs(10))
+        .await;
+    assert_eq!(
+        phase_of(&logs),
+        vec![serde_json::json!(
+            "request_body_refused_before_before_proxy"
+        )],
+        "one transaction line under the collector's phase; logs:\n{logs}"
+    );
+    backend_task.abort();
+}

@@ -5,10 +5,12 @@ use std::net::IpAddr;
 use super::BodyDirection;
 use super::Waf;
 use super::decode;
+use super::grpc::GrpcMessages;
+use super::json_doc;
 use super::normalize;
 use super::rules::{
-    BytesRuleSet, CompiledRule, Field, FieldExclusions, JsonPathMatcher, JsonPathRule,
-    JsonPathSegment, RuleHit, RuleRef, RuleTarget, TextRuleSet, UrlQuery, extract_ip_tokens,
+    BytesRuleSet, CompiledRule, Field, FieldExclusions, JsonPathMatcher, JsonPathRule, RuleHit,
+    RuleRef, RuleTarget, TextRuleSet, UrlQuery, extract_ip_tokens,
 };
 use super::websocket::WsSessionPolicy;
 use crate::plugins::RequestContext;
@@ -29,15 +31,225 @@ pub(super) enum ScanSubject<'a> {
     WebSocketSession(&'a WsSessionPolicy),
 }
 
+/// Most distinct field names one scan records in `matched_fields`.
+const MAX_MATCHED_FIELDS: usize = 16;
+
+/// Longest encoded field name recorded; a longer one ends in a bare `*`.
+const MAX_MATCHED_FIELD_NAME_BYTES: usize = 128;
+
 #[derive(Debug, Default)]
 pub(super) struct ScanOutcome {
     pub hits: Vec<RuleHit>,
     pub truncated: bool,
     pub timed_out: bool,
+    /// `<kind>:<name>` labels of the request/response fields accepted
+    /// blocking-posture hits came from (`query`, `header`, `cookie`,
+    /// `response_header`). Names only — a field VALUE is never recorded.
+    /// Bounded by [`MAX_MATCHED_FIELDS`] and [`MAX_MATCHED_FIELD_NAME_BYTES`];
+    /// see [`matched_field_label`].
+    pub matched_fields: Vec<String>,
+    /// The same labels for hits of detection-only (paranoia band) rules, kept
+    /// apart so each list names exactly the fields its published rule-hit list
+    /// came from.
+    pub detection_matched_fields: Vec<String>,
+    /// Every accepted blocking-posture hit, including a repeat of an
+    /// already-recorded rule, so a scan can tell whether one field produced
+    /// any hit at all.
+    pub(super) accepted_hits: usize,
+    /// Detection-only counterpart of `accepted_hits`.
+    pub(super) accepted_detection_hits: usize,
+}
+
+/// What the JSON-path pass learned about every reading of one body.
+struct JsonReadings {
+    /// Some reading a backend takes as the body was read completely (or is
+    /// blank): the raw bytes, a wide reading the body declares, a framed
+    /// message, or the NUL-skipping reading.
+    complete: bool,
+    /// Some UTF-16 / UTF-32 reading found only by the BOM-less signature was
+    /// read completely. A backend defaulting to UTF-8 does not take it, so
+    /// it does not vouch for a NUL-skipping reading of the raw bytes.
+    complete_sniffed: bool,
+    /// Some reading held something neither parse could read.
+    refused: bool,
+    /// The most JSON-like opening among the parts that could not be read.
+    refused_opening: json_doc::JsonOpening,
+    /// The lenient work every reading of this body shares.
+    budget: json_doc::WorkBudget,
+    /// Per JSON-path rule (by position in `body_json_paths`): already hit on
+    /// this body. Allocated on the first hit, so a clean body allocates
+    /// nothing; with `pending` it keeps the work per reading at one check
+    /// per rule, and none once every rule has hit.
+    hit: Vec<bool>,
+    /// JSON-path rules not yet hit on this body.
+    pending: usize,
+    /// A COMPLETE message of a framed RPC stream could not be read (it was
+    /// refused, compressed, or lies past a framing defect). That message is
+    /// a whole document whatever `max_scan_bytes` did to a later one, so its
+    /// refusal is judged even when the body as a whole is only a prefix.
+    complete_message_refused: bool,
+}
+
+/// How one reading's refusal is weighed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadingKind {
+    /// The raw bytes, a UTF-16 / UTF-32 reading the body declares (charset or
+    /// BOM), the raw bytes of a framed RPC stream as sent and with their NULs
+    /// removed, or the NUL-skipping reading of an ordinary body: several such
+    /// readings coexist, and a backend may take any of them.
+    Alternative,
+    /// A UTF-16 / UTF-32 reading found only by the BOM-less wide signature.
+    /// Judged like [`Self::Alternative`], but completing it does not vouch
+    /// for the raw bytes.
+    SniffedCharset,
+    /// One message of a framed RPC stream: the document itself, with no
+    /// alternative reading, so any refusal fails closed.
+    FramedMessage,
+}
+
+impl JsonReadings {
+    fn for_body(length: usize, rules: usize) -> Self {
+        Self {
+            complete: false,
+            complete_sniffed: false,
+            refused: false,
+            refused_opening: json_doc::JsonOpening::No,
+            budget: json_doc::WorkBudget::for_body(length),
+            hit: Vec::new(),
+            pending: rules,
+            complete_message_refused: false,
+        }
+    }
+
+    fn record(&mut self, view: &json_doc::JsonView, kind: ReadingKind) {
+        let Some(opening) = view.refused() else {
+            match kind {
+                ReadingKind::SniffedCharset => self.complete_sniffed = true,
+                ReadingKind::Alternative | ReadingKind::FramedMessage => self.complete = true,
+            }
+            return;
+        };
+        let opening = match kind {
+            ReadingKind::Alternative | ReadingKind::SniffedCharset => opening,
+            ReadingKind::FramedMessage => {
+                self.complete_message_refused = true;
+                json_doc::JsonOpening::Yes
+            }
+        };
+        self.refused = true;
+        self.refused_opening = self.refused_opening.max(opening);
+    }
+
+    /// A message of a framed RPC stream the WAF cannot read (compressed): the
+    /// backend decodes it, so it fails closed like any unreadable message.
+    fn record_unreadable(&mut self) {
+        self.refused = true;
+        self.refused_opening = json_doc::JsonOpening::Yes;
+        self.complete_message_refused = true;
+    }
+
+    /// The extent a refusal is judged under. A prefix scan cuts only the
+    /// document the window ends in; a complete framed message that could not
+    /// be read is judged as the complete document it is.
+    fn judged_extent(&self, body: BodyExtent) -> BodyExtent {
+        if self.complete_message_refused {
+            BodyExtent::Complete
+        } else {
+            body
+        }
+    }
+
+    fn is_hit(&self, position: usize) -> bool {
+        self.hit.get(position).copied().unwrap_or(false)
+    }
+
+    fn mark_hit(&mut self, position: usize, rules: usize) {
+        if self.hit.is_empty() {
+            self.hit = vec![false; rules];
+        }
+        if let Some(slot) = self.hit.get_mut(position)
+            && !*slot
+        {
+            *slot = true;
+            self.pending = self.pending.saturating_sub(1);
+        }
+    }
+
+    /// The raw bytes refused in a way only a NUL-skipping parser reads past,
+    /// and the only complete reading is a signature-sniffed wide one: that
+    /// reading is not what a UTF-8 backend takes, so the NUL-skipping reading
+    /// must be read itself (it vouches for the raw bytes when it completes).
+    fn needs_nul_skipping_reading(&self) -> bool {
+        self.refused_opening == json_doc::JsonOpening::SkippingNul
+            && !self.complete
+            && self.complete_sniffed
+    }
+
+    /// Whether the body is JSON the rules could not read, so the rules fail
+    /// closed:
+    ///
+    /// - a document that could not be read opens like a JSON object or array,
+    ///   in any reading, whatever the declared type and whatever the other
+    ///   readings did; a message of a framed stream could not be read
+    ///   (including a compressed one); or the body's lenient work budget ran
+    ///   out;
+    /// - no reading a backend takes was read completely, and a document that
+    ///   could not be read opens like a JSON container once U+0000 is skipped
+    ///   between tokens (Json.NET). A signature-sniffed wide reading does not
+    ///   count: it is not what a UTF-8 backend reads;
+    /// - no reading at all was read completely and the `Content-Type`
+    ///   declares JSON. Under a JSON declaration no sniff is needed: the
+    ///   backend is told the body is JSON, and a reading the WAF cannot parse
+    ///   is exactly the gap a lenient parser reads through.
+    ///
+    /// A complete reading is what keeps an ordinary UTF-16 / UTF-32 body open:
+    /// its raw bytes are refused (a NUL follows every ASCII character) while
+    /// its declared reading, or its NUL-skipping reading, parses.
+    fn fail_closed(&self, content_type: Option<&str>) -> bool {
+        if self.refused_opening == json_doc::JsonOpening::Yes || self.budget.exhausted() {
+            return true;
+        }
+        if self.complete || !self.refused {
+            return false;
+        }
+        if self.refused_opening == json_doc::JsonOpening::SkippingNul {
+            return true;
+        }
+        !self.complete_sniffed && json_doc::media_type_declares_json(content_type)
+    }
+}
+
+/// Whether a scanned body is the whole representation or only its first
+/// `max_scan_bytes`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum BodyExtent {
+    Complete,
+    Prefix,
+}
+
+impl BodyExtent {
+    pub(super) fn of(truncated: bool) -> Self {
+        if truncated {
+            BodyExtent::Prefix
+        } else {
+            BodyExtent::Complete
+        }
+    }
 }
 
 impl ScanOutcome {
     pub fn push(&mut self, hit: RuleHit) {
+        self.push_classified(hit, false);
+    }
+
+    /// Record an accepted hit; `detection_only` selects which counter (and,
+    /// for a named field, which field list) it belongs to.
+    fn push_classified(&mut self, hit: RuleHit, detection_only: bool) {
+        if detection_only {
+            self.accepted_detection_hits = self.accepted_detection_hits.saturating_add(1);
+        } else {
+            self.accepted_hits = self.accepted_hits.saturating_add(1);
+        }
         if !self
             .hits
             .iter()
@@ -46,6 +258,75 @@ impl ScanOutcome {
             self.hits.push(hit);
         }
     }
+
+    /// Record the NAME of the field an accepted hit came from. Cold path: it
+    /// runs only after a rule matched.
+    fn record_field(&mut self, kind: &str, name: &str, detection_only: bool) {
+        let fields = if detection_only {
+            &mut self.detection_matched_fields
+        } else {
+            &mut self.matched_fields
+        };
+        if fields.len() >= MAX_MATCHED_FIELDS {
+            return;
+        }
+        let label = matched_field_label(kind, name);
+        if !fields.contains(&label) {
+            fields.push(label);
+        }
+    }
+
+    /// [`Self::record_field`] for a per-field surface. Query parameters are
+    /// recorded by `scan_query_pair`, which knows the name as the application
+    /// reads it; whole-surface matches (path, method, URL, bodies) have no
+    /// field name to report.
+    fn record_field_of(&mut self, field: Field<'_>, detection_only: bool) {
+        let (kind, name) = match field {
+            Field::Header(name) => ("header", name),
+            Field::ResponseHeader(name) => ("response_header", name),
+            Field::Cookie(name) => ("cookie", name),
+            Field::QueryParam(_) | Field::Whole | Field::Url { .. } => return,
+        };
+        self.record_field(kind, name, detection_only);
+    }
+}
+
+/// The UTF-16 / UTF-32 readings of one body or framed message. The single
+/// decode site of the shared body engine, used for both directions (and for
+/// each message of a framed body), so no direction can grow a private copy.
+fn wide_charset_views(body: &[u8], content_type: Option<&str>) -> normalize::WideCharsetViews {
+    normalize::decode_wide_charset_body_views(body, content_type)
+}
+
+/// `<kind>:<name>` with every byte of `name` outside the RFC 3986 unreserved
+/// set (`A-Z a-z 0-9 - . _ ~`) percent-encoded, so an attacker-chosen name can
+/// neither inject a delimiter (`,`), a control character, nor a log-format
+/// escape into transaction metadata, while an ordinary name reads verbatim.
+/// A name whose encoding exceeds [`MAX_MATCHED_FIELD_NAME_BYTES`] is cut and
+/// ends in a bare `*` (a literal `*` is always encoded as `%2A`).
+fn matched_field_label(kind: &str, name: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut label =
+        String::with_capacity(kind.len() + 1 + name.len().min(MAX_MATCHED_FIELD_NAME_BYTES) + 1);
+    label.push_str(kind);
+    label.push(':');
+    let start = label.len();
+    for byte in name.bytes() {
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~');
+        let encoded_len = if unreserved { 1 } else { 3 };
+        if label.len() - start + encoded_len > MAX_MATCHED_FIELD_NAME_BYTES {
+            label.push('*');
+            return label;
+        }
+        if unreserved {
+            label.push(char::from(byte));
+        } else {
+            label.push('%');
+            label.push(char::from(HEX[usize::from(byte >> 4)]));
+            label.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    label
 }
 
 impl Waf {
@@ -190,7 +471,25 @@ impl Waf {
                 } else {
                     Cow::Borrowed(raw_k)
                 };
-                self.scan_query_pair(&mut outcome, raw_k, raw_v, &name, subject);
+                self.scan_query_pair(&mut outcome, raw_k, raw_v, &name, false, subject);
+                // A backend that also splits on `;` reads each `;` sub-pair as
+                // a parameter of its own (issue #6579), so `?html=ok;q=<x>`
+                // must not hide `q` behind an excluded `html`. Split on the
+                // encoded bytes so `%3B` stays content.
+                if pair.contains(';') {
+                    // Every sub-pair, the first included: an anchored or
+                    // `equals` rule, or a suffix filter, can decide `role=admin`
+                    // differently from `role=admin;note=ok`.
+                    for sub_pair in pair.split(';').filter(|sub| !sub.is_empty()) {
+                        let (sub_k, sub_v) = sub_pair.split_once('=').unwrap_or((sub_pair, ""));
+                        let sub_name = if self.compiled.query_exclusions_active {
+                            normalize::query_component_name(sub_k)
+                        } else {
+                            Cow::Borrowed(sub_k)
+                        };
+                        self.scan_query_pair(&mut outcome, sub_k, sub_v, &sub_name, false, subject);
+                    }
+                }
             }
         } else {
             // Materialized keys are already decoded: they are the names as
@@ -199,7 +498,7 @@ impl Waf {
             // that the whole-URL re-check, which compares these keys as they
             // are, does not honour.
             for (key, value) in &ctx.query_params {
-                self.scan_query_pair(&mut outcome, key, value, key, subject);
+                self.scan_query_pair(&mut outcome, key, value, key, true, subject);
             }
         }
 
@@ -261,13 +560,24 @@ impl Waf {
         outcome
     }
 
+    /// `grpc` is the message split of a framed gRPC body (see
+    /// [`super::grpc::split_messages`]); `None` scans `body` as one document.
     pub(super) fn run_request_body_scan(
         &self,
         ctx: &RequestContext,
         body: &[u8],
         content_type: Option<&str>,
+        extent: BodyExtent,
+        grpc: Option<&GrpcMessages<'_>>,
     ) -> ScanOutcome {
-        self.scan_request_body_rules(ScanSubject::Http(ctx), body, content_type)
+        self.scan_body_rules(
+            ScanSubject::Http(ctx),
+            body,
+            content_type,
+            BodyDirection::Request,
+            extent,
+            grpc,
+        )
     }
 
     /// Request-side body rule engine, shared by the HTTP final-request-body
@@ -277,60 +587,258 @@ impl Waf {
         subject: ScanSubject<'_>,
         body: &[u8],
         content_type: Option<&str>,
+        extent: BodyExtent,
     ) -> ScanOutcome {
-        self.scan_body_rules(subject, body, content_type, BodyDirection::Request)
+        self.scan_body_rules(
+            subject,
+            body,
+            content_type,
+            BodyDirection::Request,
+            extent,
+            None,
+        )
     }
 
     /// One bounded view policy for both HTTP directions and WS messages.
     /// Admission, size limits, and the scan budget remain owned by the caller.
+    ///
+    /// `grpc` is the message split of a framed gRPC / gRPC-Web body: the
+    /// whole-body text rules then read each message payload as well as the
+    /// complete wire body, and the JSON-path pass
+    /// reads each complete message as its own document (see
+    /// [`Self::scan_json_path_body`]). Messages the caller already refused or
+    /// recorded as uninspectable (compressed, over the count cap, after a
+    /// framing defect) are not in `grpc`.
     fn scan_body_rules(
         &self,
         subject: ScanSubject<'_>,
         body: &[u8],
         content_type: Option<&str>,
         direction: BodyDirection,
+        extent: BodyExtent,
+        grpc: Option<&GrpcMessages<'_>>,
     ) -> ScanOutcome {
-        let (bytes, text_rules_active) = match direction {
-            BodyDirection::Request => (
-                self.compiled.body_bytes.as_ref(),
-                self.compiled.request_body_text_rules_active,
-            ),
-            BodyDirection::Response => (
-                self.compiled.response_body_bytes.as_ref(),
-                self.compiled.response_body_rules_active,
-            ),
+        let text_rules_active = match direction {
+            BodyDirection::Request => self.compiled.request_body_text_rules_active,
+            BodyDirection::Response => self.compiled.response_body_rules_active,
         };
         let mut outcome = ScanOutcome::default();
-        self.scan_bytes_set(&mut outcome, bytes, body, subject);
-        if direction == BodyDirection::Request {
-            // JSON-path rules normalize selected scalars, never the whole
-            // document: normalization must not rewrite unrelated '+' values.
-            self.scan_json_path_rules(&mut outcome, body, subject);
-        }
-        // Encoding-only packs also consume text views. JSON-path-only packs
-        // retain their semantic parser without allocating unused wide views.
-        let transcoded_views = if text_rules_active
+        // Encoding-only packs also consume text views.
+        let text_views_active = text_rules_active
             || self.specials.encoding.is_some()
-            || self.specials.overlong_utf8.is_some()
-        {
-            normalize::decode_wide_charset_body_views(body, content_type)
+            || self.specials.overlong_utf8.is_some();
+        let json_paths_active =
+            direction == BodyDirection::Request && !self.compiled.body_json_paths.is_empty();
+        // The whole body's wide-charset readings, decoded once and shared by
+        // the JSON-path pass and the whole-body text pass.
+        let body_views = if json_paths_active || text_views_active {
+            wide_charset_views(body, content_type)
         } else {
             normalize::WideCharsetViews::empty()
         };
+        if json_paths_active {
+            self.scan_json_path_body(
+                &mut outcome,
+                subject,
+                body,
+                content_type,
+                extent,
+                grpc,
+                &body_views,
+            );
+        }
+        // Nothing below has a consumer unless a whole-body text rule (body
+        // text, Luhn, CIDR) or a body-scoped encoding special is active: a
+        // JSON-path-only policy normalizes its selected scalars above and must
+        // not pay for decoding and copying the entire document as well.
+        if !text_views_active {
+            return outcome;
+        }
+        // The complete wire body is always scanned: the framing and the media
+        // type are client-controlled and say nothing about the backend, so a
+        // backend that ignores the envelopes consumes these raw bytes, and a
+        // token may straddle a frame header. A framed body's message payloads
+        // are scanned IN ADDITION, as the RPC backend reads them (a signature
+        // split by a frame header is whole there). Each pass is bounded by the
+        // retained body, so the text work at most doubles.
+        self.scan_body_text_rules(&mut outcome, subject, body, &body_views, direction);
+        if let Some(messages) = grpc {
+            for payload in messages.payloads() {
+                let views = wide_charset_views(payload.bytes, content_type);
+                self.scan_body_text_rules(&mut outcome, subject, payload.bytes, &views, direction);
+            }
+        }
+        outcome
+    }
+
+    /// Every whole-body text rule (bytes set, layered decode, encoding
+    /// specials, Luhn, CIDR) over one body or message and its wide-charset
+    /// readings.
+    fn scan_body_text_rules(
+        &self,
+        outcome: &mut ScanOutcome,
+        subject: ScanSubject<'_>,
+        body: &[u8],
+        transcoded_views: &normalize::WideCharsetViews,
+        direction: BodyDirection,
+    ) {
+        let bytes = match direction {
+            BodyDirection::Request => self.compiled.body_bytes.as_ref(),
+            BodyDirection::Response => self.compiled.response_body_bytes.as_ref(),
+        };
+        self.scan_bytes_set(outcome, bytes, body, subject);
         let text = String::from_utf8_lossy(body);
         if transcoded_views.uninspectable_charset()
             && let Some(rule_index) = self.specials.encoding
         {
-            self.push_special(&mut outcome, rule_index, text.as_ref(), subject);
+            self.push_special(outcome, rule_index, text.as_ref(), subject, Field::Whole);
         }
         // A declared charset adds coverage; it must not remove matches from
         // raw text or its transformations (including mixed representations).
-        self.scan_body_text_view(&mut outcome, text.as_ref(), subject, direction);
+        self.scan_body_text_view(outcome, text.as_ref(), subject, direction);
         for decoded in transcoded_views.iter() {
-            self.scan_bytes_set(&mut outcome, bytes, decoded.as_bytes(), subject);
-            self.scan_body_text_view(&mut outcome, decoded, subject, direction);
+            self.scan_bytes_set(outcome, bytes, decoded.as_bytes(), subject);
+            self.scan_body_text_view(outcome, decoded, subject, direction);
         }
-        outcome
+    }
+
+    /// The JSON-path pass over every admitted reading of one request body.
+    ///
+    /// JSON-path rules normalize selected scalars, never the whole document:
+    /// normalization must not rewrite unrelated '+' values. They parse every
+    /// admitted reading of the body — the raw bytes and each UTF-16 / UTF-32
+    /// view — since a backend may accept any of them as JSON, and a body no
+    /// reading of which parses fails closed ([`JsonReadings::fail_closed`]).
+    ///
+    /// A framed gRPC / gRPC-Web body (`grpc`) is read as its messages, as an
+    /// RPC backend reads it: each complete message is one document with no
+    /// alternative reading, so a message that does not parse fails closed. A
+    /// message the WAF cannot read at all (compressed, past the count cap,
+    /// after a framing defect) fails closed the same way; the message the
+    /// `max_scan_bytes` window cut short is not a complete document and is not
+    /// judged. Other framed media types (Connect streaming) are recognized by
+    /// [`json_doc::FramedStream`]. Because the media type and framing are
+    /// client-controlled and say nothing about the backend, a framed body's raw
+    /// bytes are read too, as sent and as a NUL-skipping parser (Json.NET)
+    /// takes them, and judged like any other reading.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_json_path_body(
+        &self,
+        outcome: &mut ScanOutcome,
+        subject: ScanSubject<'_>,
+        body: &[u8],
+        content_type: Option<&str>,
+        extent: BodyExtent,
+        grpc: Option<&GrpcMessages<'_>>,
+        transcoded_views: &normalize::WideCharsetViews,
+    ) {
+        let mut readings = JsonReadings::for_body(body.len(), self.compiled.body_json_paths.len());
+        let mut framed = false;
+        match grpc {
+            // A non-JSON codec: no reading of the body is a JSON document.
+            Some(_) if !json_doc::media_type_declares_json(content_type) => framed = true,
+            Some(messages) => {
+                framed = true;
+                for payload in messages.payloads() {
+                    if payload.trailer || !payload.complete {
+                        continue;
+                    }
+                    self.scan_json_path_rules(
+                        outcome,
+                        payload.bytes,
+                        subject,
+                        ReadingKind::FramedMessage,
+                        &mut readings,
+                    );
+                }
+                if messages.uninspectable().is_some() {
+                    readings.record_unreadable();
+                }
+                if !messages.is_text() {
+                    self.scan_framed_raw_readings(outcome, subject, body, &mut readings);
+                }
+            }
+            None => match json_doc::FramedStream::parse(content_type, body) {
+                Some(stream) if !stream.is_json_codec() => framed = true,
+                Some(stream) => {
+                    framed = true;
+                    for message in stream.messages() {
+                        match message {
+                            json_doc::FramedMessage::Json(message) => self.scan_json_path_rules(
+                                outcome,
+                                message,
+                                subject,
+                                ReadingKind::FramedMessage,
+                                &mut readings,
+                            ),
+                            json_doc::FramedMessage::Compressed => readings.record_unreadable(),
+                        }
+                    }
+                    if !stream.is_text() {
+                        self.scan_framed_raw_readings(outcome, subject, body, &mut readings);
+                    }
+                }
+                None => self.scan_json_path_rules(
+                    outcome,
+                    body,
+                    subject,
+                    ReadingKind::Alternative,
+                    &mut readings,
+                ),
+            },
+        }
+        let wide_kind = if normalize::wide_charset_is_declared(body, content_type) {
+            ReadingKind::Alternative
+        } else {
+            ReadingKind::SniffedCharset
+        };
+        for decoded in transcoded_views.iter() {
+            self.scan_json_path_rules(
+                outcome,
+                decoded.as_bytes(),
+                subject,
+                wide_kind,
+                &mut readings,
+            );
+        }
+        // A body whose wide reading is only sniffed: a UTF-8 backend that
+        // skips NULs (Json.NET) reads the raw bytes without their NULs, a
+        // different document whenever a code unit's two bytes are both
+        // non-zero. Read that document too. (A framed stream already reads it
+        // above.)
+        if !framed && readings.needs_nul_skipping_reading() {
+            let without_nuls = json_doc::without_nul_bytes(body);
+            self.scan_json_path_rules(
+                outcome,
+                &without_nuls,
+                subject,
+                ReadingKind::Alternative,
+                &mut readings,
+            );
+        }
+        if readings.fail_closed(content_type) {
+            self.push_unparsed_json_hits(outcome, subject, readings.judged_extent(extent));
+        }
+    }
+
+    /// The raw bytes of a framed binary RPC body, as sent and with their NULs
+    /// removed: the readings a backend that ignores the framing takes.
+    fn scan_framed_raw_readings(
+        &self,
+        outcome: &mut ScanOutcome,
+        subject: ScanSubject<'_>,
+        body: &[u8],
+        readings: &mut JsonReadings,
+    ) {
+        self.scan_json_path_rules(outcome, body, subject, ReadingKind::Alternative, readings);
+        let without_nuls = json_doc::without_nul_bytes(body);
+        self.scan_json_path_rules(
+            outcome,
+            &without_nuls,
+            subject,
+            ReadingKind::Alternative,
+            readings,
+        );
     }
 
     /// Layered decode, encoding specials, Luhn, and CIDR on one body-text view.
@@ -399,13 +907,23 @@ impl Waf {
         outcome
     }
 
+    /// Response-side counterpart of [`Self::run_request_body_scan`].
+    /// `body_json_path` rules are request-only, so the extent is unused.
     pub(super) fn run_response_body_scan(
         &self,
         ctx: &RequestContext,
         body: &[u8],
         content_type: Option<&str>,
+        grpc: Option<&GrpcMessages<'_>>,
     ) -> ScanOutcome {
-        self.scan_response_body_rules(ScanSubject::Http(ctx), body, content_type)
+        self.scan_body_rules(
+            ScanSubject::Http(ctx),
+            body,
+            content_type,
+            BodyDirection::Response,
+            BodyExtent::Complete,
+            grpc,
+        )
     }
 
     /// Response-side engine for HTTP bodies and backend→client WS messages.
@@ -415,7 +933,15 @@ impl Waf {
         body: &[u8],
         content_type: Option<&str>,
     ) -> ScanOutcome {
-        self.scan_body_rules(subject, body, content_type, BodyDirection::Response)
+        // `body_json_path` rules are request-only, so the extent is unused.
+        self.scan_body_rules(
+            subject,
+            body,
+            content_type,
+            BodyDirection::Response,
+            BodyExtent::Complete,
+            None,
+        )
     }
 
     fn scan_text_set(
@@ -484,30 +1010,91 @@ impl Waf {
         outcome: &mut ScanOutcome,
         body: &[u8],
         subject: ScanSubject<'_>,
+        kind: ReadingKind,
+        readings: &mut JsonReadings,
     ) {
-        if self.compiled.body_json_paths.is_empty() {
+        if self.compiled.body_json_paths.is_empty() || readings.pending == 0 {
+            // Every JSON-path rule has already hit this body: no reading can
+            // change the outcome.
             return;
         }
-        let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        // Duplicate-preserving parse: every occurrence of a repeated member
+        // is inspected, so the verdict holds whichever one the backend reads.
+        // Every document read is inspected, including the ones around a part
+        // that could not be read.
+        let view = json_doc::parse(body, &mut readings.budget);
+        readings.record(&view, kind);
+        let documents = view.documents();
+        if documents.is_empty() {
             return;
-        };
-        for path_rule in &self.compiled.body_json_paths {
-            let Some(value) = json_path_value(&json, &path_rule.path) else {
+        }
+        let rules = self.compiled.body_json_paths.len();
+        for (position, path_rule) in self.compiled.body_json_paths.iter().enumerate() {
+            // One hit per rule is all the outcome records. Stop at it, and skip
+            // a rule an earlier reading already hit, so duplicated members and
+            // many framed messages cannot multiply matching or
+            // hit-deduplication work.
+            if readings.is_hit(position) {
                 continue;
-            };
-            let mut scratch = None;
-            let Some(text) = json_scan_text(value, &mut scratch) else {
-                continue;
-            };
-            self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject);
-            // `text` is already JSON-unescaped; its single-character escapes
-            // are not resolved a second time.
-            for variant in normalize::decoded_json_value_variants(text) {
-                self.push_json_path_hit_if_matched(outcome, path_rule, &variant, text, subject);
+            }
+            let selected = documents
+                .iter()
+                .flat_map(|document| json_doc::select(document, &path_rule.path));
+            'occurrences: for value in selected {
+                for text in json_doc::scan_texts(value) {
+                    let text = text.as_ref();
+                    if self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject) {
+                        readings.mark_hit(position, rules);
+                        break 'occurrences;
+                    }
+                    // `text` is already JSON-unescaped; its single-character
+                    // escapes are not resolved a second time.
+                    for variant in normalize::decoded_json_value_variants(text) {
+                        if self.push_json_path_hit_if_matched(
+                            outcome, path_rule, &variant, text, subject,
+                        ) {
+                            readings.mark_hit(position, rules);
+                            break 'occurrences;
+                        }
+                    }
+                }
             }
         }
     }
 
+    /// A body JSON-path rules could not read (see [`JsonReadings::fail_closed`]).
+    /// Backend parsers accept grammar `serde_json` refuses — a number beyond
+    /// the `f64` range, nesting deeper than 128 levels, `NaN` / `Infinity`,
+    /// comments, a trailing comma, unquoted member names, text after the
+    /// document — so treating such a body as "nothing selected" would let one
+    /// such token switch every JSON-path rule off. No path can be evaluated,
+    /// so every applicable `body_json_path` rule records a hit
+    /// and its own action, scoring, and paranoia band decide, exactly as for a
+    /// match.
+    ///
+    /// A prefix scan (`on_body_too_large: scan_truncated`, or a non-blocking
+    /// configuration's prefix observation) cuts the document short, so its
+    /// view is unparsed by construction and is not judged here.
+    fn push_unparsed_json_hits(
+        &self,
+        outcome: &mut ScanOutcome,
+        subject: ScanSubject<'_>,
+        extent: BodyExtent,
+    ) {
+        if extent == BodyExtent::Prefix {
+            return;
+        }
+        for path_rule in &self.compiled.body_json_paths {
+            if self.rule_applies(subject, path_rule.rule_index) {
+                outcome.push(RuleHit {
+                    rule_index: path_rule.rule_index,
+                    target_name: path_rule.target_name,
+                });
+            }
+        }
+    }
+
+    /// Records the rule's hit when it matches; returns whether it did.
     fn push_json_path_hit_if_matched(
         &self,
         outcome: &mut ScanOutcome,
@@ -515,13 +1102,16 @@ impl Waf {
         match_value: &str,
         fp_filter_target: &str,
         subject: ScanSubject<'_>,
-    ) {
-        if self.json_path_rule_matches(path_rule, match_value, fp_filter_target, subject) {
+    ) -> bool {
+        let matched =
+            self.json_path_rule_matches(path_rule, match_value, fp_filter_target, subject);
+        if matched {
             outcome.push(RuleHit {
                 rule_index: path_rule.rule_index,
                 target_name: path_rule.target_name,
             });
         }
+        matched
     }
 
     fn json_path_rule_matches(
@@ -608,14 +1198,19 @@ impl Waf {
         );
     }
 
+    /// `key_is_decoded` is true for a materialized query map, whose keys are
+    /// already the names the application reads; a raw pair's key is decoded
+    /// once (only when it produced a hit) for the `matched_fields` record.
     fn scan_query_pair(
         &self,
         outcome: &mut ScanOutcome,
         raw_key: &str,
         raw_value: &str,
         name: &str,
+        key_is_decoded: bool,
         subject: ScanSubject<'_>,
     ) {
+        let accepted_before = (outcome.accepted_hits, outcome.accepted_detection_hits);
         // One shared decode: split components are already isolated, then
         // `canonical_query_component_views` percent-decodes `%2f` and produces
         // the bounded layered variants. PATHTRAV/LFI (canonical_query_values)
@@ -650,6 +1245,21 @@ impl Waf {
                 subject,
                 field,
             );
+        }
+        let blocking_hit = outcome.accepted_hits != accepted_before.0;
+        let detection_hit = outcome.accepted_detection_hits != accepted_before.1;
+        if blocking_hit || detection_hit {
+            let label_name = if key_is_decoded {
+                Cow::Borrowed(raw_key)
+            } else {
+                normalize::query_component_name(raw_key)
+            };
+            if blocking_hit {
+                outcome.record_field("query", &label_name, false);
+            }
+            if detection_hit {
+                outcome.record_field("query", &label_name, true);
+            }
         }
     }
 
@@ -746,16 +1356,24 @@ impl Waf {
                 && !rule.suppresses_text(value)
                 && self.field_permits(rule, field)
             {
-                outcome.push(RuleHit {
-                    rule_index,
-                    target_name: rule.target.log_target(),
-                });
+                self.push_hit(
+                    outcome,
+                    RuleHit {
+                        rule_index,
+                        target_name: rule.target.log_target(),
+                    },
+                    field,
+                );
             }
         }
     }
 
     /// URL-side encoding specials. `url` lets a special with query-parameter
-    /// exclusions judge the URL without its excluded pairs.
+    /// exclusions judge the URL without its excluded pairs. As on the body
+    /// side, double-encoding and percent-null markers belong to FE-ENCODING-001
+    /// and overlong UTF-8 only to FE-ENCODING-002, so one marker is scored
+    /// once and each rule's mode, override, or disablement governs its own
+    /// markers.
     fn scan_encoding_specials(
         &self,
         outcome: &mut ScanOutcome,
@@ -763,19 +1381,22 @@ impl Waf {
         subject: ScanSubject<'_>,
         url: Field<'_>,
     ) {
+        // Every encoding special matches `%`-prefixed sequences; skip all three
+        // marker scans and any `url_for_rule` rebuild when `%` is absent.
+        if memchr::memchr(b'%', value.as_bytes()).is_none() {
+            return;
+        }
         if let Some(rule_index) = self.specials.encoding {
             let judged = self.url_for_rule(rule_index, value, url);
-            if decode::has_double_encoded_marker(&judged)
-                || decode::has_percent_null_byte(&judged)
-                || decode::has_overlong_utf8_marker(&judged)
+            if decode::has_double_encoded_marker(&judged) || decode::has_percent_null_byte(&judged)
             {
-                self.push_special(outcome, rule_index, &judged, subject);
+                self.push_special(outcome, rule_index, &judged, subject, url);
             }
         }
         if let Some(rule_index) = self.specials.overlong_utf8 {
             let judged = self.url_for_rule(rule_index, value, url);
             if decode::has_overlong_utf8_marker(&judged) {
-                self.push_special(outcome, rule_index, &judged, subject);
+                self.push_special(outcome, rule_index, &judged, subject, url);
             }
         }
     }
@@ -855,14 +1476,14 @@ impl Waf {
         residual_encoding: bool,
         subject: ScanSubject<'_>,
     ) {
-        let percent_markers_present = text.as_bytes().contains(&b'%');
+        let percent_markers_present = memchr::memchr(b'%', text.as_bytes()).is_some();
         if let Some(rule_index) = self.specials.encoding {
             let flagged = residual_encoding
                 || (percent_markers_present
                     && (decode::has_double_encoded_marker(text)
                         || decode::has_percent_null_byte(text)));
             if flagged {
-                self.push_special(outcome, rule_index, text, subject);
+                self.push_special(outcome, rule_index, text, subject, Field::Whole);
             }
         }
         // The marker helpers all look for `%`-prefixed sequences, so skip their
@@ -871,7 +1492,7 @@ impl Waf {
             && let Some(rule_index) = self.specials.overlong_utf8
             && decode::has_overlong_utf8_marker(text)
         {
-            self.push_special(outcome, rule_index, text, subject);
+            self.push_special(outcome, rule_index, text, subject, Field::Whole);
         }
     }
 
@@ -883,15 +1504,66 @@ impl Waf {
     ) {
         if let Some(rule_index) = self.specials.hpp {
             // An excluded parameter may legitimately repeat (`ids=1&ids=2`),
-            // so its pairs are dropped before duplicates are compared.
-            let judged = match &self.compiled.rules[rule_index].exclusions {
-                Some(exclusions) if !exclusions.query_params.is_empty() => {
-                    Cow::Owned(query_without_excluded_params(raw_query, exclusions))
-                }
-                _ => Cow::Borrowed(raw_query),
+            // so its pairs are dropped before duplicates are compared. Each
+            // separator convention is judged on its own retained pairs, and
+            // false-positive filters see that same text: `&` only, then `&`
+            // plus `;` for backends that also split on `;` (issue #6579). A
+            // conflict that survives suppression under either convention is
+            // enforced.
+            let exclusions = self.compiled.rules[rule_index]
+                .exclusions
+                .as_ref()
+                .filter(|exclusions| !exclusions.query_params.is_empty());
+            let kept = |pair: &&str| {
+                exclusions.is_none_or(|exclusions| {
+                    let raw_key = pair.split_once('=').map_or(*pair, |(key, _)| key);
+                    !exclusions.excludes_query_param(&normalize::query_component_name(raw_key))
+                })
             };
-            if decode::has_conflicting_duplicate_query_key(&judged) {
-                self.push_special(outcome, rule_index, &judged, subject);
+            if decode::has_conflicting_duplicate_among(raw_query.split('&').filter(kept)) {
+                // Filters see exactly the pairs conflict detection judged.
+                let judged = match exclusions {
+                    Some(_) => Cow::Owned(
+                        raw_query
+                            .split('&')
+                            .filter(|pair| !pair.is_empty())
+                            .filter(kept)
+                            .collect::<Vec<_>>()
+                            .join("&"),
+                    ),
+                    None => Cow::Borrowed(raw_query),
+                };
+                if self.special_hit_allowed(rule_index, &judged, subject) {
+                    // Already judged above: record the hit directly rather
+                    // than through `push_special`, which would repeat the
+                    // scope, exemption, and false-positive checks.
+                    let target_name = self.compiled.rules[rule_index].target.log_target();
+                    self.push_hit(
+                        outcome,
+                        RuleHit {
+                            rule_index,
+                            target_name,
+                        },
+                        Field::Whole,
+                    );
+                    return;
+                }
+            }
+            if raw_query.contains(';') {
+                let retained: Vec<&str> = raw_query
+                    .split(['&', ';'])
+                    .filter(|pair| !pair.is_empty())
+                    .filter(kept)
+                    .collect();
+                if decode::has_conflicting_duplicate_among(retained.iter().copied()) {
+                    self.push_special(
+                        outcome,
+                        rule_index,
+                        &retained.join("&"),
+                        subject,
+                        Field::Whole,
+                    );
+                }
             }
         }
     }
@@ -909,7 +1581,7 @@ impl Waf {
                 .iter()
                 .any(|configured| configured.eq_ignore_ascii_case(method))
         {
-            self.push_special(outcome, rule_index, method, subject);
+            self.push_special(outcome, rule_index, method, subject, Field::Whole);
         }
     }
 
@@ -928,26 +1600,59 @@ impl Waf {
                 Field::Header("x-http-method-override"),
             )
         {
-            self.push_special(outcome, rule_index, override_method, subject);
+            self.push_special(
+                outcome,
+                rule_index,
+                override_method,
+                subject,
+                Field::Header("x-http-method-override"),
+            );
         }
     }
 
+    /// Whether a special rule's hit on `value` survives scoping, exemptions,
+    /// and the rule's false-positive filters.
+    fn special_hit_allowed(
+        &self,
+        rule_index: usize,
+        value: &str,
+        subject: ScanSubject<'_>,
+    ) -> bool {
+        let rule = &self.compiled.rules[rule_index];
+        self.rule_applies(subject, rule_index)
+            && !self.exemptions.suppresses_value(value)
+            && !rule.suppresses_text(value)
+    }
+
+    /// Accept one hit and record the field it came from, classified by
+    /// whether the rule is detection-only.
+    fn push_hit(&self, outcome: &mut ScanOutcome, hit: RuleHit, field: Field<'_>) {
+        let detection_only = self.compiled.rules[hit.rule_index].detection_only;
+        outcome.push_classified(hit, detection_only);
+        outcome.record_field_of(field, detection_only);
+    }
+
+    /// `field` names the request field a special judged, when it judged one
+    /// (`x-http-method-override`); URL, body, and method specials pass
+    /// `Field::Whole` / `Field::Url`, which carry no field name.
     fn push_special(
         &self,
         outcome: &mut ScanOutcome,
         rule_index: usize,
         value: &str,
         subject: ScanSubject<'_>,
+        field: Field<'_>,
     ) {
         let rule = &self.compiled.rules[rule_index];
-        if self.rule_applies(subject, rule_index)
-            && !self.exemptions.suppresses_value(value)
-            && !rule.suppresses_text(value)
-        {
-            outcome.push(RuleHit {
-                rule_index,
-                target_name: rule.target.log_target(),
-            });
+        if self.special_hit_allowed(rule_index, value, subject) {
+            self.push_hit(
+                outcome,
+                RuleHit {
+                    rule_index,
+                    target_name: rule.target.log_target(),
+                },
+                field,
+            );
         }
     }
 
@@ -970,10 +1675,14 @@ impl Waf {
             && !rule.suppresses_text(value)
             && self.field_permits(rule, field)
         {
-            outcome.push(RuleHit {
-                rule_index: rule_ref.rule_index,
-                target_name: rule_ref.target_name,
-            });
+            self.push_hit(
+                outcome,
+                RuleHit {
+                    rule_index: rule_ref.rule_index,
+                    target_name: rule_ref.target_name,
+                },
+                field,
+            );
         }
     }
 }
@@ -985,19 +1694,38 @@ fn cookie_name(crumb: &str) -> &str {
 
 /// `raw_query` without the pairs whose decoded name is excluded.
 fn query_without_excluded_params(raw_query: &str, exclusions: &FieldExclusions) -> String {
+    let excluded = |pair: &str| {
+        let raw_key = pair.split_once('=').map_or(pair, |(key, _)| key);
+        exclusions.excludes_query_param(&normalize::query_component_name(raw_key))
+    };
     let mut kept = String::with_capacity(raw_query.len());
     for pair in raw_query.split('&') {
         if pair.is_empty() {
             continue;
         }
-        let raw_key = pair.split_once('=').map_or(pair, |(key, _)| key);
-        if exclusions.excludes_query_param(&normalize::query_component_name(raw_key)) {
+        // An excluded `&` pair may still carry non-excluded `;` sub-pairs that
+        // a `;`-splitting backend reads as parameters of their own (issue
+        // #6579); keep those so whole-URL rules still see them.
+        // A non-excluded pair is kept whole: under the `&` reading its value
+        // runs to the next `&`, `;` sub-pairs included.
+        let retained: Cow<'_, str> = if !excluded(pair) {
+            Cow::Borrowed(pair)
+        } else if pair.contains(';') {
+            let subs: Vec<&str> = pair
+                .split(';')
+                .filter(|sub| !sub.is_empty() && !excluded(sub))
+                .collect();
+            if subs.is_empty() {
+                continue;
+            }
+            Cow::Owned(subs.join(";"))
+        } else {
             continue;
-        }
+        };
         if !kept.is_empty() {
             kept.push('&');
         }
-        kept.push_str(pair);
+        kept.push_str(&retained);
     }
     kept
 }
@@ -1041,43 +1769,6 @@ fn header_value_target_matches(target: &RuleTarget, header_name: &str) -> bool {
     }
 }
 
-fn json_path_value<'a>(
-    value: &'a serde_json::Value,
-    path: &[JsonPathSegment],
-) -> Option<&'a serde_json::Value> {
-    let mut current = value;
-    for segment in path {
-        match segment {
-            JsonPathSegment::Key(key) => {
-                current = current.get(key)?;
-            }
-            JsonPathSegment::Index(index) => {
-                current = current.get(*index)?;
-            }
-        }
-    }
-    Some(current)
-}
-
-fn json_scan_text<'a>(
-    value: &'a serde_json::Value,
-    scratch: &'a mut Option<String>,
-) -> Option<&'a str> {
-    match value {
-        serde_json::Value::String(value) => Some(value.as_str()),
-        serde_json::Value::Number(value) => {
-            *scratch = Some(value.to_string());
-            scratch.as_deref()
-        }
-        serde_json::Value::Bool(value) => Some(if *value { "true" } else { "false" }),
-        serde_json::Value::Null => Some("null"),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            *scratch = Some(value.to_string());
-            scratch.as_deref()
-        }
-    }
-}
-
 const MAX_LUHN_DIGIT_RUN_SCAN: usize = 4096;
 
 fn contains_luhn_candidate(value: &str) -> bool {
@@ -1096,41 +1787,47 @@ fn contains_luhn_candidate(value: &str) -> bool {
     //   window and again at the run's terminating boundary we check every
     //   valid card length (13..=19) anchored at the window's start and
     //   end, catching cards padded on either side.
-    let mut digits: Vec<u8> = Vec::with_capacity(19);
+    let mut digits = [0u8; 20];
+    let mut digits_len = 0usize;
     let mut overflowed_run = false;
     let mut run_digits_seen = 0usize;
     let mut run_scan_suppressed = false;
-    for ch in value.chars() {
-        if ch.is_ascii_digit() {
+    // ASCII digits and separators (` `, `-`, `.`) are all single bytes < 0x80,
+    // which never collide with UTF-8 multi-byte sequences; iterating bytes avoids
+    // UTF-8 decoding and the stack `[u8; 20]` eliminates a heap `Vec` per field.
+    for &byte in value.as_bytes() {
+        if byte.is_ascii_digit() {
             run_digits_seen += 1;
             if run_digits_seen > MAX_LUHN_DIGIT_RUN_SCAN {
-                if !run_scan_suppressed && check_run(&digits, overflowed_run) {
+                if !run_scan_suppressed && check_run(&digits[..digits_len], overflowed_run) {
                     return true;
                 }
                 run_scan_suppressed = true;
                 continue;
             }
-            digits.push(ch as u8 - b'0');
-            if digits.len() > 19 {
+            digits[digits_len] = byte - b'0';
+            digits_len += 1;
+            if digits_len > 19 {
                 if check_card_substrings(&digits[..19]) {
                     return true;
                 }
-                digits.remove(0);
+                digits.copy_within(1..20, 0);
+                digits_len = 19;
                 overflowed_run = true;
             }
-        } else if matches!(ch, ' ' | '-' | '.') {
+        } else if matches!(byte, b' ' | b'-' | b'.') {
             continue;
         } else {
-            if !run_scan_suppressed && check_run(&digits, overflowed_run) {
+            if !run_scan_suppressed && check_run(&digits[..digits_len], overflowed_run) {
                 return true;
             }
-            digits.clear();
+            digits_len = 0;
             overflowed_run = false;
             run_digits_seen = 0;
             run_scan_suppressed = false;
         }
     }
-    !run_scan_suppressed && check_run(&digits, overflowed_run)
+    !run_scan_suppressed && check_run(&digits[..digits_len], overflowed_run)
 }
 
 fn check_run(digits: &[u8], overflowed: bool) -> bool {

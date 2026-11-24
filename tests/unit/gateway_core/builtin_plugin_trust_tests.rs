@@ -645,7 +645,7 @@ fn custom_plugins_reporting_finalized_built_in_names_get_no_finalizer() {
 /// the registered type's built-in standing or decides nothing. A new lookup
 /// must go through `is_builtin_named` (or pair the name with standing the same
 /// way) and be listed here.
-const REPORTED_NAME_USES: [(&str, usize); 6] = [
+const REPORTED_NAME_USES: [(&str, usize); 7] = [
     // `is_builtin_named` itself.
     (
         "plugin.name() == name && crate::plugins::is_builtin_plugin(plugin.as_ref())",
@@ -671,6 +671,10 @@ const REPORTED_NAME_USES: [(&str, usize); 6] = [
         "presentation_policy_contributions.push((p.name(), digest));",
         1,
     ),
+    // `plugin_chain_order` breaks equal-priority ties by the reported name
+    // (issue #6614). It only orders the chain; it grants no built-in standing
+    // and keys no lookup.
+    (".then_with(|| left.name().cmp(right.name()))", 2),
 ];
 
 /// The byte offset of every `.name()` call in `source` outside comments and

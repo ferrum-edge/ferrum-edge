@@ -42,12 +42,7 @@ When both a `_PATH` and `_SOURCE` variable are set, `_SOURCE` wins and the start
 
 ### Custom CA Bundles
 
-The `FERRUM_TLS_CA_BUNDLE_PATH` allows you to specify custom Certificate Authority (CA) bundles for backend TLS verification. This is useful for:
-
-- **Enterprise Environments**: When backend services use certificates from private CAs
-- **Development**: Using self-signed certificates in testing environments
-- **Security**: Fine-grained control over trusted CAs beyond system defaults
-- **Compliance**: Meeting regulatory requirements for certificate validation
+The `FERRUM_TLS_CA_BUNDLE_PATH` allows you to specify custom Certificate Authority (CA) bundles for backend TLS verification.
 
 **How it works:**
 - The CA bundle is loaded when a connection pool entry is first created for a proxy
@@ -58,7 +53,7 @@ The `FERRUM_TLS_CA_BUNDLE_PATH` allows you to specify custom Certificate Authori
 
 The gateway resolves backend CA trust in the following order:
 
-1. **Explicit system roots** (`backend_tls_server_ca_cert_path: "system://"`) — verify with **only** the bundled webpki/system trust anchors. This is a *pin*, not an absence: steps 2 and 4 are skipped entirely (see below).
+1. **Explicit system roots** (`backend_tls_server_ca_cert_path: "system://"`) — verify with **only** the bundled webpki/system trust anchors. This is a *pin*, not an absence: step 3 (the global CA bundle) and the global `FERRUM_TLS_NO_VERIFY` opt-out in step 5 never apply (see below).
 2. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — verify with **only** that CA. Webpki/system roots are excluded to prevent public CAs from being trusted alongside your internal CA.
 3. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH` / `FERRUM_TLS_CA_BUNDLE_SOURCE`) — verify with **only** the global CA. Same exclusivity as proxy-specific.
 4. **Neither set** — verify with **bundled webpki roots** (secure default). The gateway does **not** skip verification when no CA is configured.
@@ -83,7 +78,8 @@ field unset in three ways that matter:
 It must be spelled exactly `system://`, with no path or query options, and is
 only valid on a CA-bundle field — `system://corp-ca.pem` and `system://` on a
 client cert/key field are both rejected at config load. It is what Gateway API
-`BackendTLSPolicy` `wellKnownCACertificates: System` translates to.
+`BackendTLSPolicy` `wellKnownCACertificates: System` translates to. For Gateway API
+conformance status, see [gateway_api_conformance.md](gateway_api_conformance.md).
 
 Ferrum supports exactly one `BackendTLSPolicy.spec.targetRefs` entry, following
 the Gateway API v1.5.1 recommendation while multi-target conflict/status
@@ -152,12 +148,13 @@ traffic, and both are fail-closed on explicitly configured material:
 * A backend TLS **server-name override** (`backend_tls_sni`, which
   `BackendTLSPolicy` `validation.hostname` and a DestinationRule
   `trafficPolicy.tls.sni` both project onto) is enforced by direct HTTP/2,
-  gRPC over H2, native H3, reqwest HTTP/1.1, and terminating `tcp`/`tcp_tls`
-  stream paths that originate backend TLS. It sets both ClientHello SNI and
+  gRPC over H2, native H3, reqwest HTTP/1.1, and `tcps` stream paths that
+  originate backend TLS. It sets both ClientHello SNI and
   the certificate verification name while the selected target controls the
   socket destination. The override partitions HTTP-family backend pools;
-  stream proxies do not pool connections. It is applied by **HTTP and gRPC
-  probes** as well. A backend whose certificate is valid only for the override
+  stream proxies do not pool connections. See
+  [Server-name override (SNI) transport](#server-name-override-sni-transport)
+  for the HTTP/1.1 dial. It is applied by **HTTP and gRPC probes** as well. A backend whose certificate is valid only for the override
   name would otherwise serve requests successfully while every probe failed name
   verification against the target host and ejected it. The probe still dials
   only the already-resolved, egress-screened target candidate, and the backend
@@ -192,7 +189,7 @@ when verification is disabled.
 > The proxy backend path (HTTP/1.1, H2, HTTP/3, gRPC, WebSocket, TCP/TLS) builds its trust store in-house from `webpki-roots`'s `TLS_SERVER_ROOTS` and hands the resulting `rustls::ClientConfig` to reqwest via `use_preconfigured_tls(...)`. That means the "no custom CA" fallback always uses bundled webpki on every platform — Linux, macOS, and Windows — regardless of OS keychain contents. Only the `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE` or per-proxy CA paths can change which roots the gateway trusts for backend traffic.
 
 > **Trust roots — internal helper clients.**
-> A few internal-helper reqwest clients (plugin outbound HTTP via `PluginHttpClient`, the `spec_expose` plugin, and skip-verify health-check probes) do not preconfigure TLS the way the proxy backend path does. Those clients use `rustls-platform-verifier`, which resolves trust roots from the **OS keychain on macOS/Windows** and from the host CA bundle on Linux (`rustls-native-certs`, typically `/etc/ssl/certs` via `ca-certificates`). Linux does **not** fall through to bundled webpki when that host bundle is missing or empty: verifier construction fails instead. `PluginHttpClient` then constructs a fail-closed client — native/built-in roots disabled, empty trust store, certificate verification still enabled — so the gateway stays up and plugin HTTPS calls fail at handshake rather than aborting the process. If even that bounded empty-trust construction fails, the shared client stays inert and outbound plugin HTTP fails closed without hanging, panicking, or restoring ambient proxy, redirects, or an unapproved crypto provider. Ambient proxy environment and redirect following stay disabled on that fallback. When the gateway DNS resolver is present, every fallback retains it so hostname resolution cannot bypass `FERRUM_BACKEND_ALLOW_IPS`; the HTTP/2 companion likewise retains prior-knowledge mode instead of downgrading h2c. Operators running the gateway locally on macOS/Windows will see helper-client TLS verified against their OS keychain unless a `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE` or per-plugin CA is configured (in which case the custom CA replaces the trust store wholesale, per the exclusivity rule above). Production images should still ship CA certificates so ordinary plugin HTTPS can authenticate public peers.
+> A few internal-helper reqwest clients (plugin outbound HTTP via `PluginHttpClient` and the plugins with their own client such as `spec_expose`, when no gateway CRL is enforced, and skip-verify health-check probes) do not preconfigure TLS the way the proxy backend path does. When `FERRUM_TLS_CRL_FILE_PATH` is configured and verification is on, `PluginHttpClient` and those plugin-owned clients instead preconfigure rustls with the shared CRL verifier over `FERRUM_TLS_CA_BUNDLE_PATH` exclusively or, without it, the bundled webpki roots: an OS-installed private CA is then **not** trusted for plugin egress, so configure it in `FERRUM_TLS_CA_BUNDLE_PATH`. Those clients use `rustls-platform-verifier`, which resolves trust roots from the **OS keychain on macOS/Windows** and from the host CA bundle on Linux (`rustls-native-certs`, typically `/etc/ssl/certs` via `ca-certificates`). Linux does **not** fall through to bundled webpki when that host bundle is missing or empty: verifier construction fails instead. `PluginHttpClient` then constructs a fail-closed client — native/built-in roots disabled, empty trust store, certificate verification still enabled — so the gateway stays up and plugin HTTPS calls fail at handshake rather than aborting the process. If even that bounded empty-trust construction fails, the shared client stays inert and outbound plugin HTTP fails closed without hanging, panicking, or restoring ambient proxy, redirects, or an unapproved crypto provider. Ambient proxy environment and redirect following stay disabled on that fallback. When the gateway DNS resolver is present, every fallback retains it so hostname resolution cannot bypass `FERRUM_BACKEND_ALLOW_IPS`; the HTTP/2 companion likewise retains prior-knowledge mode instead of downgrading h2c. Operators running the gateway locally on macOS/Windows will see helper-client TLS verified against their OS keychain unless a `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE` or per-plugin CA is configured (in which case the custom CA replaces the trust store wholesale, per the exclusivity rule above). Production images should still ship CA certificates so ordinary plugin HTTPS can authenticate public peers.
 >
 > Verified HTTPS and gRPC health-check probes are not in that helper-client group: they preconfigure rustls with the same server verifier and shared CRL snapshot as proxy backend traffic.
 
@@ -283,21 +280,26 @@ export FERRUM_BACKEND_TLS_CLIENT_CERT_PATH="/etc/ssl/certs/default-client.pem"
 export FERRUM_BACKEND_TLS_CLIENT_KEY_PATH="/etc/ssl/private/default-client-key.pem"
 
 # Configure specific proxy with different certificates
+# A complete file-mode config: `version` and `plugin_configs` are required
 cat > config.yaml << EOF
+version: "1"
 proxies:
   - id: "public-api"
     listen_path: "/public"
+    backend_scheme: "https"
     backend_host: "public-api.example.com"
     backend_port: 443
     # Uses global mTLS settings
-    
-  - id: "secure-api"  
+
+  - id: "secure-api"
     listen_path: "/secure"
+    backend_scheme: "https"
     backend_host: "secure-api.example.com"
     backend_port: 443
     # Override with specific certificates
     backend_tls_client_cert_path: "/etc/ssl/certs/secure-client.pem"
     backend_tls_client_key_path: "/etc/ssl/private/secure-client-key.pem"
+plugin_configs: []
 EOF
 
 ./ferrum-edge run --mode file --spec config.yaml
@@ -409,6 +411,16 @@ outbound:
   `nextUpdate`, new backend connections that would be policed by it fail. In-flight
   requests on already-established connections are unaffected; the refusal applies
   to new handshakes. Refresh the CRL ahead of its own `nextUpdate`.
+- **CRL-enforcing outbound clients do full handshakes on reconnect.** TLS 1.2
+  session IDs/tickets and TLS 1.3 PSK resumption bypass certificate
+  reverification, so resumption is disabled for every cached rustls client
+  config with a nonempty CRL set: backend data paths, verified HTTPS/gRPC
+  probes, the `tcp_logging` and `ws_logging` sinks, `ldap_auth`, SMTP
+  notifications, and mesh SPIFFE outbound configs. This also adds
+  full-handshake latency and cryptographic work for uncovered issuers sharing
+  those configs; their chains remain accepted. Connection reuse and established
+  in-flight traffic are unaffected. Empty-CRL and skip-verify configs keep
+  resumption. DTLS clients (`udp_logging`, backend DTLS) never resume sessions.
 - **A candidate CRL outside its validity window is refused whole.** Startup
   fails; a live reload keeps the previously accepted CRL slot, backend pools, and
   health checks exactly as they were, and logs a redacted warning.
@@ -440,7 +452,10 @@ outbound:
 - The same policy covers the rustls logging sinks (`tcp_logging` TLS,
   `ws_logging` wss, `udp_logging` DTLS) and `ldap_auth` over `ldaps://` /
   StartTLS. `kafka_logging` maps the source to librdkafka's `ssl.crl.location`
-  instead, and reqwest-based plugin egress does not apply CRLs at all.
+  instead. Plugin HTTP egress (JWKS, OIDC, introspection, webhooks, HTTP
+  logging sinks) applies the same policy through a preconfigured rustls
+  verifier that follows the live backend CRL generation; see
+  [CRL Policy](frontend_tls.md#surfaces-crls-do-not-reach).
 
 ### Operational Contract for Backend TLS Sources
 
@@ -457,6 +472,7 @@ This matters in Kubernetes and similar environments:
 - Persistent source failures continue incrementing attempt/failure counters on every poll, but the bounded TLS event ring records transitions only: first fixed failure class, changed class, recovery, and later regression. Event source identities are digests and contain no source URI, credentials, or provider response.
 - The backend watcher recollects sources from the current gateway config on each pass. After a file-mode SIGHUP reload, database poll, or CP/DP config push adds or replaces backend TLS source URIs, those new sources are watched without restarting Ferrum.
 - Watched backend TLS sources include global backend mTLS env vars, per-proxy settings, per-upstream settings, and direct-backend `mesh_route_dispatch.rules[].destination.backend_tls` overrides.
+- The backend watcher polls its current source set at the shortest selected interval: file sources default to `FERRUM_BACKEND_TLS_WATCH_INTERVAL_SECONDS` (30 seconds, clamped to 1–3600), and provider sources to `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`. A URI `?poll=` overrides that source's default, including `file://`; mixed sources are polled together at the shortest interval.
 - If you disable backend TLS live reload, treat in-place backend certificate rotation as requiring a **rolling redeploy / rolling restart** of Ferrum pods.
 
 Recommended practice:
@@ -482,7 +498,7 @@ variables.
 - **Fail-fast on bad certificates**: All backend TLS certificate sources — both global env vars (`FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` / `_SOURCE`, `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` / `_SOURCE`, `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE`, `FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE`) and per-proxy fields (`backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) — are validated at startup and config load time when they are file-backed, inline PEM, provider-backed (`vault://`, `aws://`, `azure://`, `gcp://`), Kubernetes Secret-backed (`k8s://namespace/secret#key`), admin-managed (`managed://certificates/id#cert`, `managed://certificates/id#key`, `managed://ca-bundles/id`, `managed://crls/id`), or PKCS#11-backed (`pkcs11://label?...`) for client keys. Provider URI sources require the matching secret-provider Cargo feature and use the same credentials/configuration as the existing `_VAULT`, `_AWS`, `_AZURE`, and `_GCP` env-var suffixes. Kubernetes sources use the default `kube` client environment. Managed sources are stored under `FERRUM_TLS_MANAGED_STORE_PATH`. PKCS#11 key sources require the `pkcs11` Cargo feature and a token RSA key matching the configured selector, and that key must also be proven to pair with the configured client certificate before the backend client identity is published; see [pkcs11_tls.md](pkcs11_tls.md). If any configured source is missing, unreadable, unsupported by the current build, unreachable, or contains invalid/corrupt material, the gateway **refuses to start** or rejects the config reload. There is no silent fallback to unauthenticated connections or to webpki-only verification when a configured CA source fails to load. Cert and key sources must always be configured as a pair; setting one without the other is a validation error. CA and CRL sources are independent — you can set just a CA to verify a server without presenting client identity.
 - **TLS source deduplication**: When multiple proxies share the same cert/key/CA/CRL source values, each unique source is parsed only once during validation. This avoids redundant disk I/O and PEM parsing at config load time.
 - **Pool-per-cert-source**: Each unique combination of `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path` produces a **separate connection pool entry** per protocol. Inline PEM values are represented by a SHA-256 source component instead of the raw PEM; PKCS#11 values use the URI selector as the non-secret pool key component:
-  - **HTTP/1.1 + H2** (`ConnectionPool`): separate `reqwest::Client` instances keyed by `host:port:protocol:dns_override:ca_path`
+  - **HTTP/1.1 + H2** (`ConnectionPool`): separate `reqwest::Client` instances keyed by destination, protocol, DNS override, subset, CA, client cert/key, SNI, SAN allow-list digest, verify flag, SVID generation, and client-behavior (`rcfg=`) settings
   - **HTTP/3** (`Http3ConnectionPool`): separate `rustls::ClientConfig` + QUIC endpoints per proxy
   - **gRPC** (`GrpcConnectionPool`): separate `rustls::ClientConfig` + H2 senders per target
   - **HTTP/2 direct** (`Http2ConnectionPool`): separate `rustls::ClientConfig` + H2 senders per target
@@ -502,6 +518,63 @@ variables.
 - If certificate source loading or parsing fails at request time (e.g., file deleted after startup), the request fails with an error. This behavior is consistent across all backend protocols (HTTP/1.1, H2, and HTTP/3). The gateway continues running and serves other proxies normally.
 - Connection reuse respects the original mTLS configuration
 
+### Server-name override (SNI) transport
+
+Plain HTTPS requests with a `backend_tls_sni` override prefer the direct HTTP/2
+pool, which sets the TLS server name natively. When that pool is unavailable or
+the backend speaks only HTTP/1.1, the request uses a reqwest HTTP/1.1 dial.
+reqwest exposes no per-request server-name hook — its connector derives the
+rustls server name from the request URL's host — so this dial puts the override
+in the URL **authority** while the pooled client's `DnsCacheResolver` is pinned
+to the load-balancer-selected target's already-resolved, already-egress-screened
+address. The resolver answers every name with the pinned address, so the
+override hostname is never itself resolved. `backend_tls_sni` is validated to be
+a DNS hostname and never an IP literal, so it cannot become a URL-literal dial
+that bypasses the resolver.
+
+* **ALPN is restricted to `http/1.1`** on that client. HTTP/2 derives
+  `:authority` from the URL, which carries the server name, so the backend
+  instead reads its authority from the explicit `Host` header dispatch sets from
+  the effective target host. H2-capable targets keep using the direct-H2 pool.
+* **Pool identity** carries the pinned address and a force-H1 discriminator
+  alongside the SNI / CA / SAN-digest / mTLS / verification components, so an
+  SNI dial shares a client neither with a default h2-capable client nor with
+  another target's pin. An SNI-override route therefore partitions its reqwest
+  client per target (up to one per endpoint) and gives up in-client
+  multi-address failover for that dial.
+* **Retries, timeouts, and streaming bodies** behave as on any other reqwest
+  dial. A retry builds the same dial against the newly selected target under the
+  same server name.
+* **HTTP/3 frontend requests** bridged to a non-H3 backend use the same H1 SNI
+  dial on both the buffered and streaming legs. The bridge keeps the real target
+  for circuit-breaker, load-balancer, and `backend_target` accounting, and
+  resolves the dial as a local dispatch-policy decision before backend
+  admission, the least-connections connection-start record, and any client
+  fetch.
+* Nonzero global body-size limits (`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` /
+  `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, including the default 10 MiB response
+  cap) do **not** disqualify direct-H2: that path enforces them in-path (413 on
+  oversized requests, 502 on oversized responses) with the same `ErrorClass` /
+  `connection_error` contracts as the reqwest path.
+
+`ferrum-edge validate` and the Admin API admit proxy-level and DestinationRule /
+`BackendTLSPolicy` per-port SNI overrides combined with effective retry,
+request-body-buffering plugins, `pool_enable_http2: false`, or all three,
+because the H1 dial serves them (issue #3276). What stays fail-closed is decided
+at runtime:
+
+* On every dispatch path (HTTP/1.1 and HTTP/2 frontends, the retry path, and the
+  HTTP/3 bridge), a dial that cannot be constructed — no resolved target address
+  to pin, or a backend URL whose authority does not carry the selected target
+  host — answers `502` with
+  `gateway-error-reason: backend_tls_sni_requires_direct_h2`, so the override is
+  never silently dropped and the handshake is never made under the wrong server
+  name.
+* On the HTTP/3 bridge that decision is made before backend admission, so the
+  `502` is sent without dialing the backend or relaying a request body.
+* A `wss://` WebSocket upgrade with an override is refused before dialing, as
+  described under [Connection Pool Behavior](#connection-pool-behavior).
+
 ## Testing with Self-Signed Certificates
 
 ### No-Verify Mode (Testing Only)
@@ -513,11 +586,6 @@ export FERRUM_TLS_NO_VERIFY="true"
 ```
 
 **⚠️ Security Warning**: No-verify mode disables ALL certificate verification and should NEVER be used in production environments.
-
-**Use Cases:**
-- **Development**: Testing with self-signed backend certificates
-- **Staging**: Temporary environments with invalid certificates
-- **Internal Networks**: Isolated environments where verification is not needed
 
 **Gateway Behavior:**
 - Logs a startup warning: `WARNING: FERRUM_TLS_NO_VERIFY=true — outbound TLS certificate verification is DISABLED. Do not use in production.`
@@ -540,12 +608,3 @@ openssl x509 -req -days 365 -in client.csr -signkey client-key.pem -out client-c
 # Clean up CSR
 rm client.csr
 ```
-
-## Performance Impact
-
-- **Certificate Loading**: One-time cost per client creation
-- **Connection Pooling**: Minimal impact after initial setup
-- **TLS Handshake**: Slightly increased due to client certificate verification
-- **Memory**: Small increase due to certificate storage in connection pool
-
-Overall performance impact is minimal when connection pooling is enabled.

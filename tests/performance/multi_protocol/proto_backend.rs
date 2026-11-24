@@ -82,6 +82,16 @@ struct BackendStats {
     http_echo_requests: AtomicU64,
     /// `UnaryEcho` calls on both gRPC listeners.
     grpc_echo_requests: AtomicU64,
+    /// `ServerStream` calls on both gRPC listeners, stalled probes included.
+    grpc_stream_requests: AtomicU64,
+    /// gRPC calls (either method) that arrived carrying `grpc-timeout`: the
+    /// #6904 A/B proves its deadline cells exercised the deadline path.
+    grpc_deadline_requests: AtomicU64,
+    /// Stalled `ServerStream` probes (`x-bench-stall`) opened, and those whose
+    /// response stream the peer has since released. Equal counts after a
+    /// probe mean the gateway freed every backend stream it held.
+    grpc_stalled_started: AtomicU64,
+    grpc_stalled_released: AtomicU64,
 }
 
 static STATS: BackendStats = BackendStats {
@@ -90,6 +100,10 @@ static STATS: BackendStats = BackendStats {
     grpcs_accepted: AtomicU64::new(0),
     http_echo_requests: AtomicU64::new(0),
     grpc_echo_requests: AtomicU64::new(0),
+    grpc_stream_requests: AtomicU64::new(0),
+    grpc_deadline_requests: AtomicU64::new(0),
+    grpc_stalled_started: AtomicU64::new(0),
+    grpc_stalled_released: AtomicU64::new(0),
 };
 
 fn stats_json() -> Bytes {
@@ -100,9 +114,21 @@ fn stats_json() -> Bytes {
             "grpcs_accepted": STATS.grpcs_accepted.load(Ordering::Relaxed),
             "http_echo_requests": STATS.http_echo_requests.load(Ordering::Relaxed),
             "grpc_echo_requests": STATS.grpc_echo_requests.load(Ordering::Relaxed),
+            "grpc_stream_requests": STATS.grpc_stream_requests.load(Ordering::Relaxed),
+            "grpc_deadline_requests": STATS.grpc_deadline_requests.load(Ordering::Relaxed),
+            "grpc_stalled_started": STATS.grpc_stalled_started.load(Ordering::Relaxed),
+            "grpc_stalled_released": STATS.grpc_stalled_released.load(Ordering::Relaxed),
         })
         .to_string(),
     )
+}
+
+/// Count a gRPC call whose request carried `grpc-timeout` (tonic's server
+/// keeps the header in the request metadata).
+fn count_grpc_deadline<T>(request: &tonic::Request<T>) {
+    if request.metadata().contains_key("grpc-timeout") {
+        STATS.grpc_deadline_requests.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -115,6 +141,7 @@ impl BenchService for BenchServiceImpl {
         request: tonic::Request<EchoRequest>,
     ) -> Result<tonic::Response<EchoResponse>, tonic::Status> {
         STATS.grpc_echo_requests.fetch_add(1, Ordering::Relaxed);
+        count_grpc_deadline(&request);
         let payload = request.into_inner().payload;
         let timestamp_us = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -133,8 +160,24 @@ impl BenchService for BenchServiceImpl {
         &self,
         request: tonic::Request<EchoRequest>,
     ) -> Result<tonic::Response<Self::ServerStreamStream>, tonic::Status> {
+        STATS.grpc_stream_requests.fetch_add(1, Ordering::Relaxed);
+        count_grpc_deadline(&request);
+        let stall = request.metadata().contains_key("x-bench-stall");
         let payload = request.into_inner().payload;
         let (tx, rx) = tokio::sync::mpsc::channel(10);
+        if stall {
+            // Headers only, then hold the stream until the peer drops it. Tonic
+            // does not bound a response stream by `grpc-timeout`, so only the
+            // gateway's deadline can end this call (#6904).
+            STATS.grpc_stalled_started.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(async move {
+                tx.closed().await;
+                STATS.grpc_stalled_released.fetch_add(1, Ordering::Relaxed);
+            });
+            return Ok(tonic::Response::new(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ));
+        }
         tokio::spawn(async move {
             for i in 0..10 {
                 let ts = SystemTime::now()

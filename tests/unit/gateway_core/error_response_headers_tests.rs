@@ -4,8 +4,10 @@
 use std::collections::HashMap;
 
 use ferrum_edge::_test_support::{
-    PROTOCOL_LEVEL_405_ALLOW_FOR_TEST, allow_header_from_allowed_methods_for_test,
-    apply_authoritative_backend_gateway_error_header_for_test, request_method_is_allowed_for_test,
+    PROTOCOL_LEVEL_405_ALLOW_FOR_TEST, admin_builder_failure_response_for_test,
+    allow_header_from_allowed_methods_for_test,
+    apply_authoritative_backend_gateway_error_header_for_test,
+    internal_error_fallback_response_for_test, request_method_is_allowed_for_test,
     x_gateway_error_for_backend_failure_for_test,
 };
 
@@ -41,6 +43,51 @@ fn x_gateway_error_maps_connect_timeout_and_backend_5xx() {
         x_gateway_error_for_backend_failure_for_test(false, 404),
         None
     );
+    // #6770 / #6771: a connect timeout (504) and a pre-dial maxConnections
+    // refusal (503) are still pre-wire connection failures for the header.
+    assert_eq!(
+        x_gateway_error_for_backend_failure_for_test(true, 504),
+        Some("connection_failure")
+    );
+    assert_eq!(
+        x_gateway_error_for_backend_failure_for_test(true, 503),
+        Some("connection_failure")
+    );
+}
+
+#[test]
+fn response_builder_fallback_is_500_not_default_200() {
+    // #6775: `Response::new` defaults to 200 OK, so every builder-failure
+    // fallback must set 500 explicitly and keep a fixed, safe body.
+    for (body, content_type) in [
+        (r#"{"error":"Internal server error"}"#, "application/json"),
+        ("Internal server error", "text/plain"),
+    ] {
+        let response = internal_error_fallback_response_for_test(body);
+        assert_eq!(response.status(), hyper::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response
+                .headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(content_type)
+        );
+    }
+}
+
+#[test]
+fn no_proxy_response_fallback_defaults_to_200() {
+    // Guard the pattern itself: a bare `Response::new(ProxyBody::from_string(..))`
+    // in the proxy core must set its status before it can be returned.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    for (index, _) in proxy.match_indices("Response::new(ProxyBody::from_string(") {
+        let window = &proxy[index..proxy.len().min(index + 400)];
+        assert!(
+            window.contains(".status_mut()"),
+            "Response::new fallback without an explicit status near: {}",
+            &proxy[index..proxy.len().min(index + 120)]
+        );
+    }
 }
 
 #[test]
@@ -333,12 +380,57 @@ fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
     let token = writer
         .find(token_writer)
         .expect("the writer applies the gateway token itself");
+    // The committed observers see the client response as written, token
+    // included (read-only), and settle request state such as the
+    // `request_deduplication` in-flight lease before the wire write.
+    let committed = writer
+        .find("run_cross_protocol_reject_committed_hooks_with(")
+        .expect("the writer runs the response_committed observers");
     let write = writer
-        .find("write_plain_gateway_reject(")
-        .expect("the writer writes through the gateway reject writer");
+        .find("write_normalized_plain_gateway_reject(")
+        .expect("the writer writes through the normalized gateway reject writer");
     assert!(
-        hooks < token && token < write,
-        "the token must be written after the hooks and before the wire write"
+        hooks < token && token < committed && committed < write,
+        "the token must be written after the hooks, and the committed observers \
+         must run over that terminal before the wire write"
+    );
+    // The observers race the RPC / authorization deadline (not charged) and
+    // may never replace the gateway terminal (`replace_on_deadline: false`).
+    let writer_compact: String = writer.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(
+        writer_compact.contains(
+            "run_cross_protocol_reject_committed_hooks_with(plugins,ctx,false,false,false,"
+        ),
+        "the gateway terminal's observers must race the deadline without replacing it"
+    );
+    // The pooled-client failure terminal is written inside the caller's
+    // deadline race, so it runs no observers.
+    let pool_body =
+        "Bytes::from_static(crate::proxy::CONNECTION_POOL_CLIENT_ERROR_BODY.as_bytes()),";
+    let pool_start = cross
+        .find(pool_body)
+        .expect("the pooled-client failure terminal body");
+    let pool_call: String = cross[pool_start..]
+        .split(".await?;")
+        .next()
+        .expect("the pooled-client failure terminal call")
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    assert!(
+        pool_call.contains("),true,false,backend_start,0,"),
+        "the raced pooled-client failure terminal must not run committed observers"
+    );
+    // A deadline that passed while an observer was pending leaves the gateway
+    // terminal to the bounded post-deadline write, never the unbounded one.
+    let bounded_after_observers = writer[committed..]
+        .find("return write_normalized_plain_gateway_reject_after_deadline(")
+        .map(|idx| committed + idx)
+        .expect("a deadline that passed during the observers is detected");
+    assert!(
+        bounded_after_observers < write,
+        "the bounded post-deadline write must be selected after the committed \
+         observers and before the unbounded gateway reject write"
     );
     assert_eq!(
         writer.matches(token_writer).count(),
@@ -387,9 +479,76 @@ fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
         oversized_compact.contains(
             "write_plain_gateway_error_terminal(stream,plugins,ctx,StatusCode::BAD_GATEWAY,"
         ) && oversized_compact.contains("Bytes::from_static(")
-            && oversized_compact.contains("),false,backend_start,bytes_sent,")
+            // `connection_error: false`, then `run_committed_observers: true`.
+            && oversized_compact.contains("),false,true,backend_start,bytes_sent,")
             && !oversized.contains(token_writer)
             && !oversized_compact.contains("headers"),
         "the declared-oversize 502 must hand the typed signal to the terminal writer"
     );
+}
+
+#[test]
+fn admin_builder_fallback_is_500_not_default_200() {
+    let response = admin_builder_failure_response_for_test();
+    assert_eq!(response.status(), hyper::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    // The fallback carries the full admin security-header set (issue #7074).
+    for (name, expected) in [
+        (hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (hyper::header::CACHE_CONTROL, "no-store"),
+        (hyper::header::X_FRAME_OPTIONS, "DENY"),
+    ] {
+        assert_eq!(
+            response
+                .headers()
+                .get(&name)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected),
+            "{name}"
+        );
+    }
+    for (file, source) in [
+        (
+            "src/admin/mod.rs",
+            include_str!("../../../src/admin/mod.rs"),
+        ),
+        (
+            "src/admin/config_export.rs",
+            include_str!("../../../src/admin/config_export.rs"),
+        ),
+        (
+            "src/admin/api_specs/handlers.rs",
+            include_str!("../../../src/admin/api_specs/handlers.rs"),
+        ),
+    ] {
+        assert!(
+            !source.contains("unwrap_or_else(|_| Response::new("),
+            "{file}: admin builder fallbacks must not default to 200"
+        );
+        // A hand-built fallback (`Response::new`) bypasses the explicit 500 and
+        // the security headers; only `admin_builder_failure_response` may
+        // construct one.
+        assert!(
+            source.matches("Response::new(").count() <= usize::from(file == "src/admin/mod.rs"),
+            "{file}: build admin fallbacks with admin_builder_failure_response()"
+        );
+        // Security headers come from `with_admin_security_headers` /
+        // `insert_missing_admin_security_headers`, never per-response copies.
+        for literal in [
+            "\"X-Content-Type-Options\"",
+            "\"X-Frame-Options\"",
+            "\"Cache-Control\", \"no-store\"",
+        ] {
+            assert!(
+                !source.contains(literal),
+                "{file}: set {literal} through with_admin_security_headers()"
+            );
+        }
+    }
 }

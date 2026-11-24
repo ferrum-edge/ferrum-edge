@@ -132,30 +132,6 @@ def throughput_speedup(serial_ns: float, parallel_ns: float, parallel_threads: i
     return (parallel_threads * serial_ns) / parallel_ns
 
 
-def classify_parallel_floor(
-    selection_speedup: float,
-    control_speedup: float | None,
-    min_parallel_speedup: float,
-) -> str:
-    """Classify a parallel-floor reading.
-
-    Returns:
-      pass — selection cleared the floor
-      regression — selection missed and the control still scaled (or was
-        unavailable: fail closed)
-      runner_contention — both selection and the independent-work control
-        missed, so the runner is oversubscribed and the reading is not a
-        load-balancer signal
-    """
-    if selection_speedup >= min_parallel_speedup:
-        return "pass"
-    if control_speedup is None:
-        return "regression"
-    if control_speedup < min_parallel_speedup:
-        return "runner_contention"
-    return "regression"
-
-
 def apply_runner_contention_guard(
     failures: list[str],
     control_speedup: float | None,
@@ -435,19 +411,6 @@ def self_test() -> int:
             "4_targets serial wall >> 32_targets serial wall must fail the "
             "small-cardinality serial-ratio ceiling"
         )
-
-    if classify_parallel_floor(2.0, 3.0, HOSTED_CONTENTION_FLOOR) != "pass":
-        failures.append("healthy selection must pass regardless of control")
-    if classify_parallel_floor(1.0, 3.0, HOSTED_CONTENTION_FLOOR) != "regression":
-        failures.append("serialized 1.0x with a healthy control must be a regression")
-    if classify_parallel_floor(0.48, 0.50, HOSTED_CONTENTION_FLOOR) != "runner_contention":
-        failures.append(
-            "0.48x selection with 0.50x control is runner contention, not a regression"
-        )
-    if classify_parallel_floor(0.48, None, HOSTED_CONTENTION_FLOOR) != "regression":
-        failures.append("missing control must fail closed and enforce the floor")
-    if statistics.median([0.4, 3.0, 3.2]) < HOSTED_CONTENTION_FLOOR:
-        failures.append("median-of-N must not follow a single oversubscribed sample")
 
     demoted, notes = apply_runner_contention_guard(
         ser_failures, control_speedup=0.50, min_parallel_speedup=HOSTED_CONTENTION_FLOOR

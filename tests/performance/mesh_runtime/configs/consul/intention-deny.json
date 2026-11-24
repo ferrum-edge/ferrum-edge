@@ -1,0 +1,1 @@
+{"Kind": "service-intentions", "Name": "svc", "Sources": [{"Name": "client", "Action": "deny"}]}

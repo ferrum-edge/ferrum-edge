@@ -397,15 +397,6 @@ pub async fn bind_dtls(
     Ok(ferrum_edge::dtls::DtlsServer::from_socket(socket, config))
 }
 
-pub async fn bind_dtls_with_limits(
-    addr: SocketAddr,
-    config: ferrum_edge::dtls::FrontendDtlsConfig,
-    limits: ferrum_edge::dtls::DtlsServerLimits,
-) -> Result<ferrum_edge::dtls::DtlsServer, anyhow::Error> {
-    let socket = UdpSocket::bind_test(addr).await?;
-    ferrum_edge::dtls::DtlsServer::from_socket_with_limits(socket, config, limits)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

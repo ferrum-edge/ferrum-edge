@@ -426,7 +426,7 @@ fn test_env_config() -> EnvConfig {
 
 struct RunningGateway {
     handles: ServeHandles,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: ferrum_edge::overload::ShutdownSender,
     /// Bound port of each declared Gateway listener port, in declared order.
     listener_ports: Vec<u16>,
 }
@@ -441,7 +441,7 @@ impl RunningGateway {
     }
 
     async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.shutdown();
         let _ = tokio::time::timeout(Duration::from_secs(5), self.handles.join()).await;
     }
 }
@@ -476,7 +476,8 @@ async fn start_gateway(config: &GatewayConfig, declared: &[u16]) -> RunningGatew
         let admin_http = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind admin port");
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::ZERO);
         let handles = serve(
             test_env_config(),
             config,
@@ -511,7 +512,7 @@ async fn start_gateway(config: &GatewayConfig, declared: &[u16]) -> RunningGatew
             "mixed-transport gateway startup attempt {attempt}/{GATEWAY_STARTUP_ATTEMPTS} did not \
              bind every listener: want {expected:?}, active {active:?}, refusals {failures:?}"
         );
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
     }
     panic!("the Gateway listeners never all bound in {GATEWAY_STARTUP_ATTEMPTS} attempts")

@@ -48,11 +48,11 @@ Enforcement details, in either case:
 
 - The `ns` claim accepts the same shapes as the gRPC plane: a single string (`"ns": "prod"`) or an array of strings (`"ns": ["prod", "staging"]`).
 - A request whose `X-Ferrum-Namespace` (or the `ferrum` default when the header is omitted) is not in the token's `ns` set is rejected with `403 Forbidden`, whether or not enforcement is on. With enforcement on, tokens without an `ns` claim are also rejected on namespace-scoped routes — tenancy intent must be explicit.
-- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/config/export`, `/backend-egress-policy`, `/restore`, `/audit`, `/gateway-trust-bundles`, and `/gateway-trust` (including `/gateway-trust/status`). Those routes are selected by `X-Ferrum-Namespace`. `/config/apply-status` is not namespace-scoped.
+- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/deployment-snapshot`, `/config/export`, `/backend-egress-policy`, `/restore`, `/audit`, `/gateway-trust-bundles`, and `/gateway-trust` (including `/gateway-trust/status`). Those routes are selected by `X-Ferrum-Namespace`. `/config/apply-status` is not namespace-scoped.
 - The `/namespaces` registry is a global surface (the header does not select a tenant). When the flag is on, or the token carries an `ns` claim, `GET /namespaces` is **filtered** to the JWT `ns` claim — with the flag on, a token with no claim receives an empty list rather than `403`. `GET`/`PUT`/`DELETE /namespaces/{name}` and `POST /namespaces` return `403` when the token cannot address that name; rename checks both the current and target names.
 - Other global surfaces (observability, `/cluster`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) are not selected by `X-Ferrum-Namespace`; a token without an `ns` claim reaches them whatever the flag says, and a token with one is refused (see below). Audit events for those fleet-global mutations (including TLS/ACME management and `POST /mesh/config-revision/reset`) are stored under the canonical default namespace (`ferrum`), not the request header. The same canonical bucket is used for an invalid `X-Ferrum-Namespace` and for an `ns`-claim denial, so a scoped caller cannot file a privileged record under another tenant.
 - Malformed `ns` claims (non-string entries, empty strings) are rejected at authentication time regardless of the flag — a garbled tenancy claim never widens access.
-- With enforcement on, an `operator` creating or updating a proxy or upstream may introduce only inline PEM, `system://`, or a `k8s://` Secret in the addressed namespace in `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path`. The gateway resolves these references with its own credentials, so another namespace's Secret, a secret-manager or managed/ACME/PKCS#11 store, and a gateway-local file are refused with `400` before anything is loaded; the answer does not depend on whether the material exists. A value already stored on the resource is left alone, and `admin` tokens are unaffected. The check maps the Ferrum namespace an operator is scoped to onto the Kubernetes namespace of the same name: `k8s://<that namespace>/…` is admitted and is read with the gateway's own ServiceAccount, so do not give a Ferrum tenant namespace the name of a Kubernetes namespace that tenant must not read (for example `kube-system` or a platform namespace).
+- With enforcement on, or whenever the token carries an `ns` claim (even with enforcement off), an `operator` creating or updating a proxy or upstream may introduce only inline PEM, `system://`, or a `k8s://` Secret in the addressed namespace in `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path`. The same rule covers every plugin config field that names gateway TLS material: the route-local `client_cert_path`, `client_key_path`, and `server_ca_cert_path` in each `rules[].destination.backend_tls` of a `mesh_route_dispatch` plugin config, the `dtls_cert_path`, `dtls_key_path`, and `dtls_ca_cert_path` of a `udp_logging` plugin config, and each `x509_signature.trusted_certs` and `saml.trusted_signing_certs` entry of a `soap_ws_security` plugin config. Plugin fields that name a gateway filesystem path or a native library setting cannot be introduced by such an operator at all. These are the `kafka_logging` `ssl_certificate_location`, `ssl_key_location`, and `ssl_ca_location`, any `kafka_logging` `producer_config` key outside a reviewed tuning-only list, the `api_chargeback_sink` `clickhouse.tls.*_file` fields and `spool.dir`, `grpc.descriptor_path` of `ai_response_guard` and `ai_transcript_audit`, `body_validator` `protobuf_descriptor_path`, and `geo_restriction` `db_path`. A plugin that is not a built-in (a custom plugin) cannot be classified, so such an operator may not introduce or change its config. Every classified field is listed in `src/admin/crud/scoped_references.rs`. The gateway resolves these references with its own credentials, so another namespace's Secret, a secret-manager or managed/ACME/PKCS#11 store, and a gateway-local file are refused with `400` before anything is loaded; the answer does not depend on whether the material exists. A value already stored at the same field path of the resource (for array fields, the same index) is left alone, and `admin` tokens are unaffected. The check maps the Ferrum namespace an operator is scoped to onto the Kubernetes namespace of the same name: `k8s://<that namespace>/…` is admitted and is read with the gateway's own ServiceAccount, so do not give a Ferrum tenant namespace the name of a Kubernetes namespace that tenant must not read (for example `kube-system` or a platform namespace).
 
 With enforcement off — the flag unset and the CP scope single-namespace — the namespace header remains a routing selector only for tokens without an `ns` claim.
 
@@ -169,7 +169,8 @@ are never affected.
   route runs. It does not depend on `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`.
 - Every namespace-scoped route listed above (proxies, consumers and
   credentials, plugin configs, upstreams, API specs, trust bundles and
-  `/gateway-trust/status`, `/batch`, `/backup`, `/restore`, `/audit`) and
+  `/gateway-trust/status`, `/batch`, `/backup`, `/deployment-snapshot`,
+  `/restore`, `/audit`) and
   `GET /config/export` and `GET /backend-egress-policy` answer `403` for a namespace outside the ceiling,
   including the `ferrum` default when the header is omitted. The refusal
   depends only on the credential and the requested namespace, never on whether
@@ -186,12 +187,9 @@ are never affected.
 - For a ceiling-bound viewer-key token, global routes fail closed with `403`
   unless they are `GET /namespaces`, `GET /namespaces/{name}`, `GET /plugins`
   (plugin type catalog), or health/liveness/readiness probes (`GET /health`,
-  `/live`, `/status`, `/overload`). Without an allowlisted source IP, these
-  tokens receive the [tenant tier](#tenant-tier-for-namespace-bounded-tokens)
-  from `/health` and `/status`, and only `{level}` from `/overload`. An
-  allowlisted IP retains the detail it would receive without the viewer token,
-  consistently across all three routes. Detailed `/metrics` routes return
-  `403`, even from an allowlisted source IP. Other
+  `/live`, `/status`, `/overload`). Their observability detail follows the
+  namespace-bounded rules under [Authentication](#authentication). Detailed
+  `/metrics` routes return `403`, even from an allowlisted source IP. Other
   denied routes include `/charges`, `/admin/metrics`,
   `/metrics/runtime`, `/cluster`, `/backend-capabilities`, mesh introspection,
   and all other global routes. The namespace registry remains filtered as
@@ -310,7 +308,8 @@ Replace `YOUR_PROXY_ID` with the `id` returned by `POST /proxies`.
 Required field is `username`. Built-in credential map keys are `keyauth`,
 `basicauth`, `jwt`, `hmac_auth`, and `mtls_auth`. Each value is a **non-empty
 rotation array** of objects, not a single object. `keyauth` is the API-key
-credential type; `key_auth` is rejected here.
+credential type; `key_auth` is rejected here. Each `keyauth` `key` needs at
+least 16 non-whitespace characters; a shorter key is rejected with `400`.
 
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" \
@@ -429,7 +428,7 @@ curl http://localhost:9000/live
 
 #### Withdrawn admin client-certificate trust
 
-There is one transport-level exception that applies to **every** admin endpoint, `/live` included. When admin HTTPS terminates client certificates (`FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`) and frontend TLS live reload is enabled, an established admin connection whose client certificate the operator has since revoked — via `FERRUM_TLS_CRL_FILE_PATH` — or whose issuing CA has left the bundle is **retired**: any request already buffered on that connection is refused with a fixed `401 {"error":"Client certificate trust withdrawn"}` *before* it enters admin routing, and the connection ends through hyper's graceful shutdown (HTTP/2 gets a `GOAWAY`; HTTP/1.1 ends keep-alive). Plaintext admin connections and admin TLS connections that presented no client certificate are untouched, and the admin connection permit and slowloris accounting release exactly once on the paths that already own them. See [Frontend TLS → Client-Trust Generations and Established-Transport Retirement](frontend_tls.md#client-trust-generations-and-established-transport-retirement).
+There is one transport-level exception that applies to **every** admin endpoint, `/live` included. When admin HTTPS terminates client certificates (`FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`) and frontend TLS live reload is enabled, an established admin connection whose client certificate the operator has since revoked — via `FERRUM_TLS_CRL_FILE_PATH` — or whose issuing CA has left the bundle is **retired**: any request already buffered on that connection is refused with a fixed `401 {"error":"Client certificate trust withdrawn"}` (carrying `WWW-Authenticate: ClientCertificate realm="ferrum-edge"`) *before* it enters admin routing, and the connection ends through hyper's graceful shutdown (HTTP/2 gets a `GOAWAY`; HTTP/1.1 ends keep-alive). Plaintext admin connections and admin TLS connections that presented no client certificate are untouched, and the admin connection permit and slowloris accounting release exactly once on the paths that already own them. See [Frontend TLS → Client-Trust Generations and Established-Transport Retirement](frontend_tls.md#client-trust-generations-and-established-transport-retirement).
 
 ### `/health`, `/status` — readiness + diagnostics (tiered)
 
@@ -454,13 +453,26 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
 # `admin_writes_enabled` is the config-database mutation signal (CRUD/specs/
 # batch/restore); managed TLS/ACME stores are independent and are not gated by
 # sticky DB failover topology.
+# While a MongoDB mTLS DNS admission fence is retained after an uncertain
+# protected mutation, authenticated `database.mtls_dns_admission_fence`
+# ({"fenced":true,"retained_fences":N,"namespaces":[...],
+#   "oldest_retained_since_unix_ms":...}) is present; admissions for those
+# namespaces fail closed while reconnect/failover stay available.
 ```
 
 Service-discovery task lifecycle and bounded staleness drive the same coarse fields: a restarting, crash-looping, stale, or withdrawn upstream sets `status: "degraded"` while staying ready after a configured `withdraw` has published successfully. An expired upstream configured with `fail_readiness`, or a default `withdraw` upstream whose fail-closed withdrawal publication is still retrying, flips `ready: false` with `status: "unavailable"` and HTTP 503. Background task transitions precompute this fixed-cardinality coarse projection, so the unauthenticated probe remains an O(1), lock-free snapshot load rather than walking configured upstreams. The authenticated tier adds a `service_discovery` object with process aggregates plus per-upstream detail (provider, task state, stale/withdrawn flags, effective policy and window, last-success age, restart and consecutive-failure counts, and a closed-set `last_error` token) — never a registry URL, Consul/Kubernetes token, or response payload. `/metrics` carries only the fixed-cardinality `ferrum_service_discovery_*` aggregates; the namespaced upstream id is deliberately never a Prometheus label.
 
 A terminating process reports `status: "draining"`, `ready: false`, and HTTP 503. The verdict is published the moment SIGTERM/SIGINT is observed — ahead of the accept-loop close — so an orchestrator or load balancer can withdraw the replica from its endpoint set before a new connection is refused; `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` keeps every listener (proxy and admin) accepting for that window. `draining` is terminal and wins over every other status. `/live` is deliberately unaffected and keeps returning 200: a liveness probe pointed at a draining pod must not trigger a SIGKILL mid-drain. See [graceful_shutdown.md](graceful_shutdown.md).
 
-Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. Active remote JWKS trust still drives those coarse fields without leaking detail: grace keeps `ready: true` with `status: "degraded"`; expiry flips `ready: false` with `status: "unavailable"` and HTTP 503; with no active remote JWKS the coarse shape stays neutral. The probe path is an O(1) ArcSwap load plus monotonic deadline comparison — it never walks attacker-sized cache state. The detailed diagnostics (DB type/pool stats, optional `database.failover_topology`, cached-config proxy/consumer counts, `database_polling` degradation, `config_rejected`, mesh state, sanitized listener failures, fixed-cardinality `jwks_trust` fresh/grace/expired counts with per-state max ages — never URLs, kids, tokens, claims, or key material — and the `service_discovery` block described below) require an admin JWT that is not namespace-bounded, `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS` source IP (a namespace-bounded JWT gets the [tenant tier](#tenant-tier-for-namespace-bounded-tokens)). In **data-plane mode**, authenticated detail additionally includes a fixed-cardinality `dp_config` object; `cp_disconnected_seconds` there measures how long the DP has been without usable applied configuration (`0` only after a snapshot is accepted and applied, not on bare transport connect). In database mode the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config. Both **database** and **cp** modes expose `database_polling.last_poll_completed_at` (updated on every normally completed poll outcome — empty success, rejection, or handled error — not on panic/abort/cancel) so operators can alert when the supervised poll task stops advancing. In **cp** mode, unexpected poll-task exit (panic/abort/unexpected completion — not ordinary shutdown) flips sticky `serving_degraded`, so `/health` returns 503 with `status: "unavailable"` and `ready: false`. In **database** mode the poll task is respawned after an unexpected exit while last-known-good config continues to serve. When the optional MongoDB change-stream watcher is enabled (`FERRUM_MONGO_CHANGE_STREAM_ENABLED`, replica sets only), `database_polling.change_stream` reports its bounded connected/degraded/reconnect state; it is a reload-latency signal only and never forces `status: "degraded"`, because periodic polling stays authoritative. See [mongodb.md](mongodb.md#change-stream-triggered-reloads).
+Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. Active remote and admin-managed (`jwks_source`) JWKS trust still drives those coarse fields without leaking detail: grace keeps `ready: true` with `status: "degraded"`; expiry flips `ready: false` with `status: "unavailable"` and HTTP 503; with no active remote JWKS the coarse shape stays neutral. The probe path is an O(1) ArcSwap load plus monotonic deadline comparison — it never walks attacker-sized cache state.
+
+The detailed diagnostics (DB type/pool stats, optional `database.failover_topology`, optional `database.mtls_dns_admission_fence` (see [mongodb.md](mongodb.md#retained-mtls-dns-admission-fences)), cached-config proxy/consumer counts, `database_polling` degradation, `config_rejected`, mesh state, sanitized listener failures, fixed-cardinality `jwks_trust` fresh/grace/expired counts with per-state max ages — never URLs, kids, tokens, claims, or key material — and the `service_discovery` block described below) require the authenticated tier described under [Authentication](#authentication); a namespace-bounded JWT gets the [tenant tier](#tenant-tier-for-namespace-bounded-tokens).
+
+- **Data-plane mode**: authenticated detail additionally includes a fixed-cardinality `dp_config` object; `cp_disconnected_seconds` there measures how long the DP has been without usable applied configuration (`0` only after a snapshot is accepted and applied, not on bare transport connect).
+- **Database mode**: the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config. The poll task is respawned after an unexpected exit while last-known-good config continues to serve.
+- **Database and cp modes**: both expose `database_polling.last_poll_completed_at` (updated on every normally completed poll outcome — empty success, rejection, or handled error — not on panic/abort/cancel) so operators can alert when the supervised poll task stops advancing.
+- **CP mode**: unexpected poll-task exit (panic/abort/unexpected completion — not ordinary shutdown) flips sticky `serving_degraded`, so `/health` returns 503 with `status: "unavailable"` and `ready: false`.
+- **MongoDB change stream**: when the optional MongoDB change-stream watcher is enabled (`FERRUM_MONGO_CHANGE_STREAM_ENABLED`, replica sets only), `database_polling.change_stream` reports its bounded connected/degraded/reconnect state; it is a reload-latency signal only and never forces `status: "degraded"`, because periodic polling stays authoritative. See [mongodb.md](mongodb.md#change-stream-triggered-reloads).
 
 In mesh mode, authenticated health detail includes
 `mesh.egress_scope.sidecar_admitted_services` and
@@ -517,7 +529,7 @@ diagnosable.
 
 In database **and control-plane** mode, if a **full** config load is rejected by the runtime-config validation contract (a reachable backend served a semantically-invalid snapshot — e.g. a partial/direct-DB write) **or by typed SQL row decoding** (a reachable backend served an undecodable row — e.g. malformed JSON in a column) the gateway keeps serving the last known-good config **and keeps the admin API writable**: `db_available` stays true because admin writes are the in-band repair path for the offending resource. Re-enabling writes is gated on any deferred schema migration applying first, so a reachable backend whose schema is still pending keeps writes blocked while `config_rejected` stays set. The rejection also skips failover (the same invalid snapshot lives on every replica). The authenticated `/health` detail then carries `config_rejected: true` and `status: "degraded"` (the boolean detail is authenticated-only; the coarse `degraded` status is also visible unauthenticated). The flag is sticky and clears only after an accepted authoritative **full** reload (an accepted incremental poll does not clear it). While the backend is later unreachable (`admin_writes_enabled` false) the `config_rejected` detail is suppressed so it never advertises the writable repair path during an outage, even though the underlying flag remains set. A genuine connectivity failure is unaffected and still flips `admin_writes_enabled` to false. Startup still fails loudly for undecodable rows (backup bootstrap is not eligible), matching the non-transient decode policy.
 
-In **database** mode a stored `plugin_configs` row that the shared plugin **construction** gate refuses (unknown key, bad regex, out-of-range value) is **quarantined** rather than fatal **only when the plugin's failure policy is `OptionalFailOpen`** (logging, metrics and other instrumentation): the serving-mode full load drops that row, logs one `error!` naming the plugin, its config id, and the constructor error, omits it from the plugin cache, and raises `config_rejected`. The process therefore reaches its admin listener with the offending row still visible through `GET /plugins/config/{id}` and deletable through `DELETE /plugins/config/{id}`, which is the in-band repair path. `config_rejected` is *not* cleared by a later accepted reload that still had to quarantine a row. A refused `FailClosed` or `KeepLastKnownGood` row, and any unknown or retired plugin name, is **never** quarantined: the serving-mode load rejects the whole snapshot and the process refuses to start, because silently omitting an authentication, authorization or traffic-policy plugin would serve requests without the control the operator configured. Repair those rows out of band (directly in the database) before restarting. Control-plane mode **rejects** every unconstructible snapshot outright, so such a row is never broadcast to the data-plane fleet.
+In **database** mode a stored `plugin_configs` row that the shared plugin **construction** gate refuses (unknown key, bad regex, out-of-range value) is **quarantined** rather than fatal **only when the plugin's failure policy is `OptionalFailOpen`** (metrics, tracing, alerting and other instrumentation; log sinks are `KeepLastKnownGood` and are never quarantined): the serving-mode full load drops that row, logs one `error!` naming the plugin, its config id, and the constructor error, omits it from the plugin cache, and raises `config_rejected`. The process therefore reaches its admin listener with the offending row still visible through `GET /plugins/config/{id}` and deletable through `DELETE /plugins/config/{id}`, which is the in-band repair path. `config_rejected` is *not* cleared by a later accepted reload that still had to quarantine a row. A refused `FailClosed` or `KeepLastKnownGood` row, and any unknown or retired plugin name, is **never** quarantined: the serving-mode load rejects the whole snapshot and the process refuses to start, because silently omitting an authentication, authorization or traffic-policy plugin would serve requests without the control the operator configured. Repair those rows out of band (directly in the database) before restarting. Control-plane mode **rejects** every unconstructible snapshot outright, so such a row is never broadcast to the data-plane fleet.
 
 A malformed `FailClosed` / `KeepLastKnownGood` row therefore never yields a serving snapshot with that plugin omitted, on any path: a cold start without `FERRUM_DB_CONFIG_BACKUP_PATH` exits before any proxy or admin listener binds; a cold start with a usable backup serves the backup generation — security plugins included — with `config_rejected` raised and admin writes available for in-band repair; and a hot reload whose authoritative full load contains such a row never reaches `update_config`, so the complete previous runtime generation keeps serving. End-to-end coverage lives in `tests/functional/functional_plugin_quarantine_test.rs`.
 
@@ -620,7 +632,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/admin/tls/rotate/proxy_https"
 ```
 
-Supported force-reload surfaces are `proxy_https`, `backend_tls`, `admin_https`, `dtls`, `database_tls`, `cp_grpc`, `dp_grpc`, `svid`, and `all` for every registered watcher plus the configured gateway SVID. Aliases `frontend`, `backend`, `admin`, `frontend_dtls`, `db`, `database`, `cp_grpc_tls`, `dp_grpc_tls`, and `gateway_svid` are accepted. Watcher-backed TLS reloads are enqueued and report success or failure asynchronously through `/admin/tls/events` and `/metrics`; `svid` reloads are validated synchronously and publish a backend SVID generation bump on success. The `dtls` / `frontend_dtls` surface validates one immutable generation (server cert/key, optional client CA, CRLs) before publishing it into every active DTLS server; a rejected candidate retains the previous generation and is recorded as a rebuild failure without secret paths or PEM material. Authenticated `GET /overload` includes the bounded `stream_listeners.frontend_dtls_reload` generation, last publish count, timestamps, and fixed-cardinality outcome.
+Supported force-reload surfaces are `proxy_https`, `backend_tls`, `admin_https`, `dtls`, `database_tls`, `cp_grpc`, `dp_grpc`, `svid`, and `all` for every registered watcher plus the configured gateway SVID. Aliases `frontend`, `backend`, `admin`, `frontend_dtls`, `db`, `database`, `cp_grpc_tls`, `dp_grpc_tls`, and `gateway_svid` are accepted. Watcher-backed TLS reloads are enqueued and report success or failure asynchronously through `/admin/tls/events` and `/metrics`; `svid` reloads are validated synchronously and publish a backend SVID generation bump on success. The `dtls` / `frontend_dtls` surface validates one immutable generation (server cert/key, optional client CA, CRLs) before publishing it into every active DTLS server; a rejected candidate retains the previous generation and is recorded as a rebuild failure without secret paths or PEM material. Authenticated `GET /overload` includes the bounded `stream_listeners.frontend_dtls_reload` generation, last publish count, timestamps, and fixed-cardinality outcome. The owner-scoped mesh NodeWaypoint DTLS slot reports the same fields separately as `stream_listeners.mesh_node_waypoint_dtls_reload`, so a rejected mesh PeerAuthentication candidate is visible without touching the operator slot.
 
 ## TLS Validation
 
@@ -664,7 +676,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/admin/tls/acme/certificates
 ```
 
-Responses return non-secret certificate metadata, source URI, issuer, SANs, validity, fingerprint, ACME directory/account/order metadata, and timestamps. Private keys are persisted but never returned. Create, update, and delete operations ask active TLS source watchers to re-pull immediately; `DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record. SAN strings use the same canonical representation as [TLS Inventory](#tls-inventory).
+Responses return non-secret certificate metadata, source URI, issuer, SANs, validity, fingerprint, ACME directory/account/order metadata, and timestamps. Private keys are persisted but never returned. Create, update, and delete operations ask active TLS source watchers to re-pull immediately; `DELETE` returns `409 Conflict` when any configuration still references the record (see [Managed record deletion](#managed-record-deletion)). SAN strings use the same canonical representation as [TLS Inventory](#tls-inventory).
 
 Import, update, and order finalization return `413 Payload Too Large` when the certificate, private key, or combined certificate chain exceeds `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`; the error never echoes material or source identifiers.
 
@@ -697,6 +709,8 @@ Every ACME response body, including an issued certificate chain, is limited to 1
 
 `challenge_type` defaults to `http01`; set it to `tls_alpn01` to prepare TLS-ALPN-01 challenge material or `dns01` to prepare DNS-01 TXT material. HTTP-01 responses include public key-authorization values and challenge paths. TLS-ALPN-01 responses include the SNI identifier, token, `acme-tls/1` ALPN protocol, and base64url SHA-256 digest embedded in the validation certificate's critical `acmeIdentifier` extension. DNS-01 responses include the identifier, token, TXT record name, and TXT value. While an order is `pending_challenges`, `ready`, or `processing`, proxy listeners serve HTTP-01 key authorizations at `/.well-known/acme-challenge/{token}` before normal route matching, and TLS listeners return the TLS-ALPN-01 validation certificate when the ClientHello offers only `acme-tls/1` and SNI matches an active challenge. DNS-01 TXT records must be published in authoritative DNS before finalization. Account credentials are persisted in the order store for follow-up ACME calls but are never returned.
 
+A new order id is always admitted. Re-using an existing id returns `409` unless the request sets `allow_overwrite`, and an overwrite is an order status write like any other, so it must be a legal lifecycle move. The replacement is a freshly prepared `pending_challenges` order, so only a stored `pending_challenges` order can be replaced: overwriting a `ready` or `processing` order would move it backwards, and overwriting a `valid`, `failed`, or `cancelled` order would reopen a terminal one, so both return `409` with an error naming the order and the two states. Both refusals happen before any directory request, so no CA order is created for a write that cannot land; the store re-checks under its lock. `POST /admin/tls/acme/renew/{cert_id}` with an explicit `id` follows the same rules.
+
 `GET /admin/tls/acme/accounts` lists non-secret account identifiers, ACME directory URLs, order/certificate counts, whether resumable credentials exist, and last-seen timestamps. It merges credentials from order records and the dedicated `acme-accounts.json` account store, but never returns credential material.
 
 After DNS points at the gateway and the HTTP-01 challenge path or TLS-ALPN-01 listener is externally reachable, or after DNS-01 TXT records are published, finalize the order:
@@ -709,6 +723,12 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 ```
 
 Finalization re-reads the order's current state from the ACME directory and drives it from there: a `pending` order has its prepared HTTP-01, TLS-ALPN-01, or DNS-01 challenges marked ready and is polled to readiness before being finalized; a `ready` order is finalized exactly once with the CSR generated when the order was created; a `processing` or `valid` order is *not* finalized again, because that finalize already landed — its certificate is retrieved and paired with the private key persisted at creation time. An `invalid` order fails closed. Ferrum then fetches the PEM certificate chain, persists it as the order's `certificate_id`, and asks active TLS source watchers to re-pull. The stored certificate can then be used through `acme://certificates/edge-cert#cert` and `acme://certificates/edge-cert#key`.
+
+Only an active order (`pending_challenges`, `ready`, or `processing`) can be finalized. `valid`, `failed`, and `cancelled` are terminal: finalizing one returns `409` before any directory request, so create a new order instead. Finalization marks the order `failed` only when the ACME directory reports it `invalid`; a network error, poll timeout, or local certificate validation failure returns the error and leaves the order active, so the same request can be retried. The final order write is a compare-and-set on the order as it was read before the directory I/O: if a renewal completed the order, an operator deleted it, or anything else rewrote it while finalization was in flight, the order is left untouched. For a successful finalization the endpoint then returns `409` (the issued certificate, when one was already stored, stays stored and TLS source watchers are asked to re-pull it); a directory-reported `invalid` result still returns the directory error (`502`), whether or not its best-effort `failed` write applied.
+
+Finalize is idempotent for an order that is already complete. When the stored order is `valid`, was finalized into the certificate this request resolves to, and the stored certificate carries the same `order_url` — so it is the certificate this CA order produced — the endpoint returns `200` with the same `{order, certificate}` body as a fresh finalization. A repeated finalize after one that already succeeded is answered before any directory request. When a renewal or a concurrent finalize completes the same CA order while this request is in its directory I/O, the request still performs that I/O, then finds the order and certificate already published and also returns `200` — with or without `allow_overwrite` (without it, the existing certificate record is left as it is instead of returning `409`). Every other terminal or changed order — `failed`, `cancelled`, a `valid` order whose certificate came from another order or is missing, a deleted or rewritten order — and an existing certificate record from another CA order still return `409`.
+
+The order is persisted under the `certificate_id` the request names (else its own `certificate_id`, else the order id); finalizing returns `409` before any directory request when that certificate's latest order is another active order, because the finalized order would otherwise hide it from renewal.
 
 The private key and CSR are generated when the order is created and stored with the order, which is what makes finalization retryable after a crash. They are never returned by any endpoint and never appear in `GET /admin/tls/acme/orders` output. An order whose material is missing or unusable is rejected with `400` before any directory request using a fixed diagnostic that never describes the material.
 
@@ -723,7 +743,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 Ferrum reuses persisted account credentials from the latest order for that certificate when available. The request accepts the same `challenge_type` values as order creation. The response is a new order whose selected challenges must become reachable before calling `/admin/tls/acme/orders/{id}/finalize`.
 
-Automatic renewal can be enabled with `FERRUM_ACME_AUTO_RENEW_ENABLED=true`. The scheduler reuses persisted account credentials, renews certificates inside `FERRUM_ACME_RENEW_WHEN_REMAINING_DAYS`, and finalizes HTTP-01/TLS-ALPN-01 renewals after Ferrum stores their challenge material. For DNS-01 renewals, set `FERRUM_ACME_DNS01_HOOK_COMMAND` to an executable that creates and cleans up provider TXT records; Ferrum passes the challenge through `FERRUM_ACME_DNS01_*` environment variables, waits `FERRUM_ACME_DNS01_PROPAGATION_SECONDS`, then finalizes the order.
+Automatic renewal can be enabled with `FERRUM_ACME_AUTO_RENEW_ENABLED=true`. The scheduler reuses persisted account credentials — the certificate's own account from the shared `acme-accounts.json` store, falling back to the latest order's credentials only when that store has none for the account — renews certificates inside `FERRUM_ACME_RENEW_WHEN_REMAINING_DAYS`, and finalizes HTTP-01/TLS-ALPN-01 renewals after Ferrum stores their challenge material. For DNS-01 renewals, set `FERRUM_ACME_DNS01_HOOK_COMMAND` to an executable that creates and cleans up provider TXT records; Ferrum passes the challenge through `FERRUM_ACME_DNS01_*` environment variables, waits `FERRUM_ACME_DNS01_PROPAGATION_SECONDS`, then finalizes the order.
 
 ## Managed TLS Records
 
@@ -774,9 +794,80 @@ export FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE="managed://ocsp-responses/edge-o
 export FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true
 ```
 
-JWKS-capable plugin fields can reference `managed://jwks/{id}#jwks` once the plugin accepts `CertSource` JWKS material.
+JWKS records are read by `jwks_auth` (`providers[].jwks_source`) and `oidc_relying_party` (`providers[0].jwks_source`, with explicit endpoints) as `managed://jwks/{id}#jwks` (issue #7277):
 
-`DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record.
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"id": "corp-idp", "name": "Corporate IdP keys", "jwks_json": "{\"keys\":[...]}"}' \
+  http://localhost:9000/admin/tls/jwks
+```
+
+```yaml
+plugin_name: jwks_auth
+config:
+  providers:
+    - issuer: "https://idp.corp.example"
+      jwks_source: "managed://jwks/corp-idp#jwks"
+```
+
+- **Admission.** `POST`/`PUT /admin/tls/jwks` admit `jwks_json` only when a JWKS consumer could verify with it: at most 1 MiB and 256 keys, no duplicate usable `kid`, and at least one usable signing key (same key rules as a fetched JWKS; unusable keys beside a usable one are skipped). A plugin write whose `jwks_source` names a record that does not exist, is of another kind, or holds no usable key returns `400`; so do `POST /batch` and `POST /restore` rows, and `POST`/`PUT /api-specs` refuses an enabled `x-ferrum-plugins` entry the same way (`422`). Namespace-bounded operator tokens cannot introduce a `managed://` reference.
+- **Rotation.** Before a JWKS create, `PUT`, or delete returns, every key store on this node that is backed by a managed JWKS record is re-read, so a `kid` the update adds is accepted and a `kid` it removes is refused on this node when the response arrives. Other nodes sharing `FERRUM_TLS_MANAGED_STORE_PATH` (database replicas, data planes) re-read every `jwks_refresh_interval_secs` (`900` seconds for `oidc_relying_party`), and an unknown `kid` triggers a background re-read subject to `kid_miss_refresh_cooldown_seconds`. The request that names the unknown `kid` is still refused (fail closed); later requests verify once that re-read completes. To rotate without refusals, add the new key, wait until every node has re-read the record (one refresh interval), then move signers to it. Set the refresh interval to your key-removal objective.
+- **Trust.** A present record with usable keys is `fresh` (no interval-based grace). A deleted, wrong-kind, oversized, malformed, or keyless record withdraws every key and the consumer refuses tokens, exactly like an expired remote set (`expired` in `jwks_trust`, readiness `unavailable`). A store that cannot be read keeps the last-read keys in `grace` for at most `jwks_max_stale_seconds`.
+- **Control plane / data plane.** The record never travels on ConfigSync: the plugin config carries only the reference, and each node resolves it from its own `FERRUM_TLS_MANAGED_STORE_PATH`, like every other `managed://` source. Point the CP and every DP at one shared store volume (see [Managed TLS And ACME Across Multiple Replicas](frontend_tls.md#managed-tls-and-acme-across-multiple-replicas)); a DP without the record refuses the provider's tokens.
+
+`DELETE` returns `409 Conflict` when any configuration still references the record (see [Managed record deletion](#managed-record-deletion)).
+
+### Managed record deletion
+
+`DELETE` on a managed certificate, CA bundle, CRL, OCSP response, or JWKS
+record, and on an ACME certificate, returns `409 Conflict` while any
+configuration still names the record, with the referencing resources in
+`used_by`. Every gateway that shares `FERRUM_TLS_MANAGED_STORE_PATH` reads the
+record whatever namespace it serves, while a database-mode node serves only
+`FERRUM_NAMESPACE` (and a control plane only `FERRUM_CP_NAMESPACES`) and its
+Admin API writes any namespace through `X-Ferrum-Namespace`. The check
+therefore covers this node's environment and served configuration and, on a
+node with a configuration store (database and CP modes), every namespace in
+that store; `used_by[].namespace` names the namespace of a reference found
+there. Disabled plugin configs do not hold a reference. If the store cannot
+be read, the delete is refused with `503` rather than guessed.
+
+The scan and the delete are fenced against concurrent configuration writes.
+The delete pins the config store's write topology, takes the
+namespace-registry admission lease and every listed namespace's config
+admission lease (the same leases every admin writer holds from validation to
+commit), reads only proxies, upstreams and plugin configs under them,
+re-reads the namespace list, and removes the record only after the TLS store
+has re-validated the fence under its own exclusive lock. The store checks the
+fence again once the removal is persisted, still under that lock, and restores
+the record if the fence lapsed while the write was being persisted. The fence
+stays held until that store write concludes, even if the request is
+cancelled; if it lapsed or the topology changed, the record is left (or put
+back) in place and the answer is `503`.
+A namespace that appears during the scan restarts it (up to three times,
+then `503`).
+
+What the fence guarantees: no write in a scanned namespace commits between
+the scan and the delete, so the `409`/`200` answer reflects the stored
+configuration at the moment the record is removed. What happens to a write
+that was waiting depends on whether its admission resolves the record. A
+`managed://jwks/...` reference from `jwks_auth` or `oidc_relying_party` is
+checked against the store, so it then fails admission (`400`) because the
+record is gone. Backend TLS paths on proxies and upstreams
+(`backend_tls_*_path`) are not resolved at admission, so such a write then
+commits a reference to the deleted record, exactly as it could reference a
+record that never existed; the backend TLS connection fails until the record
+is restored.
+
+One window remains: a first write into a namespace that still has no rows
+when the list is re-read can commit before the record is removed, because no
+lease covers a name that does not exist yet. While the fence is held, every
+configuration write in the store waits, so a managed TLS delete briefly
+pauses admin writes fleet-wide. Nodes without
+a store (file and data-plane modes) check only their own configuration, and
+no node can see another process's environment, so a record named only by
+another gateway's `FERRUM_*` TLS settings is not protected by this check.
 
 ## Cached-config read fallback
 
@@ -1341,23 +1432,24 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/consumers
 # Create consumer
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"username": "alice", "credentials": {"keyauth": [{"key": "my-key"}]}}' \
+  -d '{"username": "alice", "credentials": {"keyauth": [{"key": "my-key-0123456789abcdef"}]}}' \
   http://localhost:9000/consumers
 
 # Replace all credentials of a type (PUT replaces entirely and stores an array)
 curl -X PUT -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '[{"key": "new-api-key"}]' \
+  -d '[{"key": "new-api-key-0123456789"}]' \
   http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
 
 # Append a credential for zero-downtime rotation (POST adds to array)
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"key": "rotated-api-key"}' \
+  -d '{"key": "rotated-api-key-0123456789"}' \
   http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
 
-# Delete a specific credential by index (0-based)
-curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+# Delete a specific credential by index (0-based), conditioned on the
+# Consumer's ETag from the GET the index was chosen from
+curl -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: $CONSUMER_ETAG" \
   http://localhost:9000/consumers/{consumer_id}/credentials/keyauth/0
 
 # Delete all credentials of a type
@@ -1374,10 +1466,38 @@ policy. Remove or edit the username in those plugin configs, then retry. A
 consumer named only in `disallowed_consumers`, or not named in any
 `access_control` allow-list, can still be deleted.
 
+`PUT /consumers/{id}` that changes the consumer's `username` returns
+**409 Conflict** with
+`{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be renamed"}`
+while any `access_control` plugin config in the same namespace still names the
+**previous** username in `allowed_consumers` **or** `disallowed_consumers`.
+Matching is byte-for-byte, so the rename would otherwise silently detach the
+entry: an orphaned allow entry is inherited by any later consumer created under
+that username, and an orphaned deny entry un-revokes the renamed consumer. Edit
+those plugin configs first (for example, replace the old username with the new
+one), then rename. Updates that keep the username are unaffected. File mode
+applies the same rule on reload: a reloaded file that renames a consumer while
+its own `access_control` configs still name the previous username is rejected
+and the previous configuration is kept.
+
 Credential rotation workflow:
 1. `POST .../credentials/keyauth` with the new key — both old and new are now active
 2. Roll out the new key to all clients
-3. `DELETE .../credentials/keyauth/0` to remove the old key
+3. `GET /consumers/{consumer_id}`, then `DELETE .../credentials/keyauth/0` with
+   that response's `ETag` as `If-Match` to remove the old key
+
+The index is a position in the array as the caller last read it, and every
+entry reads back redacted, so an index alone cannot say which credential was
+meant once another writer (another admin, a second UI tab, automation) has
+appended or removed one: an unconditional indexed delete removes whatever
+entry now sits at that position. The credential endpoints (`PUT`, `POST` and
+`DELETE` on `/consumers/{id}/credentials/{cred_type}`, and the indexed
+`DELETE`) therefore evaluate `If-Match` against the Consumer's own `ETag` from
+`GET /consumers/{id}`. The comparison runs under the namespace admission lease
+the write commits under, so any change to the Consumer since that read is
+refused with `412 Precondition Failed` and nothing is written; re-read the
+Consumer and choose the entry again. Omitting `If-Match` keeps the write
+unconditional. See [Conditional writes](#conditional-writes-etag--if-match).
 
 Max credentials per type is controlled by `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2).
 
@@ -1394,7 +1514,7 @@ per-type breakdown and the mitigations.
 
 The OpenAPI document models these wire differences with separate Consumer surface schemas: `ConsumerCreate` is the create/batch request shape (write-only credential inputs, including plaintext `basicauth` `password`, and no `[REDACTED]` values), `ConsumerUpdate` is the `PUT` request shape (identical to `ConsumerCreate` except that `keyauth`, `jwt`, and `hmac_auth` entries may also be the exact `[REDACTED]` placeholder, so the server's own redacted response validates as an update body), `Consumer` is the ordinary redacted response shape (`basicauth` absent; `keyauth.key`, `jwt.secret`, and `hmac_auth.secret` carry the exact `[REDACTED]` placeholder), and `ConsumerBackup`/`ConsumerRestore` are the unredacted backup/restore shapes documented in [docs/admin_backup_restore.md](admin_backup_restore.md). Every composed Consumer surface closes unknown top-level fields (`unevaluatedProperties: false`), matching runtime `Consumer` serde `deny_unknown_fields` on create, update, batch, restore, and file/CP-DP config deserialization (SQL/Mongo loaders construct Consumers from typed columns/documents rather than accepting free-form top-level JSON). Credential mutation request bodies use `ConsumerCredentialInput`, the union of the per-type input entry schemas. Dedicated credential `PUT`/`POST` path parameters advertise only `BuiltInCredentialType` (`basicauth`, `keyauth`, `jwt`, `hmac_auth`, `mtls_auth`), matching runtime `ALLOWED_CREDENTIAL_TYPES`; type-level `DELETE` keeps the broader path-safe `CredentialTypeName` so custom maps remain removable.
 
-Consumer credential string maxima use Unicode character counts, matching OpenAPI `maxLength`: `basicauth.password`, `keyauth.key`, `hmac_auth.secret`, `jwt.secret`, and `mtls_auth.identity` are limited to 4096 characters and reject disallowed ASCII control bytes. HMAC secrets additionally require at least 32 non-whitespace characters. Consumer `jwt` credential entries support one key form: exactly one `secret` string (32-4096 characters) used for HS256 verification. Fields such as `algorithm`, `public_key`, `jwks`, and `jwks_uri` are rejected rather than ignored. RSA/EC/JWKS verification is configured through the separate `jwks_auth` plugin; it may map verified claims to a Consumer identity but does not read Consumer `jwt` credentials.
+Consumer credential string maxima use Unicode character counts, matching OpenAPI `maxLength`: `basicauth.password`, `keyauth.key`, `hmac_auth.secret`, `jwt.secret`, and `mtls_auth.identity` are limited to 4096 characters and reject disallowed ASCII control bytes. HMAC and JWT secrets additionally require at least 32 non-whitespace characters. Consumer `jwt` credential entries support one key form: exactly one `secret` string (32-4096 characters, at least 32 non-whitespace) used for HMAC verification with the algorithm the `jwt_auth` instance pins (`HS256` by default). A `jwt` secret already configured on a different Consumer in the same namespace is refused on create, update, batch, restore, and the credential endpoints, the same as an `hmac_auth` secret: the token's signer chooses the identity claim, so a shared JWT secret would let either Consumer sign as the other. Rotation entries within one Consumer may repeat a secret, and separate namespaces may reuse one. Fields such as `algorithm`, `public_key`, `jwks`, and `jwks_uri` are rejected rather than ignored. RSA/EC/JWKS verification is configured through the separate `jwks_auth` plugin; it may map verified claims to a Consumer identity but does not read Consumer `jwt` credentials.
 
 ## Replace semantics for `PUT`
 
@@ -1436,6 +1556,9 @@ their place. For the roles that can write:
 
 - **`operator` reads of upstreams** replace `service_discovery.consul.token`
   with `[REDACTED]`.
+- **`operator` reads of proxies and upstreams** replace stored backend TLS
+  private-key material with `[REDACTED]` (see
+  [Backend TLS private keys in reads](#backend-tls-private-keys-in-reads)).
 - **`operator` reads of plugin configs** use the redacted plugin-config
   projection described under [Plugin Configs](#plugin-configs): `[REDACTED]`
   for secrets, structural endpoint URLs retain markers for each stripped
@@ -1445,12 +1568,12 @@ their place. For the roles that can write:
   as `redis://redacted@host:port/db`; one with a query projects as
   `redis://host:port/db?[REDACTED_QUERY]`.
 
-`admin` reads of these resources are raw, and `operator` reads of proxies keep
-URL userinfo verbatim, so neither has anything to write back.
+`admin` reads of these resources are raw, and `operator` reads of proxies and
+upstreams keep URL userinfo verbatim, so neither has anything to write back.
 
-A `POST` or `PUT` of an upstream or plugin config whose body carries one of those
-placeholders at a field the caller's read projection masks is refused with `400`
-and nothing is mutated (issue #5925). Without this check, an operator tool that
+A `POST` or `PUT` of a proxy, upstream, or plugin config whose body carries one
+of those placeholders at a field the caller's read projection masks is refused
+with `400` and nothing is mutated (issue #5925). Without this check, an operator tool that
 reads a resource, edits an unrelated field, and writes the body back would store
 the literal placeholder as the secret. `If-Match` cannot catch it: the `ETag`
 covers the full stored resource, so the masked body's tag still matches. The
@@ -1468,6 +1591,15 @@ projection masks, so the same string in a field the read shows verbatim is
 written as sent. One real value looks exactly like a placeholder: a URL whose
 userinfo is the username `redacted` with no password, at a masked field. An
 operator cannot write that value, but an admin can.
+
+The exact string `[REDACTED]` is the exception: in a proxy, upstream, or
+plugin config it is refused at **any** string field, not only at fields the
+read masks. Stored TLS private-key material is withheld by its content
+wherever it occurs (see
+[Backend TLS private keys in reads](#backend-tls-private-keys-in-reads)), so a
+masked key in a field with no TLS name looks, once echoed back, exactly like
+`[REDACTED]` typed into an ordinary field. An operator cannot store the literal
+string `[REDACTED]` in these resources; an admin can.
 
 To change a resource that holds a masked secret, an operator must do one of these:
 
@@ -1488,13 +1620,51 @@ are also `admin`-only, and their credential projection has its own round-trip
 rule: a `[REDACTED]` credential entry is restored from the stored entry (see
 [Consumers](#consumers)).
 
+### Backend TLS private keys in reads
+
+Proxies and upstreams name TLS material in several places, and each accepts
+inline PEM as well as a reference:
+
+| Slot | Private-key field | Certificate / CA fields |
+| --- | --- | --- |
+| Proxy and Upstream top level | `backend_tls_client_key_path` | `backend_tls_client_cert_path`, `backend_tls_server_ca_cert_path` |
+| Upstream `port_overrides.<port>.tls` (DestinationRule `portLevelSettings[].tls`) | `client_key_path` | `client_cert_path`, `server_ca_cert_path` |
+| Upstream `subsets[].traffic_policy.tls` (DestinationRule subset `trafficPolicy.tls`) | `private_key` | `client_certificate`, `ca_certificates` |
+
+Non-admin projections never return stored private-key material: `viewer` and
+`operator` reads (single and list, from the database or a cached snapshot),
+write responses to an `operator`, admin audit diffs, and `GET /config/export`
+(as a fingerprint at the field's exact JSON pointer, for example
+`/port_overrides/443/tls/client_key_path`) all withhold it. `admin` reads and
+`/backup` stay raw.
+
+- **Withheld.** In a private-key field, any value that is or may be inline
+  material: PEM armour (`-----BEGIN`, in any case) anywhere in the value, or a
+  line break or other control character, neither of which a path or typed URI
+  contains. In a certificate or CA field, and in any other string of the
+  resource, a value that carries a PEM private-key block (for example a
+  certificate-plus-key bundle pasted into the certificate field). The field
+  names are matched wherever they occur in the body, so a TLS slot nested
+  somewhere new is covered the same way.
+- **Visible.** References name the material without disclosing it and are
+  returned verbatim: a filesystem path, `k8s://`, `vault://`, `aws://`,
+  `azure://`, `gcp://`, `managed://`, `acme://`, `pkcs11://` and `system://`
+  sources. Inline certificates and CA bundles are public and stay visible.
+
+An `operator` write that echoes the `[REDACTED]` placeholder back in any of
+these fields is refused with `400`, exactly as described above, and the stored
+key is untouched. Because the certificate and key must be set together,
+omitting the key does not clear it; send the real key (an inline PEM key or a
+reference) with the change, or have an `admin` make it.
 
 ### Conditional writes (`ETag` / `If-Match`)
 
 Because a `PUT` is a full replace, a client that submits an editor opened
 before someone else's accepted change does not merely omit that change — it
 reverts it. `GET /proxies/{id}`, `/upstreams/{id}`, `/consumers/{id}`, and
-`/plugins/config/{id}` return a strong `ETag`; send it back as `If-Match` on
+`/plugins/config/{id}` return a strong `ETag` (except to a token verified by
+`FERRUM_ADMIN_JWT_VIEWER_SECRET`, which cannot write and must never hold a MAC
+keyed by `FERRUM_ADMIN_JWT_SECRET`; GHSA-crqx-mp2f-v8c8); send it back as `If-Match` on
 `PUT` or `DELETE` of the same resource and the write is refused with
 `412 Precondition Failed` — writing nothing — unless the stored resource still
 has the state validated by that tag. The validator covers complete stored
@@ -1534,13 +1704,23 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
   Comparison is strong, so a weak `W/"…"` tag never matches. A comma-separated list
   matches if any member does. A malformed or empty `If-Match` is `400`, never
   treated as absent. Row preconditions apply only to `PUT`/`DELETE` on the
-  four resource routes above. `POST /restore` supports the separate namespace
+  four resource routes above and to the consumer credential endpoints
+  (`PUT`/`POST`/`DELETE /consumers/{id}/credentials/{cred_type}` and
+  `DELETE /consumers/{id}/credentials/{cred_type}/{index}`), which take the
+  Consumer's tag. `POST /restore` supports the separate namespace
   precondition described below. Opt-in deployment removal and spec replacement
   use the separate [deployment authority profile](deployment_mutations.md).
   `If-Match` on any other mutating route (including
-  `POST` creates, `/batch`, and `/gateway-trust-bundles/{id}`, which keeps its
-  own body `revision` contract) is `400` rather than applied unconditionally.
-  A request that would be `404` without the header is still `404`.
+  `POST` creates, `POST /api-specs`, `DELETE /api-specs/{id}` even with the
+  `ETag` from `GET /api-specs/{id}`, `/batch`, and `/gateway-trust-bundles/{id}`,
+  which keeps its own body `revision` contract) is `400` rather than applied
+  unconditionally.
+  When a well-formed row precondition is evaluated and the target resource
+  (the Consumer, for the credential sub-routes, whose index is checked after
+  the tag) does not exist, the response is still `404`. A route that does not evaluate the
+  header (including all three `/api-specs` mutations, whose `PUT` accepts only
+  the deployment profile) refuses it before any lookup, so a missing ID is
+  `400` there, and the refusal also precedes the read-only `403`.
 - **Namespace restore precondition.** `GET /backup?conditional=true` returns
   an `ETag` equal to `conditional.namespace_etag` for the complete coherent
   namespace state. Send that tag as `If-Match` to `POST /restore?confirm=true`
@@ -1561,6 +1741,28 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
   carries none, because it may lag the database.
 - **Unconditional writes are unchanged.** Omitting `If-Match` keeps today's
   last-writer-wins behavior, including unconditional restore.
+
+### Plugin-config association precondition (`expected_proxy_ids`)
+
+A plugin config's own `ETag` cannot fence its proxy associations: they live
+on proxy rows, and `DELETE /plugins/config/{id}` (or a `proxy`/`global`
+`PUT`) removes them. `PUT` and `DELETE` on `/plugins/config/{id}` therefore
+**require** the `expected_proxy_ids` query parameter — a comma-separated
+list of every proxy the caller expects to reference the config and accepts
+the write detaching (a `proxy`-scoped PUT's kept `proxy_id` target may be
+listed or omitted; send the parameter with an empty value to expect none).
+Absent, repeated, or malformed is `400`. The gateway compares the set
+against primary association state *now*, under the same namespace config
+admission lease as `If-Match`; a referencing proxy outside the set refuses
+the write with `412` naming it, and nothing is mutated. SQL and replica-set
+MongoDB also recheck inside the backend write transaction, so a write delayed
+past admission-lease loss cannot bypass the precondition. The association-only
+read does not decode the plugin row, preserving DELETE repair of damaged rows.
+Standalone MongoDB checks immediately before its mutation sequence; it cannot
+provide multi-document atomicity without a replica set. Re-read the
+namespace and retry with the current referencing set to accept detaching
+those proxies. This is unconditional (forge-ops #569): there is no opt-out,
+and older clients that omit the parameter now receive `400`.
 
 ## Dependency-fenced deployment recovery (#6010)
 
@@ -1642,17 +1844,17 @@ touched proxy is republished by the next poll / control-plane broadcast. The
 single-resource routes also advance the touched proxy's `updated_at`; the
 `/batch` and `/restore` paths leave it unchanged. Those paths reject a `proxy_id`
 that does not exist in the namespace with `400` before anything is written. `GET /proxies/{id}` is therefore authoritative: a
+`201` from `POST /plugins/config` means *attached*, not merely created. A
+`proxy_id` that does not exist in the request's namespace is rejected with
+`400 {"error":"proxy_id '<P>' does not exist in namespace '<ns>'"}` and nothing
+is persisted, as before.
+
 Plugin and proxy writes validate their complete prospective plugin composition
 before persistence. Invalid CORS/mesh-dispatch ordering, exclusive-instance
 conflicts, metric-tag plan budgets and global registry ownership return `400`;
 the rejected plugin row and association are not committed. File/DB/CP admission
 and runtime cache publication use the same checks. See
 [Composition admission](plugins.md#composition-admission).
-
-`201` from `POST /plugins/config` means *attached*, not merely created. A
-`proxy_id` that does not exist in the request's namespace is rejected with
-`400 {"error":"proxy_id '<P>' does not exist in namespace '<ns>'"}` and nothing
-is persisted, as before.
 
 `scope: "proxy_group"` associations are unaffected — they are operator-managed
 through `PUT /proxies/{id}` and stay valid for any proxy in the namespace. File
@@ -1663,13 +1865,14 @@ Disabled plugin configs are stored without plugin-specific construction, so oper
 
 Global-scope requirements for `transaction_log_schema` and `prometheus_metrics` still apply while disabled.
 
-Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw. An `operator` write that sends one of the projection's placeholders back at a masked field is refused with `400`; see [Masked secrets on write](#masked-secrets-on-write-redaction-placeholders).
+Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw. The projection covers the plugin `config` and its resource-level execution `trigger`. An `operator` write that sends one of the projection's placeholders back at a masked field is refused with `400`; see [Masked secrets on write](#masked-secrets-on-write-redaction-placeholders).
 
-That projection is driven by a **schema-aware sensitivity contract** (`src/admin/plugin_config_projection.rs`), not by field-name guessing. Every built-in plugin has an entry declaring which config paths carry credentials, and a CI parity test fails if a new built-in ships without one. Three layers run in order, and each can only add redaction:
+That projection is driven by a **schema-aware sensitivity contract** (`src/admin/plugin_config_projection.rs`), not by field-name guessing. Every built-in plugin has an entry declaring which config paths carry credentials, and a CI parity test fails if a new built-in ships without one. Four layers run in order, and each can only add redaction:
 
 1. **Schema rules** — exact per-plugin paths, with `*` wildcards for arbitrary maps and arrays and case/delimiter-insensitive segment matching that also equates compact spellings (`customHeaders`, `custom-headers`, `custom.headers`, `custom_headers`, and `customheaders` are one path). Rules classify a value as a wholesale secret, a structural endpoint URL, a Redis URL, or a librdkafka producer-property map.
-2. **Name heuristics** — the historical substring matcher (`api_key`, `client_secret`, `private_key`, `*_integrity_key`, `*function_key*`, `webhook`, plus the shared log-redaction key list). It still covers custom plugins, which have no built-in schema.
+2. **Name heuristics** — the historical substring matcher (`api_key`, `client_secret`, `private_key`, `*_integrity_key`, `*function_key*`, `webhook`, plus the shared log-redaction key list). It is a floor beneath the built-in schemas; a custom plugin, which has no schema, has every scalar leaf withheld instead (see below).
 3. **Structural URL sweep** — any remaining string anywhere in the config that parses as a URL carrying userinfo has that userinfo replaced by `redacted`, so `https://user:pass@host/x` cannot survive a projection even on a path no rule names.
+4. **TLS-material sweep** — the same classification as [Backend TLS private keys in reads](#backend-tls-private-keys-in-reads), applied to the whole config: a string carrying a PEM private-key block is withheld wherever it occurs, and a field named as a TLS private-key, certificate, or CA source (`client_key_path`, `client_cert_path`, `server_ca_cert_path`, `backend_tls_*`, `private_key`, `client_certificate`, `ca_certificates`) is classified exactly as in a Proxy or Upstream, which also covers the `mesh_route_dispatch` route-local `destination.backend_tls` and the Proxy / Upstream objects a `mesh_authz` `mesh_slice` embeds.
 
 A structurally projected endpoint URL keeps `scheme://host[:port]`, replaces userinfo with `redacted@` when present, and emits `[REDACTED_PATH]`, `[REDACTED_QUERY]`, and `[REDACTED_FRAGMENT]` markers for the components that were present. A value that does not parse as a URL, or that has no host, fails closed to `[REDACTED]`. A plugin `config` that is not an object (and not `null`) is replaced wholesale — no built-in accepts a scalar or array config, so its interior cannot be classified. Explicit JSON `null` values on sensitive fields stay `null` (they disclose nothing) rather than becoming `[REDACTED]`.
 
@@ -1680,30 +1883,52 @@ Fields covered by the schema include:
 | `serverless_function` | `function_url`, `aws_endpoint_url` | structural URL |
 | `serverless_function` | `azure_function_key` | `[REDACTED]` (sent verbatim as `x-functions-key`) |
 | `http_logging`, `loki_logging`, `ws_logging` | `endpoint_url` | structural URL |
-| `http_logging`, `loki_logging` | `custom_headers.*` | `[REDACTED]` |
+| `http_logging`, `loki_logging`, `ws_logging` | `custom_headers.*` | `[REDACTED]` |
 | `loki_logging` | `authorization_header` | `[REDACTED]` |
 | `otel_tracing` | `endpoint` | structural URL |
 | `otel_tracing` | `authorization`, `headers.*` | `[REDACTED]` |
 | `opa`, `ai_transcript_audit` | `headers.*`, `custom_headers.*` | `[REDACTED]` |
+| `opa` | `opa_host` | structural URL (a base path is kept in every decision URL; `policy_path` stays visible) |
+| `request_mirror`, `mesh_route_dispatch` | `mirror_path`, `rules.*.rewrite.uri` | `[REDACTED]` unless empty or `/`: an outbound destination path configured apart from its host and port is treated like an endpoint URL's path (the host, port, protocol, and `rewrite.authority` stay visible; the client-facing `redirect.uri` is not outbound and stays visible) |
 | `ai_transcript_audit` | `sink.endpoint_url` | structural URL |
 | `ai_transcript_audit` | `sink.custom_headers.*` | `[REDACTED]` |
 | `api_chargeback_sink` | `clickhouse.insert_query_params.*` | `[REDACTED]` (credential-*named* keys are already rejected at admission; the values stay arbitrary) |
 | `proxy_alerts` | `channels.*.url` | structural URL (`channels.*.webhook_url` is caught wholesale by the name heuristic and projects as `[REDACTED]`) |
 | `proxy_alerts` | `channels.*.headers.*`, `channels.*.body_template` | `[REDACTED]` |
+| `request_transformer` | `rules.*.value` | `[REDACTED]` (header, query and body values are written into the upstream request and may carry a backend credential; `operation`, `target` and `new_key` stay visible, while `key` is already masked by the name heuristic) |
+| `mesh_route_dispatch` | `rules.*.request_transform.*.value` | `[REDACTED]` (same reason as `request_transformer`) |
+| `mesh_route_dispatch` | `rules.*.match.headers.*`, `rules.*.match.without_headers.*`, `rules.*.match.query_params.*` | `[REDACTED]` for a bare-string operand; an `{exact\|prefix\|regex}` operand keeps its match kind and masks the value |
+| `mesh_authz` | `rules.*.to.*.headers.*`, `rules.*.when.*.values`, `rules.*.when.*.not_values` of every policy in `mesh_policies`, `mesh_slice.mesh_policies` and `mesh_slice.node_waypoint_capture_mesh_policies` | `[REDACTED]` per entry, so the lists keep their length (every condition value is withheld, because the condition `key` decides whether it is a header value) |
+| `mesh_authz` | `mesh_slice.ext_authz_providers.*.include_additional_headers_in_check.*.value`, `mesh_slice.ext_authz_providers.*.path_prefix`, `mesh_slice.proxy_configs.*.environment.*`, `mesh_slice.extension_configs.*.value` | `[REDACTED]` (the provider's `name`, `service`, and `port` stay visible) |
+| `mesh_authz` | the TLS key, certificate, and CA sources of every `mesh_slice.virtual_service_l4_proxies.*` / `virtual_service_l4_upstreams.*` object (`backend_tls_*`, `port_overrides.*.tls.*`, `subsets.*.traffic_policy.tls.*`) | TLS-material sweep: inline key material, or a certificate-plus-key bundle in a certificate or CA field, is `[REDACTED]`; references and certificate-only PEM stay visible |
+| `mesh_authz` | `mesh_slice.telemetry_resources.*.config.tracing.providers.*.config.{url,agent_url,collector_url,endpoint}`, `mesh_slice.request_authentications.*.jwt_rules.*.jwks_uri`, `mesh_slice.multi_cluster.federation_endpoint`, `mesh_slice.multi_cluster.remote_clusters.*.{control_plane_url,federation_endpoint}` | structural URL |
+| every plugin (resource-level `trigger`, a sibling of `config`) | `header` / `query` / `cookie` `value.exact[*]`, `value.prefix[*]`, `value.regex` anywhere in the `all` / `any` / `not` tree | `[REDACTED]` (field names, `presence`, `multi_value`, `case_insensitive`, match kinds, and the other predicates stay visible; a shape the trigger schema does not define is withheld wholesale) |
+| `request_termination` | `trigger.header_value` | `[REDACTED]` (`trigger.header` stays visible) |
+| `mesh_route_dispatch`, `udp_logging` | `rules.*.destination.backend_tls.client_key_path` (TLS-material sweep), `dtls_key_path` | `[REDACTED]` when the value is or may be inline key material; a path or `k8s://` / `vault://` / `managed://` reference stays visible |
+| `mesh_route_dispatch`, `udp_logging`, `soap_ws_security`, `mtls_auth` | `rules.*.destination.backend_tls.{client_cert_path,server_ca_cert_path}` (TLS-material sweep), `dtls_cert_path`, `dtls_ca_cert_path`, `x509_signature.trusted_certs.*`, `saml.trusted_signing_certs.*`, `allowed_issuers.*.ca_certificate_pem` | `[REDACTED]` only when the value carries a PEM private-key block (a certificate-plus-key bundle); certificate-only PEM and references stay visible |
+| `transaction_debugger` | `capture_request_header_value` | `[REDACTED]` (`capture_request_header` stays visible) |
+| `ai_semantic_firewall` | `privacy.snippet_hash_salt` | `[REDACTED]` |
 | `kafka_logging` | `producer_config.*` | `[REDACTED]` unless the property is on the safe-tuning allow-list |
 | `jwks_auth`, `oauth2_introspection`, `oidc_relying_party` | `providers.*.{discovery_url,jwks_uri,introspection_endpoint,userinfo_endpoint,end_session_endpoint}` | structural URL |
 | `oidc_relying_party` | `providers.*.{token_endpoint,authorization_endpoint}` | `[REDACTED]` after structural projection because the additive name heuristic treats `token` and `authorization` as sensitive |
 | `mcp_gateway` | `servers.*.upstream_url` | structural URL |
+| `mcp_gateway` | `servers.*.headers.*` | `[REDACTED]` |
+| `ai_tool_governor` | `approval.headers.*` | `[REDACTED]` |
+| `openapi_validator` | `bypass.header_present.*` | `[REDACTED]` (shared secrets that skip validation) |
+| `waf` | `global_exemptions.header_present.*` | `[REDACTED]` (shared secrets that suppress every rule) |
+| `waf` | `custom_rules.*.conditions.headers.*`, `rule_overrides.*.conditions.headers.*` | `[REDACTED]` (a `null` presence-only condition stays `null`) |
 | `ldap_auth`, `spec_expose`, `api_chargeback_sink`, `ai_*` provider endpoints | discovery/base/endpoint URLs | structural URL |
 | `workload_metrics` | `tracing_provider.config.{url,agent_url,collector_url,endpoint}` and the corresponding `tracing_providers.*` paths | structural URL |
 
 Header **values** are secret by default wherever a plugin accepts an arbitrary header map, because vendor authentication header names (`x-honeycomb-team`, `dd-api-key`, `lightstep-access-token`) match no substring pattern. Header **names** stay visible as routing diagnostics. Configuration keys that hold header *name lists* rather than values (`expose_headers`, `claim_headers`, `vary_by_headers`, `forward_headers`, `redact_headers`, …) are deliberately not redacted — distinguishing them from value maps is exactly what the schema exists to do.
 
+A custom plugin (a plugin name with no built-in schema entry) cannot be classified: the projection cannot tell which of its values are credentials, whether a header map under an unexpected key, a list of name/value pairs, or a numeric account id. Its config therefore fails closed. `viewer` and `operator` reads, audit diffs, and the configuration export withhold **every scalar leaf** (string, number, and boolean), showing `[REDACTED]` (a fingerprint in the export). Object keys, array shapes, and `null` values stay visible, so the structure is still readable. Because keys stay visible, a custom plugin must not put a secret in an object key (for example a map keyed by token); only values are withheld. An `operator` write that echoes those placeholders is refused like any other masked secret. To change a custom plugin's config, an operator must send real values, or an `admin` must make the change. `admin` reads stay raw. Built-ins keep their declared projection.
+
 `kafka_logging.producer_config` is an open escape hatch forwarded verbatim to librdkafka, several of whose properties are marked sensitive upstream (`ssl.key.pem`, `ssl.key.password`, `ssl.keystore.password`, `sasl.password`, `sasl.oauthbearer.config`, …). The projection therefore allow-lists the known non-credential tuning properties and redacts everything else, so a newly added upstream sensitive property is redacted by default. Separately, `producer_config` values carrying inline PEM private-key material are **rejected at admission** — use the top-level `ssl_key_location` field or an external secret reference. The rejection message names only the property, never the rejected material.
 
 `GET /backup` remains `admin`-only and intentionally exports raw configuration: backups must stay restorable.
 
-For Redis-backed plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `request_deduplication`, `graphql`, `grpc_method_router`, `ai_semantic_cache`) the same projection covers two more secrets. `redis_integrity_key` — the HMAC-SHA256 secret that authenticates `ai_semantic_cache` Redis envelopes — is replaced wholesale by `[REDACTED]`, as is any other key whose normalized (delimiter-stripped lowercase) name contains `integritykey` (so `redis_integrity_key`, `redisIntegrityKey`, and `redisintegritykey` match); disclosure would let a reader forge an envelope the gateway replays as a cache hit. `redis_url` (including delimiter-stripped forms such as `redisUrl`, `redis-url`, and `redisurl`) is *not* wholesale-redacted, because its scheme, host, port, and database number are the diagnostics an operator needs: userinfo is replaced and stripped query/fragment components get `[REDACTED_QUERY]` and `[REDACTED_FRAGMENT]` markers. For example, `redis://user:pass@cache.internal:6379/3?token=secret#private` projects as `redis://redacted@cache.internal:6379/3?[REDACTED_QUERY]#[REDACTED_FRAGMENT]`, while a query-free URL with userinfo projects as `redis://redacted@cache.internal:6379/3`. A `redis_url` value that cannot be parsed as a URL, or that uses any scheme other than `redis`/`rediss`, fails closed to `[REDACTED]`. The separate `redis_password` field is already covered by the existing password matcher; `redis_username` is not secret material and stays visible. Because full `admin` reads stay raw, rotating either secret by read-modify-write still works.
+For Redis-backed plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `request_deduplication`, `graphql`, `grpc_method_router`, `ai_semantic_cache`, and the shared replay caches of `jwks_auth`, `hmac_auth`, and `soap_ws_security`) the same projection covers two more secrets. `redis_integrity_key` — the HMAC-SHA256 secret that authenticates `ai_semantic_cache` Redis envelopes — is replaced wholesale by `[REDACTED]`, as is any other key whose normalized (delimiter-stripped lowercase) name contains `integritykey` (so `redis_integrity_key`, `redisIntegrityKey`, and `redisintegritykey` match); disclosure would let a reader forge an envelope the gateway replays as a cache hit. `redis_url` (including delimiter-stripped forms such as `redisUrl`, `redis-url`, and `redisurl`) is *not* wholesale-redacted, because its scheme, host, port, and database number are the diagnostics an operator needs: userinfo is replaced and stripped query/fragment components get `[REDACTED_QUERY]` and `[REDACTED_FRAGMENT]` markers. For example, `redis://user:pass@cache.internal:6379/3?token=secret#private` projects as `redis://redacted@cache.internal:6379/3?[REDACTED_QUERY]#[REDACTED_FRAGMENT]`, while a query-free URL with userinfo projects as `redis://redacted@cache.internal:6379/3`. A `redis_url` value that cannot be parsed as a URL, or that uses any scheme other than `redis`/`rediss`, fails closed to `[REDACTED]`. The separate `redis_password` field is already covered by the existing password matcher; `redis_username` is not secret material and stays visible. Because full `admin` reads stay raw, rotating either secret by read-modify-write still works.
 
 ## Upstreams
 
@@ -1923,56 +2148,14 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/restore?confirm=true"
 ```
 
-The backup output can be passed unchanged to `POST /batch` (additive) or `POST /restore` (full replacement). Backup resources always include `id`s; restore requires them, while batch generates them if a caller strips them. [admin_backup_restore.md](admin_backup_restore.md) is the full reference; the key points are:
+The backup output can be passed unchanged to `POST /batch` (additive) or `POST /restore` (full replacement). Backup resources always include `id`s; restore requires them, while batch generates them if a caller strips them. [admin_backup_restore.md](admin_backup_restore.md) is the full reference; in summary:
 
-- **Backup is audited unconditionally.** Successful exports and authenticated denied/failed attempts are audited before (or instead of) releasing unredacted bytes, independent of `FERRUM_ADMIN_AUDIT_ENABLED`. If no audit sink accepts the success record, the export returns `503` with no attachment. See [Audit Log](#audit-log).
-- **Strict `resources` filter.** Query keys and values are strictly percent-decoded (`?resources=proxies%2Cconsumers` is a two-token filter; `?%72esources=` is the same key). `+`, whitespace (raw or encoded, e.g. `?resources=proxies, upstreams`), bad `%` escapes, invalid UTF-8, duplicates, a key-only `?resources`, and unknown tokens all fail closed with `400` and the static `Unsupported backup resource filter` text; the rejected text is never echoed, and audit records the fixed `invalid` sentinel. A filter never widens to a full, credential-bearing export.
-- **Closed restore envelope.** `POST /restore` requires a JSON object and rejects unknown top-level keys with `400` before anything is deleted. Accepted keys are `version`, `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`, `gateway_trust_bundles`, and the backup metadata `ferrum_version`, `exported_at`, `source` (strings) and `counts` (object), which are shape-checked and ignored. An explicit `{}` or empty arrays mean "replace this namespace with nothing". `POST /batch` and single-resource writes also require a JSON object, and object-valued fields (`circuit_breaker`, `retry`, `stream_match`, `trigger`, `health_checks`, `hash_on_cookie_config`, `service_discovery`, `locality_lb_setting`) accept an object or `null`, never an array.
-- **Validate, snapshot, then replace.** Restore validates the payload, acquires a persistent namespace guard, and snapshots the current namespace with a non-validating raw load from the primary (so already-invalid config can still be rolled back). The same guard owner is held through the clear, every import batch, and any compensating replay, so concurrent writers fail closed instead of being lost. If the snapshot cannot be taken, restore **aborts with `503` before deleting anything**. Inserts are chunked into 1,000-record batches. Conditional mTLS DNS-identity uniqueness is checked under the same guard; only the rollback replay of the old snapshot skips newly introduced mTLS DNS admission.
-- **Failure reporting.** A failed restore returns `500` with `rollback`: `completed`, `incomplete`, `not_needed` (the clear aborted atomically on SQL / replica-set MongoDB, so nothing was deleted), or `unknown_outcome` (an unknown MongoDB commit result; the guard stays held). `api_specs_not_restored` / `api_specs_note` appear only when rollback is `incomplete` and the prior namespace carried specs.
-- **API specs** travel as a versioned `api_specs` section (`section_version: "2"`). Restoring a legacy backup that omits the section into a namespace that still holds specs requires `?confirm_api_spec_deletion=true` in addition to `?confirm=true`.
-- **Gateway trust bundles** travel as a `gateway_trust_bundles` array on full, unfiltered database exports only. On restore an **absent** array leaves existing roots untouched; a **present** array (including an empty one, which revokes) is authoritative for the authenticated target namespace. More than one record is rejected with `400`. Records are re-validated through the normal admission path before the clear; `id` and `created_at` come from the stored record, `revision` is assigned by the store, and `updated_by` is the restoring admin's JWT subject (at most 255 characters; longer subjects are rejected).
+- **Backup is audited unconditionally**, independent of `FERRUM_ADMIN_AUDIT_ENABLED`; if no audit sink accepts the success record, the export returns `503` with no attachment. See [Audit Log](#audit-log).
+- **Strict `resources` filter.** Malformed, duplicate, or unknown filter tokens fail closed with `400`.
+- **Closed restore envelope.** `POST /restore` rejects unknown top-level keys with `400` before anything is deleted.
+- **Validate, snapshot, then replace.** Restore validates the payload and snapshots the current namespace under a persistent namespace guard before the destructive clear; if the snapshot cannot be taken it aborts with `503` before deleting anything.
 
-### Namespace metadata is not part of a backup
-
-A namespace backup payload carries namespace-**scoped configuration
-resources** — proxies, consumers, plugin configs, upstreams, API specs, and
-gateway trust bundles — and never the namespace registry row itself (its
-`description` and its `created_at`/`updated_at`). This boundary is deliberate:
-`POST /restore` writes into the **authenticated target namespace**, so
-transplanting the source tenant's registry metadata into a different target
-would silently relabel that target from an artifact taken elsewhere.
-
-The consequences are explicit rather than implied:
-
-- Restoring **in place** (same namespace the backup came from) leaves that
-  namespace's registry row untouched: description and timestamps are preserved
-  exactly as they were, including across the destructive clear.
-- Importing into a **fresh target** yields a namespace that holds resources but
-  has no registry row and therefore no description — a derived-only namespace.
-  It still appears in `GET /namespaces`, and `GET /namespaces/{name}` returns a
-  synthesized record with observation timestamps (see [Derived-only namespace
-  timestamps](#derived-only-namespace-timestamps)). Use `POST /namespaces` or
-  `PUT /namespaces/{name}` to materialize a durable registry row with the
-  description you want.
-
-### MongoDB restore refuses malformed split identities
-
-`POST /restore` on MongoDB uses the same strict namespace cascade as namespace
-`DELETE ?confirm=true`. Before its destructive clear, it validates every
-consumer and consumer-identity-index document's durable key against its
-embedded `namespace` (`_id = "{namespace}:{suffix}"` plus a matching
-`namespace` field and identity value), and deletes only the identities it
-validated.
-
-A document whose `_id` and embedded `namespace` disagree (a split identity that
-only a hand-edited database or an out-of-band writer can produce) aborts the
-restore as registry corruption: a redacted `500`, rolled back, prior
-configuration retained. This is intentional: deleting it could delete another
-tenant's data, and skipping it would leave the target namespace half-cleared.
-Repair or deliberately remove the offending document and re-run the restore.
-
-See [admin_backup_restore.md](admin_backup_restore.md) for details.
+Two destructive-restore exceptions to know: restoring a backup without an `api_specs` section into a namespace that still holds specs requires `?confirm_api_spec_deletion=true`, and an **absent** `gateway_trust_bundles` array leaves trust untouched while a **present** one (including an empty one, which revokes) is authoritative. [Namespace registry metadata is not part of a backup](admin_backup_restore.md#namespace-metadata-is-not-part-of-a-backup), and [MongoDB restore refuses malformed split identities](admin_backup_restore.md#mongodb-restore-refuses-malformed-split-identities).
 
 ### Read-only configuration export (`GET /config/export`)
 
@@ -1997,12 +2180,15 @@ curl -H "Authorization: Bearer $VIEWER_TOKEN" \
     per entry.
   - In plugin configs, fingerprints replace secrets and credential-bearing
     URLs, including URLs whose path or query would otherwise be masked.
-  - Upstream `service_discovery.consul.token` gets a fingerprint, and any URL
-    carrying userinfo anywhere in a Proxy or Upstream (a Consul `address`,
-    for example) is fingerprinted. `viewer` reads and audit diffs strip that
-    userinfo to `redacted@` as well. `operator` and `admin` reads of proxies
-    and upstreams keep it verbatim: both roles write those resources, and a
-    GET-then-PUT must not replace stored userinfo with `redacted@`.
+  - Upstream `service_discovery.consul.token` gets a fingerprint, as does
+    stored backend TLS private-key material in a Proxy or Upstream (see
+    [Backend TLS private keys in reads](#backend-tls-private-keys-in-reads));
+    key references stay verbatim. Any URL carrying userinfo anywhere in a
+    Proxy or Upstream (a Consul `address`, for example) is fingerprinted.
+    `viewer` reads and audit diffs strip that userinfo to `redacted@` as well.
+    `operator` and `admin` reads of proxies and upstreams keep it verbatim:
+    both roles write those resources, and a GET-then-PUT must not replace
+    stored userinfo with `redacted@`.
 
   A value the viewer projection shows is shown verbatim.
 - **Hidden credential types.** Ordinary Consumer reads omit `basicauth` and
@@ -2012,10 +2198,18 @@ curl -H "Authorization: Bearer $VIEWER_TOKEN" \
   It is present even when a consumer has none, so it shows that hidden
   credentials changed without revealing whether any exist.
 - **Fingerprint format.** `hmac-sha256:<64 lowercase hex>`, computed as
-  HMAC-SHA-256 under a subkey derived from `FERRUM_ADMIN_JWT_SECRET`
+  HMAC-SHA-256 under a subkey derived from
+  `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`
   (`HMAC-SHA-256(secret, "ferrum-edge/admin-config-export-fingerprint/v1")`).
-  The subkey is never derived from the viewer secret, so the reader cannot
-  compute or dictionary-test a fingerprint.
+  - The subkey is never derived from the viewer secret, so the reader cannot
+    compute or dictionary-test a fingerprint.
+  - It is never derived from `FERRUM_ADMIN_JWT_SECRET` either
+    (GHSA-crqx-mp2f-v8c8). `fingerprint_key_id` and the fingerprint of an
+    empty hidden-credential map are MACs over inputs every reader knows; keyed
+    by the primary secret they would let a viewer-key holder test offline
+    guesses of the secret that mints `admin` tokens. The fingerprint secret
+    must be at least 32 characters and differ from `FERRUM_ADMIN_JWT_SECRET`,
+    `FERRUM_ADMIN_JWT_VIEWER_SECRET`, and `FERRUM_CP_DP_GRPC_JWT_SECRET`.
   - The MAC input binds the resource kind, namespace, id, and the field's JSON
     pointer (for example `/credentials/keyauth/0/key` or
     `/config/headers/x-api-key`) to a key-sorted canonical JSON of the stored
@@ -2030,11 +2224,14 @@ curl -H "Authorization: Bearer $VIEWER_TOKEN" \
     its pointer uses index `0` (for example `/credentials/keyauth/0/key`), so
     the pointer always names the emitted position.
 - **Stable.** An unchanged credential fingerprints identically across calls and
-  across replicas that share `FERRUM_ADMIN_JWT_SECRET`. Rotating that secret
-  changes every fingerprint and `redaction.fingerprint_key_id`. Two caveats:
-  - In `file`/`mesh`/`node_agent` mode without `FERRUM_ADMIN_JWT_SECRET`, the
-    key is random per process, so fingerprints change on every restart.
-  - A CP and a DP (or any two replicas) whose admin secrets differ never
+  across replicas that share `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`.
+  Rotating that secret changes every fingerprint and
+  `redaction.fingerprint_key_id`. Two caveats:
+  - Without `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`, in any mode, the
+    key is random per process, so fingerprints change on every restart and
+    differ between replicas. Set it on every replica whose exports a drift
+    tool compares.
+  - A CP and a DP (or any two replicas) whose fingerprint secrets differ never
     produce comparable fingerprints.
 - **Residual oracle.** A principal that can *write* a field (an operator for
   plugin configs, upstreams, and proxies; an admin for consumers) can confirm
@@ -2081,6 +2278,40 @@ The TLS/ACME stores remain independent of config-database topology, but their
 audit handoff still happens before the action. A `fail_closed` audit outage
 therefore refuses the audited TLS/ACME action without applying sticky database
 failover policy to that independent store or operational reload.
+
+### Modes without a configuration database
+
+`mesh`, `file`, and `dp` have no `audit_events` table. Their audited actions
+(for example `POST /mesh/config-revision/reset` and `POST /admin/tls/rotate`)
+still prepare and finalize through the spool exactly as below, but the delivery
+target is the **bounded local audit retention file**
+`admin-audit-retention.json` in `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` (issue #7200):
+
+- A delivery worker starts with the admin listener. It adopts records
+  abandoned by earlier process generations (`unknown_outcome` included),
+  replays them, and drains every finalized record from `pending/` into the
+  retention file, so the spool stays empty instead of growing until
+  `FERRUM_ADMIN_AUDIT_SPOOL_MAX_RECORDS` saturates and `fail_closed` refuses
+  audited actions.
+- Without a spool the finalized event is written to the retention file
+  directly before the response returns.
+- The file is hardened, locked, and atomically published like the backup
+  fallback file beside it, and rotates the same way: it keeps the newest
+  records by event timestamp within
+  `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS` (default 4096) and
+  `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES` (default 16 MiB), dropping the
+  oldest with a content-free `audit_local_retention_rotated` warning. Delivery
+  order does not matter: a late replay of an older record never rotates a
+  newer one out. Lowering either bound takes effect on the next append, which
+  rotates the existing file down. A replayed record (same event id) is not
+  written twice; the retention directory is synced again before the replay is
+  acknowledged.
+- `ferrum_admin_audit_evidence_lost` latches only when the retention write
+  itself fails; a replayed record whose write fails stays durable in the spool
+  and is retried like any delivery.
+- Nothing ships the file: it is not returned by `GET /audit`. Collect it like
+  any other on-host security log, and put `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` on
+  a persistent, writable volume.
 
 ### Durable evidence before the mutation
 
@@ -2323,7 +2554,7 @@ not apply, so an `errors`-mode body without retries or a rejection keeps its
 | Status | When |
 |---|---|
 | `200` | Resolved. `detail` is `null` (and `detail_available` is `false`) until the request's terminal transaction record exists — a streamed response records it when its body ends — and, in `errors` mode, for the overload and stale-configuration fences, which answer before a request context exists (`all` mode records their detail) |
-| `401` | Missing or invalid admin JWT |
+| `401` | Missing or invalid admin JWT. Carries `WWW-Authenticate`: `Bearer` (missing token or unavailable authentication), `Bearer error="invalid_request"` (malformed `Authorization`), or `Bearer error="invalid_token"` (failed verification) |
 | `403` | The JWT lacks the `diagnostics:read` scope or carries no `ns` claim. Decided from the credential alone, before the reference is read. The attempt still counts against the rate limit |
 | `404` | Malformed, unknown, expired, or evicted reference; a reference outside the token's `ns` namespaces; a replica-tagged reference another gateway process minted; or references are off. All identical, so references cannot be probed. Only the replica-tagged case adds `X-Ferrum-Diagnostic-Owner-Replica`, and only for a token whose `ns` claim names this gateway's namespace; the value is read from the reference itself |
 | `429` | More than `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10) attempts in the current second across all callers, or more than half of it (at least 1) from one JWT `sub`. Every attempt counts against its subject's share, including one refused with `403`; only an attempt whose credential passes the scope and `ns` checks also consumes the global budget, and an attempt refused by either budget consumes neither. Carries `Retry-After: 1` |
@@ -2489,6 +2720,7 @@ Returns (abridged; cached for 5 seconds):
   "caches": { ... },
   "consumer_index": { ... },
   "rate_limiting": { ... },
+  "adaptive_concurrency": { ... },
   "tcp_connection_throttle": { ... }
 }
 ```
@@ -2532,6 +2764,10 @@ The response is cached briefly (`FERRUM_METRICS_RUNTIME_CACHE_MS`, default `1000
 ## Charges
 
 The `/charges` endpoint exposes per-consumer API usage charges tracked by the `api_chargeback` plugin. It requires the same admin JWT authentication as other sensitive admin endpoints.
+
+Each row's `consumer` (the JSON `consumers` key and the Prometheus `consumer` label) is the authenticated principal's billing identity: a mapped Consumer's username unchanged, or `external:<mechanism>:<authority>:<identity>` for an unmapped external principal, so a Consumer and same-named external principals from distinct mechanisms or authorities never share a row (GHSA-q9vj-rf66-3j58). The `external:` prefix is reserved: a Consumer whose username begins with it is reported in its `~sha256:` digest form, as are oversized or marker-bearing values. Rows recorded before this keying took effect carry bare display identities; see the [upgrade guide](upgrade_guide.md) for the cutover. See [plugins.md](plugins.md#api_chargeback) for the full form.
+
+Only a **designated billing collector** acknowledges delivery: a token whose `scope` claim grants `charges:collect` (a space-delimited string such as `"scope": "charges:collect"`, or an array). Its delivered responses count toward the two-hand-off rule that lets idle rows past `stale_entry_ttl_seconds` be evicted (see [plugins.md](plugins.md#api_chargeback)). Every other authenticated read gets the same document without side effects, so a dashboard, an operator `curl`, or any `FERRUM_ADMIN_JWT_VIEWER_SECRET` token (whose scope claims grant nothing) cannot make rows the collector never received evictable (GHSA-jjvr-vvwv-8qmh). The `role` claim never implies the scope; a `viewer` token with `charges:collect` is a sufficient collector credential.
 
 Monetary samples convert the stored `u64` counter to IEEE-754 binary64 and
 multiply it by the configured binary64 unit price (accepted rates are finite
@@ -2626,6 +2862,8 @@ Each `api_chargeback` plugin instance owns its own `currency` (per global/proxy/
 A proxy that serves both HTTP and stream traffic under one `proxy_id` reports `"protocol_family": "mixed"` and includes both a populated `by_status` map and a `stream` sub-object, so the per-family breakdown always reconciles with the totals. For gRPC/gRPC-Web, `by_status` is the effective billing status derived from the final client-visible terminal code; it does not overwrite the wire HTTP status in transaction logs. Missing, malformed, and unknown terminal codes fail closed to the `500` bucket.
 
 **Multi-node deployments**: Each gateway node accumulates charges independently in memory. In CP/DP topologies, scrape `/charges` from every DP node with admin JWT credentials and aggregate externally. See [plugins.md](plugins.md#api_chargeback) for Prometheus scrape configuration examples.
+
+`GET /charges/sink/status` returns `api_chargeback_sink` delivery status as JSON under the same admin-JWT gate; see [plugins.md](plugins.md#api_chargeback_sink).
 
 ## API Spec Management
 
@@ -2955,11 +3193,12 @@ self-description, not a cryptographic attestation of its host. The set is a
 point-in-time view of connected Subscribe streams: a DP that is partitioned
 from the CP keeps serving its cached config but is not listed, and a DP using
 another control plane is never seen. Consumers should require
-`all_connected_public_only_guaranteed=true` **and** compare
-`connected_data_planes` (live streams) against their expected data-plane
-inventory. When replicas share one node id, compare the stream count, not the
-distinct `node_id`s. A transient reconnect overlap can briefly count one DP
-twice; that only weakens or over-counts the set, never hides a stream.
+`all_connected_public_only_guaranteed=true` **and** require a count of distinct
+`node_id` values in `data_planes` that reaches the number of data-plane
+processes they expect for the namespace. Each Edge DP process subscribes under
+its own random `node_id`; `connected_data_planes` counts streams, so a
+reconnect overlap can count one process twice. Replicas that share one node id
+(externally minted DP JWTs) count once, so the check fails closed for them.
 `GET /cluster` shows the same per-stream reports for every namespace.
 
 Authorization: this endpoint is open to `viewer` tokens and viewer-key
@@ -2992,15 +3231,17 @@ their meaning requires a versioned contract update in `ferrum-contracts`.
 
 ## Backend Capability Registry
 
-Ferrum Edge classifies each HTTP-family backend target's protocol support (HTTP/1.1, HTTP/2 over TLS, HTTP/3, gRPC-over-TLS, h2c) at startup and on a periodic background refresh (`FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS`, default 24h). The hot path consults this registry to decide whether to route plain HTTPS traffic through the native H3 pool, the direct HTTP/2 pool, or the generic reqwest path without per-request probing. See [CLAUDE.md — Backend Capability Registry](../CLAUDE.md) and [docs/http3.md](http3.md) for the underlying design.
+Ferrum Edge classifies each HTTP-family backend target's protocol support (HTTP/1.1, HTTP/2 over TLS, HTTP/3, gRPC-over-TLS, h2c) at startup and on a periodic background refresh (`FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS`, default 24h). The hot path consults this registry to decide whether to route plain HTTPS traffic through the native H3 pool, the direct HTTP/2 pool, or the generic reqwest path without per-request probing. See [docs/http3.md](http3.md) for the underlying design.
 
 Plaintext HTTP backends are still probed for prior-knowledge h2c because gRPC is a runtime flavor, not a scheme — a single `http` origin may carry native gRPC. That probe uses the same pool handshake as live gRPC, but with explicit capability-probe context: an expected HTTP/1.1 classification miss (`h2c handshake failed`) is a debug-level event, including on SIGHUP refresh, and does not emit `WARN` at the documented default `FERRUM_LOG_LEVEL=warn`. Request-time gRPC establishment failures, probe dial timeouts, port exhaustion, and unexpected candidate connection/handshake failures remain `WARN`/`ERROR`. Secrets and credential metadata are never included in these lines.
+
+An HTTPS target's entry is published in two stages. The HTTP/2-over-TLS verdict (`plain_http.h2_tls`, `grpc_transport.h2_tls`, `plain_http.h1`) is written as soon as that probe answers; the HTTP/3 verdict follows when its probe finishes, which against a backend with no QUIC listener is the probe timeout (`backend_connect_timeout_ms`, capped at 5 s). While a background refresh is between the two, `GET /backend-capabilities` shows the new HTTP/2 classification next to the **previous** `plain_http.h3` value — `"unknown"` for a target that has never been classified. Poll for the field you need rather than for the entry's existence. Startup warmup and `POST /backend-capabilities/refresh` return only after both stages, so the state they leave is complete.
 
 Two JWT-authenticated endpoints let operators inspect and force-refresh the registry at runtime.
 
 ### `GET /backend-capabilities`
 
-Returns every cached entry keyed by the deduplicated backend-target identity the registry uses internally (scheme + host + port + `dns_override` + CA + mTLS cert + mTLS key + verify flag, plus HBONE sidecar port for targets tagged `mesh.hbone=true`).
+Returns every cached entry keyed by the deduplicated backend-target identity the registry uses internally: scheme, host, port, `dns_override`, the effective backend TLS identity and policy (CA, client cert/key, SNI, SAN digest, verify flag, optional `tlsrefused`/`noglobalid` markers, and the `svidg=` segment, `svidg=static` here), plus HBONE port, dial host, and peer SPIFFE identity for targets tagged `mesh.hbone=true`. The key is an opaque internal connection identity; its field layout may change.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/backend-capabilities
@@ -3012,7 +3253,7 @@ Response:
 {
   "entries": [
     {
-      "key": "https|api.example.internal|443||/etc/ferrum/ca.pem|||1",
+      "key": "https|api.example.internal|443|…|1|svidg=static|",
       "plain_http": {
         "h1": "supported",
         "h2_tls": "supported",
@@ -3027,7 +3268,7 @@ Response:
       "last_probe_error": null
     },
     {
-      "key": "https|legacy.example.internal|443||||0",
+      "key": "https|legacy.example.internal|443|…|0|svidg=static|",
       "plain_http": {
         "h1": "supported",
         "h2_tls": "unsupported",
@@ -3219,7 +3460,7 @@ Returns `404 Not Found` outside mesh mode (no `mesh_runtime_state`). Returns `20
 
 ## Mesh Config Revision Reset (mesh mode)
 
-`POST /mesh/config-revision/reset` clears this DP's accepted authoritative config revision so the next mesh slice from **any** config authority is eligible again. Requires JWT authentication and the **`operator`** role (`403 Forbidden` without it). Returns `404 Not Found` outside mesh mode. This lowers a fail-closed freshness guard, so it requires explicit operator confirmation via `?confirm=true` (same pattern as destructive namespace and restore operations) and leaves a durable audit record when `FERRUM_ADMIN_AUDIT_ENABLED` is on. On success returns `200 OK`:
+`POST /mesh/config-revision/reset` clears this DP's accepted authoritative config revision so the next mesh slice from **any** config authority is eligible again. Requires JWT authentication and the **`operator`** role (`403 Forbidden` without it). Returns `404 Not Found` outside mesh mode. This lowers a fail-closed freshness guard, so it requires explicit operator confirmation via `?confirm=true` (same pattern as destructive namespace and restore operations) and leaves a durable audit record when `FERRUM_ADMIN_AUDIT_ENABLED` is on. Mesh mode has no configuration database, so that record is kept in the bounded local audit retention file (`admin-audit-retention.json` in `FERRUM_ADMIN_AUDIT_FALLBACK_PATH`; see [Modes without a configuration database](#modes-without-a-configuration-database)). On success returns `200 OK`:
 
 ```json
 {
@@ -3346,7 +3587,7 @@ Returns `503 Service Unavailable` when proxy state is not yet available, `404 No
 
 ### `POST /mesh/egress-scope/test`
 
-Dry-runs a candidate destination against the current scope. Accepts a JSON object with `host` (required) and `port` (optional). Returns whether the destination is admitted by the resolved scope. Never mutates slice state.
+Dry-runs a candidate destination against the current scope. Accepts a JSON object with `host` (required) and `port` (optional). Returns whether the destination is admitted by the resolved scope. Never mutates slice state. `host` may embed a port (`reviews.alpha.svc.cluster.local:8080`, `[2001:db8::1]:443`) using the data-plane grammar (decimal 1–65535, leading zeros allowed); an explicit `port` overrides it. Any other suffix (`:0`, `:+8080`, `:http`) stays part of the host and the candidate is reported as a `deny`, matching how the `mesh_outbound_registry` plugin judges that `Host`.
 
 Because this is a non-mutating diagnostic, it remains available in read-only
 mesh and DP admin states with the standard admin JWT authentication.
@@ -3450,7 +3691,7 @@ Returns `404 Not Found` outside mesh mode (when the mesh runtime state is not wi
 
 ## Mesh Federation (mesh mode)
 
-`GET /mesh/federation` is JWT-authenticated and mesh-only. It returns the currently cached cross-cluster SPIFFE trust bundles fetched by the federation poller — the poller hits each `MultiClusterConfig.remote_clusters[].federation_endpoint` at `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` and overlays the validated bundle on `TrustBundleSet.federated`. Each entry reports the originating cluster name, trust domain, endpoint URL, fetch timestamp, derived bundle age, and X.509/JWT authority counts. Returns `404` outside mesh mode or before any federation bundle has been cached. Raw workload addresses and bundle contents are never exposed.
+`GET /mesh/federation` is JWT-authenticated and mesh-only. It returns the currently cached cross-cluster SPIFFE trust bundles fetched by the federation poller — the poller hits each `MultiClusterConfig.remote_clusters[].federation_endpoint` at `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` and overlays the validated bundle on `TrustBundleSet.federated`. Each entry reports the originating cluster name, trust domain, endpoint origin (`scheme://host[:port]` only — userinfo, path, query, and fragment of the configured `federation_endpoint` are never returned, since they may carry credentials), fetch timestamp, derived bundle age, and X.509/JWT authority counts. Returns `404` outside mesh mode or before any federation bundle has been cached. Raw workload addresses and bundle contents are never exposed.
 
 ## Mesh Runtime Overlay (mesh mode)
 
@@ -3469,12 +3710,10 @@ map of strings, for example:
 {"labels": {"provisioned-by": "ferrum-nexus", "team": "platform"}}
 ```
 
-**Availability.** Resource labels landed on `main` in
-[#5483](https://github.com/ferrum-edge/ferrum-edge/pull/5483) on 2026-09-12.
-Every published release up to and including **v0.9.4** rejects the `labels`
-field with ``unknown field `labels` ``. **v0.9.5 is the first tagged release
-with resource labels**; operators and clients should use v0.9.5 or later.
-See the [v0.9.5 upgrade guidance](upgrade_guide.md#upgrading-to-095).
+**Availability.** **v0.9.5 is the first tagged release with resource
+labels**; v0.9.4 and earlier reject the `labels` field with
+``unknown field `labels` ``. See the
+[v0.9.5 upgrade guidance](upgrade_guide.md#upgrading-to-095).
 
 Labels appear on GET/list, backup/restore, file configuration, and CP/DP
 configuration, and survive namespace renames. Empty maps are omitted from
@@ -3500,15 +3739,15 @@ managed-resource ledger, consumer identities, or upstream target `tags`.
 The gateway namespace registry and fleet-global TLS/ACME/trust management
 surfaces are separate from these four gateway configuration resource types.
 
-This schema change follows the build-out policy: the SQL baseline includes the
-labels column for PostgreSQL, MySQL and SQLite; initialize/rebuild the development
-database from that baseline when deploying it. MongoDB stores labels through its
-existing BSON resource serialization. Upgrade the gateway and file validator
-before upgrading clients that emit labels in resource bodies. In control-plane
-deployments, upgrade every data plane before the control plane: `config_json`
-is parsed with `deny_unknown_fields`, so a data plane that predates this field
-rejects a namespace snapshot as soon as any resource in it carries a non-empty
-`labels` map, and it does not converge until it is upgraded.
+Upgrade the gateway and file validator before clients that emit labels; for
+the labels upgrade, follow the
+[v0.9.5 upgrade guidance](upgrade_guide.md#upgrading-to-095). In
+control-plane deployments the CP and every DP must run the same build: the
+ConfigSync build-identity gate refuses a mismatched peer before any config is
+streamed. Until a DP is replaced it keeps serving its last applied config only
+within `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` (default 3600); after that, the
+default `fail_closed` stale action refuses new traffic (see
+[configuration.md](configuration.md#control-plane--data-plane)).
 
 Diagnostic builds with the default-off `bench-h1-profile` feature append fixed
 `ferrum_h1_profile_*` metrics to the existing authenticated `/metrics` response.

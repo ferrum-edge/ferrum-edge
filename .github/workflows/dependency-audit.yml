@@ -1,8 +1,7 @@
 name: Dependency Audit
 
 # Scheduled supply-chain governance for the dependency tree and the vendored,
-# patched crates (reqwest / h3 / tungstenite / tokio-tungstenite / dimpl —
-# canonically docs/vendored-patch-lifecycle.json). The blocking
+# patched crates listed in docs/vendored-patch-lifecycle.json. The blocking
 # advisories gate also runs per-PR in ci.yml; this workflow re-checks against the
 # latest advisory database WITHOUT a PR (so a newly-published RUSTSEC advisory is
 # caught within a week even on a quiet repo) and adds two time-sensitive checks
@@ -25,9 +24,10 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
-  # cargo-deny runs `cargo metadata`; this workflow doesn't install sccache, so
-  # clear the checked-in sccache rustc-wrapper (.cargo/config.toml) — the same
-  # fallback the setup-sccache action applies — to avoid exec'ing a missing tool.
+  # cargo-deny runs `cargo metadata`; this workflow doesn't install sccache.
+  # The repository `.cargo/config.toml` names no rustc-wrapper, but clear any
+  # runner- or user-level one anyway — the same fallback the setup-sccache
+  # action applies — so cargo never execs a missing tool.
   RUSTC_WRAPPER: ""
   CARGO_BUILD_RUSTC_WRAPPER: ""
 
@@ -36,7 +36,9 @@ jobs:
     name: Advisories & exception expiry
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -44,11 +46,11 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-deny and cargo-audit
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           # cargo-deny pinned to the validated schema version; cargo-audit is a
           # non-blocking second opinion, so it tracks latest.
-          tool: cargo-deny@0.19.9,cargo-audit
+          tool: cargo-deny@0.20.2,cargo-audit
 
       - name: cargo-deny (advisories, bans, sources, licenses)
         # Same blocking policy as the per-PR gate, re-evaluated against the
@@ -68,8 +70,8 @@ jobs:
         # never pulls in); with `unused-ignored-advisory = "deny"` those entries
         # would otherwise fail this run for not matching anything here.
         run: >-
-          cargo deny --manifest-path ebpf/Cargo.toml
-          check --allow advisory-not-detected --config deny.toml advisories bans sources licenses
+          cargo deny --manifest-path ebpf/Cargo.toml --config deny.toml
+          check --allow advisory-not-detected advisories bans sources licenses
 
       - name: cargo-deny advisories (standalone Cargo workspaces)
         # Every standalone Cargo workspace (fuzz/, tests/performance/**, and any
@@ -87,8 +89,8 @@ jobs:
           failed=0
           for manifest in "${manifests[@]}"; do
             echo "::group::cargo deny advisories ${manifest}"
-            if ! cargo deny --manifest-path "$manifest" \
-              check --allow advisory-not-detected --config deny.toml advisories; then
+            if ! cargo deny --manifest-path "$manifest" --config deny.toml \
+              check --allow advisory-not-detected advisories; then
               echo "::error file=${manifest}::cargo-deny advisories failed for ${manifest}"
               failed=1
             fi
@@ -119,7 +121,7 @@ jobs:
 
       - name: Upload third-party license inventory
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: third-party-licenses
           path: third-party-licenses.json
@@ -145,7 +147,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Vendored-patch lifecycle parity
         # Checker runs synthetic self-tests before repository parity.

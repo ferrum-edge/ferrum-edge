@@ -60,7 +60,15 @@
 //! by generating unique proofs. Capacity degrades into refusal, never into
 //! silent unprotection. Repeated refusals while every retained marker is still
 //! live are O(1): a conservative earliest-expiry lower bound skips the map walk
-//! until an expiry is actually due. Ordinary admission publishes that bound
+//! until an expiry is actually due. A due reclamation pass is itself bounded:
+//! every marker is indexed exactly once by `(expiry, digest)` in a striped
+//! ordered set, and the pass pops only markers whose expiry has passed, so
+//! staggered or clustered expirations under sustained traffic near capacity
+//! cost the due markers (plus one peek per stripe), never a rescan of live
+//! ones. Due digests are drained in fixed-size stack batches, never collected
+//! into a heap buffer proportional to the expired population. Index insert,
+//! refresh move, and removal are O(log n).
+//! Ordinary admission publishes that bound
 //! only earlier (`fetch_min`) under a lock-free active-writer count plus a
 //! completed-revision counter; prune may store a later bound only after a scan
 //! that observed no active writer and no missed completed revision. An even/odd
@@ -121,7 +129,7 @@
 //! principal can still fill a shared store and make claims fail closed for
 //! everyone under `maxmemory`/`noeviction`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -148,6 +156,22 @@ const SHARED_MARKER_RECORD: &[u8] = b"ferrum-replay-marker-v1";
 /// sharing a configured prefix.
 const SHARED_KEY_COMPONENT: &str = "replay";
 
+/// Stripes of the process-lane expiry index. Each stripe is an ordered set
+/// of `(expiry, marker digest)` behind its own short mutex; the stripe is
+/// taken from the marker digest, which is uniformly distributed, so
+/// concurrent admissions spread across stripes instead of contending on one.
+const EXPIRY_INDEX_STRIPES: usize = 16;
+
+/// Maximum due digests held on the stack between index pops and map removals.
+const EXPIRY_PRUNE_BATCH_SIZE: usize = 64;
+
+/// One stripe of the expiry index, ordered by expiry then digest.
+type ExpiryStripe = Mutex<BTreeSet<(u64, [u8; 32])>>;
+
+fn expiry_stripe(digest: &[u8; 32]) -> usize {
+    usize::from(digest[0]) % EXPIRY_INDEX_STRIPES
+}
+
 /// Process-relative monotonic base. Markers store an expiry in milliseconds
 /// since this instant so an entry is 8 bytes and no `Instant` is retained.
 static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -171,7 +195,6 @@ static CAPACITY_REFUSED: AtomicU64 = AtomicU64::new(0);
 static AUTHORITY_UNAVAILABLE: AtomicU64 = AtomicU64::new(0);
 static ADMITTED_PROCESS: AtomicU64 = AtomicU64::new(0);
 static ADMITTED_SHARED: AtomicU64 = AtomicU64::new(0);
-static LEGACY_UNSAFE_PROFILE_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot of the replay-authority counters for the runtime metrics endpoint.
 ///
@@ -192,9 +215,6 @@ pub struct ReplayAuthorityCounters {
     pub admitted_process: u64,
     /// Markers admitted against the shared (cross-replica) authority.
     pub admitted_shared: u64,
-    /// Requests accepted under an explicitly unsafe legacy freshness-only
-    /// signing profile that provides no single-use guarantee.
-    pub legacy_unsafe_profile_accepted: u64,
     /// Registered shared authorities whose backend is currently unavailable.
     /// Non-zero means protected requests on those policies are failing closed.
     pub shared_authorities_unavailable: u64,
@@ -213,17 +233,10 @@ pub fn counters() -> ReplayAuthorityCounters {
         authority_unavailable: AUTHORITY_UNAVAILABLE.load(Ordering::Relaxed),
         admitted_process: ADMITTED_PROCESS.load(Ordering::Relaxed),
         admitted_shared: ADMITTED_SHARED.load(Ordering::Relaxed),
-        legacy_unsafe_profile_accepted: LEGACY_UNSAFE_PROFILE_ACCEPTED.load(Ordering::Relaxed),
         shared_authorities_unavailable,
         shared_authorities,
         process_lanes: process_lane_count() as u64,
     }
-}
-
-/// Record one acceptance under an explicitly unsafe legacy freshness-only
-/// profile, so operators can see that a deployment still depends on it.
-pub fn record_legacy_unsafe_profile_accepted() {
-    LEGACY_UNSAFE_PROFILE_ACCEPTED.fetch_add(1, Ordering::Relaxed);
 }
 
 // ── Scope ───────────────────────────────────────────────────────────────────
@@ -430,7 +443,6 @@ pub enum ReplayAdmission {
 }
 
 impl ReplayAdmission {
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn is_admitted(self) -> bool {
         matches!(self, Self::Admitted)
     }
@@ -477,8 +489,19 @@ pub struct ProcessReplayLane {
     /// Prune snapshots this before the scan and refuses a later store if it
     /// changed.
     completed_revisions: AtomicU64,
-    /// How many times the capacity path actually walked the map (test support).
+    /// Exact expiry index: every retained marker appears exactly once, as
+    /// `(stored expiry, digest)` in its stripe's ordered set. Insert, the
+    /// in-place refresh move, and removal are O(log n) under one stripe
+    /// mutex; reclamation pops only markers whose expiry has passed, so it
+    /// never revisits a live marker. Lock order is always `entries` then a
+    /// stripe; nothing holds a stripe while taking an entry guard, and at most
+    /// one stripe is held at a time.
+    expiry_index: [ExpiryStripe; EXPIRY_INDEX_STRIPES],
+    /// How many times the capacity path actually ran a reclamation pass (test
+    /// support).
     prune_scans: AtomicU64,
+    /// Indexed markers reclamation examined, in total (test support).
+    prune_entries_examined: AtomicU64,
     /// Serializes the capacity-pressure prune so concurrent saturated requests
     /// do not each walk the map. Never taken on the ordinary admission path.
     prune_lock: Mutex<()>,
@@ -500,7 +523,9 @@ impl ProcessReplayLane {
             earliest_expiry_millis: AtomicU64::new(u64::MAX),
             active_writers: AtomicUsize::new(0),
             completed_revisions: AtomicU64::new(0),
+            expiry_index: std::array::from_fn(|_| Mutex::new(BTreeSet::new())),
             prune_scans: AtomicU64::new(0),
+            prune_entries_examined: AtomicU64::new(0),
             prune_lock: Mutex::new(()),
         })
     }
@@ -554,6 +579,7 @@ impl ProcessReplayLane {
                     // charged to the presenting principal even when the stale
                     // entry is still stored under another one.
                     if let Some(refreshed) = self.refresh_expired_entry(
+                        &key,
                         existing.get_mut(),
                         principal_digest,
                         expires_at,
@@ -578,6 +604,7 @@ impl ProcessReplayLane {
                             expires_at_millis: expires_at,
                             principal_digest: *principal_digest,
                         });
+                        self.index_expiry(&key, expires_at);
                         self.finish_expiry_write(expires_at);
                         return ReplayAdmission::Admitted;
                     } else {
@@ -628,6 +655,7 @@ impl ProcessReplayLane {
     /// expired marker.
     fn refresh_expired_entry(
         &self,
+        digest: &[u8; 32],
         entry: &mut ProcessReplayEntry,
         principal_digest: &[u8; 32],
         expires_at: u64,
@@ -646,16 +674,45 @@ impl ProcessReplayLane {
         } else if self.principal_count(principal_digest) > principal_limit {
             return None;
         }
-        let refreshed = entry.expires_at_millis.max(expires_at);
+        let previous_expiry = entry.expires_at_millis;
+        let refreshed = previous_expiry.max(expires_at);
         self.begin_expiry_write();
         *entry = ProcessReplayEntry {
             expires_at_millis: refreshed,
             principal_digest: *principal_digest,
         };
+        // Still under this entry's shard guard (entries -> index lock order).
+        if previous_expiry != refreshed {
+            self.reindex_expiry(digest, previous_expiry, refreshed);
+        }
         if moves_principal {
             self.release_principal(&previous_principal);
         }
         Some(refreshed)
+    }
+
+    fn lock_expiry_stripe(
+        &self,
+        digest: &[u8; 32],
+    ) -> std::sync::MutexGuard<'_, BTreeSet<(u64, [u8; 32])>> {
+        self.expiry_index[expiry_stripe(digest)]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Index `digest` at `expires_at_millis`. O(log n).
+    fn index_expiry(&self, digest: &[u8; 32], expires_at_millis: u64) {
+        self.lock_expiry_stripe(digest)
+            .insert((expires_at_millis, *digest));
+    }
+
+    /// Move `digest` from `previous` to `refreshed` in one stripe critical
+    /// section. O(log n). A digest a concurrent prune already popped is simply
+    /// not found under `previous`.
+    fn reindex_expiry(&self, digest: &[u8; 32], previous: u64, refreshed: u64) {
+        let mut stripe = self.lock_expiry_stripe(digest);
+        stripe.remove(&(previous, *digest));
+        stripe.insert((refreshed, *digest));
     }
 
     fn note_expiry(&self, expires_at: u64) {
@@ -762,10 +819,13 @@ impl ProcessReplayLane {
     /// Reclaim **expired** entries only. Returns how many were reclaimed.
     ///
     /// Serialized by [`Self::prune_lock`] so a burst of saturated requests pays
-    /// for at most one concurrent walk. Bounded by the lane's retained entries,
-    /// and reached only when the calling authority is already at its cap.
-    /// Repeated refusals while the conservative earliest-expiry bound is still
-    /// in the future return immediately without walking the map.
+    /// for at most one concurrent pass, and reached only when the calling
+    /// authority is already at its cap. Repeated refusals while the
+    /// conservative earliest-expiry bound is still in the future return
+    /// immediately. A due pass pops only index entries whose expiry has
+    /// passed (plus one peek per stripe), so its work is bounded by the due
+    /// markers rather than by every retained marker, however expirations are
+    /// clustered, and a live marker is never examined twice.
     fn prune_expired(&self, now_millis: u64) -> usize {
         self.prune_expired_at(now_millis, || {})
     }
@@ -783,42 +843,72 @@ impl ProcessReplayLane {
         }
 
         self.prune_scans.fetch_add(1, Ordering::Relaxed);
-        // Snapshot before the scan so a writer that inserts on an already
-        // visited shard and completes before publication is visible as a
+        // Snapshot before the pass so a writer that inserts into an already
+        // visited stripe and completes before publication is visible as a
         // revision change. Load order is owned by [`Self::writer_epoch`].
         let epoch = self.writer_epoch();
 
-        let mut expired: Vec<[u8; 32]> = Vec::new();
+        // Drain due markers in fixed-size stack batches, even if the whole
+        // lane expires together. Release the stripe before taking an entry
+        // guard to preserve the entries -> stripe lock order. Nothing live is
+        // taken out of the index, so a later pass never revisits it.
+        let mut due = [[0u8; 32]; EXPIRY_PRUNE_BATCH_SIZE];
         let mut live_min = u64::MAX;
-        for entry in self.entries.iter() {
-            let expires_at = entry.value().expires_at_millis;
-            if expires_at <= now_millis {
-                expired.push(*entry.key());
-            } else {
-                live_min = live_min.min(expires_at);
-            }
-        }
         let mut reclaimed = 0usize;
-        for key in expired {
-            // Re-check the expiry under the shard guard: a concurrent request
-            // may have refreshed this marker between the scan and the removal,
-            // and removing it then would drop a live claim.
-            match self
-                .entries
-                .remove_if(&key, |_, entry| entry.expires_at_millis <= now_millis)
-            {
-                Some((_, entry)) => {
-                    self.entry_count.fetch_sub(1, Ordering::AcqRel);
-                    self.release_principal(&entry.principal_digest);
-                    reclaimed += 1;
-                }
-                None => {
-                    if let Some(current) = self.entries.get(&key) {
-                        live_min = live_min.min(current.expires_at_millis);
+        let mut examined = 0u64;
+        for stripe in &self.expiry_index {
+            loop {
+                let mut due_len = 0;
+                {
+                    let mut stripe = stripe
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while due_len < due.len() {
+                        match stripe.first() {
+                            Some(&(expires_at, _)) if expires_at <= now_millis => {
+                                if let Some((_, digest)) = stripe.pop_first() {
+                                    due[due_len] = digest;
+                                    due_len += 1;
+                                }
+                            }
+                            Some(&(expires_at, _)) => {
+                                live_min = live_min.min(expires_at);
+                                break;
+                            }
+                            None => break,
+                        }
                     }
                 }
+                for key in &due[..due_len] {
+                    examined = examined.saturating_add(1);
+                    // Re-check under the shard guard: a concurrent refresh
+                    // re-indexes this marker at its new expiry, and must keep
+                    // its live claim and principal charge.
+                    match self
+                        .entries
+                        .remove_if(key, |_, entry| entry.expires_at_millis <= now_millis)
+                    {
+                        Some((_, entry)) => {
+                            self.entry_count.fetch_sub(1, Ordering::AcqRel);
+                            self.release_principal(&entry.principal_digest);
+                            reclaimed += 1;
+                        }
+                        None => {
+                            if let Some(expires_at) =
+                                self.entries.get(key).map(|entry| entry.expires_at_millis)
+                            {
+                                live_min = live_min.min(expires_at);
+                            }
+                        }
+                    }
+                }
+                if due_len < due.len() {
+                    break;
+                }
             }
         }
+        self.prune_entries_examined
+            .fetch_add(examined, Ordering::Relaxed);
 
         after_scan();
         self.try_publish_later_bound(live_min, epoch);
@@ -835,26 +925,41 @@ impl ProcessReplayLane {
 
     /// Retained entry count, including entries whose expiry has passed but
     /// which lazy reclamation has not yet removed (test support).
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn retained_entries(&self) -> usize {
         self.entry_count.load(Ordering::Acquire)
     }
 
-    /// How many times the capacity path walked the map (test support).
-    #[allow(dead_code)] // exercised by external unit tests
+    /// How many times the capacity path ran a reclamation pass (test support).
     pub fn prune_scans(&self) -> u64 {
         self.prune_scans.load(Ordering::Acquire)
     }
 
+    /// Markers currently held by the expiry index (test support). Equals
+    /// [`Self::retained_entries`] whenever no admission or prune is in flight.
+    pub fn indexed_markers_for_tests(&self) -> usize {
+        self.expiry_index
+            .iter()
+            .map(|stripe| {
+                stripe
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .len()
+            })
+            .sum()
+    }
+
+    /// Total indexed markers reclamation passes have examined (test support).
+    pub fn prune_entries_examined_for_tests(&self) -> u64 {
+        self.prune_entries_examined.load(Ordering::Acquire)
+    }
+
     /// Conservative earliest-expiry bound currently published (test support).
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn earliest_expiry_millis_for_tests(&self) -> u64 {
         self.earliest_expiry_millis.load(Ordering::Acquire)
     }
 
     /// Retained markers charged to `marker`'s principal, including expired
     /// ones lazy reclamation has not yet removed (test support).
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn principal_entries_for_tests(&self, marker: &ReplayMarker) -> usize {
         self.principal_count(&marker.principal_digest)
     }
@@ -866,7 +971,6 @@ impl ProcessReplayLane {
     /// Does not take `prune_lock` and does not scan. A full lane, or a
     /// presenting principal at its share, returns
     /// [`ReplayAdmission::CapacityRefused`] rather than pruning.
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn admit_at_holding_expiry_write_for_tests(
         &self,
         marker: &ReplayMarker,
@@ -883,6 +987,7 @@ impl ProcessReplayLane {
                     return Err(ReplayAdmission::Replay);
                 }
                 if let Some(refreshed) = self.refresh_expired_entry(
+                    &marker.digest,
                     existing.get_mut(),
                     &marker.principal_digest,
                     expires_at,
@@ -907,6 +1012,7 @@ impl ProcessReplayLane {
                         expires_at_millis: expires_at,
                         principal_digest: marker.principal_digest,
                     });
+                    self.index_expiry(&marker.digest, expires_at);
                     self.publish_written_expiry(expires_at);
                     return Ok(HeldExpiryWrite {
                         lane: self,
@@ -924,7 +1030,6 @@ impl ProcessReplayLane {
     ///
     /// `after_scan` runs under [`Self::prune_lock`] and must not re-enter prune.
     /// Ordinary admission from the callback is safe: it never takes that lock.
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn prune_expired_with_after_scan_for_tests(
         &self,
         now_millis: u64,
@@ -947,7 +1052,6 @@ pub struct HeldExpiryWrite<'a> {
 
 impl HeldExpiryWrite<'_> {
     /// Publish the completed revision and release the writer.
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn finish(mut self) {
         self.release();
     }
@@ -1017,14 +1121,7 @@ fn resolve_process_lane(
     Ok(lane)
 }
 
-/// Number of live process replay lanes (test support).
-#[allow(dead_code)] // exercised by external unit tests
-pub fn process_lane_count_for_tests() -> usize {
-    process_lane_count()
-}
-
 /// Whether a domain currently owns a registered process lane (test support).
-#[allow(dead_code)] // exercised by external unit tests
 pub fn process_lane_registered_for_tests(domain: &ReplayDomain) -> bool {
     PROCESS_REPLAY_LANES
         .lock()
@@ -1093,9 +1190,9 @@ fn shared_authority_health() -> (u64, u64) {
 /// Whether any registered shared replay authority is currently unavailable.
 ///
 /// Protected requests on those policies are failing closed, which is a
-/// readiness-relevant condition rather than a per-request error. Consumed by
-/// the admin `/health` + `/status` readiness decision.
-#[allow(dead_code)] // exercised by external unit tests
+/// readiness-relevant condition rather than a per-request error. Test
+/// support: the admin `/health` + `/status` readiness decision reads
+/// [`shared_health_snapshot`] directly.
 pub fn shared_authority_degraded() -> bool {
     shared_health_snapshot().unavailable()
 }
@@ -1183,7 +1280,6 @@ impl ReplayAuthority {
 
     /// Whether this shared authority's Redis recovery checker has been armed
     /// (test support). Process-scoped authorities never start one.
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn recovery_checker_started_for_test(&self) -> bool {
         match self {
             Self::Shared { client, .. } => client.health_checker_started_for_test(),
@@ -1200,7 +1296,6 @@ impl ReplayAuthority {
     }
 
     /// Retention horizon written with every marker in this authority.
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn retention(&self) -> Duration {
         match self {
             Self::Process { retention, .. } | Self::Shared { retention, .. } => *retention,
@@ -1356,7 +1451,6 @@ pub fn validate_scope_backend(
 
 /// Test-support admission against an explicit monotonic instant, so external
 /// tests can pin exact TTL boundaries without sleeping.
-#[allow(dead_code)] // exercised by external unit tests
 pub fn admit_process_at(
     authority: &ReplayAuthority,
     marker: &ReplayMarker,
@@ -1385,7 +1479,6 @@ pub fn process_max_entries(authority: &ReplayAuthority) -> Option<usize> {
 }
 
 /// The process lane behind a process-scoped authority (test support).
-#[allow(dead_code)] // exercised by external unit tests
 pub fn process_lane(authority: &ReplayAuthority) -> Option<&Arc<ProcessReplayLane>> {
     match authority {
         ReplayAuthority::Process { lane, .. } => Some(lane),

@@ -579,6 +579,9 @@ mesh:
 $authorities$federated  peer_authentications:
     - name: strict
       namespace: $NS
+      scope:
+        kind: namespace
+        namespace: $NS
       mtls_mode: strict
 $remote_block
 YAML

@@ -22,11 +22,11 @@ keeps the default single-namespace behavior.
 
 | Variable | Default | Description |
 |---|---|---|
-| `FERRUM_CP_NAMESPACES` | unset | Scope. Empty/unset = back-compat single namespace (`FERRUM_NAMESPACE`). `*` = cluster-wide CP (discovers namespaces dynamically). CSV (`prod,staging`) = explicit set. |
+| `FERRUM_CP_NAMESPACES` | unset | Scope. Empty/unset = default single namespace (`FERRUM_NAMESPACE`). `*` = cluster-wide CP (discovers namespaces dynamically). CSV (`prod,staging`) = explicit set. |
 | `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` | `false` | When `true`, every CP/DP configuration JWT must carry an `ns` claim. This remains optional only for `Single` scope; `Set` and `All` scopes require `ns` claims automatically even when this flag is `false`. |
 | `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` | unset | **CP side.** Path to the namespace-bound verification credentials described in [Trust binding](#trust-binding-ghsa-3f2j-wwqw-grmg). **Required for `Set` and `All` scopes** — a multi-namespace CP refuses to start with only `FERRUM_CP_DP_GRPC_JWT_SECRET`. |
 | `FERRUM_CP_DP_GRPC_JWT_KEY_ID` | unset | **DP / mesh / xDS client side.** JWS `kid` stamped on self-minted tokens, selecting which trust-bundle credential verifies them. |
-| `FERRUM_DP_CP_GRPC_TOKEN_FILE` | unset | **DP / mesh / xDS client side.** Path to an externally issued bearer token presented instead of minting one. The node then holds no signing key at all. |
+| `FERRUM_DP_CP_GRPC_TOKEN_FILE` | unset | **Mesh / xDS client side; refused in `dp` mode.** Path to an externally issued bearer token presented instead of minting one. The node then holds no signing key at all. |
 | `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` | `false` (forced on for `Set`/`All` scopes) | REST-plane counterpart (issue #2120): when `true`, namespace-scoped **admin API** routes require the admin JWT (signed with `FERRUM_ADMIN_JWT_SECRET`) to carry an `ns` claim authorizing the `X-Ferrum-Namespace` value; violations are 403. Same claim shapes as the gRPC plane. Like `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM`, this remains optional only for `Single` scope: `Set` and `All` scopes engage admin enforcement automatically (issue #4529), so admin tokens without an `ns` claim are refused on namespace-scoped routes. See `docs/admin_api.md`. |
 
 On Kubernetes, `charts/ferrum-gateway` exposes both tenancy flags as first-class
@@ -63,7 +63,7 @@ is printed in the CP startup log (`CP mode: serving single namespace ...`,
 
 `FERRUM_CP_NAMESPACES` parses to one of three internal shapes:
 
-- **`Single(ns)`** — back-compat default. CP loads `FERRUM_NAMESPACE` from
+- **`Single(ns)`** — the default. CP loads `FERRUM_NAMESPACE` from
   the database and serves only that namespace. DPs in other namespaces are
   rejected at subscribe time with `FAILED_PRECONDITION` and an error
   message naming both namespaces.
@@ -80,6 +80,24 @@ is printed in the CP startup log (`CP mode: serving single namespace ...`,
 
 Whitespace is trimmed; duplicates are deduplicated; `*` cannot be combined
 with explicit entries (validation error).
+
+For `Set` and `All`, the CP loads several namespaces at once within each
+polling phase: incremental deltas, the pre-load change-sequence boundaries,
+and full reloads. A phase finishes before the next one starts, so every
+boundary is captured before any resource load. Results are merged in
+namespace order, and one namespace's load failure never blocks the others.
+
+The per-phase budget depends on the backend:
+
+- **SQL** (PostgreSQL, MySQL, SQLite): a quarter of
+  `FERRUM_DB_POOL_MAX_CONNECTIONS`, between 1 and 4. The default pool of 32
+  allows 4; pools below 8 load namespaces one at a time. An in-flight full
+  load holds one primary pool connection for its whole snapshot transaction;
+  incremental loads and boundary reads hold a connection only for each query.
+- **MongoDB**: up to 4. `FERRUM_DB_POOL_*` does not apply; size the driver
+  pool with the URI `maxPoolSize` option (driver default 10), leaving room for
+  admin traffic. Driver checkouts wait rather than time out, so a smaller pool
+  only queues the extra loads.
 
 ## Per-namespace broadcast partitioning
 
@@ -260,11 +278,21 @@ token. `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` points at a JSON document:
   signature**. It authorizes nothing on its own.
 - `namespaces` is the **ceiling**, fixed by CP configuration. A token's `ns`
   claim intersects it; the bearer can only narrow.
+- When the CP scope is a single namespace or an explicit
+  `FERRUM_CP_NAMESPACES` list (not `*`), a served namespace that no credential
+  binds is logged as a warning at startup and on
+  every reload that changes the bundle. It is not a refusal: data planes in
+  that namespace cannot subscribe until a credential is bound to it.
 - Material comes from exactly one of `public_key_pem`, `public_key_path`,
   `secret`, `secret_env`, or `secret_path`. Asymmetric algorithms
   (`RS256`/`RS384`/`RS512`/`PS256`/`PS384`/`PS512`/`ES256`/`ES384`/`EdDSA`) are
   strongly preferred: the CP then holds only public material, and **no data
   plane is a signing authority at all**.
+- RSA public keys (`RS*`/`PS*`) must be 2048–8192 bits, as SPKI `PUBLIC KEY`
+  or PKCS#1 `RSA PUBLIC KEY` PEM. JWT signatures are verified with AWS-LC,
+  which accepts only that range, so a key outside it is refused when the
+  bundle loads or reloads, with its size named. A refused reload keeps the
+  previous verifier.
 - The symmetric (`HS*`) path remains supported for migration, but only because
   each secret is per-credential and bound CP-side. It requires at least 32
   bytes. Do not reuse one `HS*` secret across tenants — that reintroduces the
@@ -413,18 +441,22 @@ has a finite default.
 `cp_dp_trust` object, and `/metrics` carries the `ferrum_cp_dp_trust_*`
 families. Both are fixed-cardinality: booleans, counters, seconds, the closed
 reason set above (plus `reader_unavailable`, `reload_reader_failed`,
-`reload_read_timed_out`, `scope_validation_failed`, and `worker_exited`).
+`reload_read_timed_out`, and `worker_exited`).
 Nothing more on Prometheus: no path, `kid`, namespace, token, key byte, or
-generation identifier. Admin-JWT-authenticated health additionally carries
+generation identifier. Health authenticated by a fleet-wide admin JWT that
+`FERRUM_ADMIN_JWT_SECRET` verified (any role) additionally carries
 `active_generation`, a replica-stable HMAC-SHA-256 of the private configuration
 fingerprint under the fleet-shared `FERRUM_ADMIN_JWT_SECRET` (domain
 `ferrum-cp-dp-trust-status-id-v1\0`). Replicas that share the same accepted
 bundle and the same HMAC key publish the same 64-hex value; a semantic bundle
 change mints a new value; an unchanged revalidation keeps it. Replicas that do
 not share the HMAC key are incomparable. An admin JWT lets an operator *see*
-the identifier; it does not reveal the HMAC key. Metrics bearer tokens and
+the identifier; it does not reveal the HMAC key. Tokens verified by
+`FERRUM_ADMIN_JWT_VIEWER_SECRET`, metrics bearer tokens, and
 metrics-allowlisted source addresses receive the detailed object with
-`active_generation: null`, because they are not Admin API principals. An
+`active_generation: null`: none of them already holds a MAC under
+`FERRUM_ADMIN_JWT_SECRET`, so a keyed value over a guessable input would give
+them an offline verifier for guesses of that secret (GHSA-crqx-mp2f-v8c8). An
 unkeyed digest of the fingerprint is never published — that would be an offline
 oracle against a guessed HS\* secret. The private fingerprint stays inside the
 reload worker.
@@ -503,8 +535,9 @@ forged claim to reach, and the scope check refuses everything else anyway.
 
 ### Data-plane side
 
-Two client-side options, both applying equally to DP ConfigSync, native
-`MeshSubscribe`, and xDS ADS:
+Two client-side options for DP ConfigSync, native `MeshSubscribe`, and xDS
+ADS. The external-token option is for mesh nodes only; `dp` mode refuses it at
+startup (see the note under it):
 
 - **Externally issued token (preferred)** — `FERRUM_DP_CP_GRPC_TOKEN_FILE`
   points at a token minted by a trusted issuer. The node presents it and holds
@@ -513,13 +546,27 @@ Two client-side options, both applying equally to DP ConfigSync, native
   short-lived rotated token needs no restart.
 
   The issuer — not the node — decides what the token asserts, so it must mint
-  to Ferrum's CP/DP token contract exactly. The CP requires:
+  to Ferrum's CP/DP token contract exactly. The CP requires the claims in the
+  table below.
+
+  > **Not available to DP ConfigSync.** A stock DP (`FERRUM_MODE=dp`)
+  > generates a random per-process `node_id` at startup and sends it in
+  > `ConfigSync.Subscribe`. It does not derive that ID from an external
+  > token's `sub`, and there is no setting to pin it. Because the CP requires
+  > `sub` to equal `node_id`, an externally issued token would be refused with
+  > `PERMISSION_DENIED`, so `dp` mode refuses `FERRUM_DP_CP_GRPC_TOKEN_FILE`
+  > at startup instead of looping without config. Give each DP its own
+  > per-tenant secret plus `FERRUM_CP_DP_GRPC_JWT_KEY_ID`, the second option
+  > below. A
+  > self-minted token always carries the DP's own `node_id` as `sub`. Mesh
+  > `MeshSubscribe` and xDS clients send their configured node ID, so an issuer
+  > can mint `sub` to match it.
 
   | Claim | Requirement |
   |---|---|
   | `kid` (JWS header) | the trust-bundle credential to verify under; required on a trust-bundle CP |
   | `iss` | exactly one string, equal to `FERRUM_CP_DP_GRPC_JWT_ISSUER` (default `ferrum-edge-cp-dp`); arrays and other non-string shapes are rejected |
-  | `sub` | required (present; the node id by convention) |
+  | `sub` | required; must equal the `node_id` the node sends (surrounding whitespace trimmed from `node_id`). Enforced on `ConfigSync.Subscribe`, unary `GetFullConfig`, and native `MeshSubscribe`, which refuse a mismatch with `PERMISSION_DENIED` before allocating any subscription state |
   | `iat` | required |
   | `exp` | required; accepted until `exp` + 60 s clock-skew allowance, which is also the effective stream lease (the maximum stream lifetime can end a stream earlier) |
   | `nbf` | optional; when present, accepted from `nbf` − 60 s |
@@ -547,12 +594,12 @@ polled. `FERRUM_CP_DP_GRPC_JWT_KEY_ID` rides on every per-remote credential, so
 a peer control plane running a trust bundle can select the credential it bound
 to this cluster.
 
-### Rotate after upgrading
+### Rotate the shared secret
 
-Every data plane deployed before this change possesses fleet-wide signing
-authority. Rotate `FERRUM_CP_DP_GRPC_JWT_SECRET` (or retire it) as part of the
-rollout; upgrading the control plane alone does not revoke keys already
-distributed.
+Every data plane that holds the fleet-wide `FERRUM_CP_DP_GRPC_JWT_SECRET`
+possesses signing authority for every namespace. Rotate (or retire) that secret
+as part of moving to a trust bundle; changing control-plane scope alone does
+not revoke keys already distributed.
 
 ## Migration steps
 
@@ -560,8 +607,8 @@ distributed.
    `kubectl get ns -l ferrum-tenant=true -o name | sed 's|namespace/||'`
    is a typical pattern.
 
-2. **Roll CPs first**: deploy the new binary with the existing
-   `FERRUM_NAMESPACE` and `FERRUM_CP_NAMESPACES` unset. The CP still serves
+2. **Start single-namespace**: run the CPs with the existing
+   `FERRUM_NAMESPACE` and `FERRUM_CP_NAMESPACES` unset. Each CP serves
    a single namespace; verify with your existing single-namespace smoke tests.
 
 3. **Build the trust bundle**: create one verification credential per tenant
@@ -573,7 +620,9 @@ distributed.
 4. **Point data planes at their credential**: give each DP/mesh node either
    `FERRUM_DP_CP_GRPC_TOKEN_FILE` (an externally issued short-lived token, so
    the node holds no signing key) or its own per-tenant secret plus
-   `FERRUM_CP_DP_GRPC_JWT_KEY_ID`. A token with no `kid` is rejected by a
+   `FERRUM_CP_DP_GRPC_JWT_KEY_ID`. Stock DPs (`FERRUM_MODE=dp`) must use the
+   per-tenant secret: see the
+   [DP ConfigSync limitation](#data-plane-side) on external tokens. A token with no `kid` is rejected by a
    trust-bundle CP, so roll data planes before flipping CP scope.
 
 5. **Expand scope incrementally**: set `FERRUM_CP_NAMESPACES="ns-a,ns-b"`
@@ -582,7 +631,7 @@ distributed.
    matching namespace can now subscribe; unbound credentials, missing `kid`s,
    and wrong claims fail before snapshot serialisation.
 
-6. **Rotate the old secret**: every DP deployed before this change holds
+6. **Rotate the old secret**: every DP that held the shared secret has
    fleet-wide signing authority. Rotate or retire
    `FERRUM_CP_DP_GRPC_JWT_SECRET` once the trust bundle is serving.
 
@@ -618,18 +667,7 @@ before any tenant B configuration, mesh slice, trust material, or xDS resource
 is serialized. A shared-CA client certificate does not change this: it is
 authentication, not namespace authorization.
 
-Pre-fix validation was run at commit
-`1252246777bdaa8fcbe6b401ffdc9020d7f71e11`. A temporary SQLite CP database
-was seeded with tenant-tagged proxies, consumers, and plugin markers for
-`tenant-a` and `tenant-b`; CP startup was exercised with
-`FERRUM_CP_NAMESPACES=tenant-a,tenant-b` and `FERRUM_CP_NAMESPACES=*` while
-`FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` was unset. Existing integration tests
-confirmed that `Set` and `All` scopes accepted a shared no-claim JWT and
-returned whichever namespace was requested. Source review also found that
-native `MeshConfigSync`, xDS ADS, K8s controller broadcasts, and gateway
-trust bundles were not consistently namespace-authorised.
-
-Post-fix CI gates this with `tests/integration/cp_multi_namespace_tests.rs`:
+CI gates this with `tests/integration/cp_multi_namespace_tests.rs`:
 missing, malformed, wrong, and ambiguous claims fail before the first
 snapshot; tenant A mesh wire JSON contains only tenant A services; and
 multi-tenant *unpartitioned* trust bundle side channels serialise as `null`.

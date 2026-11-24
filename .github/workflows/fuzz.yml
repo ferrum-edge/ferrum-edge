@@ -45,9 +45,10 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
-    # The repository-root Cargo config selects sccache and host linker flags,
-    # but this isolated fuzz job installs neither sccache nor mold. Disable both
-    # Cargo wrapper inputs and inherited rustflags explicitly.
+    # The repository-root Cargo config selects host linker flags (mold), and a
+    # runner- or user-level rustc-wrapper may select sccache, but this isolated
+    # fuzz job installs neither sccache nor mold. Disable both Cargo wrapper
+    # inputs and inherited rustflags explicitly.
     env:
       RUSTC_WRAPPER: ""
       CARGO_BUILD_RUSTC_WRAPPER: ""
@@ -64,8 +65,11 @@ jobs:
           - k8s_crd
           - plugin_config
           - datagram_client_address
+          - ocsp_response
+          - jwt_svid
+          - tls_material
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -100,7 +104,7 @@ jobs:
         with:
           toolchain: nightly-2026-09-30
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: fuzz -> target
           shared-key: fuzz-sanitized
@@ -120,7 +124,7 @@ jobs:
           # itself was tampered with; it costs nothing and keeps the command
           # line free of any value this shell has not literally approved.
           case "$FUZZ_TARGET" in
-            traceparent|config_decode|proxy_protocol|mesh_udp_frame|k8s_crd|plugin_config|datagram_client_address) ;;
+            traceparent|config_decode|proxy_protocol|mesh_udp_frame|k8s_crd|plugin_config|datagram_client_address|ocsp_response|jwt_svid|tls_material) ;;
             *)
               echo "::error::unknown fuzz target" >&2
               exit 1
@@ -175,7 +179,7 @@ jobs:
       # on job failure: a skipped or failed bound must never publish.
       - name: Upload bounded crash artifacts
         if: always() && steps.bound.outcome == 'success'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fuzz-crash-${{ matrix.fuzz_target }}
           path: fuzz/artifacts/${{ matrix.fuzz_target }}

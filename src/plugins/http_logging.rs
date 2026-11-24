@@ -28,7 +28,7 @@ use super::utils::{
     assemble_json_array, build_batch_config, handle_http_batch_response_redacted,
     parse_custom_headers, parse_http_endpoint, redacted_endpoint_url_str, validate_batch_config,
 };
-use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Authoritative closed set of top-level `http_logging` configuration keys.
@@ -129,8 +129,16 @@ impl Plugin for HttpLogging {
         "http_logging"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::HTTP_LOGGING
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::LOG
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -160,6 +168,17 @@ impl Plugin for HttpLogging {
             summary,
             self.schema.as_deref(),
         );
+    }
+
+    /// WebSocket session end, emitted as the shared session-end record every
+    /// log sink writes (`WsDisconnectContext::session_end_summary`, issue
+    /// #7144) through the same admission path as `log`.
+    fn requires_ws_disconnect_hooks(&self) -> bool {
+        true
+    }
+
+    async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
+        self.log(&ctx.session_end_summary()).await;
     }
 
     async fn log(&self, summary: &TransactionSummary) {
