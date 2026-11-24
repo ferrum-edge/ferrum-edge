@@ -4295,3 +4295,143 @@ async fn row_decode_diagnostics_withhold_ids_in_outer_and_inner_reasons() {
         assert!(!rendered.contains(token), "{table}: {rendered}");
     }
 }
+
+#[tokio::test]
+async fn compact_config_changes_fires_on_per_namespace_counter_for_odd_sequences_and_batches() {
+    use sqlx::Row;
+
+    let directory = tempfile::TempDir::new().unwrap();
+    let db_url = format!(
+        "sqlite:{}?mode=rwc",
+        directory.path().join("compact.db").display()
+    );
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    // Alternate single writes across two namespaces so `ns-odd` only ever
+    // receives odd global sequences (1, 3, ..., 19). A global modulo gate
+    // (`sequence % STRIDE == 0`) would never fire for `ns-odd`.
+    for i in 0..10 {
+        let mut odd = make_upstream(&format!("odd-{i}"));
+        odd.namespace = "ns-odd".to_string();
+        odd.name = Some(format!("odd-{i}"));
+        store.create_upstream(&odd).await.unwrap();
+
+        let mut even = make_upstream(&format!("even-{i}"));
+        even.namespace = "ns-even".to_string();
+        even.name = Some(format!("even-{i}"));
+        store.create_upstream(&even).await.unwrap();
+    }
+
+    store
+        .compact_config_changes_with_limits_for_test("ns-odd", 4, 4)
+        .await
+        .unwrap();
+
+    let odd_count: i64 =
+        sqlx::query("SELECT COUNT(*) AS cnt FROM config_changes WHERE namespace = 'ns-odd'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap()
+            .try_get("cnt")
+            .unwrap();
+    let even_count: i64 =
+        sqlx::query("SELECT COUNT(*) AS cnt FROM config_changes WHERE namespace = 'ns-even'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap()
+            .try_get("cnt")
+            .unwrap();
+    let odd_counter: i64 = sqlx::query(
+        "SELECT changes_since_compaction FROM config_change_locks WHERE lock_name = 'ns-odd'",
+    )
+    .fetch_one(&store.pool())
+    .await
+    .unwrap()
+    .try_get("changes_since_compaction")
+    .unwrap();
+    assert_eq!(
+        odd_count, 4,
+        "ns-odd must retain exactly 4 rows after compaction"
+    );
+    assert_eq!(
+        even_count, 10,
+        "ns-even rows must never be evicted by ns-odd"
+    );
+    assert_eq!(
+        odd_counter, 0,
+        "compaction must reset the per-namespace counter"
+    );
+
+    // Two more writes remain below stride=4: compaction must defer.
+    for i in 10..12 {
+        let mut odd = make_upstream(&format!("odd-{i}"));
+        odd.namespace = "ns-odd".to_string();
+        odd.name = Some(format!("odd-{i}"));
+        store.create_upstream(&odd).await.unwrap();
+    }
+    store
+        .compact_config_changes_with_limits_for_test("ns-odd", 4, 4)
+        .await
+        .unwrap();
+    let deferred_count: i64 =
+        sqlx::query("SELECT COUNT(*) AS cnt FROM config_changes WHERE namespace = 'ns-odd'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap()
+            .try_get("cnt")
+            .unwrap();
+    assert_eq!(
+        deferred_count, 6,
+        "compaction must defer while changes_since_compaction < stride"
+    );
+
+    // A multi-row batch crossing stride=4 triggers compaction cleanly.
+    let batch: Vec<Upstream> = (12..17)
+        .map(|i| {
+            let mut u = make_upstream(&format!("odd-{i}"));
+            u.namespace = "ns-odd".to_string();
+            u.name = Some(format!("odd-{i}"));
+            u
+        })
+        .collect();
+    store
+        .batch_create_upstreams(&batch, &BatchConfigWriteMode::Admission)
+        .await
+        .unwrap();
+    store
+        .compact_config_changes_with_limits_for_test("ns-odd", 4, 4)
+        .await
+        .unwrap();
+    let after_batch_count: i64 =
+        sqlx::query("SELECT COUNT(*) AS cnt FROM config_changes WHERE namespace = 'ns-odd'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap()
+            .try_get("cnt")
+            .unwrap();
+    assert_eq!(
+        after_batch_count, 4,
+        "multi-row batch crossing stride must compact back down to retained count"
+    );
+}
+
+#[test]
+fn mongo_standalone_route_bucket_candidates_scope_by_listen_port() {
+    let source = include_str!("../../../src/config/mongo_store.rs");
+    let start = source
+        .find("async fn listen_path_bucket_candidates(")
+        .expect("listen_path_bucket_candidates must exist");
+    let tail = &source[start..];
+    let end = tail
+        .find("\n        async fn ")
+        .expect("listen_path_bucket_candidates followed by another method");
+    let body = &tail[..end];
+    assert!(
+        body.contains("listen_port: Option<u16>")
+            && body.contains("i32::from(port)")
+            && body.contains("Bson::Null"),
+        "standalone Mongo bucket lookup must scope by listen_port:\n{body}"
+    );
+}

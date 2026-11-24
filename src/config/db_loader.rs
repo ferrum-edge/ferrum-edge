@@ -7353,6 +7353,16 @@ impl DatabaseStore {
         .bind(Utc::now().to_rfc3339())
         .execute(&mut **tx)
         .await?;
+        // Track per-namespace change volume on the already-locked sequence
+        // row so compaction cadence does not depend on global sequence
+        // divisibility (which breaks under alternating namespaces, batches, or
+        // multi-primary auto_increment_increment).
+        sqlx::query(&self.q("UPDATE config_change_locks \
+             SET changes_since_compaction = changes_since_compaction + 1 \
+             WHERE lock_name = ?"))
+        .bind(namespace)
+        .execute(&mut **tx)
+        .await?;
         Ok(())
     }
 
@@ -7401,6 +7411,49 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
+        self.compact_config_changes_with_limits_tx(
+            tx,
+            namespace,
+            Self::CHANGE_LOG_RETAIN_PER_NAMESPACE,
+            Self::CHANGE_LOG_COMPACTION_STRIDE,
+        )
+        .await
+    }
+
+    async fn compact_config_changes_with_limits_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        retain_per_namespace: u64,
+        compaction_stride: u64,
+    ) -> Result<(), anyhow::Error> {
+        // Gate compaction on the per-namespace counter maintained on the
+        // already-locked `config_change_locks` row. Unlike gating on global
+        // `sequence % STRIDE`, this fires deterministically under alternating
+        // multi-tenant writes, multi-row batches, and multi-primary
+        // `auto_increment_increment` topologies.
+        let lock_row = sqlx::query(
+            &self.q("SELECT changes_since_compaction FROM config_change_locks WHERE lock_name = ?"),
+        )
+        .bind(namespace)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let changes_since_compaction = match lock_row {
+            Some(row) => row.try_get::<i64, _>("changes_since_compaction")?.max(0) as u64,
+            None => return Ok(()),
+        };
+        if changes_since_compaction < compaction_stride.max(1) {
+            return Ok(());
+        }
+        sqlx::query(
+            &self.q(
+                "UPDATE config_change_locks SET changes_since_compaction = 0 WHERE lock_name = ?",
+            ),
+        )
+        .bind(namespace)
+        .execute(&mut **tx)
+        .await?;
+
         // Two separate single-row indexed endpoint seeks (`ORDER BY sequence
         // DESC/ASC LIMIT 1`) rather than `SELECT MIN(...), MAX(...)`: SQLite's
         // single-aggregate min/max optimization only fires for one endpoint
@@ -7417,13 +7470,7 @@ impl DatabaseStore {
             return Ok(());
         };
         let max_sequence = max_row.try_get::<i64, _>("sequence")?.max(0) as u64;
-        if max_sequence <= Self::CHANGE_LOG_RETAIN_PER_NAMESPACE {
-            return Ok(());
-        }
-        // Amortize the per-namespace OFFSET scan so busy or interleaved
-        // namespaces do not walk up to 100k index entries on every single
-        // write while holding the per-namespace change-sequence lock.
-        if !max_sequence.is_multiple_of(Self::CHANGE_LOG_COMPACTION_STRIDE) {
+        if max_sequence <= retain_per_namespace {
             return Ok(());
         }
         let min_row = sqlx::query(&self.q("SELECT sequence FROM config_changes \
@@ -7437,7 +7484,7 @@ impl DatabaseStore {
             Some(row) => row.try_get::<i64, _>("sequence")?.max(0) as u64,
             None => return Ok(()),
         };
-        if max_sequence.saturating_sub(min_sequence) < Self::CHANGE_LOG_RETAIN_PER_NAMESPACE {
+        if max_sequence.saturating_sub(min_sequence) < retain_per_namespace {
             return Ok(());
         }
         // Compute the cutoff strictly within `namespace` so a busy tenant
@@ -7448,7 +7495,7 @@ impl DatabaseStore {
              ORDER BY sequence DESC \
              LIMIT 1 OFFSET ?"))
         .bind(namespace)
-        .bind(Self::CHANGE_LOG_RETAIN_PER_NAMESPACE as i64)
+        .bind(retain_per_namespace as i64)
         .fetch_optional(&mut **tx)
         .await?;
         let Some(cutoff_row) = cutoff_row else {
@@ -7470,6 +7517,29 @@ impl DatabaseStore {
             .bind(Utc::now().to_rfc3339())
             .execute(&mut **tx)
             .await?;
+        Ok(())
+    }
+
+    /// Test-only helper exposing bounded retention/stride compaction for
+    /// external unit tests without needing to insert 100k change rows.
+    #[doc(hidden)]
+    pub async fn compact_config_changes_with_limits_for_test(
+        &self,
+        namespace: &str,
+        retain_per_namespace: u64,
+        compaction_stride: u64,
+    ) -> Result<(), anyhow::Error> {
+        let mut tx = self.begin_write_tx().await?;
+        self.lock_config_change_sequence_tx(&mut tx, namespace)
+            .await?;
+        self.compact_config_changes_with_limits_tx(
+            &mut tx,
+            namespace,
+            retain_per_namespace,
+            compaction_stride,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 

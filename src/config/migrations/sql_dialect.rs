@@ -916,14 +916,16 @@ impl V001SqlBuilder {
             r#"
             CREATE TABLE IF NOT EXISTS config_change_locks (
                 lock_name VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
-                updated_at VARCHAR(64) NOT NULL
+                updated_at VARCHAR(64) NOT NULL,
+                changes_since_compaction BIGINT NOT NULL DEFAULT 0
             )
             "#
         } else {
             r#"
             CREATE TABLE IF NOT EXISTS config_change_locks (
                 lock_name TEXT PRIMARY KEY,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                changes_since_compaction BIGINT NOT NULL DEFAULT 0
             )
             "#
         }
