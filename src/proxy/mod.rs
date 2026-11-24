@@ -13869,15 +13869,20 @@ impl ProxyState {
         // cannot be hot-loaded into it. Rejection returns before any cache is
         // rebuilt or swapped, so the last known-good config stays published.
         // The check is inert when FIPS mode is off.
+        let candidate_mmdb_generation = new_config.validated_country_mmdb_generation;
         if let Err(error) = crate::fips::policy::check_gateway_config(&new_config) {
-            crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
+            crate::config::types::discard_unclaimed_country_mmdb_validation_handoff(
+                candidate_mmdb_generation,
+            );
             error!("Config reload rejected — FIPS policy: {}", error);
             return ConfigApplyOutcome::rejected_one(format!("FIPS policy: {error}"));
         }
 
         if let Err(errors) = self.validate_full_config_with_mesh_ids(&new_config, trusted_mesh_ids)
         {
-            crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
+            crate::config::types::discard_unclaimed_country_mmdb_validation_handoff(
+                candidate_mmdb_generation,
+            );
             for msg in &errors {
                 error!("Config reload rejected: {}", msg);
             }
@@ -13901,7 +13906,9 @@ impl ProxyState {
             {
                 Ok(inner) => inner,
                 Err(e) => {
-                    crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
+                    crate::config::types::discard_unclaimed_country_mmdb_validation_handoff(
+                        candidate_mmdb_generation,
+                    );
                     let message = format!("security plugin validation failed: {e}");
                     error!(
                         "Config reload rejected — security plugin validation failed: {}",
@@ -13937,11 +13944,15 @@ impl ProxyState {
             ) {
                 Ok(Some(epoch)) => epoch,
                 Ok(None) => {
-                    crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
+                    crate::config::types::discard_unclaimed_country_mmdb_validation_handoff(
+                        candidate_mmdb_generation,
+                    );
                     return ConfigApplyOutcome::Unchanged;
                 }
                 Err(e) => {
-                    crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
+                    crate::config::types::discard_unclaimed_country_mmdb_validation_handoff(
+                        candidate_mmdb_generation,
+                    );
                     let message = e.to_string();
                     error!("Config reload rejected: {}", e);
                     return ConfigApplyOutcome::rejected_one(message);
@@ -14067,6 +14078,8 @@ impl ProxyState {
         let route_changed = std::cell::Cell::new(false);
         let lb_changed = std::cell::Cell::new(false);
         let projected_routes_changed_flag = std::cell::Cell::new(false);
+        let mut projected_route_hostnames_for_warmup: Vec<(String, Option<String>, Option<u64>)> =
+            Vec::new();
         let mut projected_lb_upstreams_for_reconcile: Vec<Upstream> = Vec::new();
         let proxy_plugin_rebuild_count = std::cell::Cell::new(0usize);
         // Publish the candidate itself, not a second full copy of it: a
@@ -14155,6 +14168,34 @@ impl ProxyState {
                     let rebuild_routes = mesh_changed || projected_routes_changed;
                     route_changed.set(rebuild_routes);
                     projected_routes_changed_flag.set(projected_routes_changed);
+                    if projected_routes_changed {
+                        let old_route_indexed: HashMap<(&str, &str), &Proxy> = current
+                            .config
+                            .proxies
+                            .iter()
+                            .filter(|proxy| !proxy.dispatch_kind.is_stream())
+                            .map(|proxy| ((proxy.namespace.as_str(), proxy.id.as_str()), proxy))
+                            .collect();
+                        projected_route_hostnames_for_warmup = new_config
+                            .proxies
+                            .iter()
+                            .filter(|proxy| !proxy.dispatch_kind.is_stream())
+                            .filter(|new_proxy| {
+                                old_route_indexed
+                                    .get(&(new_proxy.namespace.as_str(), new_proxy.id.as_str()))
+                                    .is_some_and(|old_proxy| {
+                                        !Self::proxy_content_eq(old_proxy, new_proxy)
+                                    })
+                            })
+                            .map(|proxy| {
+                                (
+                                    proxy.backend_host.clone(),
+                                    proxy.dns_override.clone(),
+                                    proxy.dns_cache_ttl_seconds,
+                                )
+                            })
+                            .collect();
+                    }
                     lb_changed.set(projected_lb_changed);
                     projected_lb_upstreams_for_reconcile = projected_lb_modified.clone();
                     Self::preserve_live_discovery_targets(
@@ -14215,14 +14256,18 @@ impl ProxyState {
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
             Ok(None) => {
-                crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
+                crate::config::types::discard_unclaimed_country_mmdb_validation_handoff(
+                    candidate_mmdb_generation,
+                );
                 debug!("Config poll: candidate valid but unchanged, skipping update");
                 // Still update loaded_at timestamp
                 self.config.store(Arc::clone(&staged_config));
                 return ConfigApplyOutcome::Unchanged;
             }
             Err(e) => {
-                crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
+                crate::config::types::discard_unclaimed_country_mmdb_validation_handoff(
+                    candidate_mmdb_generation,
+                );
                 let message = format!("configuration publication refused: {e}");
                 error!("Config reload rejected — {}", e);
                 return ConfigApplyOutcome::rejected_one(message);
@@ -14272,20 +14317,7 @@ impl ProxyState {
             let projected_lb = lb_changed.get();
             if projected_routes || projected_lb {
                 self.prune_stale_target_health(new_config);
-                let mut new_hostnames: Vec<(String, Option<String>, Option<u64>)> = Vec::new();
-                if projected_routes {
-                    for proxy in new_config
-                        .proxies
-                        .iter()
-                        .filter(|p| !p.dispatch_kind.is_stream())
-                    {
-                        new_hostnames.push((
-                            proxy.backend_host.clone(),
-                            proxy.dns_override.clone(),
-                            proxy.dns_cache_ttl_seconds,
-                        ));
-                    }
-                }
+                let mut new_hostnames = projected_route_hostnames_for_warmup;
                 for upstream in &projected_lb_upstreams_for_reconcile {
                     for target in &upstream.targets {
                         if hbone_pool::target_hbone_cross_cluster(target) {
@@ -14647,20 +14679,15 @@ impl ProxyState {
                 !removed.contains(&(consumer.namespace.as_str(), consumer.id.as_str()))
             });
         }
-        if !result.removed_plugin_config_ids.is_empty() {
-            let removed: std::collections::HashSet<(&str, &str)> = result
-                .removed_plugin_config_ids
-                .iter()
-                .map(|key| (key.namespace.as_str(), key.id.as_str()))
-                .collect();
+        let removed_plugins: std::collections::HashSet<(&str, &str)> = result
+            .removed_plugin_config_ids
+            .iter()
+            .map(|key| (key.namespace.as_str(), key.id.as_str()))
+            .collect();
+        if !removed_plugins.is_empty() {
             new_config
                 .plugin_configs
-                .retain(|pc| !removed.contains(&(pc.namespace.as_str(), pc.id.as_str())));
-            for proxy in &mut new_config.proxies {
-                proxy.plugins.retain(|assoc| {
-                    !removed.contains(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
-                });
-            }
+                .retain(|pc| !removed_plugins.contains(&(pc.namespace.as_str(), pc.id.as_str())));
         }
         if !result.removed_upstream_ids.is_empty() {
             let removed: std::collections::HashSet<(&str, &str)> = result
@@ -14694,6 +14721,17 @@ impl ProxyState {
                     idx.insert(key, new_config.proxies.len());
                     new_config.proxies.push(proxy);
                 }
+            }
+        }
+        // Prune associations to removed plugin configs AFTER upserting proxies
+        // so a combined delta carrying both a modified proxy and a deleted
+        // plugin matches `incremental_apply::apply_incremental_to_config_snapshot`.
+        if !removed_plugins.is_empty() {
+            for proxy in &mut new_config.proxies {
+                proxy.plugins.retain(|assoc| {
+                    !removed_plugins
+                        .contains(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
+                });
             }
         }
 
@@ -14849,11 +14887,14 @@ impl ProxyState {
             };
         }
 
+        let candidate_mmdb_generation = new_config.validated_country_mmdb_generation;
         let topology_permit = if let Some((db, expected_epoch)) = database_topology_fence {
             let permit = db.acquire_write_topology_permit().await;
             let actual_epoch = permit.topology_epoch();
             if actual_epoch != expected_epoch {
-                crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
+                crate::config::types::discard_unclaimed_country_mmdb_validation_handoff(
+                    candidate_mmdb_generation,
+                );
                 return IncrementalApplyResult::TopologyChanged(actual_epoch);
             }
             Some(permit)
@@ -14937,11 +14978,15 @@ impl ProxyState {
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
             Ok(None) => {
-                crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
+                crate::config::types::discard_unclaimed_country_mmdb_validation_handoff(
+                    candidate_mmdb_generation,
+                );
                 return IncrementalApplyResult::Outcome(ConfigApplyOutcome::Unchanged);
             }
             Err(e) => {
-                crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
+                crate::config::types::discard_unclaimed_country_mmdb_validation_handoff(
+                    candidate_mmdb_generation,
+                );
                 let message = format!("configuration publication refused: {e}");
                 return IncrementalApplyResult::Outcome(ConfigApplyOutcome::rejected_one(message));
             }
@@ -15117,11 +15162,9 @@ impl ProxyState {
             delta.modified_upstreams.len(),
         );
 
-        // Reconcile service discovery tasks for changed upstreams
-        if !delta.added_upstreams.is_empty()
-            || !delta.removed_upstream_ids.is_empty()
-            || !delta.modified_upstreams.is_empty()
-        {
+        // Reconcile service discovery tasks for changed upstreams (including
+        // timestamp-neutral upstream edits detected via `lb_changed`).
+        if upstreams_changed {
             let new_cfg = self.config.load_full();
             self.service_discovery_manager.reconcile(&new_cfg, None);
         }
@@ -15131,10 +15174,7 @@ impl ProxyState {
         // in `update_config` — incremental DB polls and CP gRPC pushes both
         // route through this method, so without it any upstream churn after
         // startup is invisible to the probe layer.
-        if !delta.added_upstreams.is_empty()
-            || !delta.removed_upstream_ids.is_empty()
-            || !delta.modified_upstreams.is_empty()
-        {
+        if upstreams_changed {
             let new_cfg = self.config.load_full();
             self.health_checker
                 .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
@@ -15151,15 +15191,15 @@ impl ProxyState {
     /// does before it swaps, so the result is content-comparable against
     /// [`Self::current_config`].
     ///
-    /// `update_config` normalizes fields, resolves upstream TLS, quarantines
-    /// invalid HMAC credentials, and injects gateway workload-metrics identity
-    /// **before** storing the snapshot. A raw CP-delivered candidate has not
-    /// been through those node-local steps, so comparing it directly against
-    /// the applied config reports a spurious mismatch on any node whose
-    /// identity or credential state triggers one of them — most visibly a DP
-    /// with a gateway SVID, where the injected
-    /// `ferrum-internal-gateway-workload-metrics`
-    /// plugin config exists only on the applied side.
+    /// `update_config` normalizes fields, resolves upstream TLS, sorts
+    /// consumers by `(namespace, id)`, quarantines invalid HMAC credentials,
+    /// and injects gateway workload-metrics identity **before** storing the
+    /// snapshot. A raw CP-delivered candidate has not been through those
+    /// node-local steps, so comparing it directly against the applied config
+    /// reports a spurious mismatch on any node whose identity or credential
+    /// state triggers one of them — most visibly a DP with a gateway SVID,
+    /// where the injected `ferrum-internal-gateway-workload-metrics` plugin
+    /// config exists only on the applied side.
     ///
     /// The ConfigSync older-cross-source identical-payload exception
     /// (`configsync_lifecycle::authoritative_snapshot_payload_matches`) depends
@@ -15173,6 +15213,9 @@ impl ProxyState {
         let mut candidate = config.clone();
         candidate.normalize_fields();
         candidate.resolve_upstream_tls();
+        candidate
+            .consumers
+            .sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
         let _ = candidate.quarantine_invalid_hmac_credentials();
         inject_gateway_workload_metrics_if_svid(
             &mut candidate,
@@ -73932,6 +73975,7 @@ mod tests {
             node_waypoint_udp_steer_destinations: Vec::new(),
             node_waypoint_udp_destination_routes: Vec::new(),
             k8s_mesh_overlay: Default::default(),
+            validated_country_mmdb_generation: None,
             gateway_trust_bundles: Vec::new(),
         }
     }

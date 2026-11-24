@@ -21720,6 +21720,7 @@ mod build_h3_backend_headers_tests {
             node_waypoint_udp_steer_destinations: Vec::new(),
             node_waypoint_udp_destination_routes: Vec::new(),
             k8s_mesh_overlay: Default::default(),
+            validated_country_mmdb_generation: None,
             gateway_trust_bundles: Vec::new(),
         };
         ProxyState::new(config, dns_cache, EnvConfig::default(), None, None)

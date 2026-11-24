@@ -5976,6 +5976,52 @@ async fn older_cross_source_payload_comparison_canonicalizes_the_candidate() {
     );
 }
 
+#[tokio::test]
+async fn canonicalize_snapshot_for_comparison_matches_regardless_of_consumer_array_order() {
+    use ferrum_edge::grpc::configsync_lifecycle::gateway_config_content_matches;
+
+    let state = create_test_proxy_state();
+
+    let consumer_a = Consumer {
+        id: "consumer-a".to_string(),
+        namespace: "ferrum".to_string(),
+        username: "alice".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        labels: Default::default(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let consumer_b = Consumer {
+        id: "consumer-b".to_string(),
+        namespace: "ferrum".to_string(),
+        username: "bob".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        labels: Default::default(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    let base_config = create_test_config(1);
+    let mut applied_input = base_config.clone();
+    applied_input.consumers = vec![consumer_a.clone(), consumer_b.clone()];
+    let outcome = state.update_config(applied_input);
+    assert_eq!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied);
+
+    let applied = state.current_config();
+    let mut reversed_cp_snapshot = base_config;
+    reversed_cp_snapshot.consumers = vec![consumer_b, consumer_a];
+
+    let comparable = state.canonicalize_snapshot_for_comparison(&reversed_cp_snapshot);
+    assert!(
+        gateway_config_content_matches(applied.as_ref(), &comparable),
+        "equivalent CP snapshot with different consumer ordering must match applied DP config"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn dp_becomes_ready_and_applies_delta_despite_unbindable_stream_port() {
     // Issue #2971 acceptance: a CP snapshot containing a stream proxy whose port
