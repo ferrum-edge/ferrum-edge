@@ -12,11 +12,8 @@
 //!   [`TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV`], and the dynamic plugin-config
 //!   secret namespace [`PLUGIN_SECRET_EXAMPLE_ENV`])
 //!
-//! [`PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS`] is a small allowlist for accepted
-//! compatibility aliases that intentionally share the canonical setting's
-//! docs/template row. [`is_public_ferrum_env_coverage_exempt`] is the membership
-//! check used by the external parity tests. Build-out policy does not add new
-//! legacy shims; only existing permitted aliases belong here.
+//! Every inventory member owns its own docs table row and template
+//! assignment; build-out policy keeps no compatibility aliases.
 //!
 //! External unit tests under `tests/unit/config/env_docs_parity_tests.rs`
 //! fail closed when a public inventory setting lacks a
@@ -42,7 +39,8 @@ pub const TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV: &str = "FERRUM_TRANSCRIPT_SINK_SEC
 /// (`api_chargeback_sink` `clickhouse.password_ref`, `ai_semantic_firewall`
 /// `provider.api_key_env`, `ai_stream_router` `${...}` API keys,
 /// `workload_metrics` Lightstep `access_token_env`, `proxy_alerts` channel
-/// `*_env` fields, and the `serverless_function` Azure/GCP fallbacks) resolves
+/// `*_env` fields, log-schema `transforms.<field>.secret_ref` `${...}` hash
+/// keys, and the `serverless_function` Azure/GCP fallbacks) resolves
 /// ONLY this namespace, where `<NAME>` is any uppercase `[A-Z_][A-Z0-9_]*`
 /// suffix (see `crate::plugins::utils::plugin_secret_env`). The namespace has
 /// no fixed key set; this representative key is its machine-checkable
@@ -77,6 +75,8 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_ADMIN_ALLOWED_CIDRS",
     "FERRUM_ADMIN_AUDIT_ENABLED",
     "FERRUM_ADMIN_AUDIT_FALLBACK_PATH",
+    "FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES",
+    "FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS",
     "FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS",
     "FERRUM_ADMIN_AUDIT_QUEUE_CAPACITY",
     "FERRUM_ADMIN_AUDIT_RETAINED_MAX_RECORDS",
@@ -85,6 +85,7 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY",
     "FERRUM_ADMIN_BIND_ADDRESS",
     "FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS",
+    "FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET",
     "FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS",
     "FERRUM_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES",
     "FERRUM_ADMIN_HTTPS_PORT",
@@ -294,6 +295,7 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_HTTP3_SEND_WINDOW",
     "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW",
     "FERRUM_HTTP3_WEBSOCKET_ENABLED",
+    "FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS",
     "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS",
     "FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB",
     "FERRUM_INJECTOR_ALLOW_PLAINTEXT",
@@ -332,6 +334,8 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_K8S_WATCH_ISTIO_CRDS",
     "FERRUM_K8S_WATCH_MESH_CONFIG",
     "FERRUM_K8S_WATCH_NAMESPACES",
+    "FERRUM_KAFKA_ALLOWED_BROKERS",
+    "FERRUM_KAFKA_ALLOW_NATIVE_CONFIG",
     "FERRUM_KTLS_ENABLED",
     "FERRUM_LOG_BUFFER_BYTES",
     "FERRUM_LOG_BUFFER_CAPACITY",
@@ -340,6 +344,7 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_LOG_LEVEL",
     "FERRUM_LOG_MAX_RECORD_BYTES",
     "FERRUM_LOG_REDACT_METADATA_KEYS",
+    "FERRUM_LOG_SAFE_METADATA_KEYS",
     "FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS",
     "FERRUM_MAX_CONCURRENT_FAULT_DELAYS",
     "FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP",
@@ -419,7 +424,6 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_MESH_JWT_SVID_TTL_SECONDS",
     "FERRUM_MESH_LOCALITY_LB_STRICT",
     "FERRUM_MESH_NODE_ID",
-    "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS",
     "FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS",
     "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR",
     "FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID",
@@ -509,6 +513,7 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES",
     "FERRUM_NODE_AGENT_FALLBACK_MODE",
     "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT",
+    "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES",
     "FERRUM_NODE_AGENT_NODE_IP",
     "FERRUM_NODE_AGENT_NODE_IPS",
     "FERRUM_NODE_AGENT_NODE_NAME",
@@ -595,6 +600,7 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_TLS_ACME_MAX_ACCOUNTS",
     "FERRUM_TLS_ACME_MAX_CERTIFICATES",
     "FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY",
+    "FERRUM_TLS_AEAD_BACKEND",
     "FERRUM_TLS_CA_BUNDLE_PATH",
     "FERRUM_TLS_CA_BUNDLE_SOURCE",
     "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS",
@@ -602,7 +608,6 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS",
     "FERRUM_TLS_CRL_FILE_PATH",
     "FERRUM_TLS_CRL_SOURCE",
-    "FERRUM_TLS_CURVES",
     "FERRUM_TLS_EARLY_DATA_METHODS",
     "FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS",
     "FERRUM_TLS_KEY_EXCHANGE_GROUPS",
@@ -634,6 +639,7 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_UDP_MAX_SESSIONS_PER_IP",
     "FERRUM_UDP_PKTINFO_ENABLED",
     "FERRUM_UDP_RECVMMSG_BATCH_SIZE",
+    "FERRUM_VAULT_ALLOW_PLAINTEXT",
     "FERRUM_VIA_PSEUDONYM",
     "FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS",
     "FERRUM_WEBSOCKET_MAX_CONNECTIONS",
@@ -656,26 +662,6 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_XDS_MAX_TOTAL_STREAMS",
     "FERRUM_XDS_STREAM_CHANNEL_CAPACITY",
 ];
-
-/// Accepted settings that intentionally do not own a separate docs table row
-/// and/or `ferrum.conf` assignment. Canonical replacements remain covered.
-///
-/// Keep this list sorted and minimal. Prefer documenting the canonical name
-/// only; do not grow this allowlist for new aliases under build-out policy.
-pub const PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS: &[&str] = &[
-    // Compatibility alias of `FERRUM_TLS_KEY_EXCHANGE_GROUPS` (canonical).
-    "FERRUM_TLS_CURVES",
-];
-
-/// True when `key` is an explicit DOC-03 docs/`ferrum.conf` coverage exemption.
-///
-/// Exemptions remain inventory members; they only skip owning a separate docs
-/// table row and/or template assignment because a canonical twin is covered.
-pub fn is_public_ferrum_env_coverage_exempt(key: &str) -> bool {
-    PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS
-        .binary_search(&key)
-        .is_ok()
-}
 
 /// Recognized settings-file keys. This does not restrict arbitrary process
 /// environment variables or extend secret-suffix resolution to ferrum.conf.

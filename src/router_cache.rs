@@ -73,7 +73,9 @@ enum MeshRouteDirectionFilter {
     Unfiltered,
     /// Admit non-mesh routes plus mesh routes whose direction equals this
     /// request's listener direction (`None` ⇒ a non-mesh listener, which admits
-    /// no direction-scoped mesh route).
+    /// no direction-scoped mesh route). A carried VirtualService HTTP route is
+    /// never admitted on an inbound mesh listener
+    /// (`modes::mesh::mesh_route_admitted_for_direction`, issue #7423).
     MatchingDirection(Option<crate::modes::mesh::MeshTrafficDirection>),
 }
 
@@ -1586,7 +1588,6 @@ impl RouterCache {
     /// Without this,
     /// the tiny-cache eviction short-circuit would leave the cache unbounded
     /// under load.
-    #[allow(dead_code)]
     pub fn new(config: &GatewayConfig, max_cache_entries: usize) -> Self {
         Self::with_shard_amount(config, max_cache_entries, 0)
     }
@@ -1686,7 +1687,6 @@ impl RouterCache {
     /// Standalone-router admission publisher for external regression tests.
     /// Production admission is published only through `RequestEpochStore`.
     #[doc(hidden)]
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn publish_listener_admission_for_test(&self, pending: bool, refused_ports: BTreeSet<u16>) {
         let current = self.route_snapshot.load_full();
         let listener_admission = if pending {
@@ -1842,14 +1842,12 @@ impl RouterCache {
     /// Results are cached (including misses) for O(1) repeated lookups.
     /// Prefix and regex matches use separate cache partitions.
     /// Library/test API; request hot paths use find_proxy_in_epoch().
-    #[allow(dead_code)]
     pub fn find_proxy(&self, host: Option<&str>, path: &str) -> Option<RouteMatch> {
         self.find_proxy_on_frontend(host, path, None, false)
     }
 
     /// Port-aware library/test lookup. Production request paths pass the
     /// frontend accept port and TLS class into [`Self::find_proxy_in_epoch`].
-    #[allow(dead_code)]
     pub fn find_proxy_on_frontend(
         &self,
         host: Option<&str>,
@@ -2092,15 +2090,13 @@ impl RouterCache {
         // to a lower-priority valid route instead of returning a wrong-direction
         // route. A no-op (and zero-cost via short-circuit) on the normal
         // `Unfiltered` lookup path.
-        let admit = |rm: &RouteMatch| match direction_filter {
+        let admit_id = |id: &str| match direction_filter {
             MeshRouteDirectionFilter::Unfiltered => true,
             MeshRouteDirectionFilter::MatchingDirection(req_dir) => {
-                match crate::modes::mesh::mesh_route_direction(&rm.proxy.id) {
-                    None => true,
-                    Some(route_dir) => req_dir == Some(route_dir),
-                }
+                crate::modes::mesh::mesh_route_admitted_for_direction(id, req_dir)
             }
         };
+        let admit = |rm: &RouteMatch| admit_id(&rm.proxy.id);
         if let Some(host) = host {
             // 1. Exact host match — exact path, prefix, regex, then host-only
             if table.has_exact_path_routes
@@ -2112,7 +2108,7 @@ impl RouterCache {
             }
             if let Some(routes) = table.exact_hosts.get(host)
                 && let Some(route_match) =
-                    find_prefix_match_indexed(routes, path, port_ctx).filter(|rm| admit(rm))
+                    find_admitted_prefix_match_indexed(routes, path, port_ctx, admit)
             {
                 return Some(route_match);
             }
@@ -2126,6 +2122,7 @@ impl RouterCache {
             if table.has_host_only_routes
                 && let Some(candidates) = table.exact_hosts_host_only.get(host)
                 && let Some(proxy) = select_port_aware_proxy(candidates, port_ctx)
+                && admit_id(&proxy.id)
             {
                 return Some(RouteMatch {
                     proxy: Arc::clone(proxy),
@@ -2149,7 +2146,7 @@ impl RouterCache {
             for (pattern, routes) in &table.wildcard_hosts {
                 if wildcard_matches(pattern, host)
                     && let Some(route_match) =
-                        find_prefix_match_indexed(routes, path, port_ctx).filter(|rm| admit(rm))
+                        find_admitted_prefix_match_indexed(routes, path, port_ctx, admit)
                 {
                     return Some(route_match);
                 }
@@ -2168,6 +2165,7 @@ impl RouterCache {
                 for (pattern, candidates) in &table.wildcard_hosts_host_only {
                     if wildcard_matches(pattern, host)
                         && let Some(proxy) = select_port_aware_proxy(candidates, port_ctx)
+                        && admit_id(&proxy.id)
                     {
                         return Some(RouteMatch {
                             proxy: Arc::clone(proxy),
@@ -2188,7 +2186,7 @@ impl RouterCache {
             return Some(route_match);
         }
         if let Some(route_match) =
-            find_prefix_match_indexed(&table.catch_all, path, port_ctx).filter(|rm| admit(rm))
+            find_admitted_prefix_match_indexed(&table.catch_all, path, port_ctx, admit)
         {
             return Some(route_match);
         }
@@ -2300,7 +2298,6 @@ impl RouterCache {
     /// resolve through [`Self::resolve_mesh_scoped_route_in_epoch`]. It is
     /// public only so the library's external tests can reach it.
     #[doc(hidden)]
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn resolve_mesh_scoped_route_for_test(
         &self,
         host: Option<&str>,
@@ -2383,13 +2380,11 @@ impl RouterCache {
     }
 
     /// Number of entries currently in the prefix cache (for testing).
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn cache_len(&self) -> usize {
         self.prefix_cache_entries.load(Ordering::Relaxed)
     }
 
     /// Number of entries currently in the regex cache (for testing).
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn regex_cache_len(&self) -> usize {
         self.regex_cache_entries.load(Ordering::Relaxed)
     }
@@ -2441,7 +2436,6 @@ impl RouterCache {
     }
 
     /// Number of routes in the pre-sorted route table (for testing).
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn route_count(&self) -> usize {
         let snapshot = self.route_snapshot.load();
         let table = &snapshot.table;
@@ -3275,14 +3269,13 @@ impl RouterCache {
             }
         }
 
-        // Sort prefix route lists by listen_path length descending (longest first)
-        // and build HashMap indexes for O(path_depth) lookups
-        for routes in exact_hosts.values_mut() {
-            routes.sort_by_key(|b| std::cmp::Reverse(b.listen_path.len()));
-        }
+        // Build HashMap indexes for O(path_depth) longest-prefix lookups. The
+        // index groups candidates by exact listen_path, so the insertion order
+        // of different paths does not matter; same-path candidates keep their
+        // input order.
         let exact_hosts_indexed: HashMap<String, IndexedPrefixRoutes> = exact_hosts
             .into_iter()
-            .map(|(host, routes)| (host, IndexedPrefixRoutes::from_sorted(routes)))
+            .map(|(host, routes)| (host, IndexedPrefixRoutes::from_entries(routes)))
             .collect();
         let exact_hosts_exact_path_indexed: HashMap<String, IndexedExactPathRoutes> =
             exact_hosts_exact_paths
@@ -3291,14 +3284,11 @@ impl RouterCache {
                 .collect();
 
         let mut wildcard_vec: Vec<(String, Vec<RouteEntry>)> = wildcard_hosts.into_iter().collect();
-        for (_, routes) in &mut wildcard_vec {
-            routes.sort_by_key(|b| std::cmp::Reverse(b.listen_path.len()));
-        }
         // Sort wildcard patterns by length descending (more-specific wildcards first)
         wildcard_vec.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
         let wildcard_indexed: Vec<(String, IndexedPrefixRoutes)> = wildcard_vec
             .into_iter()
-            .map(|(pattern, routes)| (pattern, IndexedPrefixRoutes::from_sorted(routes)))
+            .map(|(pattern, routes)| (pattern, IndexedPrefixRoutes::from_entries(routes)))
             .collect();
         let mut wildcard_exact_path_vec: Vec<(String, Vec<RouteEntry>)> =
             wildcard_hosts_exact_paths.into_iter().collect();
@@ -3309,8 +3299,7 @@ impl RouterCache {
                 .map(|(pattern, routes)| (pattern, IndexedExactPathRoutes::from_entries(routes)))
                 .collect();
 
-        catch_all.sort_by_key(|b| std::cmp::Reverse(b.listen_path.len()));
-        let catch_all_indexed = IndexedPrefixRoutes::from_sorted(catch_all);
+        let catch_all_indexed = IndexedPrefixRoutes::from_entries(catch_all);
         let catch_all_exact_path_indexed =
             IndexedExactPathRoutes::from_entries(catch_all_exact_paths);
 
@@ -3452,10 +3441,12 @@ impl IndexedExactPathRoutes {
 }
 
 impl IndexedPrefixRoutes {
-    /// Build from a pre-sorted Vec<RouteEntry> (must already be sorted by length descending).
-    fn from_sorted(sorted: Vec<RouteEntry>) -> Self {
+    /// Group route entries by exact `listen_path`. Lookup walks the request
+    /// path's segment boundaries longest-first, so entry order across paths
+    /// is irrelevant; same-path candidates keep their input order.
+    fn from_entries(entries: Vec<RouteEntry>) -> Self {
         let mut path_index: HashMap<String, Vec<PortScopedProxy>> = HashMap::new();
-        for entry in sorted {
+        for entry in entries {
             path_index
                 .entry(entry.listen_path)
                 .or_default()
@@ -3495,10 +3486,17 @@ fn find_exact_path_match_indexed(
 ///
 /// This is the key optimization that prevents throughput degradation as proxy count
 /// scales from tens to tens of thousands.
-fn find_prefix_match_indexed(
+///
+/// A prefix whose selected route `admit` refuses is skipped and the walk keeps
+/// going to shorter prefixes (issue #7423). The mesh direction filter needs
+/// this: a carried VirtualService `/api` route refused on an inbound listener
+/// must not hide the local inbound `/` route of the same host. The cached
+/// lookup admits everything.
+fn find_admitted_prefix_match_indexed(
     routes: &IndexedPrefixRoutes,
     path: &str,
     port_ctx: HttpPortMatchContext,
+    admit: impl Fn(&RouteMatch) -> bool,
 ) -> Option<RouteMatch> {
     if routes.path_index.is_empty() {
         return None;
@@ -3511,11 +3509,13 @@ fn find_prefix_match_indexed(
     };
 
     let pick = |candidates: &Vec<PortScopedProxy>, matched_prefix_len: usize| {
-        select_port_aware_proxy(candidates, port_ctx).map(|proxy| RouteMatch {
-            proxy: Arc::clone(proxy),
-            path_params: Vec::new(),
-            matched_prefix_len,
-        })
+        select_port_aware_proxy(candidates, port_ctx)
+            .map(|proxy| RouteMatch {
+                proxy: Arc::clone(proxy),
+                path_params: Vec::new(),
+                matched_prefix_len,
+            })
+            .filter(|route_match| admit(route_match))
     };
 
     // 1. Exact match (most common case for the scale test pattern)
@@ -3728,7 +3728,6 @@ pub struct MeshScopedRoute(RouteMatch);
 
 impl MeshScopedRoute {
     /// The resolved route.
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn route_match(&self) -> &RouteMatch {
         &self.0
     }
@@ -3762,8 +3761,10 @@ fn complete_mesh_scoped_resolution(
 
     let found = match found {
         Some(route)
-            if crate::modes::mesh::mesh_route_direction(&route.proxy.id)
-                .is_some_and(|direction| Some(direction) != mesh.direction) =>
+            if !crate::modes::mesh::mesh_route_admitted_for_direction(
+                &route.proxy.id,
+                mesh.direction,
+            ) =>
         {
             exclude_wrong_direction()
         }
@@ -3840,7 +3841,6 @@ fn complete_mesh_scoped_resolution(
 ///
 /// Anything this cannot place, such as a proxy whose hosts do not match the
 /// request host, is refused.
-#[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
 pub fn path_parameter_route_admitted(
     matched: &Proxy,
     stripped_route: &RouteMatch,
@@ -4236,12 +4236,8 @@ fn frequency_aware_evict<V>(
     removed
 }
 
-/// Build a cache key from host and path with exact-capacity pre-allocation.
-///
-/// Uses NUL separator which cannot appear in hostnames or URL paths.
-/// Uses `String::with_capacity` + `push_str` instead of `format!()` to
-/// avoid format-machinery overhead and produce an exact-size allocation.
-/// Write the cache key into an existing buffer (zero-allocation on cache hits).
+/// Write the cache key (`host\0path\0port-or-*\0t|p`) into an existing buffer
+/// (no allocation on cache hits). NUL cannot appear in hostnames or URL paths.
 /// Used by the thread-local fast path in `find_proxy()`.
 #[inline]
 fn write_cache_key(
@@ -4315,51 +4311,54 @@ fn make_cache_key(
 /// in the SAME coordinate system the router used to compute the offset, so the
 /// slice can never land mid-codepoint or desync routing from forwarding.
 pub(crate) fn normalize_encoded_slashes(path: &str) -> Cow<'_, str> {
-    if !path.as_bytes().contains(&b'%') {
-        return Cow::Borrowed(path);
-    }
-
     let bytes = path.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    let mut modified = false;
+    // Find the first foldable escape before allocating, so a path that only
+    // carries other percent-escapes stays zero-allocation (issue #7207).
+    // Every byte before it is copied verbatim by the fold loop, so starting
+    // the loop there keeps the output byte-identical.
+    let Some(first) = (0..bytes.len()).find(|&i| encoded_slash_len(bytes, i).is_some()) else {
+        return Cow::Borrowed(path);
+    };
 
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(&bytes[..first]);
+    let mut i = first;
     while i < bytes.len() {
-        if bytes[i] == b'%' {
-            // Double-encoded slash: %252F / %252f (5 bytes)
-            if i + 4 < bytes.len()
-                && bytes[i + 1] == b'2'
-                && bytes[i + 2] == b'5'
-                && bytes[i + 3] == b'2'
-                && matches!(bytes[i + 4], b'F' | b'f')
-            {
-                out.push(b'/');
-                i += 5;
-                modified = true;
-                continue;
-            }
-            // Single-encoded slash: %2F / %2f (3 bytes)
-            if i + 2 < bytes.len() && bytes[i + 1] == b'2' && matches!(bytes[i + 2], b'F' | b'f') {
-                out.push(b'/');
-                i += 3;
-                modified = true;
-                continue;
-            }
+        if let Some(len) = encoded_slash_len(bytes, i) {
+            out.push(b'/');
+            i += len;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
     }
 
-    if modified {
-        // Input was valid UTF-8 and we only replaced ASCII percent-sequences
-        // with ASCII '/'; the result is guaranteed valid UTF-8.
-        match String::from_utf8(out) {
-            Ok(s) => Cow::Owned(s),
-            Err(_) => Cow::Borrowed(path),
-        }
-    } else {
-        Cow::Borrowed(path)
+    // Input was valid UTF-8 and we only replaced ASCII percent-sequences
+    // with ASCII '/'; the result is guaranteed valid UTF-8.
+    match String::from_utf8(out) {
+        Ok(s) => Cow::Owned(s),
+        Err(_) => Cow::Borrowed(path),
     }
+}
+
+/// Length of the encoded slash starting at `bytes[i]`: 5 for a double-encoded
+/// `%252F` / `%252f`, 3 for `%2F` / `%2f`, `None` otherwise.
+fn encoded_slash_len(bytes: &[u8], i: usize) -> Option<usize> {
+    if bytes.get(i) != Some(&b'%') {
+        return None;
+    }
+    if i + 4 < bytes.len()
+        && bytes[i + 1] == b'2'
+        && bytes[i + 2] == b'5'
+        && bytes[i + 3] == b'2'
+        && matches!(bytes[i + 4], b'F' | b'f')
+    {
+        return Some(5);
+    }
+    if i + 2 < bytes.len() && bytes[i + 1] == b'2' && matches!(bytes[i + 2], b'F' | b'f') {
+        return Some(3);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -5490,7 +5489,6 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
-            pool_max_requests_per_connection: None,
             pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,
@@ -6277,7 +6275,18 @@ mod tests {
     #[test]
     fn encoded_slash_other_percent_unchanged() {
         let result = normalize_encoded_slashes("/api%20name");
+        // Issue #7207: a path with only non-slash escapes is not copied.
+        assert!(matches!(result, Cow::Borrowed(_)));
         assert_eq!(result, "/api%20name");
+    }
+
+    #[test]
+    fn encoded_slash_after_other_escapes_keeps_prefix_bytes() {
+        assert_eq!(
+            normalize_encoded_slashes("/x%20y%25%2Fz%252"),
+            "/x%20y%25/z%252"
+        );
+        assert_eq!(normalize_encoded_slashes("/%2%2f"), "/%2/");
     }
 
     #[test]
@@ -7520,11 +7529,15 @@ mod tests {
         let cached_before = cache.cache_len();
         assert!(cached_before >= 1);
 
-        // Flip refusal without clearing so the next lookup must reject a
-        // still-resident positive cache entry on the hit path.
-        cache.publish_listener_admission_without_clearing_for_tests(
-            GatewayListenerAdmission::decided(BTreeSet::from([80])),
-        );
+        // Flip to a pending admission without clearing, so the next lookup
+        // must reject a still-resident positive cache entry on the hit path.
+        // `pending()` refuses port-scoped routes but not the frontend port, so
+        // the early `explicitly_refuses` return does not fire and only the
+        // cache-hit `allows(port)` check stands between the lookup and the
+        // stale entry.
+        let admission = GatewayListenerAdmission::pending();
+        assert!(!admission.explicitly_refuses(80));
+        cache.publish_listener_admission_without_clearing_for_tests(admission);
         assert_eq!(
             cache.cache_len(),
             cached_before,

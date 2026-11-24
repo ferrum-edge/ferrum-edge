@@ -39,11 +39,6 @@
       "tcp_port": "webhook"
     },
     {
-      "name": "ferrum-mesh-ca",
-      "kind": "Deployment",
-      "handler": "admin_health"
-    },
-    {
       "name": "ferrum-mesh-east-west",
       "kind": "Deployment",
       "handler": "admin_health"

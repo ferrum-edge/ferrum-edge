@@ -130,6 +130,7 @@ fn test_upstream(id: &str, host: &str, port: u16) -> Upstream {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -194,7 +195,6 @@ fn test_proxy(id: &str, listen_path: &str, plugins: Vec<PluginAssociation>) -> P
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -1070,6 +1070,55 @@ mod mongo_incremental_poll_contract {
         );
     }
 
+    fn mongo_method_body(marker: &str) -> &'static str {
+        let start = MONGO_STORE_SOURCE
+            .find(marker)
+            .unwrap_or_else(|| panic!("{marker} must exist"));
+        let tail = &MONGO_STORE_SOURCE[start + marker.len()..];
+        let end = tail
+            .find("\n        async fn ")
+            .unwrap_or_else(|| panic!("{marker} must be followed by another method"));
+        &MONGO_STORE_SOURCE[start..start + marker.len() + end]
+    }
+
+    /// Issue #7210: once the change row is inserted, a compaction failure must
+    /// not propagate. Every standalone write rolls its resource back on an
+    /// error from these helpers, which would leave a durable change row that
+    /// points at a rolled-back resource.
+    #[test]
+    fn change_row_writers_compact_best_effort_after_the_row_is_durable() {
+        for marker in [
+            "async fn record_config_change_returning_sequence(",
+            "async fn record_config_changes_batch(",
+        ] {
+            let body = mongo_method_body(marker);
+            assert!(
+                body.contains("self.compact_config_changes_best_effort(namespace).await;"),
+                "{marker} must compact through the best-effort helper:\n{body}"
+            );
+            assert!(
+                !body.contains("self.compact_config_changes(namespace).await?"),
+                "{marker} must not propagate a compaction failure:\n{body}"
+            );
+        }
+    }
+
+    /// Issue #7210: the standalone namespace wipe records its delete rows in
+    /// one batch (one reservation, one compaction probe), not one row and one
+    /// compaction probe per deleted id.
+    #[test]
+    fn standalone_delete_all_resources_records_changes_in_one_batch() {
+        let body = mongo_method_body("async fn delete_all_resources(");
+        assert!(
+            body.contains("self.record_config_changes_batch(&changes).await?"),
+            "delete_all_resources must record its delete rows in one batch:\n{body}"
+        );
+        assert!(
+            !body.contains("self.record_config_change(namespace,"),
+            "delete_all_resources must not record one change row per id:\n{body}"
+        );
+    }
+
     #[test]
     fn every_sequence_reader_shares_the_widened_decoder() {
         for marker in [
@@ -1294,7 +1343,7 @@ async fn saturated_change_log_fallback_converges_within_two_poll_cycles() {
     let _cap = ChangeLogCap::set("ferrum", 10_000);
     let db: Arc<dyn DatabaseBackend> = Arc::new(store);
     let proxy_state = scale_proxy_state();
-    let apply = RuntimeConfigApply::new("ferrum", 0);
+    let apply = RuntimeConfigApply::at_epoch("ferrum", 0, 0);
 
     // Seed the accepted cursor from the startup full load exactly as
     // database mode does.
@@ -1416,7 +1465,7 @@ async fn saturated_change_log_fallback_converges_within_two_poll_cycles() {
         "the poll after a fallback reload must be incremental, not another full reload"
     );
     assert_eq!(cursor.sequence, watermark);
-    assert_eq!(apply.accepted_sequence(), watermark);
+    assert_eq!(apply.accepted_cursor().sequence, watermark);
 
     // A write after the fallback is picked up incrementally from the
     // committed cursor, proving the reload neither skipped ahead of the rows
@@ -1437,7 +1486,7 @@ async fn saturated_change_log_fallback_converges_within_two_poll_cycles() {
         "a single post-reload write must apply incrementally"
     );
     assert_eq!(cursor.sequence, after_watermark);
-    assert_eq!(apply.accepted_sequence(), after_watermark);
+    assert_eq!(apply.accepted_cursor().sequence, after_watermark);
     assert_eq!(
         proxy_state.current_config().proxies.len(),
         SATURATED_BATCH_PROXIES + 1,

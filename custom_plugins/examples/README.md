@@ -17,6 +17,13 @@ cp custom_plugins/examples/example_audit_plugin.rs custom_plugins/
 cargo build
 ```
 
+## Required exports
+
+Each example exports `create_plugin`, `failure_policy`, and `config_contract`.
+`config_contract()` lists example configs that the plugin test sweep validates,
+probes for unknown keys at every depth, and checks for runtime-free
+construction (see `CUSTOM_PLUGINS.md`, "Config contract").
+
 ## `example_audit_plugin` storage notes
 
 Runtime writes go to the gateway's SQL configuration database, resolved via

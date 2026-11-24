@@ -3,6 +3,7 @@
 //! Tests:
 //! - `/metrics` endpoint on admin port returns Prometheus exposition format after traffic
 //! - Request count metrics reflect actual traffic volume
+//! - Pre-routing 404s and HTTP body bytes reach `/metrics`
 //!
 //! Uses file mode with the shared `TestGateway` harness + shared echo server
 //! (no bind-drop-rebind race).
@@ -256,6 +257,135 @@ plugin_configs:
         found_histogram_count,
         "Did not find ferrum_request_duration_ms_count for traffic-proxy. Full /metrics:\n{}",
         body
+    );
+}
+
+/// Unmatched-route `404`s never reach a plugin, so they are counted on
+/// `ferrum_unmatched_requests_total`; routed traffic exports per-proxy HTTP
+/// body bytes and finite long-range duration buckets.
+#[ignore]
+#[tokio::test]
+async fn test_prometheus_metrics_count_unmatched_routes_and_body_bytes() {
+    let backend = spawn_http_echo().await.expect("spawn echo");
+
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "bytes-proxy"
+    listen_path: "/bytes"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+
+consumers: []
+upstreams: []
+
+plugin_configs:
+  - id: "prom-unmatched"
+    plugin_name: "prometheus_metrics"
+    scope: "global"
+    enabled: true
+    config:
+      render_cache_ttl_seconds: 0
+"#,
+        backend_port = backend.port,
+    );
+
+    let gateway = TestGateway::builder()
+        .mode_file(config)
+        .log_level("debug")
+        .spawn()
+        .await
+        .expect("start gateway");
+
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let resp = client
+            .get(gateway.proxy_url("/no-such-route/anything"))
+            .send()
+            .await
+            .expect("Failed to send unrouted request");
+        assert_eq!(resp.status(), 404, "unrouted request must be a 404");
+    }
+    let resp = client
+        .post(gateway.proxy_url("/bytes/echo"))
+        .body("x".repeat(512))
+        .send()
+        .await
+        .expect("Failed to send routed request");
+    assert_eq!(resp.status(), 200, "routed request should succeed");
+    let _ = resp.bytes().await;
+
+    // The routed transaction is recorded by a separately scheduled terminal
+    // logging task; draining the response does not join it. Scrape until the
+    // monotonic series that task records appear, under a bounded deadline,
+    // instead of trusting a fixed sleep. Traffic is never resent.
+    let routed_series_recorded = |body: &str| {
+        body.lines().any(|line| {
+            line.starts_with("ferrum_request_body_bytes_total{proxy_id=\"bytes-proxy\"")
+        }) && body.lines().any(|line| {
+            line.starts_with("ferrum_response_body_bytes_total{proxy_id=\"bytes-proxy\"")
+        }) && body.lines().any(|line| {
+            line.starts_with("ferrum_request_duration_ms_count{proxy_id=\"bytes-proxy\"")
+        })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let body = loop {
+        let body = client
+            .get(gateway.admin_url("/metrics"))
+            .header("Authorization", gateway.auth_header())
+            .send()
+            .await
+            .expect("Failed to scrape /metrics")
+            .text()
+            .await
+            .expect("Failed to read /metrics body");
+        if routed_series_recorded(body.as_str()) {
+            break body;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "routed series never appeared within 15s. Last /metrics:\n{body}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    };
+
+    let sample = |prefix: &str| -> Option<u64> {
+        body.lines()
+            .find(|line| line.starts_with(prefix))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse().ok())
+    };
+
+    let unmatched =
+        sample("ferrum_unmatched_requests_total{reason=\"route_not_found\",status_code=\"404\"")
+            .unwrap_or_else(|| panic!("missing unmatched-route counter. Full /metrics:\n{body}"));
+    assert!(
+        unmatched >= 2,
+        "expected >= 2 unmatched 404s, got {unmatched}. Full /metrics:\n{body}"
+    );
+    assert!(
+        !body.contains("ferrum_requests_total{proxy_id=\"unknown\""),
+        "unrouted requests must not be attributed to a synthetic proxy. Full /metrics:\n{body}"
+    );
+
+    let request_bytes = sample("ferrum_request_body_bytes_total{proxy_id=\"bytes-proxy\"")
+        .unwrap_or_else(|| panic!("missing request body bytes. Full /metrics:\n{body}"));
+    assert!(
+        request_bytes >= 512,
+        "expected >= 512 request body bytes, got {request_bytes}. Full /metrics:\n{body}"
+    );
+    assert!(
+        sample("ferrum_response_body_bytes_total{proxy_id=\"bytes-proxy\"").is_some(),
+        "missing response body bytes. Full /metrics:\n{body}"
+    );
+    assert!(
+        body.lines().any(|line| line.starts_with(
+            "ferrum_request_duration_ms_bucket{proxy_id=\"bytes-proxy\",le=\"300000\""
+        )),
+        "request duration histogram must expose the extended default layout. Full /metrics:\n{body}"
     );
 }
 

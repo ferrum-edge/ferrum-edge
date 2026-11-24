@@ -11,14 +11,23 @@
 mod aws;
 #[cfg(feature = "secrets-azure")]
 mod azure;
+#[cfg(any(feature = "secrets-azure", feature = "secrets-vault"))]
+mod ca_bundle;
 pub mod credential_file;
-pub mod env;
 pub mod file;
 #[cfg(feature = "secrets-gcp")]
 mod gcp;
 mod registry;
 #[cfg(feature = "secrets-vault")]
 mod vault;
+
+/// Emit warnings that external secret resolution recorded before the logging
+/// subscriber existed. Startup resolution runs before logging is initialized,
+/// so callers invoke this right after `init_logging` succeeds.
+pub fn emit_deferred_startup_warnings() {
+    #[cfg(feature = "secrets-vault")]
+    vault::emit_deferred_plaintext_warning();
+}
 
 #[cfg(any(feature = "secrets-aws", feature = "secrets-vault"))]
 pub(crate) fn split_reference_field(reference: &str) -> (&str, Option<&str>) {
@@ -31,7 +40,7 @@ pub(crate) fn split_reference_field(reference: &str) -> (&str, Option<&str>) {
 #[allow(unused_imports)]
 pub use registry::{
     EXTERNAL_SECRET_SUFFIXES, ResolvedEnvSecrets, ResolvedSecret, external_source_configured,
-    resolve_all_env_secrets, resolve_external_reference, resolve_secret,
+    resolve_all_env_secrets, resolve_external_reference,
 };
 
 pub(crate) use registry::resolve_selected_env_secrets;
@@ -485,9 +494,7 @@ const MINIMAL_WITHHELD_LOG_RECORD: &str = "{}";
 // already holds the `&RedactionPlan` snapshot it is acting on and reaches
 // `plan.withheld_record` through `withheld_record(plan, ..)`, so calling this
 // there would add a second global-plan lookup and let the emitted line come
-// from a different snapshot than the record being withheld. The binary target
-// therefore compiles it unused; scoped to this accessor only.
-#[allow(dead_code)]
+// from a different snapshot than the record being withheld. Tests read it.
 pub fn withheld_log_record() -> &'static str {
     match redaction_plan() {
         Some(plan) => plan.withheld_record.as_str(),
@@ -611,12 +618,14 @@ const TRACING_ENVELOPE_FIELDS_KEYS: [&str; 1] = ["message"];
 
 /// An order-preserving JSON document, used only by [`redact_log_record`].
 ///
-/// `serde_json::Value` stores objects in a `BTreeMap` — the `preserve_order`
-/// feature is deliberately not enabled crate-wide, since it would change every
-/// admin API response body — so round-tripping a record through it would
-/// alphabetize the fields of every access-log line that happened to contain a
-/// resolved value. Redaction must change values and nothing else, so objects
-/// are held here as an ordered key/value list.
+/// Redaction must change values and nothing else, so field order has to
+/// survive the round trip. Whether `serde_json::Value` keeps object order
+/// depends on its `preserve_order` cargo feature, which any crate in the graph
+/// can turn on (today `bson`, through `mongodb`, does) and which could equally
+/// be turned off by a dependency change; without it objects are a `BTreeMap`
+/// and every access-log line that contained a resolved value would come out
+/// alphabetized. Objects are therefore held here as an explicit ordered
+/// key/value list, independent of that feature.
 ///
 /// Depth is bounded by `serde_json`'s own recursion limit on the parse, which
 /// also bounds the redaction walk and the reserialization.
@@ -828,7 +837,7 @@ const MAX_REFERENCE_FORMS: usize = 5;
 ///   and keeps only the identifier, and
 ///   `secrets::registry::SecretBackend::source` renders the completed fetch as
 ///   `<provider>:<identifier>` — one colon, no `//`, which is the shape a
-///   single-key `resolve_secret`/`resolve_external_reference` caller reports.
+///   `resolve_external_reference` caller reports.
 ///   (TLS material no longer carries that string: `load_secret_material` now
 ///   stamps `MaterializedMaterial`'s `display_source_id` with the provider-only
 ///   `CertSourceUri::redacted_source_id()`, so a PEM-parse failure prints
@@ -1288,6 +1297,14 @@ pub use azure::{
     AzureCredentials, AzureSecret, apply_tls_version_option as azure_apply_tls_version_option,
     parse_keyvault_reference as azure_parse_keyvault_reference,
 };
+#[cfg(feature = "secrets-azure")]
+#[doc(hidden)]
+pub use ca_bundle::hold_ca_bundle_reader_permit_for_test as azure_hold_ca_bundle_reader_permit_for_test;
+// The CA bundle reader admission gate is shared by every provider transport
+// that trusts `FERRUM_TLS_CA_BUNDLE_PATH`.
+#[cfg(any(feature = "secrets-azure", feature = "secrets-vault"))]
+#[doc(hidden)]
+pub use ca_bundle::hold_ca_bundle_reader_permit_for_test;
 
 /// Candidate derivation is deliberately private — the whole point of
 /// [`RedactionPlan`] is that no caller can hand it a different candidate set —
@@ -1306,7 +1323,7 @@ mod derivation_tests {
     fn provider_source_rendering_of_a_uri_is_derived() {
         // `SecretBackend::source` renders the completed fetch with one colon
         // and no `//`. TLS material now stamps the provider-only redacted id
-        // instead, but single-key callers still report this shape, so the
+        // instead, but direct-reference callers still report this shape, so the
         // derivation must keep covering it.
         let forms = derive_reference_forms("vault://secret/data/gw#cert");
         assert!(forms.contains(&"vault:secret/data/gw#cert".to_string()));

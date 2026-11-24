@@ -98,6 +98,21 @@ fn make_ctx() -> RequestContext {
     ctx
 }
 
+/// Build this instance's response-stream inspector through the core wrapper the
+/// proxy uses: stream selection runs first, then the factory with the
+/// request-owned terminal handoff attached. The inspector publishes its capture
+/// into that handoff when it drops, so a test drops it before calling
+/// `on_response_stream_terminated`.
+fn audit_stream_inspector(
+    plugin: &Arc<AiTranscriptAudit>,
+    ctx: &mut RequestContext,
+    response_status: u16,
+    content_type: Option<&str>,
+) -> Option<Box<dyn ResponseStreamInspector>> {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    create_response_stream_inspector(&plugins, ctx, response_status, content_type)
+}
+
 fn ai_request_body() -> &'static [u8] {
     br#"{"model":"gpt-4o","messages":[{"role":"user","content":"my ssn is 123-45-6789"}]}"#
 }
@@ -477,6 +492,44 @@ async fn cleartext_sink_requires_explicit_loopback_only_opt_in() {
                 "allow_insecure_loopback": true
             }
         }),
+        // A name never proves the collector is on this machine: DNS overrides
+        // and the resolver decide where `localhost` connects (#6659).
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "http://localhost:9001/audit",
+                "allow_insecure_loopback": true
+            }
+        }),
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "http://collector.localhost:9001/audit",
+                "allow_insecure_loopback": true
+            }
+        }),
+        // The URL parser ignores surrounding whitespace and embedded
+        // tabs/newlines, so the scheme is judged on the parsed URL, not on the
+        // configured spelling.
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": " http://collector.example.com/audit"
+            }
+        }),
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": " http://localhost:9001/audit",
+                "allow_insecure_loopback": true
+            }
+        }),
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "ht\ttp://collector.example.com/audit"
+            }
+        }),
     ] {
         let err = AiTranscriptAudit::new(&config, loopback_http_client())
             .err()
@@ -498,6 +551,22 @@ async fn cleartext_sink_requires_explicit_loopback_only_opt_in() {
         AiTranscriptAudit::new(&loopback, loopback_http_client()).is_ok(),
         "explicit IPv6 loopback cleartext should remain available for local development"
     );
+    for endpoint in [
+        "http://127.1:9001/audit",
+        "http://[0:0:0:0:0:0:0:1]:9001/audit",
+    ] {
+        let config = json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": endpoint,
+                "allow_insecure_loopback": true
+            }
+        });
+        assert!(
+            AiTranscriptAudit::new(&config, loopback_http_client()).is_ok(),
+            "URL-normalized loopback IP literal {endpoint} stays admitted"
+        );
+    }
 }
 
 #[tokio::test]
@@ -552,7 +621,7 @@ async fn rejects_privacy_capture_sampling_redaction_limits_and_fail_posture_typo
             Some("always_capture_on_guardrail"),
         ),
         (
-            json!({ "redaction": { "hash_secre": "fleet-stable-hmac-key" } }),
+            json!({ "redaction": { "hash_secre": "fleet-stable-hmac-key-0123456789ab" } }),
             "config.redaction.hash_secre",
             Some("hash_secret"),
         ),
@@ -915,6 +984,7 @@ async fn final_request_body_drops_stale_candidate_after_ai_is_transformed_away()
             loopback_http_client(),
         )
         .unwrap();
+        let plugin = Arc::new(plugin);
         let mut ctx = make_ctx();
         ctx.metadata.insert(
             "request_body".to_string(),
@@ -940,9 +1010,7 @@ async fn final_request_body_drops_stale_candidate_after_ai_is_transformed_away()
         );
         assert!(!plugin.forces_reqwest_dispatch(&ctx));
         assert!(
-            plugin
-                .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-                .is_none()
+            audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream")).is_none()
         );
     }
 }
@@ -980,6 +1048,7 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let headers = json_headers();
@@ -1042,6 +1111,7 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
         loopback_http_client(),
     )
     .unwrap();
+    let peer = Arc::new(peer);
     peer.start_background_tasks().expect("live start");
     peer.commit_background_tasks();
     let mut peer_overflow = make_ctx();
@@ -1080,8 +1150,7 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
         "a saturated instance must not force reqwest dispatch for a peer's stream candidate"
     );
     assert!(
-        plugin
-            .response_stream_inspector(&peer_overflow, 200, Some("text/event-stream"))
+        audit_stream_inspector(&plugin, &mut peer_overflow, 200, Some("text/event-stream"))
             .is_none(),
         "a saturated instance must not tee a peer's stream"
     );
@@ -1092,8 +1161,7 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
         "true".to_string(),
     );
     assert!(
-        plugin
-            .response_stream_inspector(&peer_overflow, 200, Some("text/event-stream"))
+        audit_stream_inspector(&plugin, &mut peer_overflow, 200, Some("text/event-stream"))
             .is_none(),
         "shared sample_hit must not authorize a saturated instance to tee"
     );
@@ -1113,8 +1181,7 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
         "peer must retain its staging commit capability after saturated response hooks"
     );
     assert!(
-        peer.response_stream_inspector(&peer_overflow, 200, Some("text/event-stream"))
-            .is_some(),
+        audit_stream_inspector(&peer, &mut peer_overflow, 200, Some("text/event-stream")).is_some(),
         "peer must still be able to tee its own staged stream"
     );
     let mut still_saturated = make_ctx();
@@ -2371,6 +2438,7 @@ async fn sampled_streaming_capture_honors_sampling_rate() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     let headers = json_headers();
 
     // rate 0, no guardrail: instance-local staging exists, but the tee gate
@@ -2385,9 +2453,7 @@ async fn sampled_streaming_capture_honors_sampling_rate() {
         "sampled mode must honor sampling.rate for the dispatch decision"
     );
     assert!(
-        plugin
-            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-            .is_none(),
+        audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream")).is_none(),
         "sampled mode must honor sampling.rate for the tee decision"
     );
 
@@ -2402,8 +2468,7 @@ async fn sampled_streaming_capture_honors_sampling_rate() {
         .await;
     assert!(plugin.forces_reqwest_dispatch(&guardrail_ctx));
     assert!(
-        plugin
-            .response_stream_inspector(&guardrail_ctx, 200, Some("text/event-stream"))
+        audit_stream_inspector(&plugin, &mut guardrail_ctx, 200, Some("text/event-stream"))
             .is_some()
     );
 }
@@ -2418,28 +2483,17 @@ async fn error_sse_response_is_teed_when_error_capture_enabled() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    assert!(
-        plugin
-            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-            .is_some()
-    );
+    assert!(audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream")).is_some());
     // always_capture_on_error (default true) wants response evidence for
     // error transactions — error SSE must be teed too.
-    assert!(
-        plugin
-            .response_stream_inspector(&ctx, 500, Some("text/event-stream"))
-            .is_some()
-    );
+    assert!(audit_stream_inspector(&plugin, &mut ctx, 500, Some("text/event-stream")).is_some());
     // Redirects are neither successes nor error captures.
-    assert!(
-        plugin
-            .response_stream_inspector(&ctx, 304, Some("text/event-stream"))
-            .is_none()
-    );
+    assert!(audit_stream_inspector(&plugin, &mut ctx, 304, Some("text/event-stream")).is_none());
 
     // With error capture disabled AND the request un-sampled (rate 0), a non-2xx
     // SSE stays un-teed: the record would not emit, so there is no body to
@@ -2456,13 +2510,13 @@ async fn error_sse_response_is_teed_when_error_capture_enabled() {
         loopback_http_client(),
     )
     .unwrap();
+    let no_error_capture = Arc::new(no_error_capture);
     let mut ctx2 = make_ctx();
     no_error_capture
         .on_final_request_body_with_context(&mut ctx2, &json_headers(), ai_request_body())
         .await;
     assert!(
-        no_error_capture
-            .response_stream_inspector(&ctx2, 500, Some("text/event-stream"))
+        audit_stream_inspector(&no_error_capture, &mut ctx2, 500, Some("text/event-stream"))
             .is_none()
     );
 }
@@ -2953,12 +3007,12 @@ async fn stream_inspector_without_body_drive_does_not_emit_pending_record() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let _inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let _inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
 
     plugin
@@ -2987,18 +3041,19 @@ async fn unsampled_completed_stream_writes_hash_before_deferring_emit() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let stream =
         b"data: {\"choices\":[{\"delta\":{\"content\":\"complete\"}}]}\n\ndata: [DONE]\n\n";
-    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(stream)).await;
     let _ = inspector.on_end().await;
 
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
@@ -3028,8 +3083,8 @@ struct TerminateOnEnd;
 
 #[async_trait]
 impl ResponseStreamInspector for TerminateOnEnd {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-        ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk))
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(chunk.clone())
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
@@ -3052,20 +3107,20 @@ async fn downstream_stream_cut_omits_pre_cut_capture_and_forces_guardrail_sample
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let audit = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let audit = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("audit inspector");
     let mut chain = chain_response_stream_inspectors(vec![audit, Box::new(TerminateOnEnd)])
         .expect("chained inspector");
     let stream = b"data: {\"choices\":[{\"delta\":{\"content\":\"secret backend bytes\"}}]}\n\n";
     assert!(matches!(
-        chain.on_chunk(stream).await,
+        chain.on_chunk(&Bytes::copy_from_slice(stream)).await,
         ResponseStreamAction::Forward(_)
     ));
     assert!(matches!(
@@ -3073,6 +3128,7 @@ async fn downstream_stream_cut_omits_pre_cut_capture_and_forces_guardrail_sample
         ResponseStreamAction::Terminate(_)
     ));
 
+    drop(chain);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
@@ -3155,21 +3211,24 @@ async fn stream_capture_tail_guard_prevents_boundary_leak() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     // The SSN starts just before the 300-byte capture cap, so the accumulator
     // holds only its raw prefix — the tail guard must drop it before redaction.
     let mut stream = format!("data: {}", "y".repeat(288));
     stream.push_str("123-45-6789 and more trailing data beyond the cap");
-    let _ = inspector.on_chunk(stream.as_bytes()).await;
+    let _ = inspector
+        .on_chunk(&Bytes::copy_from_slice(stream.as_bytes()))
+        .await;
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
@@ -3209,14 +3268,14 @@ async fn stream_capture_redacts_decoded_sse_json_frames() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let stream = br#"data: {"choices":[{"delta":{"content":"ssn 123\u002d45\u002d6789"}}]}
 
@@ -3225,8 +3284,9 @@ data: provider-error jane.doe@example.com
 data: [DONE]
 
 "#;
-    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(stream)).await;
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
@@ -3284,8 +3344,8 @@ async fn hash_secret_keys_the_redacted_value_digest() {
         PiiRedactor::from_config(&builtins, &[], "[REDACTED:{type}]", true, secret, "test")
             .expect("valid redactor")
     };
-    let keyed_a = make(Some("fleet-stable-hmac-key"));
-    let keyed_b = make(Some("fleet-stable-hmac-key"));
+    let keyed_a = make(Some("fleet-stable-hmac-key-0123456789ab"));
+    let keyed_b = make(Some("fleet-stable-hmac-key-0123456789ab"));
     let keyed_other = make(Some("a-different-hmac-key"));
     let random_a = make(None);
     let random_b = make(None);
@@ -3478,8 +3538,6 @@ async fn harvests_namespaced_cache_telemetry_and_rejects_everything_else() {
         ("ai_semantic_cache.7.cache_match", "semantic"),
         ("ai_semantic_cache.7.cache_similarity", "0.950000"),
         ("ai_semantic_cache.12.cache_status", "MISS"),
-        // Pre-namespace spelling still lands in the cache section.
-        ("ai_cache_status", "BYPASS"),
         // Separate producer, separate key.
         ("request_deduplication.replayed", "true"),
     ];
@@ -3487,6 +3545,10 @@ async fn harvests_namespaced_cache_telemetry_and_rejects_everything_else() {
         // The staged prompt fingerprint is not telemetry and must never ship.
         ("ai_semantic_cache.7.cache_key", "0123456789abcdef01234567"),
         ("ai_cache_key", "0123456789abcdef01234567"),
+        // Pre-namespace spellings no built-in writes (issue #7115).
+        ("ai_cache_status", "BYPASS"),
+        ("ai_cache_match", "semantic"),
+        ("ai_cache_similarity", "0.950000"),
         // Right namespace, invented field — must not become an export channel.
         ("ai_semantic_cache.7.prompt", "who is the ceo of acme corp"),
         ("ai_semantic_cache.7.cache_status.extra", "HIT"),
@@ -3558,10 +3620,10 @@ async fn harvests_namespaced_cache_telemetry_and_rejects_everything_else() {
 
 /// Oversized multi-instance chains must truncate the `cache` section in sorted
 /// key order (not `HashMap` iteration order) so the surviving subset is stable,
-/// and only along the per-instance axis: the fixed-name producer keys sort
-/// around the `ai_semantic_cache.*` block — `request_deduplication.replayed`
-/// sorts after all of it — so a plain sorted cut would drop the documented
-/// replay marker before an eleventh cache instance's status.
+/// and only along the per-instance axis: the fixed-name producer key
+/// `request_deduplication.replayed` sorts after the whole `ai_semantic_cache.*`
+/// block, so a plain sorted cut would drop the documented replay marker before
+/// an eleventh cache instance's status.
 #[tokio::test]
 async fn cache_telemetry_section_caps_at_thirty_two_sorted_keys() {
     let server = mock_sink().await;
@@ -3579,16 +3641,13 @@ async fn cache_telemetry_section_caps_at_thirty_two_sorted_keys() {
         .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
         .await;
 
-    // Two fixed-name keys: one sorting before the namespaced block, one after.
-    let fixed: &[(&str, &str)] = &[
-        ("ai_cache_status", "BYPASS"),
-        ("request_deduplication.replayed", "true"),
-    ];
+    // The one fixed-name key, sorting after the namespaced block.
+    let fixed: &[(&str, &str)] = &[("request_deduplication.replayed", "true")];
     for &(key, value) in fixed {
         ctx.metadata.insert(key.to_string(), value.to_string());
     }
-    // 40 instances against a 32-entry cap with 2 fixed-name keys reserved
-    // leaves a 30-entry budget on the per-instance axis.
+    // 40 instances against a 32-entry cap with 1 fixed-name key reserved
+    // leaves a 31-entry budget on the per-instance axis.
     let mut expected_namespaced = std::collections::BTreeMap::new();
     for instance_id in 0..40u64 {
         let key = format!("ai_semantic_cache.{instance_id}.cache_status");
@@ -3596,7 +3655,7 @@ async fn cache_telemetry_section_caps_at_thirty_two_sorted_keys() {
         ctx.metadata.insert(key.clone(), value.to_string());
         expected_namespaced.insert(key, value.to_string());
     }
-    let boundary = expected_namespaced.keys().nth(30).cloned();
+    let boundary = expected_namespaced.keys().nth(31).cloned();
     if let Some(boundary) = boundary {
         expected_namespaced.retain(|key, _| *key < boundary);
     }
@@ -3610,7 +3669,7 @@ async fn cache_telemetry_section_caps_at_thirty_two_sorted_keys() {
         .as_object()
         .expect("cache section is an object");
     assert_eq!(cache.len(), 32);
-    assert_eq!(expected_namespaced.len(), 30);
+    assert_eq!(expected_namespaced.len(), 31);
     for &(key, value) in fixed {
         assert_eq!(
             cache.get(key).and_then(|entry| entry.as_str()),
@@ -3696,19 +3755,20 @@ async fn sampled_error_sse_is_teed_and_captures_body() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let inspector = plugin
-        .response_stream_inspector(&ctx, 500, Some("text/event-stream"))
+    let inspector = audit_stream_inspector(&plugin, &mut ctx, 500, Some("text/event-stream"))
         .expect("sampled error SSE must be teed");
     let mut chain = chain_response_stream_inspectors(vec![inspector]).expect("inspector");
     let body = b"data: {\"error\":{\"message\":\"upstream boom\"}}\n\ndata: [DONE]\n\n";
-    let _ = chain.on_chunk(body).await;
+    let _ = chain.on_chunk(&Bytes::copy_from_slice(body)).await;
     let _ = chain.on_end().await;
+    drop(chain);
     plugin
         .on_response_stream_terminated(&mut ctx, 500, &BodyOutcome::success(body.len() as u64))
         .await;
@@ -4205,17 +4265,19 @@ async fn stream_end_without_on_end_omits_body() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let _ = inspector
-        .on_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
+        .on_chunk(&Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        ))
         .await;
     drop(inspector); // on_end never ran
     plugin
@@ -4408,7 +4470,9 @@ async fn stream_sampling_reads_instance_staging_not_shared_metadata() {
         )
     };
     let instance_a = AiTranscriptAudit::new(&cfg(1.0), loopback_http_client()).unwrap();
+    let instance_a = Arc::new(instance_a);
     let instance_b = AiTranscriptAudit::new(&cfg(0.0), loopback_http_client()).unwrap();
+    let instance_b = Arc::new(instance_b);
     let mut ctx = make_ctx();
     let body_str = std::str::from_utf8(ai_request_body()).unwrap();
     let mut headers = ctx.headers.clone();
@@ -4432,16 +4496,12 @@ async fn stream_sampling_reads_instance_staging_not_shared_metadata() {
     );
     // A must still tee its sampled 5xx SSE, reading its own staged roll.
     assert!(
-        instance_a
-            .response_stream_inspector(&ctx, 500, Some("text/event-stream"))
-            .is_some(),
+        audit_stream_inspector(&instance_a, &mut ctx, 500, Some("text/event-stream")).is_some(),
         "instance A must tee its sampled error stream despite B overwriting shared sample_hit"
     );
     // B (un-sampled, error capture off) does not tee.
     assert!(
-        instance_b
-            .response_stream_inspector(&ctx, 500, Some("text/event-stream"))
-            .is_none()
+        audit_stream_inspector(&instance_b, &mut ctx, 500, Some("text/event-stream")).is_none()
     );
 }
 
@@ -4466,6 +4526,7 @@ async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
         loopback_http_client(),
     )
     .unwrap();
+    let saturated = Arc::new(saturated);
     let headers = json_headers();
     for _ in 0..4096 {
         let mut filler = make_ctx();
@@ -4486,6 +4547,7 @@ async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
         loopback_http_client(),
     )
     .unwrap();
+    let peer = Arc::new(peer);
     let mut ctx = make_ctx();
     assert!(matches!(
         peer.on_final_request_body_with_context(&mut ctx, &headers, stream_request_body())
@@ -4529,9 +4591,7 @@ async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
         "peer sample_hit must not authorize stream dispatch without local staging"
     );
     assert!(
-        saturated
-            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-            .is_none(),
+        audit_stream_inspector(&saturated, &mut ctx, 200, Some("text/event-stream")).is_none(),
         "peer marker must not tee on a saturated instance"
     );
     let saturated_after_peer_stream = saturated.status_snapshot();
@@ -4554,6 +4614,7 @@ async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
         loopback_http_client(),
     )
     .unwrap();
+    let off = Arc::new(off);
     let mut off_ctx = make_ctx();
     off.on_final_request_body_with_context(&mut off_ctx, &headers, ai_request_body())
         .await;
@@ -4562,8 +4623,7 @@ async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
         "streaming off must not force reqwest dispatch"
     );
     assert!(
-        off.response_stream_inspector(&off_ctx, 200, Some("text/event-stream"))
-            .is_none(),
+        audit_stream_inspector(&off, &mut off_ctx, 200, Some("text/event-stream")).is_none(),
         "streaming off must not tee SSE"
     );
 
@@ -4576,14 +4636,16 @@ async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
     );
     let peer_before_reservation = peer.status_snapshot();
     peer.on_response_stream_selected(&ctx, 200, Some("text/event-stream"));
-    let mut peer_inspector = peer
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-        .expect("locally staged sampled winner must install a stream inspector");
+    let mut peer_inspector =
+        audit_stream_inspector(&peer, &mut ctx, 200, Some("text/event-stream"))
+            .expect("locally staged sampled winner must install a stream inspector");
     let peer_probe = peer
         .stream_capture_probe(&ctx)
         .expect("owned stream must publish a local lifecycle slot");
     let peer_chunk = vec![b'p'; 4096];
-    let _ = peer_inspector.on_chunk(&peer_chunk).await;
+    let _ = peer_inspector
+        .on_chunk(&Bytes::copy_from_slice(&peer_chunk))
+        .await;
     let peer_during_reservation = peer.status_snapshot();
     assert!(
         peer_during_reservation
@@ -4784,7 +4846,7 @@ async fn body_hashes_are_keyed_hmac_not_plain_sha256() {
     // be HMAC-SHA256 under that key — reusing the redaction-placeholder key —
     // and never the plain SHA-256 an offline attacker could brute-force through
     // a predictable JSON wrapper.
-    let secret = "fleet-stable-hmac-key";
+    let secret = "fleet-stable-hmac-key-0123456789ab";
     let resp_body: &[u8] = br#"{"choices":[{"message":{"content":"hi"}}]}"#;
     let records =
         capture_roundtrip(json!({ "redaction": { "hash_secret": secret } }), resp_body).await;
@@ -4876,7 +4938,7 @@ async fn pii_redactor_fallback_key_is_shared_across_constructions() {
 
 #[tokio::test]
 async fn stream_hash_is_incremental_keyed_hmac_over_teed_bytes() {
-    let secret = "fleet-stable-hmac-key";
+    let secret = "fleet-stable-hmac-key-0123456789ab";
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
     let plugin = AiTranscriptAudit::new(
@@ -4890,20 +4952,21 @@ async fn stream_hash_is_incremental_keyed_hmac_over_teed_bytes() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let chunk_a: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n";
     let chunk_b: &[u8] = b"data: [DONE]\n\n";
-    let _ = inspector.on_chunk(chunk_a).await;
-    let _ = inspector.on_chunk(chunk_b).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk_a)).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk_b)).await;
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(
             &mut ctx,
@@ -5184,15 +5247,16 @@ async fn tool_governor_buffered_and_terminal_stream_decisions_force_capture_but_
     streaming
         .on_final_request_body_with_context(&mut stream_ctx, &headers, ai_request_body())
         .await;
-    let mut inspector = streaming
-        .response_stream_inspector(&stream_ctx, 200, Some("text/event-stream"))
-        .expect("streaming capture is enabled");
+    let mut inspector =
+        audit_stream_inspector(&streaming, &mut stream_ctx, 200, Some("text/event-stream"))
+            .expect("streaming capture is enabled");
     let stream =
         b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
-    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(stream)).await;
     let _ = inspector.on_end().await;
     let termination_plugins: Vec<Arc<dyn Plugin>> =
         vec![streaming.clone(), Arc::new(TerminalToolGovernorDecision)];
+    drop(inspector);
     run_response_stream_termination_hooks(
         &termination_plugins,
         &mut stream_ctx,
@@ -5261,10 +5325,6 @@ async fn transcript_internal_lifecycle_state_never_reaches_transaction_log_metad
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    ctx.metadata.insert(
-        "ai_transcript_audit.stream_marker.0x7ffeeabc".to_string(),
-        "true".to_string(),
-    );
     let logged = clone_log_metadata(&ctx);
     for key in logged.keys() {
         assert!(
@@ -5274,8 +5334,8 @@ async fn transcript_internal_lifecycle_state_never_reaches_transaction_log_metad
                     | "ai_transcript_audit.sample_hit"
                     | "ai_transcript_audit.stream_request"
                     | "ai_transcript_audit.final_req_seen"
-            ) && !key.starts_with("ai_transcript_audit.stream_marker"),
-            "internal or pointer-derived transcript state leaked to logs: {key}"
+            ),
+            "internal transcript state leaked to logs: {key}"
         );
     }
     assert!(
@@ -5404,6 +5464,7 @@ async fn request_guardrail_after_staging_tees_unsampled_stream() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
@@ -5420,12 +5481,12 @@ async fn request_guardrail_after_staging_tees_unsampled_stream() {
         plugin.forces_reqwest_dispatch(&ctx),
         "request-side guardrail hit must tee the un-sampled stream"
     );
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("guardrail-flagged un-sampled stream must get an inspector");
     let stream: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"evidence\"}}]}\n\n";
-    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(stream)).await;
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
@@ -5455,6 +5516,7 @@ async fn request_guardrail_after_staging_tees_unsampled_stream() {
         loopback_http_client(),
     )
     .unwrap();
+    let no_override = Arc::new(no_override);
     let mut ctx2 = make_ctx();
     no_override
         .on_final_request_body_with_context(&mut ctx2, &headers, ai_request_body())
@@ -5463,9 +5525,7 @@ async fn request_guardrail_after_staging_tees_unsampled_stream() {
         .insert("ai_shield_redacted".to_string(), "true".to_string());
     assert!(!no_override.forces_reqwest_dispatch(&ctx2));
     assert!(
-        no_override
-            .response_stream_inspector(&ctx2, 200, Some("text/event-stream"))
-            .is_none()
+        audit_stream_inspector(&no_override, &mut ctx2, 200, Some("text/event-stream")).is_none()
     );
 }
 
@@ -6069,14 +6129,14 @@ async fn sse_pii_split_across_deltas_is_redacted_in_reassembled_excerpt() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     // The SSN 123-45-6789 is split so no single frame matches the regex.
     let chunks: [&[u8]; 4] = [
@@ -6087,10 +6147,11 @@ async fn sse_pii_split_across_deltas_is_redacted_in_reassembled_excerpt() {
     ];
     let mut total = 0u64;
     for chunk in chunks {
-        let _ = inspector.on_chunk(chunk).await;
+        let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await;
         total += chunk.len() as u64;
     }
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(total))
         .await;
@@ -6127,14 +6188,14 @@ async fn malformed_optional_sse_fields_do_not_bypass_split_pii_redaction() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let chunks: [&[u8]; 3] = [
         b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"alice@\"}}]}\n\n",
@@ -6143,10 +6204,11 @@ async fn malformed_optional_sse_fields_do_not_bypass_split_pii_redaction() {
     ];
     let mut total = 0u64;
     for chunk in chunks {
-        let _ = inspector.on_chunk(chunk).await;
+        let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await;
         total += chunk.len() as u64;
     }
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(total))
         .await;
@@ -6190,22 +6252,25 @@ async fn reassembled_sse_excerpt(frames: &[&str]) -> String {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let mut total = 0u64;
     for frame in frames {
         let chunk = format!("data: {frame}\n\n");
-        let _ = inspector.on_chunk(chunk.as_bytes()).await;
+        let _ = inspector
+            .on_chunk(&Bytes::copy_from_slice(chunk.as_bytes()))
+            .await;
         total += chunk.len() as u64;
     }
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(total))
         .await;
@@ -7084,14 +7149,14 @@ async fn mixed_sse_text_and_interleaved_tool_calls_are_reassembled_and_redacted(
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let chunks: [&[u8]; 6] = [
         b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I will look that up.\"}}]}\n\n",
@@ -7103,10 +7168,11 @@ async fn mixed_sse_text_and_interleaved_tool_calls_are_reassembled_and_redacted(
     ];
     let mut total = 0u64;
     for chunk in chunks {
-        let _ = inspector.on_chunk(chunk).await;
+        let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await;
         total += chunk.len() as u64;
     }
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(total))
         .await;
@@ -7164,18 +7230,19 @@ async fn tool_call_only_sse_uses_reassembled_shape() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":2,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_only\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"id\\\":42}\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":2,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
-    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(stream)).await;
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
@@ -7205,18 +7272,19 @@ async fn repeated_indexless_tool_call_frames_stay_reassembled_with_withheld_argu
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"id\\\":\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"42}\"}}]}}]}\n\ndata: [DONE]\n\n";
-    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(stream)).await;
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
@@ -7262,20 +7330,21 @@ async fn non_openai_sse_capture_keeps_per_frame_redacted_fallback() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     // Anthropic-style event frames: no object=chat.completion.chunk.
     let chunk: &[u8] =
         b"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"ssn 123-45-6789\"}}\n\n";
-    let _ = inspector.on_chunk(chunk).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await;
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(chunk.len() as u64))
         .await;
@@ -7306,21 +7375,22 @@ async fn streamed_sse_excerpt(chunks: &[&[u8]]) -> String {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let mut total = 0u64;
     for chunk in chunks {
-        let _ = inspector.on_chunk(chunk).await;
+        let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await;
         total += chunk.len() as u64;
     }
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(total))
         .await;
@@ -8175,7 +8245,7 @@ async fn model_and_tool_pii_crossing_bound_is_redacted_before_truncation() {
         "tools": [{"type":"function","function":{"name": huge_tool.clone()}}]
     });
     let body_bytes = serde_json::to_vec(&body).unwrap();
-    let secret = "fleet-stable-hmac-key";
+    let secret = "fleet-stable-hmac-key-0123456789ab";
 
     for mode in [
         json!({ "mode": "redacted_body" }),
@@ -9080,6 +9150,7 @@ async fn retained_budget_staging_refusal_leaves_no_stale_or_peer_erasing_metadat
         loopback_http_client(),
     )
     .expect("valid peer");
+    let peer = Arc::new(peer);
     peer.start_background_tasks().expect("peer live start");
     peer.commit_background_tasks();
     let mut peer_ctx = make_ctx();
@@ -9163,8 +9234,7 @@ async fn retained_budget_staging_refusal_leaves_no_stale_or_peer_erasing_metadat
         "peer must retain stream dispatch after a sibling's refused admission"
     );
     assert!(
-        peer.response_stream_inspector(&peer_ctx, 200, Some("text/event-stream"))
-            .is_some(),
+        audit_stream_inspector(&peer, &mut peer_ctx, 200, Some("text/event-stream")).is_some(),
         "peer must still tee its owned stream after a sibling refusal"
     );
     assert!(
@@ -9513,7 +9583,7 @@ async fn expired_stream_revokes_capture_and_hash_work_while_forwarding() {
         .stream_capture_probe(&stuck)
         .expect("registered capture probe");
     let first = vec![b'a'; 4096];
-    match inspector.on_chunk(&first).await {
+    match inspector.on_chunk(&Bytes::copy_from_slice(&first)).await {
         ResponseStreamAction::Forward(forwarded) => {
             assert_eq!(forwarded.as_ref(), first.as_slice())
         }
@@ -9536,7 +9606,10 @@ async fn expired_stream_revokes_capture_and_hash_work_while_forwarding() {
     assert_eq!(plugin.status_snapshot().stream_reservations_expired, 1);
 
     let after_expiry = vec![b'b'; 4096];
-    match inspector.on_chunk(&after_expiry).await {
+    match inspector
+        .on_chunk(&Bytes::copy_from_slice(&after_expiry))
+        .await
+    {
         ResponseStreamAction::Forward(forwarded) => {
             assert_eq!(forwarded.as_ref(), after_expiry.as_slice())
         }
@@ -9600,7 +9673,9 @@ async fn repeated_expired_stream_cohorts_cannot_bypass_retained_capacity() {
             create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
                 .expect("cohort inspector");
         let cohort_chunk = vec![b'c'; 8192];
-        let _ = inspector.on_chunk(&cohort_chunk).await;
+        let _ = inspector
+            .on_chunk(&Bytes::copy_from_slice(&cohort_chunk))
+            .await;
         probes.push(
             plugin
                 .stream_capture_probe(&ctx)
@@ -9646,10 +9721,15 @@ async fn repeated_expired_stream_cohorts_cannot_bypass_retained_capacity() {
         .stream_capture_probe(&second_cohort)
         .expect("second cohort probe");
     let second_chunk = vec![b'd'; 8192];
-    let _ = second_inspector.on_chunk(&second_chunk).await;
+    let _ = second_inspector
+        .on_chunk(&Bytes::copy_from_slice(&second_chunk))
+        .await;
     for inspector in &mut inspectors {
         let forwarded = vec![b'e'; 8192];
-        match inspector.on_chunk(&forwarded).await {
+        match inspector
+            .on_chunk(&Bytes::copy_from_slice(&forwarded))
+            .await
+        {
             ResponseStreamAction::Forward(bytes) => {
                 assert_eq!(bytes.as_ref(), forwarded.as_slice())
             }
@@ -9719,7 +9799,9 @@ async fn late_normal_termination_emits_exactly_one_safe_expiry_fallback() {
     let mut inspector =
         create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
             .expect("inspector");
-    let _ = inspector.on_chunk(response.as_bytes()).await;
+    let _ = inspector
+        .on_chunk(&Bytes::copy_from_slice(response.as_bytes()))
+        .await;
 
     tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
     let _ = inspector.on_end().await;
@@ -9785,7 +9867,9 @@ async fn abnormal_post_expiry_drop_cannot_leak_or_double_emit() {
     let mut inspector =
         create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
             .expect("inspector");
-    let _ = inspector.on_chunk(b"abnormal-secret").await;
+    let _ = inspector
+        .on_chunk(&Bytes::from_static(b"abnormal-secret"))
+        .await;
     let probe = plugin.stream_capture_probe(&ctx).expect("capture probe");
 
     tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
@@ -9948,6 +10032,7 @@ async fn redacted_stream_accumulation_stops_at_scan_bound() {
         loopback_http_client(),
     )
     .expect("valid config");
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
 
@@ -9956,12 +10041,11 @@ async fn redacted_stream_accumulation_stops_at_scan_bound() {
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
     plugin.on_response_stream_selected(&ctx, 200, Some("text/event-stream"));
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let probe = plugin.stream_capture_probe(&ctx).expect("capture probe");
     let chunk = vec![b'r'; 6000];
-    match inspector.on_chunk(&chunk).await {
+    match inspector.on_chunk(&Bytes::copy_from_slice(&chunk)).await {
         ResponseStreamAction::Forward(forwarded) => {
             assert_eq!(forwarded.as_ref(), chunk.as_slice())
         }
@@ -10018,16 +10102,17 @@ async fn streaming_hash_is_capped_by_default_and_marked_partial() {
             loopback_http_client(),
         )
         .expect("valid config");
+        let plugin = Arc::new(plugin);
         plugin.start_background_tasks().expect("live start");
         plugin.commit_background_tasks();
         let mut ctx = make_ctx();
         plugin
             .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
             .await;
-        let mut inspector = plugin
-            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-            .expect("inspector");
-        let _ = inspector.on_chunk(chunk).await;
+        let mut inspector =
+            audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
+                .expect("inspector");
+        let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await;
         let _ = inspector.on_end().await;
         drop(inspector);
         plugin
@@ -10201,7 +10286,7 @@ async fn unemittable_candidate_pays_no_capture_work() {
 async fn unchanged_request_body_is_hmaced_once_across_every_hook() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
-    let secret = "fleet-stable-hmac-key-once";
+    let secret = "fleet-stable-hmac-key-0123456789ab-once";
     let overrides = json!({ "redaction": { "hash_secret": secret } });
     let plugin = AiTranscriptAudit::new(
         &config_with_sink(&endpoint, overrides),
@@ -10379,6 +10464,7 @@ async fn unemittable_candidate_is_not_teed_with_streaming_capture_on() {
         loopback_http_client(),
     )
     .expect("valid config");
+    let plugin = Arc::new(plugin);
     let mut ctx = make_ctx();
     set_prebuffered_body(&mut ctx, ai_request_body());
     let mut headers = ctx.headers.clone();
@@ -10386,7 +10472,7 @@ async fn unemittable_candidate_is_not_teed_with_streaming_capture_on() {
     assert_eq!(audit_meta(&ctx, CANDIDATE_KEY).as_deref(), Some("true"));
     assert!(!plugin.forces_reqwest_dispatch(&ctx));
     let sse = Some("text/event-stream");
-    assert!(plugin.response_stream_inspector(&ctx, 200, sse).is_none());
+    assert!(audit_stream_inspector(&plugin, &mut ctx, 200, sse).is_none());
 
     // A sampled candidate under the same streaming policy still tees.
     let sampled = AiTranscriptAudit::new(
@@ -10397,12 +10483,13 @@ async fn unemittable_candidate_is_not_teed_with_streaming_capture_on() {
         loopback_http_client(),
     )
     .expect("valid config");
+    let sampled = Arc::new(sampled);
     let mut hit = make_ctx();
     set_prebuffered_body(&mut hit, ai_request_body());
     let mut hit_headers = hit.headers.clone();
     sampled.before_proxy(&mut hit, &mut hit_headers).await;
     assert!(sampled.forces_reqwest_dispatch(&hit));
-    assert!(sampled.response_stream_inspector(&hit, 200, sse).is_some());
+    assert!(audit_stream_inspector(&sampled, &mut hit, 200, sse).is_some());
 }
 
 /// Two candidates may reach capture admission before either enqueues. With
@@ -10429,6 +10516,7 @@ async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
         loopback_http_client(),
     )
     .expect("valid config");
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let headers = json_headers();
@@ -10457,9 +10545,7 @@ async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
         "rate-limited candidate must not pin reqwest dispatch"
     );
     assert!(
-        plugin
-            .response_stream_inspector(&limited, 200, sse)
-            .is_none(),
+        audit_stream_inspector(&plugin, &mut limited, 200, sse).is_none(),
         "rate-limited candidate must not install an SSE inspector"
     );
 
@@ -10484,6 +10570,7 @@ async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
         loopback_http_client(),
     )
     .expect("valid config");
+    let admissible = Arc::new(admissible);
     let mut hit = make_ctx();
     set_prebuffered_body(&mut hit, stream_body);
     let mut hit_headers = hit.headers.clone();
@@ -10492,11 +10579,7 @@ async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
         .on_final_request_body_with_context(&mut hit, &headers, stream_body)
         .await;
     assert!(admissible.forces_reqwest_dispatch(&hit));
-    assert!(
-        admissible
-            .response_stream_inspector(&hit, 200, sse)
-            .is_some()
-    );
+    assert!(audit_stream_inspector(&admissible, &mut hit, 200, sse).is_some());
 }
 
 /// A sampling loser that may emit only through `always_capture_on_error` must
@@ -10578,6 +10661,7 @@ async fn streamed_transaction_pays_one_request_capture() {
         loopback_http_client(),
     )
     .expect("valid config");
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
 
@@ -10595,14 +10679,14 @@ async fn streamed_transaction_pays_one_request_capture() {
     assert_eq!(plugin.capture_counters(), (1, 0));
 
     let sse = Some("text/event-stream");
-    let inspector = plugin
-        .response_stream_inspector(&ctx, 200, sse)
-        .expect("sampled SSE must be teed");
+    let inspector =
+        audit_stream_inspector(&plugin, &mut ctx, 200, sse).expect("sampled SSE must be teed");
     let mut chain = chain_response_stream_inspectors(vec![inspector]).expect("chain");
     let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
-    let _ = chain.on_chunk(body).await;
+    let _ = chain.on_chunk(&Bytes::copy_from_slice(body)).await;
     let _ = chain.on_end().await;
     let outcome = BodyOutcome::success(body.len() as u64);
+    drop(chain);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &outcome)
         .await;
@@ -11396,8 +11480,8 @@ async fn grpc_full_method_metadata_without_leading_slash_still_enrolls() {
 ///
 /// `should_buffer_request_body` and `before_proxy` both run before
 /// `on_backend_path_resolved`, so they only see the client path. A client path
-/// like `/prefix/test.Greeter/SayHello` does not even parse as a gRPC method,
-/// yet listen-path stripping makes the backend-effective method the enrolled
+/// like `/prefix/SayHello` names no enrolled method, yet listen-path stripping
+/// plus `backend_path` assembly makes the backend-effective method the enrolled
 /// `/test.Greeter/SayHello`. If the buffer gate answered `false` there, the
 /// request would ride the native-gRPC streaming fast path and no final
 /// request-body hook would ever run — a silent, total capture loss.
@@ -11413,7 +11497,7 @@ async fn grpc_backend_effective_method_enrolls_after_unenrolled_client_path() {
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
 
-    let mut ctx = grpc_ctx("/prefix/test.Greeter/SayHello");
+    let mut ctx = grpc_ctx("/prefix/SayHello");
     // The provisional publication from `grpc_method_router::on_request_received`
     // is absent, because the client path does not parse as `/service/method`.
     assert!(
@@ -11473,6 +11557,155 @@ async fn grpc_backend_effective_method_enrolls_after_unenrolled_client_path() {
     assert!(
         !request_body.contains("agent@example.com"),
         "captured excerpt leaked an email: {request_body}"
+    );
+}
+
+/// Before routing, the audit's provisional view is EXACT, not canonicalized:
+/// a provisional enrollment reaches rejecting request admission in
+/// `before_proxy`, so a prefixed client path such as
+/// `/api/test.Greeter/SayHello` must not provisionally enroll (and, under a
+/// fail-closed sink policy, refuse) a call whose backend method may be
+/// unenrolled. The bound backend path stays authoritative once it exists.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_pre_bind_prefixed_client_path_does_not_stage_or_refuse_provisionally() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let mut config = config_with_sink(&endpoint, grpc_audit_overrides());
+    config["sink"]["on_sink_error"] = json!("reject");
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let req = grpc_frame(&hello_request_bytes("contact agent@example.com"));
+    let mut ctx = grpc_ctx("/api/test.Greeter/SayHello");
+    let mut headers = grpc_headers();
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    let early = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(early, PluginResult::Continue),
+        "no provisional admission may refuse an unbound prefixed path"
+    );
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "a prefixed client path does not provisionally enroll"
+    );
+
+    // The backend-effective method is a different, unenrolled one.
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/other.Service/SayHello",
+    );
+    let resolved = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+/// Plugin-writable `grpc_full_method` metadata never outranks the private bound
+/// backend path, and the bound path selects on its canonical trailing
+/// `/Service/Method` (the `body_validator` #6845 rule).
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_bound_backend_path_outranks_plugin_writable_method_metadata() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let req = grpc_frame(&hello_request_bytes("contact agent@example.com"));
+
+    // Metadata naming an unenrolled method cannot hide the enrolled method the
+    // backend actually serves from capture.
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let mut headers = grpc_headers();
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/test.Greeter/SayHello",
+    );
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/Other".to_string(),
+    );
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the bound enrolled method must be captured whatever the metadata says"
+    );
+
+    // Nor can metadata enroll a backend method that is not enrolled.
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/test.Greeter/Other",
+    );
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "metadata must not enroll an unenrolled backend method"
+    );
+
+    // An upstream base path in front of the method does not hide it, at the
+    // backend-path boundary or in the final hook.
+    let mut ctx = grpc_ctx("/audit/SayHello");
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let resolved = plugin
+        .on_backend_path_resolved(&mut ctx, "/base/test.Greeter/SayHello")
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "a base-path prefix must not un-enroll the backend method at the boundary"
+    );
+    let mut ctx = grpc_ctx("/audit/SayHello");
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/base/test.Greeter/SayHello",
+    );
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "a base-path prefix must not un-enroll the backend method"
     );
 }
 
@@ -13240,6 +13473,19 @@ async fn mcp_roundtrip(
     final_body: &[u8],
     response: &Value,
 ) -> Vec<Value> {
+    let response = serde_json::to_vec(response).expect("serialize response");
+    mcp_roundtrip_raw(overrides, ctx, final_body, &response, &json_headers()).await
+}
+
+/// [`mcp_roundtrip`] with the client-visible response given as raw bytes and
+/// headers, for event-stream framings.
+async fn mcp_roundtrip_raw(
+    overrides: Value,
+    ctx: &mut RequestContext,
+    final_body: &[u8],
+    response: &[u8],
+    response_headers: &HashMap<String, String>,
+) -> Vec<Value> {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
     let plugin = AiTranscriptAudit::new(
@@ -13264,9 +13510,8 @@ async fn mcp_roundtrip(
     plugin
         .on_final_request_body_with_context(ctx, &headers, final_body)
         .await;
-    let response = serde_json::to_vec(response).expect("serialize response");
     plugin
-        .capture_final_response_body(ctx, 200, &json_headers(), &response)
+        .capture_final_response_body(ctx, 200, response_headers, response)
         .await;
     wait_for_records(&server).await
 }
@@ -13422,12 +13667,13 @@ async fn mcp_audit_keeps_lenient_parser_tool_calls_as_candidates() {
         r#"{"jsonrpc":"2.0","id":75,"method":"tools/call","params":{"name":"crm.lookup","#,
         r#""arguments":{"e":"alice@example.com","n":NaN}}}"#
     );
-    // A UTF-8 byte-order mark: strict JSON refuses it, lenient decoders strip it.
+    // A UTF-8 byte-order mark: strict JSON refuses it, lenient decoders strip
+    // it — and so does the audit, which therefore reads the call itself.
     let bom_call = format!(
         "\u{feff}{}",
         mcp_call_value(json!(75), "crm.lookup", json!({"e": "alice@example.com"}))
     );
-    for body in [nan_call, bom_call.as_str()] {
+    for (body, calls_read) in [(nan_call, false), (bom_call.as_str(), true)] {
         let mut ctx = mcp_ctx(&json!({}));
         ctx.metadata
             .insert("request_body".to_string(), body.to_string());
@@ -13442,7 +13688,11 @@ async fn mcp_audit_keeps_lenient_parser_tool_calls_as_candidates() {
         let mcp = &records[0]["mcp"];
         assert!(mcp.is_object(), "{records:#?}");
         assert_eq!(mcp["batch"], json!(false), "{mcp}");
-        assert_eq!(mcp["calls"], json!([]), "{mcp}");
+        if calls_read {
+            assert_eq!(mcp["calls"][0]["tool"], "crm.lookup", "{mcp}");
+        } else {
+            assert_eq!(mcp["calls"], json!([]), "{mcp}");
+        }
         assert!(
             !records[0].to_string().contains("alice@example.com"),
             "{records:#?}"
@@ -13482,7 +13732,8 @@ async fn mcp_audit_keeps_lenient_parser_tool_calls_as_candidates() {
 #[tokio::test]
 async fn mcp_audit_stages_content_type_less_bom_prefixed_tool_calls() {
     // Without a Content-Type only bodies the lenient prefilter does not flag
-    // are skipped; a BOM-prefixed call is flagged, so it is still audited.
+    // are skipped; a BOM-prefixed call is flagged, so it is still audited, and
+    // the BOM is stripped before parsing, so the call itself is read.
     let body = format!(
         "\u{feff}{}",
         mcp_call_value(json!(77), "crm.lookup", json!({"q": "x"}))
@@ -13499,7 +13750,10 @@ async fn mcp_audit_stages_content_type_less_bom_prefixed_tool_calls() {
     )
     .await;
     assert_eq!(records.len(), 1, "{records:#?}");
-    assert_eq!(records[0]["mcp"]["calls"], json!([]), "{records:#?}");
+    assert_eq!(
+        records[0]["mcp"]["calls"][0]["tool"], "crm.lookup",
+        "{records:#?}"
+    );
 }
 
 #[tokio::test]
@@ -13730,6 +13984,47 @@ async fn a_jsonrpc_error_outcome_is_an_error_for_retention() {
     assert_eq!(records[0]["mcp"]["calls"][0]["error_code"], json!(-32001));
 }
 
+/// An MCP server may answer a `tools/call` with an event stream, framed with
+/// any WHATWG line terminator and optionally BOM-prefixed. The outcome parser
+/// must split it the way a client does (issue #7134): otherwise a JSON-RPC
+/// error is missed and `always_capture_on_error` drops the failed call.
+#[tokio::test]
+async fn mcp_event_stream_outcomes_accept_cr_and_bom_framing() {
+    // (label, leading BOM, line terminator)
+    let framings = [
+        ("CR", "", "\r"),
+        ("CRLF", "", "\r\n"),
+        ("BOM+LF", "\u{feff}", "\n"),
+    ];
+    for (label, bom, eol) in framings {
+        let request = mcp_call_value(json!(21), "pets.deletePet", json!({"petId": "7"}));
+        let mut ctx = mcp_ctx(&request);
+        let body = request.to_string();
+        // A progress notification precedes the answer, so the stream holds
+        // two events and the call is matched by id.
+        let stream = format!(
+            "{bom}event: message{eol}\
+             data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progress\":1}}}}{eol}{eol}\
+             event: message{eol}\
+             data: {{\"jsonrpc\":\"2.0\",\"id\":21,\"error\":{{\"code\":-32001,\"message\":\"x\"}}}}{eol}{eol}"
+        );
+        let overrides = json!({ "sampling": { "rate": 0.0, "always_capture_on_error": true } });
+        let records = mcp_roundtrip_raw(
+            overrides,
+            &mut ctx,
+            body.as_bytes(),
+            stream.as_bytes(),
+            &content_type_headers("text/event-stream"),
+        )
+        .await;
+        assert_eq!(records.len(), 1, "{label}: {records:?}");
+        assert_eq!(records[0]["capture_reason"], "error", "{label}");
+        let call = &records[0]["mcp"]["calls"][0];
+        assert_eq!(call["result"], "error", "{label}: {call}");
+        assert_eq!(call["error_code"], json!(-32001), "{label}: {call}");
+    }
+}
+
 #[tokio::test]
 async fn mcp_tool_calls_follow_the_mcp_gateway_media_types_and_can_be_disabled() {
     let plugin = AiTranscriptAudit::new(
@@ -13801,4 +14096,870 @@ fn mcp_arguments_capture_requires_mcp_calls_and_a_body_mode() {
     });
     let config = config_with_sink("https://audit.example.com/x", overrides);
     assert!(AiTranscriptAudit::new(&config, loopback_http_client()).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Production-launch review regressions
+// ---------------------------------------------------------------------------
+
+/// The secret every structural-redaction regression below tries to smuggle
+/// out. It matches no built-in PII pattern, so only the sensitive-member-name
+/// policy (which needs a structural parse) can remove it.
+const GENERIC_SECRET: &str = "correct horse battery staple";
+
+#[tokio::test]
+async fn redacted_body_never_pattern_redacts_an_unparseable_mcp_document() {
+    // ai_transcript_audit-SOL-1: a JSON-like body the whole-document parse
+    // refuses used to fall back to regex-only redaction, which cannot see a
+    // generic `password` value, so it was exported verbatim under
+    // `mode: redacted_body`.
+    let response = json!({"jsonrpc": "2.0", "id": 1, "result": {"isError": false}});
+
+    // A UTF-8 BOM is stripped before the structural parse, so the document is
+    // redacted by member name and still exported.
+    let bom_call = format!(
+        "\u{feff}{}",
+        mcp_call_value(json!(1), "lookup", json!({ "password": GENERIC_SECRET }))
+    );
+    let mut ctx = mcp_ctx(&json!({}));
+    ctx.metadata
+        .insert("request_body".to_string(), bom_call.clone());
+    let records = mcp_roundtrip(json!({}), &mut ctx, bom_call.as_bytes(), &response).await;
+    assert_eq!(records.len(), 1, "{records:#?}");
+    let excerpt = records[0]["request_body"]
+        .as_str()
+        .expect("a BOM-prefixed document is structurally redacted and exported");
+    assert!(excerpt.contains("lookup"), "{excerpt}");
+    assert!(
+        !records[0].to_string().contains(GENERIC_SECRET),
+        "{records:#?}"
+    );
+
+    // `NaN` (a lenient-parser document) and a batch past the whole-document
+    // nesting limit cannot be parsed at all: the excerpt is withheld.
+    let nan_call = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"lookup","arguments":{{"password":"{GENERIC_SECRET}","n":NaN}}}}}}"#
+    );
+    let deep_batch = mcp_batch_past_whole_document_recursion_limit().replacen(
+        r#""id":74,"#,
+        &format!(r#""id":74,"password":"{GENERIC_SECRET}","#),
+        1,
+    );
+    assert!(deep_batch.contains(GENERIC_SECRET));
+    assert!(serde_json::from_str::<Value>(&deep_batch).is_err());
+    let deep_response = json!([{"jsonrpc": "2.0", "id": 74, "result": {"isError": false}}]);
+    for (body, response) in [(nan_call, &response), (deep_batch, &deep_response)] {
+        let mut ctx = mcp_ctx(&json!({}));
+        ctx.metadata
+            .insert("request_body".to_string(), body.clone());
+        let records = mcp_roundtrip(json!({}), &mut ctx, body.as_bytes(), response).await;
+        assert_eq!(records.len(), 1, "the call must still be audited");
+        let record = &records[0];
+        assert!(record.get("request_body").is_none(), "{record}");
+        assert_eq!(
+            record["request_body_omitted_reason"], "unparseable_document",
+            "{record}"
+        );
+        assert_eq!(record["request_body_truncated"], true, "{record}");
+        assert!(record["request_hash"].is_string(), "{record}");
+        assert!(!record.to_string().contains(GENERIC_SECRET), "{record}");
+    }
+}
+
+#[tokio::test]
+async fn full_body_keeps_exporting_unparseable_documents_raw() {
+    // The explicit raw-capture opt-in is unaffected by the withholding rule.
+    let nan_call = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"lookup","arguments":{{"password":"{GENERIC_SECRET}","n":NaN}}}}}}"#
+    );
+    let mut ctx = mcp_ctx(&json!({}));
+    ctx.metadata
+        .insert("request_body".to_string(), nan_call.clone());
+    let records = mcp_roundtrip(
+        json!({ "mode": "full_body", "allow_full_body": true }),
+        &mut ctx,
+        nan_call.as_bytes(),
+        &json!({"jsonrpc": "2.0", "id": 1, "result": {"isError": false}}),
+    )
+    .await;
+    assert_eq!(records.len(), 1, "{records:#?}");
+    let excerpt = records[0]["request_body"].as_str().expect("raw excerpt");
+    assert!(excerpt.contains(GENERIC_SECRET), "{excerpt}");
+    assert!(records[0].get("request_body_omitted_reason").is_none());
+}
+
+#[tokio::test]
+async fn unparseable_json_responses_and_sse_frames_are_withheld_not_pattern_redacted() {
+    // The response side shares the redactor: a JSON-typed buffered response
+    // the parser refuses is withheld as a whole.
+    let response = format!(r#"{{"choices":[],"client_secret":"{GENERIC_SECRET}","n":NaN}}"#);
+    let records = capture_roundtrip(json!({}), response.as_bytes()).await;
+    assert_eq!(records.len(), 1, "{records:#?}");
+    let record = &records[0];
+    assert!(record.get("response_body").is_none(), "{record}");
+    assert_eq!(
+        record["response_body_omitted_reason"], "unparseable_document",
+        "{record}"
+    );
+    assert!(!record.to_string().contains(GENERIC_SECRET), "{record}");
+
+    // An event stream keeps frame-by-frame redaction, but a JSON-shaped frame
+    // the parser refuses is replaced instead of exported as pattern-redacted
+    // text.
+    let parseable = r#"{"type":"message_start","message":{"id":"msg_1"}}"#;
+    let unparseable =
+        format!(r#"{{"type":"content_block_delta","token":"{GENERIC_SECRET}","n":NaN}}"#);
+    let capture = format!("data: {parseable}\n\ndata: {unparseable}\n\n");
+    let excerpt = streamed_sse_excerpt(&[capture.as_bytes()]).await;
+    assert!(!excerpt.contains(GENERIC_SECRET), "{excerpt}");
+    assert!(excerpt.contains("message_start"), "{excerpt}");
+    assert!(excerpt.contains("[UNPARSEABLE]"), "{excerpt}");
+}
+
+/// `ai_transcript_audit-SOL-2`: an audit-only native-gRPC proxy (no
+/// `grpc_method_router`, so no `grpc_full_method`) whose listen-path stripping
+/// or `backend_path` assembly changes the method must decide enrollment on the
+/// backend-effective path the proxy binds, not on the client path.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_enrollment_uses_the_bound_backend_path_without_a_method_router() {
+    let plain = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    assert!(
+        !plain.requires_backend_path_resolution(),
+        "an HTTP-only instance does not join the backend-path boundary"
+    );
+
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    assert!(
+        plugin.requires_backend_path_resolution(),
+        "a grpc-enrolled instance must make the proxy bind the backend-effective path"
+    );
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    // `listen_path: /audit`, `strip_listen_path: true`,
+    // `backend_path: /test.Greeter`: the client sends `/audit/SayHello`, the
+    // backend receives `/test.Greeter/SayHello`.
+    let mut ctx = grpc_ctx("/audit/SayHello");
+    let mut headers = grpc_headers();
+    let req = grpc_frame(&hello_request_bytes("contact agent@example.com"));
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the client path is not enrolled"
+    );
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/test.Greeter/SayHello",
+    );
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the bound backend-effective method is enrolled, so it must be captured"
+    );
+    let resp = grpc_frame(&hello_response_bytes("ok"));
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &resp)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let request_body = records[0]["request_body"].as_str().unwrap_or_default();
+    assert!(
+        request_body.contains("/test.Greeter/SayHello"),
+        "the excerpt must name the backend-effective method: {request_body}"
+    );
+
+    // The inverse: an enrolled client path whose backend-effective method is
+    // a different, unenrolled one is refuted, not captured as the wrong method.
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let mut headers = grpc_headers();
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the provisional client-path method is enrolled"
+    );
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/test.Greeter/Other",
+    );
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("false"),
+        "the bound backend-effective method refutes the provisional enrollment"
+    );
+}
+
+#[tokio::test]
+async fn tool_governor_unkeyed_argument_digests_are_never_harvested() {
+    // ai_transcript_audit-SOL-3: `ai_tool_governor.arguments_hashes` is a plain
+    // SHA-256 of each call's raw arguments — an offline guessing oracle for a
+    // small argument space. Other governor decision fields stay harvested.
+    for mode in ["redacted_body", "metadata_only"] {
+        let server = mock_sink().await;
+        let endpoint = format!("{}/ingest", server.uri());
+        let plugin = AiTranscriptAudit::new(
+            &config_with_sink(&endpoint, json!({ "mode": mode })),
+            loopback_http_client(),
+        )
+        .unwrap();
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+
+        let mut ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+            .await;
+        let unkeyed_digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        ctx.metadata.insert(
+            "ai_tool_governor.arguments_hashes".to_string(),
+            unkeyed_digest.to_string(),
+        );
+        ctx.metadata
+            .insert("ai_tool_governor.decision".to_string(), "allow".to_string());
+        ctx.metadata.insert(
+            "ai_tool_governor.tool_names".to_string(),
+            "lookup".to_string(),
+        );
+        let mut summary = create_test_transaction_summary();
+        summary.response_status_code = 200;
+        summary.metadata = ctx.metadata.clone();
+        plugin.log(&summary).await;
+
+        let records = wait_for_records(&server).await;
+        assert_eq!(records.len(), 1, "{mode}: {records:?}");
+        let record = &records[0];
+        assert!(
+            !record.to_string().contains(unkeyed_digest),
+            "{mode}: the unkeyed argument digest must not be exported: {record}"
+        );
+        assert!(
+            record["guardrails"]
+                .get("ai_tool_governor.arguments_hashes")
+                .is_none(),
+            "{mode}: {record}"
+        );
+        assert_eq!(
+            record["guardrails"]["ai_tool_governor.decision"], "allow",
+            "{mode}: {record}"
+        );
+        assert_eq!(
+            record["guardrails"]["ai_tool_governor.tool_names"], "lookup",
+            "{mode}: {record}"
+        );
+    }
+}
+
+/// A sink that fails closed on delivery errors, pointed at `endpoint`.
+fn fail_closed_sink(endpoint: &str) -> Value {
+    json!({
+        "type": "http",
+        "endpoint_url": endpoint,
+        "allow_insecure_loopback": true,
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "on_sink_error": "reject"
+    })
+}
+
+fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).expect("gzip write");
+    encoder.finish().expect("gzip finish")
+}
+
+#[test]
+fn fail_closed_audit_claims_the_final_representation_of_candidate_posts_only() {
+    // ai_transcript_audit-M1: the claim is what makes the shared request
+    // representation gate decode a content-coded AI request (or refuse it)
+    // before this plugin classifies it.
+    let fail_closed = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "sink": fail_closed_sink("https://audit.example.com/x") }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    let fail_open = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let ctx = make_ctx();
+    assert!(fail_closed.enforces_final_request_body_policy(&ctx, &headers, b"coded"));
+    assert!(
+        !fail_open.enforces_final_request_body_policy(&ctx, &headers, b"coded"),
+        "a fail-open audit cannot refuse, so it must not turn an undecodable body into a 400"
+    );
+    let mut get = make_ctx();
+    get.method = "GET".to_string();
+    assert!(!fail_closed.enforces_final_request_body_policy(&get, &headers, b"coded"));
+    let mut text_headers = headers.clone();
+    text_headers.insert("content-type".to_string(), "text/plain".to_string());
+    assert!(!fail_closed.enforces_final_request_body_policy(&ctx, &text_headers, b"coded"));
+    let grpc = grpc_ctx("/test.Greeter/SayHello");
+    assert!(!fail_closed.enforces_final_request_body_policy(&grpc, &headers, b"coded"));
+}
+
+#[tokio::test]
+async fn fail_closed_audit_classifies_content_coded_requests_on_the_decoded_view() {
+    // ai_transcript_audit-M1: a gzip AI request used to be classified on its
+    // coded octets, never staged, and so never reached fail-closed admission.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = Arc::new(
+        AiTranscriptAudit::new(
+            &config_with_sink(&endpoint, json!({ "sink": fail_closed_sink(&endpoint) })),
+            loopback_http_client(),
+        )
+        .expect("valid config"),
+    );
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let coded = gzip_bytes(ai_request_body());
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let mut ctx = make_ctx();
+
+    // The production gate decodes the body because this instance claims it.
+    let as_dyn: Arc<dyn Plugin> = plugin.clone();
+    let plugins = vec![as_dyn];
+    let outcome = ferrum_edge::_test_support::evaluate_final_request_representation(
+        &plugins, &ctx, &headers, &coded,
+    );
+    let plaintext = match outcome {
+        ferrum_edge::_test_support::FinalRequestRepresentationOutcome::Decoded(plaintext) => {
+            plaintext
+        }
+        other => panic!("the fail-closed claim must decode the coded body: {other:?}"),
+    };
+    assert_eq!(plaintext.as_slice(), ai_request_body());
+
+    ferrum_edge::_test_support::stage_final_request_body_plaintext(&mut ctx, plaintext);
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &coded)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the decoded AI request must be staged so fail-closed admission applies"
+    );
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 200;
+    summary.metadata = ctx.metadata.clone();
+    plugin.log(&summary).await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let excerpt = records[0]["request_body"].as_str().expect("excerpt");
+    assert!(excerpt.contains("gpt-4o"), "{excerpt}");
+    assert!(!excerpt.contains("123-45-6789"), "{excerpt}");
+}
+
+#[tokio::test]
+async fn fail_closed_audit_stages_json_documents_no_parser_can_read() {
+    // ai_transcript_audit-M1: with MCP recognition off, a UTF-16 AI request is
+    // not readable by the strict parser, yet a lenient upstream executes it.
+    // Under a fail-closed policy it is conservatively audited (excerpt
+    // withheld) instead of being forwarded with no record and no admission.
+    let utf16: Vec<u8> = std::str::from_utf8(ai_request_body())
+        .expect("utf-8 fixture")
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let capture = json!({ "mcp_tool_calls": false });
+
+    let open_plugin = AiTranscriptAudit::new(
+        &config_with_sink("http://127.0.0.1:1/ingest", json!({ "capture": capture })),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    open_plugin.start_background_tasks().expect("live start");
+    open_plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    open_plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), &utf16)
+        .await;
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "fail-open policies keep the heuristic classification"
+    );
+
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": capture, "sink": fail_closed_sink(&endpoint) }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), &utf16)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "an unreadable JSON document is in fail-closed audit scope"
+    );
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 200;
+    summary.metadata = ctx.metadata.clone();
+    plugin.log(&summary).await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert!(record.get("request_body").is_none(), "{record}");
+    assert_eq!(
+        record["request_body_omitted_reason"], "unparseable_document",
+        "{record}"
+    );
+    assert!(record["request_hash"].is_string(), "{record}");
+}
+
+/// A fail-closed (`on_sink_error: reject`), request-only audit whose collector
+/// refuses every batch, returned once an ordinary AI request is already
+/// rejected for the unhealthy sink.
+async fn unhealthy_fail_closed_audit(capture: Value) -> (MockServer, AiTranscriptAudit) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "capture": capture,
+                "sampling": {
+                    "rate": 1.0,
+                    "always_capture_on_error": false,
+                    "always_capture_on_guardrail": false
+                },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint,
+                    "allow_insecure_loopback": true,
+                    "batch_size": 1,
+                    "flush_interval_ms": 100,
+                    "max_retries": 0,
+                    "on_sink_error": "reject"
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut first = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut first, &json_headers(), ai_request_body())
+        .await;
+    let mut summary = create_test_transaction_summary();
+    summary.metadata = first.metadata.clone();
+    plugin.log(&summary).await;
+    for _ in 0..100 {
+        let mut ctx = make_ctx();
+        if matches!(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+                .await,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ) {
+            return (server, plugin);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the collector's 401 never marked the sink unhealthy");
+}
+
+#[tokio::test]
+async fn fail_closed_audit_refuses_every_unreadable_candidate_body_while_the_sink_is_down() {
+    // PR6815-SOL-1: with MCP recognition off, a comment-led or
+    // non-ASCII-whitespace-led AI request is unreadable to the strict parser
+    // but executed by a lenient upstream. No lead-byte heuristic may decide
+    // whether it is audited: under a reject policy it must reach fail-closed
+    // admission, including when it arrives content-coded.
+    let capture = json!({
+        "request": true,
+        "response": false,
+        "streaming_response": false,
+        "mcp_tool_calls": false
+    });
+    let (_server, plugin) = unhealthy_fail_closed_audit(capture).await;
+    let document = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#;
+    let lenient = [
+        format!("/* client context */ {document}"),
+        format!("// client context\n{document}"),
+        format!("\u{a0}{document}"),
+        r#"{"model":"gpt-4o","messages":[],}"#.to_string(),
+    ];
+    for body in &lenient {
+        assert!(serde_json::from_str::<Value>(body).is_err(), "{body}");
+        let mut ctx = make_ctx();
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), body.as_bytes())
+            .await;
+        assert!(
+            matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 503,
+                    ..
+                }
+            ),
+            "an unreadable candidate body must not bypass fail-closed admission: {body}"
+        );
+    }
+
+    // The same comment-led request, gzip-coded: the claimed gate decodes it
+    // and the plugin decides the decoded plaintext the same way.
+    let plugin = Arc::new(plugin);
+    let coded = gzip_bytes(lenient[0].as_bytes());
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let mut ctx = make_ctx();
+    let as_dyn: Arc<dyn Plugin> = plugin.clone();
+    let plugins = vec![as_dyn];
+    let plaintext = match ferrum_edge::_test_support::evaluate_final_request_representation(
+        &plugins, &ctx, &headers, &coded,
+    ) {
+        ferrum_edge::_test_support::FinalRequestRepresentationOutcome::Decoded(plaintext) => {
+            plaintext
+        }
+        other => panic!("the fail-closed claim must decode the coded body: {other:?}"),
+    };
+    ferrum_edge::_test_support::stage_final_request_body_plaintext(&mut ctx, plaintext);
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &coded)
+        .await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ),
+        "a decoded unreadable candidate body must not bypass fail-closed admission"
+    );
+}
+
+#[tokio::test]
+async fn multiline_sse_events_are_redacted_as_one_document() {
+    // PR6815-SOL-2: an SSE event's payload is all of its `data:` lines joined
+    // with `\n`. A JSON document spread over several lines must be redacted
+    // (or withheld) as that one document, never line by line, or the
+    // continuation line carrying the value escapes member-name redaction.
+    let parseable = format!(
+        "data: {{\"type\":\"content_block_delta\",\"password\":\ndata: \"{GENERIC_SECRET}\"}}\n\n"
+    );
+    let unparseable = format!(
+        "data: {{\"type\":\"content_block_delta\",\"token\":\ndata: \"{GENERIC_SECRET}\",\"n\":NaN}}\n\n"
+    );
+    for capture in [parseable.clone(), parseable.replace('\n', "\r\n")] {
+        let bytes = capture.as_bytes();
+        let (head, tail) = bytes.split_at(bytes.len() / 2);
+        let excerpt = streamed_sse_excerpt(&[head, tail]).await;
+        assert!(!excerpt.contains(GENERIC_SECRET), "{excerpt}");
+        assert!(excerpt.contains("content_block_delta"), "{excerpt}");
+    }
+    for capture in [unparseable.clone(), unparseable.replace('\n', "\r\n")] {
+        let excerpt = streamed_sse_excerpt(&[capture.as_bytes()]).await;
+        assert!(!excerpt.contains(GENERIC_SECRET), "{excerpt}");
+        assert!(excerpt.contains("[UNPARSEABLE]"), "{excerpt}");
+    }
+
+    // The buffered SSE capture shares the same redactor.
+    for capture in [&parseable, &unparseable] {
+        let server = mock_sink().await;
+        let endpoint = format!("{}/ingest", server.uri());
+        let plugin = AiTranscriptAudit::new(
+            &config_with_sink(
+                &endpoint,
+                json!({ "capture": { "streaming_response": true } }),
+            ),
+            loopback_http_client(),
+        )
+        .expect("valid config");
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+        let mut ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+            .await;
+        plugin
+            .capture_final_response_body(
+                &mut ctx,
+                200,
+                &content_type_headers("text/event-stream"),
+                capture.as_bytes(),
+            )
+            .await;
+        let records = wait_for_records(&server).await;
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(
+            !records[0].to_string().contains(GENERIC_SECRET),
+            "{records:#?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_late_enrollment_is_staged_at_the_backend_path_boundary() {
+    // PR6815-SOL-3: a call enrolled only by its backend-effective method must
+    // be staged when that method becomes authoritative, so a deferred
+    // `before_proxy` short circuit (a `fault_injection` abort) that answers
+    // before the final request-body hook still leaves its record.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let req = grpc_frame(&hello_request_bytes("boundary-subject"));
+    let mut ctx = grpc_ctx("/audit/SayHello");
+    let mut headers = grpc_headers();
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the client path is not enrolled"
+    );
+    let resolved = plugin
+        .on_backend_path_resolved(&mut ctx, "/test.Greeter/SayHello")
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the enrolled backend-effective method stages at the boundary"
+    );
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/test.Greeter/SayHello",
+    );
+
+    // The deferred abort: no final request-body hook, then the reject-path
+    // refresh and the transaction-log fallback.
+    let mut response_headers = HashMap::new();
+    plugin
+        .after_proxy(&mut ctx, 503, &mut response_headers)
+        .await;
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 503;
+    summary.metadata = ctx.metadata.clone();
+    plugin.log(&summary).await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let request_body = records[0]["request_body"].as_str().unwrap_or_default();
+    assert!(
+        request_body.contains("/test.Greeter/SayHello"),
+        "the record must name the backend-effective method: {request_body}"
+    );
+    assert!(request_body.contains("boundary-subject"), "{request_body}");
+
+    // A backend-effective method that is not enrolled stages nothing.
+    let mut other = grpc_ctx("/audit/SayHello");
+    other.request_body_bytes = Some(Bytes::from(req));
+    let resolved = plugin
+        .on_backend_path_resolved(&mut other, "/test.Greeter/Other")
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    assert_ne!(
+        other
+            .metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+/// Drive a deferred `before_proxy` short circuit after the backend path was
+/// bound: no final request-body hook, then the reject-path refresh and the
+/// transaction-log fallback.
+async fn deferred_short_circuit_after_bind(
+    plugin: &AiTranscriptAudit,
+    ctx: &mut RequestContext,
+    backend_path: &str,
+) {
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(ctx, backend_path);
+    let mut response_headers = HashMap::new();
+    plugin.after_proxy(ctx, 503, &mut response_headers).await;
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 503;
+    summary.metadata = ctx.metadata.clone();
+    plugin.log(&summary).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_boundary_staging_ignores_a_provisional_router_method() {
+    // PR6815-SOL-5: `grpc_method_router` publishes the CLIENT method in
+    // `on_request_received` and refreshes it only in its own backend-path
+    // callback, which may run after this one (priorities are configurable).
+    // The boundary decision must come from the authoritative `backend_path`.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let req = grpc_frame(&hello_request_bytes("provisional-router-subject"));
+    let mut ctx = grpc_ctx("/audit/SayHello");
+    ctx.metadata
+        .insert("grpc_full_method".to_string(), "audit/SayHello".to_string());
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    let mut headers = grpc_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let resolved = plugin
+        .on_backend_path_resolved(&mut ctx, "/test.Greeter/SayHello")
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the provisional router value must not veto the enrolled backend path"
+    );
+    // The router's own (later) boundary callback refreshes the method.
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+    deferred_short_circuit_after_bind(&plugin, &mut ctx, "/test.Greeter/SayHello").await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let request_body = records[0]["request_body"].as_str().unwrap_or_default();
+    assert!(
+        request_body.contains("provisional-router-subject"),
+        "{request_body}"
+    );
+
+    // And a provisional value cannot enroll an unenrolled backend path.
+    let mut other = grpc_ctx("/audit/SayHello");
+    other.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+    other.request_body_bytes = Some(Bytes::from(req));
+    let resolved = plugin
+        .on_backend_path_resolved(&mut other, "/test.Greeter/Other")
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    assert_ne!(
+        other
+            .metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_boundary_staging_uses_the_live_before_proxy_framing_witness() {
+    // PR6815-SOL-6: a `before_proxy` transform set `grpc-encoding: gzip` on
+    // the live header map while `ctx.headers` still holds the inbound map
+    // (no `grpc-encoding`). A call enrolled only at the backend-path boundary
+    // and then short-circuited must decode with the live witness.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = live_grpc_audit_plugin(&endpoint);
+
+    let request = gzip_grpc_frame(&hello_request_bytes("live-witness-subject"));
+    let mut ctx = grpc_ctx("/audit/SayHello");
+    ctx.headers.remove("grpc-encoding");
+    ctx.request_body_bytes = Some(Bytes::copy_from_slice(&request));
+    let mut proxy_headers = grpc_headers();
+    proxy_headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the client path is not enrolled"
+    );
+    let resolved = plugin
+        .on_backend_path_resolved(&mut ctx, "/test.Greeter/SayHello")
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    deferred_short_circuit_after_bind(&plugin, &mut ctx, "/test.Greeter/SayHello").await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        records[0]
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str),
+        None,
+        "the live framing witness must decode the gzip request: {}",
+        records[0]
+    );
+    let request_body = records[0]["request_body"].as_str().unwrap_or_default();
+    assert!(
+        request_body.contains("live-witness-subject"),
+        "the inflated excerpt must carry the decoded field: {request_body}"
+    );
 }

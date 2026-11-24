@@ -319,3 +319,34 @@ fn effective_claim_header_family_collisions_are_rejected() {
         );
     }
 }
+
+/// The cross-family check compares destinations as a CGI-style backend reads
+/// them, for the global fallback and for a provider override.
+#[test]
+fn effective_claim_header_family_collisions_fold_underscores() {
+    for config in [
+        json!({
+            "claim_headers": {"tenant": "X-Tenant-Id"},
+            "providers": [{
+                "jwks": build_rsa_jwks_from_pem(PUBLIC_KEY),
+                "output_claim_headers": [{"header": "X_Tenant_Id", "claim": "sub"}],
+            }],
+        }),
+        json!({
+            "providers": [{
+                "jwks": build_rsa_jwks_from_pem(PUBLIC_KEY),
+                "claim_headers": {"tenant": "X-Tenant-Id"},
+                "output_claim_headers": [{"header": "X_Tenant_Id", "claim": "sub"}],
+            }],
+        }),
+    ] {
+        let error = match JwksAuth::new(&config, default_client()) {
+            Ok(_) => panic!("backend-equivalent destinations cannot use both mapping families"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("both `claim_headers` and `output_claim_headers`"),
+            "expected a cross-family collision diagnostic, got: {error}"
+        );
+    }
+}

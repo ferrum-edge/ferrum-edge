@@ -32,8 +32,14 @@ use tokio::time::sleep;
 const SETTLE: Duration = Duration::from_millis(400);
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_destination_active_requests_h3_sheds_and_releases_on_relay_end() {
+#[test]
+fn functional_destination_active_requests_h3_sheds_and_releases_on_relay_end() {
+    crate::common::in_process_gateway_runtime(4).block_on(
+        functional_destination_active_requests_h3_sheds_and_releases_on_relay_end_inner(),
+    );
+}
+
+async fn functional_destination_active_requests_h3_sheds_and_releases_on_relay_end_inner() {
     let backend = HoldingHttp1Backend::spawn(HoldBehavior::RespondOk).await;
     let config = h3_destination_config(backend.port);
     let prepared = prepare_for_assertions(config.clone());
@@ -89,8 +95,13 @@ async fn functional_destination_active_requests_h3_sheds_and_releases_on_relay_e
 }
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_destination_active_requests_h3_release_on_client_cancellation() {
+#[test]
+fn functional_destination_active_requests_h3_release_on_client_cancellation() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_destination_active_requests_h3_release_on_client_cancellation_inner());
+}
+
+async fn functional_destination_active_requests_h3_release_on_client_cancellation_inner() {
     let backend = HoldingHttp1Backend::spawn(HoldBehavior::RespondOk).await;
     let gateway = start_gateway(h3_destination_config(backend.port), true)
         .await
@@ -151,8 +162,15 @@ async fn functional_destination_active_requests_h3_release_on_client_cancellatio
 }
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_destination_active_requests_h3_release_on_streaming_upload_cancellation() {
+#[test]
+fn functional_destination_active_requests_h3_release_on_streaming_upload_cancellation() {
+    crate::common::in_process_gateway_runtime(4).block_on(
+        functional_destination_active_requests_h3_release_on_streaming_upload_cancellation_inner(),
+    );
+}
+
+async fn functional_destination_active_requests_h3_release_on_streaming_upload_cancellation_inner()
+{
     let backend = HoldingHttp1Backend::spawn(HoldBehavior::RespondOk).await;
     let gateway = start_gateway(h3_destination_config(backend.port), true)
         .await
@@ -213,8 +231,14 @@ async fn functional_destination_active_requests_h3_release_on_streaming_upload_c
 }
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_destination_active_requests_h3_release_on_streaming_request_reset() {
+#[test]
+fn functional_destination_active_requests_h3_release_on_streaming_request_reset() {
+    crate::common::in_process_gateway_runtime(4).block_on(
+        functional_destination_active_requests_h3_release_on_streaming_request_reset_inner(),
+    );
+}
+
+async fn functional_destination_active_requests_h3_release_on_streaming_request_reset_inner() {
     let backend = HoldingHttp1Backend::spawn(HoldBehavior::RespondOk).await;
     let gateway = start_gateway(h3_destination_config(backend.port), true)
         .await

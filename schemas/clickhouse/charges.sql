@@ -1,5 +1,10 @@
 CREATE DATABASE IF NOT EXISTS ferrum;
 
+-- Retention: the TTL below deletes raw charge events about 13 months after
+-- received_at, and the rollup views lose the same history. Set the retention
+-- your record-keeping obligations require (or remove the TTL) before the first
+-- apply. Re-applying this file never changes the TTL of an existing table. Use
+-- ALTER TABLE ... MODIFY TTL (or REMOVE TTL) on a live table instead.
 CREATE TABLE IF NOT EXISTS ferrum.charges_raw (
     event_id              String,
     received_at           DateTime64(9, 'UTC'),

@@ -59,7 +59,6 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         pool_tcp_keepalive_seconds: None,
         upstream_id: None,
@@ -142,6 +141,7 @@ fn make_upstream(id: &str) -> Upstream {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -820,14 +820,35 @@ fn test_consumer_colon_username_with_basicauth_is_rejected() {
     );
 }
 
+/// Issue #7217: a credential type key that fails the path-safe name rule is
+/// reported once, by that rule, which Debug-quotes it. The per-entry checks
+/// that render the key bare in a `credentials.<type>[<n>]` path must not run.
+#[test]
+fn test_consumer_unsafe_credential_type_is_not_rendered_in_entry_paths() {
+    let mut consumer = make_consumer("test", "alice");
+    consumer
+        .credentials
+        .insert("bad key'".into(), serde_json::json!([]));
+    let errs = consumer.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("credential type")),
+        "the name rule must report the key: {errs:?}"
+    );
+    assert!(
+        errs.iter().all(|e| !e.contains("credentials.bad key")),
+        "an unsafe key must not be interpolated bare: {errs:?}"
+    );
+}
+
 #[test]
 fn test_consumer_colon_username_without_basicauth_is_admitted() {
     // The restriction is Basic-specific: other credential types represent a
     // colon-bearing identity perfectly well.
     let mut consumer = make_consumer("test", "alice:admin");
-    consumer
-        .credentials
-        .insert("keyauth".into(), serde_json::json!([{"key": "the-key"}]));
+    consumer.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "the-key-0123456789"}]),
+    );
     assert!(
         consumer.validate_fields().is_ok(),
         "{:?}",
@@ -974,7 +995,7 @@ fn test_consumer_keyauth_accepts_valid_rotation_array() {
     let mut consumer = make_consumer("test", "alice");
     consumer.credentials.insert(
         "keyauth".into(),
-        serde_json::json!([{"key": "current-key"}, {"key": "next-key"}]),
+        serde_json::json!([{"key": "current-key-0123456789"}, {"key": "next-key-0123456789"}]),
     );
 
     assert!(consumer.validate_fields().is_ok());
@@ -2104,26 +2125,6 @@ fn test_proxy_http2_max_concurrent_streams_valid() {
     assert!(proxy.validate_fields().is_ok());
 }
 
-#[test]
-fn test_proxy_pool_max_requests_per_connection_above_sql_integer_limit() {
-    let mut proxy = make_proxy("test", "/api");
-    proxy.pool_max_requests_per_connection = Some(MAX_POOL_SQL_INTEGER_VALUE + 1);
-    let errs = proxy.validate_fields().unwrap_err();
-    assert!(
-        errs.iter()
-            .any(|e| e.contains("pool_max_requests_per_connection"))
-    );
-}
-
-#[test]
-fn test_proxy_pool_max_requests_per_connection_valid_bounds() {
-    let mut proxy = make_proxy("test", "/api");
-    proxy.pool_max_requests_per_connection = Some(0);
-    assert!(proxy.validate_fields().is_ok());
-    proxy.pool_max_requests_per_connection = Some(MAX_POOL_SQL_INTEGER_VALUE);
-    assert!(proxy.validate_fields().is_ok());
-}
-
 // ---- HTTP/3 connections per backend tests ----
 
 #[test]
@@ -2632,7 +2633,8 @@ fn test_proxy_allowed_ws_origins_star_does_not_fail_load_validation() {
     };
     assert!(
         config.validate_all_fields(30).is_ok(),
-        "file/database/CP load must keep serving proxies whose stored allow-list is '*'"
+        "database/CP/DP load validation must keep serving proxies whose stored allow-list is '*' \
+         (file mode refuses it separately in file_loader, issue #7218)"
     );
 }
 
@@ -2667,6 +2669,171 @@ fn test_proxy_allowed_ws_origins_load_warns_once_per_proxy() {
         output.contains(ALLOWED_WS_ORIGINS_STAR_GUIDANCE),
         "warning must carry the admission guidance: {output}"
     );
+}
+
+/// Issue #7218 review follow-up: file mode refuses a `*` / non-origin
+/// `allowed_ws_origins` document, so it must not first log the database/CP/DP
+/// grandfathering warning ("stored database/control-plane config is still
+/// loaded"), which would be false for a refused file.
+#[test]
+fn test_file_mode_refusal_of_allowed_ws_origins_star_does_not_log_grandfathering_warning() {
+    use std::io::Write;
+
+    let document = serde_json::json!({
+        "version": "1",
+        "proxies": [{
+            "id": "ws-proxy",
+            "listen_path": "/ws",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 3000,
+            "allowed_ws_origins": ["*", "https://app.example.com/path"]
+        }],
+        "consumers": [],
+        "plugin_configs": []
+    });
+    let mut file = tempfile::NamedTempFile::with_suffix(".json").unwrap();
+    write!(file, "{}", serde_json::to_string(&document).unwrap()).unwrap();
+    let path = file.path().to_str().unwrap();
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+
+    let (logs, guard) = capture_ws_origin_logs();
+    let load = ferrum_edge::config::file_loader::load_config_from_file(path, 30, &policy, "ferrum");
+    let reload =
+        ferrum_edge::config::file_loader::reload_config_from_file(path, 30, &policy, "ferrum");
+    drop(guard);
+    for (operation, result) in [("load", load), ("reload", reload)] {
+        let error = format!("{:#}", result.expect_err(operation));
+        assert!(
+            error.contains("invalid `allowed_ws_origins` entry(ies)"),
+            "{operation}: {error}"
+        );
+    }
+    let output = logs.contents();
+    assert!(
+        !output.contains("`allowed_ws_origins` contains `*`") && !output.contains("still loaded"),
+        "a refused file-mode document must not log the grandfathering warning: {output}"
+    );
+
+    // Positive control: the same capture does see the warning on the
+    // database/CP/DP load-validation path, so the absence above is real.
+    let mut proxy = make_proxy("star-proxy", "/api");
+    proxy.allowed_ws_origins = vec!["*".into()];
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..Default::default()
+    };
+    let (logs, _guard) = capture_ws_origin_logs();
+    config
+        .validate_all_fields(30)
+        .expect("database/CP/DP load validation keeps a legacy star");
+    assert!(
+        logs.contents()
+            .contains("`allowed_ws_origins` contains `*`"),
+        "positive control: the warning must be captured on the load path: {}",
+        logs.contents()
+    );
+}
+
+/// Admin API restore refuses `*` / non-origin `allowed_ws_origins`, so its
+/// field validation must not log the #5454 grandfathering warning, which
+/// says the config "is still loaded". The refusal and its aggregation are
+/// unchanged: the admission errors are still reported, after the pipeline.
+#[test]
+fn test_restore_refusal_of_allowed_ws_origins_star_does_not_log_grandfathering_warning() {
+    // Restore validation reads process env (the plugin-config step builds the
+    // compression admission policy from it): isolate and serialize it for the
+    // whole test so a sibling's env mutation cannot add an unrelated error.
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let mut proxy = make_proxy("ws-proxy", "/ws");
+    proxy.allowed_ws_origins = vec!["*".into(), "https://app.example.com/path".into()];
+    let mut candidate = GatewayConfig {
+        proxies: vec![proxy],
+        ..Default::default()
+    };
+    let expected = candidate.allowed_ws_origins_admission_errors();
+    assert_eq!(expected.len(), 2, "both entries are admission errors");
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+
+    let (logs, guard) = capture_ws_origin_logs();
+    let errors = ferrum_edge::_test_support::restore_candidate_validation_errors_for_test(
+        &mut candidate,
+        30,
+        &policy,
+    );
+    drop(guard);
+    assert_eq!(
+        errors, expected,
+        "restore must refuse the candidate with exactly the admission errors"
+    );
+    assert!(
+        errors[0].contains("allowed_ws_origins[0] is '*'")
+            && errors[0].contains(ALLOWED_WS_ORIGINS_STAR_GUIDANCE),
+        "{errors:?}"
+    );
+    assert!(
+        errors[1].contains("allowed_ws_origins[1] must be a literal origin"),
+        "{errors:?}"
+    );
+    let output = logs.contents();
+    assert!(
+        !output.contains("`allowed_ws_origins` contains `*`") && !output.contains("still loaded"),
+        "a refused restore must not log the grandfathering warning: {output}"
+    );
+
+    // Positive control: the same capture sees the warning when the same
+    // candidate goes through database/CP/DP load validation, so the absence
+    // above is real and those loads keep #5454's grandfathering.
+    let (logs, _guard) = capture_ws_origin_logs();
+    candidate
+        .validate_all_fields(30)
+        .expect("database/CP/DP load validation keeps a legacy star");
+    let output = logs.contents();
+    assert!(
+        output.contains("`allowed_ws_origins` contains `*`") && output.contains("still loaded"),
+        "positive control: the warning must be captured on the load path: {output}"
+    );
+}
+
+/// Restore skips the #5454 grandfathering warning because it refuses every
+/// entry the warning would flag. Pin that the warning fires exactly when
+/// admission refuses, over each entry class, so neither side can drift.
+#[test]
+fn test_allowed_ws_origins_grandfathering_warning_matches_admission_refusal() {
+    for (origin, refused) in [
+        ("", false),
+        ("   ", false),
+        ("*", true),
+        (" * ", true),
+        ("null", true),
+        ("app.example.com", true),
+        ("https://app.example.com/path", true),
+        ("https://app.example.com/?x=1", true),
+        ("https://app.example.com/#frag", true),
+        ("https://user:pass@app.example.com", true),
+        ("ftp://app.example.com", true),
+        ("https://app.example.com", false),
+        ("https://app.example.com/", false),
+        ("http://localhost:3000", false),
+        ("ws://app.example.com:8080", false),
+        ("wss://app.example.com", false),
+    ] {
+        let mut proxy = make_proxy("origin-proxy", "/ws");
+        proxy.allowed_ws_origins = vec![origin.to_string()];
+        assert_eq!(
+            !proxy.allowed_ws_origins_admission_errors().is_empty(),
+            refused,
+            "admission verdict for {origin:?}"
+        );
+        let (logs, guard) = capture_ws_origin_logs();
+        proxy.warn_legacy_allowed_ws_origins();
+        drop(guard);
+        let warned = logs.contents().contains("still loaded");
+        assert_eq!(
+            warned, refused,
+            "the grandfathering warning must fire exactly when admission refuses {origin:?}"
+        );
+    }
 }
 
 #[derive(Clone, Default)]
@@ -2717,6 +2884,7 @@ fn capture_ws_origin_logs() -> (CapturedWsOriginLogs, tracing::subscriber::Defau
         .without_time()
         .with_writer(writer.clone())
         .finish();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let guard = tracing::subscriber::set_default(subscriber);
     (writer, guard)
 }
@@ -3539,6 +3707,7 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     };
     let config = GatewayConfig {

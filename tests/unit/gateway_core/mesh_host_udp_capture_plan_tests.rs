@@ -321,6 +321,77 @@ fn host_udp_guard_release_is_strict_about_resource_errors() {
     );
 }
 
+/// Run a generated teardown script against an xtables shim whose rule check
+/// always matches while every rule delete fails with status 4 (an xtables lock
+/// held past `-w`). Returns `None` when the script is still running after the
+/// deadline, which is the spin the strict jump-release loop must never enter.
+#[cfg(unix)]
+fn run_teardown_with_stuck_jump_delete(script: &str) -> Option<std::process::Output> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    // Shell functions shadow the real binaries (and satisfy `command -v`), so
+    // nothing here touches the host's netfilter or routing state. No `set -e`:
+    // this is how the best-effort teardown scripts and the node-agent cleanup
+    // runner execute.
+    let harness = format!(
+        r#"
+iptables() {{
+  case "$*" in
+    *" -D "*) return 4 ;;
+    *) return 0 ;;
+  esac
+}}
+ip6tables() {{ iptables "$@"; }}
+ip() {{ return 0; }}
+{script}
+"#
+    );
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(harness)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sh");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if child.try_wait().expect("poll sh").is_some() {
+            return Some(child.wait_with_output().expect("collect sh output"));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn teardown_aborts_instead_of_spinning_when_a_jump_delete_keeps_failing() {
+    for (name, script) in [
+        ("host", IptablesPlan::host_udp_teardown_script()),
+        ("pod-netns", IptablesPlan::udp_teardown_script(false)),
+    ] {
+        let output = run_teardown_with_stuck_jump_delete(&script).unwrap_or_else(|| {
+            panic!("{name} teardown spun on a jump whose delete keeps failing:\n{script}")
+        });
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "{name} teardown must exit with the failed delete's status: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("could not delete"),
+            "{name} teardown must report the failed jump delete: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[test]
 fn host_capture_interface_names_reject_shell_and_wildcard_injection() {
     assert!(validate_host_capture_interface("veth1234abcd").is_ok());

@@ -28,9 +28,7 @@ use ferrum_edge::_test_support::{
     retain_grpc_web_client_content_type_for_test, set_request_grpc_web_upload_for_test,
 };
 use ferrum_edge::plugins::TransactionSummary;
-use ferrum_edge::plugins::mesh::prometheus_helpers::{
-    GrpcMessageFraming, MESH_PROMETHEUS_METRICS_OBSERVED_METADATA,
-};
+use ferrum_edge::plugins::mesh::prometheus_helpers::GrpcMessageFraming;
 use ferrum_edge::proxy::body::ProxyBodyError;
 use futures_util::stream;
 use http::{HeaderMap, HeaderValue};
@@ -379,7 +377,7 @@ fn an_empty_content_coded_body_has_no_unreadable_status() {
     record_grpc_web_passthrough_status_for_test(&ctx, &encoded, b"", &mut metadata);
     assert!(!metadata.contains_key("grpc_status_unreadable"));
     let summary = TransactionSummary {
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ..Default::default()
     };
     assert_eq!(summary.grpc_status(), Some(2));
@@ -486,10 +484,7 @@ fn buffered_passthrough_response_messages_are_counted_on_decoded_frames() {
         ),
     ] {
         let mut ctx = create_test_context();
-        ctx.metadata.insert(
-            MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
-            "true".to_string(),
-        );
+        ctx.mark_prometheus_metrics_observed();
         ctx.metadata
             .insert("request_protocol".to_string(), "grpc".to_string());
         retain_grpc_web_client_content_type_for_test(&mut ctx, content_type);
@@ -506,10 +501,7 @@ fn buffered_passthrough_response_messages_are_counted_on_decoded_frames() {
 /// `prometheus_metrics` hook leaves it.
 fn observing_request_context() -> ferrum_edge::plugins::RequestContext {
     let mut ctx = create_test_context();
-    ctx.metadata.insert(
-        MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
-        "true".to_string(),
-    );
+    ctx.mark_prometheus_metrics_observed();
     ctx.metadata
         .insert("request_protocol".to_string(), "grpc".to_string());
     ctx
@@ -679,7 +671,7 @@ fn an_unreadable_status_stays_unset_instead_of_unknown() {
         Some("compressed_trailer_frame")
     );
     let summary = TransactionSummary {
-        metadata: metadata.clone(),
+        metadata: metadata.clone().into_iter().collect(),
         ..Default::default()
     };
     assert_eq!(
@@ -698,7 +690,7 @@ fn an_unreadable_status_stays_unset_instead_of_unknown() {
     );
     assert!(!missing.contains_key("grpc_status_unreadable"));
     let summary = TransactionSummary {
-        metadata: missing,
+        metadata: missing.into_iter().collect(),
         ..Default::default()
     };
     assert_eq!(summary.grpc_status(), Some(2));

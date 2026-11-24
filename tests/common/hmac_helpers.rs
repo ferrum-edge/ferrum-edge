@@ -7,68 +7,12 @@ use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
-struct HmacSignatureInput<'a> {
-    namespace: &'a str,
-    method: &'a str,
-    path: &'a str,
-    query: &'a str,
-    date: &'a str,
-    username: &'a str,
-    authority: &'a str,
-    secret: &'a str,
-    digest_header: &'a str,
-}
-
-/// Generate an HMAC-SHA256 signature for a request, matching the signing
-/// string format expected by the `hmac_auth` plugin. No-query requests still
-/// include the empty query field in the signed string.
-pub fn generate_hmac_signature(
-    method: &str,
-    path: &str,
-    date: &str,
-    username: &str,
-    authority: &str,
-    secret: &str,
-) -> String {
-    generate_hmac_signature_from(HmacSignatureInput {
-        namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
-        method,
-        path,
-        query: "",
-        date,
-        username,
-        authority,
-        secret,
-        digest_header: &empty_digest_header(),
-    })
-}
-
-/// Generate an HMAC-SHA256 signature for a request with a raw query string.
-pub fn generate_hmac_signature_with_query(
-    method: &str,
-    path: &str,
-    query: &str,
-    date: &str,
-    username: &str,
-    authority: &str,
-    secret: &str,
-) -> String {
-    generate_hmac_signature_from(HmacSignatureInput {
-        namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
-        method,
-        path,
-        query,
-        date,
-        username,
-        authority,
-        secret,
-        digest_header: &empty_digest_header(),
-    })
-}
-
-/// Generate an HMAC-SHA256 signature for a no-query request with an explicit
-/// Digest or Content-Digest header value.
-pub fn generate_hmac_signature_with_digest(
+/// `Authorization` header for one `ferrum-hmac-v2` request with an empty
+/// query, signed over `digest_header` with a fresh nonce.
+///
+/// Every call mints a new nonce, so each request built from it is single-use
+/// on its own; resending the returned header is a replay.
+pub fn hmac_v2_authorization(
     method: &str,
     path: &str,
     date: &str,
@@ -77,35 +21,31 @@ pub fn generate_hmac_signature_with_digest(
     secret: &str,
     digest_header: &str,
 ) -> String {
-    generate_hmac_signature_from(HmacSignatureInput {
-        namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
-        method,
-        path,
-        query: "",
-        date,
-        username,
-        authority,
-        secret,
-        digest_header,
-    })
+    let nonce = fresh_hmac_v2_nonce();
+    hmac_v2_authorization_header(
+        &HmacV2Request {
+            method,
+            path,
+            date,
+            username,
+            authority,
+            secret,
+            digest_header,
+            nonce: &nonce,
+        },
+        None,
+    )
 }
 
-fn generate_hmac_signature_from(input: HmacSignatureInput<'_>) -> String {
-    let signing_string = format!(
-        "ferrum-hmac-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        input.namespace,
-        input.username,
-        input.authority,
-        input.method,
-        input.path,
-        input.query,
-        input.date,
-        input.digest_header
-    );
-    let mut mac = HmacSha256::new_from_slice(input.secret.as_bytes())
-        .expect("Failed to create HMAC instance");
-    mac.update(signing_string.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+/// A process-unique 32-hex-character nonce (wall-clock nanoseconds plus a
+/// counter), so concurrently built requests never share one.
+fn fresh_hmac_v2_nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+    format!("{nanos:016x}{:016x}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Fields signed by the `ferrum-hmac-v2` base.
@@ -123,9 +63,9 @@ pub struct HmacV2Request<'a> {
 
 /// Compute a `ferrum-hmac-v2` signature.
 ///
-/// The v2 base is v1 plus a trailing bound `{NONCE}` field, and the profile
-/// version is the base's first field — so this signature cannot verify under
-/// v1 and a v1 signature cannot verify here.
+/// The profile version is the base's first field and the nonce its trailing
+/// bound field, so the signature verifies only as `ferrum-hmac-v2` with this
+/// exact nonce.
 pub fn hmac_v2_signature(request: &HmacV2Request<'_>) -> String {
     let signing_string = format!(
         "ferrum-hmac-v2\n{}\n{}\n{}\n{}\n{}\n\n{}\n{}\n{}",

@@ -10,6 +10,7 @@ use chrono::Utc;
 use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 use serde_json::Value;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -29,8 +30,10 @@ const PROMETHEUS_METRICS_CONFIG_KEYS: &[&str] = &[
     "cache_invalidation_min_age_ms",
     "mesh_series_budget_per_family",
     "render_cache_ttl_seconds",
+    "request_duration_buckets_ms",
     "schema",
     "schema_ref",
+    "session_duration_buckets_ms",
     "stale_entry_ttl_seconds",
 ];
 
@@ -127,6 +130,25 @@ pub struct WsTrafficKey {
     pub direction: &'static str,
 }
 
+/// Key for `ferrum_unmatched_requests_total`: a closed pre-routing rejection
+/// reason and the gateway-authored response status. Neither label is ever
+/// derived from request input (paths, hosts, and methods are never labels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnmatchedRequestKey {
+    /// `route_not_found`, `mesh_registry_only`, or `other`.
+    pub reason: &'static str,
+    /// Response status the gateway answered with; `0` if outside `100..=599`.
+    pub status_code: u16,
+}
+
+fn unmatched_request_reason(phase: &str) -> &'static str {
+    match phase {
+        crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE => "route_not_found",
+        crate::diagnostic_ref::MESH_REGISTRY_ONLY_PHASE => "mesh_registry_only",
+        _ => "other",
+    }
+}
+
 /// Composite key for the HTTP-family client-disconnect counter.
 ///
 /// Populated whenever a `TransactionSummary` is logged with
@@ -138,15 +160,22 @@ pub struct WsTrafficKey {
 ///   drained, body error, or dropped mid-stream — and written into the summary
 ///   by [`crate::proxy::deferred_log::DeferredTransactionLogger`] at fire time.
 /// * HTTP/3 drives its QUIC send stream to completion synchronously inside
-///   `proxy_to_backend_h3_streaming`, so its summary sites read the flag off
+///   `stream_h3_open_response_to_client`, so its summary sites read the flag off
 ///   `H3StreamResult` without a deferred logger.
 ///
 /// Only downstream aborts are counted: a backend-side close mid-body maps to a
 /// transport `ErrorClass` with `client_disconnected == false` (see
 /// [`crate::retry::classify_body_error`]), so backend resets never inflate this
-/// series. Buffered responses log before the body reaches the wire and so
-/// always report `false` — a disconnect while hyper writes an already
-/// materialized body is not observable at that log site.
+/// series. Buffered responses log before the body reaches the wire, so their
+/// summary carries `response_delivery: not_observed` and `false` here means
+/// "no disconnect seen before the hand-off", not "delivered": a disconnect
+/// while hyper writes an already materialized body is not observable at that
+/// log site.
+///
+/// An H1/H2 client that resets or closes before any response head is counted
+/// once through the client-abort `499` summary
+/// ([`crate::proxy::client_abort_scope`]), which carries `client_disconnected ==
+/// true`.
 ///
 /// WebSocket sessions are not counted here; their terminal classification has a
 /// dedicated bounded family, `ferrum_websocket_sessions_total`, keyed by
@@ -488,7 +517,9 @@ fn method_label(method: &str) -> &'static str {
 /// Convert the internal gRPC terminal-status metadata to a bounded Prometheus
 /// label. Standard codes retain their numeric representation; malformed or
 /// future non-standard codes share one `OTHER` bucket.
-fn grpc_status_label(metadata: &std::collections::HashMap<String, String>) -> Option<&'static str> {
+fn grpc_status_label<MS: std::hash::BuildHasher>(
+    metadata: &std::collections::HashMap<String, String, MS>,
+) -> Option<&'static str> {
     let status = match metadata.get("grpc_status")?.trim().parse::<u32>() {
         Ok(status) => status,
         Err(_) => return Some("OTHER"),
@@ -530,13 +561,20 @@ impl TimestampedCounter {
     }
 
     fn increment(&self, epoch: Instant) {
-        self.add(1, epoch);
+        self.add_at(1, epoch.elapsed().as_nanos() as u64);
+    }
+
+    fn increment_at(&self, now_nanos: u64) {
+        self.add_at(1, now_nanos);
     }
 
     fn add(&self, value: u64, epoch: Instant) {
+        self.add_at(value, epoch.elapsed().as_nanos() as u64);
+    }
+
+    fn add_at(&self, value: u64, now_nanos: u64) {
         self.value.fetch_add(value, Ordering::Relaxed);
-        self.last_updated
-            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.last_updated.fetch_max(now_nanos, Ordering::Relaxed);
     }
 
     fn saturating_add(&self, value: u64, epoch: Instant) {
@@ -546,7 +584,7 @@ impl TimestampedCounter {
                 Some(current.saturating_add(value))
             });
         self.last_updated
-            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            .fetch_max(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     fn nanos_since_update(&self, epoch: Instant) -> u64 {
@@ -629,12 +667,85 @@ impl TimestampedCostCounter {
     }
 }
 
+/// Default finite upper bounds (milliseconds) for request-scoped duration
+/// histograms: `ferrum_request_duration_ms`, `ferrum_backend_duration_ms`,
+/// `ferrum_edge_overhead_ms`, and `ferrum_mesh_request_duration_ms`.
+///
+/// The range extends to five minutes so long AI/SSE generations and long-poll
+/// requests resolve to a finite bucket instead of saturating `histogram_quantile`
+/// at the former 10 s ceiling. Overridable with `request_duration_buckets_ms`.
+pub const DEFAULT_REQUEST_DURATION_BUCKETS_MS: &[f64] = &[
+    5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0, 60000.0,
+    120000.0, 300000.0,
+];
+
+/// Default finite upper bounds (milliseconds) for session-scoped duration
+/// histograms: `ferrum_stream_duration_ms` (TCP/UDP) and
+/// `ferrum_websocket_session_duration_ms`.
+///
+/// Sessions routinely last minutes to hours, so the range extends to one hour.
+/// Overridable with `session_duration_buckets_ms`.
+pub const DEFAULT_SESSION_DURATION_BUCKETS_MS: &[f64] = &[
+    5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0, 60000.0,
+    300000.0, 900000.0, 1800000.0, 3600000.0,
+];
+
+/// Inclusive upper bound on the number of finite buckets an operator may
+/// configure for one duration layout. Every bucket is one exposition line per
+/// series, so the bound keeps `/metrics` size proportional to series count.
+pub const MAX_DURATION_BUCKETS: usize = 64;
+
+/// The configured layouts for millisecond duration histograms.
+///
+/// Every histogram created for a duration family shares its layout's `Arc`, so
+/// the record path detects a superseded layout by pointer identity alone.
+struct DurationBucketLayouts {
+    request: Arc<[f64]>,
+    session: Arc<[f64]>,
+}
+
+impl DurationBucketLayouts {
+    fn defaults() -> Self {
+        Self {
+            request: Arc::from(DEFAULT_REQUEST_DURATION_BUCKETS_MS),
+            session: Arc::from(DEFAULT_SESSION_DURATION_BUCKETS_MS),
+        }
+    }
+
+    fn layout(&self, kind: DurationLayoutKind) -> &Arc<[f64]> {
+        match kind {
+            DurationLayoutKind::Request => &self.request,
+            DurationLayoutKind::Session => &self.session,
+        }
+    }
+}
+
+/// Which configured duration layout a histogram family uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurationLayoutKind {
+    /// `request_duration_buckets_ms` families.
+    Request,
+    /// `session_duration_buckets_ms` families.
+    Session,
+}
+
+/// A captured duration-layout snapshot, standing in for a recorder that loaded
+/// the layouts before a reload published new ones. Test-only handle; the
+/// production record paths load the snapshot themselves.
+#[doc(hidden)]
+pub struct DurationLayoutSnapshotForTest(Arc<DurationBucketLayouts>);
+
 /// Histogram with predefined buckets and a last-updated timestamp.
 pub struct HistogramBuckets {
-    /// Bucket boundaries in the metric's native unit.
-    pub boundaries: Vec<f64>,
-    /// Count of observations <= each boundary
-    pub counts: Vec<CachePadded<AtomicU64>>,
+    /// Strictly increasing finite bucket upper bounds in the metric's native
+    /// unit. Duration histograms share the registry's configured layout `Arc`.
+    pub boundaries: Arc<[f64]>,
+    /// Non-cumulative per-bucket counts: `counts[i]` holds the observations in
+    /// `(boundaries[i - 1], boundaries[i]]`. One observation touches one slot;
+    /// the cumulative `le` series is the prefix sum taken at render time
+    /// ([`Self::cumulative_buckets`]). Values above the last bound are counted
+    /// only by `count` (the `+Inf` bucket).
+    counts: Vec<CachePadded<AtomicU64>>,
     /// Sum of all observations
     pub sum: CachePadded<AtomicU64>, // stored as bits of f64
     /// Total count
@@ -644,37 +755,7 @@ pub struct HistogramBuckets {
 }
 
 impl HistogramBuckets {
-    fn new(epoch: Instant) -> Self {
-        Self::new_with_boundaries(
-            vec![
-                5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
-            ],
-            epoch,
-        )
-    }
-
-    fn new_seconds(epoch: Instant) -> Self {
-        Self::new_with_boundaries(
-            vec![
-                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
-            ],
-            epoch,
-        )
-    }
-
-    /// Istio-aligned byte histogram buckets for REQUEST_SIZE / RESPONSE_SIZE.
-    fn new_bytes(epoch: Instant) -> Self {
-        Self::new_with_boundaries(
-            vec![
-                1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
-                8192.0, 16384.0, 32768.0, 65536.0, 131072.0, 262144.0, 524288.0, 1048576.0,
-                2097152.0, 4194304.0, 8388608.0,
-            ],
-            epoch,
-        )
-    }
-
-    fn new_with_boundaries(boundaries: Vec<f64>, epoch: Instant) -> Self {
+    fn with_layout(boundaries: Arc<[f64]>, epoch: Instant) -> Self {
         let counts = boundaries
             .iter()
             .map(|_| CachePadded::new(AtomicU64::new(0)))
@@ -688,10 +769,71 @@ impl HistogramBuckets {
         }
     }
 
+    /// `(upper_bound, cumulative_count)` for every finite bucket in ascending
+    /// bound order — the Prometheus `le` series. The running total is
+    /// monotonic by construction even while observations race the scrape.
+    pub fn cumulative_buckets(&self) -> impl Iterator<Item = (f64, u64)> + '_ {
+        let mut running = 0u64;
+        self.boundaries
+            .iter()
+            .zip(self.counts.iter())
+            .map(move |(bound, slot)| {
+                running = running.saturating_add(slot.load(Ordering::Relaxed));
+                (*bound, running)
+            })
+    }
+
+    /// Cumulative count of observations `<= boundaries[index]` (the value of
+    /// the `le` bucket at `index`). An index past the last bound returns the
+    /// total over every finite bucket.
+    pub fn cumulative_count(&self, index: usize) -> u64 {
+        self.counts
+            .iter()
+            .take(index.saturating_add(1))
+            .fold(0u64, |total, slot| {
+                total.saturating_add(slot.load(Ordering::Relaxed))
+            })
+    }
+
+    /// `_count` / `le="+Inf"` value for rendering: never below the last finite
+    /// cumulative bucket, so a scrape racing `observe` cannot expose a
+    /// non-monotonic bucket series.
+    fn rendered_total(&self, finite_total: u64) -> u64 {
+        self.count.load(Ordering::Relaxed).max(finite_total)
+    }
+
+    fn new_seconds(epoch: Instant) -> Self {
+        Self::new_with_boundaries(
+            vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+            ],
+            epoch,
+        )
+    }
+
+    /// Istio-aligned byte histogram buckets for REQUEST_SIZE / RESPONSE_SIZE.
+    fn new_bytes(epoch: Instant) -> Self {
+        Self::with_layout(
+            Arc::from(vec![
+                1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
+                8192.0, 16384.0, 32768.0, 65536.0, 131072.0, 262144.0, 524288.0, 1048576.0,
+                2097152.0, 4194304.0, 8388608.0,
+            ]),
+            epoch,
+        )
+    }
+
+    fn new_with_boundaries(boundaries: Vec<f64>, epoch: Instant) -> Self {
+        Self::with_layout(Arc::from(boundaries), epoch)
+    }
+
     fn observe(&self, value: f64, epoch: Instant) {
+        self.observe_at(value, epoch.elapsed().as_nanos() as u64);
+    }
+
+    fn observe_at(&self, value: f64, now_nanos: u64) {
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.last_updated
-            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.last_updated.fetch_max(now_nanos, Ordering::Relaxed);
         // Add to sum (using u64 bit representation of f64)
         loop {
             let old = self.sum.load(Ordering::Relaxed);
@@ -707,11 +849,17 @@ impl HistogramBuckets {
                 Err(_) => continue,
             }
         }
-        // Increment bucket counters
-        for (i, boundary) in self.boundaries.iter().enumerate() {
-            if value <= *boundary {
-                self.counts[i].fetch_add(1, Ordering::Relaxed);
-            }
+        // Non-cumulative storage: exactly one bucket slot per observation —
+        // the first bound `>= value`. Boundaries are strictly increasing, so
+        // `partition_point` finds it without touching every bucket. NaN and
+        // values above the last bound land only in `+Inf` (via `count`), as
+        // they did when every matching cumulative bucket was incremented.
+        let index = self.boundaries.partition_point(|bound| *bound < value);
+        if let Some(bound) = self.boundaries.get(index)
+            && value <= *bound
+            && let Some(slot) = self.counts.get(index)
+        {
+            slot.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -728,6 +876,12 @@ const DEFAULT_STALE_TTL_NANOS: u64 = 3_600_000_000_000;
 /// Default render cache TTL: 5 seconds.
 const DEFAULT_RENDER_CACHE_TTL_SECS: u64 = 5;
 
+/// Headroom reserved past the cached body for the live (uncached) families
+/// `render()` appends, so appending them does not reallocate the whole body.
+/// Sized for the externally sourced process families (about 12 KiB with the
+/// node agent registered) on top of the mesh and trust tails.
+const RENDER_LIVE_TAIL_RESERVE_BYTES: usize = 32 * 1024;
+
 /// Default minimum cache age (in nanoseconds) before record() will invalidate.
 /// At high RPS this prevents an Arc allocation on every single request.
 const DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS: u64 = 500_000_000; // 500ms
@@ -743,6 +897,73 @@ const OAUTH2_INTROSPECTION_CACHE_ADMISSION_SKIP_REASONS: [&str; 7] = [
     "total_bytes",
 ];
 const OAUTH2_INTROSPECTION_CACHE_EVICTION_REASONS: [&str; 2] = ["capacity", "expired"];
+
+/// `response_caching` lookup outcomes, as `(X-Cache-Status value, metric label)`.
+/// A fixed, compiled-in set: the label is the outcome class only and never a
+/// cache key, path, host, caller, or plugin-instance identifier.
+const RESPONSE_CACHE_LOOKUP_STATUSES: [(&str, &str); 5] = [
+    ("HIT", "hit"),
+    ("MISS", "miss"),
+    ("BYPASS", "bypass"),
+    ("REVALIDATED", "revalidated"),
+    ("PREDICTED-BYPASS", "predicted_bypass"),
+];
+
+/// `direction` label values of `ferrum_ws_message_size_limit_rejected_total`,
+/// indexed by [`ws_message_size_limit_direction_index`].
+const WS_MESSAGE_SIZE_LIMIT_DIRECTIONS: [&str; 2] = ["client_to_backend", "backend_to_client"];
+
+fn ws_message_size_limit_direction_index(direction: super::WebSocketFrameDirection) -> usize {
+    match direction {
+        super::WebSocketFrameDirection::ClientToBackend => 0,
+        super::WebSocketFrameDirection::BackendToClient => 1,
+    }
+}
+
+/// `adaptive_concurrency` admission decisions exported as
+/// `ferrum_adaptive_concurrency_decisions_total{proxy_id, decision}`.
+///
+/// A fixed, compiled-in label set. Ordinary within-limit admissions are not
+/// counted, so the request path records nothing unless a request is shed,
+/// would have been shed in `shadow_mode`, or bypassed adaptive limiting at the
+/// `max_tracked_keys` cap. The backend target is never a label.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptiveConcurrencyDecision {
+    /// Admission refused with a 503: the target was at its adaptive limit, or
+    /// the request crossed a policy/load-balancer generation handoff.
+    Rejected,
+    /// `shadow_mode` admitted a request the adaptive limit would have refused.
+    WouldReject,
+    /// The target is beyond `max_tracked_keys` and was admitted without
+    /// adaptive limiting.
+    UntrackedBypass,
+}
+
+impl AdaptiveConcurrencyDecision {
+    pub const ALL: [Self; 3] = [Self::Rejected, Self::WouldReject, Self::UntrackedBypass];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Rejected => "rejected",
+            Self::WouldReject => "would_reject",
+            Self::UntrackedBypass => "untracked_bypass",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Rejected => 0,
+            Self::WouldReject => 1,
+            Self::UntrackedBypass => 2,
+        }
+    }
+}
+
+fn response_cache_lookup_status_index(status: &str) -> Option<usize> {
+    RESPONSE_CACHE_LOOKUP_STATUSES
+        .iter()
+        .position(|(candidate, _)| *candidate == status)
+}
 
 fn oauth2_introspection_cache_class_index(class: &str) -> Option<usize> {
     OAUTH2_INTROSPECTION_CACHE_CLASSES
@@ -815,6 +1036,17 @@ pub struct MetricsRegistry {
     pub backend_duration_buckets: DashMap<Arc<str>, HistogramBuckets>,
     /// Gateway overhead histogram buckets by proxy_id
     pub gateway_overhead_buckets: DashMap<Arc<str>, HistogramBuckets>,
+    /// HTTP-family request body bytes relayed client → backend, by proxy_id
+    /// (`TransactionSummary::bytes_sent`).
+    pub request_body_bytes_counter: DashMap<Arc<str>, TimestampedCounter>,
+    /// HTTP-family response body bytes relayed backend → client, by proxy_id
+    /// (`TransactionSummary::bytes_received`).
+    pub response_body_bytes_counter: DashMap<Arc<str>, TimestampedCounter>,
+    /// Requests refused before routing (no proxy matched, or the mesh
+    /// `REGISTRY_ONLY` policy refused an outbound route miss). These never
+    /// reach any plugin, so they are counted directly by the shared route-miss
+    /// funnel. Keys are a closed reason set × gateway-authored status codes.
+    pub unmatched_request_counter: DashMap<UnmatchedRequestKey, CachePadded<AtomicU64>>,
     /// Prompt tokens from one selected ai_token_metrics instance per request.
     pub ai_prompt_tokens_counter: DashMap<AiUsageKey, TimestampedCounter>,
     /// Completion tokens from one selected ai_token_metrics instance per request.
@@ -853,8 +1085,9 @@ pub struct MetricsRegistry {
     /// this is the alertable signal that the configured quota is currently
     /// being enforced once per gateway process instead of once per fleet.
     pub rate_limit_fallback_decisions: AtomicU64,
-    /// `rate_limiting` requests refused because centralized enforcement was
-    /// unavailable and `redis_failure_policy` is `fail_closed`.
+    /// `rate_limiting` requests refused, and `ws_rate_limiting` sessions
+    /// closed, because centralized enforcement was unavailable and
+    /// `redis_failure_policy` is `fail_closed`.
     pub rate_limit_unavailable_denials: AtomicU64,
     pub ai_rate_limit_local_accounting_tokens: AtomicU64,
     pub ai_rate_limit_unaccounted_tokens: AtomicU64,
@@ -870,10 +1103,27 @@ pub struct MetricsRegistry {
     oauth2_introspection_cache_evictions: [[AtomicU64; 2]; 2],
     /// Bounded eviction/cleanup tickets examined.
     oauth2_introspection_cache_cleanup_work: AtomicU64,
+    /// `response_caching` lookup outcomes by the fixed
+    /// [`RESPONSE_CACHE_LOOKUP_STATUSES`] classes. Each slot is padded onto its
+    /// own cache line because every cache-eligible request increments one.
+    response_cache_lookups: [CachePadded<AtomicU64>; 5],
+    /// WebSocket sessions closed with 1009 because a `ws_message_size_limiting`
+    /// ceiling was exceeded, by the fixed [`WS_MESSAGE_SIZE_LIMIT_DIRECTIONS`]
+    /// of the rejected input. Incremented once per terminal policy Close, never
+    /// per frame.
+    ws_message_size_limit_rejections: [AtomicU64; 2],
+    /// `adaptive_concurrency` decisions by proxy_id, one map per
+    /// [`AdaptiveConcurrencyDecision`] (indexed by `AdaptiveConcurrencyDecision::index`).
+    /// Keyed by the configured proxy id only, so cardinality is bounded by the
+    /// proxy inventory; stale series age out with the other per-proxy counters.
+    adaptive_concurrency_decisions: [DashMap<Arc<str>, TimestampedCounter>; 3],
     /// Admin configuration mutations refused because the Admin API is in
     /// read-only mode. Counted only on real admission attempts, not on
     /// observe-only health probes.
     admin_read_only_rejected_mutations: AtomicU64,
+    /// Process-local mTLS DNS admission fences currently retained by config
+    /// stores after an uncertain protected mutation outcome (issue #7031).
+    mtls_dns_admission_fences_retained: AtomicU64,
     /// `request_mirror` detached tasks admitted past concurrency + byte budgets.
     request_mirror_dispatched: AtomicU64,
     /// `request_mirror` tasks that fully drained a response (any status) within bounds.
@@ -942,10 +1192,23 @@ pub struct MetricsRegistry {
     ai_federation_circuit_half_open_probes: AtomicU64,
     /// Provider attempts skipped because an ai_federation circuit was open.
     ai_federation_circuit_open_skips: AtomicU64,
+    /// Open/half-open ai_federation circuits by configured provider name.
+    /// Live state, not TTL-evicted: an entry is removed when its count returns
+    /// to zero (circuit closed or the circuit dropped on reload), so the key
+    /// set is bounded by the provider names of currently configured
+    /// federation instances.
+    ai_federation_provider_circuits_open: DashMap<Arc<str>, i64>,
+    /// Closed-to-open transitions by configured provider name (TTL-evicted).
+    ai_federation_provider_circuits_opened: DashMap<Arc<str>, TimestampedCounter>,
+    /// Half-open-to-closed recoveries by configured provider name (TTL-evicted).
+    ai_federation_provider_circuits_closed: DashMap<Arc<str>, TimestampedCounter>,
     /// Stream connections by (proxy_id, protocol)
     pub stream_connection_counter: DashMap<StreamCounterKey, TimestampedCounter>,
     /// Stream connection duration histogram by proxy_id
     pub stream_duration_buckets: DashMap<Arc<str>, HistogramBuckets>,
+    /// `tcp_connection_throttle` refusals by proxy_id. Written only on the
+    /// refusal path; admission never touches it.
+    tcp_connection_throttle_rejections: DashMap<Arc<str>, TimestampedCounter>,
     /// Completed WebSocket sessions by bounded terminal classification.
     pub ws_session_counter: DashMap<WsSessionKey, TimestampedCounter>,
     /// WebSocket session duration by the same bounded terminal classification.
@@ -1064,8 +1327,17 @@ pub struct MetricsRegistry {
     /// DP ConfigSync delta-rejection divergence metrics (issue #2394).
     configsync_divergence_metrics:
         ArcSwap<Option<Arc<crate::grpc::configsync_lifecycle::ConfigSyncDivergenceMetrics>>>,
-    /// Cached render output with generation timestamp
-    render_cache: ArcSwap<Option<(Instant, String)>>,
+    /// Cached render output with the instant its rebuild started. The body is
+    /// shared (`Arc<str>`) by every cache hit.
+    render_cache: ArcSwap<Option<(Instant, Arc<str>)>>,
+    /// Scrape-path single-flight for cache rebuilds. Only a cache MISS takes
+    /// it; hits stay lock-free. Serializing rebuild + publication means a
+    /// slower renderer can never replace a newer snapshot with older counter
+    /// values, and concurrent misses reuse one rebuild instead of each walking
+    /// every map. Never taken on the request-recording path.
+    render_rebuild_lock: std::sync::Mutex<()>,
+    /// Configured bucket layouts for millisecond duration histograms.
+    duration_bucket_layouts: ArcSwap<DurationBucketLayouts>,
     /// Configurable render cache TTL in seconds
     render_cache_ttl_secs: AtomicU64,
     /// Configurable stale entry TTL in nanoseconds
@@ -1094,26 +1366,33 @@ impl Default for MetricsRegistry {
 
 impl MetricsRegistry {
     pub fn new() -> Self {
+        // Every per-request counter map is hot-path state. The registry is
+        // process-global and built before `EnvConfig` is consulted, so it uses
+        // the same auto-sized shard formula as `FERRUM_POOL_SHARD_AMOUNT=0`.
+        let shards = crate::util::sharding::pool_shard_amount(0);
         Self {
             epoch: Instant::now(),
-            request_counter: DashMap::new(),
-            request_duration_buckets: DashMap::new(),
-            backend_duration_buckets: DashMap::new(),
-            gateway_overhead_buckets: DashMap::new(),
-            ai_prompt_tokens_counter: DashMap::new(),
-            ai_completion_tokens_counter: DashMap::new(),
-            ai_total_tokens_counter: DashMap::new(),
-            ai_estimated_cost_counter: DashMap::new(),
-            mesh_request_counter: DashMap::new(),
-            mesh_request_duration_buckets: DashMap::new(),
-            mesh_request_bytes_buckets: DashMap::new(),
-            mesh_response_bytes_buckets: DashMap::new(),
-            mesh_tcp_opened_counter: DashMap::new(),
-            mesh_tcp_closed_counter: DashMap::new(),
-            mesh_tcp_sent_bytes_counter: DashMap::new(),
-            mesh_tcp_received_bytes_counter: DashMap::new(),
-            mesh_grpc_request_messages_counter: DashMap::new(),
-            mesh_grpc_response_messages_counter: DashMap::new(),
+            request_counter: DashMap::with_shard_amount(shards),
+            request_duration_buckets: DashMap::with_shard_amount(shards),
+            backend_duration_buckets: DashMap::with_shard_amount(shards),
+            gateway_overhead_buckets: DashMap::with_shard_amount(shards),
+            request_body_bytes_counter: DashMap::with_shard_amount(shards),
+            response_body_bytes_counter: DashMap::with_shard_amount(shards),
+            unmatched_request_counter: DashMap::with_shard_amount(shards),
+            ai_prompt_tokens_counter: DashMap::with_shard_amount(shards),
+            ai_completion_tokens_counter: DashMap::with_shard_amount(shards),
+            ai_total_tokens_counter: DashMap::with_shard_amount(shards),
+            ai_estimated_cost_counter: DashMap::with_shard_amount(shards),
+            mesh_request_counter: DashMap::with_shard_amount(shards),
+            mesh_request_duration_buckets: DashMap::with_shard_amount(shards),
+            mesh_request_bytes_buckets: DashMap::with_shard_amount(shards),
+            mesh_response_bytes_buckets: DashMap::with_shard_amount(shards),
+            mesh_tcp_opened_counter: DashMap::with_shard_amount(shards),
+            mesh_tcp_closed_counter: DashMap::with_shard_amount(shards),
+            mesh_tcp_sent_bytes_counter: DashMap::with_shard_amount(shards),
+            mesh_tcp_received_bytes_counter: DashMap::with_shard_amount(shards),
+            mesh_grpc_request_messages_counter: DashMap::with_shard_amount(shards),
+            mesh_grpc_response_messages_counter: DashMap::with_shard_amount(shards),
             rate_limit_exceeded: AtomicU64::new(0),
             rate_limit_fallback_decisions: AtomicU64::new(0),
             rate_limit_unavailable_denials: AtomicU64::new(0),
@@ -1128,7 +1407,13 @@ impl MetricsRegistry {
                 std::array::from_fn(|_| AtomicU64::new(0))
             }),
             oauth2_introspection_cache_cleanup_work: AtomicU64::new(0),
+            response_cache_lookups: std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0))),
+            ws_message_size_limit_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
+            adaptive_concurrency_decisions: std::array::from_fn(|_| {
+                DashMap::with_shard_amount(shards)
+            }),
             admin_read_only_rejected_mutations: AtomicU64::new(0),
+            mtls_dns_admission_fences_retained: AtomicU64::new(0),
             request_mirror_dispatched: AtomicU64::new(0),
             request_mirror_completed: AtomicU64::new(0),
             request_mirror_request_timeouts: AtomicU64::new(0),
@@ -1160,28 +1445,32 @@ impl MetricsRegistry {
             ai_federation_circuits_closed: AtomicU64::new(0),
             ai_federation_circuit_half_open_probes: AtomicU64::new(0),
             ai_federation_circuit_open_skips: AtomicU64::new(0),
-            stream_connection_counter: DashMap::new(),
-            stream_duration_buckets: DashMap::new(),
-            ws_session_counter: DashMap::new(),
-            ws_session_duration_buckets: DashMap::new(),
-            ws_bytes_counter: DashMap::new(),
-            ws_frames_counter: DashMap::new(),
-            client_disconnect_counter: DashMap::new(),
-            stream_disconnect_counter: DashMap::new(),
+            ai_federation_provider_circuits_open: DashMap::with_shard_amount(shards),
+            ai_federation_provider_circuits_opened: DashMap::with_shard_amount(shards),
+            ai_federation_provider_circuits_closed: DashMap::with_shard_amount(shards),
+            stream_connection_counter: DashMap::with_shard_amount(shards),
+            stream_duration_buckets: DashMap::with_shard_amount(shards),
+            tcp_connection_throttle_rejections: DashMap::with_shard_amount(shards),
+            ws_session_counter: DashMap::with_shard_amount(shards),
+            ws_session_duration_buckets: DashMap::with_shard_amount(shards),
+            ws_bytes_counter: DashMap::with_shard_amount(shards),
+            ws_frames_counter: DashMap::with_shard_amount(shards),
+            client_disconnect_counter: DashMap::with_shard_amount(shards),
+            stream_disconnect_counter: DashMap::with_shard_amount(shards),
             mesh_dns_upstream_id_exhaustions: AtomicU64::new(0),
-            hbone_relay_failure_counter: DashMap::new(),
-            hbone_tunnel_revocation_counter: DashMap::new(),
-            hbone_inner_pool_event_counter: DashMap::new(),
-            mesh_tcp_egress_connection_counter: DashMap::new(),
-            mesh_outbound_registry_decisions: DashMap::new(),
-            mesh_outbound_registry_stream_decisions: DashMap::new(),
-            tls_cert_gauges: DashMap::new(),
-            tls_revocation_gauges: DashMap::new(),
+            hbone_relay_failure_counter: DashMap::with_shard_amount(shards),
+            hbone_tunnel_revocation_counter: DashMap::with_shard_amount(shards),
+            hbone_inner_pool_event_counter: DashMap::with_shard_amount(shards),
+            mesh_tcp_egress_connection_counter: DashMap::with_shard_amount(shards),
+            mesh_outbound_registry_decisions: DashMap::with_shard_amount(shards),
+            mesh_outbound_registry_stream_decisions: DashMap::with_shard_amount(shards),
+            tls_cert_gauges: DashMap::with_shard_amount(shards),
+            tls_revocation_gauges: DashMap::with_shard_amount(shards),
             tls_inventory_freshness: ArcSwap::from_pointee(None),
-            tls_source_refresh_counter: DashMap::new(),
-            tls_source_fetch_duration_buckets: DashMap::new(),
-            tls_source_fetch_failure_counter: DashMap::new(),
-            tls_cert_rotation_counter: DashMap::new(),
+            tls_source_refresh_counter: DashMap::with_shard_amount(shards),
+            tls_source_fetch_duration_buckets: DashMap::with_shard_amount(shards),
+            tls_source_fetch_failure_counter: DashMap::with_shard_amount(shards),
+            tls_cert_rotation_counter: DashMap::with_shard_amount(shards),
             tls_store_document_bytes: std::array::from_fn(|_| AtomicU64::new(0)),
             tls_store_record_count: std::array::from_fn(|_| AtomicU64::new(0)),
             tls_store_oversized_total: std::array::from_fn(|_| {
@@ -1198,6 +1487,8 @@ impl MetricsRegistry {
             database_delta_poll_metrics: ArcSwap::from_pointee(None),
             configsync_divergence_metrics: ArcSwap::from_pointee(None),
             render_cache: ArcSwap::from_pointee(None),
+            render_rebuild_lock: std::sync::Mutex::new(()),
+            duration_bucket_layouts: ArcSwap::from_pointee(DurationBucketLayouts::defaults()),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
             stale_entry_ttl_nanos: AtomicU64::new(DEFAULT_STALE_TTL_NANOS),
             cache_invalidation_min_age_nanos: AtomicU64::new(
@@ -1239,11 +1530,177 @@ impl MetricsRegistry {
             ),
             Ordering::Release,
         );
+        // Fence against an in-flight cache rebuild: a body rendered under the
+        // previous namespace label must not be published after this
+        // invalidation (see `configure_duration_buckets`).
+        let _rebuild = self.lock_render_rebuild();
         // Set namespace label fragment for every namespace.
         if let Ok(mut ns_label) = self.namespace_label.write() {
             *ns_label = format!(",namespace=\"{}\"", escape_label_value(namespace));
         }
         self.render_cache.store(Arc::new(None));
+    }
+
+    /// Acquire the scrape-path rebuild lock. The guarded data is `()`, so a
+    /// guard poisoned by a panicking renderer is always safe to recover.
+    fn lock_render_rebuild(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.render_rebuild_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Publish the millisecond duration-histogram bucket layouts.
+    ///
+    /// `request_bounds` governs `ferrum_request_duration_ms`,
+    /// `ferrum_backend_duration_ms`, `ferrum_edge_overhead_ms`, and
+    /// `ferrum_mesh_request_duration_ms`; `session_bounds` governs
+    /// `ferrum_stream_duration_ms` and `ferrum_websocket_session_duration_ms`.
+    /// Callers pass layouts already validated as non-empty, finite, positive,
+    /// and strictly increasing (the plugin constructor does).
+    ///
+    /// Re-publishing an identical layout is a no-op, so an unchanged reload
+    /// keeps every series. When a layout changes, every retained series of the
+    /// affected families is dropped so a family never exposes two `le`
+    /// layouts at once (cross-series `sum by (le)` would otherwise mix them);
+    /// those series restart from zero under the new layout, which Prometheus
+    /// treats as an ordinary counter reset.
+    ///
+    /// Reload safety: a recorder that captured the previous layout before this
+    /// publication only uses that capture for its shared-guard fast path.
+    /// Every insert or replacement re-reads the CURRENTLY published layout
+    /// while holding the entry's shard write lock, and the retirement sweep
+    /// below takes the same shard locks after publishing, so a late recorder
+    /// can neither resurrect a retired layout nor replace a current-layout
+    /// series with a retired one. The whole publication runs under the
+    /// scrape rebuild lock, so a body rendered before the change cannot be
+    /// published after its cache invalidation.
+    pub fn configure_duration_buckets(&self, request_bounds: &[f64], session_bounds: &[f64]) {
+        let _rebuild = self.lock_render_rebuild();
+        let current = self.duration_bucket_layouts.load_full();
+        let request_changed = current.request.as_ref() != request_bounds;
+        let session_changed = current.session.as_ref() != session_bounds;
+        if !request_changed && !session_changed {
+            return;
+        }
+        let next = Arc::new(DurationBucketLayouts {
+            request: if request_changed {
+                Arc::from(request_bounds)
+            } else {
+                Arc::clone(&current.request)
+            },
+            session: if session_changed {
+                Arc::from(session_bounds)
+            } else {
+                Arc::clone(&current.session)
+            },
+        });
+        self.duration_bucket_layouts.store(Arc::clone(&next));
+
+        if request_changed {
+            let layout = &next.request;
+            for map in [
+                &self.request_duration_buckets,
+                &self.backend_duration_buckets,
+                &self.gateway_overhead_buckets,
+            ] {
+                map.retain(|_, histogram| Arc::ptr_eq(&histogram.boundaries, layout));
+            }
+            self.mesh_request_duration_buckets.retain(|_, histogram| {
+                let keep = Arc::ptr_eq(&histogram.boundaries, layout);
+                if !keep {
+                    self.release_mesh_series(prometheus_helpers::MeshMetricFamily::RequestDuration);
+                }
+                keep
+            });
+        }
+        if session_changed {
+            let layout = &next.session;
+            self.stream_duration_buckets
+                .retain(|_, histogram| Arc::ptr_eq(&histogram.boundaries, layout));
+            self.ws_session_duration_buckets
+                .retain(|_, histogram| Arc::ptr_eq(&histogram.boundaries, layout));
+        }
+        self.render_cache.store(Arc::new(None));
+    }
+
+    /// Live request-scoped duration bucket layout (milliseconds).
+    #[doc(hidden)]
+    pub fn request_duration_buckets_ms_for_test(&self) -> Vec<f64> {
+        self.duration_bucket_layouts.load().request.to_vec()
+    }
+
+    /// Live session-scoped duration bucket layout (milliseconds).
+    #[doc(hidden)]
+    pub fn session_duration_buckets_ms_for_test(&self) -> Vec<f64> {
+        self.duration_bucket_layouts.load().session.to_vec()
+    }
+
+    /// Capture the currently published duration layouts, as a recorder does
+    /// at the start of `record`.
+    #[doc(hidden)]
+    pub fn duration_layout_snapshot_for_test(&self) -> DurationLayoutSnapshotForTest {
+        DurationLayoutSnapshotForTest(self.duration_bucket_layouts.load_full())
+    }
+
+    /// Record an HTTP-family summary as a recorder that captured `snapshot`
+    /// before a later reload (the late-recorder interleaving).
+    #[doc(hidden)]
+    pub fn record_with_layout_snapshot_for_test(
+        &self,
+        summary: &TransactionSummary,
+        snapshot: &DurationLayoutSnapshotForTest,
+    ) {
+        let mesh_key = prometheus_helpers::mesh_request_key(summary);
+        self.record_with_layouts(summary, mesh_key.as_ref(), &snapshot.0);
+    }
+
+    /// Stream-summary counterpart of [`Self::record_with_layout_snapshot_for_test`].
+    #[doc(hidden)]
+    pub fn record_stream_with_layout_snapshot_for_test(
+        &self,
+        summary: &StreamTransactionSummary,
+        snapshot: &DurationLayoutSnapshotForTest,
+    ) {
+        self.record_stream_with_layouts(summary, &snapshot.0);
+    }
+
+    /// WebSocket counterpart of [`Self::record_with_layout_snapshot_for_test`].
+    #[doc(hidden)]
+    pub fn record_ws_session_with_layout_snapshot_for_test(
+        &self,
+        ctx: &WsDisconnectContext,
+        snapshot: &DurationLayoutSnapshotForTest,
+    ) {
+        self.record_ws_session_with_layouts(ctx, &snapshot.0);
+    }
+
+    /// Count one request refused before routing.
+    ///
+    /// Called from the shared route-miss funnel
+    /// (`crate::diagnostic_ref::record_route_miss`) that every HTTP-family
+    /// listener (H1/H2 and H3) passes through, so unmatched-route `404`s and
+    /// mesh `REGISTRY_ONLY` refusals appear on `/metrics` even though they
+    /// never reach a plugin (and so never reach `ferrum_requests_total`).
+    /// `phase` maps to a closed reason set and `status` is gateway-authored, so
+    /// request paths, hosts, and methods never become labels.
+    pub fn record_unmatched_request(&self, phase: &str, status: u16) {
+        let key = UnmatchedRequestKey {
+            reason: unmatched_request_reason(phase),
+            status_code: if (100..=599).contains(&status) {
+                status
+            } else {
+                0
+            },
+        };
+        Self::update_series(
+            &self.unmatched_request_counter,
+            key,
+            || CachePadded::new(AtomicU64::new(0)),
+            |counter| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+        self.maybe_invalidate_cache();
     }
 
     /// Current `,namespace="…"` label fragment, empty until [`Self::configure`]
@@ -1260,36 +1717,52 @@ impl MetricsRegistry {
     }
 
     pub fn record_stream(&self, summary: &StreamTransactionSummary) {
-        let proxy_id: Arc<str> = Arc::from(summary.proxy_id.as_str());
+        let layouts = self.duration_bucket_layouts.load();
+        self.record_stream_with_layouts(summary, &layouts);
+    }
+
+    fn record_stream_with_layouts(
+        &self,
+        summary: &StreamTransactionSummary,
+        layouts: &DurationBucketLayouts,
+    ) {
+        let epoch = self.epoch;
+        let proxy_id = self.observe_proxy_duration(
+            &self.stream_duration_buckets,
+            summary.proxy_id.as_str(),
+            DurationLayoutKind::Session,
+            &layouts.session,
+            summary.duration_ms,
+        );
+        let protocol: Arc<str> = Arc::from(summary.protocol.as_str());
 
         let counter_key = StreamCounterKey {
             proxy_id: Arc::clone(&proxy_id),
-            protocol: Arc::from(summary.protocol.as_str()),
+            protocol: Arc::clone(&protocol),
         };
-        self.stream_connection_counter
-            .entry(counter_key)
-            .or_insert_with(|| TimestampedCounter::new(self.epoch))
-            .increment(self.epoch);
-
-        self.stream_duration_buckets
-            .entry(Arc::clone(&proxy_id))
-            .or_insert_with(|| HistogramBuckets::new(self.epoch))
-            .observe(summary.duration_ms, self.epoch);
+        Self::update_series(
+            &self.stream_connection_counter,
+            counter_key,
+            || TimestampedCounter::new(epoch),
+            |counter| counter.increment(epoch),
+        );
 
         // Always record disconnect cause+direction, even on clean shutdowns,
         // so operators can compare ratios (e.g., graceful vs. error) without
         // having to subtract from the connections-total counter.
         let disconnect_key = StreamDisconnectKey {
             proxy_id,
-            protocol: Arc::from(summary.protocol.as_str()),
+            protocol,
             cause: disconnect_cause_label(summary.disconnect_cause),
             direction: direction_label(summary.disconnect_direction),
             error_class: summary.error_class.as_ref().map(ErrorClass::as_str),
         };
-        self.stream_disconnect_counter
-            .entry(disconnect_key)
-            .or_insert_with(|| TimestampedCounter::new(self.epoch))
-            .increment(self.epoch);
+        Self::update_series(
+            &self.stream_disconnect_counter,
+            disconnect_key,
+            || TimestampedCounter::new(epoch),
+            |counter| counter.increment(epoch),
+        );
 
         self.record_mesh_tcp_closed_and_bytes(summary);
 
@@ -1313,9 +1786,9 @@ impl MetricsRegistry {
     /// reached both the Prometheus and workload-metrics hooks finalize here too
     /// so opened/closed stay balanced. The stamp gates
     /// `record_mesh_tcp_closed_and_bytes`.
-    pub fn finalize_mesh_tcp_opened(
+    pub fn finalize_mesh_tcp_opened<MS: std::hash::BuildHasher>(
         &self,
-        metadata: &mut std::collections::HashMap<String, String>,
+        metadata: &mut std::collections::HashMap<String, String, MS>,
         proxy_id: &str,
         proxy_name: Option<&str>,
     ) {
@@ -1331,9 +1804,9 @@ impl MetricsRegistry {
 
     /// Record TCP_OPENED_CONNECTIONS under the finalized mesh metadata of a
     /// stream. Reached only through `finalize_mesh_tcp_opened`.
-    fn record_mesh_tcp_opened(
+    fn record_mesh_tcp_opened<MS: std::hash::BuildHasher>(
         &self,
-        metadata: &std::collections::HashMap<String, String>,
+        metadata: &std::collections::HashMap<String, String, MS>,
         proxy_id: &str,
         proxy_name: Option<&str>,
     ) {
@@ -1351,18 +1824,18 @@ impl MetricsRegistry {
         ) {
             return;
         }
-        let key = prometheus_helpers::mesh_request_key_for_family_from_metadata(
+        let key = prometheus_helpers::mesh_request_key_for_family_from_metadata_cow(
             metadata,
             &base,
             prometheus_helpers::MeshMetricFamily::TcpOpenedConnections,
         );
-        let epoch = self.epoch;
+        let now_nanos = self.epoch.elapsed().as_nanos() as u64;
         self.update_mesh_series(
             prometheus_helpers::MeshMetricFamily::TcpOpenedConnections,
             &self.mesh_tcp_opened_counter,
             key,
-            || TimestampedCounter::new(epoch),
-            |counter| counter.increment(epoch),
+            || TimestampedCounter::new(self.epoch),
+            |counter| counter.increment_at(now_nanos),
         );
         self.maybe_invalidate_cache();
     }
@@ -1384,34 +1857,33 @@ impl MetricsRegistry {
         if !prometheus_helpers::is_mesh_tcp_protocol(base.request_protocol.as_ref()) {
             return;
         }
+        let now_nanos = self.epoch.elapsed().as_nanos() as u64;
         if !prometheus_helpers::mesh_metric_disabled_metadata(
             &summary.metadata,
             prometheus_helpers::MeshMetricFamily::TcpClosedConnections,
         ) {
-            let key = prometheus_helpers::mesh_request_key_for_family_from_metadata(
+            let key = prometheus_helpers::mesh_request_key_for_family_from_metadata_cow(
                 &summary.metadata,
                 &base,
                 prometheus_helpers::MeshMetricFamily::TcpClosedConnections,
             );
-            let epoch = self.epoch;
             self.update_mesh_series(
                 prometheus_helpers::MeshMetricFamily::TcpClosedConnections,
                 &self.mesh_tcp_closed_counter,
                 key,
-                || TimestampedCounter::new(epoch),
-                |counter| counter.increment(epoch),
+                || TimestampedCounter::new(self.epoch),
+                |counter| counter.increment_at(now_nanos),
             );
         }
         if !prometheus_helpers::mesh_metric_disabled_metadata(
             &summary.metadata,
             prometheus_helpers::MeshMetricFamily::TcpSentBytes,
         ) {
-            let key = prometheus_helpers::mesh_request_key_for_family_from_metadata(
+            let key = prometheus_helpers::mesh_request_key_for_family_from_metadata_cow(
                 &summary.metadata,
                 &base,
                 prometheus_helpers::MeshMetricFamily::TcpSentBytes,
             );
-            let epoch = self.epoch;
             // Istio Telemetry defines TCP_SENT_BYTES as response bytes.
             // StreamTransactionSummary uses Ferrum's gateway-perspective
             // names, where bytes_received is backend->client.
@@ -1420,20 +1892,19 @@ impl MetricsRegistry {
                 prometheus_helpers::MeshMetricFamily::TcpSentBytes,
                 &self.mesh_tcp_sent_bytes_counter,
                 key,
-                || TimestampedCounter::new(epoch),
-                |counter| counter.add(bytes, epoch),
+                || TimestampedCounter::new(self.epoch),
+                |counter| counter.add_at(bytes, now_nanos),
             );
         }
         if !prometheus_helpers::mesh_metric_disabled_metadata(
             &summary.metadata,
             prometheus_helpers::MeshMetricFamily::TcpReceivedBytes,
         ) {
-            let key = prometheus_helpers::mesh_request_key_for_family_from_metadata(
+            let key = prometheus_helpers::mesh_request_key_for_family_from_metadata_cow(
                 &summary.metadata,
                 &base,
                 prometheus_helpers::MeshMetricFamily::TcpReceivedBytes,
             );
-            let epoch = self.epoch;
             // Istio Telemetry defines TCP_RECEIVED_BYTES as request bytes.
             // StreamTransactionSummary.bytes_sent is client->backend.
             let bytes = summary.bytes_sent;
@@ -1441,13 +1912,22 @@ impl MetricsRegistry {
                 prometheus_helpers::MeshMetricFamily::TcpReceivedBytes,
                 &self.mesh_tcp_received_bytes_counter,
                 key,
-                || TimestampedCounter::new(epoch),
-                |counter| counter.add(bytes, epoch),
+                || TimestampedCounter::new(self.epoch),
+                |counter| counter.add_at(bytes, now_nanos),
             );
         }
     }
 
     pub fn record_ws_session(&self, ctx: &WsDisconnectContext) {
+        let layouts = self.duration_bucket_layouts.load();
+        self.record_ws_session_with_layouts(ctx, &layouts);
+    }
+
+    fn record_ws_session_with_layouts(
+        &self,
+        ctx: &WsDisconnectContext,
+        layouts: &DurationBucketLayouts,
+    ) {
         let proxy_id: Arc<str> = Arc::from(ctx.proxy_id.as_str());
         let session_key = WsSessionKey {
             proxy_id: Arc::clone(&proxy_id),
@@ -1465,14 +1945,21 @@ impl MetricsRegistry {
                 .unwrap_or("none"),
             termination_reason: websocket_termination_reason_label(ctx),
         };
-        self.ws_session_counter
-            .entry(session_key.clone())
-            .or_insert_with(|| TimestampedCounter::new(self.epoch))
-            .increment(self.epoch);
-        self.ws_session_duration_buckets
-            .entry(session_key)
-            .or_insert_with(|| HistogramBuckets::new(self.epoch))
-            .observe(ctx.duration_ms.max(0.0), self.epoch);
+        let epoch = self.epoch;
+        self.observe_duration(
+            &self.ws_session_duration_buckets,
+            &session_key,
+            || session_key.clone(),
+            DurationLayoutKind::Session,
+            &layouts.session,
+            ctx.duration_ms.max(0.0),
+        );
+        Self::update_series(
+            &self.ws_session_counter,
+            session_key,
+            || TimestampedCounter::new(epoch),
+            |counter| counter.increment(epoch),
+        );
 
         for (direction, bytes, frames) in [
             (
@@ -1490,14 +1977,18 @@ impl MetricsRegistry {
                 proxy_id: Arc::clone(&proxy_id),
                 direction,
             };
-            self.ws_bytes_counter
-                .entry(key.clone())
-                .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                .add(bytes, self.epoch);
-            self.ws_frames_counter
-                .entry(key)
-                .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                .add(frames, self.epoch);
+            Self::update_series(
+                &self.ws_bytes_counter,
+                key.clone(),
+                || TimestampedCounter::new(epoch),
+                |counter| counter.add(bytes, epoch),
+            );
+            Self::update_series(
+                &self.ws_frames_counter,
+                key,
+                || TimestampedCounter::new(epoch),
+                |counter| counter.add(frames, epoch),
+            );
         }
 
         self.maybe_invalidate_cache();
@@ -1508,6 +1999,35 @@ impl MetricsRegistry {
     pub fn record_rate_limit_exceeded(&self) {
         self.rate_limit_exceeded.fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
+    }
+
+    /// Record one TCP connection refused by `tcp_connection_throttle` on
+    /// `proxy_id`. The key is allocated only for a proxy's first refusal.
+    pub fn record_tcp_connection_throttle_rejection(&self, proxy_id: &str) {
+        let recorded = match self.tcp_connection_throttle_rejections.get(proxy_id) {
+            Some(existing) => {
+                existing.increment(self.epoch);
+                true
+            }
+            None => false,
+        };
+        // The shared read guard above is released before the insert below
+        // takes the shard write lock.
+        if !recorded {
+            self.tcp_connection_throttle_rejections
+                .entry(Arc::from(proxy_id))
+                .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                .increment(self.epoch);
+        }
+        self.maybe_invalidate_cache();
+    }
+
+    /// Current `tcp_connection_throttle` refusal count for `proxy_id` (0 when
+    /// none was recorded or the series was evicted as stale).
+    pub fn tcp_connection_throttle_rejections_for_proxy(&self, proxy_id: &str) -> u64 {
+        self.tcp_connection_throttle_rejections
+            .get(proxy_id)
+            .map_or(0, |counter| counter.value.load(Ordering::Relaxed))
     }
 
     /// Record one rate-limit decision taken on the per-process fallback budget
@@ -1522,8 +2042,9 @@ impl MetricsRegistry {
         self.maybe_invalidate_cache();
     }
 
-    /// Record one request refused because centralized rate-limit enforcement
-    /// was unavailable under `redis_failure_policy: fail_closed`.
+    /// Record one request refused (or WebSocket session closed) because
+    /// centralized rate-limit enforcement was unavailable under
+    /// `redis_failure_policy: fail_closed`.
     pub fn record_rate_limit_enforcement_unavailable(&self) {
         self.rate_limit_unavailable_denials
             .fetch_add(1, Ordering::Relaxed);
@@ -1588,6 +2109,68 @@ impl MetricsRegistry {
         self.maybe_invalidate_cache();
     }
 
+    /// Record one `response_caching` lookup outcome by its `X-Cache-Status`
+    /// value (`HIT`, `MISS`, `BYPASS`, `REVALIDATED`, `PREDICTED-BYPASS`).
+    /// Any other value is ignored, so the exported label set stays fixed.
+    pub fn record_response_cache_lookup(&self, status: &str) {
+        let Some(index) = response_cache_lookup_status_index(status) else {
+            return;
+        };
+        self.response_cache_lookups[index].fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Record one WebSocket session closed by a `ws_message_size_limiting`
+    /// ceiling, by the direction of the rejected input.
+    pub fn record_ws_message_size_limit_rejection(
+        &self,
+        direction: super::WebSocketFrameDirection,
+    ) {
+        self.ws_message_size_limit_rejections[ws_message_size_limit_direction_index(direction)]
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Current `ferrum_ws_message_size_limit_rejected_total` value for one
+    /// direction (test-crate reader).
+    pub fn ws_message_size_limit_rejections_total(
+        &self,
+        direction: super::WebSocketFrameDirection,
+    ) -> u64 {
+        self.ws_message_size_limit_rejections[ws_message_size_limit_direction_index(direction)]
+            .load(Ordering::Relaxed)
+    }
+
+    /// Record one `adaptive_concurrency` decision for `proxy_id`. Allocates the
+    /// series key only the first time a proxy reports that decision.
+    pub fn record_adaptive_concurrency_decision(
+        &self,
+        proxy_id: &str,
+        decision: AdaptiveConcurrencyDecision,
+    ) {
+        let counters = &self.adaptive_concurrency_decisions[decision.index()];
+        if let Some(existing) = counters.get(proxy_id) {
+            existing.increment(self.epoch);
+        } else {
+            counters
+                .entry(Arc::from(proxy_id))
+                .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                .increment(self.epoch);
+        }
+        self.maybe_invalidate_cache();
+    }
+
+    /// Current `adaptive_concurrency` decision count for one proxy.
+    pub fn adaptive_concurrency_decision_total(
+        &self,
+        proxy_id: &str,
+        decision: AdaptiveConcurrencyDecision,
+    ) -> u64 {
+        self.adaptive_concurrency_decisions[decision.index()]
+            .get(proxy_id)
+            .map_or(0, |counter| counter.value.load(Ordering::Relaxed))
+    }
+
     /// Record one admin configuration mutation refused by read-only mode.
     /// Returns the counter value before this increment.
     pub fn record_admin_read_only_rejection(&self) -> u64 {
@@ -1598,8 +2181,6 @@ impl MetricsRegistry {
         previous
     }
 
-    // Test-crate-only; dead code in the BIN target (see `src/admin/mod.rs`).
-    #[allow(dead_code)]
     #[doc(hidden)]
     pub fn reset_admin_read_only_rejection_metrics_for_test(&self) {
         self.admin_read_only_rejected_mutations
@@ -1607,8 +2188,30 @@ impl MetricsRegistry {
         self.maybe_invalidate_cache();
     }
 
-    // Test-crate-only; dead code in the BIN target.
-    #[allow(dead_code)]
+    /// One mTLS DNS admission fence became retained (issue #7031). State
+    /// transitions are rare, so the cached body is invalidated immediately.
+    pub fn record_mtls_dns_admission_fence_retained(&self) {
+        self.mtls_dns_admission_fences_retained
+            .fetch_add(1, Ordering::Relaxed);
+        self.render_cache.store(Arc::new(None));
+    }
+
+    /// One retained mTLS DNS admission fence was cleared (saturating).
+    pub fn record_mtls_dns_admission_fence_cleared(&self) {
+        let _ = self.mtls_dns_admission_fences_retained.try_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
+        self.render_cache.store(Arc::new(None));
+    }
+
+    /// Current retained mTLS DNS admission fence count.
+    pub fn mtls_dns_admission_fences_retained(&self) -> u64 {
+        self.mtls_dns_admission_fences_retained
+            .load(Ordering::Relaxed)
+    }
+
     pub fn admin_read_only_rejected_mutations_total(&self) -> u64 {
         self.admin_read_only_rejected_mutations
             .load(Ordering::Relaxed)
@@ -1792,93 +2395,55 @@ impl MetricsRegistry {
         self.maybe_invalidate_cache();
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_task_panics_total(&self) -> u64 {
         self.service_discovery_task_panics.load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_task_restarts_total(&self) -> u64 {
         self.service_discovery_task_restarts.load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_stale_expiries_total(&self) -> u64 {
         self.service_discovery_stale_expiries
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_stale_withdrawals_total(&self) -> u64 {
         self.service_discovery_stale_withdrawals
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_stale_recoveries_total(&self) -> u64 {
         self.service_discovery_stale_recoveries
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
-    pub fn service_discovery_tasks_kept_total(&self) -> u64 {
-        self.service_discovery_tasks_kept.load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
-    pub fn service_discovery_tasks_started_total(&self) -> u64 {
-        self.service_discovery_tasks_started.load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
-    pub fn service_discovery_tasks_replaced_total(&self) -> u64 {
-        self.service_discovery_tasks_replaced
-            .load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
-    pub fn service_discovery_tasks_stopped_total(&self) -> u64 {
-        self.service_discovery_tasks_stopped.load(Ordering::Relaxed)
-    }
-
     // Test-crate observation seams for issue #3719 / #3718 / #3720 counters.
-    #[allow(dead_code)]
     pub fn service_discovery_provider_normalization_rejected_total(&self) -> u64 {
         self.service_discovery_provider_normalization_rejected
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_shared_admission_rejected_total(&self) -> u64 {
         self.service_discovery_shared_admission_rejected
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_cursor_rollback_total(&self) -> u64 {
         self.service_discovery_cursor_rollback
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_cursor_advance_total(&self) -> u64 {
         self.service_discovery_cursor_advance
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_response_oversized_total(&self) -> u64 {
         self.service_discovery_response_oversized
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
-    pub fn service_discovery_body_budget_rejected_total(&self) -> u64 {
-        self.service_discovery_body_budget_rejected
-            .load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
     pub fn service_discovery_malformed_envelope_total(&self) -> u64 {
         self.service_discovery_malformed_envelope
             .load(Ordering::Relaxed)
@@ -1910,6 +2475,51 @@ impl MetricsRegistry {
             |current| Some(current.saturating_sub(1)),
         );
         self.maybe_invalidate_cache();
+    }
+
+    /// Per-provider companion of [`Self::record_ai_federation_circuit_opened`].
+    /// `provider` is the operator-configured provider name (bounded charset and
+    /// length, at most 128 per instance), never a model or request value.
+    pub fn record_ai_federation_provider_circuit_opened(&self, provider: &str) {
+        let key: Arc<str> = Arc::from(provider);
+        *self
+            .ai_federation_provider_circuits_open
+            .entry(Arc::clone(&key))
+            .or_insert(0) += 1;
+        self.ai_federation_provider_circuits_opened
+            .entry(key)
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Per-provider companion of [`Self::record_ai_federation_circuit_closed`].
+    pub fn record_ai_federation_provider_circuit_closed(&self, provider: &str) {
+        self.decrement_ai_federation_provider_open(provider);
+        self.ai_federation_provider_circuits_closed
+            .entry(Arc::from(provider))
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Per-provider companion of [`Self::release_ai_federation_open_circuit`]
+    /// (an open circuit dropped on reload).
+    pub fn release_ai_federation_provider_open_circuit(&self, provider: &str) {
+        self.decrement_ai_federation_provider_open(provider);
+        self.maybe_invalidate_cache();
+    }
+
+    fn decrement_ai_federation_provider_open(&self, provider: &str) {
+        if let dashmap::mapref::entry::Entry::Occupied(mut entry) = self
+            .ai_federation_provider_circuits_open
+            .entry(Arc::from(provider))
+        {
+            *entry.get_mut() -= 1;
+            if *entry.get() <= 0 {
+                entry.remove();
+            }
+        }
     }
 
     pub fn record_ai_federation_half_open_probe(&self) {
@@ -1981,10 +2591,13 @@ impl MetricsRegistry {
             protocol: protocol.as_str(),
             event: event.as_str(),
         };
-        self.hbone_inner_pool_event_counter
-            .entry(key)
-            .or_insert_with(|| TimestampedCounter::new(self.epoch))
-            .increment(self.epoch);
+        let epoch = self.epoch;
+        Self::update_series(
+            &self.hbone_inner_pool_event_counter,
+            key,
+            || TimestampedCounter::new(epoch),
+            |counter| counter.increment(epoch),
+        );
 
         self.maybe_invalidate_cache();
     }
@@ -1998,10 +2611,13 @@ impl MetricsRegistry {
             transport,
             result: if success { "success" } else { "failure" },
         };
-        self.mesh_tcp_egress_connection_counter
-            .entry(key)
-            .or_insert_with(|| TimestampedCounter::new(self.epoch))
-            .increment(self.epoch);
+        let epoch = self.epoch;
+        Self::update_series(
+            &self.mesh_tcp_egress_connection_counter,
+            key,
+            || TimestampedCounter::new(epoch),
+            |counter| counter.increment(epoch),
+        );
 
         self.maybe_invalidate_cache();
     }
@@ -2252,7 +2868,6 @@ impl MetricsRegistry {
 
     /// Fixed-cardinality test/operator seam for the current logical record
     /// count gauge of one persistent TLS store.
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn current_tls_store_record_count(
         &self,
         kind: crate::tls::shared_store::TlsPersistentStoreKind,
@@ -2364,13 +2979,45 @@ impl MetricsRegistry {
         mesh_key: Option<&MeshRequestKey>,
     ) {
         // Mirror/shadow summaries represent internal backend probes rather
-        // than client-facing proxy results. They must not affect normal
-        // request counters/histograms exposed on unauthenticated /metrics.
+        // than client-facing proxy results. They must not affect the normal
+        // request counters/histograms exposed on the gated `/metrics` scrape.
         if summary.mirror {
             return;
         }
+        let layouts = self.duration_bucket_layouts.load();
+        self.record_with_layouts(summary, mesh_key, &layouts);
+    }
 
-        let proxy_id: Arc<str> = Arc::from(summary.proxy_id.as_deref().unwrap_or("unknown"));
+    /// `record_with_mesh_key` against an explicit duration-layout snapshot.
+    /// `layouts` only seeds the shared-guard fast paths; inserts re-read the
+    /// published layout (see `configure_duration_buckets`).
+    fn record_with_layouts(
+        &self,
+        summary: &TransactionSummary,
+        mesh_key: Option<&MeshRequestKey>,
+        layouts: &DurationBucketLayouts,
+    ) {
+        if summary.mirror {
+            return;
+        }
+        let epoch = self.epoch;
+        // Sample the monotonic clock ONCE for every counter/histogram series
+        // touched by this transaction instead of calling `Instant::now()` 6–12
+        // times per request.
+        let now_nanos = epoch.elapsed().as_nanos() as u64;
+        let proxy_key: &str = summary.proxy_id.as_deref().unwrap_or("unknown");
+
+        // The request-duration histogram is recorded for every transaction, so
+        // its map key is the shared `proxy_id` for every other per-proxy family
+        // below (no per-transaction `Arc<str>` allocation once established).
+        let proxy_id = self.observe_proxy_duration_at(
+            &self.request_duration_buckets,
+            proxy_key,
+            DurationLayoutKind::Request,
+            &layouts.request,
+            summary.latency_total_ms,
+            now_nanos,
+        );
 
         // Increment request counter (composite key — no format!() allocation)
         let counter_key = CounterKey {
@@ -2380,34 +3027,59 @@ impl MetricsRegistry {
             grpc_status: grpc_status_label(&summary.metadata),
             error_class: summary.metrics_error_class_label(),
         };
-        self.request_counter
-            .entry(counter_key)
-            .or_insert_with(|| TimestampedCounter::new(self.epoch))
-            .increment(self.epoch);
-
-        self.request_duration_buckets
-            .entry(Arc::clone(&proxy_id))
-            .or_insert_with(|| HistogramBuckets::new(self.epoch))
-            .observe(summary.latency_total_ms, self.epoch);
+        Self::update_series(
+            &self.request_counter,
+            counter_key,
+            || TimestampedCounter::new(self.epoch),
+            |counter| counter.increment_at(now_nanos),
+        );
 
         // Guard against sentinel value (-1.0) used for streaming responses
         // where total backend latency is unknown at log time.
         if summary.latency_backend_total_ms >= 0.0 {
-            self.backend_duration_buckets
-                .entry(Arc::clone(&proxy_id))
-                .or_insert_with(|| HistogramBuckets::new(self.epoch))
-                .observe(summary.latency_backend_total_ms, self.epoch);
+            self.observe_duration_at(
+                &self.backend_duration_buckets,
+                proxy_key,
+                || Arc::clone(&proxy_id),
+                DurationLayoutKind::Request,
+                &layouts.request,
+                summary.latency_backend_total_ms,
+                now_nanos,
+            );
         }
 
         // Same sentinel guard for gateway overhead: streamed responses with an
         // unknown backend total emit LATENCY_UNKNOWN_MS rather than inventing
         // overhead from TTFB (issue #2532).
         if summary.latency_gateway_overhead_ms >= 0.0 {
-            self.gateway_overhead_buckets
-                .entry(Arc::clone(&proxy_id))
-                .or_insert_with(|| HistogramBuckets::new(self.epoch))
-                .observe(summary.latency_gateway_overhead_ms, self.epoch);
+            self.observe_duration_at(
+                &self.gateway_overhead_buckets,
+                proxy_key,
+                || Arc::clone(&proxy_id),
+                DurationLayoutKind::Request,
+                &layouts.request,
+                summary.latency_gateway_overhead_ms,
+                now_nanos,
+            );
         }
+
+        // Per-proxy HTTP-family body bandwidth. Recorded for mesh and non-mesh
+        // traffic alike; the mesh size histograms below are a separate,
+        // identity-labelled view of the same bytes.
+        self.add_proxy_counter_at(
+            &self.request_body_bytes_counter,
+            proxy_key,
+            &proxy_id,
+            summary.bytes_sent,
+            now_nanos,
+        );
+        self.add_proxy_counter_at(
+            &self.response_body_bytes_counter,
+            proxy_key,
+            &proxy_id,
+            summary.bytes_received,
+            now_nanos,
+        );
 
         if let Some(usage) = summary.ai_usage_export.as_ref()
             && let Some(provider) = ai_provider_label(usage.provider)
@@ -2417,28 +3089,36 @@ impl MetricsRegistry {
                 provider,
             };
             if let Some(value) = usage.prompt_tokens {
-                self.ai_prompt_tokens_counter
-                    .entry(key.clone())
-                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                    .saturating_add(value, self.epoch);
+                Self::update_series(
+                    &self.ai_prompt_tokens_counter,
+                    key.clone(),
+                    || TimestampedCounter::new(epoch),
+                    |counter| counter.saturating_add(value, epoch),
+                );
             }
             if let Some(value) = usage.completion_tokens {
-                self.ai_completion_tokens_counter
-                    .entry(key.clone())
-                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                    .saturating_add(value, self.epoch);
+                Self::update_series(
+                    &self.ai_completion_tokens_counter,
+                    key.clone(),
+                    || TimestampedCounter::new(epoch),
+                    |counter| counter.saturating_add(value, epoch),
+                );
             }
             if let Some(value) = usage.total_tokens {
-                self.ai_total_tokens_counter
-                    .entry(key.clone())
-                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                    .saturating_add(value, self.epoch);
+                Self::update_series(
+                    &self.ai_total_tokens_counter,
+                    key.clone(),
+                    || TimestampedCounter::new(epoch),
+                    |counter| counter.saturating_add(value, epoch),
+                );
             }
             if let Some(value) = usage.cost.as_ref() {
-                self.ai_estimated_cost_counter
-                    .entry(key)
-                    .or_insert_with(|| TimestampedCostCounter::new(self.epoch))
-                    .add(value, self.epoch);
+                Self::update_series(
+                    &self.ai_estimated_cost_counter,
+                    key,
+                    || TimestampedCostCounter::new(epoch),
+                    |counter| counter.add(value, epoch),
+                );
             }
         }
 
@@ -2447,56 +3127,53 @@ impl MetricsRegistry {
                 summary,
                 prometheus_helpers::MeshMetricFamily::RequestCount,
             ) {
-                let count_key = prometheus_helpers::mesh_request_key_for_family(
+                let count_key = prometheus_helpers::mesh_request_key_for_family_cow(
                     summary,
                     mesh_key,
                     prometheus_helpers::MeshMetricFamily::RequestCount,
                 );
-                let epoch = self.epoch;
                 self.update_mesh_series(
                     prometheus_helpers::MeshMetricFamily::RequestCount,
                     &self.mesh_request_counter,
                     count_key,
-                    || TimestampedCounter::new(epoch),
-                    |counter| counter.increment(epoch),
+                    || TimestampedCounter::new(self.epoch),
+                    |counter| counter.increment_at(now_nanos),
                 );
             }
             if !prometheus_helpers::mesh_metric_disabled(
                 summary,
                 prometheus_helpers::MeshMetricFamily::RequestDuration,
             ) {
-                let duration_key = prometheus_helpers::mesh_request_key_for_family(
+                let duration_key = prometheus_helpers::mesh_request_key_for_family_cow(
                     summary,
                     mesh_key,
                     prometheus_helpers::MeshMetricFamily::RequestDuration,
                 );
-                let epoch = self.epoch;
-                let latency = summary.latency_total_ms;
-                self.update_mesh_series(
+                self.observe_mesh_duration_series_at(
                     prometheus_helpers::MeshMetricFamily::RequestDuration,
                     &self.mesh_request_duration_buckets,
                     duration_key,
-                    || HistogramBuckets::new(epoch),
-                    |buckets| buckets.observe(latency, epoch),
+                    &layouts.request,
+                    summary.latency_total_ms,
+                    now_nanos,
                 );
             }
             if !prometheus_helpers::mesh_metric_disabled(
                 summary,
                 prometheus_helpers::MeshMetricFamily::RequestSize,
             ) {
-                let size_key = prometheus_helpers::mesh_request_key_for_family(
+                let size_key = prometheus_helpers::mesh_request_key_for_family_cow(
                     summary,
                     mesh_key,
                     prometheus_helpers::MeshMetricFamily::RequestSize,
                 );
-                let epoch = self.epoch;
                 let bytes = summary.bytes_sent as f64;
                 self.update_mesh_series(
                     prometheus_helpers::MeshMetricFamily::RequestSize,
                     &self.mesh_request_bytes_buckets,
                     size_key,
-                    || HistogramBuckets::new_bytes(epoch),
-                    |buckets| buckets.observe(bytes, epoch),
+                    || HistogramBuckets::new_bytes(self.epoch),
+                    |buckets| buckets.observe_at(bytes, now_nanos),
                 );
             }
             if !prometheus_helpers::mesh_metric_disabled(
@@ -2506,19 +3183,18 @@ impl MetricsRegistry {
                 // Record observed response bytes even when the body did not
                 // complete; deferred logging already finalizes the transferred
                 // count. Incomplete streams still contribute authoritative size.
-                let size_key = prometheus_helpers::mesh_request_key_for_family(
+                let size_key = prometheus_helpers::mesh_request_key_for_family_cow(
                     summary,
                     mesh_key,
                     prometheus_helpers::MeshMetricFamily::ResponseSize,
                 );
-                let epoch = self.epoch;
                 let bytes = summary.bytes_received as f64;
                 self.update_mesh_series(
                     prometheus_helpers::MeshMetricFamily::ResponseSize,
                     &self.mesh_response_bytes_buckets,
                     size_key,
-                    || HistogramBuckets::new_bytes(epoch),
-                    |buckets| buckets.observe(bytes, epoch),
+                    || HistogramBuckets::new_bytes(self.epoch),
+                    |buckets| buckets.observe_at(bytes, now_nanos),
                 );
             }
             if prometheus_helpers::is_mesh_grpc_protocol(mesh_key.request_protocol.as_ref()) {
@@ -2528,19 +3204,18 @@ impl MetricsRegistry {
                         prometheus_helpers::MeshMetricFamily::GrpcRequestMessages,
                     )
                 {
-                    let key = prometheus_helpers::mesh_request_key_for_family(
+                    let key = prometheus_helpers::mesh_request_key_for_family_cow(
                         summary,
                         mesh_key,
                         prometheus_helpers::MeshMetricFamily::GrpcRequestMessages,
                     );
-                    let epoch = self.epoch;
                     let messages = summary.grpc_request_messages;
                     self.update_mesh_series(
                         prometheus_helpers::MeshMetricFamily::GrpcRequestMessages,
                         &self.mesh_grpc_request_messages_counter,
                         key,
-                        || TimestampedCounter::new(epoch),
-                        |counter| counter.add(messages, epoch),
+                        || TimestampedCounter::new(self.epoch),
+                        |counter| counter.add_at(messages, now_nanos),
                     );
                 }
                 if summary.grpc_response_messages > 0
@@ -2549,19 +3224,18 @@ impl MetricsRegistry {
                         prometheus_helpers::MeshMetricFamily::GrpcResponseMessages,
                     )
                 {
-                    let key = prometheus_helpers::mesh_request_key_for_family(
+                    let key = prometheus_helpers::mesh_request_key_for_family_cow(
                         summary,
                         mesh_key,
                         prometheus_helpers::MeshMetricFamily::GrpcResponseMessages,
                     );
-                    let epoch = self.epoch;
                     let messages = summary.grpc_response_messages;
                     self.update_mesh_series(
                         prometheus_helpers::MeshMetricFamily::GrpcResponseMessages,
                         &self.mesh_grpc_response_messages_counter,
                         key,
-                        || TimestampedCounter::new(epoch),
-                        |counter| counter.add(messages, epoch),
+                        || TimestampedCounter::new(self.epoch),
+                        |counter| counter.add_at(messages, now_nanos),
                     );
                 }
             }
@@ -2574,10 +3248,12 @@ impl MetricsRegistry {
         // abort signal rather than a generic body-failure counter.
         if summary.client_disconnected {
             let key = ClientDisconnectKey { proxy_id };
-            self.client_disconnect_counter
-                .entry(key)
-                .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                .increment(self.epoch);
+            Self::update_series(
+                &self.client_disconnect_counter,
+                key,
+                || TimestampedCounter::new(self.epoch),
+                |counter| counter.increment_at(now_nanos),
+            );
         }
 
         self.maybe_invalidate_cache();
@@ -2586,7 +3262,6 @@ impl MetricsRegistry {
     /// Lower the per-family mesh series budget for focused cardinality tests.
     /// Clamps into the same nonzero bounded range as production config.
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn set_mesh_series_budget_per_family_for_test(&self, budget: usize) {
         self.mesh_series_budget_per_family.store(
             budget.clamp(
@@ -2599,28 +3274,24 @@ impl MetricsRegistry {
 
     /// Current per-family mesh series budget (exact admission ceiling).
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn mesh_series_budget_per_family_for_test(&self) -> usize {
         self.mesh_series_budget_per_family.load(Ordering::Acquire)
     }
 
     /// Live render-cache TTL in seconds (process-wide tunable).
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn render_cache_ttl_secs_for_test(&self) -> u64 {
         self.render_cache_ttl_secs.load(Ordering::Relaxed)
     }
 
     /// Live stale-entry TTL in seconds (process-wide tunable).
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn stale_entry_ttl_secs_for_test(&self) -> u64 {
         self.stale_entry_ttl_nanos.load(Ordering::Relaxed) / 1_000_000_000
     }
 
     /// Live cache-invalidation minimum age in milliseconds.
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn cache_invalidation_min_age_ms_for_test(&self) -> u64 {
         self.cache_invalidation_min_age_nanos
             .load(Ordering::Relaxed)
@@ -2629,7 +3300,6 @@ impl MetricsRegistry {
 
     /// Live admitted series for one mesh family (exact reservation count).
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn mesh_series_live_for_test(&self, family: &str) -> Option<usize> {
         prometheus_helpers::MeshMetricFamily::from_config_name(family).map(|family| {
             self.mesh_series_budgets[family.index()]
@@ -2640,7 +3310,6 @@ impl MetricsRegistry {
 
     /// Overflow drops for one mesh family.
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn mesh_series_overflow_for_test(&self, family: &str) -> Option<u64> {
         prometheus_helpers::MeshMetricFamily::from_config_name(family).map(|family| {
             self.mesh_series_budgets[family.index()]
@@ -2685,12 +3354,20 @@ impl MetricsRegistry {
         &self,
         family: prometheus_helpers::MeshMetricFamily,
         map: &DashMap<MeshRequestKey, V>,
-        key: MeshRequestKey,
+        key: std::borrow::Cow<'_, MeshRequestKey>,
         create: impl FnOnce() -> V,
         update: impl FnOnce(&V) -> R,
     ) -> Option<R> {
         use dashmap::mapref::entry::Entry;
-        match map.entry(key) {
+        // Established series update under a shared read guard so concurrent
+        // recorders of one hot series do not serialize on the shard write
+        // lock. Borrowing `&MeshRequestKey` avoids cloning its 14 `Arc<str>`
+        // labels on every warm hit. Only a miss takes the exclusive `entry()`
+        // path, which re-checks occupancy before reserving budget.
+        if let Some(existing) = map.get(key.as_ref()) {
+            return Some(update(existing.value()));
+        }
+        match map.entry(key.into_owned()) {
             Entry::Occupied(entry) => Some(update(entry.get())),
             Entry::Vacant(entry) => {
                 if !self.try_reserve_mesh_series(family) {
@@ -2703,6 +3380,227 @@ impl MetricsRegistry {
                 Some(result)
             }
         }
+    }
+
+    /// The duration layout published right now (not a recorder's capture).
+    ///
+    /// Read under an entry's shard write lock by every insert/replace path, so
+    /// a recorder that captured a since-retired layout can never write it back.
+    fn current_duration_layout(&self, kind: DurationLayoutKind) -> Arc<[f64]> {
+        Arc::clone(self.duration_bucket_layouts.load().layout(kind))
+    }
+
+    /// Mesh duration-histogram variant of [`Self::update_mesh_series`] that
+    /// also enforces the published request bucket layout.
+    ///
+    /// `captured` (the recorder's snapshot) only qualifies the shared-guard
+    /// fast path. Under the entry write lock the CURRENT layout decides: a
+    /// retained key whose histogram predates it is reset in place (keeping its
+    /// reserved budget slot), and a current-layout histogram is never replaced
+    /// by a stale capture.
+    fn observe_mesh_duration_series_at(
+        &self,
+        family: prometheus_helpers::MeshMetricFamily,
+        map: &DashMap<MeshRequestKey, HistogramBuckets>,
+        key: std::borrow::Cow<'_, MeshRequestKey>,
+        captured: &Arc<[f64]>,
+        value: f64,
+        now_nanos: u64,
+    ) {
+        use dashmap::mapref::entry::Entry;
+        if let Some(existing) = map.get(key.as_ref())
+            && Arc::ptr_eq(&existing.boundaries, captured)
+        {
+            existing.observe_at(value, now_nanos);
+            return;
+        }
+        match map.entry(key.into_owned()) {
+            Entry::Occupied(mut entry) => {
+                let current = self.current_duration_layout(DurationLayoutKind::Request);
+                if !Arc::ptr_eq(&entry.get().boundaries, &current) {
+                    let _superseded =
+                        entry.insert(HistogramBuckets::with_layout(current, self.epoch));
+                }
+                entry.get().observe_at(value, now_nanos);
+            }
+            Entry::Vacant(entry) => {
+                if !self.try_reserve_mesh_series(family) {
+                    self.record_mesh_series_overflow(family);
+                    return;
+                }
+                let current = self.current_duration_layout(DurationLayoutKind::Request);
+                let histogram = HistogramBuckets::with_layout(current, self.epoch);
+                histogram.observe_at(value, now_nanos);
+                entry.insert(histogram);
+            }
+        }
+    }
+
+    /// Update one non-mesh series: shared read guard for an established key,
+    /// exclusive `entry()` only to insert a missing one.
+    ///
+    /// The read guard is held across `update`, so stale eviction (`retain`
+    /// takes the shard write lock) cannot remove the entry mid-update, while
+    /// concurrent recorders of the same series proceed in parallel on the
+    /// value's atomics.
+    fn update_series<K, V, R>(
+        map: &DashMap<K, V>,
+        key: K,
+        create: impl FnOnce() -> V,
+        update: impl FnOnce(&V) -> R,
+    ) -> R
+    where
+        K: Eq + std::hash::Hash,
+    {
+        if let Some(existing) = map.get(&key) {
+            return update(existing.value());
+        }
+        let entry = map.entry(key).or_insert_with(create);
+        update(entry.value())
+    }
+
+    /// Observe `value` on a duration histogram keyed by `lookup`.
+    ///
+    /// `captured` (the recorder's layout snapshot) only qualifies the
+    /// shared-read-guard fast path. Every insert or replacement happens under
+    /// the entry's shard write lock against the CURRENTLY published `kind`
+    /// layout: a series carrying a superseded layout is reset to the current
+    /// one, and a recorder whose capture predates a reload can neither
+    /// resurrect the retired layout nor replace a current-layout series.
+    fn observe_duration<K, Q>(
+        &self,
+        map: &DashMap<K, HistogramBuckets>,
+        lookup: &Q,
+        owned_key: impl FnOnce() -> K,
+        kind: DurationLayoutKind,
+        captured: &Arc<[f64]>,
+        value: f64,
+    ) where
+        K: Eq + std::hash::Hash + std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        self.observe_duration_at(
+            map,
+            lookup,
+            owned_key,
+            kind,
+            captured,
+            value,
+            self.epoch.elapsed().as_nanos() as u64,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn observe_duration_at<K, Q>(
+        &self,
+        map: &DashMap<K, HistogramBuckets>,
+        lookup: &Q,
+        owned_key: impl FnOnce() -> K,
+        kind: DurationLayoutKind,
+        captured: &Arc<[f64]>,
+        value: f64,
+        now_nanos: u64,
+    ) where
+        K: Eq + std::hash::Hash + std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        use dashmap::mapref::entry::Entry;
+        if let Some(existing) = map.get(lookup)
+            && Arc::ptr_eq(&existing.boundaries, captured)
+        {
+            existing.observe_at(value, now_nanos);
+            return;
+        }
+        match map.entry(owned_key()) {
+            Entry::Occupied(mut entry) => {
+                let current = self.current_duration_layout(kind);
+                if !Arc::ptr_eq(&entry.get().boundaries, &current) {
+                    let _superseded =
+                        entry.insert(HistogramBuckets::with_layout(current, self.epoch));
+                }
+                entry.get().observe_at(value, now_nanos);
+            }
+            Entry::Vacant(entry) => {
+                let histogram =
+                    HistogramBuckets::with_layout(self.current_duration_layout(kind), self.epoch);
+                histogram.observe_at(value, now_nanos);
+                entry.insert(histogram);
+            }
+        }
+    }
+
+    /// Observe a per-proxy duration and return that map's `proxy_id` key.
+    ///
+    /// A per-proxy duration histogram exists for every recorded transaction,
+    /// so its key doubles as the shared `Arc<str>` for the caller's remaining
+    /// per-proxy families: the established-series path clones a refcount
+    /// instead of allocating a fresh `Arc<str>` per transaction.
+    fn observe_proxy_duration(
+        &self,
+        map: &DashMap<Arc<str>, HistogramBuckets>,
+        proxy_key: &str,
+        kind: DurationLayoutKind,
+        captured: &Arc<[f64]>,
+        value: f64,
+    ) -> Arc<str> {
+        self.observe_proxy_duration_at(
+            map,
+            proxy_key,
+            kind,
+            captured,
+            value,
+            self.epoch.elapsed().as_nanos() as u64,
+        )
+    }
+
+    fn observe_proxy_duration_at(
+        &self,
+        map: &DashMap<Arc<str>, HistogramBuckets>,
+        proxy_key: &str,
+        kind: DurationLayoutKind,
+        captured: &Arc<[f64]>,
+        value: f64,
+        now_nanos: u64,
+    ) -> Arc<str> {
+        let proxy_id = match map.get(proxy_key) {
+            Some(existing) => {
+                let proxy_id = Arc::clone(existing.key());
+                if Arc::ptr_eq(&existing.boundaries, captured) {
+                    existing.observe_at(value, now_nanos);
+                    return proxy_id;
+                }
+                proxy_id
+            }
+            None => Arc::from(proxy_key),
+        };
+        self.observe_duration_at(
+            map,
+            proxy_key,
+            || Arc::clone(&proxy_id),
+            kind,
+            captured,
+            value,
+            now_nanos,
+        );
+        proxy_id
+    }
+
+    /// Add `value` to a per-proxy counter, allocating the key only on a miss.
+    fn add_proxy_counter_at(
+        &self,
+        map: &DashMap<Arc<str>, TimestampedCounter>,
+        proxy_key: &str,
+        proxy_id: &Arc<str>,
+        value: u64,
+        now_nanos: u64,
+    ) {
+        if let Some(existing) = map.get(proxy_key) {
+            existing.add_at(value, now_nanos);
+            return;
+        }
+        map.entry(Arc::clone(proxy_id))
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .add_at(value, now_nanos);
     }
 
     /// Invalidate the render cache only if it's older than the configured
@@ -2760,6 +3658,23 @@ impl MetricsRegistry {
             }
             keep
         });
+
+        for counters in [
+            &self.request_body_bytes_counter,
+            &self.response_body_bytes_counter,
+            &self.tcp_connection_throttle_rejections,
+        ]
+        .into_iter()
+        .chain(self.adaptive_concurrency_decisions.iter())
+        {
+            counters.retain(|_, value| {
+                let keep = value.nanos_since_update(self.epoch) < ttl_nanos;
+                if !keep {
+                    evicted += 1;
+                }
+                keep
+            });
+        }
 
         for counters in [
             &self.ai_prompt_tokens_counter,
@@ -2925,6 +3840,22 @@ impl MetricsRegistry {
             keep
         });
 
+        self.ai_federation_provider_circuits_opened.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.ai_federation_provider_circuits_closed.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
         self.hbone_tunnel_revocation_counter.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
@@ -3040,26 +3971,23 @@ impl MetricsRegistry {
     /// when time simply passes, so no invalidation hook could keep those honest
     /// inside a memoized body — a cached age is wrong by however long the cache
     /// has been held. Rendering them live is the only correct option.
+    ///
+    /// Families read from other modules' process-wide state (service
+    /// discovery, compression, admin audit, UDP amplification, gateway trust,
+    /// the connection limiters, the node agent) are appended live for the same
+    /// reason: their producers cannot invalidate `render_cache` (issue #7145).
+    ///
+    /// Cache rebuilds are single-flight (see `cacheable_body`): a
+    /// published body is never replaced by one rendered from older counter
+    /// reads, so successive scrapes of the cached families are monotonic.
     pub fn render(&self) -> String {
-        // Check cache
-        let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
-        let cached = self.render_cache.load();
-        let mut output = if let Some((generated_at, ref output)) = **cached
-            && generated_at.elapsed().as_secs() < ttl_secs
-        {
-            output.clone()
-        } else {
-            // Lazy eviction: piggyback on cache-miss (at most once per render_cache_ttl_secs)
-            let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
-            self.evict_stale(stale_ttl);
-
-            let output = self.render_cacheable_body();
-
-            self.render_cache
-                .store(Arc::new(Some((Instant::now(), output.clone()))));
-
-            output
-        };
+        let body = self.cacheable_body();
+        // One copy of the shared cached body, with headroom for the live
+        // families appended below so they do not force a second full-body
+        // reallocation.
+        let mut output = String::with_capacity(body.len() + RENDER_LIVE_TAIL_RESERVE_BYTES);
+        output.push_str(&body);
+        drop(body);
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
         self.append_grpc_stream_auth_prometheus(&mut output);
@@ -3071,7 +3999,49 @@ impl MetricsRegistry {
         self.append_gateway_trust_retirement_prometheus(&mut output);
         self.append_gateway_listener_status_prometheus(&mut output);
         self.append_k8s_controller_prometheus(&mut output);
+        self.append_external_process_prometheus(&mut output);
         output
+    }
+
+    /// The cached body when it is still within `render_cache_ttl_seconds`.
+    fn fresh_cached_body(&self, ttl_secs: u64) -> Option<Arc<str>> {
+        let cached = self.render_cache.load();
+        match &**cached {
+            Some((generated_at, body)) if generated_at.elapsed().as_secs() < ttl_secs => {
+                Some(Arc::clone(body))
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the memoized registry-owned body, rebuilding it on a miss.
+    ///
+    /// Hits are lock-free. A miss takes the scrape-only `render_rebuild_lock`
+    /// and re-checks the cache, so concurrent misses (for example an HA
+    /// Prometheus pair) coalesce onto one rebuild + eviction sweep. Because
+    /// rebuild and publication are serialized, each published body was read
+    /// from counters no older than the previous publication's: a slower
+    /// renderer can no longer overwrite a newer snapshot and make a cached
+    /// counter go backwards (which `rate()`/`increase()` would read as a
+    /// reset). The generation timestamp is taken before rendering, so the TTL
+    /// never extends past what the body's counter reads justify.
+    fn cacheable_body(&self) -> Arc<str> {
+        let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
+        if let Some(body) = self.fresh_cached_body(ttl_secs) {
+            return body;
+        }
+        let _rebuild = self.lock_render_rebuild();
+        if let Some(body) = self.fresh_cached_body(ttl_secs) {
+            return body;
+        }
+        let started_at = Instant::now();
+        // Lazy eviction: piggyback on cache-miss (at most once per render_cache_ttl_secs)
+        let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
+        self.evict_stale(stale_ttl);
+        let body: Arc<str> = Arc::from(self.render_cacheable_body());
+        self.render_cache
+            .store(Arc::new(Some((started_at, Arc::clone(&body)))));
+        body
     }
 
     /// Append the bounded DP configuration-freshness families from live state.
@@ -3277,6 +4247,18 @@ impl MetricsRegistry {
             "",
         );
         output.push_str(
+            "# HELP ferrum_k8s_controller_watch_evidence_refresh_relists_total Watch-scope reflector rebuilds started by a demand-driven revision-evidence refresh; the scope's live watch keeps delivering while the replacement lists.\n",
+        );
+        output.push_str(
+            "# TYPE ferrum_k8s_controller_watch_evidence_refresh_relists_total counter\n",
+        );
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_watch_evidence_refresh_relists_total",
+            snapshot.watch_evidence_refresh_relists,
+            "",
+        );
+        output.push_str(
             "# HELP ferrum_k8s_controller_watch_errors_total Kubernetes watch stream errors observed across every watched scope, including refused initial lists and failed watch starts.\n",
         );
         output.push_str("# TYPE ferrum_k8s_controller_watch_errors_total counter\n");
@@ -3479,17 +4461,687 @@ impl MetricsRegistry {
         crate::backend_active_request_limit::render_prometheus(output, &gateway_ns_label);
     }
 
+    /// Append the families whose producers live outside this registry and
+    /// never invalidate `render_cache` (issue #7145): service-discovery task
+    /// health (including the wall-clock last-success age), compression codec
+    /// admission, the admin audit pipeline and its availability gauges, UDP
+    /// response amplification, gateway trust bundles, the admin and CP gRPC
+    /// connection limiters, and the node agent. Cached, they would stay frozen
+    /// for up to `render_cache_ttl_seconds` on a node where nothing else
+    /// invalidates the cache, so every scrape renders them from live state.
+    fn append_external_process_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        // Service-discovery task lifecycle / staleness gauges (issues #3717 /
+        // #3721 / #3722). Aggregated across every configured upstream — the
+        // namespaced upstream identity stays off `/metrics` entirely and is
+        // exposed only on the authenticated `/health` and `/status` surfaces.
+        let discovery_health = crate::service_discovery::health::aggregate();
+        for (name, help, value) in [
+            (
+                "ferrum_service_discovery_tasks",
+                "Service-discovery tasks currently supervised.",
+                discovery_health.tasks as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_running",
+                "Service-discovery tasks whose retained health state is starting or running; a recorded lifecycle state, not a live poller-handle census.",
+                discovery_health.running as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_restarting",
+                "Service-discovery tasks whose retained health state is restarting after an unexpected poller exit; the state persists through backoff and respawn until a snapshot is published.",
+                discovery_health.restarting as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_crash_looping",
+                "Service-discovery tasks whose retained health state is crash-looping after repeated unexpected exits without an intervening published snapshot; the state persists through respawn until a snapshot is published.",
+                discovery_health.crash_looping as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_stale",
+                "Service-discovery tasks whose staleness anchor (last published snapshot, or task start before any) has reached the effective staleness bound (configured window floored at three poll intervals).",
+                discovery_health.stale as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_withdrawn",
+                "Service-discovery tasks whose discovered targets are currently withdrawn by the staleness policy.",
+                discovery_health.withdrawn as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_readiness_failing",
+                "Stale service-discovery tasks failing readiness by policy or because withdrawal publication is still retrying.",
+                discovery_health.readiness_failing as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_never_succeeded",
+                "Service-discovery tasks that have never published an admitted snapshot.",
+                discovery_health.never_succeeded as i64,
+            ),
+            (
+                "ferrum_service_discovery_last_success_age_seconds_max",
+                "Maximum age in seconds of the staleness anchor across service-discovery tasks (task start when no snapshot has ever been published).",
+                discovery_health.max_anchor_age_seconds as i64,
+            ),
+        ] {
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} gauge");
+            render_process_gauge(output, name, value, &ns_label);
+        }
+
+        // Compression codec admission / worker outcomes (process-wide).
+        let compression_codec = crate::plugins::compression::compression_codec_metrics();
+        for (name, help, value) in [
+            (
+                "ferrum_compression_codec_admitted_total",
+                "Compression codec jobs admitted to the bounded spawn_blocking pool.",
+                compression_codec.admitted,
+            ),
+            (
+                "ferrum_compression_codec_saturated_total",
+                "Compression codec admission refusals when the bounded pool is saturated.",
+                compression_codec.saturated,
+            ),
+            (
+                "ferrum_compression_codec_join_failures_total",
+                "Compression codec spawn_blocking tasks that failed to join.",
+                compression_codec.join_failures,
+            ),
+            (
+                "ferrum_compression_codec_worker_failures_total",
+                "Compression codec worker errors (encode/decode failures inside spawn_blocking).",
+                compression_codec.worker_failures,
+            ),
+            (
+                "ferrum_compression_response_buffer_admitted_total",
+                "Response-compression buffer admissions granted (bounds bodies collected for compression).",
+                compression_codec.response_buffer_admitted,
+            ),
+            (
+                "ferrum_compression_response_buffer_saturated_total",
+                "Response-compression buffer admission refusals; the response streams identity (or 406) instead.",
+                compression_codec.response_buffer_saturated,
+            ),
+        ] {
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} counter");
+            render_process_counter(output, name, value, &ns_label);
+        }
+
+        // Admin audit delivery pipeline (issue #2421). Process-wide counters
+        // and bounded-backlog gauges so an operator can reconcile committed
+        // mutations against durable audit rows. Values only — no actor subject,
+        // token, diff, resource id, or spool path ever reaches the exposition,
+        // and the single `reason` label comes from a closed `&'static str` set.
+        let audit_pipeline = crate::admin::audit::pipeline_metrics_snapshot();
+        for (name, help, value) in [
+            (
+                "ferrum_admin_audit_events_accepted_total",
+                "Admin audit events accepted from a committed admin mutation.",
+                audit_pipeline.accepted_total,
+            ),
+            (
+                "ferrum_admin_audit_intents_prepared_total",
+                "Pre-mutation admin audit intents made durable (fsynced) before the configuration mutation was invoked.",
+                audit_pipeline.prepared_total,
+            ),
+            (
+                "ferrum_admin_audit_events_finalized_total",
+                "Admin audit intents durably finalized with the mutation's known outcome.",
+                audit_pipeline.finalized_total,
+            ),
+            (
+                "ferrum_admin_audit_unknown_outcome_total",
+                "Prepared admin audit records whose trustworthy outcome observer was lost to process exit or request cancellation.",
+                audit_pipeline.unknown_outcome_total,
+            ),
+            (
+                "ferrum_admin_audit_events_enqueued_total",
+                "Admin audit events admitted to the bounded in-memory delivery queue.",
+                audit_pipeline.enqueued_total,
+            ),
+            (
+                "ferrum_admin_audit_events_delivered_total",
+                "Admin audit events accepted by the configured database backend.",
+                audit_pipeline.delivered_total,
+            ),
+            (
+                "ferrum_admin_audit_events_replayed_total",
+                "Durable admin audit records re-read from the spool for delivery (restart, queue overflow, or an expired shutdown drain).",
+                audit_pipeline.replayed_total,
+            ),
+            (
+                "ferrum_admin_audit_delivery_retries_total",
+                "Bounded-backoff retries scheduled after a transient admin audit delivery failure.",
+                audit_pipeline.retries_total,
+            ),
+            (
+                "ferrum_admin_audit_delivery_failures_total",
+                "Admin audit delivery attempts that returned an error from the database backend.",
+                audit_pipeline.delivery_failures_total,
+            ),
+            (
+                "ferrum_admin_audit_events_retained_total",
+                "Admin audit events that exhausted the delivery-attempt budget and were retained for operator remediation.",
+                audit_pipeline.retained_total,
+            ),
+            (
+                "ferrum_admin_audit_corrupt_records_total",
+                "Durable admin audit records quarantined as corrupt (bad version, unparseable, oversized, or id mismatch).",
+                audit_pipeline.corrupt_records_total,
+            ),
+            (
+                "ferrum_admin_audit_destination_mismatch_total",
+                "Durable admin audit records quarantined because they target a different database or namespace destination.",
+                audit_pipeline.destination_mismatch_total,
+            ),
+            (
+                "ferrum_admin_audit_truncated_diffs_total",
+                "Admin audit events whose diff was replaced by a redacted marker because it exceeded the durable record ceiling.",
+                audit_pipeline.truncated_diffs_total,
+            ),
+            (
+                "ferrum_admin_audit_fail_closed_rejections_total",
+                "Admin mutations refused up front because the audit pipeline is unavailable under the fail_closed policy.",
+                audit_pipeline.fail_closed_rejections_total,
+            ),
+            (
+                "ferrum_admin_audit_fail_open_unaudited_mutations_total",
+                "Admin mutations allowed to proceed without durable pre-mutation audit evidence under the fail_open policy.",
+                audit_pipeline.fail_open_unaudited_mutations_total,
+            ),
+        ] {
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} counter");
+            render_process_counter(output, name, value, &ns_label);
+        }
+        output.push_str(
+            "# HELP ferrum_admin_audit_events_dropped_total Admin audit events lost without a durable record, by reason.\n",
+        );
+        output.push_str("# TYPE ferrum_admin_audit_events_dropped_total counter\n");
+        // Emit every reason bucket even at zero so dashboards can pin them.
+        for (reason, value) in [
+            (
+                "durable_handoff_failed",
+                audit_pipeline.dropped_durable_handoff_failed_total,
+            ),
+            (
+                "no_durable_spool",
+                audit_pipeline.dropped_no_durable_spool_total,
+            ),
+            (
+                "retained_capacity",
+                audit_pipeline.dropped_retained_capacity_total,
+            ),
+        ] {
+            let _ = writeln!(
+                output,
+                "ferrum_admin_audit_events_dropped_total{{reason=\"{reason}\"{ns_label}}} {value}"
+            );
+        }
+        let audit_status = crate::admin::audit::pipeline_status();
+        for (name, help, value) in [
+            (
+                "ferrum_admin_audit_queue_depth",
+                "Admin audit events currently waiting in the bounded in-memory delivery queue.",
+                audit_pipeline.queue_depth as i64,
+            ),
+            (
+                "ferrum_admin_audit_queue_capacity",
+                "Configured depth of the bounded in-memory admin audit delivery queue.",
+                audit_status.queue_capacity as i64,
+            ),
+            (
+                "ferrum_admin_audit_delivery_in_flight",
+                "Admin audit delivery attempts currently in flight.",
+                audit_pipeline.delivery_in_flight as i64,
+            ),
+            (
+                "ferrum_admin_audit_spool_prepared_records",
+                "Durable pre-mutation admin audit intents awaiting finalization.",
+                audit_pipeline.spool_prepared_records as i64,
+            ),
+            (
+                "ferrum_admin_audit_spool_pending_records",
+                "Durable admin audit records awaiting delivery (O(1) admission counter; a saturated background scan reports a floor).",
+                audit_pipeline.spool_pending_records as i64,
+            ),
+            (
+                "ferrum_admin_audit_retained_records",
+                "Durable admin audit records retained as unrecoverable for operator remediation.",
+                audit_pipeline.spool_retained_records as i64,
+            ),
+            (
+                "ferrum_admin_audit_available",
+                "Whether the admin audit pipeline can durably record committed mutations (1) or not (0).",
+                i64::from(audit_status.available),
+            ),
+            (
+                "ferrum_admin_audit_degraded",
+                "Sticky evidence that admin audit records were corrupted, retained as unrecoverable, or permanently discarded (1) or not (0). A later successful delivery does not clear it.",
+                i64::from(audit_status.degraded),
+            ),
+            (
+                "ferrum_admin_audit_evidence_lost",
+                "Whether admin audit evidence has been permanently discarded (1) or not (0). Never clears.",
+                i64::from(audit_status.evidence_lost),
+            ),
+        ] {
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} gauge");
+            render_process_gauge(output, name, value, &ns_label);
+        }
+
+        let amp = crate::udp_amplification::metrics_snapshot();
+        for (name, help, value) in [
+            (
+                "ferrum_udp_amplification_responses_allowed_total",
+                "UDP backend responses admitted by the per-request amplification budget.",
+                amp.responses_allowed,
+            ),
+            (
+                "ferrum_udp_amplification_responses_dropped_total",
+                "UDP backend responses dropped for exceeding the per-request amplification budget.",
+                amp.responses_dropped,
+            ),
+            (
+                "ferrum_udp_amplification_policy_invalid_total",
+                "UDPResponseAmplificationPolicy admission refusals: one per invalid, unauthorized, or unresolved policy object in each translation pass (repeats across passes); otherwise-valid policies that lose a conflict are not counted.",
+                amp.policy_invalid,
+            ),
+            (
+                "ferrum_udp_amplification_unlimited_total",
+                "UDP/DTLS sessions admitted without a response-amplification limit.",
+                amp.policy_unlimited,
+            ),
+        ] {
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} counter");
+            render_process_counter(output, name, value, &ns_label);
+        }
+
+        // Gateway trust bundles (issue #3727). Fixed cardinality: no namespace,
+        // trust-domain, or resource-id labels — the namespace-scoped view is on
+        // the authenticated admin status surface. Nothing here can carry
+        // PEM/JWKS bytes or a secret/provider URI.
+        {
+            // LABEL-FREE by construction: every series below is rendered with
+            // an empty label set, never `ns_label`. A namespace label here would
+            // be unbounded on a cluster-wide CP and would publish
+            // tenant-identifying names to any `/metrics` reader; the
+            // namespace-scoped view lives on the authenticated
+            // `GET /gateway-trust/status` surface instead. There is likewise no
+            // per-namespace revision gauge: a process-wide "published revision"
+            // would be a last-writer-wins lie on a multi-namespace CP.
+            const NO_LABELS: &str = "";
+            let trust = crate::config::gateway_trust::observability_snapshot();
+            output.push_str(
+                "# HELP ferrum_gateway_trust_bundle_published_generations_total Gateway trust-bundle generations carrying a database-sourced record that reached the live configuration swap; a generation refused by the ambiguous-authority rule is not counted.\n",
+            );
+            output.push_str(
+                "# TYPE ferrum_gateway_trust_bundle_published_generations_total counter\n",
+            );
+            render_process_counter(
+                output,
+                "ferrum_gateway_trust_bundle_published_generations_total",
+                trust.published_generations_total,
+                NO_LABELS,
+            );
+
+            output.push_str(
+                "# HELP ferrum_gateway_trust_bundle_load_rejections_total Gateway trust-bundle candidates refused before the live swap; the previous valid generation stays active.\n",
+            );
+            output.push_str("# TYPE ferrum_gateway_trust_bundle_load_rejections_total counter\n");
+            render_process_counter(
+                output,
+                "ferrum_gateway_trust_bundle_load_rejections_total",
+                trust.load_rejections_total,
+                NO_LABELS,
+            );
+
+            output.push_str(
+                "# HELP ferrum_gateway_trust_bundle_ambiguous_authority_total Publications that found both a database record and a file-sourced trust value and kept the previously accepted trust.\n",
+            );
+            output
+                .push_str("# TYPE ferrum_gateway_trust_bundle_ambiguous_authority_total counter\n");
+            render_process_counter(
+                output,
+                "ferrum_gateway_trust_bundle_ambiguous_authority_total",
+                trust.ambiguous_authority_total,
+                NO_LABELS,
+            );
+
+            output.push_str(
+                "# HELP ferrum_gateway_trust_bundle_last_published_unix_seconds Unix time of the most recently published gateway trust-bundle generation; 0 when none.\n",
+            );
+            output
+                .push_str("# TYPE ferrum_gateway_trust_bundle_last_published_unix_seconds gauge\n");
+            render_process_counter(
+                output,
+                "ferrum_gateway_trust_bundle_last_published_unix_seconds",
+                trust.last_published_unix_seconds,
+                NO_LABELS,
+            );
+        }
+
+        let admin_conn_metrics = self.admin_conn_metrics.load_full();
+        if let Some(limiter) = admin_conn_metrics.as_ref() {
+            let snapshot = limiter.snapshot();
+            output.push_str(
+                "# HELP ferrum_admin_active_connections Admin/management-plane connections currently in flight.\n",
+            );
+            output.push_str("# TYPE ferrum_admin_active_connections gauge\n");
+            render_process_counter(
+                output,
+                "ferrum_admin_active_connections",
+                snapshot.active_connections,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_admin_max_connections Configured admin connection cap (0 = unlimited).\n",
+            );
+            output.push_str("# TYPE ferrum_admin_max_connections gauge\n");
+            render_process_counter(
+                output,
+                "ferrum_admin_max_connections",
+                snapshot.max_connections as u64,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_admin_max_connections_per_ip Configured per-source-IP admin connection cap (0 = unlimited).\n",
+            );
+            output.push_str("# TYPE ferrum_admin_max_connections_per_ip gauge\n");
+            render_process_counter(
+                output,
+                "ferrum_admin_max_connections_per_ip",
+                snapshot.max_connections_per_ip as u64,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_admin_rejected_connections_total Admin connections rejected by the connection limiter, by reason.\n",
+            );
+            output.push_str("# TYPE ferrum_admin_rejected_connections_total counter\n");
+            // Emit both reason buckets even at zero so dashboards can pin them.
+            for (reason, value) in [
+                ("max_connections", snapshot.rejected_max_connections),
+                (
+                    "max_connections_per_ip",
+                    snapshot.rejected_max_connections_per_ip,
+                ),
+            ] {
+                let _ = writeln!(
+                    output,
+                    "ferrum_admin_rejected_connections_total{{reason=\"{reason}\"{ns_label}}} {value}"
+                );
+            }
+        }
+
+        // CP gRPC pre-authentication connection admission (advisory
+        // GHSA-2xqr-7j7p-77qp). Fixed cardinality: no source-IP label, and the
+        // reason labels come from a closed `&'static str` set.
+        let cp_grpc_conn_metrics = self.cp_grpc_conn_metrics.load_full();
+        if let Some(limiter) = cp_grpc_conn_metrics.as_ref() {
+            let snapshot = limiter.snapshot();
+            output.push_str(
+                "# HELP ferrum_cp_grpc_active_connections CP gRPC listener connections currently admitted (pre-handshake through served HTTP/2 session).\n",
+            );
+            output.push_str("# TYPE ferrum_cp_grpc_active_connections gauge\n");
+            render_process_counter(
+                output,
+                "ferrum_cp_grpc_active_connections",
+                snapshot.active_connections,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_cp_grpc_max_connections Configured CP gRPC connection cap (0 = unlimited).\n",
+            );
+            output.push_str("# TYPE ferrum_cp_grpc_max_connections gauge\n");
+            render_process_counter(
+                output,
+                "ferrum_cp_grpc_max_connections",
+                snapshot.max_connections as u64,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_cp_grpc_max_connections_per_ip Configured per-source-IP CP gRPC connection cap (0 = unlimited).\n",
+            );
+            output.push_str("# TYPE ferrum_cp_grpc_max_connections_per_ip gauge\n");
+            render_process_counter(
+                output,
+                "ferrum_cp_grpc_max_connections_per_ip",
+                snapshot.max_connections_per_ip as u64,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_cp_grpc_rejected_connections_total CP gRPC connections rejected before any handshake work was allocated, by reason.\n",
+            );
+            output.push_str("# TYPE ferrum_cp_grpc_rejected_connections_total counter\n");
+            // Emit both reason buckets even at zero so dashboards can pin them.
+            for (reason, value) in [
+                ("max_connections", snapshot.rejected_max_connections),
+                (
+                    "max_connections_per_ip",
+                    snapshot.rejected_max_connections_per_ip,
+                ),
+            ] {
+                let _ = writeln!(
+                    output,
+                    "ferrum_cp_grpc_rejected_connections_total{{reason=\"{reason}\"{ns_label}}} {value}"
+                );
+            }
+        }
+
+        let node_agent_metrics = self.node_agent_metrics.load_full();
+        if let Some(metrics) = node_agent_metrics.as_ref() {
+            let snapshot = metrics.snapshot();
+            output.push_str(
+                "# HELP ferrum_node_agent_pods_enrolled_total Pods enrolled for node-agent capture.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_pods_enrolled_total counter\n");
+            render_process_counter(
+                output,
+                "ferrum_node_agent_pods_enrolled_total",
+                snapshot.pods_enrolled,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_node_agent_pods_unenrolled_total Pods unenrolled from node-agent capture.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_pods_unenrolled_total counter\n");
+            render_process_counter(
+                output,
+                "ferrum_node_agent_pods_unenrolled_total",
+                snapshot.pods_unenrolled,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_node_agent_attach_errors_total Node-agent BPF attachment or map update errors.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_attach_errors_total counter\n");
+            render_process_counter(
+                output,
+                "ferrum_node_agent_attach_errors_total",
+                snapshot.attach_errors,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_node_agent_pod_annotation_updates_applied_total Mid-life pod includeOutboundPorts annotation changes re-applied to the BPF map.\n",
+            );
+            output.push_str(
+                "# TYPE ferrum_node_agent_pod_annotation_updates_applied_total counter\n",
+            );
+            render_process_counter(
+                output,
+                "ferrum_node_agent_pod_annotation_updates_applied_total",
+                snapshot.pod_annotation_updates_applied,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_node_agent_pod_annotation_updates_failed_total Mid-life pod includeOutboundPorts annotation changes that failed to re-apply (annotation parse error or BPF map write error). Cgroup-id-unavailable retries are intentionally not counted here because they are routinely observed during early pod startup and are retried on the next Apply event.\n",
+            );
+            output
+                .push_str("# TYPE ferrum_node_agent_pod_annotation_updates_failed_total counter\n");
+            render_process_counter(
+                output,
+                "ferrum_node_agent_pod_annotation_updates_failed_total",
+                snapshot.pod_annotation_updates_failed,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_node_agent_cni_socket_lifecycle_total Node-agent CNI socket lifecycle failures by bounded reason.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_cni_socket_lifecycle_total counter\n");
+            for reason in crate::ebpf::CniSocketLifecycleReason::all() {
+                let value = snapshot.cni_socket_lifecycle[reason as usize];
+                let _ = writeln!(
+                    output,
+                    "ferrum_node_agent_cni_socket_lifecycle_total{{reason=\"{}\"{}}} {}",
+                    reason.label(),
+                    ns_label,
+                    value,
+                );
+            }
+
+            output.push_str(
+                "# HELP ferrum_node_agent_cni_calls_total Node-agent CNI plugin RPC outcomes by verb.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_cni_calls_total counter\n");
+            for verb in crate::ebpf::CniCallVerb::all() {
+                for outcome in crate::ebpf::CniCallOutcome::all() {
+                    let value = snapshot.cni_calls[verb as usize][outcome as usize];
+                    let _ = writeln!(
+                        output,
+                        "ferrum_node_agent_cni_calls_total{{verb=\"{}\",outcome=\"{}\"{}}} {}",
+                        verb.label(),
+                        outcome.label(),
+                        ns_label,
+                        value,
+                    );
+                }
+            }
+
+            // Capture-state gauge — one hot label from a closed set. This is
+            // the readiness/condition surface operators alert on; the
+            // topology-degraded gauge below explains the first degradation
+            // reason in more detail.
+            output.push_str(
+                "# HELP ferrum_node_agent_capture_state \
+                 Node-agent capture backend condition. Exactly one state label is 1.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_capture_state gauge\n");
+            for state in crate::ebpf::NODE_AGENT_CAPTURE_STATES {
+                let value = u64::from(snapshot.capture_state == *state);
+                let _ = writeln!(
+                    output,
+                    "ferrum_node_agent_capture_state{{state=\"{}\"{}}} {}",
+                    state, ns_label, value,
+                );
+            }
+
+            // Ingress-interface topology proof. State and reason are closed
+            // enums; configured/expected interface names are deliberately
+            // absent from labels and values to keep cardinality bounded and
+            // avoid exposing operator- or host-controlled strings.
+            let topology = snapshot.ingress_topology;
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_topology NodeWaypoint ingress-interface topology validation state and bounded reason.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_ingress_interface_topology gauge\n");
+            let _ = writeln!(
+                output,
+                "ferrum_node_agent_ingress_interface_topology{{state=\"{}\",reason=\"{}\"{}}} 1",
+                topology.state.label(),
+                topology.reason.label(),
+                ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_configured_interfaces Number of explicitly configured ingress interfaces (names are never labels).\n",
+            );
+            output.push_str(
+                "# TYPE ferrum_node_agent_ingress_interface_configured_interfaces gauge\n",
+            );
+            render_process_counter(
+                output,
+                "ferrum_node_agent_ingress_interface_configured_interfaces",
+                u64::from(topology.configured_interfaces),
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_expected_interfaces Ingress interfaces established for the node/CNI route topology (names are never labels): the complete required set only when topology validation succeeds; while topology is unavailable, the partial count reached before validation stopped, not readiness or complete route coverage.\n",
+            );
+            output
+                .push_str("# TYPE ferrum_node_agent_ingress_interface_expected_interfaces gauge\n");
+            render_process_counter(
+                output,
+                "ferrum_node_agent_ingress_interface_expected_interfaces",
+                u64::from(topology.expected_interfaces),
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_family_required Whether a route family must be covered by the configured interface set.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_ingress_interface_family_required gauge\n");
+            for (family, required) in [
+                ("ipv4", topology.ipv4_required),
+                ("ipv6", topology.ipv6_required),
+            ] {
+                let _ = writeln!(
+                    output,
+                    "ferrum_node_agent_ingress_interface_family_required{{family=\"{family}\"{ns_label}}} {}",
+                    u64::from(required),
+                );
+            }
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_family_covered Whether the required route family is currently proved complete.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_ingress_interface_family_covered gauge\n");
+            for (family, covered) in [
+                ("ipv4", topology.ipv4_covered),
+                ("ipv6", topology.ipv6_covered),
+            ] {
+                let _ = writeln!(
+                    output,
+                    "ferrum_node_agent_ingress_interface_family_covered{{family=\"{family}\"{ns_label}}} {}",
+                    u64::from(covered),
+                );
+            }
+
+            // Topology-degraded gauge — emitted whenever the node-agent
+            // metrics are registered so dashboards can pin "expected: 0"
+            // even on healthy nodes. `reason` is a closed snake_case set
+            // from KernelProbeResult::degradation_reason (kernel_too_old,
+            // cgroup_v1, bpffs_missing), plus ebpf_feature_disabled when the
+            // binary was built without `--features ebpf` and falls back to the
+            // mock backend (GAP-1b), plus a single "none" series on nominal
+            // nodes — total cardinality is bounded per node.
+            output.push_str(
+                "# HELP ferrum_mesh_node_topology_degraded \
+                 Node-agent detected missing eBPF prerequisites or a build without eBPF capture. \
+                 1 with a reason label means degraded, 0 with reason=\"none\" means nominal.\n",
+            );
+            output.push_str("# TYPE ferrum_mesh_node_topology_degraded gauge\n");
+            let (reason, value) = match snapshot.topology_degraded_reason {
+                Some(reason) => (reason, 1u64),
+                None => ("none", 0u64),
+            };
+            let _ = writeln!(
+                output,
+                "ferrum_mesh_node_topology_degraded{{reason=\"{}\"{}}} {}",
+                reason, ns_label, value,
+            );
+        }
+    }
+
     /// Render metrics without caching. Used internally and for testing.
     ///
     /// Includes the process-static mesh observability families so this stays a
     /// complete rendering of everything the registry owns plus everything it
     /// composes. `render()` reaches the same families through a live append
     /// rather than through the cached body.
-    // Now that `render()` memoizes `render_cacheable_body()` instead, this is
-    // reached only from the test suites, which compile against the library
-    // crate. The binary target compiles this module without them, so `-D
-    // warnings` sees it as dead there.
-    #[allow(dead_code)]
     pub fn render_uncached(&self) -> String {
         let mut output = self.render_cacheable_body();
         self.append_mesh_observability_prometheus(&mut output);
@@ -3503,6 +5155,7 @@ impl MetricsRegistry {
         self.append_gateway_trust_retirement_prometheus(&mut output);
         self.append_gateway_listener_status_prometheus(&mut output);
         self.append_k8s_controller_prometheus(&mut output);
+        self.append_external_process_prometheus(&mut output);
         output
     }
 
@@ -3535,12 +5188,16 @@ impl MetricsRegistry {
             + self.mesh_grpc_response_messages_counter.len() * 600
             + self.stream_connection_counter.len() * 200
             + self.stream_duration_buckets.len() * 800
+            + self.tcp_connection_throttle_rejections.len() * 180
             + self.ws_session_counter.len() * 320
             + self.ws_session_duration_buckets.len() * 1000
             + self.ws_bytes_counter.len() * 180
             + self.ws_frames_counter.len() * 180
             + self.hbone_relay_failure_counter.len() * 240
             + self.hbone_tunnel_revocation_counter.len() * 200
+            + self.ai_federation_provider_circuits_open.len() * 160
+            + self.ai_federation_provider_circuits_opened.len() * 160
+            + self.ai_federation_provider_circuits_closed.len() * 160
             + self.hbone_inner_pool_event_counter.len() * 160
             + self.mesh_tcp_egress_connection_counter.len() * 120
             + self
@@ -3571,21 +5228,6 @@ impl MetricsRegistry {
                 400
             } else {
                 0
-            }
-            + if self.node_agent_metrics.load().is_some() {
-                2600
-            } else {
-                0
-            }
-            + if self.admin_conn_metrics.load().is_some() {
-                512
-            } else {
-                0
-            }
-            + if self.cp_grpc_conn_metrics.load().is_some() {
-                512
-            } else {
-                0
             };
         let mut output = String::with_capacity(estimated_cap);
 
@@ -3608,26 +5250,36 @@ impl MetricsRegistry {
             let proxy_id = escape_label_value(&key.proxy_id);
             if let Some(grpc_status) = key.grpc_status {
                 if let Some(error_class) = key.error_class {
-                    output.push_str(&format!(
-                        "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\",grpc_status=\"{}\",error_class=\"{}\"{}}} {}\n",
-                        proxy_id, key.method, key.status_code, grpc_status, error_class, ns_label, count
-                    ));
+                    let _ = writeln!(
+                        output,
+                        "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\",grpc_status=\"{}\",error_class=\"{}\"{}}} {}",
+                        proxy_id,
+                        key.method,
+                        key.status_code,
+                        grpc_status,
+                        error_class,
+                        ns_label,
+                        count
+                    );
                 } else {
-                    output.push_str(&format!(
-                        "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\",grpc_status=\"{}\"{}}} {}\n",
+                    let _ = writeln!(
+                        output,
+                        "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\",grpc_status=\"{}\"{}}} {}",
                         proxy_id, key.method, key.status_code, grpc_status, ns_label, count
-                    ));
+                    );
                 }
             } else if let Some(error_class) = key.error_class {
-                output.push_str(&format!(
-                    "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\",error_class=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\",error_class=\"{}\"{}}} {}",
                     proxy_id, key.method, key.status_code, error_class, ns_label, count
-                ));
+                );
             } else {
-                output.push_str(&format!(
-                    "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\"{}}} {}",
                     proxy_id, key.method, key.status_code, ns_label, count
-                ));
+                );
             }
         }
 
@@ -3661,14 +5313,15 @@ impl MetricsRegistry {
                 let key = entry.key();
                 let value = entry.value().rounded_microunits();
                 let proxy_id = escape_label_value(&key.proxy_id);
-                output.push_str(&format!(
-                    "ferrum_ai_estimated_cost_currency_units_total{{proxy_id=\"{}\",provider=\"{}\"{}}} {}.{:06}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_ai_estimated_cost_currency_units_total{{proxy_id=\"{}\",provider=\"{}\"{}}} {}.{:06}",
                     proxy_id,
                     key.provider,
                     ns_label,
                     value / 1_000_000,
                     value % 1_000_000
-                ));
+                );
             }
         }
 
@@ -3732,10 +5385,11 @@ impl MetricsRegistry {
                 } else {
                     gateway_ns_label.as_str()
                 };
-                output.push_str(&format!(
-                    "ferrum_mesh_requests_total{{{}{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_mesh_requests_total{{{}{}}} {}",
                     labels, counter_gateway_ns_label, count
-                ));
+                );
             }
         }
 
@@ -3821,8 +5475,8 @@ impl MetricsRegistry {
             if map.is_empty() {
                 continue;
             }
-            output.push_str(&format!("# HELP {name} {help}\n"));
-            output.push_str(&format!("# TYPE {name} counter\n"));
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} counter");
             for entry in map.iter() {
                 let count = entry.value().value.load(Ordering::Relaxed);
                 let labels = prometheus_helpers::mesh_label_fragment(entry.key(), None);
@@ -3833,10 +5487,11 @@ impl MetricsRegistry {
                 } else {
                     gateway_ns_label.as_str()
                 };
-                output.push_str(&format!(
-                    "{name}{{{}{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "{name}{{{}{}}} {}",
                     labels, counter_gateway_ns_label, count
-                ));
+                );
             }
         }
 
@@ -3857,20 +5512,13 @@ impl MetricsRegistry {
                 if count == 0 {
                     continue;
                 }
-                if ns_label.is_empty() {
-                    output.push_str(&format!(
-                        "ferrum_mesh_metric_series_overflow_total{{family=\"{}\"}} {}\n",
-                        family.overflow_family_label(),
-                        count
-                    ));
-                } else {
-                    output.push_str(&format!(
-                        "ferrum_mesh_metric_series_overflow_total{{family=\"{}\"{}}} {}\n",
-                        family.overflow_family_label(),
-                        gateway_ns_label,
-                        count
-                    ));
-                }
+                let _ = writeln!(
+                    output,
+                    "ferrum_mesh_metric_series_overflow_total{{family=\"{}\"{}}} {}",
+                    family.overflow_family_label(),
+                    gateway_ns_label,
+                    count
+                );
             }
         }
 
@@ -3899,24 +5547,18 @@ impl MetricsRegistry {
                     .load(Ordering::Relaxed),
             ),
         ] {
-            output.push_str(&format!("# HELP {name} {help}\n"));
-            output.push_str(&format!("# TYPE {name} counter\n"));
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} counter");
             render_process_counter(&mut output, name, value, &ns_label);
         }
         output.push_str("# HELP ferrum_rate_limit_exceeded_total Total rate limit rejections.\n");
         output.push_str("# TYPE ferrum_rate_limit_exceeded_total counter\n");
-        if ns_label.is_empty() {
-            output.push_str(&format!(
-                "ferrum_rate_limit_exceeded_total {}\n",
-                self.rate_limit_exceeded.load(Ordering::Relaxed)
-            ));
-        } else {
-            output.push_str(&format!(
-                "ferrum_rate_limit_exceeded_total{{{}}} {}\n",
-                namespace_label_body(&ns_label),
-                self.rate_limit_exceeded.load(Ordering::Relaxed)
-            ));
-        }
+        render_process_counter(
+            &mut output,
+            "ferrum_rate_limit_exceeded_total",
+            self.rate_limit_exceeded.load(Ordering::Relaxed),
+            &ns_label,
+        );
 
         output.push_str(
             "# HELP ferrum_oauth2_introspection_cache_entries OAuth2 introspection cache entries retained across live plugin generations.\n",
@@ -3927,15 +5569,16 @@ impl MetricsRegistry {
         );
         output.push_str("# TYPE ferrum_oauth2_introspection_cache_retained_bytes gauge\n");
         for (class_idx, class) in OAUTH2_INTROSPECTION_CACHE_CLASSES.iter().enumerate() {
-            output.push_str(&format!(
-                "ferrum_oauth2_introspection_cache_entries{{class=\"{class}\"{ns_label}}} {}\n",
+            let _ = writeln!(
+                output,
+                "ferrum_oauth2_introspection_cache_entries{{class=\"{class}\"{ns_label}}} {}",
                 self.oauth2_introspection_cache_entries[class_idx].load(Ordering::Relaxed)
-            ));
-            output.push_str(&format!(
-                "ferrum_oauth2_introspection_cache_retained_bytes{{class=\"{class}\"{ns_label}}} {}\n",
-                self.oauth2_introspection_cache_retained_bytes[class_idx]
-                    .load(Ordering::Relaxed)
-            ));
+            );
+            let _ = writeln!(
+                output,
+                "ferrum_oauth2_introspection_cache_retained_bytes{{class=\"{class}\"{ns_label}}} {}",
+                self.oauth2_introspection_cache_retained_bytes[class_idx].load(Ordering::Relaxed)
+            );
         }
         output.push_str(
             "# HELP ferrum_oauth2_introspection_cache_admission_skips_total OAuth2 introspection results not retained because a bounded cache admission could not complete.\n",
@@ -3948,9 +5591,10 @@ impl MetricsRegistry {
             {
                 let value = self.oauth2_introspection_cache_admission_skips[class_idx][reason_idx]
                     .load(Ordering::Relaxed);
-                output.push_str(&format!(
-                    "ferrum_oauth2_introspection_cache_admission_skips_total{{class=\"{class}\",reason=\"{reason}\"{ns_label}}} {value}\n"
-                ));
+                let _ = writeln!(
+                    output,
+                    "ferrum_oauth2_introspection_cache_admission_skips_total{{class=\"{class}\",reason=\"{reason}\"{ns_label}}} {value}"
+                );
             }
         }
         output.push_str(
@@ -3964,9 +5608,10 @@ impl MetricsRegistry {
             {
                 let value = self.oauth2_introspection_cache_evictions[class_idx][reason_idx]
                     .load(Ordering::Relaxed);
-                output.push_str(&format!(
-                    "ferrum_oauth2_introspection_cache_evictions_total{{class=\"{class}\",reason=\"{reason}\"{ns_label}}} {value}\n"
-                ));
+                let _ = writeln!(
+                    output,
+                    "ferrum_oauth2_introspection_cache_evictions_total{{class=\"{class}\",reason=\"{reason}\"{ns_label}}} {value}"
+                );
             }
         }
         output.push_str(
@@ -3980,6 +5625,30 @@ impl MetricsRegistry {
                 .load(Ordering::Relaxed),
             &ns_label,
         );
+
+        output.push_str(
+            "# HELP ferrum_response_cache_lookups_total response_caching lookup outcomes by X-Cache-Status class, across every plugin instance in this process.\n",
+        );
+        output.push_str("# TYPE ferrum_response_cache_lookups_total counter\n");
+        for (index, (_, label)) in RESPONSE_CACHE_LOOKUP_STATUSES.iter().enumerate() {
+            let value = self.response_cache_lookups[index].load(Ordering::Relaxed);
+            let _ = writeln!(
+                output,
+                "ferrum_response_cache_lookups_total{{status=\"{label}\"{ns_label}}} {value}"
+            );
+        }
+
+        output.push_str(
+            "# HELP ferrum_ws_message_size_limit_rejected_total WebSocket sessions closed with 1009 because a ws_message_size_limiting frame or message ceiling was exceeded, by direction of the rejected input.\n",
+        );
+        output.push_str("# TYPE ferrum_ws_message_size_limit_rejected_total counter\n");
+        for (index, label) in WS_MESSAGE_SIZE_LIMIT_DIRECTIONS.iter().enumerate() {
+            let value = self.ws_message_size_limit_rejections[index].load(Ordering::Relaxed);
+            let _ = writeln!(
+                output,
+                "ferrum_ws_message_size_limit_rejected_total{{direction=\"{label}\"{ns_label}}} {value}"
+            );
+        }
 
         // request_mirror lifecycle (aggregate, label-safe; no URLs/plugin IDs).
         // Terminal outcomes for dispatched tasks sum to dispatched:
@@ -4040,8 +5709,8 @@ impl MetricsRegistry {
                 self.request_mirror_budget_drops.load(Ordering::Relaxed),
             ),
         ] {
-            output.push_str(&format!("# HELP {name} {help}\n"));
-            output.push_str(&format!("# TYPE {name} counter\n"));
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} counter");
             render_process_counter(&mut output, name, value, &ns_label);
         }
 
@@ -4139,194 +5808,22 @@ impl MetricsRegistry {
                 self.service_discovery_tasks_stopped.load(Ordering::Relaxed),
             ),
         ] {
-            output.push_str(&format!("# HELP {name} {help}\n"));
-            output.push_str(&format!("# TYPE {name} counter\n"));
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} counter");
             render_process_counter(&mut output, name, value, &ns_label);
         }
 
-        // Service-discovery task lifecycle / staleness gauges (issues #3717 /
-        // #3721 / #3722). Aggregated across every configured upstream — the
-        // namespaced upstream identity stays off `/metrics` entirely and is
-        // exposed only on the authenticated `/health` and `/status` surfaces.
-        let discovery_health = crate::service_discovery::health::aggregate();
-        for (name, help, value) in [
-            (
-                "ferrum_service_discovery_tasks",
-                "Service-discovery tasks currently supervised.",
-                discovery_health.tasks as i64,
-            ),
-            (
-                "ferrum_service_discovery_tasks_running",
-                "Service-discovery tasks whose retained health state is starting or running; a recorded lifecycle state, not a live poller-handle census.",
-                discovery_health.running as i64,
-            ),
-            (
-                "ferrum_service_discovery_tasks_restarting",
-                "Service-discovery tasks whose retained health state is restarting after an unexpected poller exit; the state persists through backoff and respawn until a snapshot is published.",
-                discovery_health.restarting as i64,
-            ),
-            (
-                "ferrum_service_discovery_tasks_crash_looping",
-                "Service-discovery tasks whose retained health state is crash-looping after repeated unexpected exits without an intervening published snapshot; the state persists through respawn until a snapshot is published.",
-                discovery_health.crash_looping as i64,
-            ),
-            (
-                "ferrum_service_discovery_tasks_stale",
-                "Service-discovery tasks whose staleness anchor (last published snapshot, or task start before any) has reached the effective staleness bound (configured window floored at three poll intervals).",
-                discovery_health.stale as i64,
-            ),
-            (
-                "ferrum_service_discovery_tasks_withdrawn",
-                "Service-discovery tasks whose discovered targets are currently withdrawn by the staleness policy.",
-                discovery_health.withdrawn as i64,
-            ),
-            (
-                "ferrum_service_discovery_tasks_readiness_failing",
-                "Stale service-discovery tasks failing readiness by policy or because withdrawal publication is still retrying.",
-                discovery_health.readiness_failing as i64,
-            ),
-            (
-                "ferrum_service_discovery_tasks_never_succeeded",
-                "Service-discovery tasks that have never published an admitted snapshot.",
-                discovery_health.never_succeeded as i64,
-            ),
-            (
-                "ferrum_service_discovery_last_success_age_seconds_max",
-                "Maximum age in seconds of the staleness anchor across service-discovery tasks (task start when no snapshot has ever been published).",
-                discovery_health.max_anchor_age_seconds as i64,
-            ),
-        ] {
-            output.push_str(&format!("# HELP {name} {help}\n"));
-            output.push_str(&format!("# TYPE {name} gauge\n"));
-            render_process_gauge(&mut output, name, value, &ns_label);
-        }
-
-        // Compression codec admission / worker outcomes (process-wide).
-        let compression_codec = crate::plugins::compression::compression_codec_metrics();
-        for (name, help, value) in [
-            (
-                "ferrum_compression_codec_admitted_total",
-                "Compression codec jobs admitted to the bounded spawn_blocking pool.",
-                compression_codec.admitted,
-            ),
-            (
-                "ferrum_compression_codec_saturated_total",
-                "Compression codec admission refusals when the bounded pool is saturated.",
-                compression_codec.saturated,
-            ),
-            (
-                "ferrum_compression_codec_join_failures_total",
-                "Compression codec spawn_blocking tasks that failed to join.",
-                compression_codec.join_failures,
-            ),
-            (
-                "ferrum_compression_codec_worker_failures_total",
-                "Compression codec worker errors (encode/decode failures inside spawn_blocking).",
-                compression_codec.worker_failures,
-            ),
-            (
-                "ferrum_compression_response_buffer_admitted_total",
-                "Response-compression buffer admissions granted (bounds bodies collected for compression).",
-                compression_codec.response_buffer_admitted,
-            ),
-            (
-                "ferrum_compression_response_buffer_saturated_total",
-                "Response-compression buffer admission refusals; the response streams identity (or 406) instead.",
-                compression_codec.response_buffer_saturated,
-            ),
-        ] {
-            output.push_str(&format!("# HELP {name} {help}\n"));
-            output.push_str(&format!("# TYPE {name} counter\n"));
-            render_process_counter(&mut output, name, value, &ns_label);
-        }
-
-        // Admin audit delivery pipeline (issue #2421). Process-wide counters
-        // and bounded-backlog gauges so an operator can reconcile committed
-        // mutations against durable audit rows. Values only — no actor subject,
-        // token, diff, resource id, or spool path ever reaches the exposition,
-        // and the single `reason` label comes from a closed `&'static str` set.
-        let audit_pipeline = crate::admin::audit::pipeline_metrics_snapshot();
-        for (name, help, value) in [
-            (
-                "ferrum_admin_audit_events_accepted_total",
-                "Admin audit events accepted from a committed admin mutation.",
-                audit_pipeline.accepted_total,
-            ),
-            (
-                "ferrum_admin_audit_intents_prepared_total",
-                "Pre-mutation admin audit intents made durable (fsynced) before the configuration mutation was invoked.",
-                audit_pipeline.prepared_total,
-            ),
-            (
-                "ferrum_admin_audit_events_finalized_total",
-                "Admin audit intents durably finalized with the mutation's known outcome.",
-                audit_pipeline.finalized_total,
-            ),
-            (
-                "ferrum_admin_audit_unknown_outcome_total",
-                "Prepared admin audit records whose trustworthy outcome observer was lost to process exit or request cancellation.",
-                audit_pipeline.unknown_outcome_total,
-            ),
-            (
-                "ferrum_admin_audit_events_enqueued_total",
-                "Admin audit events admitted to the bounded in-memory delivery queue.",
-                audit_pipeline.enqueued_total,
-            ),
-            (
-                "ferrum_admin_audit_events_delivered_total",
-                "Admin audit events accepted by the configured database backend.",
-                audit_pipeline.delivered_total,
-            ),
-            (
-                "ferrum_admin_audit_events_replayed_total",
-                "Durable admin audit records re-read from the spool for delivery (restart, queue overflow, or an expired shutdown drain).",
-                audit_pipeline.replayed_total,
-            ),
-            (
-                "ferrum_admin_audit_delivery_retries_total",
-                "Bounded-backoff retries scheduled after a transient admin audit delivery failure.",
-                audit_pipeline.retries_total,
-            ),
-            (
-                "ferrum_admin_audit_delivery_failures_total",
-                "Admin audit delivery attempts that returned an error from the database backend.",
-                audit_pipeline.delivery_failures_total,
-            ),
-            (
-                "ferrum_admin_audit_events_retained_total",
-                "Admin audit events that exhausted the delivery-attempt budget and were retained for operator remediation.",
-                audit_pipeline.retained_total,
-            ),
-            (
-                "ferrum_admin_audit_corrupt_records_total",
-                "Durable admin audit records quarantined as corrupt (bad version, unparseable, oversized, or id mismatch).",
-                audit_pipeline.corrupt_records_total,
-            ),
-            (
-                "ferrum_admin_audit_destination_mismatch_total",
-                "Durable admin audit records quarantined because they target a different database or namespace destination.",
-                audit_pipeline.destination_mismatch_total,
-            ),
-            (
-                "ferrum_admin_audit_truncated_diffs_total",
-                "Admin audit events whose diff was replaced by a redacted marker because it exceeded the durable record ceiling.",
-                audit_pipeline.truncated_diffs_total,
-            ),
-            (
-                "ferrum_admin_audit_fail_closed_rejections_total",
-                "Admin mutations refused up front because the audit pipeline is unavailable under the fail_closed policy.",
-                audit_pipeline.fail_closed_rejections_total,
-            ),
-            (
-                "ferrum_admin_audit_fail_open_unaudited_mutations_total",
-                "Admin mutations allowed to proceed without durable pre-mutation audit evidence under the fail_open policy.",
-                audit_pipeline.fail_open_unaudited_mutations_total,
-            ),
-        ] {
-            output.push_str(&format!("# HELP {name} {help}\n"));
-            output.push_str(&format!("# TYPE {name} counter\n"));
-            render_process_counter(&mut output, name, value, &ns_label);
-        }
+        output.push_str(
+            "# HELP ferrum_database_mtls_dns_admission_fences_retained mTLS DNS admission fences retained in this process after an uncertain protected config-store mutation outcome. Admissions for a fenced namespace fail closed; reconnect and failover are not blocked.\n",
+        );
+        output.push_str("# TYPE ferrum_database_mtls_dns_admission_fences_retained gauge\n");
+        render_process_counter(
+            &mut output,
+            "ferrum_database_mtls_dns_admission_fences_retained",
+            self.mtls_dns_admission_fences_retained
+                .load(Ordering::Relaxed),
+            &ns_label,
+        );
         output.push_str(
             "# HELP ferrum_admin_read_only_rejected_mutations_total Admin configuration mutations refused because the Admin API is in read-only mode.\n",
         );
@@ -4338,82 +5835,6 @@ impl MetricsRegistry {
                 .load(Ordering::Relaxed),
             &ns_label,
         );
-        output.push_str(
-            "# HELP ferrum_admin_audit_events_dropped_total Admin audit events lost without a durable record, by reason.\n",
-        );
-        output.push_str("# TYPE ferrum_admin_audit_events_dropped_total counter\n");
-        // Emit every reason bucket even at zero so dashboards can pin them.
-        for (reason, value) in [
-            (
-                "durable_handoff_failed",
-                audit_pipeline.dropped_durable_handoff_failed_total,
-            ),
-            (
-                "no_durable_spool",
-                audit_pipeline.dropped_no_durable_spool_total,
-            ),
-            (
-                "retained_capacity",
-                audit_pipeline.dropped_retained_capacity_total,
-            ),
-        ] {
-            output.push_str(&format!(
-                "ferrum_admin_audit_events_dropped_total{{reason=\"{reason}\"{ns_label}}} {value}\n"
-            ));
-        }
-        let audit_status = crate::admin::audit::pipeline_status();
-        for (name, help, value) in [
-            (
-                "ferrum_admin_audit_queue_depth",
-                "Admin audit events currently waiting in the bounded in-memory delivery queue.",
-                audit_pipeline.queue_depth as i64,
-            ),
-            (
-                "ferrum_admin_audit_queue_capacity",
-                "Configured depth of the bounded in-memory admin audit delivery queue.",
-                audit_status.queue_capacity as i64,
-            ),
-            (
-                "ferrum_admin_audit_delivery_in_flight",
-                "Admin audit delivery attempts currently in flight.",
-                audit_pipeline.delivery_in_flight as i64,
-            ),
-            (
-                "ferrum_admin_audit_spool_prepared_records",
-                "Durable pre-mutation admin audit intents awaiting finalization.",
-                audit_pipeline.spool_prepared_records as i64,
-            ),
-            (
-                "ferrum_admin_audit_spool_pending_records",
-                "Durable admin audit records awaiting delivery (O(1) admission counter; a saturated background scan reports a floor).",
-                audit_pipeline.spool_pending_records as i64,
-            ),
-            (
-                "ferrum_admin_audit_retained_records",
-                "Durable admin audit records retained as unrecoverable for operator remediation.",
-                audit_pipeline.spool_retained_records as i64,
-            ),
-            (
-                "ferrum_admin_audit_available",
-                "Whether the admin audit pipeline can durably record committed mutations (1) or not (0).",
-                i64::from(audit_status.available),
-            ),
-            (
-                "ferrum_admin_audit_degraded",
-                "Sticky evidence that admin audit records were corrupted, retained as unrecoverable, or permanently discarded (1) or not (0). A later successful delivery does not clear it.",
-                i64::from(audit_status.degraded),
-            ),
-            (
-                "ferrum_admin_audit_evidence_lost",
-                "Whether admin audit evidence has been permanently discarded (1) or not (0). Never clears.",
-                i64::from(audit_status.evidence_lost),
-            ),
-        ] {
-            output.push_str(&format!("# HELP {name} {help}\n"));
-            output.push_str(&format!("# TYPE {name} gauge\n"));
-            render_process_gauge(&mut output, name, value, &ns_label);
-        }
-
         output.push_str(
             "# HELP ferrum_ai_federation_circuits_open Current ai_federation provider circuits in open or half-open recovery state.\n",
         );
@@ -4448,37 +5869,52 @@ impl MetricsRegistry {
                     .load(Ordering::Relaxed),
             ),
         ] {
-            output.push_str(&format!("# HELP {name} {help}\n"));
-            output.push_str(&format!("# TYPE {name} counter\n"));
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} counter");
             render_process_counter(&mut output, name, value, &ns_label);
         }
 
-        let amp = crate::udp_amplification::metrics_snapshot();
-        for (name, help, value) in [
+        if !self.ai_federation_provider_circuits_open.is_empty() {
+            output.push_str(
+                "# HELP ferrum_ai_federation_provider_circuits_open Current ai_federation circuits in open or half-open recovery state, by configured provider name.\n",
+            );
+            output.push_str("# TYPE ferrum_ai_federation_provider_circuits_open gauge\n");
+            for entry in self.ai_federation_provider_circuits_open.iter() {
+                let provider = escape_label_value(entry.key());
+                let _ = writeln!(
+                    output,
+                    "ferrum_ai_federation_provider_circuits_open{{provider=\"{}\"{}}} {}",
+                    provider,
+                    ns_label,
+                    *entry.value()
+                );
+            }
+        }
+        for (name, help, map) in [
             (
-                "ferrum_udp_amplification_responses_allowed_total",
-                "UDP backend responses admitted by the per-request amplification budget.",
-                amp.responses_allowed,
+                "ferrum_ai_federation_provider_circuits_opened_total",
+                "ai_federation circuit closed-to-open transitions, by configured provider name.",
+                &self.ai_federation_provider_circuits_opened,
             ),
             (
-                "ferrum_udp_amplification_responses_dropped_total",
-                "UDP backend responses dropped for exceeding the per-request amplification budget.",
-                amp.responses_dropped,
-            ),
-            (
-                "ferrum_udp_amplification_policy_invalid_total",
-                "UDPResponseAmplificationPolicy admission refusals: one per invalid, unauthorized, or unresolved policy object in each translation pass (repeats across passes); otherwise-valid policies that lose a conflict are not counted.",
-                amp.policy_invalid,
-            ),
-            (
-                "ferrum_udp_amplification_unlimited_total",
-                "UDP/DTLS sessions admitted without a response-amplification limit.",
-                amp.policy_unlimited,
+                "ferrum_ai_federation_provider_circuits_closed_total",
+                "ai_federation circuit half-open recoveries, by configured provider name.",
+                &self.ai_federation_provider_circuits_closed,
             ),
         ] {
-            output.push_str(&format!("# HELP {name} {help}\n"));
-            output.push_str(&format!("# TYPE {name} counter\n"));
-            render_process_counter(&mut output, name, value, &ns_label);
+            if map.is_empty() {
+                continue;
+            }
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} counter");
+            for entry in map.iter() {
+                let provider = escape_label_value(entry.key());
+                let count = entry.value().value.load(Ordering::Relaxed);
+                let _ = writeln!(
+                    output,
+                    "{name}{{provider=\"{provider}\"{ns_label}}} {count}"
+                );
+            }
         }
 
         // Stream connection counter
@@ -4492,10 +5928,11 @@ impl MetricsRegistry {
                 let count = entry.value().value.load(Ordering::Relaxed);
                 let proxy_id = escape_label_value(&key.proxy_id);
                 let protocol = escape_label_value(&key.protocol);
-                output.push_str(&format!(
-                    "ferrum_stream_connections_total{{proxy_id=\"{}\",protocol=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_stream_connections_total{{proxy_id=\"{}\",protocol=\"{}\"{}}} {}",
                     proxy_id, protocol, ns_label, count
-                ));
+                );
             }
         }
 
@@ -4517,6 +5954,23 @@ impl MetricsRegistry {
             }
         }
 
+        // `tcp_connection_throttle` refusals. Emitted only once one occurred.
+        if !self.tcp_connection_throttle_rejections.is_empty() {
+            output.push_str(
+                "# HELP ferrum_tcp_connection_throttle_rejections_total TCP connections refused by tcp_connection_throttle because the connection's Consumer or client-IP key was at max_connections_per_key.\n",
+            );
+            output.push_str("# TYPE ferrum_tcp_connection_throttle_rejections_total counter\n");
+            for entry in self.tcp_connection_throttle_rejections.iter() {
+                let count = entry.value().value.load(Ordering::Relaxed);
+                let proxy_id = escape_label_value(entry.key());
+                let _ = writeln!(
+                    output,
+                    "ferrum_tcp_connection_throttle_rejections_total{{proxy_id=\"{}\"{}}} {}",
+                    proxy_id, ns_label, count
+                );
+            }
+        }
+
         if !self.ws_session_counter.is_empty() {
             output.push_str(
                 "# HELP ferrum_websocket_sessions_total Completed WebSocket sessions by bounded terminal classification.\n",
@@ -4526,8 +5980,9 @@ impl MetricsRegistry {
                 let key = entry.key();
                 let count = entry.value().value.load(Ordering::Relaxed);
                 let proxy_id = escape_label_value(&key.proxy_id);
-                output.push_str(&format!(
-                    "ferrum_websocket_sessions_total{{proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",termination_reason=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_websocket_sessions_total{{proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",termination_reason=\"{}\"{}}} {}",
                     proxy_id,
                     key.result,
                     key.direction,
@@ -4536,7 +5991,7 @@ impl MetricsRegistry {
                     key.termination_reason,
                     ns_label,
                     count
-                ));
+                );
             }
         }
 
@@ -4559,10 +6014,11 @@ impl MetricsRegistry {
                 let key = entry.key();
                 let count = entry.value().value.load(Ordering::Relaxed);
                 let proxy_id = escape_label_value(&key.proxy_id);
-                output.push_str(&format!(
-                    "ferrum_websocket_bytes_total{{proxy_id=\"{}\",direction=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_websocket_bytes_total{{proxy_id=\"{}\",direction=\"{}\"{}}} {}",
                     proxy_id, key.direction, ns_label, count
-                ));
+                );
             }
         }
 
@@ -4575,10 +6031,11 @@ impl MetricsRegistry {
                 let key = entry.key();
                 let count = entry.value().value.load(Ordering::Relaxed);
                 let proxy_id = escape_label_value(&key.proxy_id);
-                output.push_str(&format!(
-                    "ferrum_websocket_frames_total{{proxy_id=\"{}\",direction=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_websocket_frames_total{{proxy_id=\"{}\",direction=\"{}\"{}}} {}",
                     proxy_id, key.direction, ns_label, count
-                ));
+                );
             }
         }
 
@@ -4593,16 +6050,88 @@ impl MetricsRegistry {
                 let key = entry.key();
                 let count = entry.value().value.load(Ordering::Relaxed);
                 let proxy_id = escape_label_value(&key.proxy_id);
-                output.push_str(&format!(
-                    "ferrum_client_disconnects_total{{proxy_id=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_client_disconnects_total{{proxy_id=\"{}\"{}}} {}",
                     proxy_id, ns_label, count
-                ));
+                );
             }
         }
 
-        // Stream disconnect counter, labelled by cause and direction. Unlike
-        // the connection counter this is always emitted because graceful vs.
-        // error ratios are useful to operators even on well-behaved traffic.
+        // Per-proxy HTTP-family body bandwidth (request/response body bytes).
+        for (map, name, help) in [
+            (
+                &self.request_body_bytes_counter,
+                "ferrum_request_body_bytes_total",
+                "HTTP-family request body bytes relayed from clients to backends.",
+            ),
+            (
+                &self.response_body_bytes_counter,
+                "ferrum_response_body_bytes_total",
+                "HTTP-family response body bytes relayed from backends to clients.",
+            ),
+        ] {
+            if map.is_empty() {
+                continue;
+            }
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} counter");
+            for entry in map.iter() {
+                let count = entry.value().value.load(Ordering::Relaxed);
+                let proxy_id = escape_label_value(entry.key());
+                let _ = writeln!(
+                    output,
+                    "{name}{{proxy_id=\"{}\"{}}} {}",
+                    proxy_id, ns_label, count
+                );
+            }
+        }
+
+        // adaptive_concurrency shed / shadow would-reject / key-cap bypass
+        // decisions. Emitted only once a decision has occurred.
+        if self
+            .adaptive_concurrency_decisions
+            .iter()
+            .any(|counters| !counters.is_empty())
+        {
+            output.push_str(
+                "# HELP ferrum_adaptive_concurrency_decisions_total adaptive_concurrency admission decisions other than an ordinary within-limit admit, by proxy and decision.\n",
+            );
+            output.push_str("# TYPE ferrum_adaptive_concurrency_decisions_total counter\n");
+            for decision in AdaptiveConcurrencyDecision::ALL {
+                let label = decision.label();
+                for entry in self.adaptive_concurrency_decisions[decision.index()].iter() {
+                    let count = entry.value().value.load(Ordering::Relaxed);
+                    let proxy_id = escape_label_value(entry.key());
+                    let _ = writeln!(
+                        output,
+                        "ferrum_adaptive_concurrency_decisions_total{{proxy_id=\"{proxy_id}\",decision=\"{label}\"{ns_label}}} {count}"
+                    );
+                }
+            }
+        }
+
+        // Pre-routing rejections that never reach a plugin (unmatched 404s,
+        // mesh REGISTRY_ONLY refusals). Emitted only once one has occurred.
+        if !self.unmatched_request_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_unmatched_requests_total Requests refused before routing because no proxy matched or the mesh REGISTRY_ONLY policy refused an outbound route miss, by closed reason and response status.\n",
+            );
+            output.push_str("# TYPE ferrum_unmatched_requests_total counter\n");
+            for entry in self.unmatched_request_counter.iter() {
+                let key = entry.key();
+                let count = entry.value().load(Ordering::Relaxed);
+                let _ = writeln!(
+                    output,
+                    "ferrum_unmatched_requests_total{{reason=\"{}\",status_code=\"{}\"{}}} {}",
+                    key.reason, key.status_code, ns_label, count
+                );
+            }
+        }
+
+        // Stream disconnect counter, labelled by cause and direction. Recorded
+        // for every stream (clean shutdowns included); emitted once any series
+        // exists, like the connection counter.
         if !self.stream_disconnect_counter.is_empty() {
             output.push_str(
                 "# HELP ferrum_stream_disconnects_total Stream disconnects (TCP/UDP) by cause, direction, and optional error_class.\n",
@@ -4616,15 +6145,17 @@ impl MetricsRegistry {
                 // cause, direction, and error_class are &'static str from
                 // bounded enums — no escaping needed (snake_case ASCII only).
                 if let Some(error_class) = key.error_class {
-                    output.push_str(&format!(
-                        "ferrum_stream_disconnects_total{{proxy_id=\"{}\",protocol=\"{}\",cause=\"{}\",direction=\"{}\",error_class=\"{}\"{}}} {}\n",
+                    let _ = writeln!(
+                        output,
+                        "ferrum_stream_disconnects_total{{proxy_id=\"{}\",protocol=\"{}\",cause=\"{}\",direction=\"{}\",error_class=\"{}\"{}}} {}",
                         proxy_id, protocol, key.cause, key.direction, error_class, ns_label, count
-                    ));
+                    );
                 } else {
-                    output.push_str(&format!(
-                        "ferrum_stream_disconnects_total{{proxy_id=\"{}\",protocol=\"{}\",cause=\"{}\",direction=\"{}\"{}}} {}\n",
+                    let _ = writeln!(
+                        output,
+                        "ferrum_stream_disconnects_total{{proxy_id=\"{}\",protocol=\"{}\",cause=\"{}\",direction=\"{}\"{}}} {}",
                         proxy_id, protocol, key.cause, key.direction, ns_label, count
-                    ));
+                    );
                 }
             }
         }
@@ -4636,10 +6167,11 @@ impl MetricsRegistry {
             "# HELP ferrum_mesh_dns_upstream_id_exhaustions_total Mesh DNS upstream transaction ID exhaustion events.\n",
         );
         output.push_str("# TYPE ferrum_mesh_dns_upstream_id_exhaustions_total counter\n");
-        output.push_str(&format!(
-            "ferrum_mesh_dns_upstream_id_exhaustions_total {}\n",
+        let _ = writeln!(
+            output,
+            "ferrum_mesh_dns_upstream_id_exhaustions_total {}",
             mesh_dns_exhaustions
-        ));
+        );
 
         if !self.hbone_relay_failure_counter.is_empty() {
             output.push_str(
@@ -4651,10 +6183,11 @@ impl MetricsRegistry {
                 let count = entry.value().value.load(Ordering::Relaxed);
                 let proxy_id = escape_label_value(&key.proxy_id);
                 let error_class = escape_label_value(key.error_class);
-                output.push_str(&format!(
-                    "ferrum_mesh_hbone_relay_failures_total{{proxy_id=\"{}\",direction=\"{}\",error_class=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_mesh_hbone_relay_failures_total{{proxy_id=\"{}\",direction=\"{}\",error_class=\"{}\"{}}} {}",
                     proxy_id, key.direction, error_class, ns_label, count
-                ));
+                );
             }
         }
 
@@ -4667,10 +6200,11 @@ impl MetricsRegistry {
                 let key = entry.key();
                 let count = entry.value().value.load(Ordering::Relaxed);
                 let proxy_id = escape_label_value(&key.proxy_id);
-                output.push_str(&format!(
-                    "ferrum_mesh_hbone_tunnel_revocations_total{{proxy_id=\"{}\",reason=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_mesh_hbone_tunnel_revocations_total{{proxy_id=\"{}\",reason=\"{}\"{}}} {}",
                     proxy_id, key.reason, ns_label, count
-                ));
+                );
             }
         }
 
@@ -4682,10 +6216,11 @@ impl MetricsRegistry {
             for entry in self.hbone_inner_pool_event_counter.iter() {
                 let key = entry.key();
                 let count = entry.value().value.load(Ordering::Relaxed);
-                output.push_str(&format!(
-                    "ferrum_mesh_hbone_inner_pool_events_total{{protocol=\"{}\",event=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_mesh_hbone_inner_pool_events_total{{protocol=\"{}\",event=\"{}\"{}}} {}",
                     key.protocol, key.event, ns_label, count
-                ));
+                );
             }
         }
 
@@ -4697,10 +6232,11 @@ impl MetricsRegistry {
             for entry in self.mesh_tcp_egress_connection_counter.iter() {
                 let key = entry.key();
                 let count = entry.value().value.load(Ordering::Relaxed);
-                output.push_str(&format!(
-                    "ferrum_mesh_tcp_egress_connections_total{{transport=\"{}\",result=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_mesh_tcp_egress_connections_total{{transport=\"{}\",result=\"{}\"{}}} {}",
                     key.transport, key.result, ns_label, count
-                ));
+                );
             }
         }
 
@@ -4716,17 +6252,19 @@ impl MetricsRegistry {
                     let counters = host_entry.value();
                     let admit = counters.admit.value.load(Ordering::Relaxed);
                     if admit > 0 {
-                        output.push_str(&format!(
-                            "ferrum_mesh_outbound_registry_decisions_total{{mesh_namespace=\"{}\",host=\"{}\",decision=\"admit\"{}}} {}\n",
+                        let _ = writeln!(
+                            output,
+                            "ferrum_mesh_outbound_registry_decisions_total{{mesh_namespace=\"{}\",host=\"{}\",decision=\"admit\"{}}} {}",
                             mesh_namespace, host, ns_label, admit
-                        ));
+                        );
                     }
                     let deny = counters.deny.value.load(Ordering::Relaxed);
                     if deny > 0 {
-                        output.push_str(&format!(
-                            "ferrum_mesh_outbound_registry_decisions_total{{mesh_namespace=\"{}\",host=\"{}\",decision=\"deny\"{}}} {}\n",
+                        let _ = writeln!(
+                            output,
+                            "ferrum_mesh_outbound_registry_decisions_total{{mesh_namespace=\"{}\",host=\"{}\",decision=\"deny\"{}}} {}",
                             mesh_namespace, host, ns_label, deny
-                        ));
+                        );
                     }
                 }
             }
@@ -4748,17 +6286,19 @@ impl MetricsRegistry {
                     let counters = protocol_entry.value();
                     let admit = counters.admit.value.load(Ordering::Relaxed);
                     if admit > 0 {
-                        output.push_str(&format!(
-                            "ferrum_mesh_outbound_registry_stream_decisions_total{{mesh_namespace=\"{}\",protocol=\"{}\",decision=\"admit\"{}}} {}\n",
+                        let _ = writeln!(
+                            output,
+                            "ferrum_mesh_outbound_registry_stream_decisions_total{{mesh_namespace=\"{}\",protocol=\"{}\",decision=\"admit\"{}}} {}",
                             mesh_namespace, protocol, ns_label, admit
-                        ));
+                        );
                     }
                     let deny = counters.deny.value.load(Ordering::Relaxed);
                     if deny > 0 {
-                        output.push_str(&format!(
-                            "ferrum_mesh_outbound_registry_stream_decisions_total{{mesh_namespace=\"{}\",protocol=\"{}\",decision=\"deny\"{}}} {}\n",
+                        let _ = writeln!(
+                            output,
+                            "ferrum_mesh_outbound_registry_stream_decisions_total{{mesh_namespace=\"{}\",protocol=\"{}\",decision=\"deny\"{}}} {}",
                             mesh_namespace, protocol, ns_label, deny
-                        ));
+                        );
                     }
                 }
             }
@@ -4788,14 +6328,16 @@ impl MetricsRegistry {
                     .value()
                     .not_before_unix_seconds
                     .load(Ordering::Relaxed);
-                output.push_str(&format!(
-                    "ferrum_tls_cert_expiry_seconds{{cert_id=\"{}\",surface=\"{}\",source_kind=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_tls_cert_expiry_seconds{{cert_id=\"{}\",surface=\"{}\",source_kind=\"{}\"{}}} {}",
                     cert_id, surface, source_kind, ns_label, expiry
-                ));
-                output.push_str(&format!(
-                    "ferrum_tls_cert_not_before_seconds{{cert_id=\"{}\",surface=\"{}\",source_kind=\"{}\"{}}} {}\n",
+                );
+                let _ = writeln!(
+                    output,
+                    "ferrum_tls_cert_not_before_seconds{{cert_id=\"{}\",surface=\"{}\",source_kind=\"{}\"{}}} {}",
                     cert_id, surface, source_kind, ns_label, not_before
-                ));
+                );
             }
         }
 
@@ -4815,10 +6357,11 @@ impl MetricsRegistry {
                     .next_update_unix_seconds
                     .load(Ordering::Relaxed)
                     .saturating_sub(now_ts);
-                output.push_str(&format!(
-                    "ferrum_tls_revocation_expiry_seconds{{material_id=\"{}\",kind=\"{}\",source_kind=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_tls_revocation_expiry_seconds{{material_id=\"{}\",kind=\"{}\",source_kind=\"{}\"{}}} {}",
                     material_id, kind, source_kind, ns_label, expiry
-                ));
+                );
             }
         }
 
@@ -4861,10 +6404,11 @@ impl MetricsRegistry {
                 let surface = escape_label_value(&key.surface);
                 let outcome = escape_label_value(&key.outcome);
                 let count = entry.value().value.load(Ordering::Relaxed);
-                output.push_str(&format!(
-                    "ferrum_tls_source_refresh_total{{scheme=\"{}\",kind=\"{}\",surface=\"{}\",outcome=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_tls_source_refresh_total{{scheme=\"{}\",kind=\"{}\",surface=\"{}\",outcome=\"{}\"{}}} {}",
                     scheme, kind, surface, outcome, ns_label, count
-                ));
+                );
             }
         }
 
@@ -4894,10 +6438,11 @@ impl MetricsRegistry {
                 let kind = escape_label_value(&key.kind);
                 let reason = escape_label_value(&key.reason);
                 let count = entry.value().value.load(Ordering::Relaxed);
-                output.push_str(&format!(
-                    "ferrum_tls_source_fetch_failures_total{{scheme=\"{}\",kind=\"{}\",reason=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_tls_source_fetch_failures_total{{scheme=\"{}\",kind=\"{}\",reason=\"{}\"{}}} {}",
                     scheme, kind, reason, ns_label, count
-                ));
+                );
             }
         }
 
@@ -4912,10 +6457,11 @@ impl MetricsRegistry {
                 let reason = escape_label_value(&key.reason);
                 let outcome = escape_label_value(&key.outcome);
                 let count = entry.value().value.load(Ordering::Relaxed);
-                output.push_str(&format!(
-                    "ferrum_tls_cert_rotations_total{{cert_id=\"{}\",reason=\"{}\",outcome=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_tls_cert_rotations_total{{cert_id=\"{}\",reason=\"{}\",outcome=\"{}\"{}}} {}",
                     cert_id, reason, outcome, ns_label, count
-                ));
+                );
             }
         }
 
@@ -4925,12 +6471,13 @@ impl MetricsRegistry {
         output.push_str("# TYPE ferrum_tls_store_document_bytes gauge\n");
         for kind in crate::tls::shared_store::TlsPersistentStoreKind::ALL {
             let bytes = self.tls_store_document_bytes[kind.index()].load(Ordering::Relaxed);
-            output.push_str(&format!(
-                "ferrum_tls_store_document_bytes{{store=\"{}\"{}}} {}\n",
+            let _ = writeln!(
+                output,
+                "ferrum_tls_store_document_bytes{{store=\"{}\"{}}} {}",
                 kind.as_str(),
                 ns_label,
                 bytes
-            ));
+            );
         }
         output.push_str(
             "# HELP ferrum_tls_store_record_count Current logical record count in a persistent TLS store.\n",
@@ -4938,12 +6485,13 @@ impl MetricsRegistry {
         output.push_str("# TYPE ferrum_tls_store_record_count gauge\n");
         for kind in crate::tls::shared_store::TlsPersistentStoreKind::ALL {
             let records = self.tls_store_record_count[kind.index()].load(Ordering::Relaxed);
-            output.push_str(&format!(
-                "ferrum_tls_store_record_count{{store=\"{}\"{}}} {}\n",
+            let _ = writeln!(
+                output,
+                "ferrum_tls_store_record_count{{store=\"{}\"{}}} {}",
                 kind.as_str(),
                 ns_label,
                 records
-            ));
+            );
         }
         output.push_str(
             "# HELP ferrum_tls_store_oversized_total Oversized persistent TLS store document refusals by store and direction.\n",
@@ -4956,13 +6504,14 @@ impl MetricsRegistry {
             ] {
                 let count = self.tls_store_oversized_total[kind.index()][direction as usize]
                     .load(Ordering::Relaxed);
-                output.push_str(&format!(
-                    "ferrum_tls_store_oversized_total{{store=\"{}\",direction=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_tls_store_oversized_total{{store=\"{}\",direction=\"{}\"{}}} {}",
                     kind.as_str(),
                     direction.as_str(),
                     ns_label,
                     count
-                ));
+                );
             }
         }
         output.push_str(
@@ -4976,13 +6525,14 @@ impl MetricsRegistry {
             ] {
                 let count = self.tls_store_admission_rejected_total[kind.index()][reason as usize]
                     .load(Ordering::Relaxed);
-                output.push_str(&format!(
-                    "ferrum_tls_store_admission_rejected_total{{store=\"{}\",reason=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_tls_store_admission_rejected_total{{store=\"{}\",reason=\"{}\"{}}} {}",
                     kind.as_str(),
                     reason.as_str(),
                     ns_label,
                     count
-                ));
+                );
             }
         }
         output.push_str(
@@ -5010,10 +6560,11 @@ impl MetricsRegistry {
                     .get(category)
                     .copied()
                     .unwrap_or(0);
-                output.push_str(&format!(
-                    "ferrum_database_delta_rejections_total{{resource_category=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_database_delta_rejections_total{{resource_category=\"{}\"{}}} {}",
                     category, ns_label, count
-                ));
+                );
             }
 
             output.push_str(
@@ -5038,10 +6589,11 @@ impl MetricsRegistry {
                 } else {
                     0
                 };
-                output.push_str(&format!(
-                    "ferrum_database_delta_backoff_bucket{{bucket=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_database_delta_backoff_bucket{{bucket=\"{}\"{}}} {}",
                     bucket, ns_label, value
-                ));
+                );
             }
 
             output.push_str(
@@ -5093,10 +6645,11 @@ impl MetricsRegistry {
                     .get(reason)
                     .copied()
                     .unwrap_or(0);
-                output.push_str(&format!(
-                    "ferrum_database_poll_failures_total{{reason=\"{}\"{}}} {}\n",
+                let _ = writeln!(
+                    output,
+                    "ferrum_database_poll_failures_total{{reason=\"{}\"{}}} {}",
                     reason, ns_label, count
-                ));
+                );
             }
 
             output.push_str(
@@ -5139,10 +6692,11 @@ impl MetricsRegistry {
                     } else {
                         0
                     };
-                    output.push_str(&format!(
-                        "ferrum_database_change_stream_degraded_reason{{reason=\"{}\"{}}} {}\n",
+                    let _ = writeln!(
+                        output,
+                        "ferrum_database_change_stream_degraded_reason{{reason=\"{}\"{}}} {}",
                         reason, ns_label, value
-                    ));
+                    );
                 }
 
                 output.push_str(
@@ -5240,422 +6794,6 @@ impl MetricsRegistry {
             );
         }
 
-        // Gateway trust bundles (issue #3727). Fixed cardinality: no namespace,
-        // trust-domain, or resource-id labels — the namespace-scoped view is on
-        // the authenticated admin status surface. Nothing here can carry
-        // PEM/JWKS bytes or a secret/provider URI.
-        {
-            // LABEL-FREE by construction: every series below is rendered with
-            // an empty label set, never `ns_label`. A namespace label here would
-            // be unbounded on a cluster-wide CP and would publish
-            // tenant-identifying names to any `/metrics` reader; the
-            // namespace-scoped view lives on the authenticated
-            // `GET /gateway-trust/status` surface instead. There is likewise no
-            // per-namespace revision gauge: a process-wide "published revision"
-            // would be a last-writer-wins lie on a multi-namespace CP.
-            const NO_LABELS: &str = "";
-            let trust = crate::config::gateway_trust::observability_snapshot();
-            output.push_str(
-                "# HELP ferrum_gateway_trust_bundle_published_generations_total Gateway trust-bundle generations carrying a database-sourced record that reached the live configuration swap; a generation refused by the ambiguous-authority rule is not counted.\n",
-            );
-            output.push_str(
-                "# TYPE ferrum_gateway_trust_bundle_published_generations_total counter\n",
-            );
-            render_process_counter(
-                &mut output,
-                "ferrum_gateway_trust_bundle_published_generations_total",
-                trust.published_generations_total,
-                NO_LABELS,
-            );
-
-            output.push_str(
-                "# HELP ferrum_gateway_trust_bundle_load_rejections_total Gateway trust-bundle candidates refused before the live swap; the previous valid generation stays active.\n",
-            );
-            output.push_str("# TYPE ferrum_gateway_trust_bundle_load_rejections_total counter\n");
-            render_process_counter(
-                &mut output,
-                "ferrum_gateway_trust_bundle_load_rejections_total",
-                trust.load_rejections_total,
-                NO_LABELS,
-            );
-
-            output.push_str(
-                "# HELP ferrum_gateway_trust_bundle_ambiguous_authority_total Publications that found both a database record and a file-sourced trust value and kept the previously accepted trust.\n",
-            );
-            output
-                .push_str("# TYPE ferrum_gateway_trust_bundle_ambiguous_authority_total counter\n");
-            render_process_counter(
-                &mut output,
-                "ferrum_gateway_trust_bundle_ambiguous_authority_total",
-                trust.ambiguous_authority_total,
-                NO_LABELS,
-            );
-
-            output.push_str(
-                "# HELP ferrum_gateway_trust_bundle_last_published_unix_seconds Unix time of the most recently published gateway trust-bundle generation; 0 when none.\n",
-            );
-            output
-                .push_str("# TYPE ferrum_gateway_trust_bundle_last_published_unix_seconds gauge\n");
-            render_process_counter(
-                &mut output,
-                "ferrum_gateway_trust_bundle_last_published_unix_seconds",
-                trust.last_published_unix_seconds,
-                NO_LABELS,
-            );
-        }
-
-        let admin_conn_metrics = self.admin_conn_metrics.load_full();
-        if let Some(limiter) = admin_conn_metrics.as_ref() {
-            let snapshot = limiter.snapshot();
-            output.push_str(
-                "# HELP ferrum_admin_active_connections Admin/management-plane connections currently in flight.\n",
-            );
-            output.push_str("# TYPE ferrum_admin_active_connections gauge\n");
-            render_process_counter(
-                &mut output,
-                "ferrum_admin_active_connections",
-                snapshot.active_connections,
-                &ns_label,
-            );
-            output.push_str(
-                "# HELP ferrum_admin_max_connections Configured admin connection cap (0 = unlimited).\n",
-            );
-            output.push_str("# TYPE ferrum_admin_max_connections gauge\n");
-            render_process_counter(
-                &mut output,
-                "ferrum_admin_max_connections",
-                snapshot.max_connections as u64,
-                &ns_label,
-            );
-            output.push_str(
-                "# HELP ferrum_admin_max_connections_per_ip Configured per-source-IP admin connection cap (0 = unlimited).\n",
-            );
-            output.push_str("# TYPE ferrum_admin_max_connections_per_ip gauge\n");
-            render_process_counter(
-                &mut output,
-                "ferrum_admin_max_connections_per_ip",
-                snapshot.max_connections_per_ip as u64,
-                &ns_label,
-            );
-            output.push_str(
-                "# HELP ferrum_admin_rejected_connections_total Admin connections rejected by the connection limiter, by reason.\n",
-            );
-            output.push_str("# TYPE ferrum_admin_rejected_connections_total counter\n");
-            // Emit both reason buckets even at zero so dashboards can pin them.
-            for (reason, value) in [
-                ("max_connections", snapshot.rejected_max_connections),
-                (
-                    "max_connections_per_ip",
-                    snapshot.rejected_max_connections_per_ip,
-                ),
-            ] {
-                output.push_str(&format!(
-                    "ferrum_admin_rejected_connections_total{{reason=\"{reason}\"{ns_label}}} {value}\n"
-                ));
-            }
-        }
-
-        // CP gRPC pre-authentication connection admission (advisory
-        // GHSA-2xqr-7j7p-77qp). Fixed cardinality: no source-IP label, and the
-        // reason labels come from a closed `&'static str` set.
-        let cp_grpc_conn_metrics = self.cp_grpc_conn_metrics.load_full();
-        if let Some(limiter) = cp_grpc_conn_metrics.as_ref() {
-            let snapshot = limiter.snapshot();
-            output.push_str(
-                "# HELP ferrum_cp_grpc_active_connections CP gRPC listener connections currently admitted (pre-handshake through served HTTP/2 session).\n",
-            );
-            output.push_str("# TYPE ferrum_cp_grpc_active_connections gauge\n");
-            render_process_counter(
-                &mut output,
-                "ferrum_cp_grpc_active_connections",
-                snapshot.active_connections,
-                &ns_label,
-            );
-            output.push_str(
-                "# HELP ferrum_cp_grpc_max_connections Configured CP gRPC connection cap (0 = unlimited).\n",
-            );
-            output.push_str("# TYPE ferrum_cp_grpc_max_connections gauge\n");
-            render_process_counter(
-                &mut output,
-                "ferrum_cp_grpc_max_connections",
-                snapshot.max_connections as u64,
-                &ns_label,
-            );
-            output.push_str(
-                "# HELP ferrum_cp_grpc_max_connections_per_ip Configured per-source-IP CP gRPC connection cap (0 = unlimited).\n",
-            );
-            output.push_str("# TYPE ferrum_cp_grpc_max_connections_per_ip gauge\n");
-            render_process_counter(
-                &mut output,
-                "ferrum_cp_grpc_max_connections_per_ip",
-                snapshot.max_connections_per_ip as u64,
-                &ns_label,
-            );
-            output.push_str(
-                "# HELP ferrum_cp_grpc_rejected_connections_total CP gRPC connections rejected before any handshake work was allocated, by reason.\n",
-            );
-            output.push_str("# TYPE ferrum_cp_grpc_rejected_connections_total counter\n");
-            // Emit both reason buckets even at zero so dashboards can pin them.
-            for (reason, value) in [
-                ("max_connections", snapshot.rejected_max_connections),
-                (
-                    "max_connections_per_ip",
-                    snapshot.rejected_max_connections_per_ip,
-                ),
-            ] {
-                output.push_str(&format!(
-                    "ferrum_cp_grpc_rejected_connections_total{{reason=\"{reason}\"{ns_label}}} {value}\n"
-                ));
-            }
-        }
-
-        let node_agent_metrics = self.node_agent_metrics.load_full();
-        if let Some(metrics) = node_agent_metrics.as_ref() {
-            let snapshot = metrics.snapshot();
-            output.push_str(
-                "# HELP ferrum_node_agent_pods_enrolled_total Pods enrolled for node-agent capture.\n",
-            );
-            output.push_str("# TYPE ferrum_node_agent_pods_enrolled_total counter\n");
-            render_process_counter(
-                &mut output,
-                "ferrum_node_agent_pods_enrolled_total",
-                snapshot.pods_enrolled,
-                &ns_label,
-            );
-            output.push_str(
-                "# HELP ferrum_node_agent_pods_unenrolled_total Pods unenrolled from node-agent capture.\n",
-            );
-            output.push_str("# TYPE ferrum_node_agent_pods_unenrolled_total counter\n");
-            render_process_counter(
-                &mut output,
-                "ferrum_node_agent_pods_unenrolled_total",
-                snapshot.pods_unenrolled,
-                &ns_label,
-            );
-            output.push_str(
-                "# HELP ferrum_node_agent_attach_errors_total Node-agent BPF attachment or map update errors.\n",
-            );
-            output.push_str("# TYPE ferrum_node_agent_attach_errors_total counter\n");
-            render_process_counter(
-                &mut output,
-                "ferrum_node_agent_attach_errors_total",
-                snapshot.attach_errors,
-                &ns_label,
-            );
-            output.push_str(
-                "# HELP ferrum_node_agent_pod_annotation_updates_applied_total Mid-life pod includeOutboundPorts annotation changes re-applied to the BPF map.\n",
-            );
-            output.push_str(
-                "# TYPE ferrum_node_agent_pod_annotation_updates_applied_total counter\n",
-            );
-            render_process_counter(
-                &mut output,
-                "ferrum_node_agent_pod_annotation_updates_applied_total",
-                snapshot.pod_annotation_updates_applied,
-                &ns_label,
-            );
-            output.push_str(
-                "# HELP ferrum_node_agent_pod_annotation_updates_failed_total Mid-life pod includeOutboundPorts annotation changes that failed to re-apply (annotation parse error or BPF map write error). Cgroup-id-unavailable retries are intentionally not counted here because they are routinely observed during early pod startup and are retried on the next Apply event.\n",
-            );
-            output
-                .push_str("# TYPE ferrum_node_agent_pod_annotation_updates_failed_total counter\n");
-            render_process_counter(
-                &mut output,
-                "ferrum_node_agent_pod_annotation_updates_failed_total",
-                snapshot.pod_annotation_updates_failed,
-                &ns_label,
-            );
-
-            output.push_str(
-                "# HELP ferrum_node_agent_cni_socket_lifecycle_total Node-agent CNI socket lifecycle failures by bounded reason.\n",
-            );
-            output.push_str("# TYPE ferrum_node_agent_cni_socket_lifecycle_total counter\n");
-            for reason in crate::ebpf::CniSocketLifecycleReason::all() {
-                let value = snapshot.cni_socket_lifecycle[reason as usize];
-                if ns_label.is_empty() {
-                    output.push_str(&format!(
-                        "ferrum_node_agent_cni_socket_lifecycle_total{{reason=\"{}\"}} {}\n",
-                        reason.label(),
-                        value,
-                    ));
-                } else {
-                    output.push_str(&format!(
-                        "ferrum_node_agent_cni_socket_lifecycle_total{{reason=\"{}\"{}}} {}\n",
-                        reason.label(),
-                        ns_label,
-                        value,
-                    ));
-                }
-            }
-
-            output.push_str(
-                "# HELP ferrum_node_agent_cni_calls_total Node-agent CNI plugin RPC outcomes by verb.\n",
-            );
-            output.push_str("# TYPE ferrum_node_agent_cni_calls_total counter\n");
-            for verb in crate::ebpf::CniCallVerb::all() {
-                for outcome in crate::ebpf::CniCallOutcome::all() {
-                    let value = snapshot.cni_calls[verb as usize][outcome as usize];
-                    if ns_label.is_empty() {
-                        output.push_str(&format!(
-                            "ferrum_node_agent_cni_calls_total{{verb=\"{}\",outcome=\"{}\"}} {}\n",
-                            verb.label(),
-                            outcome.label(),
-                            value,
-                        ));
-                    } else {
-                        output.push_str(&format!(
-                            "ferrum_node_agent_cni_calls_total{{verb=\"{}\",outcome=\"{}\"{}}} {}\n",
-                            verb.label(),
-                            outcome.label(),
-                            ns_label,
-                            value,
-                        ));
-                    }
-                }
-            }
-
-            // Capture-state gauge — one hot label from a closed set. This is
-            // the readiness/condition surface operators alert on; the
-            // topology-degraded gauge below explains the first degradation
-            // reason in more detail.
-            output.push_str(
-                "# HELP ferrum_node_agent_capture_state \
-                 Node-agent capture backend condition. Exactly one state label is 1.\n",
-            );
-            output.push_str("# TYPE ferrum_node_agent_capture_state gauge\n");
-            for state in crate::ebpf::NODE_AGENT_CAPTURE_STATES {
-                let value = u64::from(snapshot.capture_state == *state);
-                if ns_label.is_empty() {
-                    output.push_str(&format!(
-                        "ferrum_node_agent_capture_state{{state=\"{}\"}} {}\n",
-                        state, value,
-                    ));
-                } else {
-                    output.push_str(&format!(
-                        "ferrum_node_agent_capture_state{{state=\"{}\"{}}} {}\n",
-                        state, ns_label, value,
-                    ));
-                }
-            }
-
-            // Ingress-interface topology proof. State and reason are closed
-            // enums; configured/expected interface names are deliberately
-            // absent from labels and values to keep cardinality bounded and
-            // avoid exposing operator- or host-controlled strings.
-            let topology = snapshot.ingress_topology;
-            output.push_str(
-                "# HELP ferrum_node_agent_ingress_interface_topology NodeWaypoint ingress-interface topology validation state and bounded reason.\n",
-            );
-            output.push_str("# TYPE ferrum_node_agent_ingress_interface_topology gauge\n");
-            if ns_label.is_empty() {
-                output.push_str(&format!(
-                    "ferrum_node_agent_ingress_interface_topology{{state=\"{}\",reason=\"{}\"}} 1\n",
-                    topology.state.label(),
-                    topology.reason.label(),
-                ));
-            } else {
-                output.push_str(&format!(
-                    "ferrum_node_agent_ingress_interface_topology{{state=\"{}\",reason=\"{}\"{}}} 1\n",
-                    topology.state.label(),
-                    topology.reason.label(),
-                    ns_label,
-                ));
-            }
-            output.push_str(
-                "# HELP ferrum_node_agent_ingress_interface_configured_interfaces Number of explicitly configured ingress interfaces (names are never labels).\n",
-            );
-            output.push_str(
-                "# TYPE ferrum_node_agent_ingress_interface_configured_interfaces gauge\n",
-            );
-            render_process_counter(
-                &mut output,
-                "ferrum_node_agent_ingress_interface_configured_interfaces",
-                u64::from(topology.configured_interfaces),
-                &ns_label,
-            );
-            output.push_str(
-                "# HELP ferrum_node_agent_ingress_interface_expected_interfaces Ingress interfaces established for the node/CNI route topology (names are never labels): the complete required set only when topology validation succeeds; while topology is unavailable, the partial count reached before validation stopped, not readiness or complete route coverage.\n",
-            );
-            output
-                .push_str("# TYPE ferrum_node_agent_ingress_interface_expected_interfaces gauge\n");
-            render_process_counter(
-                &mut output,
-                "ferrum_node_agent_ingress_interface_expected_interfaces",
-                u64::from(topology.expected_interfaces),
-                &ns_label,
-            );
-            output.push_str(
-                "# HELP ferrum_node_agent_ingress_interface_family_required Whether a route family must be covered by the configured interface set.\n",
-            );
-            output.push_str("# TYPE ferrum_node_agent_ingress_interface_family_required gauge\n");
-            for (family, required) in [
-                ("ipv4", topology.ipv4_required),
-                ("ipv6", topology.ipv6_required),
-            ] {
-                if ns_label.is_empty() {
-                    output.push_str(&format!(
-                        "ferrum_node_agent_ingress_interface_family_required{{family=\"{family}\"}} {}\n",
-                        u64::from(required),
-                    ));
-                } else {
-                    output.push_str(&format!(
-                        "ferrum_node_agent_ingress_interface_family_required{{family=\"{family}\"{ns_label}}} {}\n",
-                        u64::from(required),
-                    ));
-                }
-            }
-            output.push_str(
-                "# HELP ferrum_node_agent_ingress_interface_family_covered Whether the required route family is currently proved complete.\n",
-            );
-            output.push_str("# TYPE ferrum_node_agent_ingress_interface_family_covered gauge\n");
-            for (family, covered) in [
-                ("ipv4", topology.ipv4_covered),
-                ("ipv6", topology.ipv6_covered),
-            ] {
-                if ns_label.is_empty() {
-                    output.push_str(&format!(
-                        "ferrum_node_agent_ingress_interface_family_covered{{family=\"{family}\"}} {}\n",
-                        u64::from(covered),
-                    ));
-                } else {
-                    output.push_str(&format!(
-                        "ferrum_node_agent_ingress_interface_family_covered{{family=\"{family}\"{ns_label}}} {}\n",
-                        u64::from(covered),
-                    ));
-                }
-            }
-
-            // Topology-degraded gauge — emitted whenever the node-agent
-            // metrics are registered so dashboards can pin "expected: 0"
-            // even on healthy nodes. `reason` is a closed snake_case set
-            // from KernelProbeResult::degradation_reason (kernel_too_old,
-            // cgroup_v1, bpffs_missing), plus ebpf_feature_disabled when the
-            // binary was built without `--features ebpf` and falls back to the
-            // mock backend (GAP-1b), plus a single "none" series on nominal
-            // nodes — total cardinality is bounded per node.
-            output.push_str(
-                "# HELP ferrum_mesh_node_topology_degraded \
-                 Node-agent detected missing eBPF prerequisites or a build without eBPF capture. \
-                 1 with a reason label means degraded, 0 with reason=\"none\" means nominal.\n",
-            );
-            output.push_str("# TYPE ferrum_mesh_node_topology_degraded gauge\n");
-            let (reason, value) = match snapshot.topology_degraded_reason {
-                Some(reason) => (reason, 1u64),
-                None => ("none", 0u64),
-            };
-            if ns_label.is_empty() {
-                output.push_str(&format!(
-                    "ferrum_mesh_node_topology_degraded{{reason=\"{}\"}} {}\n",
-                    reason, value,
-                ));
-            } else {
-                output.push_str(&format!(
-                    "ferrum_mesh_node_topology_degraded{{reason=\"{}\"{}}} {}\n",
-                    reason, ns_label, value,
-                ));
-            }
-        }
-
         output
     }
 }
@@ -5670,16 +6808,17 @@ fn render_ai_counter_family(
     if counters.is_empty() {
         return;
     }
-    output.push_str(&format!("# HELP {metric_name} {help}\n"));
-    output.push_str(&format!("# TYPE {metric_name} counter\n"));
+    let _ = writeln!(output, "# HELP {metric_name} {help}");
+    let _ = writeln!(output, "# TYPE {metric_name} counter");
     for entry in counters.iter() {
         let key = entry.key();
         let value = entry.value().value.load(Ordering::Relaxed);
         let proxy_id = escape_label_value(&key.proxy_id);
-        output.push_str(&format!(
-            "{metric_name}{{proxy_id=\"{}\",provider=\"{}\"{}}} {}\n",
+        let _ = writeln!(
+            output,
+            "{metric_name}{{proxy_id=\"{}\",provider=\"{}\"{}}} {}",
             proxy_id, key.provider, ns_label, value
-        ));
+        );
     }
 }
 
@@ -5866,12 +7005,13 @@ pub fn render_cp_dp_trust_reload_prometheus(
             .get(failure.as_str())
             .copied()
             .unwrap_or(0);
-        output.push_str(&format!(
-            "ferrum_cp_dp_trust_reload_rejections_total{{reason=\"{}\"{}}} {}\n",
+        let _ = writeln!(
+            output,
+            "ferrum_cp_dp_trust_reload_rejections_total{{reason=\"{}\"{}}} {}",
             failure.as_str(),
             ns_label,
             value,
-        ));
+        );
     }
 
     output.push_str(
@@ -5996,12 +7136,13 @@ pub fn render_gateway_trust_retirement_prometheus(
     );
     output.push_str("# TYPE ferrum_gateway_trust_withdrawals_total counter\n");
     for reason in crate::proxy::mesh_trust_registry::TRUST_WITHDRAWAL_REASONS {
-        output.push_str(&format!(
-            "ferrum_gateway_trust_withdrawals_total{{reason=\"{}\"{}}} {}\n",
+        let _ = writeln!(
+            output,
+            "ferrum_gateway_trust_withdrawals_total{{reason=\"{}\"{}}} {}",
             reason.as_str(),
             ns_label,
             metrics.withdrawals_for(reason),
-        ));
+        );
     }
 
     output.push_str(
@@ -6009,12 +7150,13 @@ pub fn render_gateway_trust_retirement_prometheus(
     );
     output.push_str("# TYPE ferrum_gateway_trust_retired_transports_total counter\n");
     for kind in crate::proxy::mesh_trust_registry::MESH_TRANSPORT_KINDS {
-        output.push_str(&format!(
-            "ferrum_gateway_trust_retired_transports_total{{transport=\"{}\"{}}} {}\n",
+        let _ = writeln!(
+            output,
+            "ferrum_gateway_trust_retired_transports_total{{transport=\"{}\"{}}} {}",
             kind.as_str(),
             ns_label,
             metrics.retired_for(kind),
-        ));
+        );
     }
 
     output.push_str(
@@ -6022,34 +7164,37 @@ pub fn render_gateway_trust_retirement_prometheus(
     );
     output.push_str("# TYPE ferrum_gateway_trust_admission_refusals_total counter\n");
     for kind in crate::proxy::mesh_trust_registry::MESH_TRANSPORT_KINDS {
-        output.push_str(&format!(
-            "ferrum_gateway_trust_admission_refusals_total{{transport=\"{}\"{}}} {}\n",
+        let _ = writeln!(
+            output,
+            "ferrum_gateway_trust_admission_refusals_total{{transport=\"{}\"{}}} {}",
             kind.as_str(),
             ns_label,
             metrics.refused_for(kind),
-        ));
+        );
     }
 }
 
 fn render_process_counter(output: &mut String, metric_name: &str, value: u64, ns_label: &str) {
     if ns_label.is_empty() {
-        output.push_str(&format!("{metric_name} {value}\n"));
+        let _ = writeln!(output, "{metric_name} {value}");
     } else {
-        output.push_str(&format!(
-            "{metric_name}{{{}}} {value}\n",
+        let _ = writeln!(
+            output,
+            "{metric_name}{{{}}} {value}",
             namespace_label_body(ns_label)
-        ));
+        );
     }
 }
 
 fn render_process_gauge(output: &mut String, metric_name: &str, value: i64, ns_label: &str) {
     if ns_label.is_empty() {
-        output.push_str(&format!("{metric_name} {value}\n"));
+        let _ = writeln!(output, "{metric_name} {value}");
     } else {
-        output.push_str(&format!(
-            "{metric_name}{{{}}} {value}\n",
+        let _ = writeln!(
+            output,
+            "{metric_name}{{{}}} {value}",
             namespace_label_body(ns_label)
-        ));
+        );
     }
 }
 
@@ -6074,27 +7219,32 @@ fn render_histogram(
     histogram: &HistogramBuckets,
     ns_label: &str,
 ) {
-    for (i, boundary) in histogram.boundaries.iter().enumerate() {
-        let count = histogram.counts[i].load(Ordering::Relaxed);
-        output.push_str(&format!(
-            "{}_bucket{{proxy_id=\"{}\",le=\"{}\"{}}} {}\n",
+    let mut finite_total = 0;
+    for (boundary, count) in histogram.cumulative_buckets() {
+        finite_total = count;
+        let _ = writeln!(
+            output,
+            "{}_bucket{{proxy_id=\"{}\",le=\"{}\"{}}} {}",
             metric_name, proxy_id, boundary, ns_label, count
-        ));
+        );
     }
-    let total_count = histogram.count.load(Ordering::Relaxed);
+    let total_count = histogram.rendered_total(finite_total);
     let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
-    output.push_str(&format!(
-        "{}_bucket{{proxy_id=\"{}\",le=\"+Inf\"{}}} {}\n",
+    let _ = writeln!(
+        output,
+        "{}_bucket{{proxy_id=\"{}\",le=\"+Inf\"{}}} {}",
         metric_name, proxy_id, ns_label, total_count
-    ));
-    output.push_str(&format!(
-        "{}_sum{{proxy_id=\"{}\"{}}} {:.2}\n",
+    );
+    let _ = writeln!(
+        output,
+        "{}_sum{{proxy_id=\"{}\"{}}} {:.2}",
         metric_name, proxy_id, ns_label, sum
-    ));
-    output.push_str(&format!(
-        "{}_count{{proxy_id=\"{}\"{}}} {}\n",
+    );
+    let _ = writeln!(
+        output,
+        "{}_count{{proxy_id=\"{}\"{}}} {}",
         metric_name, proxy_id, ns_label, total_count
-    ));
+    );
 }
 
 fn render_ws_histogram(
@@ -6104,10 +7254,12 @@ fn render_ws_histogram(
     ns_label: &str,
 ) {
     let proxy_id = escape_label_value(&key.proxy_id);
-    for (i, boundary) in histogram.boundaries.iter().enumerate() {
-        let count = histogram.counts[i].load(Ordering::Relaxed);
-        output.push_str(&format!(
-            "ferrum_websocket_session_duration_ms_bucket{{proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",termination_reason=\"{}\",le=\"{}\"{}}} {}\n",
+    let mut finite_total = 0;
+    for (boundary, count) in histogram.cumulative_buckets() {
+        finite_total = count;
+        let _ = writeln!(
+            output,
+            "ferrum_websocket_session_duration_ms_bucket{{proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",termination_reason=\"{}\",le=\"{}\"{}}} {}",
             proxy_id,
             key.result,
             key.direction,
@@ -6117,26 +7269,29 @@ fn render_ws_histogram(
             boundary,
             ns_label,
             count
-        ));
+        );
     }
-    let total_count = histogram.count.load(Ordering::Relaxed);
+    let total_count = histogram.rendered_total(finite_total);
     let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
     let labels = format!(
         "proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",termination_reason=\"{}\"",
         proxy_id, key.result, key.direction, key.io_side, key.error_class, key.termination_reason
     );
-    output.push_str(&format!(
-        "ferrum_websocket_session_duration_ms_bucket{{{},le=\"+Inf\"{}}} {}\n",
+    let _ = writeln!(
+        output,
+        "ferrum_websocket_session_duration_ms_bucket{{{},le=\"+Inf\"{}}} {}",
         labels, ns_label, total_count
-    ));
-    output.push_str(&format!(
-        "ferrum_websocket_session_duration_ms_sum{{{}{}}} {:.2}\n",
+    );
+    let _ = writeln!(
+        output,
+        "ferrum_websocket_session_duration_ms_sum{{{}{}}} {:.2}",
         labels, ns_label, sum
-    ));
-    output.push_str(&format!(
-        "ferrum_websocket_session_duration_ms_count{{{}{}}} {}\n",
+    );
+    let _ = writeln!(
+        output,
+        "ferrum_websocket_session_duration_ms_count{{{}{}}} {}",
         labels, ns_label, total_count
-    ));
+    );
 }
 
 fn render_tls_source_fetch_histogram(
@@ -6147,27 +7302,32 @@ fn render_tls_source_fetch_histogram(
 ) {
     let scheme = escape_label_value(&key.scheme);
     let kind = escape_label_value(&key.kind);
-    for (i, boundary) in histogram.boundaries.iter().enumerate() {
-        let count = histogram.counts[i].load(Ordering::Relaxed);
-        output.push_str(&format!(
-            "ferrum_tls_source_fetch_duration_seconds_bucket{{scheme=\"{}\",kind=\"{}\",le=\"{}\"{}}} {}\n",
+    let mut finite_total = 0;
+    for (boundary, count) in histogram.cumulative_buckets() {
+        finite_total = count;
+        let _ = writeln!(
+            output,
+            "ferrum_tls_source_fetch_duration_seconds_bucket{{scheme=\"{}\",kind=\"{}\",le=\"{}\"{}}} {}",
             scheme, kind, boundary, ns_label, count
-        ));
+        );
     }
-    let total_count = histogram.count.load(Ordering::Relaxed);
+    let total_count = histogram.rendered_total(finite_total);
     let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
-    output.push_str(&format!(
-        "ferrum_tls_source_fetch_duration_seconds_bucket{{scheme=\"{}\",kind=\"{}\",le=\"+Inf\"{}}} {}\n",
+    let _ = writeln!(
+        output,
+        "ferrum_tls_source_fetch_duration_seconds_bucket{{scheme=\"{}\",kind=\"{}\",le=\"+Inf\"{}}} {}",
         scheme, kind, ns_label, total_count
-    ));
-    output.push_str(&format!(
-        "ferrum_tls_source_fetch_duration_seconds_sum{{scheme=\"{}\",kind=\"{}\"{}}} {:.6}\n",
+    );
+    let _ = writeln!(
+        output,
+        "ferrum_tls_source_fetch_duration_seconds_sum{{scheme=\"{}\",kind=\"{}\"{}}} {:.6}",
         scheme, kind, ns_label, sum
-    ));
-    output.push_str(&format!(
-        "ferrum_tls_source_fetch_duration_seconds_count{{scheme=\"{}\",kind=\"{}\"{}}} {}\n",
+    );
+    let _ = writeln!(
+        output,
+        "ferrum_tls_source_fetch_duration_seconds_count{{scheme=\"{}\",kind=\"{}\"{}}} {}",
         scheme, kind, ns_label, total_count
-    ));
+    );
 }
 
 /// Process-wide tunables parsed during admission and published only from
@@ -6179,6 +7339,8 @@ struct PrometheusMetricsTunables {
     stale_entry_ttl_secs: u64,
     cache_invalidation_min_age_ms: u64,
     mesh_series_budget_per_family: usize,
+    request_duration_buckets_ms: Vec<f64>,
+    session_duration_buckets_ms: Vec<f64>,
     namespace: String,
 }
 
@@ -6217,6 +7379,54 @@ fn optional_mesh_series_budget_per_family(config: &Value) -> Result<usize, Strin
     usize::try_from(value).map_err(|_| {
         format!("prometheus_metrics: `mesh_series_budget_per_family` (\"{value}\") exceeds usize")
     })
+}
+
+/// Read an optional duration bucket layout: a non-empty array of at most
+/// [`MAX_DURATION_BUCKETS`] finite, positive, strictly increasing millisecond
+/// upper bounds. The implicit `+Inf` bucket is always appended at render time,
+/// so it must not be listed.
+fn optional_duration_buckets(
+    config: &Value,
+    key: &str,
+    default: &[f64],
+) -> Result<Vec<f64>, String> {
+    let Some(value) = config.get(key) else {
+        return Ok(default.to_vec());
+    };
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "prometheus_metrics: `{key}` must be an array of bucket upper bounds in milliseconds"
+        ));
+    };
+    if items.is_empty() || items.len() > MAX_DURATION_BUCKETS {
+        return Err(format!(
+            "prometheus_metrics: `{key}` must list between 1 and {MAX_DURATION_BUCKETS} bucket \
+             upper bounds (the +Inf bucket is implicit)"
+        ));
+    }
+    let mut bounds: Vec<f64> = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let Some(bound) = item.as_f64() else {
+            return Err(format!(
+                "prometheus_metrics: `{key}[{index}]` must be a number"
+            ));
+        };
+        if !bound.is_finite() || bound <= 0.0 {
+            return Err(format!(
+                "prometheus_metrics: `{key}[{index}]` must be a finite number greater than 0"
+            ));
+        }
+        if let Some(previous) = bounds.last()
+            && bound <= *previous
+        {
+            return Err(format!(
+                "prometheus_metrics: `{key}` must be strictly increasing; `{key}[{index}]` \
+                 ({bound}) is not greater than the previous bound ({previous})"
+            ));
+        }
+        bounds.push(bound);
+    }
+    Ok(bounds)
 }
 
 impl PrometheusMetrics {
@@ -6265,6 +7475,16 @@ impl PrometheusMetrics {
             DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS / 1_000_000,
         )?;
         let mesh_series_budget_per_family = optional_mesh_series_budget_per_family(config)?;
+        let request_duration_buckets_ms = optional_duration_buckets(
+            config,
+            "request_duration_buckets_ms",
+            DEFAULT_REQUEST_DURATION_BUCKETS_MS,
+        )?;
+        let session_duration_buckets_ms = optional_duration_buckets(
+            config,
+            "session_duration_buckets_ms",
+            DEFAULT_SESSION_DURATION_BUCKETS_MS,
+        )?;
 
         Ok(Self {
             registry,
@@ -6273,6 +7493,8 @@ impl PrometheusMetrics {
                 stale_entry_ttl_secs,
                 cache_invalidation_min_age_ms,
                 mesh_series_budget_per_family,
+                request_duration_buckets_ms,
+                session_duration_buckets_ms,
                 namespace: namespace.to_string(),
             },
         })
@@ -6283,7 +7505,6 @@ impl PrometheusMetrics {
     /// process-global registry when the test harness runs constructors in
     /// parallel.
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the lib target; the bin target does not.
     pub fn new_with_registry_for_test(
         config: &Value,
         namespace: &str,
@@ -6299,8 +7520,20 @@ impl Plugin for PrometheusMetrics {
         "prometheus_metrics"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
+    fn uses_mesh_request_key(&self) -> bool {
+        true
+    }
+
     fn priority(&self) -> u16 {
         super::priority::PROMETHEUS_METRICS
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED | crate::plugins::PluginHooks::LOG
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -6321,10 +7554,15 @@ impl Plugin for PrometheusMetrics {
             self.tunables.mesh_series_budget_per_family,
             &self.tunables.namespace,
         );
+        self.registry.configure_duration_buckets(
+            &self.tunables.request_duration_buckets_ms,
+            &self.tunables.session_duration_buckets_ms,
+        );
     }
 
     /// Reusable (issue #5583): pure observability. Its request-phase hooks
-    /// stamp one observed-marker key on the context; everything else it does is
+    /// mark the context as observed (a typed bit for HTTP, one metadata marker
+    /// for streams); everything else it does is
     /// recording completed transactions. It takes no admission decision, holds
     /// no per-request budget, makes no external
     /// admission call, and never rejects — so nothing an elided CONNECT would
@@ -6337,10 +7575,10 @@ impl Plugin for PrometheusMetrics {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        ctx.metadata.insert(
-            prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
-            "1".to_string(),
-        );
+        // A typed context bit, not a metadata marker: the per-request hook
+        // allocates nothing and touches no map. The gRPC message scanners read
+        // it through `prometheus_helpers::request_observes_grpc_messages`.
+        ctx.mark_prometheus_metrics_observed();
         PluginResult::Continue
     }
 
@@ -6383,7 +7621,6 @@ mod tests {
     use crate::tls::inventory::{
         TlsInventory, TlsInventoryEntry, TlsInventorySource, TlsInventoryState, TlsInventoryUsage,
     };
-    use std::collections::HashMap;
 
     fn mesh_summary() -> TransactionSummary {
         TransactionSummary {
@@ -6391,7 +7628,7 @@ mod tests {
             proxy_name: Some("orders".to_string()),
             response_status_code: 200,
             latency_total_ms: 12.0,
-            metadata: HashMap::from([
+            metadata: crate::plugins::MetadataMap::from_iter([
                 ("mesh.source.workload".to_string(), "frontend".to_string()),
                 (
                     "mesh.destination.workload".to_string(),

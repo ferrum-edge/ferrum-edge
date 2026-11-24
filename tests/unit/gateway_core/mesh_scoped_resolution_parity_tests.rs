@@ -25,8 +25,9 @@ const FRONTEND_ORIG_DST_PORT: &str = "ctx.orig_dst.map(|addr| addr.port())";
 const STEPS: &[&str] = &[
     // Host and path lookup.
     "find_proxy_in_epoch(",
-    // Direction filter: a wrong-direction mesh winner is re-resolved.
-    "mesh_route_direction(",
+    // Direction filter: a wrong-direction mesh winner (or a carried
+    // VirtualService route on an inbound listener) is re-resolved.
+    "mesh_route_admitted_for_direction(",
     "resolve_route_excluding_wrong_direction_in_epoch(",
     // Outbound port-sibling selection, direct Pod-IP routes excluded.
     "is_mesh_outbound_route_id(",
@@ -156,7 +157,10 @@ fn both_sides_guard_each_step_the_same_way() {
     let resolver = resolver_mesh_steps();
     let pairs = [
         // A mesh route of the other direction is re-resolved.
-        ("!= ctx.mesh_direction", "!= mesh.direction"),
+        (
+            "                ctx.mesh_direction,\n            ) =>",
+            "                mesh.direction,\n            ) =>",
+        ),
         // Port-sibling selection is direction-gated.
         (
             "ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)",

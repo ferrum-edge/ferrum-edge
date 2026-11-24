@@ -80,8 +80,7 @@ use bytes::Bytes;
 use reqwest::StatusCode;
 
 use super::backends::{
-    GrpcStep, H2Step, HttpStep, MatchHeaders, MatchRpc, RequestMatcher, ScriptedGrpcBackend,
-    ScriptedH2Backend, ScriptedHttp1Backend, ScriptedTcpBackend, TcpStep,
+    GrpcStep, H2Step, HttpStep, MatchHeaders, MatchRpc, RequestMatcher, ScriptedTcpBackend, TcpStep,
 };
 use super::clients::{ClientResponse, GrpcClient, GrpcResponse, Http1Client, Http2Client};
 use super::harness::GatewayHarness;
@@ -505,20 +504,6 @@ impl MatrixResponse {
             MatrixResponse::Grpc(r) => r.http_status,
         }
     }
-
-    /// Whether the response indicates a 5xx-class gateway error. For
-    /// gRPC, true when the effective grpc-status is
-    /// UNAVAILABLE/INTERNAL/UNKNOWN — the canonical mapping for
-    /// backend-side connection failures.
-    pub fn is_gateway_error(&self) -> bool {
-        match self {
-            MatrixResponse::Http(r) => r.status.is_server_error(),
-            MatrixResponse::Grpc(r) => {
-                let s = r.effective_grpc_status();
-                s == 14 || s == 13 || s == 2 // UNAVAILABLE, INTERNAL, UNKNOWN
-            }
-        }
-    }
 }
 
 /// Backend handle returned by the spawn helpers. Holds the running backend
@@ -535,9 +520,6 @@ pub struct MatrixBackend {
 enum BackendHandle {
     Refused(RefusedTcpPort),
     Tcp(ScriptedTcpBackend),
-    Http1(ScriptedHttp1Backend),
-    H2(ScriptedH2Backend),
-    Grpc(ScriptedGrpcBackend),
 }
 
 impl MatrixBackend {
@@ -563,27 +545,6 @@ impl MatrixBackend {
         Self {
             port,
             _backend: BackendHandle::Tcp(backend),
-        }
-    }
-
-    pub(crate) fn new_http1(port: u16, backend: ScriptedHttp1Backend) -> Self {
-        Self {
-            port,
-            _backend: BackendHandle::Http1(backend),
-        }
-    }
-
-    pub(crate) fn new_h2(port: u16, backend: ScriptedH2Backend) -> Self {
-        Self {
-            port,
-            _backend: BackendHandle::H2(backend),
-        }
-    }
-
-    pub(crate) fn new_grpc(port: u16, backend: ScriptedGrpcBackend) -> Self {
-        Self {
-            port,
-            _backend: BackendHandle::Grpc(backend),
         }
     }
 }

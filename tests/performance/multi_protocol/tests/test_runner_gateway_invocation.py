@@ -13,13 +13,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 RUNNERS = [
-    "tests/performance/run_perf_test.sh",
     "tests/performance/payload_size/run_payload_test.sh",
     "tests/performance/multi_protocol/run_protocol_test.sh",
 ]
 
 # A line that executes the release binary (not cargo build, cp, or a path test).
 LAUNCH = re.compile(r'(?:\./target/release/ferrum-edge|"\$GATEWAY_BIN")(?P<rest>[^\n]*)')
+
+
+_BENCH_PORTS_RE = re.compile(r'BENCH_PORTS="([^"]*)"')
+_RUN_SUBCOMMAND_RE = re.compile(r"^\s+run\b")
 
 
 class RunnerGatewayInvocationTests(unittest.TestCase):
@@ -29,12 +32,12 @@ class RunnerGatewayInvocationTests(unittest.TestCase):
             launches = [m for m in LAUNCH.finditer(text) if ">" in m.group("rest") or "&" in m.group("rest")]
             self.assertTrue(launches, f"{runner}: no gateway launch found")
             for match in launches:
-                self.assertRegex(match.group("rest"), r"^\s+run\b",
+                self.assertRegex(match.group("rest"), _RUN_SUBCOMMAND_RE,
                                  f"{runner}: gateway launched without `run`: {match.group(0)!r}")
 
     def test_protocol_runner_does_not_claim_unused_port_5000(self):
         text = (REPO_ROOT / "tests/performance/multi_protocol/run_protocol_test.sh").read_text()
-        ports = re.search(r'BENCH_PORTS="([^"]*)"', text).group(1)
+        ports = _BENCH_PORTS_RE.search(text).group(1)
         self.assertNotIn("5000", ports.split())
 
 

@@ -164,7 +164,6 @@ async fn every_closed_reason_has_a_distinct_fixed_label() {
             "reader_unavailable",
             "reload_read_timed_out",
             "reload_reader_failed",
-            "scope_validation_failed",
             "source_generation_escape",
             "source_generation_unstable",
             "source_generation_unsupported",
@@ -740,7 +739,7 @@ fn spawn_worker(
         Arc::new(ferrum_edge::grpc::cp_trust::CpDpVerifierStore::new(
             verifier(KID, NAMESPACE, SECRET),
         )),
-        false,
+        None,
         StdDuration::from_millis(1),
         status,
         shutdown,

@@ -174,6 +174,16 @@
     "emission": "when_plugin_enabled"
   },
   {
+    "name": "chargeback_sink_snapshot_late_charges_dropped_total",
+    "type": "counter",
+    "help": "Snapshot charges dropped because their record hook ran after the generation closed snapshot admission (reload retirement or shutdown).",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
     "name": "chargeback_sink_snapshot_overflow_pending_total",
     "type": "counter",
     "help": "Snapshot overflow charges staged for the next durable emission when async spool handoff was unavailable or its write failed.",
@@ -332,6 +342,20 @@
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_adaptive_concurrency_decisions_total",
+    "type": "counter",
+    "help": "adaptive_concurrency admission decisions other than an ordinary within-limit admit, by proxy and decision.",
+    "labels": [
+      "proxy_id",
+      "decision",
+      "namespace"
+    ],
+    "subsystem": "adaptive_concurrency",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
   },
   {
     "name": "ferrum_admin_active_connections",
@@ -784,6 +808,45 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_ai_federation_provider_circuits_closed_total",
+    "type": "counter",
+    "help": "ai_federation circuit half-open recoveries, by configured provider name.",
+    "labels": [
+      "provider",
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
+    "name": "ferrum_ai_federation_provider_circuits_open",
+    "type": "gauge",
+    "help": "Current ai_federation circuits in open or half-open recovery state, by configured provider name.",
+    "labels": [
+      "provider",
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
+    "name": "ferrum_ai_federation_provider_circuits_opened_total",
+    "type": "counter",
+    "help": "ai_federation circuit closed-to-open transitions, by configured provider name.",
+    "labels": [
+      "provider",
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
     "name": "ferrum_ai_prompt_tokens_total",
     "type": "counter",
     "help": "Prompt tokens reported by AI providers.",
@@ -967,7 +1030,7 @@
   {
     "name": "ferrum_api_chargeback_uncollected_retained_entries",
     "type": "gauge",
-    "help": "Billing rows the last eviction pass kept past stale_entry_ttl_seconds because no completed /charges export has collected their current counters.",
+    "help": "Billing rows the last eviction pass kept past stale_entry_ttl_seconds because no /charges delivery to a charges:collect-scoped collector has collected their current counters.",
     "labels": [],
     "subsystem": "api_chargeback",
     "export_surface": "/charges",
@@ -1270,6 +1333,55 @@
     "subsystem": "connection_pool",
     "export_surface": "/metrics",
     "bundled": "dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_connection_pool_h1_connections_opened_total",
+    "type": "counter",
+    "help": "Connections the direct HTTP/1.1 backend pool dialed, on an empty idle set or fresh to replay an idle keep-alive race.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "connection_pool",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_connection_pool_h1_connections_reused_total",
+    "type": "counter",
+    "help": "Checkouts the direct HTTP/1.1 backend pool served from its idle set, counted before the request is sent.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "connection_pool",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_connection_pool_h1_idle_connections",
+    "type": "gauge",
+    "help": "Idle connections in the direct HTTP/1.1 backend pool across every backend, at scrape time.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "connection_pool",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_connection_pool_h1_idle_evictions_total",
+    "type": "counter",
+    "help": "Idle direct HTTP/1.1 backend connections the pool discarded: ceiling (dropped at check-in because the backend's idle set was full), expired (idle past the idle timeout), closed (closed by the backend while idle), retired (closed because a reload, certificate rotation or pool clear withdrew the backend).",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "connection_pool",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
     "emission": "conditional"
   },
   {
@@ -1650,6 +1762,18 @@
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "conditional"
+  },
+  {
+    "name": "ferrum_database_mtls_dns_admission_fences_retained",
+    "type": "gauge",
+    "help": "mTLS DNS admission fences retained in this process after an uncertain protected config-store mutation outcome. Admissions for a fenced namespace fail closed; reconnect and failover are not blocked.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
   },
   {
     "name": "ferrum_database_poll_failures_total",
@@ -2194,7 +2318,7 @@
   {
     "name": "ferrum_jwks_consecutive_failures",
     "type": "gauge",
-    "help": "Maximum current consecutive failures among active remote stores by fixed failure class.",
+    "help": "Maximum current consecutive failures among active remote and admin-managed JWKS stores by fixed failure class.",
     "labels": [
       "class"
     ],
@@ -2206,7 +2330,7 @@
   {
     "name": "ferrum_jwks_refresh_failures_total",
     "type": "counter",
-    "help": "Remote JWKS refresh failures by fixed failure class.",
+    "help": "Remote and admin-managed JWKS refresh failures by fixed failure class.",
     "labels": [
       "class"
     ],
@@ -2218,7 +2342,7 @@
   {
     "name": "ferrum_jwks_trust_age_seconds",
     "type": "gauge",
-    "help": "Maximum age of the last validated non-empty JWKS among active remote stores in each trust state.",
+    "help": "Maximum age of the last validated non-empty JWKS among active remote and admin-managed stores in each trust state.",
     "labels": [
       "state"
     ],
@@ -2230,7 +2354,7 @@
   {
     "name": "ferrum_jwks_trust_stores",
     "type": "gauge",
-    "help": "Active remote JWKS stores by bounded trust state.",
+    "help": "Active remote and admin-managed JWKS stores by bounded trust state.",
     "labels": [
       "state"
     ],
@@ -2413,6 +2537,16 @@
     "name": "ferrum_k8s_controller_watch_errors_total",
     "type": "counter",
     "help": "Kubernetes watch stream errors observed across every watched scope, including refused initial lists and failed watch starts.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_watch_evidence_refresh_relists_total",
+    "type": "counter",
+    "help": "Watch-scope reflector rebuilds started by a demand-driven revision-evidence refresh; the scope's live watch keeps delivering while the replacement lists.",
     "labels": [],
     "subsystem": "k8s_controller",
     "export_surface": "/metrics",
@@ -2958,6 +3092,20 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_mesh_ext_authz_check_duration_seconds",
+    "type": "histogram",
+    "help": "Time from dispatching a CUSTOM external authorization check to the provider's response headers (or the failure that ended it), per admitted extension provider.",
+    "labels": [
+      "provider",
+      "le",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_ext_authz_check_failures_total",
     "type": "counter",
     "help": "Failed CUSTOM external authorization checks by how the failure was resolved.",
@@ -2975,6 +3123,20 @@
     "type": "counter",
     "help": "Istio AuthorizationPolicy CUSTOM external authorization check outcomes.",
     "labels": [
+      "outcome",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_ext_authz_provider_checks_total",
+    "type": "counter",
+    "help": "CUSTOM external authorization check outcomes per admitted extension provider.",
+    "labels": [
+      "provider",
       "outcome",
       "gateway_namespace"
     ],
@@ -3333,6 +3495,7 @@
       "destination_service",
       "request_protocol",
       "response_code",
+      "grpc_response_status",
       "response_flags",
       "connection_security_policy",
       "gateway_namespace",
@@ -3360,6 +3523,7 @@
       "destination_service",
       "request_protocol",
       "response_code",
+      "grpc_response_status",
       "response_flags",
       "connection_security_policy",
       "gateway_namespace",
@@ -3387,6 +3551,7 @@
       "destination_service",
       "request_protocol",
       "response_code",
+      "grpc_response_status",
       "response_flags",
       "connection_security_policy",
       "gateway_namespace"
@@ -3413,6 +3578,7 @@
       "destination_service",
       "request_protocol",
       "response_code",
+      "grpc_response_status",
       "response_flags",
       "connection_security_policy",
       "gateway_namespace"
@@ -3439,6 +3605,7 @@
       "destination_service",
       "request_protocol",
       "response_code",
+      "grpc_response_status",
       "response_flags",
       "connection_security_policy",
       "gateway_namespace",
@@ -3466,6 +3633,7 @@
       "destination_service",
       "request_protocol",
       "response_code",
+      "grpc_response_status",
       "response_flags",
       "connection_security_policy",
       "gateway_namespace"
@@ -3621,6 +3789,20 @@
       "request_protocol",
       "response_flags",
       "connection_security_policy",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_tracing_spans_dropped_total",
+    "type": "counter",
+    "help": "Finished mesh telemetry spans a workload_metrics exporter dropped, refused at enqueue or discarded at delivery, by provider and reason.",
+    "labels": [
+      "provider",
+      "reason",
       "gateway_namespace"
     ],
     "subsystem": "mesh",
@@ -4477,6 +4659,19 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_request_body_bytes_total",
+    "type": "counter",
+    "help": "HTTP-family request body bytes relayed from clients to backends.",
+    "labels": [
+      "proxy_id",
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_request_duration_ms",
     "type": "histogram",
     "help": "Request duration in milliseconds.",
@@ -4625,6 +4820,32 @@
     "subsystem": "prometheus_metrics",
     "export_surface": "/metrics",
     "bundled": "alert_and_dashboard",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_response_body_bytes_total",
+    "type": "counter",
+    "help": "HTTP-family response body bytes relayed from backends to clients.",
+    "labels": [
+      "proxy_id",
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_response_cache_lookups_total",
+    "type": "counter",
+    "help": "response_caching lookup outcomes by X-Cache-Status class, across every plugin instance in this process.",
+    "labels": [
+      "status",
+      "namespace"
+    ],
+    "subsystem": "response_caching",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
     "emission": "always"
   },
   {
@@ -4973,6 +5194,19 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_tcp_connection_throttle_rejections_total",
+    "type": "counter",
+    "help": "TCP connections refused by tcp_connection_throttle because the connection's Consumer or client-IP key was at max_connections_per_key.",
+    "labels": [
+      "proxy_id",
+      "namespace"
+    ],
+    "subsystem": "tcp_connection_throttle",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_tls_cert_expiry_seconds",
     "type": "gauge",
     "help": "Seconds until the certificate leaf not_after timestamp. Negative means expired.",
@@ -5217,6 +5451,20 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_unmatched_requests_total",
+    "type": "counter",
+    "help": "Requests refused before routing because no proxy matched or the mesh REGISTRY_ONLY policy refused an outbound route miss, by closed reason and response status.",
+    "labels": [
+      "reason",
+      "status_code",
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_upstream_targets",
     "type": "gauge",
     "help": "Targets the load balancer currently serves for an upstream: configured static targets merged with service-discovery resolved endpoints.",
@@ -5310,6 +5558,19 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_ws_message_size_limit_rejected_total",
+    "type": "counter",
+    "help": "WebSocket sessions closed with 1009 because a ws_message_size_limiting frame or message ceiling was exceeded, by direction of the rejected input.",
+    "labels": [
+      "direction",
+      "namespace"
+    ],
+    "subsystem": "ws_message_size_limiting",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_xds_active_node_ids",
     "type": "gauge",
     "help": "Distinct node state keys with at least one active ADS stream.",
@@ -5365,19 +5626,6 @@
     "type": "counter",
     "help": "ADS streams rejected at admission by any scope (total, namespace, principal, node, node cardinality, invalid Node.id, or initial-request deadline).",
     "labels": [
-      "gateway_namespace"
-    ],
-    "subsystem": "mesh",
-    "export_surface": "/metrics",
-    "bundled": "documented_only",
-    "emission": "conditional"
-  },
-  {
-    "name": "ferrum_xds_warming_partial_applies_total",
-    "type": "counter",
-    "help": "Mesh slices applied while marked as xDS required-version skewed. Normal coherent xDS apply should not increment this.",
-    "labels": [
-      "namespace",
       "gateway_namespace"
     ],
     "subsystem": "mesh",

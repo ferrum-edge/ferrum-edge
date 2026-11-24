@@ -4,7 +4,7 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::collections::{BTreeSet, HashSet, hash_map::DefaultHasher};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,15 +15,16 @@ use uuid::Uuid;
 
 use crate::admin::AdminState;
 use crate::admin::audit::{self, AuditActor, AuditEvent};
-use crate::admin::jwt_auth::AdminRole;
+use crate::admin::jwt_auth::{AdminKeyTier, AdminRole};
 use crate::admin::plugin_config_projection::PlaceholderSiteRecorder;
 use crate::admin::preconditions::{self, IfMatch};
 use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
-    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, is_mtls_dns_admission_unavailable,
-    is_mtls_dns_identity_conflict, mark_mtls_dns_admission_unavailable, mtls_dns_identity_conflict,
-    tcp_connection_throttle_attachment_conflict, validate_api_spec_proxy_plugin_association,
-    validate_api_spec_restore_inputs,
+    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, PluginAssociationPreconditionFailed,
+    is_mtls_dns_admission_unavailable, is_mtls_dns_identity_conflict,
+    mark_mtls_dns_admission_unavailable, mtls_dns_identity_conflict,
+    plugin_association_precondition_failed, tcp_connection_throttle_attachment_conflict,
+    validate_api_spec_proxy_plugin_association, validate_api_spec_restore_inputs,
 };
 use crate::config::db_loader::{is_proxy_plugin_association_load_error, is_row_decode_rejection};
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
@@ -36,7 +37,21 @@ use crate::config::types::{
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use crate::tls::source::{MaterialKind, check_namespace_scoped_material_reference};
 
+pub(crate) mod scoped_references;
+use scoped_references::ScopedReferenceClass;
+
 pub(crate) type DbResult<T> = Result<T, anyhow::Error>;
+
+/// Resolve the plugin validation HTTP client, mapping a compression-policy
+/// parse refusal (issue #6651 item 3) to a 500 response in handler context.
+#[allow(clippy::result_large_err)]
+fn validation_http_client_or_500(
+    state: &AdminState,
+) -> Result<crate::plugins::PluginHttpClient, Response<Full<Bytes>>> {
+    super::plugin_validation_http_client(state).map_err(|error| {
+        super::json_response(StatusCode::INTERNAL_SERVER_ERROR, &json!({"error": error}))
+    })
+}
 
 pub(crate) struct ValidationCtx<'a> {
     pub reserved_ports: &'a HashSet<u16>,
@@ -261,19 +276,11 @@ pub(crate) struct LeaseRenewalCounters {
     /// Attempts abandoned on a datastore error or the per-attempt timeout and
     /// re-issued inside the same window.
     pub(crate) retries: u32,
-    /// Always zero: a keeper must never re-acquire a released or absent row.
-    /// Retained for the external renewal test observation.
-    pub(crate) reclaims: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LeaseRenewalReport {
-    // Read by the external lease-renewal tests through
-    // `run_namespace_config_admission_renewal_for_test`; the binary target
-    // never inspects the report, so both fields are dead there.
-    #[allow(dead_code)]
     pub(crate) outcome: LeaseRenewalOutcome,
-    #[allow(dead_code)]
     pub(crate) counters: LeaseRenewalCounters,
 }
 
@@ -397,7 +404,6 @@ where
                     namespace = %namespace,
                     renewals = counters.renewals,
                     retries = counters.retries,
-                    reclaims = counters.reclaims,
                     detail_withheld = true,
                     "Namespace config admission lease expired before any renewal attempt could complete; failing closed"
                 );
@@ -540,6 +546,12 @@ fn validate_candidate_plugin_graph(
     crate::plugin_cache::validate_plugin_composition_candidate(candidate, http_client)
         .map_err(|error| AfterValidateError::BadRequest(vec![error]))?;
     crate::plugin_cache::validate_tcp_connection_throttle_attachments(candidate)
+        .map_err(AfterValidateError::BadRequest)?;
+    // Shared by direct plugin/proxy writes, API-spec create/replace, proxy
+    // deletes, and restore, so an API-spec bundle cannot attach a scoped
+    // `spiffe_identity` to a non-terminating stream listener either.
+    candidate
+        .validate_scoped_spiffe_identity_stream_compatibility()
         .map_err(AfterValidateError::BadRequest)
 }
 
@@ -663,7 +675,6 @@ impl NamespaceConfigAdmissionGuard {
     /// Test-only: mark the lease invalid so [`Self::ensure_held`] and
     /// [`Self::run_to_completion_while_held`] observe loss without waiting for
     /// the production renewer / TTL.
-    #[allow(dead_code)]
     pub(crate) fn force_lose_for_test(&self) {
         self.valid.store(false, Ordering::Release);
         self.valid_until_millis.store(0, Ordering::Release);
@@ -989,7 +1000,6 @@ async fn lock_namespace_config_admission_with_local(
 /// envelope exercises the identical arithmetic in milliseconds instead of
 /// minutes. Returns the renewer's report plus the guard-visible verdict
 /// [`NamespaceConfigAdmissionGuard::ensure_held`] would reach at that instant.
-#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
 pub(crate) async fn run_namespace_config_admission_renewal_for_test(
     db: Arc<dyn crate::config::db_backend::NamespaceConfigAdmissionLeaseBackend>,
     namespace: &str,
@@ -1073,6 +1083,22 @@ impl NamespaceRegistryAdmission {
             .collect()
     }
 
+    /// Whether every lease this admission holds (the registry key and each
+    /// namespace) is still valid by this process's local liveness view.
+    pub(crate) fn ensure_all_held(&self) -> Result<(), anyhow::Error> {
+        self.guards
+            .iter()
+            .try_for_each(NamespaceConfigAdmissionGuard::ensure_held)
+    }
+
+    /// Test-only: mark every lease invalid, as a lapsed renewal would.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn force_lose_for_test(&self) {
+        for guard in &self.guards {
+            guard.force_lose_for_test();
+        }
+    }
+
     /// Observe the global registry lease across a persistence future that is
     /// not cancellation-safe. The per-name leases are verified at the commit
     /// boundary by the backend; this is the local liveness view.
@@ -1150,27 +1176,42 @@ async fn plugin_has_foreign_proxy_association(
     plugin_id: &str,
     own_proxy_id: Option<&str>,
 ) -> DbResult<bool> {
-    let mut offset = 0_i64;
-    const PAGE_SIZE: i64 = 1_000;
-    loop {
-        let page = db
-            .list_proxies_paginated(namespace, PAGE_SIZE, offset)
-            .await?;
-        let items_len = page.items.len() as i64;
-        if page.items.iter().any(|proxy| {
-            own_proxy_id != Some(proxy.id.as_str())
-                && proxy
-                    .plugins
-                    .iter()
-                    .any(|association| association.plugin_config_id == plugin_id)
-        }) {
-            return Ok(true);
-        }
-        if items_len == 0 || offset + items_len >= page.total {
-            return Ok(false);
-        }
-        offset += items_len;
-    }
+    // Authoritative junction read, never the replica-backed proxy page: a
+    // just-committed attachment is exactly what must veto compensation, and
+    // a lagging replica would wave it through (forge-ops #569).
+    let referencing = db
+        .list_plugin_config_referencing_proxy_ids(namespace, plugin_id)
+        .await?;
+    Ok(referencing
+        .iter()
+        .any(|proxy_id| own_proxy_id != Some(proxy_id.as_str())))
+}
+
+/// Proxies in `current` that the caller did not account for: neither in
+/// the supplied expected set nor the write's kept target.
+fn unexpected_plugin_references(
+    current: &BTreeSet<String>,
+    expected: &ExpectedProxyIds,
+    kept: Option<&str>,
+) -> Vec<String> {
+    current
+        .iter()
+        .filter(|proxy| Some(proxy.as_str()) != kept && !expected.0.contains(*proxy))
+        .cloned()
+        .collect()
+}
+
+fn plugin_association_precondition_refusal(
+    plugin_id: &str,
+    unexpected: &[String],
+) -> AfterValidateError {
+    AfterValidateError::Response(Box::new(super::json_response(
+        StatusCode::PRECONDITION_FAILED,
+        &json!({"error": PluginAssociationPreconditionFailed {
+            plugin_id: plugin_id.to_string(),
+            unexpected: unexpected.to_vec(),
+        }.to_string()}),
+    )))
 }
 
 async fn proxy_has_scoped_plugin(
@@ -1178,25 +1219,12 @@ async fn proxy_has_scoped_plugin(
     namespace: &str,
     proxy_id: &str,
 ) -> DbResult<bool> {
-    let mut offset = 0_i64;
-    const PAGE_SIZE: i64 = 1_000;
-    loop {
-        let page = db
-            .list_plugin_configs_paginated(namespace, None, PAGE_SIZE, offset)
-            .await?;
-        let items_len = page.items.len() as i64;
-        if page
-            .items
-            .iter()
-            .any(|plugin| plugin.proxy_id.as_deref() == Some(proxy_id))
-        {
-            return Ok(true);
-        }
-        if items_len == 0 || offset + items_len >= page.total {
-            return Ok(false);
-        }
-        offset += items_len;
-    }
+    // Authoritative id-only read: compensation safety must not trust the
+    // replica-backed paginated page (forge-ops #569).
+    Ok(!db
+        .list_proxy_scoped_plugin_config_ids(namespace, proxy_id)
+        .await?
+        .is_empty())
 }
 
 /// Reacquire namespace admission after a successful late write. With no
@@ -1469,6 +1497,7 @@ async fn persist_update_to_settlement<R: AdminResource>(
     id: String,
     written: R,
     previous: R,
+    update_query: R::UpdateQuery,
 ) -> DbResult<Option<R>> {
     let OwnedWriteSettlementContext {
         db,
@@ -1479,8 +1508,11 @@ async fn persist_update_to_settlement<R: AdminResource>(
         actor,
     } = context;
     let success_db = db.clone();
-    let result = match run_db_write_while_held(guard.as_ref(), R::db_update(db.as_ref(), &written))
-        .await
+    let result = match run_db_write_while_held(
+        guard.as_ref(),
+        R::db_update_from_request(db.as_ref(), &written, &update_query),
+    )
+    .await
     {
         Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
         Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
@@ -1611,6 +1643,7 @@ async fn persist_undecodable_update_repair<R: AdminResource>(
     context: OwnedWriteSettlementContext,
     id: String,
     written: R,
+    update_query: R::UpdateQuery,
 ) -> DbResult<Option<R>> {
     let OwnedWriteSettlementContext {
         db,
@@ -1620,21 +1653,25 @@ async fn persist_undecodable_update_repair<R: AdminResource>(
         state,
         actor,
     } = context;
-    let result =
-        match run_db_write_while_held(guard.as_ref(), R::db_update(db.as_ref(), &written)).await {
-            Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
-            Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
-                Ok(false) => Ok(false),
-                // Without a hydratable previous row or namespace snapshot we cannot
-                // compensate a late write. Fail closed rather than claiming success
-                // after an unverified admission loss.
-                Ok(true) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                    "namespace config admission was lost during undecodable-row update repair"
-                ))),
-                Err(persistence_error) => Err(persistence_error),
-            },
-            Err(error) => Err(error),
-        };
+    let result = match run_db_write_while_held(
+        guard.as_ref(),
+        R::db_update_from_request(db.as_ref(), &written, &update_query),
+    )
+    .await
+    {
+        Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
+            Ok(false) => Ok(false),
+            // Without a hydratable previous row or namespace snapshot we cannot
+            // compensate a late write. Fail closed rather than claiming success
+            // after an unverified admission loss.
+            Ok(true) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                "namespace config admission was lost during undecodable-row update repair"
+            ))),
+            Err(persistence_error) => Err(persistence_error),
+        },
+        Err(error) => Err(error),
+    };
     if !result? {
         return Ok(None);
     }
@@ -1798,7 +1835,7 @@ pub(crate) async fn current_transaction_log_schema_graph_is_valid(
     namespace: &str,
 ) -> DbResult<bool> {
     let candidate = db.load_namespace_snapshot(namespace).await?;
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state).map_err(anyhow::Error::msg)?;
     match validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await {
         Ok(()) => Ok(true),
         Err(AfterValidateError::BadRequest(_) | AfterValidateError::Conflict(_)) => Ok(false),
@@ -1807,6 +1844,44 @@ pub(crate) async fn current_transaction_log_schema_graph_is_valid(
             anyhow::bail!("transaction-log schema graph validation returned an HTTP response")
         }
     }
+}
+
+/// Refuse a `spiffe_identity` write that would leave a proxy/proxy-group-scoped
+/// instance on a stream proxy terminating no TLS/DTLS, where it could never
+/// see a peer certificate.
+async fn validate_spiffe_identity_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    plugin: &PluginConfig,
+) -> Result<(), AfterValidateError> {
+    let mut config = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    if let Some(existing) = config
+        .plugin_configs
+        .iter_mut()
+        .find(|item| item.id == plugin.id)
+    {
+        *existing = plugin.clone();
+    } else {
+        config.plugin_configs.push(plugin.clone());
+    }
+    // The Admin API appends a proxy-scoped write's association in the same
+    // transaction (issue #4611), so judge the graph that write produces.
+    for proxy in plugin_attach_proxy_candidates(db, namespace, plugin)
+        .await
+        .map_err(AfterValidateError::Db)?
+    {
+        if let Some(existing) = config.proxies.iter_mut().find(|item| item.id == proxy.id) {
+            *existing = proxy;
+        } else {
+            config.proxies.push(proxy);
+        }
+    }
+    config
+        .validate_mtls_auth_compatibility()
+        .map_err(AfterValidateError::BadRequest)
 }
 
 async fn validate_mtls_auth_candidate(
@@ -1843,9 +1918,14 @@ async fn validate_mtls_auth_candidate(
             .plugin_configs
             .retain(|plugin| plugin.id != removed_plugin_id);
     }
-    if proxy
-        .is_some_and(|candidate| !config.has_effective_mtls_auth_for_proxy(candidate.id.as_str()))
-    {
+    let checks_mtls_auth = proxy
+        .is_none_or(|candidate| config.has_effective_mtls_auth_for_proxy(candidate.id.as_str()));
+    // A scoped `spiffe_identity` shares the stream TLS-termination requirement
+    // (but not the credential-uniqueness one) with `mtls_auth`.
+    let checks_spiffe_identity = proxy.is_some_and(|candidate| {
+        config.has_scoped_spiffe_identity_for_proxy(candidate.id.as_str())
+    });
+    if !checks_mtls_auth && !checks_spiffe_identity {
         return Ok(());
     }
     let compatibility_errors = config
@@ -1854,6 +1934,9 @@ async fn validate_mtls_auth_candidate(
         .unwrap_or_default();
     if !compatibility_errors.is_empty() {
         return Err(AfterValidateError::BadRequest(compatibility_errors));
+    }
+    if !checks_mtls_auth {
+        return Ok(());
     }
     config
         .validate_unique_mtls_credentials()
@@ -1915,7 +1998,8 @@ pub(crate) async fn validate_plugin_graph_candidates(
         plugin_graph_admission_candidate(db, namespace, proxies, plugins, removed_plugin_id)
             .await
             .map_err(AfterValidateError::Db)?;
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state)
+        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     validate_candidate_plugin_graph(&candidate, &http_client)
 }
 
@@ -2095,7 +2179,8 @@ pub(crate) async fn validate_plugin_graph_proxy_deletion_candidate(
         plugin.scope != PluginScope::ProxyGroup || remaining_associations.contains(&plugin.id)
     });
 
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state)
+        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     validate_candidate_plugin_graph(&candidate, &http_client)
 }
 
@@ -2231,7 +2316,8 @@ pub(crate) async fn validate_transaction_log_schema_candidates(
         }
     }
 
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state)
+        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await
 }
 
@@ -2334,7 +2420,8 @@ pub(crate) async fn validate_plugin_graph_api_spec_replacement_candidate(
         }
     }
 
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state)
+        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     validate_candidate_plugin_graph(&candidate, &http_client)
 }
 
@@ -2400,7 +2487,8 @@ pub(crate) async fn validate_transaction_log_schema_api_spec_replacement_candida
         }
     }
 
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state)
+        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await
 }
 
@@ -2472,7 +2560,8 @@ pub(crate) async fn validate_transaction_log_schema_api_spec_deletion_candidate(
     candidate
         .plugin_configs
         .retain(|plugin| !removed_plugin_ids.contains(&plugin.id));
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state)
+        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await
 }
 
@@ -2483,7 +2572,8 @@ pub(crate) fn validate_plugin_graph_restore_candidate(
     state: &AdminState,
     replacement: &GatewayConfig,
 ) -> Result<(), AfterValidateError> {
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state)
+        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     validate_candidate_plugin_graph(replacement, &http_client)
 }
 
@@ -2505,35 +2595,68 @@ async fn consumer_candidate_config(
     Ok(config)
 }
 
-pub(crate) async fn mtls_consumer_candidate_errors(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    consumer: &Consumer,
-) -> DbResult<Vec<String>> {
-    Ok(consumer_candidate_config(db, namespace, consumer)
-        .await?
-        .validate_unique_mtls_credentials()
-        .err()
-        .unwrap_or_default())
+/// Which consumer credential uniqueness checks one candidate snapshot runs.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ConsumerCredentialChecks {
+    pub(crate) mtls: bool,
+    pub(crate) hmac: bool,
+    pub(crate) jwt: bool,
 }
 
-/// Reject an admin Consumer/credential write whose hmac_auth secret is
-/// already claimed by another consumer in the namespace. Snapshot-based like
-/// the mTLS candidate check (rather than a credential-index probe) so
-/// pre-existing rows written before hmac secrets were policed are still
-/// authoritative. `lock_namespace_config_admission` serializes same-process
-/// prechecks; namespace-scoped SQL/Mongo uniqueness constraints are the
-/// cross-process persistence backstop.
-pub(crate) async fn hmac_consumer_candidate_errors(
+/// Per-kind uniqueness errors from one candidate snapshot.
+#[derive(Default)]
+pub(crate) struct ConsumerCredentialErrors {
+    pub(crate) mtls: Vec<String>,
+    pub(crate) hmac: Vec<String>,
+    pub(crate) jwt: Vec<String>,
+}
+
+/// Run the requested consumer credential uniqueness checks against ONE
+/// namespace snapshot with `consumer` applied (issue #7209: each check used to
+/// load its own snapshot). Nothing is loaded when no check is requested.
+///
+/// - mTLS: the candidate's certificate identities must be unique.
+/// - HMAC: an hmac_auth secret already claimed by another consumer is
+///   refused. Snapshot-based (rather than a credential-index probe) so
+///   pre-existing rows written before hmac secrets were policed are still
+///   authoritative. `lock_namespace_config_admission` serializes
+///   same-process prechecks; namespace-scoped SQL/Mongo uniqueness
+///   constraints are the cross-process persistence backstop.
+/// - JWT: `jwt_auth` picks the verifying Consumer from the signer-chosen
+///   identity claim, so a shared JWT secret lets each holder sign as the
+///   other. Only collisions involving this consumer are reported, so a
+///   pre-existing duplicate between two other Consumers (quarantined on
+///   load) does not block an unrelated write.
+pub(crate) async fn consumer_credential_candidate_errors(
     db: &dyn DatabaseBackend,
     namespace: &str,
     consumer: &Consumer,
-) -> DbResult<Vec<String>> {
-    Ok(consumer_candidate_config(db, namespace, consumer)
-        .await?
-        .validate_unique_hmac_credentials()
-        .err()
-        .unwrap_or_default())
+    checks: ConsumerCredentialChecks,
+) -> DbResult<ConsumerCredentialErrors> {
+    let mut errors = ConsumerCredentialErrors::default();
+    if !(checks.mtls || checks.hmac || checks.jwt) {
+        return Ok(errors);
+    }
+    let config = consumer_candidate_config(db, namespace, consumer).await?;
+    if checks.mtls {
+        errors.mtls = config
+            .validate_unique_mtls_credentials()
+            .err()
+            .unwrap_or_default();
+    }
+    if checks.hmac {
+        errors.hmac = config
+            .validate_unique_hmac_credentials()
+            .err()
+            .unwrap_or_default();
+    }
+    if checks.jwt {
+        errors.jwt = config
+            .validate_unique_jwt_credentials_for_consumers(&[consumer.id.as_str()])
+            .err()
+            .unwrap_or_default();
+    }
+    Ok(errors)
 }
 
 impl ValidationError {
@@ -2581,10 +2704,16 @@ pub(crate) trait AdminResource:
     /// Default is a no-op.
     fn set_actor(&mut self, _actor: &str) {}
 
-    /// TLS material references this resource asks the gateway to resolve, as
-    /// `(field, value, field kind)`. Default: none.
-    fn tls_material_references(&self) -> Vec<(&'static str, &str, MaterialKind)> {
+    /// References this resource asks the gateway to resolve or use with its
+    /// own identity, as `(field, value, class)`. Default: none.
+    fn tls_material_references(&self) -> Vec<(String, &str, ScopedReferenceClass)> {
         Vec::new()
+    }
+
+    /// `(plugin name, config)` of a resource whose gateway material use the
+    /// registry cannot classify. Default: none.
+    fn unclassified_material_owner(&self) -> Option<(&str, &Value)> {
+        None
     }
 
     /// Re-read the committed record after a successful create/update and use
@@ -2697,6 +2826,12 @@ pub(crate) trait AdminResource:
         error: &anyhow::Error,
         _action: WriteAction<'_>,
     ) -> Response<Full<Bytes>> {
+        if let Some(refusal) = plugin_association_precondition_failed(error) {
+            return super::json_response(
+                StatusCode::PRECONDITION_FAILED,
+                &json!({"error": refusal.to_string()}),
+            );
+        }
         if is_mtls_dns_admission_unavailable(error) {
             return super::mtls_dns_admission_unavailable_response();
         }
@@ -2734,6 +2869,12 @@ pub(crate) trait AdminResource:
     }
 
     fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+        if let Some(refusal) = plugin_association_precondition_failed(error) {
+            return super::json_response(
+                StatusCode::PRECONDITION_FAILED,
+                &json!({"error": refusal.to_string()}),
+            );
+        }
         if let Some(unsupported) =
             crate::config::db_backend::proxy_delete_atomicity_unsupported(error)
         {
@@ -2831,6 +2972,56 @@ pub(crate) trait AdminResource:
         _opts: Self::DeleteQuery,
     ) -> DbResult<bool> {
         Self::db_delete(db, namespace, id).await
+    }
+
+    /// Extra query-string state for PUT (full-replacement update). Default
+    /// is unused, mirroring [`Self::DeleteQuery`].
+    type UpdateQuery: Send + Sync + Clone + Default + 'static;
+
+    /// Persist a PUT with its parsed request preconditions. Recovery uses
+    /// the plain `db_update` so it can restore the previous graph.
+    async fn db_update_from_request(
+        db: &dyn DatabaseBackend,
+        resource: &Self,
+        _opts: &Self::UpdateQuery,
+    ) -> DbResult<bool> {
+        Self::db_update(db, resource).await
+    }
+
+    /// Parse resource-specific PUT query parameters. Default ignores the
+    /// query string. Return `Err` for a 400 before any persistence.
+    fn parse_update_query(_query: Option<&str>) -> Result<Self::UpdateQuery, String> {
+        Ok(Self::UpdateQuery::default())
+    }
+
+    /// Refuse an update whose caller-supplied precondition (from the query
+    /// string) no longer holds against current stored state. Called under
+    /// the namespace config admission lease, after validation and before
+    /// persistence. Resources requiring a write-time backstop must also
+    /// enforce their preconditions in `db_update_from_request`.
+    async fn check_update_precondition(
+        _db: &dyn DatabaseBackend,
+        _namespace: &str,
+        _resource: &Self,
+        _opts: &Self::UpdateQuery,
+    ) -> Result<(), AfterValidateError> {
+        Ok(())
+    }
+
+    /// Refuse a delete whose caller-supplied precondition (from the query
+    /// string) no longer holds against current stored state. Called under
+    /// the namespace config admission lease, before persistence.
+    /// `previous_snapshot` is the lease-held namespace snapshot when one
+    /// was loaded; it is `None` only on the undecodable-row repair path,
+    /// where the snapshot cannot be hydrated.
+    async fn check_delete_precondition(
+        _db: &dyn DatabaseBackend,
+        _namespace: &str,
+        _id: &str,
+        _previous_snapshot: Option<&GatewayConfig>,
+        _opts: &Self::DeleteQuery,
+    ) -> Result<(), AfterValidateError> {
+        Ok(())
     }
 
     async fn compensate_late_delete(
@@ -3002,10 +3193,18 @@ pub(crate) async fn handle_list_filtered<R: AdminResource>(
     }
 }
 
+/// `GET /<resource>/{id}`.
+///
+/// `key_tier` is the tier of the key that verified the caller's token. The
+/// strong `ETag` is a MAC keyed by `FERRUM_ADMIN_JWT_SECRET` over the stored
+/// representation, which for a resource without withheld fields is input the
+/// reader can reconstruct; a viewer-key token (which can never write, so has
+/// no use for `If-Match`) therefore gets no tag (GHSA-crqx-mp2f-v8c8).
 pub(crate) async fn handle_get<R: AdminResource>(
     state: &AdminState,
     id: &str,
     role: AdminRole,
+    key_tier: AdminKeyTier,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(message) = validate_resource_id(id) {
@@ -3027,8 +3226,10 @@ pub(crate) async fn handle_get<R: AdminResource>(
                 // Tags are issued only for a read from the store. The cached
                 // fallback below may lag the store, and a tag for a
                 // representation the store no longer holds would only ever
-                // produce a 412, so it gets none.
+                // produce a 412, so it gets none. Nor does a viewer-key
+                // caller: the tag is keyed by the primary admin secret.
                 if R::SUPPORTS_IF_MATCH
+                    && key_tier == AdminKeyTier::Primary
                     && let Some(tag) = current_etag(state, &resource)
                     && let Ok(value) =
                         hyper::header::HeaderValue::from_str(&preconditions::quoted(&tag))
@@ -3087,10 +3288,12 @@ pub(crate) async fn handle_create<R: AdminResource>(
         apply_mode,
         provisioner,
         None,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_update<R: AdminResource>(
     state: &AdminState,
     actor: &AuditActor,
@@ -3099,6 +3302,7 @@ pub(crate) async fn handle_update<R: AdminResource>(
     namespace: &str,
     apply_mode: LiveApplyMode,
     if_match: Option<&IfMatch>,
+    query: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     handle_write::<R>(
         state,
@@ -3109,6 +3313,7 @@ pub(crate) async fn handle_update<R: AdminResource>(
         apply_mode,
         None,
         if_match,
+        query,
     )
     .await
 }
@@ -3163,6 +3368,73 @@ fn if_match_refusal<R: AdminResource>(
     ))
 }
 
+/// `If-Match` for the `/consumers/{id}/credentials/...` mutations, evaluated
+/// against the Consumer the credential handler read under the namespace
+/// admission lease. The tag is the Consumer's own `ETag` from
+/// `GET /consumers/{id}`, so the same tag conditions a whole-Consumer write
+/// and a credential sub-route write (issue #7393).
+pub(crate) fn consumer_if_match_refusal(
+    state: &AdminState,
+    if_match: Option<&IfMatch>,
+    consumer_id: &str,
+    consumer: &Consumer,
+) -> Option<Response<Full<Bytes>>> {
+    if_match_refusal::<Consumer>(state, if_match, consumer_id, Some(consumer))
+}
+
+/// The caller-supplied set of proxies expected to reference a plugin
+/// config, from the required `expected_proxy_ids` query parameter on
+/// `PUT`/`DELETE /plugins/config/{id}` (forge-ops issue #569).
+///
+/// Deleting a plugin config removes every proxy association to it, and a
+/// `proxy`/`global` update removes every association but its target. Those
+/// rows are outside the plugin config's own `ETag`, so `If-Match` cannot
+/// fence an association another writer committed after the caller's read.
+/// The write is therefore refused unless every currently referencing
+/// proxy is in this set (or is the target a `proxy`-scoped update keeps).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ExpectedProxyIds(BTreeSet<String>);
+
+/// Parse the required `expected_proxy_ids` query parameter: exactly one
+/// occurrence, comma-separated proxy ids, present-but-empty for "expect
+/// none". Absent, repeated, or malformed (empty entry, duplicate, invalid
+/// id) is an error, because the parameter decides which associations the
+/// write may detach.
+pub(crate) fn parse_expected_proxy_ids_query(
+    query: Option<&str>,
+) -> Result<ExpectedProxyIds, String> {
+    let mut found: Option<String> = None;
+    for (key, value) in url::form_urlencoded::parse(query.unwrap_or("").as_bytes()) {
+        if key.as_ref() != "expected_proxy_ids" {
+            continue;
+        }
+        if found.is_some() {
+            return Err("expected_proxy_ids must not be supplied more than once".to_string());
+        }
+        found = Some(value.into_owned());
+    }
+    let Some(value) = found else {
+        return Err(
+            "expected_proxy_ids query parameter is required: list every proxy that may \
+             reference this plugin config (empty value expects none)"
+                .to_string(),
+        );
+    };
+    let mut ids = BTreeSet::new();
+    if value.is_empty() {
+        return Ok(ExpectedProxyIds(ids));
+    }
+    for entry in value.split(',') {
+        validate_resource_id(entry).map_err(|message| format!("expected_proxy_ids: {message}"))?;
+        if !ids.insert(entry.to_string()) {
+            return Err(format!(
+                "expected_proxy_ids lists proxy '{entry}' more than once"
+            ));
+        }
+    }
+    Ok(ExpectedProxyIds(ids))
+}
+
 /// Parse `cleanup_orphaned_upstream` from `DELETE /proxies/{id}`.
 ///
 /// The parameter is absent → `true` (today's last-referenced hand-owned
@@ -3211,6 +3483,11 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         Err(response) => return Ok(response),
     };
 
+    let validation_http_client = match validation_http_client_or_500(state) {
+        Ok(client) => client,
+        Err(response) => return Ok(response),
+    };
+
     if let Err(message) = validate_resource_id(id) {
         return Ok(super::json_response(
             StatusCode::BAD_REQUEST,
@@ -3238,6 +3515,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         }
     };
     let db = db_arc.as_ref();
+
     let mut namespace_config_admission_guard = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
         match lock_namespace_config_admission(db_arc.clone(), namespace).await {
             Ok(guard) => Some(guard),
@@ -3254,6 +3532,11 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             if let Some(response) = if_match_refusal::<R>(state, if_match, id, None) {
                 return Ok(response);
             }
+            if let Err(error) =
+                R::check_delete_precondition(db, namespace, id, None, &delete_query).await
+            {
+                return Ok(map_after_validate_error::<R>(error));
+            }
             // Issue #2997: the target row exists but cannot be decoded. Skip
             // namespace-snapshot recovery (that load fails for the same row) and
             // delete by id so admin remains the in-band repair path.
@@ -3263,7 +3546,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                         db: db_arc.clone(),
                         namespace: namespace.to_string(),
                         guard: namespace_config_admission_guard.take(),
-                        http_client: super::plugin_validation_http_client(state),
+                        http_client: validation_http_client.clone(),
                         state: state.clone(),
                         actor: actor.clone(),
                     },
@@ -3306,6 +3589,12 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     } else {
         None
     };
+    if let Err(error) =
+        R::check_delete_precondition(db, namespace, id, previous_snapshot.as_ref(), &delete_query)
+            .await
+    {
+        return Ok(map_after_validate_error::<R>(error));
+    }
     let previous_api_spec = match R::late_delete_api_spec_snapshot(
         db,
         namespace,
@@ -3328,7 +3617,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             db: db_arc.clone(),
             namespace: namespace.to_string(),
             guard: namespace_config_admission_guard.take(),
-            http_client: super::plugin_validation_http_client(state),
+            http_client: validation_http_client.clone(),
             state: state.clone(),
             actor: actor.clone(),
         },
@@ -3404,6 +3693,22 @@ pub(crate) fn consumer_audit_body(consumer: &Consumer) -> Value {
     json!(super::redact_consumer_credentials_for_audit(consumer))
 }
 
+/// `409` body for a Consumer rename the store refused because an
+/// `access_control` plugin config still names the previous username in
+/// `allowed_consumers` or `disallowed_consumers`.
+const CONSUMER_RENAME_REFERENCED_BY_ACCESS_CONTROL: &str =
+    "Consumer is referenced by one or more access_control plugin_configs and cannot be renamed";
+
+/// The SQL and MongoDB stores refuse a username change while an
+/// `access_control` entry names the old username; their error text carries
+/// this marker (driver context may wrap it, so the whole chain is searched).
+fn is_access_control_rename_conflict(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("referenced by access_control") && message.contains("cannot be renamed")
+    })
+}
+
 pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response<Full<Bytes>> {
     if config_update_target_was_not_found(error) {
         return not_found_response::<Consumer>();
@@ -3411,8 +3716,9 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
     if is_mtls_dns_admission_unavailable(error) {
         return super::mtls_dns_admission_unavailable_response();
     }
-    let unique_conflict =
-        is_mtls_dns_identity_conflict(error) || super::chain_has_unique_constraint_violation(error);
+    let unique_conflict = is_access_control_rename_conflict(error)
+        || is_mtls_dns_identity_conflict(error)
+        || super::chain_has_unique_constraint_violation(error);
     let message = consumer_persist_error_message(error);
     let status = if unique_conflict {
         StatusCode::CONFLICT
@@ -3431,6 +3737,8 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
 pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
     if is_mtls_dns_admission_unavailable(error) {
         MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string()
+    } else if is_access_control_rename_conflict(error) {
+        CONSUMER_RENAME_REFERENCED_BY_ACCESS_CONTROL.to_string()
     } else if let Some(conflict) = mtls_dns_identity_conflict(error) {
         // Render the typed conflict, not the chain's outermost message: the
         // identities it names are internally constructed and not secrets, but
@@ -3463,7 +3771,7 @@ pub(crate) fn validate_plugin_config_definition(
     state: &AdminState,
     pc: &PluginConfig,
 ) -> Result<(), String> {
-    super::validate_plugin_config_definition(pc, super::plugin_validation_http_client(state))
+    super::validate_plugin_config_definition(pc, super::plugin_validation_http_client(state)?)
 }
 
 async fn validate_openapi_validator_precondition(
@@ -3518,10 +3826,28 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
     };
 
     let mut errors = Vec::new();
+    // Every upstream the config names: each rule's destination, then each
+    // weighted split and its legs (issue #7387), which dispatch reaches the
+    // same way. Collected up front: no iterator is held across the awaits.
+    let mut named: Vec<(String, &str)> = Vec::new();
     for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
-        let Some(upstream_id) = rule.destination.upstream_id.as_deref() else {
-            continue;
-        };
+        if let Some(upstream_id) = rule.destination.upstream_id.as_deref() {
+            named.push((format!("rule {rule_idx}"), upstream_id));
+        }
+    }
+    for (split_idx, split) in dispatch_config.weighted_splits.iter().enumerate() {
+        named.push((
+            format!("weighted_splits[{split_idx}]"),
+            split.upstream_id.as_str(),
+        ));
+        for (leg_idx, leg) in split.legs.iter().enumerate() {
+            named.push((
+                format!("weighted_splits[{split_idx}].legs[{leg_idx}]"),
+                leg.upstream_id.as_str(),
+            ));
+        }
+    }
+    for (position, upstream_id) in named {
         if batch_upstream_ids.is_some_and(|ids| ids.contains(upstream_id)) {
             continue;
         }
@@ -3533,8 +3859,8 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
                 // namespace reports as non-existent (cross-namespace
                 // references are equally forbidden either way).
                 errors.push(format!(
-                    "PluginConfig '{}' (mesh_route_dispatch) rule {} references upstream_id '{}' that does not exist in namespace '{}'",
-                    plugin_config.id, rule_idx, upstream_id, namespace
+                    "PluginConfig '{}' (mesh_route_dispatch) {} references upstream_id '{}' that does not exist in namespace '{}'",
+                    plugin_config.id, position, upstream_id, namespace
                 ));
             }
             Err(error) => return Err(error),
@@ -3553,7 +3879,8 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
 /// The one redacted plugin-configuration projection.
 ///
 /// Every non-admin read, every management audit record, and every diagnostic
-/// rendering of a plugin `config` goes through here. The sensitivity contract
+/// rendering of a plugin `config` and its execution `trigger` goes through
+/// here. The sensitivity contract
 /// itself lives in [`crate::admin::plugin_config_projection`]: a per-plugin
 /// schema of credential-bearing paths, backed by the historical name heuristic
 /// and a structural URL-userinfo sweep.
@@ -3576,6 +3903,14 @@ pub(crate) fn plugin_config_audit_body_with(
             rendering,
         );
     }
+    // The execution trigger is a sibling of `config`: its header, query, and
+    // cookie operands are values a client presents to switch the instance on
+    // or off, so they are withheld like any config secret.
+    if let Some(trigger) = body.get_mut("trigger") {
+        crate::admin::plugin_config_projection::project_plugin_trigger_with(
+            trigger, "/trigger", rendering,
+        );
+    }
     body
 }
 
@@ -3585,27 +3920,25 @@ fn upstream_audit_body(resource: &Upstream) -> Value {
 
 /// The redacted Upstream projection for `viewer` reads, audit diffs, and (with
 /// a fingerprint [`RedactionRendering`]) the read-only configuration export:
-/// the Consul ACL token is withheld, and every URL-shaped string in the body
-/// (a Consul `address`, for example) has any userinfo removed.
+/// everything [`upstream_operator_projection`] withholds, plus any userinfo in
+/// a URL-shaped string anywhere in the body (a Consul `address`, for example).
 ///
 /// Operator reads deliberately do not use this: operators write upstreams, and
 /// a GET-then-PUT of a userinfo-stripped body would silently replace stored
-/// credentials with `redacted@`. They get [`upstream_consul_token_redacted`].
+/// credentials with `redacted@`. They get [`upstream_operator_projection`].
 pub(crate) fn upstream_audit_body_with(
     resource: &Upstream,
     rendering: &dyn RedactionRendering,
 ) -> Value {
-    let mut body = upstream_consul_token_redacted(resource, rendering);
+    let mut body = upstream_operator_projection(resource, rendering);
     crate::admin::plugin_config_projection::strip_url_userinfo_with(&mut body, "", rendering);
     body
 }
 
-/// An Upstream body with only the Consul ACL token withheld: the `operator`
-/// read projection.
-fn upstream_consul_token_redacted(
-    resource: &Upstream,
-    rendering: &dyn RedactionRendering,
-) -> Value {
+/// The `operator` Upstream read projection: the Consul ACL token and stored
+/// backend TLS private-key material ([`withhold_tls_private_key_material`])
+/// are withheld; everything else, URL userinfo included, stays verbatim.
+fn upstream_operator_projection(resource: &Upstream, rendering: &dyn RedactionRendering) -> Value {
     let mut body = json!(resource);
     if let Some(token) = body
         .get_mut("service_discovery")
@@ -3617,6 +3950,7 @@ fn upstream_consul_token_redacted(
         let marker = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
         *token = rendering.render(UPSTREAM_CONSUL_TOKEN_POINTER, &stored, marker);
     }
+    withhold_tls_private_key_material(&mut body, rendering);
     body
 }
 
@@ -3624,14 +3958,37 @@ fn upstream_consul_token_redacted(
 const UPSTREAM_CONSUL_TOKEN_POINTER: &str = "/service_discovery/consul/token";
 
 /// The redacted Proxy projection for `viewer` reads, audit diffs, and (with a
-/// fingerprint [`RedactionRendering`]) the read-only configuration export: any
-/// URL-shaped string carrying userinfo is stripped. `admin` and `operator` reads
-/// stay raw, because both roles write proxies and a GET-then-PUT must not
-/// replace stored userinfo with `redacted@`.
+/// fingerprint [`RedactionRendering`]) the read-only configuration export:
+/// everything [`proxy_operator_projection`] withholds, plus any userinfo in a
+/// URL-shaped string anywhere in the body.
+///
+/// Operator reads deliberately do not use this: operators write proxies, and a
+/// GET-then-PUT must not replace stored userinfo with `redacted@`.
 pub(crate) fn proxy_audit_body_with(resource: &Proxy, rendering: &dyn RedactionRendering) -> Value {
-    let mut body = json!(resource);
+    let mut body = proxy_operator_projection(resource, rendering);
     crate::admin::plugin_config_projection::strip_url_userinfo_with(&mut body, "", rendering);
     body
+}
+
+/// The `operator` Proxy read projection: only stored backend TLS private-key
+/// material ([`withhold_tls_private_key_material`]) is withheld; everything
+/// else, URL userinfo included, stays verbatim.
+fn proxy_operator_projection(resource: &Proxy, rendering: &dyn RedactionRendering) -> Value {
+    let mut body = json!(resource);
+    withhold_tls_private_key_material(&mut body, rendering);
+    body
+}
+
+/// Withhold stored private-key material anywhere in a Proxy or Upstream body,
+/// for every non-admin projection.
+///
+/// The classification is shared with the plugin-config projection (including
+/// the Proxy and Upstream objects a mesh slice embeds), so a reference or a
+/// certificate stays visible and inline key material, or a certificate-plus-key
+/// bundle, is withheld identically on every resource; see
+/// [`crate::admin::plugin_config_projection::withhold_tls_material_with`].
+fn withhold_tls_private_key_material(body: &mut Value, rendering: &dyn RedactionRendering) {
+    crate::admin::plugin_config_projection::withhold_tls_material_with(body, "", rendering);
 }
 
 pub(crate) async fn check_port_available(
@@ -3808,7 +4165,7 @@ impl AdminResource for Upstream {
         Some(&mut self.labels)
     }
 
-    fn tls_material_references(&self) -> Vec<(&'static str, &str, MaterialKind)> {
+    fn tls_material_references(&self) -> Vec<(String, &str, ScopedReferenceClass)> {
         backend_tls_material_references(
             self.backend_tls_client_cert_path.as_deref(),
             self.backend_tls_client_key_path.as_deref(),
@@ -3882,9 +4239,10 @@ impl AdminResource for Upstream {
     ) -> Value {
         match role {
             AdminRole::Admin => Self::response_body(resource),
-            // Operators write upstreams: withhold only the Consul token (as
-            // before issue #5904) so a GET-then-PUT keeps stored URL userinfo.
-            AdminRole::Operator => upstream_consul_token_redacted(resource, rendering),
+            // Operators write upstreams: withhold only stored secrets (the
+            // Consul token and backend TLS private keys) so a GET-then-PUT
+            // keeps stored URL userinfo.
+            AdminRole::Operator => upstream_operator_projection(resource, rendering),
             AdminRole::Viewer => upstream_audit_body_with(resource, rendering),
         }
     }
@@ -3970,6 +4328,7 @@ impl AdminResource for Upstream {
     }
 
     type DeleteQuery = ();
+    type UpdateQuery = ();
 
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
@@ -3998,7 +4357,7 @@ impl AdminResource for Upstream {
         _state: &AdminState,
         namespace: &str,
         resource: &Self,
-        _existing: Option<&Self>,
+        existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
         let subset_names: HashSet<&str> = resource
@@ -4008,6 +4367,19 @@ impl AdminResource for Upstream {
             .iter()
             .map(|subset| subset.name.as_str())
             .collect();
+        // Only a REMOVED subset can strand a proxy reference. An update that
+        // keeps every stored subset skips paging every proxy of the namespace
+        // (issue #7209); creates still scan.
+        if let Some(existing) = existing
+            && existing
+                .subsets
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .all(|subset| subset_names.contains(subset.name.as_str()))
+        {
+            return Ok(());
+        }
         let mut errors = Vec::new();
         let mut offset = 0_i64;
         const PAGE_SIZE: i64 = 1_000;
@@ -4226,6 +4598,7 @@ impl AdminResource for GatewayTrustBundleRecord {
     }
 
     type DeleteQuery = ();
+    type UpdateQuery = ();
 
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
@@ -4249,6 +4622,15 @@ pub(crate) const GATEWAY_TRUST_BUNDLE_SINGLETON_CONFLICT_MESSAGE: &str =
 
 #[async_trait::async_trait]
 impl AdminResource for PluginConfig {
+    fn tls_material_references(&self) -> Vec<(String, &str, ScopedReferenceClass)> {
+        scoped_references::plugin_scoped_references(&self.plugin_name, &self.config)
+    }
+
+    fn unclassified_material_owner(&self) -> Option<(&str, &Value)> {
+        (!scoped_references::plugin_is_classified(&self.plugin_name))
+            .then_some((self.plugin_name.as_str(), &self.config))
+    }
+
     fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
         Some(&mut self.labels)
     }
@@ -4435,7 +4817,99 @@ impl AdminResource for PluginConfig {
         db.delete_plugin_config(namespace, id).await
     }
 
-    type DeleteQuery = ();
+    async fn db_update_from_request(
+        db: &dyn DatabaseBackend,
+        resource: &Self,
+        opts: &Self::UpdateQuery,
+    ) -> DbResult<bool> {
+        db.update_plugin_config_expected(resource, &opts.0).await
+    }
+
+    async fn db_delete_from_request(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        id: &str,
+        opts: Self::DeleteQuery,
+    ) -> DbResult<bool> {
+        db.delete_plugin_config_expected(namespace, id, &opts.0)
+            .await
+    }
+
+    type DeleteQuery = ExpectedProxyIds;
+    type UpdateQuery = ExpectedProxyIds;
+
+    fn parse_delete_query(query: Option<&str>) -> Result<ExpectedProxyIds, String> {
+        parse_expected_proxy_ids_query(query)
+    }
+
+    fn parse_update_query(query: Option<&str>) -> Result<ExpectedProxyIds, String> {
+        parse_expected_proxy_ids_query(query)
+    }
+
+    /// Refuse the update while a proxy the caller did not account for
+    /// references this config: applying it would silently detach that
+    /// proxy (forge-ops #569). Runs under the namespace admission lease.
+    async fn check_update_precondition(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        resource: &Self,
+        expected: &ExpectedProxyIds,
+    ) -> Result<(), AfterValidateError> {
+        let current = db
+            .list_plugin_config_referencing_proxy_ids(namespace, &resource.id)
+            .await
+            .map_err(AfterValidateError::Db)?;
+        let kept = if resource.scope == PluginScope::Proxy {
+            resource.proxy_id.as_deref()
+        } else {
+            None
+        };
+        let unexpected = unexpected_plugin_references(&current, expected, kept);
+        if unexpected.is_empty() {
+            Ok(())
+        } else {
+            Err(plugin_association_precondition_refusal(
+                &resource.id,
+                &unexpected,
+            ))
+        }
+    }
+
+    /// Refuse the delete while a proxy the caller did not account for
+    /// references this config (forge-ops #569). The lease-held snapshot is
+    /// authoritative when present; the undecodable-row repair path reads
+    /// primary association ids independently of the damaged plugin row.
+    async fn check_delete_precondition(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        id: &str,
+        previous_snapshot: Option<&GatewayConfig>,
+        expected: &ExpectedProxyIds,
+    ) -> Result<(), AfterValidateError> {
+        let current = match previous_snapshot {
+            Some(snapshot) => snapshot
+                .proxies
+                .iter()
+                .filter(|proxy| {
+                    proxy
+                        .plugins
+                        .iter()
+                        .any(|association| association.plugin_config_id == id)
+                })
+                .map(|proxy| proxy.id.clone())
+                .collect::<BTreeSet<_>>(),
+            None => db
+                .list_plugin_config_referencing_proxy_ids(namespace, id)
+                .await
+                .map_err(AfterValidateError::Db)?,
+        };
+        let unexpected = unexpected_plugin_references(&current, expected, None);
+        if unexpected.is_empty() {
+            Ok(())
+        } else {
+            Err(plugin_association_precondition_refusal(id, &unexpected))
+        }
+    }
 
     async fn compensate_late_delete(
         db: &dyn DatabaseBackend,
@@ -4641,6 +5115,16 @@ impl AdminResource for PluginConfig {
             )]));
         }
 
+        let managed_jwks_errors = super::managed_jwks_source_admission_errors(resource).await;
+        if !managed_jwks_errors.is_empty() {
+            return Err(AfterValidateError::BadRequest(
+                managed_jwks_errors
+                    .into_iter()
+                    .map(|error| format!("Invalid plugin config: {error}"))
+                    .collect(),
+            ));
+        }
+
         validate_openapi_validator_precondition(db, namespace, resource).await?;
 
         let upstream_errors =
@@ -4655,6 +5139,12 @@ impl AdminResource for PluginConfig {
             || existing.is_some_and(|plugin| plugin.plugin_name == "mtls_auth")
         {
             validate_mtls_auth_candidate(db, namespace, None, Some(resource), None).await?;
+        } else if resource.plugin_name == "spiffe_identity" && resource.scope != PluginScope::Global
+        {
+            // Stream TLS-termination compatibility only; a `spiffe_identity`
+            // write never changes mTLS credential uniqueness, and a global
+            // instance is exempt (it no-ops on plaintext listeners).
+            validate_spiffe_identity_candidate(db, namespace, resource).await?;
         }
         // Validate the graph the write will produce, including the proxy
         // association it attaches (issue #4611).
@@ -4787,7 +5277,7 @@ impl AdminResource for Proxy {
         Some(&mut self.labels)
     }
 
-    fn tls_material_references(&self) -> Vec<(&'static str, &str, MaterialKind)> {
+    fn tls_material_references(&self) -> Vec<(String, &str, ScopedReferenceClass)> {
         backend_tls_material_references(
             self.backend_tls_client_cert_path.as_deref(),
             self.backend_tls_client_key_path.as_deref(),
@@ -4812,9 +5302,10 @@ impl AdminResource for Proxy {
         rendering: &dyn RedactionRendering,
     ) -> Value {
         match role {
-            // Both roles write proxies: a GET-then-PUT must round-trip the
-            // stored body unchanged.
-            AdminRole::Admin | AdminRole::Operator => Self::response_body(resource),
+            AdminRole::Admin => Self::response_body(resource),
+            // Operators write proxies: withhold only stored backend TLS
+            // private keys so a GET-then-PUT keeps stored URL userinfo.
+            AdminRole::Operator => proxy_operator_projection(resource, rendering),
             AdminRole::Viewer => proxy_audit_body_with(resource, rendering),
         }
     }
@@ -4998,6 +5489,7 @@ impl AdminResource for Proxy {
     }
 
     type DeleteQuery = bool;
+    type UpdateQuery = ();
 
     fn parse_delete_query(query: Option<&str>) -> Result<bool, String> {
         parse_cleanup_orphaned_upstream_query(query)
@@ -5694,6 +6186,7 @@ impl AdminResource for Consumer {
     }
 
     type DeleteQuery = ();
+    type UpdateQuery = ();
 
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
@@ -5727,21 +6220,17 @@ impl AdminResource for Consumer {
         _existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
-        let mut errors = Vec::new();
-        if resource.has_credential("mtls_auth") {
-            errors.extend(
-                mtls_consumer_candidate_errors(db, namespace, resource)
-                    .await
-                    .map_err(AfterValidateError::Db)?,
-            );
-        }
-        if resource.has_credential("hmac_auth") {
-            errors.extend(
-                hmac_consumer_candidate_errors(db, namespace, resource)
-                    .await
-                    .map_err(AfterValidateError::Db)?,
-            );
-        }
+        let checks = ConsumerCredentialChecks {
+            mtls: resource.has_credential("mtls_auth"),
+            hmac: resource.has_credential("hmac_auth"),
+            jwt: resource.has_credential("jwt"),
+        };
+        let found = consumer_credential_candidate_errors(db, namespace, resource, checks)
+            .await
+            .map_err(AfterValidateError::Db)?;
+        let mut errors = found.mtls;
+        errors.extend(found.hmac);
+        errors.extend(found.jwt);
         if errors.is_empty() {
             Ok(())
         } else {
@@ -5803,7 +6292,7 @@ fn backend_tls_material_references<'a>(
     client_cert_path: Option<&'a str>,
     client_key_path: Option<&'a str>,
     server_ca_path: Option<&'a str>,
-) -> Vec<(&'static str, &'a str, MaterialKind)> {
+) -> Vec<(String, &'a str, ScopedReferenceClass)> {
     let candidates = [
         (
             "backend_tls_client_cert_path",
@@ -5824,7 +6313,11 @@ fn backend_tls_material_references<'a>(
     let mut references = Vec::new();
     for (field, value, kind) in candidates {
         if let Some(value) = value {
-            references.push((field, value, kind));
+            references.push((
+                field.to_string(),
+                value,
+                ScopedReferenceClass::TlsMaterial(kind),
+            ));
         }
     }
     references
@@ -5848,22 +6341,56 @@ fn tls_reference_refusal<R: AdminResource>(
     resource: &R,
     existing: Option<&R>,
 ) -> Option<Response<Full<Bytes>>> {
-    if !state.admin_require_namespace_claim || actor.role == AdminRole::Admin {
+    if actor.role == AdminRole::Admin
+        || !(state.admin_require_namespace_claim || actor.allowed_namespaces.is_present())
+    {
         return None;
     }
-    let stored = existing
+    let refuse = |message: String| {
+        Some(super::json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": message}),
+        ))
+    };
+    // Default-deny: a plugin the registry cannot classify may not be
+    // introduced or changed, because its gateway material use is unknown.
+    if let Some((plugin, config)) = resource.unclassified_material_owner() {
+        let unchanged = existing
+            .and_then(|existing| existing.unclassified_material_owner())
+            .is_some_and(|stored| stored == (plugin, config));
+        if !unchanged {
+            return refuse(
+                "this plugin's use of gateway filesystem paths, credentials and native \
+                 modules cannot be classified, so namespace-scoped configuration may not \
+                 introduce or change its config"
+                    .to_string(),
+            );
+        }
+    }
+    let stored: HashSet<_> = existing
         .map(|existing| existing.tls_material_references())
-        .unwrap_or_default();
-    for (field, value, kind) in resource.tls_material_references() {
-        if stored.contains(&(field, value, kind)) {
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    for reference in resource.tls_material_references() {
+        if stored.contains(&reference) {
             continue;
         }
-        let verdict = check_namespace_scoped_material_reference(value, kind, namespace, &[]);
-        if let Err(refusal) = verdict {
-            return Some(super::json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": format!("`{field}`: {}", refusal.reason())}),
-            ));
+        let (field, value, class) = reference;
+        match class {
+            ScopedReferenceClass::TlsMaterial(kind) => {
+                let verdict =
+                    check_namespace_scoped_material_reference(value, kind, namespace, &[]);
+                if let Err(refusal) = verdict {
+                    return refuse(format!("`{field}`: {}", refusal.reason()));
+                }
+            }
+            ScopedReferenceClass::GatewayOnly => {
+                return refuse(format!(
+                    "`{field}`: gateway filesystem paths and native library settings are not \
+                     available to namespace-scoped configuration"
+                ));
+            }
         }
     }
     None
@@ -5879,6 +6406,7 @@ async fn handle_write<R: AdminResource>(
     apply_mode: LiveApplyMode,
     provisioner: Option<&str>,
     if_match: Option<&IfMatch>,
+    query: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -5894,6 +6422,20 @@ async fn handle_write<R: AdminResource>(
         ));
     }
 
+    let update_query = if matches!(action, WriteAction::Update { .. }) {
+        match R::parse_update_query(query) {
+            Ok(opts) => opts,
+            Err(message) => {
+                return Ok(super::json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": message}),
+                ));
+            }
+        }
+    } else {
+        R::UpdateQuery::default()
+    };
+
     let db_arc = match state.db.as_ref() {
         Some(db) => db.clone(),
         None => {
@@ -5902,6 +6444,11 @@ async fn handle_write<R: AdminResource>(
                 &json!({"error": "No database"}),
             ));
         }
+    };
+
+    let validation_http_client = match validation_http_client_or_500(state) {
+        Ok(client) => client,
+        Err(response) => return Ok(response),
     };
     let db = db_arc.as_ref();
     let mut namespace_config_admission_guard = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
@@ -6088,6 +6635,15 @@ async fn handle_write<R: AdminResource>(
         return Ok(map_after_validate_error::<R>(error));
     }
 
+    // Caller-supplied state precondition, still under the admission lease
+    // this write commits under (forge-ops #569).
+    if matches!(action, WriteAction::Update { .. })
+        && let Err(error) =
+            R::check_update_precondition(db, namespace, &resource, &update_query).await
+    {
+        return Ok(map_after_validate_error::<R>(error));
+    }
+
     if let Err(error) = resource.prepare_for_write() {
         return Ok(super::json_response(
             error.status(),
@@ -6119,7 +6675,7 @@ async fn handle_write<R: AdminResource>(
                     db: db_arc.clone(),
                     namespace: namespace.to_string(),
                     guard: namespace_config_admission_guard.take(),
-                    http_client: super::plugin_validation_http_client(state),
+                    http_client: validation_http_client.clone(),
                     state: state.clone(),
                     actor: actor.clone(),
                 },
@@ -6145,12 +6701,13 @@ async fn handle_write<R: AdminResource>(
                             db: db_arc.clone(),
                             namespace: namespace.to_string(),
                             guard: namespace_config_admission_guard.take(),
-                            http_client: super::plugin_validation_http_client(state),
+                            http_client: validation_http_client.clone(),
                             state: state.clone(),
                             actor: actor.clone(),
                         },
                         id.to_string(),
                         resource.clone(),
+                        update_query.clone(),
                     ))
                     .await
                     {
@@ -6177,13 +6734,14 @@ async fn handle_write<R: AdminResource>(
                             db: db_arc.clone(),
                             namespace: namespace.to_string(),
                             guard: namespace_config_admission_guard.take(),
-                            http_client: super::plugin_validation_http_client(state),
+                            http_client: validation_http_client.clone(),
                             state: state.clone(),
                             actor: actor.clone(),
                         },
                         id.to_string(),
                         resource.clone(),
                         previous,
+                        update_query.clone(),
                     ))
                     .await
                     {

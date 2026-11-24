@@ -1666,26 +1666,37 @@ fn the_client_to_backend_authorization_gate_stays_on_the_hot_path_budget() {
     }
 }
 
-/// The backend reply direction arms ONE timer, outside its receive loop.
+/// The backend reply direction arms ONE timer, outside its receive loops.
 #[test]
 fn the_reply_task_arms_its_authorization_timer_once() {
     let create_session = body_of("async fn create_session(");
     let arm_at = create_session
         .find("let mut reply_authorization_deadline")
         .expect("the reply task's authorization arm");
+    let linux_loop_at = create_session[arm_at..]
+        .find("'reply_linux: loop {")
+        .expect("the labeled Linux plain-UDP reply receive loop");
     let loop_at = create_session[arm_at..]
-        .find("\n        'reply: loop {")
+        .find("'reply: loop {")
         .expect("the labeled reply receive loop");
     assert!(
-        loop_at > 0,
-        "the deadline must be armed BEFORE the receive loop, so no per-datagram timer is \
+        linux_loop_at > 0 && loop_at > 0,
+        "the deadline must be armed BEFORE every receive loop, so no per-datagram timer is \
          registered"
     );
-    let receive_loop = &create_session[arm_at + loop_at..];
+    let all_receive_loops = &create_session[arm_at + linux_loop_at..];
     assert!(
-        !receive_loop.contains("tokio::time::sleep_until("),
-        "the receive loop must not re-arm a timer per datagram"
+        !all_receive_loops.contains("tokio::time::sleep_until("),
+        "no receive loop may re-arm a timer per datagram"
     );
+    let linux_receive_loop = &create_session[arm_at + linux_loop_at..arm_at + loop_at];
+    assert!(
+        linux_receive_loop.contains("biased;")
+            && linux_receive_loop.contains("reply_authorization_deadline.as_mut()"),
+        "the Linux plain-UDP receive loop must race sock.readable() behind the biased \
+         authorization deadline"
+    );
+    let receive_loop = &create_session[arm_at + loop_at..];
     assert_eq!(
         receive_loop
             .matches("udp_reply_recv_until_stop_or_expiry(")
@@ -1750,18 +1761,24 @@ fn every_plain_udp_setup_stage_runs_under_the_authorization_deadline() {
         .find("let first_datagram_allowed =")
         .expect("the bounded first-datagram policy stage");
     assert!(first_datagram > admit_at);
-    // The pending drain stops at expiry.
+    // The pending drain stops at expiry. It returns with the pending gate still
+    // armed, so the gate's `Drop` removes the entry (GHSA-4wqw-qq7v-pwhp; see
+    // `pending_drain_authorization_expiry_returns_with_the_gate_armed`).
     let drain_gate = new_session
-        .find("'drain: while let Some(batch) = take_pending_datagrams(")
-        .expect("the labeled pending-datagram drain");
-    let drain_break = new_session[drain_gate..]
-        .find("break 'drain;")
-        .expect("the drain's expiry break");
+        .find("while let Some(batch) = take_pending_datagrams(")
+        .expect("the pending-datagram drain");
+    let drain_expiry = new_session[drain_gate..]
+        .find("if session.refuse_if_authorization_expired().is_some() {")
+        .expect("the drain's expiry check");
+    let drain_stop = new_session[drain_gate + drain_expiry..]
+        .find("return Ok(());")
+        .map(|at| drain_expiry + at)
+        .expect("the drain's expiry stop");
     let drain_hook = new_session[drain_gate..]
         .find("udp_datagram_allowed(")
         .expect("the drain's per-datagram hook");
     assert!(
-        drain_break < drain_hook,
+        drain_expiry < drain_stop && drain_stop < drain_hook,
         "the pending-datagram drain must stop at expiry BEFORE running another hook"
     );
 
@@ -2039,37 +2056,44 @@ fn client_facing_sends_are_raced_against_the_authorization_plan() {
         .next()
         .expect("direct_send_to_client body");
     assert!(
-        linux_direct.contains("udp_frontend_send_until_expiry("),
-        "the Linux send_to fallback must race the client send"
-    );
-    assert!(
-        linux_direct.contains("frontend.send_to(data, client_addr)"),
-        "the Linux family-mismatch fallback still uses send_to under the race"
+        linux_direct.contains("frontend.try_send_to(data, client_addr)"),
+        "the Linux family-mismatch fallback must use non-blocking try_send_to with post-wait revalidation"
     );
     assert!(
         linux_direct.contains("udp_frontend_writable_until_expiry("),
-        "the Linux pktinfo WouldBlock path must race writable()"
+        "the Linux direct-send WouldBlock paths must race writable() against authorization expiry"
     );
-    let writable_wait = linux_direct
-        .find("udp_frontend_writable_until_expiry(")
-        .expect("writable race");
-    let would_block = linux_direct
-        .find("ErrorKind::WouldBlock")
-        .expect("WouldBlock path");
+    let try_send = linux_direct
+        .find("frontend.try_send_to(data, client_addr)")
+        .expect("try_send_to fallback");
+    assert!(
+        linux_direct[..try_send].contains("udp_reply_expired_at_commit(authorization)"),
+        "the try_send_to fallback must be preceded by an authorization recheck"
+    );
     let syscall = linux_direct
         .find("send_with_pktinfo(")
         .expect("the pktinfo syscall");
     assert!(
-        linux_direct[..syscall].contains("udp_reply_expired_at_commit(authorization)"),
+        linux_direct[try_send..syscall].contains("udp_reply_expired_at_commit(authorization)"),
         "the pktinfo syscall must be preceded by an authorization recheck"
     );
+    let pktinfo_would_block = linux_direct[syscall..]
+        .find("ErrorKind::WouldBlock")
+        .expect("pktinfo WouldBlock path");
+    let pktinfo_writable_wait = linux_direct[syscall..]
+        .find("udp_frontend_writable_until_expiry(")
+        .expect("pktinfo writable race");
     assert!(
-        writable_wait > would_block,
+        pktinfo_writable_wait > pktinfo_would_block,
         "writable wait is the authorization-owned helper, not a bare frontend.writable().await"
     );
     assert!(
         !linux_direct.contains("frontend.writable().await"),
         "writable() must not be awaited outside the authorization race"
+    );
+    assert!(
+        !linux_direct.contains("frontend.send_to(data, client_addr).await"),
+        "send_to must not be awaited unguarded"
     );
 
     let dtls_inner = body_of("async fn handle_dtls_client_inner(");
@@ -2378,4 +2402,43 @@ async fn an_unauthenticated_dtls_c2b_stage_has_no_timer() {
     let _ = release_tx.send(());
     assert_eq!(raced.await.expect("join"), Ok(4));
     assert!(emitted.load(Ordering::SeqCst));
+}
+
+/// GHSA-4wqw-qq7v-pwhp: an authorization expiry while the queued setup
+/// datagrams drain must leave the pending-session gate ARMED. A non-empty
+/// `take_pending_datagrams` keeps the map entry, and nothing else removes it,
+/// so disarming on that path leaked the entry: every later datagram from the
+/// client tuple was queued and tail-dropped, and the leaked entry held a
+/// pending slot against `max_sessions` for the listener's lifetime.
+///
+/// The drain runs inside `process_new_session_datagram` with no seam to expire
+/// a credential mid-drain, so this pins the shape structurally: the loop has
+/// no `break` (the only exit that reaches `gate.disarm()` is the empty take
+/// that removed the entry) and the expiry check returns with the gate armed.
+#[test]
+fn pending_drain_authorization_expiry_returns_with_the_gate_armed() {
+    const UDP_PROXY_SOURCE: &str = include_str!("../../../src/proxy/udp_proxy.rs");
+    let drain = UDP_PROXY_SOURCE
+        .split("while let Some(batch) = take_pending_datagrams(pending_sessions, &session_key) {")
+        .nth(1)
+        .expect("post-setup pending datagram drain")
+        .split("gate.disarm();")
+        .next()
+        .expect("drain ends at the gate disarm");
+    assert!(
+        !drain
+            .lines()
+            .any(|line| line.trim_start().starts_with("break")),
+        "no drain exit may reach `gate.disarm()` while the pending entry is still mapped"
+    );
+    let expiry = drain
+        .split("if session.refuse_if_authorization_expired().is_some() {")
+        .nth(1)
+        .expect("mid-drain authorization expiry check");
+    let arm = expiry.split('}').next().unwrap_or_default();
+    assert_eq!(
+        arm.trim(),
+        "return Ok(());",
+        "a mid-drain authorization expiry must return with the gate still armed"
+    );
 }

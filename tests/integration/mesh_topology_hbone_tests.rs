@@ -15,13 +15,14 @@ use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::OutboundTrafficPolicy;
 use ferrum_edge::modes::mesh::hbone::{
     BAGGAGE_HEADER, HboneIdentity, baggage_header_for_source, is_authenticated_hbone_connect,
-    is_hbone_connect,
+    is_hbone_connect, strip_egress_baggage_in_map,
+    strip_egress_baggage_in_map_with_static_prefixes,
 };
 use ferrum_edge::modes::mesh::{
     MESH_ACCESS_LOG_PLUGIN_ID, MESH_AUTHZ_PLUGIN_ID, MESH_BPF_METRICS_PLUGIN_ID,
     MESH_OUTBOUND_REGISTRY_PLUGIN_ID, MESH_REQUEST_AUTH_PLUGIN_ID, MESH_SPIFFE_IDENTITY_PLUGIN_ID,
     MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshListenerKind, MeshTopology, MeshTrafficDirection,
-    prepare_gateway_config_for_mesh,
+    prepare_gateway_config_via_mesh_slice,
 };
 use http::{HeaderMap, HeaderValue, Method, Version};
 
@@ -96,10 +97,10 @@ fn egress_gateway_topology_runs_mesh_internal_mtls_inbound() {
 
 #[test]
 fn topology_predicates_match_listener_plan_shape() {
-    // The convenience predicates on `MeshTopology` are used by listener
-    // spawning and admin endpoints — guard against a future drift
-    // where a topology starts terminating HBONE but `terminates_hbone()`
-    // still returns false.
+    // Listener spawning derives HBONE termination from `listener_plan()`;
+    // `is_waypoint()` drives slice filtering and admin dispatch. Guard both
+    // against drift: only Ambient and the two waypoints terminate HBONE, and
+    // only the waypoints are waypoints.
     for topology in [
         MeshTopology::Sidecar,
         MeshTopology::Ambient,
@@ -113,9 +114,12 @@ fn topology_predicates_match_listener_plan_shape() {
             .iter()
             .any(|l| l.kind == MeshListenerKind::HboneTermination);
         assert_eq!(
-            topology.terminates_hbone(),
             has_hbone,
-            "terminates_hbone() should align with listener plan for {topology:?}"
+            matches!(
+                topology,
+                MeshTopology::Ambient | MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint
+            ),
+            "HBONE termination listener for {topology:?}"
         );
         assert_eq!(
             topology.is_waypoint(),
@@ -138,7 +142,8 @@ fn ambient_topology_injects_same_core_plugins_as_sidecar() {
     let workload = workload_for("reviews", "default", [("app", "reviews")], ["10.0.0.1"]);
     let mesh = mesh_config_with(vec![workload], Vec::new(), Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("ambient prepared");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("ambient prepared");
     let ids: std::collections::HashSet<_> = prepared
         .plugin_configs
         .iter()
@@ -176,7 +181,7 @@ fn node_waypoint_topology_injects_bpf_metrics() {
     let mesh = mesh_config_with(vec![workload], Vec::new(), Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("node-waypoint prepared");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("node-waypoint prepared");
     let ids: std::collections::HashSet<_> = prepared
         .plugin_configs
         .iter()
@@ -208,7 +213,7 @@ fn registry_only_outbound_policy_injects_outbound_registry_plugin_for_sidecar() 
     let service = service_for("reviews", "default", &[&workload]);
     let mesh = mesh_config_with(vec![workload], vec![service], Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
     let registry_plugin = prepared
         .plugin_configs
         .iter()
@@ -233,7 +238,7 @@ fn allow_any_outbound_policy_omits_outbound_registry_plugin() {
     runtime.outbound_traffic_policy = OutboundTrafficPolicy::AllowAny;
     let mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
     assert!(
         prepared
             .plugin_configs
@@ -257,7 +262,7 @@ fn request_authentication_plugin_only_injected_when_jwt_rules_present() {
         let workload = workload_for("reviews", "default", [("app", "reviews")], ["10.0.0.1"]);
         let mesh = mesh_config_with(vec![workload], Vec::new(), Vec::new());
         let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
+        let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
         let plugin_ids: std::collections::HashSet<_> = prepared
             .plugin_configs
             .iter()
@@ -277,6 +282,7 @@ fn request_authentication_plugin_only_injected_when_jwt_rules_present() {
         let mut mesh = mesh_config_with(vec![workload], Vec::new(), Vec::new());
         mesh.request_authentications
             .push(MeshRequestAuthentication {
+                refused: false,
                 name: "issuer".to_string(),
                 namespace: "default".to_string(),
                 scope: PolicyScope::MeshWide,
@@ -292,7 +298,7 @@ fn request_authentication_plugin_only_injected_when_jwt_rules_present() {
                 }],
             });
         let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
+        let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
         let plugin_ids: std::collections::HashSet<_> = prepared
             .plugin_configs
             .iter()
@@ -319,6 +325,9 @@ fn request_authentication_plugin_only_injected_when_jwt_rules_present() {
             jwks.config["emit_mesh_request_principal_metadata"],
             serde_json::json!(true)
         );
+        // Permissive missing-token handling is an explicit opt-in on the
+        // mesh-generated instance, never implied by the metadata flag.
+        assert_eq!(jwks.config["allow_missing_token"], serde_json::json!(true));
         // Mesh injection carries no cooldown knob, so the injected generation
         // inherits the shared store's default unknown-`kid` refetch: an IdP
         // rotation recovers for mesh workloads exactly as it does for a
@@ -418,6 +427,76 @@ fn baggage_parser_ignores_keys_outside_the_documented_principal_alias_set() {
         "non-canonical baggage key must NOT populate source_principal, got {:?}",
         identity.source_principal
     );
+}
+
+// ── Egress baggage stripping on map-shaped headers ────────────────────────
+//
+// A map can carry more than one spelling of the `baggage` header (a
+// request-transforming plugin may add `Baggage` beside the lowercase key).
+// The receiver merges every baggage field line, so egress stripping must
+// filter every case-insensitive match, not just one.
+
+#[test]
+fn strip_egress_baggage_in_map_filters_every_case_variant_of_the_header() {
+    let mut headers = HashMap::from([
+        (
+            "baggage".to_string(),
+            "source.principal=spiffe://td/ns/a/sa/b,userid=alice".to_string(),
+        ),
+        (
+            "Baggage".to_string(),
+            "source.principal=spiffe://td/ns/evil/sa/x,trace.note=keep".to_string(),
+        ),
+        ("BAGGAGE".to_string(), "source.uid=forged".to_string()),
+        ("host".to_string(), "example.com".to_string()),
+    ]);
+
+    strip_egress_baggage_in_map(&mut headers, &["source.".to_string()]);
+
+    assert_eq!(
+        headers.get("baggage").map(String::as_str),
+        Some("userid=alice")
+    );
+    assert_eq!(
+        headers.get("Baggage").map(String::as_str),
+        Some("trace.note=keep")
+    );
+    assert!(
+        !headers.contains_key("BAGGAGE"),
+        "a spelling whose every member is stripped must be removed"
+    );
+    assert_eq!(headers.get("host").map(String::as_str), Some("example.com"));
+    assert!(
+        headers
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(BAGGAGE_HEADER))
+            .all(|(_, value)| !value.contains("source.")),
+        "no baggage spelling may forward a stripped member: {headers:?}"
+    );
+}
+
+#[test]
+fn strip_egress_baggage_in_map_with_static_prefixes_filters_every_case_variant() {
+    let mut headers = HashMap::from([
+        ("baggage".to_string(), "userid=alice".to_string()),
+        (
+            "Baggage".to_string(),
+            "source.principal=spiffe://td/ns/evil/sa/x,tenant.id=t1,keep=1".to_string(),
+        ),
+    ]);
+
+    strip_egress_baggage_in_map_with_static_prefixes(
+        &mut headers,
+        &["tenant.".to_string()],
+        &["source.", "destination."],
+    );
+
+    assert_eq!(
+        headers.get("baggage").map(String::as_str),
+        Some("userid=alice"),
+        "a spelling with no stripped member is forwarded unchanged"
+    );
+    assert_eq!(headers.get("Baggage").map(String::as_str), Some("keep=1"));
 }
 
 #[test]
@@ -562,7 +641,7 @@ fn workload_labels_round_trip_through_runtime_config() {
 
     let mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
     let authz = prepared
         .plugin_configs
         .iter()

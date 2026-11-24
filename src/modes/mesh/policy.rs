@@ -1,11 +1,10 @@
 //! Mesh authorization policy evaluation.
 //!
-//! This is the Layer 5 policy core used by the future `mesh_authz` plugin.
-//! It evaluates the Layer 2 `MeshPolicy` model without changing the plugin
-//! trait or proxy hot path.
+//! This is the Layer 5 policy core behind the `mesh_authz` plugin
+//! (`crate::plugins::mesh::authz`), evaluated on its per-request path.
+//! It evaluates the Layer 2 `MeshPolicy` model.
 //! Path matching is intentionally literal; callers must pass already-normalized
 //! request paths when they want dot-segment, slash, or percent-decoding policy.
-#![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -17,6 +16,7 @@ use crate::modes::mesh::config::{
     PrincipalMatch, RequestMatch, SourceNegationMatch, canonical_mesh_condition_sni_value,
     classify_mesh_condition_key, normalize_mesh_policy_header_map,
 };
+#[cfg(test)]
 use crate::modes::mesh::slice::MeshSlice;
 
 /// Protocol family of the evaluation context.
@@ -172,7 +172,10 @@ pub struct MeshAuthzEvaluation {
 /// this reaches deny metadata, which is attacker-triggerable.
 pub const MESH_AUTHZ_CUSTOM_PROVIDER_CONFLICT: &str = "custom:provider-conflict";
 
-pub fn evaluate_mesh_authorization(
+/// Test convenience: evaluate a whole slice's policies. Production always
+/// goes through [`evaluate_mesh_authorization_policies`] with a scoped list.
+#[cfg(test)]
+pub(crate) fn evaluate_mesh_authorization(
     slice: &MeshSlice,
     request: &MeshAuthzRequest,
 ) -> MeshAuthzDecision {
@@ -181,9 +184,9 @@ pub fn evaluate_mesh_authorization(
 
 /// Evaluate Layer 5 mesh authorization against an arbitrary policy iterator.
 ///
-/// Mirrors [`evaluate_mesh_authorization`] but accepts any borrowing iterator
-/// of `&MeshPolicy`. Lets node-waypoint topology apply a per-request scope
-/// filter without cloning the full [`MeshSlice`] — the slice carries dozens
+/// Accepts any borrowing iterator of `&MeshPolicy`, not a whole mesh slice.
+/// Lets node-waypoint topology apply a per-request scope filter without
+/// cloning the full [`crate::modes::mesh::slice::MeshSlice`] — the slice carries dozens
 /// of unrelated Vec fields (workloads, services, destination_rules, etc.)
 /// that the authz engine never reads, so cloning the slice just to swap
 /// `mesh_policies` would be a major regression on the request hot path.
@@ -245,7 +248,9 @@ where
     let mut matched_deny: Option<String> = None;
     let mut custom: Option<MeshAuthzCustomDelegation> = None;
     let mut custom_provider_conflict = false;
-    let normalized_host = request.host.as_deref().and_then(normalize_match_host);
+    // Normalized on first use: only rules whose `to:` entries constrain
+    // `hosts` / `notHosts` read it, and `mesh_authz` evaluates per request.
+    let mut normalized_host: Option<Option<NormalizedHost>> = None;
 
     for policy in policies {
         for rule in &policy.rules {
@@ -259,7 +264,14 @@ where
             if matched_deny.is_some() && (custom_provider_conflict || !is_custom) {
                 continue;
             }
-            if !rule_matches(rule, request, normalized_host.as_ref(), &policy.namespace) {
+            let rule_host = if rule_reads_host(rule) {
+                normalized_host
+                    .get_or_insert_with(|| request.host.as_deref().and_then(normalize_match_host))
+                    .as_ref()
+            } else {
+                None
+            };
+            if !rule_matches(rule, request, rule_host, &policy.namespace) {
                 continue;
             }
             match &rule.action {
@@ -355,11 +367,7 @@ pub fn mesh_rule_request_scope_may_apply(
     if rule.to.is_empty() {
         return true;
     }
-    let needs_host = rule
-        .to
-        .iter()
-        .any(|match_| !match_.hosts.is_empty() || !match_.not_hosts.is_empty());
-    let normalized_host = if needs_host {
+    let normalized_host = if rule_reads_host(rule) {
         host.and_then(normalize_match_host)
     } else {
         None
@@ -439,6 +447,15 @@ fn request_scope_method_path_host_may_apply(
 /// `AuthorizationPolicy`'s own namespace on the Kubernetes path). Istio resolves
 /// a bare `when: source.serviceAccount` value against it, so it has to reach
 /// condition evaluation.
+/// Whether any `to:` entry of `rule` constrains `hosts` / `notHosts`, the only
+/// readers of the normalized request host. A rule that does not read it is
+/// evaluated with `None`, which no other matcher consults.
+fn rule_reads_host(rule: &MeshRule) -> bool {
+    rule.to
+        .iter()
+        .any(|match_| !match_.hosts.is_empty() || !match_.not_hosts.is_empty())
+}
+
 fn rule_matches(
     rule: &MeshRule,
     request: &MeshAuthzRequest,
@@ -599,7 +616,7 @@ fn matches_source_negation(neg: &SourceNegationMatch, request: &MeshAuthzRequest
             return false;
         }
         if !neg.not_namespace_patterns.is_empty()
-            && extract_namespace(source.as_str()).is_some_and(|namespace| {
+            && source.namespace().is_some_and(|namespace| {
                 neg.not_namespace_patterns
                     .iter()
                     .any(|pattern| wildcard_match(pattern, namespace))
@@ -755,7 +772,9 @@ fn principal_match(match_: &PrincipalMatch, source: Option<&SpiffeId>) -> bool {
         return false;
     }
     if let Some(pattern) = match_.namespace_pattern.as_ref()
-        && !extract_namespace(source.as_str()).is_some_and(|ns| wildcard_match(pattern, ns))
+        && !source
+            .namespace()
+            .is_some_and(|ns| wildcard_match(pattern, ns))
     {
         return false;
     }
@@ -1263,16 +1282,6 @@ fn istio_condition_string_match(pattern: &str, value: &str) -> bool {
     pattern == value
 }
 
-fn extract_namespace(spiffe_id: &str) -> Option<&str> {
-    let mut segments = spiffe_id.split('/');
-    while let Some(segment) = segments.next() {
-        if segment == "ns" {
-            return segments.next();
-        }
-    }
-    None
-}
-
 /// Returns `true` when `ip` falls inside the CIDR (or bare IP) `cidr`.
 ///
 /// Allocation-light: `IpAddr` / `Ipv4Addr` / `Ipv6Addr` `FromStr` parse into
@@ -1445,10 +1454,27 @@ pub(crate) fn mesh_policy_has_header_rules(
         .any(|request| !request.headers.is_empty())
 }
 
-pub(crate) fn mesh_policies_have_header_rules(
+/// The distinct, lowercase request-header names referenced by any
+/// `to.headers` predicate across `policies`, sorted.
+///
+/// `mesh_authz` precomputes this once per generation so the request path
+/// resolves only these names instead of copying the whole client header map.
+/// Empty when no policy carries a header predicate.
+pub(crate) fn mesh_policies_header_rule_names(
     policies: &[crate::modes::mesh::config::MeshPolicy],
-) -> bool {
-    policies.iter().any(mesh_policy_has_header_rules)
+) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for policy in policies
+        .iter()
+        .filter(|policy| mesh_policy_has_header_rules(policy))
+    {
+        for request in policy.rules.iter().flat_map(|rule| &rule.to) {
+            for name in request.headers.keys() {
+                names.insert(name.to_ascii_lowercase());
+            }
+        }
+    }
+    names.into_iter().collect()
 }
 
 /// An exact `connection.sni` condition value that names a mesh service's bare
@@ -2379,8 +2405,8 @@ mod tests {
 
     #[test]
     fn first_deny_match_wins_second_deny_not_evaluated() {
-        // Two DENY policies with different names; the first match returns
-        // immediately with its policy name.
+        // Two DENY policies with different names; the first matching DENY is
+        // the one reported.
         let slice = MeshSlice {
             mesh_policies: vec![
                 policy("deny-first", PolicyAction::Deny, Vec::new()),
@@ -2901,7 +2927,8 @@ mod tests {
 
     #[test]
     fn header_name_lookup_is_case_insensitive() {
-        // Headers stored with mixed case should match rules written lowercase.
+        // A rule header name written in mixed case matches the lowercased
+        // request header map.
         let slice = MeshSlice {
             mesh_policies: vec![MeshPolicy {
                 name: "allow-tenant".to_string(),
@@ -2910,7 +2937,7 @@ mod tests {
                 rules: vec![MeshRule {
                     from: Vec::new(),
                     to: vec![RequestMatch {
-                        headers: BTreeMap::from([("x-tenant".to_string(), "prod".to_string())])
+                        headers: BTreeMap::from([("X-Tenant".to_string(), "prod".to_string())])
                             .into_iter()
                             .collect(),
                         ..RequestMatch::default()
@@ -3273,13 +3300,27 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        let mut attrs = BTreeMap::new();
-        attrs.insert("source.ip".to_string(), "10.2.3.4".into());
+        // `source.ip` is sourceable only with typed transport evidence, so the
+        // request carries `source_ip` as well as the attribute; without it the
+        // DENY would match through the unsourceable branch and never reach
+        // the CIDR comparison.
+        let request_from = |ip: &str| {
+            let mut attrs = BTreeMap::new();
+            attrs.insert("source.ip".to_string(), ip.into());
+            MeshAuthzRequest {
+                source_ip: Some(ip.parse().unwrap()),
+                ..http_request(attrs)
+            }
+        };
         assert_eq!(
-            evaluate_mesh_authorization(&slice, &http_request(attrs)),
+            evaluate_mesh_authorization(&slice, &request_from("10.2.3.4")),
             MeshAuthzDecision::Deny {
                 policy: "deny-private-source-ip".to_string()
             }
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request_from("192.168.1.1")),
+            MeshAuthzDecision::Allow
         );
     }
 
@@ -3923,24 +3964,6 @@ mod tests {
         );
     }
 
-    // ── Extract namespace ────────────────────────────────────────────────
-
-    #[test]
-    fn extract_namespace_from_spiffe_id() {
-        assert_eq!(
-            extract_namespace("spiffe://cluster.local/ns/default/sa/client"),
-            Some("default")
-        );
-        assert_eq!(
-            extract_namespace("spiffe://cluster.local/ns/prod/sa/admin"),
-            Some("prod")
-        );
-        // No "/ns/" segment.
-        assert_eq!(extract_namespace("spiffe://cluster.local/sa/client"), None);
-        // "/ns/" at the very end with no following segment.
-        assert_eq!(extract_namespace("spiffe://cluster.local/ns/"), Some(""));
-    }
-
     // ── Istio-style negative-match (notMethods/notPaths/notHosts/notPorts) ─
 
     fn policy_with_request_match(
@@ -4073,6 +4096,59 @@ mod tests {
                 policy: "implicit-deny".to_string()
             }
         );
+    }
+
+    #[test]
+    fn host_normalization_is_lazy_without_changing_decisions() {
+        // #7250: the request host is normalized only for rules that read
+        // `hosts` / `notHosts`. A host-free DENY evaluated before a
+        // host-constrained ALLOW must decide exactly as before, including for
+        // an unparsable host (which only the host rule can reject).
+        let slice = MeshSlice {
+            mesh_policies: vec![
+                deny_policy_with_request_match(
+                    "deny-admin",
+                    RequestMatch {
+                        paths: vec!["/admin".to_string()],
+                        ..RequestMatch::default()
+                    },
+                ),
+                allow_policy_with_request_match(
+                    "allow-web",
+                    RequestMatch {
+                        hosts: vec!["web.example.com".to_string()],
+                        ..RequestMatch::default()
+                    },
+                ),
+            ],
+            ..MeshSlice::default()
+        };
+        let request = |host: &str, path: &str| MeshAuthzRequest {
+            host: Some(host.to_string()),
+            path: Some(path.to_string()),
+            protocol: MeshAuthzProtocol::Http,
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request("WEB.example.com:8080", "/x")),
+            MeshAuthzDecision::Allow
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request("web.example.com", "/admin")),
+            MeshAuthzDecision::Deny {
+                policy: "deny-admin".to_string()
+            }
+        );
+        for host in ["other.example.com", "user@web.example.com", ""] {
+            assert_eq!(
+                evaluate_mesh_authorization(&slice, &request(host, "/x")),
+                MeshAuthzDecision::Deny {
+                    policy: "implicit-deny".to_string()
+                },
+                "{host:?}"
+            );
+        }
     }
 
     #[test]

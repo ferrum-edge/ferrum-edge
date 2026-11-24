@@ -204,7 +204,8 @@ this Istio config supported by Ferrum Edge?".
   `ISTIO_MUTUAL`), `portLevelSettings`, and subset overrides.
 - **`istio_peer_authentication`** — single-winner precedence
   (`WorkloadSelector > Namespace > MeshWide`), `mtls.mode` translation
-  (`STRICT` / `PERMISSIVE` / `DISABLE`), per-port overrides.
+  (`STRICT` / `PERMISSIVE` / `DISABLE`), `UNSET` / omitted-mode inheritance
+  from the next-higher tier, per-port overrides.
 - **`istio_request_authentication`** — `jwtRules[]` translation (issuer,
   inline `jwks` vs `jwksUri`, audiences, header/param extraction,
   `forwardOriginalToken`, scope resolution).
@@ -223,7 +224,8 @@ this Istio config supported by Ferrum Edge?".
   `ferrum.log.level`).
 - **`mesh_topology_matrix`** — every mesh topology (`Sidecar`, `Ambient`,
   `NodeWaypoint`, `ServiceWaypoint`, `EastWestGateway`, `EgressGateway`)
-  boots from a minimal config; `terminates_hbone` classification invariant.
+  boots from a minimal config; HBONE termination listener invariant (read
+  from the runtime `listener_plan()`).
 - **`mesh_config_transport`**, **`mesh_spiffe_identity`**,
   **`mesh_multicluster_federation`** — hermetic semantics for the native
   `MeshSubscribe` config transport, SPIRE-backed identity decisions, and the
@@ -289,7 +291,7 @@ removed or fixed before they land — the suite is all-green in `main`.
    features would force operators to read the test source to learn which
    assertion proved which feature.
 3. Drive translation through the public API (`translate_k8s_objects`,
-   `prepare_gateway_config_for_mesh`, `translate_mesh_slice_to_snapshot`)
+   `prepare_gateway_config_via_mesh_slice`, `translate_mesh_slice_to_snapshot`)
    so the conformance test exercises the same code path operators hit.
 4. For matcher-style features, run the resulting plugin on a synthetic
    request and assert the visible outcome (route override, reject, etc.)

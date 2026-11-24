@@ -2464,7 +2464,7 @@ mod tests {
     fn test_engine() -> Engine {
         let cert = generate_self_signed_certificate().expect("gen cert");
         let config = Arc::new(Config::builder().build().expect("build config"));
-        Engine::new(config, cert)
+        Engine::new(config, cert.into())
     }
 
     /// Issue 2: Epoch-0 sequence number must have an overflow guard.

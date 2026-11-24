@@ -160,7 +160,7 @@ fn mint_with_exp(
     encode(
         &header,
         &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).unwrap(),
     )
     .expect("test JWT must encode")
 }
@@ -191,7 +191,7 @@ fn mint_with_nbf(
     encode(
         &header,
         &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).unwrap(),
     )
     .expect("test JWT must encode")
 }
@@ -457,6 +457,7 @@ fn mesh_subscribe_request(
         waypoint_name: String::new(),
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
         remote_discovery,
     }
 }
@@ -1365,6 +1366,7 @@ async fn mesh_subscribe_refuses_tenant_a_credential_signing_a_tenant_b_claim() {
                 waypoint_name: String::new(),
                 ambient_udp_source_scoping: false,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
                 remote_discovery: false,
             },
         ))
@@ -1850,6 +1852,37 @@ fn fleet_secret_backed_credentials_are_refused() {
         .expect("a per-tenant secret distinct from the fleet secret must load");
 }
 
+/// Startup and every accepted reload warn about served namespaces no
+/// credential binds (issue #7203); this is the shared computation.
+#[test]
+fn unbound_served_namespaces_lists_only_served_namespaces_without_a_credential() {
+    let document = json!({
+        "version": 1,
+        "keys": [
+            { "kid": TENANT_B, "algorithm": "HS256", "secret": TENANT_B_SECRET,
+              "namespaces": [TENANT_B] },
+        ]
+    })
+    .to_string();
+    let bundle = CpDpTrustBundle::from_document_str(&document, "tenant-b-only", None)
+        .expect("tenant B bundle must load");
+    let served = vec![
+        TENANT_A.to_string(),
+        TENANT_B.to_string(),
+        "tenant-c".to_string(),
+    ];
+    assert_eq!(
+        bundle.unbound_served_namespaces(&served),
+        vec![TENANT_A, "tenant-c"]
+    );
+    assert!(
+        bundle
+            .unbound_served_namespaces(&[TENANT_B.to_string()])
+            .is_empty()
+    );
+    assert!(bundle.unbound_served_namespaces(&[]).is_empty());
+}
+
 // ── Fail-closed startup ──────────────────────────────────────────────────
 
 /// A multi-namespace control plane must refuse the fleet-wide self-minting
@@ -1978,6 +2011,7 @@ async fn mesh_subscribe_rejects_trust_bundle_token_with_kid_but_no_ns_claim() {
                 waypoint_name: String::new(),
                 ambient_udp_source_scoping: false,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
                 remote_discovery: false,
             },
         ))
@@ -2210,7 +2244,7 @@ async fn unauthenticated_failures_do_not_disclose_key_inventory() {
         encode(
             &header,
             &claims,
-            &EncodingKey::from_secret(TENANT_A_SECRET.as_bytes()),
+            &EncodingKey::from_secret(TENANT_A_SECRET.as_bytes()).unwrap(),
         )
         .expect("test JWT must encode")
     };
@@ -3199,7 +3233,7 @@ mod projected_generation {
             mount.bundle_path(),
             None,
             store.clone(),
-            true,
+            Some(vec![TENANT_A.to_string(), TENANT_B.to_string()]),
             Duration::from_secs(1),
             Arc::new(CpDpTrustReloadStatus::disabled()),
             shutdown_rx,
@@ -3647,4 +3681,110 @@ async fn stale_trust_ends_the_shared_authorization_lease() {
 
     let reason = waiter.await.expect("lease waiter must not panic");
     assert_eq!(reason.label(), "trust_stale");
+}
+
+/// DER length octets.
+fn der_length(len: usize) -> Vec<u8> {
+    if len < 0x80 {
+        return vec![len as u8];
+    }
+    let bytes: Vec<u8> = len
+        .to_be_bytes()
+        .into_iter()
+        .skip_while(|b| *b == 0)
+        .collect();
+    let mut out = vec![0x80 | bytes.len() as u8];
+    out.extend(bytes);
+    out
+}
+
+fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    out.extend(der_length(content.len()));
+    out.extend_from_slice(content);
+    out
+}
+
+/// A syntactically valid RSA public key of exactly `bits` modulus bits.
+///
+/// Admission measures only the modulus, so the value need not be a product of
+/// primes; that keeps a 16384-bit case cheap. Returns (SPKI PEM, PKCS#1 PEM).
+fn synthetic_rsa_public_key_pems(bits: usize) -> (String, String) {
+    use base64::Engine as _;
+    let mut modulus = vec![0xff_u8; bits / 8];
+    // Leading 0x00 keeps the DER INTEGER positive; the top bit stays set so the
+    // significant bit length is exactly `bits`.
+    modulus.insert(0, 0x00);
+    let mut pkcs1 = der_tlv(0x02, &modulus);
+    pkcs1.extend(der_tlv(0x02, &[0x01, 0x00, 0x01]));
+    let pkcs1 = der_tlv(0x30, &pkcs1);
+    let mut algorithm = der_tlv(
+        0x06,
+        &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01],
+    );
+    algorithm.extend([0x05, 0x00]);
+    let mut spki = der_tlv(0x30, &algorithm);
+    let mut bit_string = vec![0x00];
+    bit_string.extend(&pkcs1);
+    spki.extend(der_tlv(0x03, &bit_string));
+    let spki = der_tlv(0x30, &spki);
+    let pem = |label: &str, der: &[u8]| {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+        let body: Vec<&str> = encoded
+            .as_bytes()
+            .chunks(64)
+            .map(|chunk| std::str::from_utf8(chunk).expect("base64 is ASCII"))
+            .collect();
+        format!(
+            "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+            body.join("\n")
+        )
+    };
+    (pem("PUBLIC KEY", &spki), pem("RSA PUBLIC KEY", &pkcs1))
+}
+
+/// jsonwebtoken's AWS-LC backend verifies RS*/PS* only with 2048-8192-bit RSA
+/// keys, on every build profile. A trust bundle naming a key outside that
+/// window is refused at load (and so at reload, which keeps the previous
+/// verifier), with the size named, instead of admitting a key every token
+/// would then fail against.
+#[test]
+fn trust_bundle_admits_rsa_public_keys_only_inside_the_jwt_backend_window() {
+    let document = |algorithm: &str, pem: &str| {
+        json!({ "version": 1, "keys": [{ "kid": "rsa", "algorithm": algorithm,
+                "public_key_pem": pem, "namespaces": [TENANT_A] }] })
+        .to_string()
+    };
+    for bits in [2048, 4096] {
+        let (spki, pkcs1) = synthetic_rsa_public_key_pems(bits);
+        for (form, pem) in [("SPKI", &spki), ("PKCS#1", &pkcs1)] {
+            for algorithm in ["RS256", "PS512"] {
+                let bundle = CpDpTrustBundle::from_document_str(
+                    &document(algorithm, pem),
+                    "rsa-window",
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("{bits}-bit {form} {algorithm} key must load: {e}"));
+                assert_eq!(bundle.key_count(), 1);
+            }
+        }
+    }
+    for bits in [1024, 16384] {
+        let (spki, pkcs1) = synthetic_rsa_public_key_pems(bits);
+        for (form, pem) in [("SPKI", &spki), ("PKCS#1", &pkcs1)] {
+            for algorithm in ["RS256", "PS256"] {
+                let error = CpDpTrustBundle::from_document_str(
+                    &document(algorithm, pem),
+                    "rsa-window",
+                    None,
+                )
+                .expect_err("an out-of-window RSA key must be refused at admission");
+                assert!(
+                    error.contains(&format!("RSA public key is {bits} bits"))
+                        && error.contains("2048-8192"),
+                    "{bits}-bit {form} {algorithm}: unexpected error: {error}"
+                );
+            }
+        }
+    }
 }

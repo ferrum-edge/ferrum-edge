@@ -19,13 +19,14 @@
 //!
 //! **Key implementation details**:
 //! - Postgres `?` → `$N` placeholder rewrite via `q()` method (sqlx `Any` uses `?`)
-//! - `>500` IN-clause threshold switches to full-table fetch + in-memory filter
-//! - `ArcSwap`-based pool swap enables zero-downtime DNS re-resolution on failover
+//! - ID lookups are chunked by `ASSOCIATION_LOOKUP_CHUNK_SIZE` (500) per IN clause
+//! - The active pool is published atomically with its failover topology
+//!   (`DbFailoverTopologyState`), enabling zero-downtime DNS re-resolution on failover
 //! - Batch chunking (`BATCH_CHUNK_SIZE`) for large imports to stay within DB limits
 
 use crate::config::db_backend::{
     ConditionalNamespaceRestore, ConditionalNamespaceSnapshot, GatewayTrustBundleRevisionConflict,
-    NamespacePreconditionFailed,
+    NamespacePreconditionFailed, PluginAssociationPreconditionFailed,
 };
 use crate::config::db_backend::{
     ConsumerQuarantineTracker, consumer_change_requires_authoritative_reload,
@@ -42,6 +43,11 @@ use crate::config::namespace_registry::{
     protected_namespaces_contains, require_namespace_registry_admission_leases,
 };
 use crate::config::policy_graph_scope::PolicyGraphScope;
+use crate::config::store_policy::{
+    access_control_plugin_allows_consumer, consumer_identity_values,
+    consumer_identity_values_from_fields, mesh_route_dispatch_referenced_upstream,
+    mesh_route_dispatch_references_upstream_id, store_canonical_resource_hash,
+};
 use crate::config::types::{
     AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
     HealthCheckConfig, LoadBalancerAlgorithm, PluginAssociation, PluginConfig, PluginScope, Proxy,
@@ -52,10 +58,9 @@ use crate::config::validation_pipeline::{
     collect_rejecting_runtime_config_errors, validate_plugin_file_dependencies_off_thread,
 };
 use crate::fips::approved::Sha256;
-use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use crate::proxy::stream_match::StreamMatchCriteria;
 use crate::util::deserialization as config_decode;
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use dashmap::DashMap;
@@ -108,6 +113,56 @@ pub(crate) fn rewrite_query_placeholders(db_type: &str, sql: &str) -> String {
     result
 }
 
+/// SQL text Ferrum authored, rewritten for the target dialect.
+///
+/// SQLx 0.9 takes query text only as a `&'static str` or behind an explicit
+/// [`sqlx::AssertSqlSafe`]. This type is the SQL backend's single assertion
+/// point for the dynamic SQL it builds, so every constructor must uphold the
+/// invariant: the text is assembled only from SQL literals, `?` placeholder
+/// lists, numeric limits, dialect fragments chosen by `db_type`, and table or
+/// column identifiers taken from fixed allowlists (or from database metadata
+/// that was validated as a plain identifier). Request, stored, or other
+/// operator data is never formatted into it; it is bound with `.bind()`.
+#[derive(Debug, Clone)]
+pub(crate) struct FerrumSql(String);
+
+impl FerrumSql {
+    /// Rewrite `?` placeholders for `db_type` (see
+    /// [`rewrite_query_placeholders`]) and mark the result as Ferrum-authored
+    /// SQL under the type-level invariant above.
+    pub(crate) fn for_dialect(db_type: &str, sql: &str) -> Self {
+        Self(rewrite_query_placeholders(db_type, sql))
+    }
+}
+
+impl std::ops::Deref for FerrumSql {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for FerrumSql {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl sqlx::SqlSafeStr for FerrumSql {
+    fn into_sql_str(self) -> sqlx::SqlStr {
+        sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(self.0))
+    }
+}
+
+/// Lets one built statement be reused (`sqlx::query(&sql)` in a loop); each
+/// use copies the text into the query.
+impl sqlx::SqlSafeStr for &FerrumSql {
+    fn into_sql_str(self) -> sqlx::SqlStr {
+        sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(self.0.as_str()))
+    }
+}
+
 /// Database-side "now" in epoch milliseconds. Lease expiry is always compared
 /// against the datastore's own clock, never a process clock.
 pub(crate) fn config_admission_lease_now_sql(db_type: &str) -> &'static str {
@@ -121,11 +176,13 @@ pub(crate) fn config_admission_lease_now_sql(db_type: &str) -> &'static str {
 /// Conditional lease acquisition: takes the row only when it is unowned,
 /// expired, or already owned by this owner. It never steals an unexpired
 /// owner's lease, and it bumps `generation` on every ownership change.
-pub(crate) fn config_admission_lease_acquire_sql(db_type: &str) -> String {
+pub(crate) fn config_admission_lease_acquire_sql(db_type: &str) -> FerrumSql {
     let now = config_admission_lease_now_sql(db_type);
     match db_type {
-        "mysql" => format!(
-            "INSERT INTO config_admission_locks \
+        "mysql" => FerrumSql::for_dialect(
+            db_type,
+            &format!(
+                "INSERT INTO config_admission_locks \
              (namespace, owner, expires_at, generation) VALUES (?, ?, {now} + ?, 1) \
              ON DUPLICATE KEY UPDATE \
              generation = IF(\
@@ -134,8 +191,9 @@ pub(crate) fn config_admission_lease_acquire_sql(db_type: &str) -> String {
                  generation), \
              owner = IF(expires_at <= {now} OR owner = VALUES(owner), VALUES(owner), owner), \
              expires_at = IF(owner = VALUES(owner), VALUES(expires_at), expires_at)"
+            ),
         ),
-        _ => rewrite_query_placeholders(
+        _ => FerrumSql::for_dialect(
             db_type,
             &format!(
                 "INSERT INTO config_admission_locks \
@@ -543,22 +601,6 @@ fn consumer_credential_index_entries(consumer: &Consumer) -> Vec<ConsumerCredent
     entries
 }
 
-/// Deduped set of identity values a consumer claims within its namespace:
-/// id, username, and custom_id (when present). Deduped because
-/// self-collisions — a consumer whose own custom_id equals its own id or
-/// username — are explicitly allowed (matching
-/// `GatewayConfig::validate_unique_consumer_identities`); only cross-consumer
-/// collisions must trip the `consumer_identity_index` primary key.
-fn consumer_identity_values(consumer: &Consumer) -> Vec<&str> {
-    let mut values = vec![consumer.id.as_str(), consumer.username.as_str()];
-    if let Some(custom_id) = consumer.custom_id.as_deref() {
-        values.push(custom_id);
-    }
-    values.sort_unstable();
-    values.dedup();
-    values
-}
-
 fn consumer_identity_probe_fields<'a>(
     consumer_id: &'a str,
     username: &'a str,
@@ -613,49 +655,6 @@ pub(crate) fn format_consumer_identity_conflict(
     }
 }
 
-fn mesh_route_dispatch_references_upstream_id(plugin: &PluginConfig, upstream_id: &str) -> bool {
-    if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
-        return false;
-    }
-    MeshRouteDispatchConfig::from_value(&plugin.config)
-        .is_ok_and(|config| config.references_upstream_id(upstream_id))
-}
-
-fn mesh_route_dispatch_referenced_upstream(
-    plugin: &PluginConfig,
-    upstream_ids: &HashSet<String>,
-) -> Option<String> {
-    if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
-        return None;
-    }
-    let config = MeshRouteDispatchConfig::from_value(&plugin.config).ok()?;
-    config
-        .rules
-        .iter()
-        .filter_map(|rule| rule.destination.upstream_id.as_deref())
-        .find(|upstream_id| upstream_ids.contains(*upstream_id))
-        .map(ToOwned::to_owned)
-}
-
-/// `access_control.allowed_consumers` names gateway Consumer usernames
-/// (byte-for-byte). A delete must refuse while any plugin config in the
-/// namespace still authorizes that username; the operator's policy is not
-/// rewritten.
-fn access_control_plugin_allows_consumer(plugin: &PluginConfig, username: &str) -> bool {
-    if plugin.plugin_name != "access_control" {
-        return false;
-    }
-    plugin
-        .config
-        .get("allowed_consumers")
-        .and_then(|value| value.as_array())
-        .is_some_and(|consumers| {
-            consumers
-                .iter()
-                .any(|entry| entry.as_str() == Some(username))
-        })
-}
-
 fn upstream_backend_tls_san_allow_list_json(
     upstream: &Upstream,
 ) -> Result<Option<String>, anyhow::Error> {
@@ -666,26 +665,6 @@ fn upstream_backend_tls_san_allow_list_json(
             .map(Some)
             .map_err(Into::into)
     }
-}
-
-fn store_canonical_resource_hash(
-    bundle: &crate::admin::api_specs::ExtractedBundle,
-) -> Result<String, anyhow::Error> {
-    let mut proxy = bundle.proxy.clone();
-    proxy.normalize_fields();
-    let upstream = bundle.upstream.clone().map(|mut upstream| {
-        upstream.normalize_fields();
-        upstream
-    });
-    let mut plugins = bundle.plugins.clone();
-    for plugin in &mut plugins {
-        plugin.normalize_fields();
-    }
-    crate::admin::api_specs::hash_resource_bundle(&crate::admin::api_specs::ExtractedBundle {
-        proxy,
-        upstream,
-        plugins,
-    })
 }
 
 #[derive(Debug)]
@@ -711,7 +690,7 @@ pub struct DbPoolConfig {
     /// connect, failover, replica, reconnect, migrate). Default: 10.
     ///
     /// Enforced by [`await_pool_connect_with_timeout`] around sqlx
-    /// `AnyPoolOptions::connect` — sqlx 0.8's native PG/MySQL drivers ignore a
+    /// `AnyPoolOptions::connect` — sqlx's native PG/MySQL drivers (still in 0.9.1) ignore a
     /// `connect_timeout` URL query parameter, so Ferrum must bound the future
     /// itself. Separate from [`Self::acquire_timeout_seconds`], which still
     /// covers in-pool checkout wait + connect. `0` disables the bound.
@@ -892,30 +871,32 @@ pub struct SqlReconnectTransitionTestHooks {
     /// Invoked after a successful connect and immediately before awaiting the
     /// reconnect transition write lock.
     pub before_lock: Option<SqlReconnectTransitionHook>,
-    /// Invoked while the reconnect transition write lock is held, after pool
-    /// publication (and after failover gate-before-publish), before deferred
-    /// migrations and primary `mark_primary` finalize the transition.
+    /// Invoked while the reconnect transition write lock is held, after
+    /// deferred migrations on the staged pool and after the pool and its
+    /// topology were published together.
     pub while_holding: Option<SqlReconnectTransitionHook>,
 }
 
 /// Database configuration store.
 ///
-/// The inner pool is wrapped in `ArcSwap` so it can be atomically replaced
-/// when DNS re-resolution detects that the database FQDN now points to a
-/// different IP. All readers (query methods, transactions) take a cheap
-/// `Arc` clone of the current pool, so in-flight queries finish on the old
-/// pool while new queries go to the freshly connected one.
+/// The active pool is published inside `failover_topology` so it can be
+/// atomically replaced when DNS re-resolution detects that the database FQDN
+/// now points to a different IP, or on failover/failback. All readers (query
+/// methods, transactions) take a cheap clone of the current pool, so in-flight
+/// queries finish on the old pool while new queries go to the freshly
+/// connected one.
 #[derive(Clone)]
 pub struct DatabaseStore {
-    pool: Arc<ArcSwap<AnyPool>>,
     read_replica_url: Option<String>,
     read_replica_pool: Arc<ArcSwapOption<AnyPool>>,
     /// Read replicas belong to the configured primary topology. While the
     /// active write/runtime pool points at a failover URL, admin reads must
     /// stay on that same active pool rather than crossing into a replica of
     /// the unavailable primary topology. Also tracks sticky failover topology
-    /// and the process-local opt-in divergence-risk marker (issue #3001).
-    failover_topology: DbFailoverTopologyState,
+    /// and the process-local opt-in divergence-risk marker (issue #3001), and
+    /// publishes the active pool together with that topology as one value
+    /// (issue #7061).
+    failover_topology: DbFailoverTopologyState<AnyPool>,
     /// Write-locks serialize SQL reconnect publication + topology transitions
     /// across concurrent callers (DB polling/failover and DB TLS reload),
     /// including the deferred-migration await window. Admin mutations take a
@@ -1188,43 +1169,43 @@ impl DatabaseStore {
     /// causes a parse error.
     ///
     /// This method is a no-op for MySQL and SQLite (which use `?` natively).
-    fn q(&self, sql: &str) -> String {
-        rewrite_query_placeholders(&self.db_type, sql)
+    /// Dialect-rewritten, Ferrum-authored SQL; see [`FerrumSql`] for what
+    /// `sql` may contain.
+    fn q(&self, sql: &str) -> FerrumSql {
+        FerrumSql::for_dialect(&self.db_type, sql)
     }
 
-    fn proxy_route_lock_insert_sql(&self) -> String {
+    fn proxy_route_lock_insert_sql(&self) -> FerrumSql {
         match self.db_type.as_str() {
             // Same S->X upgrade trap as config_change_locks / mTLS DNS
             // admission: INSERT IGNORE takes a shared duplicate-key lock, then
             // SELECT ... FOR UPDATE upgrades it. Prefer the no-op upsert so
             // MySQL holds the exclusive row lock up front.
-            "mysql" => MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL.to_string(),
-            "sqlite" => "INSERT OR IGNORE INTO proxy_route_locks \
-                 (namespace, route_key_hash, created_at) VALUES (?, ?, ?)"
-                .to_string(),
+            "mysql" => self.q(MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL),
+            "sqlite" => self.q("INSERT OR IGNORE INTO proxy_route_locks \
+                 (namespace, route_key_hash, created_at) VALUES (?, ?, ?)"),
             _ => self.q("INSERT INTO proxy_route_locks \
                  (namespace, route_key_hash, created_at) VALUES (?, ?, ?) \
                  ON CONFLICT (namespace, route_key_hash) DO NOTHING"),
         }
     }
 
-    fn config_change_lock_insert_sql(&self) -> String {
+    fn config_change_lock_insert_sql(&self) -> FerrumSql {
         match self.db_type.as_str() {
             // Each namespace owns its own lock row. INSERT IGNORE + FOR UPDATE
             // deadlocks on the S->X upgrade under concurrent first-writers of
             // the same namespace; the no-op upsert acquires the exclusive lock
             // immediately.
-            "mysql" => MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL.to_string(),
-            "sqlite" => "INSERT OR IGNORE INTO config_change_locks \
-                 (lock_name, updated_at) VALUES (?, ?)"
-                .to_string(),
+            "mysql" => self.q(MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL),
+            "sqlite" => self.q("INSERT OR IGNORE INTO config_change_locks \
+                 (lock_name, updated_at) VALUES (?, ?)"),
             _ => self.q("INSERT INTO config_change_locks \
                  (lock_name, updated_at) VALUES (?, ?) \
                  ON CONFLICT (lock_name) DO NOTHING"),
         }
     }
 
-    fn config_admission_lease_acquire_sql(&self) -> String {
+    fn config_admission_lease_acquire_sql(&self) -> FerrumSql {
         config_admission_lease_acquire_sql(&self.db_type)
     }
 
@@ -1232,7 +1213,7 @@ impl DatabaseStore {
         config_admission_lease_now_sql(&self.db_type)
     }
 
-    fn config_admission_lease_renew_sql(&self) -> String {
+    fn config_admission_lease_renew_sql(&self) -> FerrumSql {
         let now = self.config_admission_lease_now_sql();
         self.q(&format!(
             "UPDATE config_admission_locks SET expires_at = {now} + ? \
@@ -1240,36 +1221,33 @@ impl DatabaseStore {
         ))
     }
 
-    fn mtls_dns_admission_lock_insert_sql(&self) -> String {
+    fn mtls_dns_admission_lock_insert_sql(&self) -> FerrumSql {
         match self.db_type.as_str() {
             // INSERT IGNORE takes a shared duplicate-key lock before the
             // SELECT ... FOR UPDATE below tries to upgrade it. Two contenders
             // can deadlock on that S->X upgrade. The no-op duplicate-key UPDATE
             // acquires the row exclusively up front, so same-namespace writers
             // serialize before the SELECT instead of mutually upgrading.
-            "mysql" => MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL.to_string(),
-            "sqlite" => "INSERT OR IGNORE INTO mtls_dns_admission_locks \
-                 (namespace, updated_at) VALUES (?, ?)"
-                .to_string(),
+            "mysql" => self.q(MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL),
+            "sqlite" => self.q("INSERT OR IGNORE INTO mtls_dns_admission_locks \
+                 (namespace, updated_at) VALUES (?, ?)"),
             _ => self.q("INSERT INTO mtls_dns_admission_locks \
                  (namespace, updated_at) VALUES (?, ?) \
                  ON CONFLICT (namespace) DO NOTHING"),
         }
     }
-    fn config_change_retention_upsert_sql(&self) -> String {
+    fn config_change_retention_upsert_sql(&self) -> FerrumSql {
         match self.db_type.as_str() {
-            "mysql" => "INSERT INTO config_change_retention \
+            "mysql" => self.q("INSERT INTO config_change_retention \
                  (namespace, retained_sequence, updated_at) VALUES (?, ?, ?) \
                  ON DUPLICATE KEY UPDATE \
                  retained_sequence = GREATEST(retained_sequence, VALUES(retained_sequence)), \
-                 updated_at = VALUES(updated_at)"
-                .to_string(),
-            "sqlite" => "INSERT INTO config_change_retention \
+                 updated_at = VALUES(updated_at)"),
+            "sqlite" => self.q("INSERT INTO config_change_retention \
                  (namespace, retained_sequence, updated_at) VALUES (?, ?, ?) \
                  ON CONFLICT (namespace) DO UPDATE SET \
                  retained_sequence = max(config_change_retention.retained_sequence, excluded.retained_sequence), \
-                 updated_at = excluded.updated_at"
-                .to_string(),
+                 updated_at = excluded.updated_at"),
             _ => self.q("INSERT INTO config_change_retention \
                  (namespace, retained_sequence, updated_at) VALUES (?, ?, ?) \
                  ON CONFLICT (namespace) DO UPDATE SET \
@@ -1283,7 +1261,7 @@ impl DatabaseStore {
         listen_port: Option<u16>,
         listen_path: Option<&str>,
         exclude_id: Option<&str>,
-    ) -> String {
+    ) -> FerrumSql {
         let port_filter = if listen_port.is_some() {
             "listen_port = ?"
         } else {
@@ -1540,7 +1518,7 @@ impl DatabaseStore {
         let owner = Uuid::new_v4().to_string();
         let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
-        let result = sqlx::query(&self.q(
+        let result = sqlx::query(self.q(
             "UPDATE mtls_dns_admission_locks SET restore_owner = ?, updated_at = ? \
              WHERE namespace = ? AND restore_owner IS NULL",
         ))
@@ -1564,7 +1542,7 @@ impl DatabaseStore {
         let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, Some(owner))
             .await?;
-        let result = sqlx::query(&self.q(
+        let result = sqlx::query(self.q(
             "UPDATE mtls_dns_admission_locks SET restore_owner = NULL, updated_at = ? \
              WHERE namespace = ? AND restore_owner = ?",
         ))
@@ -1903,8 +1881,7 @@ impl DatabaseStore {
         // so the delete must be namespace-scoped or it would wipe another
         // namespace's rows for a same-id consumer.
         sqlx::query(
-            &self
-                .q("DELETE FROM consumer_credential_index WHERE namespace = ? AND consumer_id = ?"),
+            self.q("DELETE FROM consumer_credential_index WHERE namespace = ? AND consumer_id = ?"),
         )
         .bind(namespace)
         .bind(consumer_id)
@@ -1939,7 +1916,7 @@ impl DatabaseStore {
         consumer_id: &str,
     ) -> Result<(), anyhow::Error> {
         sqlx::query(
-            &self.q("DELETE FROM consumer_identity_index WHERE namespace = ? AND consumer_id = ?"),
+            self.q("DELETE FROM consumer_identity_index WHERE namespace = ? AND consumer_id = ?"),
         )
         .bind(namespace)
         .bind(consumer_id)
@@ -2046,13 +2023,14 @@ impl DatabaseStore {
                     if let Some(sql) =
                         statement_timeout_sql(statement_timeout_seconds, is_postgres, is_mysql)
                     {
-                        conn.execute(sql.as_str()).await?;
+                        conn.execute(sqlx::AssertSqlSafe(sql)).await?;
                     }
                     // MySQL only: `max_execution_time` above does not bound a
                     // write blocked on another transaction's row lock, which is
                     // the zombie-lock pileup in issue #4146.
+                    // Same integer-only interpolation as above.
                     if let Some(sql) = lock_wait_timeout_sql(statement_timeout_seconds, is_mysql) {
-                        conn.execute(sql.as_str()).await?;
+                        conn.execute(sqlx::AssertSqlSafe(sql)).await?;
                     }
                     Ok(())
                 })
@@ -2079,10 +2057,9 @@ impl DatabaseStore {
         .await?;
 
         let store = Self {
-            pool: Arc::new(ArcSwap::from_pointee(pool)),
             read_replica_url: None,
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
-            failover_topology: DbFailoverTopologyState::new(),
+            failover_topology: DbFailoverTopologyState::new(pool),
             reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
             topology_epoch: Arc::new(AtomicU64::new(1)),
             reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
@@ -2179,10 +2156,9 @@ impl DatabaseStore {
         let pool = options.connect_lazy(&snapshot_url)?;
 
         Ok(Self {
-            pool: Arc::new(ArcSwap::from_pointee(pool)),
             read_replica_url: None,
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
-            failover_topology: DbFailoverTopologyState::new(),
+            failover_topology: DbFailoverTopologyState::new(pool),
             reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
             topology_epoch: Arc::new(AtomicU64::new(1)),
             reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
@@ -2203,14 +2179,16 @@ impl DatabaseStore {
     }
 
     /// Run versioned schema migrations using the MigrationRunner.
-    ///
-    /// This replaces the old inline `CREATE TABLE IF NOT EXISTS` approach with
-    /// a tracked, versioned migration system. Existing databases are automatically
-    /// detected and bootstrapped into the new system.
     async fn run_migrations(&self) -> Result<(), anyhow::Error> {
+        self.run_migrations_on_pool(self.pool()).await
+    }
+
+    /// [`Self::run_migrations`] against an explicit pool. Reconnect uses this
+    /// to migrate a staged pool *before* publishing it (issue #7033).
+    async fn run_migrations_on_pool(&self, pool: AnyPool) -> Result<(), anyhow::Error> {
         use crate::config::migrations::MigrationRunner;
 
-        let runner = MigrationRunner::new(self.pool(), self.db_type.clone());
+        let runner = MigrationRunner::new(pool, self.db_type.clone());
         let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
         let applied = runner
             .run_pending_with_plugin_history(&plugin_migrations)
@@ -2242,6 +2220,20 @@ impl DatabaseStore {
     ///   pool happened to connect on the first query and `reconnect()` never
     ///   fired — otherwise the flag would stay `true` indefinitely).
     pub async fn maybe_apply_deferred_migrations(&self) -> Result<bool, anyhow::Error> {
+        self.maybe_apply_deferred_migrations_on_pool(self.pool())
+            .await
+    }
+
+    /// [`Self::maybe_apply_deferred_migrations`] against an explicit pool.
+    ///
+    /// Reconnect publication runs this on the newly connected pool before it
+    /// is swapped in, so a migration failure leaves the previously published
+    /// pool and topology untouched instead of exposing an unmigrated pool
+    /// whose topology was never finalized (issue #7033).
+    async fn maybe_apply_deferred_migrations_on_pool(
+        &self,
+        pool: AnyPool,
+    ) -> Result<bool, anyhow::Error> {
         // Only one caller wins the CAS and runs migrations; the rest see
         // `Ok(false)` and return early. Acquire on success ensures we see
         // the constructor's write of `true`; Release on the clear ensures
@@ -2255,7 +2247,7 @@ impl DatabaseStore {
         }
 
         info!("Applying deferred migrations after backup-bootstrap recovery");
-        match self.run_migrations().await {
+        match self.run_migrations_on_pool(pool).await {
             Ok(()) => {
                 info!("Deferred migrations applied — database ready for polling");
                 Ok(true)
@@ -2276,7 +2268,7 @@ impl DatabaseStore {
     ) -> anyhow::Error {
         let message = match namespace {
             Some(namespace) => format!(
-                "operation={} resource=proxy_plugins namespace={}: failed to query proxy/plugin associations: {}",
+                "operation={} resource=proxy_plugins namespace={:?}: failed to query proxy/plugin associations: {}",
                 operation, namespace, source
             ),
             None => format!(
@@ -2319,7 +2311,7 @@ impl DatabaseStore {
         row.try_get::<String, _>("plugin_config_id").map_err(|e| {
             anyhow::Error::new(ProxyPluginAssociationLoadError::with_source(
                 format!(
-                    "operation={} resource=proxy_plugins proxy_id={} column=plugin_config_id: failed to decode proxy/plugin association row: {}",
+                    "operation={} resource=proxy_plugins proxy_id={:?} column=plugin_config_id: failed to decode proxy/plugin association row: {}",
                     operation, proxy_id, e
                 ),
                 e,
@@ -2338,7 +2330,7 @@ impl DatabaseStore {
             .unwrap_or_default();
         anyhow::Error::new(ProxyPluginAssociationLoadError::with_source(
             format!(
-                "operation={} resource=proxy_plugins namespace={}{}: failed to load plugin_config references for proxy/plugin association validation: {}",
+                "operation={} resource=proxy_plugins namespace={:?}{}: failed to load plugin_config references for proxy/plugin association validation: {}",
                 operation, namespace, column_context, source
             ),
             source,
@@ -2367,7 +2359,7 @@ impl DatabaseStore {
         if let Some(proxy_id) = associations.keys().next() {
             return Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
                 format!(
-                    "operation={} resource=proxy_plugins proxy_id={}: association row references a proxy that was not present in the loaded proxy candidate",
+                    "operation={} resource=proxy_plugins proxy_id={:?}: association row references a proxy that was not present in the loaded proxy candidate",
                     operation, proxy_id
                 ),
             )));
@@ -2400,6 +2392,36 @@ impl DatabaseStore {
             Self::push_proxy_plugin_association_row(&mut associations, row, operation)?;
         }
         Ok(associations)
+    }
+
+    /// One proxy's junction rows inside an open transaction. Deployment
+    /// preservation needs a single proxy's associations; loading the whole
+    /// namespace's junction while holding the admission row, change lock and
+    /// lease was redundant work (issue #7209).
+    async fn load_proxy_plugin_associations_for_proxy_tx(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        operation: &str,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<Vec<PluginAssociation>, anyhow::Error> {
+        let sql = self.q(
+            "SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?",
+        );
+        let rows: Vec<AnyRow> = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(proxy_id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| {
+                Self::proxy_plugin_association_query_error(operation, Some(namespace), e)
+            })?;
+
+        let mut associations = HashMap::with_capacity(1);
+        for row in &rows {
+            Self::push_proxy_plugin_association_row(&mut associations, row, operation)?;
+        }
+        Ok(associations.remove(proxy_id).unwrap_or_default())
     }
 
     async fn load_proxy_plugin_associations_for_proxy_ids(
@@ -2523,7 +2545,7 @@ impl DatabaseStore {
 
         Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
             format!(
-                "operation={} resource=proxy_plugins proxy_id={} namespace={}: invalid proxy/plugin associations: {}",
+                "operation={} resource=proxy_plugins proxy_id={:?} namespace={:?}: invalid proxy/plugin associations: {}",
                 operation,
                 proxy.id,
                 proxy.namespace,
@@ -2557,7 +2579,7 @@ impl DatabaseStore {
 
         Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
             format!(
-                "operation={} resource=proxy_plugins namespace={}: invalid proxy/plugin associations: {}",
+                "operation={} resource=proxy_plugins namespace={:?}: invalid proxy/plugin associations: {}",
                 operation,
                 namespace,
                 errors.join("; ")
@@ -2734,8 +2756,7 @@ impl DatabaseStore {
         purpose: FullConfigLoadPurpose,
     ) -> Result<GatewayConfig, anyhow::Error> {
         let start = Instant::now();
-        // Capture timestamp before queries so the incremental polling safety
-        // margin covers the full load duration.
+        // Config version stamp for this load; captured before the queries run.
         let loaded_at = Utc::now();
         let mut tx = self.pool().begin().await?;
         self.configure_full_load_snapshot(&mut tx).await?;
@@ -2785,6 +2806,30 @@ impl DatabaseStore {
             .run()?;
         Self::reject_invalid_gateway_plugin_references("load_full_config", &config)?;
 
+        // Fail-closed Consumer `jwt` secret policy: strip weak, malformed, or
+        // cross-Consumer shared JWT secrets (on every Consumer sharing one)
+        // instead of publishing them behind the warning-only field validation
+        // below. Admin write-time validation rejects new violations; this
+        // guard covers stored rows. It runs BEFORE identity quarantine: a
+        // consumer that identity quarantine removes still knows its secrets,
+        // so it must count as a holder when shared-key ownership is judged.
+        let jwt_outcome = config.quarantine_invalid_jwt_credentials_against(
+            &crate::config::types::JwtSharedSecretHistory::default(),
+        );
+        // Hand the stripped shared secrets to the serving `ProxyState`, which
+        // would otherwise receive this snapshot with no trace of them.
+        config.quarantined_jwt_shared_secrets = jwt_outcome.shared;
+        let jwt_quarantined = jwt_outcome.messages;
+        if !jwt_quarantined.is_empty() {
+            for message in &jwt_quarantined {
+                error!("{}", crate::startup::sanitize_startup_cause(message, &[]));
+            }
+            error!(
+                "Quarantined {} jwt credential(s) during full config load",
+                jwt_quarantined.len()
+            );
+        }
+
         // Fail-closed consumer identity handling (issue #2121): quarantine
         // (remove) consumers whose id/username/custom_id collides with an
         // earlier-loaded consumer instead of warn-and-overwrite, which
@@ -2817,7 +2862,9 @@ impl DatabaseStore {
                 hmac_quarantined.len()
             );
         }
-        let consumer_quarantine_active = !quarantined.is_empty() || !hmac_quarantined.is_empty();
+
+        let consumer_quarantine_active =
+            !quarantined.is_empty() || !hmac_quarantined.is_empty() || !jwt_quarantined.is_empty();
 
         ValidationPipeline::new(&mut config)
             .resolve_upstream_tls()
@@ -3003,6 +3050,38 @@ impl DatabaseStore {
         };
         config.normalize_fields();
         self.check_slow_query("load_namespace_policy_graph", start);
+        Ok(config)
+    }
+
+    /// Load proxies, upstreams and plugin configs (the resources that can name
+    /// a TLS source) in one primary snapshot, for the managed TLS / ACME
+    /// delete guard (issue #7394). Consumers and trust bundles are not read.
+    pub async fn load_namespace_tls_reference_graph(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        let start = Instant::now();
+        let loaded_at = Utc::now();
+        let mut tx = self.pool().begin().await?;
+        self.configure_full_load_snapshot(&mut tx).await?;
+        let purpose = FullLoadPurpose::AdmissionValidation;
+        let proxies = self.load_proxies_tx(namespace, purpose, &mut tx).await?;
+        let plugin_configs = self
+            .load_plugin_configs_tx(namespace, purpose, &mut tx)
+            .await?;
+        let upstreams = self.load_upstreams_tx(namespace, purpose, &mut tx).await?;
+        tx.commit().await?;
+        let mut config = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            proxies,
+            plugin_configs,
+            upstreams,
+            loaded_at,
+            known_namespaces: Vec::new(),
+            ..Default::default()
+        };
+        config.normalize_fields();
+        self.check_slow_query("load_namespace_tls_reference_graph", start);
         Ok(config)
     }
 
@@ -3256,7 +3335,7 @@ impl DatabaseStore {
             ..Default::default()
         };
         config.normalize_fields();
-        let rows = sqlx::query(&self.q("SELECT * FROM api_specs WHERE namespace = ? ORDER BY id"))
+        let rows = sqlx::query(self.q("SELECT * FROM api_specs WHERE namespace = ? ORDER BY id"))
             .bind(namespace)
             .fetch_all(&mut **tx)
             .await?;
@@ -3268,7 +3347,7 @@ impl DatabaseStore {
         // is decoded, rather than holding both until the snapshot returns.
         drop(rows);
         let namespace_record = self.get_namespace_tx(tx, namespace).await?;
-        let row = sqlx::query(&self.q(
+        let row = sqlx::query(self.q(
             "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM config_changes WHERE namespace = ?",
         ))
         .bind(namespace)
@@ -3276,7 +3355,7 @@ impl DatabaseStore {
         .await?;
         let sequence: i64 = row.try_get("sequence")?;
         let retention = sqlx::query(
-            &self.q("SELECT retained_sequence FROM config_change_retention WHERE namespace = ?"),
+            self.q("SELECT retained_sequence FROM config_change_retention WHERE namespace = ?"),
         )
         .bind(namespace)
         .fetch_optional(&mut **tx)
@@ -3436,13 +3515,13 @@ impl DatabaseStore {
             .await?;
         // Only selected associations and rows are removed. Never run the
         // namespace-wide orphan sweeper or restore unrelated stored resources.
-        sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?"))
+        sqlx::query(self.q("DELETE FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?"))
             .bind(namespace)
             .bind(id)
             .execute(&mut *tx)
             .await?;
         for plugin_id in &plan.plugins {
-            sqlx::query(&self.q("DELETE FROM plugin_configs WHERE namespace = ? AND id = ?"))
+            sqlx::query(self.q("DELETE FROM plugin_configs WHERE namespace = ? AND id = ?"))
                 .bind(namespace)
                 .bind(plugin_id)
                 .execute(&mut *tx)
@@ -3450,20 +3529,20 @@ impl DatabaseStore {
             self.record_config_change_tx(&mut tx, namespace, "plugin_config", plugin_id, "delete")
                 .await?;
         }
-        sqlx::query(&self.q("DELETE FROM proxies WHERE namespace = ? AND id = ?"))
+        sqlx::query(self.q("DELETE FROM proxies WHERE namespace = ? AND id = ?"))
             .bind(namespace)
             .bind(id)
             .execute(&mut *tx)
             .await?;
         if let Some(spec_id) = &plan.spec_id {
-            sqlx::query(&self.q("DELETE FROM api_specs WHERE namespace = ? AND id = ?"))
+            sqlx::query(self.q("DELETE FROM api_specs WHERE namespace = ? AND id = ?"))
                 .bind(namespace)
                 .bind(spec_id)
                 .execute(&mut *tx)
                 .await?;
         }
         for upstream_id in &plan.upstreams {
-            sqlx::query(&self.q("DELETE FROM upstreams WHERE namespace = ? AND id = ?"))
+            sqlx::query(self.q("DELETE FROM upstreams WHERE namespace = ? AND id = ?"))
                 .bind(namespace)
                 .bind(upstream_id)
                 .execute(&mut *tx)
@@ -3488,7 +3567,7 @@ impl DatabaseStore {
     pub async fn count_api_specs(&self, namespace: &str) -> Result<u64, anyhow::Error> {
         let start = Instant::now();
         let primary_pool = self.pool();
-        let row = sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM api_specs WHERE namespace = ?"))
+        let row = sqlx::query(self.q("SELECT COUNT(*) AS cnt FROM api_specs WHERE namespace = ?"))
             .bind(namespace)
             .fetch_one(&primary_pool)
             .await?;
@@ -3507,7 +3586,7 @@ impl DatabaseStore {
     ) -> Result<Vec<crate::config::types::ApiSpec>, anyhow::Error> {
         let start = Instant::now();
         let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM api_specs WHERE namespace = ? ORDER BY id ASC"))
+            sqlx::query(self.q("SELECT * FROM api_specs WHERE namespace = ? ORDER BY id ASC"))
                 .bind(namespace)
                 .fetch_all(&self.pool())
                 .await?;
@@ -3558,7 +3637,7 @@ impl DatabaseStore {
             // tags are stamped separately because ordinary batch inserts omit
             // `api_spec_id` so direct admin writes cannot forge managed state.
             let proxy_row: Option<AnyRow> =
-                sqlx::query(&self.q("SELECT id FROM proxies WHERE namespace = ? AND id = ?"))
+                sqlx::query(self.q("SELECT id FROM proxies WHERE namespace = ? AND id = ?"))
                     .bind(&spec.namespace)
                     .bind(&spec.proxy_id)
                     .fetch_optional(&mut *tx)
@@ -3602,7 +3681,7 @@ impl DatabaseStore {
         for proxy in proxies {
             if let Some(spec_id) = proxy.api_spec_id.as_deref() {
                 sqlx::query(
-                    &self.q("UPDATE proxies SET api_spec_id = ? WHERE namespace = ? AND id = ?"),
+                    self.q("UPDATE proxies SET api_spec_id = ? WHERE namespace = ? AND id = ?"),
                 )
                 .bind(spec_id)
                 .bind(&proxy.namespace)
@@ -3614,7 +3693,7 @@ impl DatabaseStore {
         for upstream in upstreams {
             if let Some(spec_id) = upstream.api_spec_id.as_deref() {
                 sqlx::query(
-                    &self.q("UPDATE upstreams SET api_spec_id = ? WHERE namespace = ? AND id = ?"),
+                    self.q("UPDATE upstreams SET api_spec_id = ? WHERE namespace = ? AND id = ?"),
                 )
                 .bind(spec_id)
                 .bind(&upstream.namespace)
@@ -3626,7 +3705,7 @@ impl DatabaseStore {
         for plugin in plugin_configs {
             if let Some(spec_id) = plugin.api_spec_id.as_deref() {
                 sqlx::query(
-                    &self.q(
+                    self.q(
                         "UPDATE plugin_configs SET api_spec_id = ? WHERE namespace = ? AND id = ?",
                     ),
                 )
@@ -3897,60 +3976,49 @@ impl DatabaseStore {
 
     // ---- Proxy INSERT SQL helpers ----
     //
-    // The column list for a proxy INSERT appears in three places:
-    //   1. `create_proxy`           — direct admin POST /proxies
-    //   2. `batch_create_proxies_chunk` — bulk import
-    //   3. `submit_api_spec_bundle` — spec-owned INSERT (adds `api_spec_id` column)
+    // ── Drift-prevention contract for proxy write call sites ─────────────────
     //
-    // Sites 1 and 2 share `PROXY_INSERT_SQL` (no api_spec_id).
-    // Site 3 uses `PROXY_INSERT_WITH_SPEC_SQL` (adds api_spec_id before created_at).
+    // The 53-column proxy column list is canonical. When you add a new column
+    // to the `proxies` table, it must be added — in the same position — to ALL
+    // of:
     //
-    // IMPORTANT: when adding a new column to `proxies`, update BOTH constants and
-    // the corresponding `.bind()` chains in all three call sites.  The direct-admin
-    // `update_proxy` (also in this file) and `replace_api_spec_bundle` UPDATE paths
-    // are separate SQL strings and must be updated independently.
+    //   1. `PROXY_INSERT_SQL` and its `.bind()` chains in `create_proxy` (admin
+    //      POST /proxies) and `insert_proxies_in_tx` (bulk import)
+    //   2. `PROXY_INSERT_WITH_API_SPEC_ID_SQL` and its `.bind()` chain in
+    //      `restore_api_spec_bundle_inner` (spec-owned; adds `api_spec_id`
+    //      before `created_at`)
+    //   3. the `update_proxy` SET clause + bind chain
+    //   4. the proxy UPDATE in `replace_api_spec_bundle_inner`
+    //   5. the `proxies` entry of `DEPLOYMENT_KNOWN_COLUMNS`
+    //      (`src/config/deployment_mutation.rs`)
+    //   6. `PROXY_INSERT_PLACEHOLDER_COUNT` and
+    //      `PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT` below
     //
-    // NOTE: `submit_api_spec_bundle` uses a literal multi-line query string with
-    // `\` continuation rather than this const because it adds the `api_spec_id`
-    // column.  The `replace_api_spec_bundle` path uses UPDATE so it is out of scope.
-    // ── Drift-prevention contract for proxy INSERT call sites ────────────────
-    //
-    // The 54-column proxy column list is canonical and shared by THREE INSERT
-    // sites and ONE UPDATE site. When you add a new column to the `proxies`
-    // table, it must be added — in the same position — to ALL of:
-    //
-    //   1. PROXY_INSERT_SQL                         (direct admin path)
-    //   2. create_proxy() bind chain                (this file, ~line 790)
-    //   3. submit_api_spec_bundle() proxy INSERT    (this file, ~line 3387)
-    //   4. update_proxy() SET clause + bind chain   (this file, ~line 919)
-    //   5. PROXY_INSERT_PLACEHOLDER_COUNT below     (drift catcher)
-    //   6. PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT below
-    //
-    // The two `proxy_insert_sql_*_count_matches_bind_count` tests below count
-    // `?` placeholders in the SQL and assert against the constants here. If
-    // you forget to update the placeholder count, the test fails and points
-    // at the exact discrepancy. If you update the constant but forget to
-    // bind, sqlx returns "wrong number of parameters" at execute time.
+    // `proxy_insert_sql_placeholder_count_matches_const` (in
+    // `proxy_insert_sql_drift_tests`) counts the `?` placeholders in
+    // `PROXY_INSERT_SQL` and asserts against the constant. If you update the
+    // constant but forget to bind, sqlx returns "wrong number of parameters"
+    // at execute time.
     //
     // We chose this drift-catcher pattern over a fully-generic
     // `bind_proxy_base_columns` helper because the sqlx::Any generic makes
     // such helpers verbose without meaningful runtime benefit.
 
     /// Number of `?` placeholders in `PROXY_INSERT_SQL` (no api_spec_id).
-    /// 54 resource columns + `created_at` + `updated_at` = 56.
+    /// 53 resource columns + `created_at` + `updated_at` = 55.
     ///
     /// Used only by the drift-catcher tests in `proxy_insert_sql_drift_tests`;
     /// kept available outside `#[cfg(test)]` so it remains a visible
     /// drift-prevention anchor when reading the SQL definition.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 56;
+    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 55;
 
     /// Number of `?` placeholders in the `submit_api_spec_bundle` proxy
     /// INSERT statement (which adds `api_spec_id` between
     /// `stream_match` and `created_at`).
-    /// 56 base + 1 (api_spec_id) = 57.
+    /// 55 base + 1 (api_spec_id) = 56.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 57;
+    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 56;
 
     /// Proxy INSERT SQL without `api_spec_id` (direct admin path and bulk import).
     ///
@@ -3971,7 +4039,7 @@ impl DatabaseStore {
          pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, \
          pool_http2_initial_connection_window_size, pool_http2_adaptive_window, \
          pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
-         pool_http3_connections_per_backend, pool_max_requests_per_connection, \
+         pool_http3_connections_per_backend, \
          listen_port, frontend_tls, passthrough, \
          udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
          websocket_permessage_deflate, allow_path_parameters, \
@@ -3979,6 +4047,34 @@ impl DatabaseStore {
          stream_proxy_protocol, backend_proxy_protocol, stream_match, \
          upstream_subset, \
          created_at, updated_at) \
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+    /// Spec-owned proxy INSERT used by `restore_api_spec_bundle_inner`: the
+    /// `PROXY_INSERT_SQL` columns plus `api_spec_id` before `created_at`.
+    /// Kept as a constant so the placeholder drift test counts the statement
+    /// that actually runs.
+    const PROXY_INSERT_WITH_API_SPEC_ID_SQL: &'static str = "INSERT INTO proxies \
+        (labels, id, namespace, name, hosts, listen_path, backend_scheme, backend_host, \
+        backend_port, backend_path, strip_listen_path, preserve_host_header, \
+        backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, \
+        backend_tls_client_cert_path, backend_tls_client_key_path, \
+        backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, \
+        dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, upstream_subset, \
+        circuit_breaker, retry, response_body_mode, \
+        pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, \
+        pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, \
+        pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, \
+        pool_http2_initial_connection_window_size, pool_http2_adaptive_window, \
+        pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
+        pool_http3_connections_per_backend, \
+        listen_port, frontend_tls, passthrough, \
+        udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
+        websocket_permessage_deflate, allow_path_parameters, \
+        allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
+        stream_proxy_protocol, backend_proxy_protocol, stream_match, \
+        api_spec_id, created_at, updated_at) \
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
@@ -4011,7 +4107,7 @@ impl DatabaseStore {
 
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
-        sqlx::query(&self.q(Self::PROXY_INSERT_SQL))
+        sqlx::query(self.q(Self::PROXY_INSERT_SQL))
             .bind(serde_json::to_string(&proxy.labels)?)
             .bind(&proxy.id)
             .bind(&proxy.namespace)
@@ -4081,7 +4177,6 @@ impl DatabaseStore {
             .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
             .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
             .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
-            .bind(proxy.pool_max_requests_per_connection.map(|v| v as i64))
             .bind(proxy.listen_port.map(|v| v as i32))
             .bind(if proxy.frontend_tls { 1i32 } else { 0 })
             .bind(if proxy.passthrough { 1i32 } else { 0 })
@@ -4122,7 +4217,7 @@ impl DatabaseStore {
 
         // Persist plugin associations in the junction table
         for assoc in &proxy.plugins {
-            sqlx::query(&self.q(
+            sqlx::query(self.q(
                 "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) \
                  VALUES (?, ?, ?)",
             ))
@@ -4193,7 +4288,7 @@ impl DatabaseStore {
         let stream_match_json = serialize_stream_match(proxy)?;
 
         sqlx::query(
-            &self.q("UPDATE proxies SET labels=?, name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, websocket_permessage_deflate=?, allow_path_parameters=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, backend_proxy_protocol=?, stream_match=?, updated_at=? WHERE id=? AND namespace=?")
+            self.q("UPDATE proxies SET labels=?, name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, websocket_permessage_deflate=?, allow_path_parameters=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, backend_proxy_protocol=?, stream_match=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(serde_json::to_string(&proxy.labels)?)
         .bind(&proxy.name)
@@ -4232,7 +4327,6 @@ impl DatabaseStore {
         .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
         .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
         .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
-        .bind(proxy.pool_max_requests_per_connection.map(|v| v as i64))
         .bind(proxy.listen_port.map(|v| v as i32))
         .bind(if proxy.frontend_tls { 1i32 } else { 0 })
         .bind(if proxy.passthrough { 1i32 } else { 0 })
@@ -4254,14 +4348,14 @@ impl DatabaseStore {
         .await?;
 
         // Update plugin associations: remove old, insert new
-        sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?"))
+        sqlx::query(self.q("DELETE FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?"))
             .bind(&proxy.namespace)
             .bind(&proxy.id)
             .execute(&mut *tx)
             .await?;
 
         for assoc in &proxy.plugins {
-            sqlx::query(&self.q(
+            sqlx::query(self.q(
                 "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) \
                  VALUES (?, ?, ?)",
             ))
@@ -4336,7 +4430,7 @@ impl DatabaseStore {
         let upstream_id: Option<String> = proxy_row.try_get::<String, _>("upstream_id").ok();
 
         let spec_row: Option<AnyRow> = sqlx::query(
-            &self.q("SELECT id, namespace FROM api_specs WHERE namespace = ? AND proxy_id = ?"),
+            self.q("SELECT id, namespace FROM api_specs WHERE namespace = ? AND proxy_id = ?"),
         )
         .bind(namespace)
         .bind(id)
@@ -4351,8 +4445,7 @@ impl DatabaseStore {
                 .await?;
         }
         let proxy_scoped_plugin_rows: Vec<AnyRow> = sqlx::query(
-            &self
-                .q("SELECT id, namespace FROM plugin_configs WHERE namespace = ? AND proxy_id = ?"),
+            self.q("SELECT id, namespace FROM plugin_configs WHERE namespace = ? AND proxy_id = ?"),
         )
         .bind(namespace)
         .bind(id)
@@ -4364,13 +4457,13 @@ impl DatabaseStore {
             .collect::<Result<_, _>>()?;
 
         // Clean up junction table (defense in depth alongside ON DELETE CASCADE)
-        sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?"))
+        sqlx::query(self.q("DELETE FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?"))
             .bind(namespace)
             .bind(id)
             .execute(&mut *tx)
             .await?;
 
-        let result = sqlx::query(&self.q("DELETE FROM proxies WHERE id = ? AND namespace = ?"))
+        let result = sqlx::query(self.q("DELETE FROM proxies WHERE id = ? AND namespace = ?"))
             .bind(id)
             .bind(namespace)
             .execute(&mut *tx)
@@ -4391,7 +4484,7 @@ impl DatabaseStore {
         // can drift the pointer away from the original spec-owned upstream.
         if let Some((ref spec_id, ref spec_namespace)) = spec_owner {
             let upstream_rows: Vec<AnyRow> = sqlx::query(
-                &self.q("SELECT id FROM upstreams WHERE api_spec_id = ? AND namespace = ?"),
+                self.q("SELECT id FROM upstreams WHERE api_spec_id = ? AND namespace = ?"),
             )
             .bind(spec_id)
             .bind(spec_namespace)
@@ -4401,7 +4494,7 @@ impl DatabaseStore {
                 .iter()
                 .map(|row| row.try_get("id"))
                 .collect::<Result<_, _>>()?;
-            sqlx::query(&self.q("DELETE FROM upstreams WHERE api_spec_id = ? AND namespace = ?"))
+            sqlx::query(self.q("DELETE FROM upstreams WHERE api_spec_id = ? AND namespace = ?"))
                 .bind(spec_id)
                 .bind(spec_namespace)
                 .execute(&mut *tx)
@@ -4437,6 +4530,10 @@ impl DatabaseStore {
         .await?;
         self.record_config_change_tx(&mut tx, namespace, "proxy", id, "delete")
             .await?;
+        // Compact once per touched namespace after every change row is
+        // written, not once per plugin (issue #7209).
+        let mut compact_namespaces: BTreeSet<String> = BTreeSet::new();
+        compact_namespaces.insert(namespace.to_string());
         for (plugin_id, plugin_namespace) in proxy_scoped_plugins {
             self.record_config_change_tx(
                 &mut tx,
@@ -4446,10 +4543,12 @@ impl DatabaseStore {
                 "delete",
             )
             .await?;
-            self.compact_config_changes_tx(&mut tx, &plugin_namespace)
+            compact_namespaces.insert(plugin_namespace);
+        }
+        for compact_namespace in &compact_namespaces {
+            self.compact_config_changes_tx(&mut tx, compact_namespace)
                 .await?;
         }
-        self.compact_config_changes_tx(&mut tx, namespace).await?;
         tx.commit().await?;
 
         self.check_slow_query("delete_proxy", start);
@@ -4468,7 +4567,7 @@ impl DatabaseStore {
         // Every selected orphan must decode. Silently dropping a row on
         // try_get failure would commit the parent mutation while retaining the
         // orphan and omitting its delete change record (issue #3221).
-        let orphaned_configs: Vec<(String, String)> = sqlx::query(&self.q(
+        let orphaned_configs: Vec<(String, String)> = sqlx::query(self.q(
             "SELECT pc.id, pc.namespace FROM plugin_configs pc \
                  WHERE pc.scope = 'proxy_group' AND pc.namespace = ? \
                  AND NOT EXISTS (SELECT 1 FROM proxy_plugins pp \
@@ -4494,8 +4593,11 @@ impl DatabaseStore {
         .collect::<Result<_, _>>()?;
 
         for (id, namespace) in &orphaned_configs {
-            info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
-            sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ? AND namespace = ?"))
+            info!(
+                "Cascade-deleting orphaned proxy_group plugin config {}",
+                crate::startup::sanitize_startup_scalar(id)
+            );
+            sqlx::query(self.q("DELETE FROM plugin_configs WHERE id = ? AND namespace = ?"))
                 .bind(id)
                 .bind(namespace)
                 .execute(&mut **tx)
@@ -4519,7 +4621,7 @@ impl DatabaseStore {
             return Ok(());
         }
         let upstream_row: Option<AnyRow> = sqlx::query(
-            &self.q("SELECT api_spec_id FROM upstreams WHERE id = ? AND namespace = ? LIMIT 1"),
+            self.q("SELECT api_spec_id FROM upstreams WHERE id = ? AND namespace = ? LIMIT 1"),
         )
         .bind(upstream_id)
         .bind(namespace)
@@ -4534,7 +4636,7 @@ impl DatabaseStore {
         }
 
         let ref_rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT id FROM proxies WHERE upstream_id = ? AND namespace = ? LIMIT 1"),
+            self.q("SELECT id FROM proxies WHERE upstream_id = ? AND namespace = ? LIMIT 1"),
         )
         .bind(upstream_id)
         .bind(namespace)
@@ -4549,8 +4651,11 @@ impl DatabaseStore {
         };
 
         if ref_rows.is_empty() && dispatch_ref.is_none() {
-            info!("Cleaning up orphaned upstream {}", upstream_id);
-            sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
+            info!(
+                "Cleaning up orphaned upstream {}",
+                crate::startup::sanitize_startup_scalar(upstream_id)
+            );
+            sqlx::query(self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
                 .bind(upstream_id)
                 .bind(namespace)
                 .execute(&mut **tx)
@@ -4603,7 +4708,7 @@ impl DatabaseStore {
         // (issue #2122): a caller can never see a same-id proxy that lives in
         // another namespace.
         let row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM proxies WHERE id = ? AND namespace = ?"))
+            sqlx::query(self.q("SELECT * FROM proxies WHERE id = ? AND namespace = ?"))
                 .bind(id)
                 .bind(namespace)
                 .fetch_optional(&self.pool())
@@ -4640,7 +4745,7 @@ impl DatabaseStore {
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE id = ? AND namespace = ?"))
+            sqlx::query(self.q("SELECT id FROM proxies WHERE id = ? AND namespace = ?"))
                 .bind(proxy_id)
                 .bind(namespace)
                 .fetch_optional(&self.pool())
@@ -4657,7 +4762,7 @@ impl DatabaseStore {
         self.lock_mtls_dns_admission_tx(&mut tx, &consumer.namespace)
             .await?;
         sqlx::query(
-            &self.q("INSERT INTO consumers (labels, id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            self.q("INSERT INTO consumers (labels, id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(serde_json::to_string(&consumer.labels)?)
         .bind(&consumer.id)
@@ -4712,25 +4817,47 @@ impl DatabaseStore {
         // identical values would falsely report 0 for an existing row.
         // FOR UPDATE locks the row against a concurrent delete until commit.
         let exists_sql = if self.db_type == "sqlite" {
-            self.q("SELECT id FROM consumers WHERE id = ? AND namespace = ?")
+            self.q("SELECT id, username FROM consumers WHERE id = ? AND namespace = ?")
         } else {
-            self.q("SELECT id FROM consumers WHERE id = ? AND namespace = ? FOR UPDATE")
+            self.q("SELECT id, username FROM consumers WHERE id = ? AND namespace = ? FOR UPDATE")
         };
         let existing: Option<AnyRow> = sqlx::query(&exists_sql)
             .bind(&consumer.id)
             .bind(&consumer.namespace)
             .fetch_optional(&mut *tx)
             .await?;
-        if existing.is_none() {
+        let Some(existing) = existing else {
             tx.rollback().await?;
             self.check_slow_query("update_consumer", start);
             return Ok(false);
+        };
+        // A rename detaches every byte-for-byte `access_control` entry naming
+        // the old username, so it is refused while one does (the delete guard's
+        // sibling; see `access_control::config_names_consumer_username`).
+        let previous_username: String = existing.try_get("username")?;
+        if previous_username != consumer.username
+            && let Some(plugin) = self
+                .find_access_control_consumer_ref_tx(
+                    &mut tx,
+                    &consumer.namespace,
+                    &previous_username,
+                    crate::plugins::access_control::config_names_consumer_username,
+                )
+                .await?
+        {
+            tx.rollback().await?;
+            anyhow::bail!(
+                "Consumer {:?} is referenced by access_control plugin_config {:?} and cannot be \
+                 renamed",
+                consumer.id,
+                plugin.id
+            );
         }
         self.delete_consumer_credential_index_tx(&mut tx, &consumer.namespace, &consumer.id)
             .await?;
         self.delete_consumer_identity_index_tx(&mut tx, &consumer.namespace, &consumer.id)
             .await?;
-        sqlx::query(&self.q(
+        sqlx::query(self.q(
             "UPDATE consumers SET labels=?, username=?, custom_id=?, credentials=?, acl_groups=?, updated_at=? WHERE id=? AND namespace=?",
         ))
         .bind(serde_json::to_string(&consumer.labels)?)
@@ -4775,7 +4902,7 @@ impl DatabaseStore {
         // Scope the existence check to the caller's namespace (issue #2122):
         // consumer ids are only unique per namespace.
         let existing: Option<AnyRow> = sqlx::query(
-            &self.q("SELECT id, username FROM consumers WHERE id = ? AND namespace = ?"),
+            self.q("SELECT id, username FROM consumers WHERE id = ? AND namespace = ?"),
         )
         .bind(id)
         .bind(namespace)
@@ -4788,7 +4915,12 @@ impl DatabaseStore {
         };
         let username: String = existing.try_get("username")?;
         if let Some(plugin) = self
-            .find_access_control_consumer_ref_tx(&mut tx, namespace, &username)
+            .find_access_control_consumer_ref_tx(
+                &mut tx,
+                namespace,
+                &username,
+                access_control_plugin_allows_consumer,
+            )
             .await?
         {
             tx.rollback().await?;
@@ -4805,7 +4937,7 @@ impl DatabaseStore {
             .await?;
         self.delete_consumer_identity_index_tx(&mut tx, namespace, id)
             .await?;
-        let result = sqlx::query(&self.q("DELETE FROM consumers WHERE id = ? AND namespace = ?"))
+        let result = sqlx::query(self.q("DELETE FROM consumers WHERE id = ? AND namespace = ?"))
             .bind(id)
             .bind(namespace)
             .execute(&mut *tx)
@@ -4827,7 +4959,7 @@ impl DatabaseStore {
     ) -> Result<Option<Consumer>, anyhow::Error> {
         let start = Instant::now();
         let row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM consumers WHERE id = ? AND namespace = ?"))
+            sqlx::query(self.q("SELECT * FROM consumers WHERE id = ? AND namespace = ?"))
                 .bind(id)
                 .bind(namespace)
                 .fetch_optional(&self.pool())
@@ -4891,7 +5023,7 @@ impl DatabaseStore {
         // silently dropped row would leave an invalid association behind while
         // the write reported success (same contract as `delete_plugin_config`).
         let existing_rows: Vec<AnyRow> =
-            sqlx::query(&self.q(
+            sqlx::query(self.q(
                 "SELECT proxy_id FROM proxy_plugins WHERE namespace = ? AND plugin_config_id = ?",
             ))
             .bind(namespace)
@@ -4928,7 +5060,7 @@ impl DatabaseStore {
         if let Some(desired) = desired
             && !attached.iter().any(|current| current.as_str() == desired)
         {
-            sqlx::query(&self.q(
+            sqlx::query(self.q(
                 "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) \
                  VALUES (?, ?, ?)",
             ))
@@ -4971,7 +5103,7 @@ impl DatabaseStore {
         self.lock_mtls_dns_admission_tx(&mut tx, &pc.namespace)
             .await?;
         sqlx::query(
-            &self.q("INSERT INTO plugin_configs (labels, id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, trigger_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            self.q("INSERT INTO plugin_configs (labels, id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, trigger_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(serde_json::to_string(&pc.labels)?)
         .bind(&pc.id)
@@ -5024,6 +5156,14 @@ impl DatabaseStore {
     }
 
     pub async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<bool, anyhow::Error> {
+        self.update_plugin_config_inner(pc, None).await
+    }
+
+    async fn update_plugin_config_inner(
+        &self,
+        pc: &PluginConfig,
+        expected: Option<&BTreeSet<String>>,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let config_json = serde_json::to_string(&pc.config)?;
         let scope_str = match pc.scope {
@@ -5054,8 +5194,28 @@ impl DatabaseStore {
             self.check_slow_query("update_plugin_config", start);
             return Ok(false);
         }
+        if let Some(expected) = expected {
+            let current: Vec<String> = sqlx::query_scalar(self.q(
+                "SELECT proxy_id FROM proxy_plugins WHERE namespace = ? AND plugin_config_id = ?",
+            ))
+            .bind(&pc.namespace)
+            .bind(&pc.id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let kept = if pc.scope == PluginScope::Proxy {
+                pc.proxy_id.as_deref()
+            } else {
+                None
+            };
+            PluginAssociationPreconditionFailed::check(
+                &pc.id,
+                &current.into_iter().collect(),
+                expected,
+                kept,
+            )?;
+        }
         sqlx::query(
-            &self.q("UPDATE plugin_configs SET labels=?, plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, trigger_json=?, updated_at=? WHERE id=? AND namespace=?")
+            self.q("UPDATE plugin_configs SET labels=?, plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, trigger_json=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(serde_json::to_string(&pc.labels)?)
         .bind(&pc.plugin_name)
@@ -5111,6 +5271,15 @@ impl DatabaseStore {
         namespace: &str,
         id: &str,
     ) -> Result<bool, anyhow::Error> {
+        self.delete_plugin_config_inner(namespace, id, None).await
+    }
+
+    async fn delete_plugin_config_inner(
+        &self,
+        namespace: &str,
+        id: &str,
+        expected: Option<&BTreeSet<String>>,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
@@ -5120,7 +5289,7 @@ impl DatabaseStore {
         // Scope the existence check to the caller's namespace (issue #2122) so
         // a tenant cannot delete a same-id plugin config in another namespace.
         let existing: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT id FROM plugin_configs WHERE id = ? AND namespace = ?"))
+            sqlx::query(self.q("SELECT id FROM plugin_configs WHERE id = ? AND namespace = ?"))
                 .bind(id)
                 .bind(namespace)
                 .fetch_optional(&mut *tx)
@@ -5136,7 +5305,7 @@ impl DatabaseStore {
         // failure would delete the plugin while omitting proxies.updated_at
         // bumps and proxy config_change upserts (issue #3209).
         let affected_proxy_rows: Vec<AnyRow> =
-            sqlx::query(&self.q(
+            sqlx::query(self.q(
                 "SELECT proxy_id FROM proxy_plugins WHERE namespace = ? AND plugin_config_id = ?",
             ))
             .bind(namespace)
@@ -5154,12 +5323,21 @@ impl DatabaseStore {
             })
             .collect::<Result<_, _>>()?;
 
+        if let Some(expected) = expected {
+            PluginAssociationPreconditionFailed::check(
+                id,
+                &affected_proxy_ids.iter().cloned().collect(),
+                expected,
+                None,
+            )?;
+        }
+
         // Clean up junction table (defense in depth alongside ON DELETE CASCADE).
         // The namespace predicate is what keeps a plugin-config delete in one
         // tenant from unbinding a same-id plugin config in another (issue
         // #4627).
         sqlx::query(
-            &self.q("DELETE FROM proxy_plugins WHERE namespace = ? AND plugin_config_id = ?"),
+            self.q("DELETE FROM proxy_plugins WHERE namespace = ? AND plugin_config_id = ?"),
         )
         .bind(namespace)
         .bind(id)
@@ -5180,7 +5358,7 @@ impl DatabaseStore {
         }
 
         let result =
-            sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ? AND namespace = ?"))
+            sqlx::query(self.q("DELETE FROM plugin_configs WHERE id = ? AND namespace = ?"))
                 .bind(id)
                 .bind(namespace)
                 .execute(&mut *tx)
@@ -5212,7 +5390,7 @@ impl DatabaseStore {
     ) -> Result<Option<PluginConfig>, anyhow::Error> {
         let start = Instant::now();
         let row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM plugin_configs WHERE id = ? AND namespace = ?"))
+            sqlx::query(self.q("SELECT * FROM plugin_configs WHERE id = ? AND namespace = ?"))
                 .bind(id)
                 .bind(namespace)
                 .fetch_optional(&self.pool())
@@ -5325,14 +5503,14 @@ impl DatabaseStore {
         let start = Instant::now();
 
         let count_row =
-            sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM proxies WHERE namespace = ?"))
+            sqlx::query(self.q("SELECT COUNT(*) AS cnt FROM proxies WHERE namespace = ?"))
                 .bind(namespace)
                 .fetch_one(pool)
                 .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
         let rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM proxies WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
+            self.q("SELECT * FROM proxies WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
         )
         .bind(namespace)
         .bind(limit)
@@ -5432,14 +5610,14 @@ impl DatabaseStore {
         let start = Instant::now();
 
         let count_row =
-            sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM consumers WHERE namespace = ?"))
+            sqlx::query(self.q("SELECT COUNT(*) AS cnt FROM consumers WHERE namespace = ?"))
                 .bind(namespace)
                 .fetch_one(pool)
                 .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
         let rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM consumers WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
+            self.q("SELECT * FROM consumers WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
         )
         .bind(namespace)
         .bind(limit)
@@ -5938,14 +6116,14 @@ impl DatabaseStore {
         let start = Instant::now();
 
         let count_row =
-            sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM upstreams WHERE namespace = ?"))
+            sqlx::query(self.q("SELECT COUNT(*) AS cnt FROM upstreams WHERE namespace = ?"))
                 .bind(namespace)
                 .fetch_one(pool)
                 .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
         let rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM upstreams WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
+            self.q("SELECT * FROM upstreams WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
         )
         .bind(namespace)
         .bind(limit)
@@ -5999,7 +6177,7 @@ impl DatabaseStore {
         self.lock_mtls_dns_admission_tx(&mut tx, &upstream.namespace)
             .await?;
         sqlx::query(
-            &self.q("INSERT INTO upstreams (labels, id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, backend_tls_sni, backend_tls_san_allow_list, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            self.q("INSERT INTO upstreams (labels, id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, backend_tls_sni, backend_tls_san_allow_list, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(serde_json::to_string(&upstream.labels)?)
         .bind(&upstream.id)
@@ -6090,7 +6268,7 @@ impl DatabaseStore {
             return Ok(false);
         }
         sqlx::query(
-            &self.q("UPDATE upstreams SET labels=?, name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, subsets=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, backend_tls_sni=?, backend_tls_san_allow_list=?, updated_at=? WHERE id=? AND namespace=?")
+            self.q("UPDATE upstreams SET labels=?, name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, subsets=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, backend_tls_sni=?, backend_tls_san_allow_list=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(serde_json::to_string(&upstream.labels)?)
         .bind(&upstream.name)
@@ -6140,7 +6318,7 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
-        let rows: Vec<AnyRow> = sqlx::query(&self.q("SELECT * FROM plugin_configs \
+        let rows: Vec<AnyRow> = sqlx::query(self.q("SELECT * FROM plugin_configs \
              WHERE namespace = ? AND plugin_name = ? AND enabled = 1"))
         .bind(namespace)
         .bind("mesh_route_dispatch")
@@ -6169,14 +6347,17 @@ impl DatabaseStore {
         }))
     }
 
+    /// First `access_control` plugin config in `namespace` whose config
+    /// `references` reports as naming `username`.
     async fn find_access_control_consumer_ref_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         username: &str,
+        references: fn(&serde_json::Value, &str) -> bool,
     ) -> Result<Option<PluginConfig>, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND namespace = ?"),
+            self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND namespace = ?"),
         )
         .bind("access_control")
         .bind(namespace)
@@ -6185,7 +6366,7 @@ impl DatabaseStore {
 
         for row in &rows {
             let plugin = row_to_plugin_config(row)?;
-            if access_control_plugin_allows_consumer(&plugin, username) {
+            if plugin.plugin_name == "access_control" && references(&plugin.config, username) {
                 return Ok(Some(plugin));
             }
         }
@@ -6203,7 +6384,7 @@ impl DatabaseStore {
         // Scope the existence check to the caller's namespace (issue #2122) so
         // a tenant cannot delete a same-id upstream in another namespace.
         let existing: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT id FROM upstreams WHERE id = ? AND namespace = ?"))
+            sqlx::query(self.q("SELECT id FROM upstreams WHERE id = ? AND namespace = ?"))
                 .bind(id)
                 .bind(namespace)
                 .fetch_optional(&mut *tx)
@@ -6216,7 +6397,7 @@ impl DatabaseStore {
 
         // Check reference within the transaction to prevent races
         let ref_rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT id FROM proxies WHERE upstream_id = ? AND namespace = ? LIMIT 1"),
+            self.q("SELECT id FROM proxies WHERE upstream_id = ? AND namespace = ? LIMIT 1"),
         )
         .bind(id)
         .bind(namespace)
@@ -6242,7 +6423,7 @@ impl DatabaseStore {
             );
         }
 
-        let result = sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
+        let result = sqlx::query(self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
             .bind(id)
             .bind(namespace)
             .execute(&mut *tx)
@@ -6285,7 +6466,7 @@ impl DatabaseStore {
     ) -> Result<Option<Upstream>, anyhow::Error> {
         let start = Instant::now();
         let row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM upstreams WHERE id = ? AND namespace = ?"))
+            sqlx::query(self.q("SELECT * FROM upstreams WHERE id = ? AND namespace = ?"))
                 .bind(id)
                 .bind(namespace)
                 .fetch_optional(&self.pool())
@@ -6352,7 +6533,7 @@ impl DatabaseStore {
         let start = Instant::now();
         let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
             sqlx::query(
-                &self.q("SELECT id FROM proxies WHERE namespace = ? AND name = ? AND id != ?"),
+                self.q("SELECT id FROM proxies WHERE namespace = ? AND name = ? AND id != ?"),
             )
             .bind(namespace)
             .bind(name)
@@ -6360,7 +6541,7 @@ impl DatabaseStore {
             .fetch_all(&self.pool())
             .await?
         } else {
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE namespace = ? AND name = ?"))
+            sqlx::query(self.q("SELECT id FROM proxies WHERE namespace = ? AND name = ?"))
                 .bind(namespace)
                 .bind(name)
                 .fetch_all(&self.pool())
@@ -6381,7 +6562,7 @@ impl DatabaseStore {
         let start = Instant::now();
         let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
             sqlx::query(
-                &self.q("SELECT id FROM upstreams WHERE namespace = ? AND name = ? AND id != ?"),
+                self.q("SELECT id FROM upstreams WHERE namespace = ? AND name = ? AND id != ?"),
             )
             .bind(namespace)
             .bind(name)
@@ -6389,7 +6570,7 @@ impl DatabaseStore {
             .fetch_all(&self.pool())
             .await?
         } else {
-            sqlx::query(&self.q("SELECT id FROM upstreams WHERE namespace = ? AND name = ?"))
+            sqlx::query(self.q("SELECT id FROM upstreams WHERE namespace = ? AND name = ?"))
                 .bind(namespace)
                 .bind(name)
                 .fetch_all(&self.pool())
@@ -6415,9 +6596,7 @@ impl DatabaseStore {
     ) -> Result<Option<String>, anyhow::Error> {
         let start = Instant::now();
         let candidates = consumer_identity_probe_fields(consumer_id, username, custom_id);
-        let mut values: Vec<&str> = candidates.iter().map(|(_, value)| *value).collect();
-        values.sort_unstable();
-        values.dedup();
+        let values = consumer_identity_values_from_fields(consumer_id, username, custom_id);
 
         let placeholders = std::iter::repeat_n("?", values.len())
             .collect::<Vec<_>>()
@@ -6471,7 +6650,7 @@ impl DatabaseStore {
         owner_id: &str,
     ) -> Result<String, anyhow::Error> {
         let row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT id, username, custom_id FROM consumers \
+            sqlx::query(self.q("SELECT id, username, custom_id FROM consumers \
              WHERE namespace = ? AND id = ?"))
             .bind(namespace)
             .bind(owner_id)
@@ -6523,7 +6702,7 @@ impl DatabaseStore {
         let start = Instant::now();
         let credential_hash = credential_value_hash(api_key);
         let row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT consumer_id FROM consumer_credential_index \
+            sqlx::query(self.q("SELECT consumer_id FROM consumer_credential_index \
                  WHERE namespace = ? AND credential_type = ? AND credential_hash = ?"))
             .bind(namespace)
             .bind("keyauth")
@@ -6542,6 +6721,13 @@ impl DatabaseStore {
     }
 
     /// Check that an mTLS identity is not already used by another consumer.
+    ///
+    /// `consumer_credential_index` is authoritative: every SQL consumer writer
+    /// (create, update, batch/restore, namespace rename) writes the trimmed
+    /// identity hash in the same transaction as `consumers.credentials`, and
+    /// its primary key lets only one consumer hold a hash. A point lookup is
+    /// therefore equivalent to scanning the stored credentials. Matching is
+    /// exact here; only san_dns plugin candidates apply ASCII case folding.
     pub async fn check_mtls_identity_unique(
         &self,
         namespace: &str,
@@ -6549,98 +6735,24 @@ impl DatabaseStore {
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let canonical_identity = canonical_mtls_identity(mtls_identity);
-        let credential_hash = credential_value_hash(canonical_identity);
+        let credential_hash = credential_value_hash(canonical_mtls_identity(mtls_identity));
         let row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT consumer_id FROM consumer_credential_index \
+            sqlx::query(self.q("SELECT consumer_id FROM consumer_credential_index \
                  WHERE namespace = ? AND credential_type = ? AND credential_hash = ?"))
             .bind(namespace)
             .bind("mtls_auth")
             .bind(credential_hash)
             .fetch_optional(&self.pool())
             .await?;
-        if let Some(row) = row {
-            let consumer_id: String = row.try_get("consumer_id")?;
-            if exclude_consumer_id != Some(consumer_id.as_str()) {
-                self.check_slow_query("check_mtls_identity_unique", start);
-                return Ok(false);
+        let is_unique = match row {
+            Some(row) => {
+                let consumer_id: String = row.try_get("consumer_id")?;
+                exclude_consumer_id == Some(consumer_id.as_str())
             }
-        }
-
-        // Rows written before surrounding whitespace was normalized have a hash
-        // that a trimmed probe cannot find. Fall back to the authoritative
-        // Consumer rows before admitting a write. Matching remains exact here:
-        // only san_dns plugin candidates apply ASCII case-folded uniqueness.
-        // The path is admin-only and paginated; malformed stored credentials
-        // fail closed as a database error.
-        let is_unique = self
-            .stored_mtls_identity_is_unique(namespace, canonical_identity, exclude_consumer_id)
-            .await?;
+            None => true,
+        };
         self.check_slow_query("check_mtls_identity_unique", start);
         Ok(is_unique)
-    }
-
-    async fn stored_mtls_identity_is_unique(
-        &self,
-        namespace: &str,
-        canonical_identity: &str,
-        exclude_consumer_id: Option<&str>,
-    ) -> Result<bool, anyhow::Error> {
-        let mut last_id: Option<String> = None;
-        loop {
-            let sql = if last_id.is_some() {
-                "SELECT id, credentials FROM consumers WHERE namespace = ? AND id > ? ORDER BY id LIMIT ?"
-            } else {
-                "SELECT id, credentials FROM consumers WHERE namespace = ? ORDER BY id LIMIT ?"
-            };
-            let query_sql = self.q(sql);
-            let mut query = sqlx::query(&query_sql).bind(namespace);
-            if let Some(last_id) = last_id.as_deref() {
-                query = query.bind(last_id);
-            }
-            let rows: Vec<AnyRow> = query
-                .bind(self.full_load_page_size)
-                .fetch_all(&self.pool())
-                .await?;
-            let fetched = rows.len();
-            for row in rows {
-                let consumer_id: String = row.try_get("id")?;
-                // Skip the excluded consumer before parsing credentials so PUT
-                // overwrite repair of an undecodable row (issue #2997) is not
-                // blocked by its own corrupt body. Other malformed rows still
-                // fail closed below.
-                if exclude_consumer_id == Some(consumer_id.as_str()) {
-                    last_id = Some(consumer_id);
-                    continue;
-                }
-                let credentials_json = required_utf8_text_column(&row, "credentials")?;
-                let credentials: HashMap<String, serde_json::Value> =
-                    config_decode::from_json_str(&credentials_json).map_err(|error| {
-                        anyhow::anyhow!(
-                            "Consumer {:?}: failed to parse credentials JSON while checking \
-                             mTLS uniqueness: {}",
-                            consumer_id,
-                            error
-                        )
-                    })?;
-                if credentials.get("mtls_auth").is_some_and(|credential| {
-                    Consumer::credential_entries_from_value(credential)
-                        .iter()
-                        .any(|entry| {
-                            entry
-                                .get("identity")
-                                .and_then(serde_json::Value::as_str)
-                                .is_some_and(|identity| identity.trim() == canonical_identity)
-                        })
-                }) {
-                    return Ok(false);
-                }
-                last_id = Some(consumer_id);
-            }
-            if (fetched as i64) < self.full_load_page_size {
-                return Ok(true);
-            }
-        }
     }
 
     /// Check if an upstream with the given ID exists in `namespace`.
@@ -6656,7 +6768,7 @@ impl DatabaseStore {
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT id FROM upstreams WHERE id = ? AND namespace = ?"))
+            sqlx::query(self.q("SELECT id FROM upstreams WHERE id = ? AND namespace = ?"))
                 .bind(upstream_id)
                 .bind(namespace)
                 .fetch_optional(&self.pool())
@@ -6760,7 +6872,7 @@ impl DatabaseStore {
             anyhow::bail!("latest_change_sequence test fault");
         }
         let row = sqlx::query(
-            &self.q("SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM config_changes WHERE namespace = ?"),
+            self.q("SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM config_changes WHERE namespace = ?"),
         )
         .bind(namespace)
         .fetch_one(&self.pool())
@@ -6776,7 +6888,7 @@ impl DatabaseStore {
         // Same revision with different content. The sum of each namespace's
         // high-water mark is strictly monotonic when any namespace advances
         // and still includes deleted namespaces whose change-log rows remain.
-        let rows = sqlx::query(&self.q("SELECT COALESCE(MAX(sequence), 0) AS max_sequence \
+        let rows = sqlx::query(self.q("SELECT COALESCE(MAX(sequence), 0) AS max_sequence \
              FROM config_changes GROUP BY namespace"))
         .fetch_all(&self.pool())
         .await?;
@@ -7047,7 +7159,7 @@ impl DatabaseStore {
         after_sequence: u64,
     ) -> Result<(), anyhow::Error> {
         let row = sqlx::query(
-            &self.q("SELECT retained_sequence FROM config_change_retention WHERE namespace = ?"),
+            self.q("SELECT retained_sequence FROM config_change_retention WHERE namespace = ?"),
         )
         .bind(namespace)
         .fetch_optional(&mut **tx)
@@ -7084,7 +7196,7 @@ impl DatabaseStore {
         let mut changes = Vec::new();
         let mut page_after = after_sequence;
         loop {
-            let rows = sqlx::query(&self.q(
+            let rows = sqlx::query(self.q(
                 "SELECT sequence, resource_type, resource_id, operation \
                  FROM config_changes \
                  WHERE namespace = ? AND sequence > ? \
@@ -7343,7 +7455,28 @@ impl DatabaseStore {
         operation: &str,
     ) -> Result<(), anyhow::Error> {
         self.lock_config_change_sequence_tx(tx, namespace).await?;
-        sqlx::query(&self.q("INSERT INTO config_changes \
+        self.insert_config_change_row_tx(tx, namespace, resource_type, resource_id, operation)
+            .await
+    }
+
+    /// Insert one change row WITHOUT taking the namespace change-sequence
+    /// lock.
+    ///
+    /// Only for callers that already hold [`Self::lock_config_change_sequences_tx`]
+    /// for `namespace` in this transaction (the batch insert helpers, whose
+    /// callers lock every item's namespace in sorted order first). Re-taking
+    /// the lock per row cost an upsert plus `SELECT ... FOR UPDATE` (or an
+    /// SQLite `UPDATE`) for every one of up to thousands of rows (issue
+    /// #7209). Everyone else uses [`Self::record_config_change_tx`].
+    async fn insert_config_change_row_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        resource_type: &str,
+        resource_id: &str,
+        operation: &str,
+    ) -> Result<(), anyhow::Error> {
+        sqlx::query(self.q("INSERT INTO config_changes \
              (namespace, resource_type, resource_id, operation, created_at) \
              VALUES (?, ?, ?, ?, ?)"))
         .bind(namespace)
@@ -7357,7 +7490,7 @@ impl DatabaseStore {
         // row so compaction cadence does not depend on global sequence
         // divisibility (which breaks under alternating namespaces, batches, or
         // multi-primary auto_increment_increment).
-        sqlx::query(&self.q("UPDATE config_change_locks \
+        sqlx::query(self.q("UPDATE config_change_locks \
              SET changes_since_compaction = changes_since_compaction + 1 \
              WHERE lock_name = ?"))
         .bind(namespace)
@@ -7391,7 +7524,7 @@ impl DatabaseStore {
     ) -> Result<u64, anyhow::Error> {
         self.record_config_change_tx(tx, namespace, resource_type, resource_id, operation)
             .await?;
-        let row = sqlx::query(&self.q("SELECT COALESCE(MAX(sequence), 0) AS max_sequence \
+        let row = sqlx::query(self.q("SELECT COALESCE(MAX(sequence), 0) AS max_sequence \
              FROM config_changes WHERE namespace = ?"))
         .bind(namespace)
         .fetch_one(&mut **tx)
@@ -7433,7 +7566,7 @@ impl DatabaseStore {
         // multi-tenant writes, multi-row batches, and multi-primary
         // `auto_increment_increment` topologies.
         let lock_row = sqlx::query(
-            &self.q("SELECT changes_since_compaction FROM config_change_locks WHERE lock_name = ?"),
+            self.q("SELECT changes_since_compaction FROM config_change_locks WHERE lock_name = ?"),
         )
         .bind(namespace)
         .fetch_optional(&mut **tx)
@@ -7446,7 +7579,7 @@ impl DatabaseStore {
             return Ok(());
         }
         sqlx::query(
-            &self.q(
+            self.q(
                 "UPDATE config_change_locks SET changes_since_compaction = 0 WHERE lock_name = ?",
             ),
         )
@@ -7459,7 +7592,7 @@ impl DatabaseStore {
         // single-aggregate min/max optimization only fires for one endpoint
         // aggregate, so separate LIMIT 1 queries stay O(log N) across SQLite,
         // PostgreSQL, and MySQL alike.
-        let max_row = sqlx::query(&self.q("SELECT sequence FROM config_changes \
+        let max_row = sqlx::query(self.q("SELECT sequence FROM config_changes \
              WHERE namespace = ? \
              ORDER BY sequence DESC \
              LIMIT 1"))
@@ -7473,7 +7606,7 @@ impl DatabaseStore {
         if max_sequence <= retain_per_namespace {
             return Ok(());
         }
-        let min_row = sqlx::query(&self.q("SELECT sequence FROM config_changes \
+        let min_row = sqlx::query(self.q("SELECT sequence FROM config_changes \
              WHERE namespace = ? \
              ORDER BY sequence ASC \
              LIMIT 1"))
@@ -7490,7 +7623,7 @@ impl DatabaseStore {
         // Compute the cutoff strictly within `namespace` so a busy tenant
         // advancing the global auto-increment sequence cannot evict a quieter
         // tenant's rows.
-        let cutoff_row = sqlx::query(&self.q("SELECT sequence FROM config_changes \
+        let cutoff_row = sqlx::query(self.q("SELECT sequence FROM config_changes \
              WHERE namespace = ? \
              ORDER BY sequence DESC \
              LIMIT 1 OFFSET ?"))
@@ -7505,7 +7638,7 @@ impl DatabaseStore {
         if retained_sequence <= 0 {
             return Ok(());
         }
-        sqlx::query(&self.q("DELETE FROM config_changes WHERE namespace = ? AND sequence <= ?"))
+        sqlx::query(self.q("DELETE FROM config_changes WHERE namespace = ? AND sequence <= ?"))
             .bind(namespace)
             .bind(retained_sequence)
             .execute(&mut **tx)
@@ -7600,11 +7733,15 @@ impl DatabaseStore {
                         e,
                     )
                 })?;
-                let scope = match scope_raw.as_str() {
-                    "proxy" => PluginScope::Proxy,
-                    "proxy_group" => PluginScope::ProxyGroup,
-                    _ => PluginScope::Global,
-                };
+                // Strict: an unknown stored scope must not widen a proxy-scoped
+                // plugin to global (issue #7192).
+                let scope = parse_plugin_scope(&scope_raw).map_err(|reason| {
+                    anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
+                        "operation={} resource=proxy_plugins namespace={} \
+                         column=plugin_configs.scope: {}",
+                        operation, namespace, reason
+                    )))
+                })?;
                 let proxy_id = row
                     .try_get::<Option<String>, _>("proxy_id")
                     .map_err(|e| {
@@ -7647,31 +7784,14 @@ impl DatabaseStore {
     /// `FERRUM_DB_FULL_LOAD_PAGE_SIZE`.
     const DEFAULT_FULL_LOAD_PAGE_SIZE: i64 = 10_000;
 
-    /// Batch-create multiple proxies, chunked into transactions of
-    /// [`BATCH_CHUNK_SIZE`] for large-scale imports.
-    #[allow(dead_code)]
-    pub async fn batch_create_proxies(
-        &self,
-        proxies: &[Proxy],
-        mode: &BatchConfigWriteMode,
-    ) -> Result<usize, anyhow::Error> {
-        self.batch_create_proxies_internal(proxies, true, mode)
-            .await
-    }
-
+    /// Batch-create multiple proxies without their plugin associations,
+    /// chunked into transactions of [`BATCH_CHUNK_SIZE`] for large-scale
+    /// imports. Associations are written afterwards by
+    /// [`Self::batch_attach_proxy_plugins`], once the referenced plugin
+    /// configs exist.
     pub async fn batch_create_proxies_without_plugins(
         &self,
         proxies: &[Proxy],
-        mode: &BatchConfigWriteMode,
-    ) -> Result<usize, anyhow::Error> {
-        self.batch_create_proxies_internal(proxies, false, mode)
-            .await
-    }
-
-    async fn batch_create_proxies_internal(
-        &self,
-        proxies: &[Proxy],
-        attach_plugins: bool,
         mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let start = Instant::now();
@@ -7680,11 +7800,9 @@ impl DatabaseStore {
         }
         let mut total = 0usize;
         for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
-            total += self
-                .batch_create_proxies_chunk(chunk, attach_plugins, mode)
-                .await?;
+            total += self.batch_create_proxies_chunk(chunk, mode).await?;
         }
-        self.check_slow_query("batch_create_proxies", start);
+        self.check_slow_query("batch_create_proxies_without_plugins", start);
         Ok(total)
     }
 
@@ -7692,7 +7810,6 @@ impl DatabaseStore {
     async fn batch_create_proxies_chunk(
         &self,
         proxies: &[Proxy],
-        attach_plugins: bool,
         mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.begin_write_tx().await?;
@@ -7709,7 +7826,7 @@ impl DatabaseStore {
         self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces)
             .await?;
         let mut touched_namespaces = HashSet::new();
-        self.insert_proxies_in_tx(&mut tx, proxies, attach_plugins, &mut touched_namespaces)
+        self.insert_proxies_in_tx(&mut tx, proxies, &mut touched_namespaces)
             .await?;
 
         if mode.validates_mtls_dns() {
@@ -7726,24 +7843,22 @@ impl DatabaseStore {
         Ok(count)
     }
 
-    /// Insert one chunk of proxies into a caller-owned transaction.
+    /// Insert one chunk of proxies into a caller-owned transaction, without
+    /// their plugin associations.
     ///
     /// Shared by the chunk-per-transaction import path and the
     /// single-transaction atomic batch graph write so both write identical rows
-    /// and change records. The caller owns the namespace admission lock, the
-    /// post-write admission re-validation, change-log compaction, and the
-    /// commit.
+    /// and change records. Associations are attached in a later phase, once
+    /// the referenced plugin configs exist. The caller owns the namespace
+    /// admission lock, the post-write admission re-validation, change-log
+    /// compaction, and the commit.
     async fn insert_proxies_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         proxies: &[Proxy],
-        attach_plugins: bool,
         touched_namespaces: &mut HashSet<String>,
     ) -> Result<(), anyhow::Error> {
         let insert_sql = self.q(Self::PROXY_INSERT_SQL);
-        let assoc_sql = self.q(
-            "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES (?, ?, ?)",
-        );
 
         for proxy in proxies {
             self.ensure_proxy_route_unique_tx(&mut *tx, proxy, None)
@@ -7836,7 +7951,6 @@ impl DatabaseStore {
                 .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
                 .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
                 .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
-                .bind(proxy.pool_max_requests_per_connection.map(|v| v as i64))
                 .bind(proxy.listen_port.map(|v| v as i32))
                 .bind(if proxy.frontend_tls { 1i32 } else { 0 })
                 .bind(if proxy.passthrough { 1i32 } else { 0 })
@@ -7875,18 +7989,14 @@ impl DatabaseStore {
                 .execute(&mut **tx)
                 .await?;
 
-            if attach_plugins {
-                for assoc in &proxy.plugins {
-                    sqlx::query(&assoc_sql)
-                        .bind(&proxy.namespace)
-                        .bind(&proxy.id)
-                        .bind(&assoc.plugin_config_id)
-                        .execute(&mut **tx)
-                        .await?;
-                }
-            }
-            self.record_config_change_tx(&mut *tx, &proxy.namespace, "proxy", &proxy.id, "upsert")
-                .await?;
+            self.insert_config_change_row_tx(
+                &mut *tx,
+                &proxy.namespace,
+                "proxy",
+                &proxy.id,
+                "upsert",
+            )
+            .await?;
             touched_namespaces.insert(proxy.namespace.clone());
         }
 
@@ -7954,6 +8064,8 @@ impl DatabaseStore {
         let mut touched_proxies: HashSet<(&str, &str)> = HashSet::new();
         for proxy in proxies {
             for assoc in &proxy.plugins {
+                // Proxy and plugin-config ids are unique per namespace only, so
+                // the dedupe key carries the namespace like `touched_proxies`.
                 if !seen.insert((
                     proxy.namespace.as_str(),
                     proxy.id.as_str(),
@@ -7990,7 +8102,7 @@ impl DatabaseStore {
                     .bind(namespace)
                     .execute(&mut **tx)
                     .await?;
-                self.record_config_change_tx(&mut *tx, namespace, "proxy", proxy_id, "upsert")
+                self.insert_config_change_row_tx(&mut *tx, namespace, "proxy", proxy_id, "upsert")
                     .await?;
             }
         }
@@ -8083,7 +8195,7 @@ impl DatabaseStore {
                 .await?;
             self.insert_consumer_identity_index_tx(&mut *tx, consumer)
                 .await?;
-            self.record_config_change_tx(
+            self.insert_config_change_row_tx(
                 &mut *tx,
                 &consumer.namespace,
                 "consumer",
@@ -8206,10 +8318,16 @@ impl DatabaseStore {
                     .bind(&pc.id)
                     .execute(&mut **tx)
                     .await?;
-                self.record_config_change_tx(&mut *tx, &pc.namespace, "proxy", proxy_id, "upsert")
-                    .await?;
+                self.insert_config_change_row_tx(
+                    &mut *tx,
+                    &pc.namespace,
+                    "proxy",
+                    proxy_id,
+                    "upsert",
+                )
+                .await?;
             }
-            self.record_config_change_tx(
+            self.insert_config_change_row_tx(
                 &mut *tx,
                 &pc.namespace,
                 "plugin_config",
@@ -8330,7 +8448,7 @@ impl DatabaseStore {
                 .bind(upstream.updated_at.to_rfc3339())
                 .execute(&mut **tx)
                 .await?;
-            self.record_config_change_tx(
+            self.insert_config_change_row_tx(
                 &mut *tx,
                 &upstream.namespace,
                 "upstream",
@@ -8447,7 +8565,7 @@ impl DatabaseStore {
         for (index, chunk) in graph.proxies.chunks(chunk_size).enumerate() {
             // Associations are attached in their own phase below so a plugin
             // config submitted in the same graph is already present.
-            self.insert_proxies_in_tx(&mut tx, chunk, false, &mut touched_namespaces)
+            self.insert_proxies_in_tx(&mut tx, chunk, &mut touched_namespaces)
                 .await?;
             Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Proxies, index + 1)?;
         }
@@ -8512,7 +8630,7 @@ impl DatabaseStore {
             ] {
                 for (id, spec_id) in rows {
                     if let Some(spec_id) = spec_id {
-                        sqlx::query(&self.q(&format!(
+                        sqlx::query(self.q(&format!(
                             "UPDATE {table} SET api_spec_id = ? WHERE namespace = ? AND id = ?"
                         )))
                         .bind(spec_id)
@@ -8528,7 +8646,7 @@ impl DatabaseStore {
                     .load_gateway_trust_bundle_tx(graph.namespace, &mut tx)
                     .await?
                 {
-                    sqlx::query(&self.q(GATEWAY_TRUST_BUNDLE_DELETE_SQL))
+                    sqlx::query(self.q(GATEWAY_TRUST_BUNDLE_DELETE_SQL))
                         .bind(graph.namespace)
                         .bind(&current.id)
                         .execute(&mut *tx)
@@ -8554,7 +8672,7 @@ impl DatabaseStore {
                         .await?;
                     let revision = i64::try_from(revision)
                         .map_err(|_| anyhow::anyhow!("Trust revision exceeds BIGINT range"))?;
-                    sqlx::query(&self.q(GATEWAY_TRUST_BUNDLE_INSERT_SQL))
+                    sqlx::query(self.q(GATEWAY_TRUST_BUNDLE_INSERT_SQL))
                         .bind(graph.namespace)
                         .bind(&record.id)
                         .bind(&record.trust_domain)
@@ -8748,11 +8866,11 @@ impl DatabaseStore {
             .select_resource_ids_tx(tx, "upstreams", namespace, None, true)
             .await?;
 
-        sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE namespace = ?"))
+        sqlx::query(self.q("DELETE FROM proxy_plugins WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut **tx)
             .await?;
-        sqlx::query(&self.q("DELETE FROM plugin_configs WHERE namespace = ?"))
+        sqlx::query(self.q("DELETE FROM plugin_configs WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut **tx)
             .await?;
@@ -8760,47 +8878,50 @@ impl DatabaseStore {
         // DELETE CASCADE) would handle it, but explicit deletion is clearer and
         // matches the Mongo path.  Also ensures cleanup even if FK enforcement is
         // disabled (e.g. SQLite PRAGMA foreign_keys=OFF in recovery scenarios).
-        sqlx::query(&self.q("DELETE FROM api_specs WHERE namespace = ?"))
+        sqlx::query(self.q("DELETE FROM api_specs WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut **tx)
             .await?;
-        sqlx::query(&self.q("DELETE FROM proxies WHERE namespace = ?"))
+        sqlx::query(self.q("DELETE FROM proxies WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut **tx)
             .await?;
-        sqlx::query(&self.q("DELETE FROM consumer_credential_index WHERE namespace = ?"))
+        sqlx::query(self.q("DELETE FROM consumer_credential_index WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut **tx)
             .await?;
-        sqlx::query(&self.q("DELETE FROM consumer_identity_index WHERE namespace = ?"))
+        sqlx::query(self.q("DELETE FROM consumer_identity_index WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut **tx)
             .await?;
-        sqlx::query(&self.q("DELETE FROM consumers WHERE namespace = ?"))
+        sqlx::query(self.q("DELETE FROM consumers WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut **tx)
             .await?;
-        sqlx::query(&self.q("DELETE FROM upstreams WHERE namespace = ?"))
+        sqlx::query(self.q("DELETE FROM upstreams WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut **tx)
             .await?;
         if mode.validates_mtls_dns() {
             self.validate_mtls_dns_admission_tx(tx, namespace).await?;
         }
+        // Every row below is in this one namespace: take its change-sequence
+        // lock once instead of once per deleted resource (issue #7209).
+        self.lock_config_change_sequence_tx(tx, namespace).await?;
         for id in proxy_ids {
-            self.record_config_change_tx(tx, namespace, "proxy", &id, "delete")
+            self.insert_config_change_row_tx(tx, namespace, "proxy", &id, "delete")
                 .await?;
         }
         for id in plugin_config_ids {
-            self.record_config_change_tx(tx, namespace, "plugin_config", &id, "delete")
+            self.insert_config_change_row_tx(tx, namespace, "plugin_config", &id, "delete")
                 .await?;
         }
         for id in consumer_ids {
-            self.record_config_change_tx(tx, namespace, "consumer", &id, "delete")
+            self.insert_config_change_row_tx(tx, namespace, "consumer", &id, "delete")
                 .await?;
         }
         for id in upstream_ids {
-            self.record_config_change_tx(tx, namespace, "upstream", &id, "delete")
+            self.insert_config_change_row_tx(tx, namespace, "upstream", &id, "delete")
                 .await?;
         }
         self.compact_config_changes_tx(tx, namespace).await?;
@@ -8821,10 +8942,9 @@ impl DatabaseStore {
         if let Some(fault_pool) = crate::config::test_db_fault::tripped_fault_pool() {
             return fault_pool;
         }
-        (**self.pool.load()).clone()
+        self.failover_topology.handle()
     }
 
-    #[allow(dead_code)]
     pub fn db_type_str(&self) -> &str {
         &self.db_type
     }
@@ -8882,7 +9002,6 @@ impl DatabaseStore {
 
     /// Install (or clear) async test hooks around the reconnect transition
     /// write lock. Production leaves this unset.
-    #[allow(dead_code)] // exercised via external unit tests through the lib target
     pub fn set_reconnect_transition_hooks_for_test(
         &self,
         hooks: Option<SqlReconnectTransitionTestHooks>,
@@ -8895,10 +9014,15 @@ impl DatabaseStore {
     }
 
     /// Fail the next [`Self::latest_change_sequence`] reads (issue #3926 tests).
-    #[allow(dead_code)] // exercised via external unit tests through the lib target
     pub fn set_latest_change_sequence_fault_for_test(&self, fail: bool) {
         self.latest_change_sequence_test_fault
             .store(fail, Ordering::Release);
+    }
+
+    /// Re-arm the offline-bootstrap deferred-migration flag so reconnect tests
+    /// can drive a failback whose deferred migrations fail (issue #7033).
+    pub(crate) fn set_migrations_pending_for_test(&self, pending: bool) {
+        self.migrations_pending.store(pending, Ordering::Release);
     }
 
     async fn invoke_reconnect_transition_hook(
@@ -9006,29 +9130,57 @@ impl DatabaseStore {
         // (shared reads) and serializes concurrent reconnect publishers.
         let _transition_guard = self.reconnect_transition.write().await;
 
-        if topology == DatabaseTopology::Primary {
-            self.failover_topology.ensure_primary_failback_allowed()?;
-        }
+        let primary_failback_permit = match topology {
+            DatabaseTopology::Primary => {
+                Some(self.failover_topology.ensure_primary_failback_allowed()?)
+            }
+            DatabaseTopology::Failover => None,
+        };
         let next_topology_epoch = crate::config::db_backend::checked_next_config_topology_epoch(
             self.topology_epoch.load(Ordering::Acquire),
         )?;
 
-        // Disable and close the configured primary-topology replica before
-        // exposing a failover pool. Keeping the dormant pool would make it
-        // look immediately available on failback and skip the one reconnect
-        // that refreshes its connections after the topology transition.
-        // Gate-before-publish: flip the write gate before ArcSwap so
-        // `check_write_allowed()` / `admit_write()` cannot observe a failover
-        // pool while `primary_active` is still true.
-        if topology == DatabaseTopology::Failover {
-            self.failover_topology
-                .mark_failover(&Self::redact_url(db_url));
-            self.suppress_read_replica_pool();
+        // If this store was bootstrapped via `connect_offline_with_pool_config`
+        // (backup-file startup with an unreachable DB), migrations never ran.
+        // Run them against the *staged* pool before anything is published
+        // (issue #7033): a failure then returns with the previous pool, replica
+        // and topology all still installed, instead of leaving the new pool
+        // live while topology still reports the old side (on a primary
+        // failback that let opt-in Admin writes land on the primary while
+        // being recorded as failover writes, fencing the next failback). The
+        // helper uses a CAS so concurrent callers don't run migrations twice,
+        // and restores the flag on failure so a transient error doesn't
+        // silently skip migrations forever.
+        //
+        // The failback permit is then revalidated right before publication: a
+        // permit gone stale (an Admin write admitted on failover since the
+        // fence check) aborts here with nothing published.
+        let staged = async {
+            self.maybe_apply_deferred_migrations_on_pool(new_pool.clone())
+                .await?;
+            if let Some(permit) = primary_failback_permit.as_ref() {
+                self.failover_topology.revalidate_primary_failback(permit)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = staged {
+            tokio::spawn(async move {
+                new_pool.close().await;
+            });
+            if let Some(new_replica) = new_replica {
+                tokio::spawn(async move {
+                    new_replica.close().await;
+                });
+            }
+            return Err(error);
         }
 
-        // Atomic swap — readers that already loaded the old pool keep using it.
-        let old_pool = self.pool.swap(Arc::new(new_pool));
-        let published_replica = new_replica.is_some();
+        // Nothing below can fail: the pool and its topology are published
+        // together under this same lock.
+
+        // A replica only serves reads while the primary is published, so a
+        // fresh one is installed before the publication that activates it.
         if let Some(new_replica) = new_replica {
             let old_replica = self.read_replica_pool.swap(Some(Arc::new(new_replica)));
             if let Some(old_replica) = old_replica {
@@ -9036,6 +9188,33 @@ impl DatabaseStore {
                     old_replica.close().await;
                 });
             }
+        }
+
+        // One atomic store publishes the pool AND its topology (issue #7061):
+        // `check_write_allowed()` / `admit_write()` can never observe a
+        // failover pool while `primary_active` is still true, and a primary
+        // pool never goes live while topology still reports failover. Readers
+        // that already loaded the old pool keep using it. The primary arm
+        // consumes the failback permit checked under this same lock.
+        let old_pool = match primary_failback_permit {
+            Some(permit) => {
+                self.failover_topology
+                    .publish_primary(new_pool, permit, &Self::redact_url(db_url))
+            }
+            None => self
+                .failover_topology
+                .publish_failover(new_pool, &Self::redact_url(db_url)),
+        };
+        // Disable and close the configured primary-topology replica once the
+        // failover topology is published. Keeping the dormant pool would make
+        // it look immediately available on failback and skip the one
+        // reconnect that refreshes its connections after the transition.
+        // Suppressing AFTER publication closes the race with a concurrent
+        // `reconnect_read_replica`: one that installed its pool before this
+        // point is removed here, and one that installs later sees failover
+        // topology in its own post-install check and removes itself.
+        if topology == DatabaseTopology::Failover {
+            self.suppress_read_replica_pool();
         }
         self.topology_epoch
             .store(next_topology_epoch, Ordering::Release);
@@ -9050,38 +9229,10 @@ impl DatabaseStore {
             old_pool.close().await;
         });
 
-        // Test seam: hold the transition across the deferred-migration window
-        // so a later failover/primary cannot interleave and then be overwritten
-        // by a delayed mark_primary / mismatched topology finalization.
+        // Test seam: hold the transition after publication so a concurrent
+        // failover/primary must wait for this one to release the lock.
         self.invoke_reconnect_transition_hook(|hooks| hooks.while_holding.as_ref(), topology_kind)
             .await;
-
-        // If this store was bootstrapped via `connect_offline_with_pool_config`
-        // (backup-file startup with an unreachable DB), migrations never ran.
-        // Now that the pool is reconnected to a live DB, run them before
-        // returning so the polling loop finds tables at the expected schema.
-        // The helper uses a CAS so concurrent callers don't run migrations
-        // twice, and restores the flag on failure so a transient error
-        // doesn't silently skip migrations forever.
-        if let Err(error) = self.maybe_apply_deferred_migrations().await {
-            // `mark_primary` below never runs on this path, so a replica this
-            // call just published would stay live but inert (admin reads gate
-            // on `primary_active()`), holding connections and its snapshot
-            // files until some later replica reconnect replaced it. Retract it.
-            if published_replica && let Some(raced_replica) = self.read_replica_pool.swap(None) {
-                tokio::spawn(async move {
-                    raced_replica.close().await;
-                });
-            }
-            return Err(error);
-        }
-
-        // Primary failback stays fail-closed for writes until publication and
-        // deferred migrations succeed: mark_primary only after the await.
-        if topology == DatabaseTopology::Primary {
-            self.failover_topology
-                .mark_primary(&Self::redact_url(db_url));
-        }
 
         Ok(())
     }
@@ -9089,7 +9240,6 @@ impl DatabaseStore {
     /// Extract the hostname from a database URL, if it contains one.
     ///
     /// Delegates to [`crate::config::db_backend::extract_db_hostname`].
-    #[allow(dead_code)]
     pub fn extract_db_hostname(db_url: &str) -> Option<String> {
         crate::config::db_backend::extract_db_hostname(db_url)
     }
@@ -9139,7 +9289,7 @@ impl DatabaseStore {
                             store.failover_urls = failover_urls.to_vec();
                             store
                                 .failover_topology
-                                .mark_failover(&Self::redact_url(url));
+                                .mark_connected_to_failover(&Self::redact_url(url));
                             return Ok(store);
                         }
                         Err(e) => {
@@ -9173,13 +9323,23 @@ impl DatabaseStore {
         }
     }
 
+    /// Record the admin-read replica URL without dialing it.
+    ///
+    /// Startup pairs this with a background
+    /// [`reconnect_read_replica`](Self::reconnect_read_replica) so an unreachable
+    /// replica cannot delay the authoritative primary load; admin reads use the
+    /// primary until the replica pool is published.
+    pub fn set_read_replica_url(&mut self, replica_url: &str) {
+        self.read_replica_url = Some(replica_url.to_string());
+    }
+
     /// Connect a read replica pool for admin read offload.
     ///
     /// The read replica pool uses the same connection settings (max_connections,
     /// max_lifetime) as the primary. Migrations are NOT run on the replica.
     pub async fn connect_read_replica(&mut self, replica_url: &str) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
-        self.read_replica_url = Some(replica_url.to_string());
+        self.set_read_replica_url(replica_url);
 
         if !self.failover_topology.primary_active() {
             info!(
@@ -9473,7 +9633,6 @@ impl DatabaseStore {
     }
 
     /// Returns true if a read replica URL is configured.
-    #[allow(dead_code)] // Public API for tests and future consumers
     pub fn has_read_replica_pool(&self) -> bool {
         self.read_replica_url.is_some()
     }
@@ -9605,7 +9764,7 @@ impl DatabaseStore {
                         UNION SELECT DISTINCT namespace FROM upstreams \
                         UNION SELECT DISTINCT namespace FROM gateway_trust_bundles \
                         ) AS ferrum_namespaces ORDER BY 1 LIMIT ? OFFSET ?";
-        let rows: Vec<AnyRow> = sqlx::query(&self.q(page_sql))
+        let rows: Vec<AnyRow> = sqlx::query(self.q(page_sql))
             .bind(limit)
             .bind(offset)
             .fetch_all(pool)
@@ -9627,7 +9786,7 @@ impl DatabaseStore {
     ) -> Result<Option<crate::config::namespace_registry::NamespaceRecord>, anyhow::Error> {
         let pool = self.pool();
         let row =
-            sqlx::query(&self.q(
+            sqlx::query(self.q(
                 "SELECT name, description, created_at, updated_at FROM namespaces WHERE name = ?",
             ))
             .bind(name)
@@ -9794,7 +9953,7 @@ impl DatabaseStore {
         name: &str,
     ) -> Result<Option<crate::config::namespace_registry::NamespaceRecord>, anyhow::Error> {
         let row =
-            sqlx::query(&self.q(
+            sqlx::query(self.q(
                 "SELECT name, description, created_at, updated_at FROM namespaces WHERE name = ?",
             ))
             .bind(name)
@@ -9863,7 +10022,7 @@ impl DatabaseStore {
         if self.namespace_name_in_use_tx(&mut tx, &record.name).await? {
             return Err(RegistryError::name_in_use(&record.name));
         }
-        sqlx::query(&self.q(
+        sqlx::query(self.q(
             "INSERT INTO namespaces (name, description, created_at, updated_at) VALUES (?, ?, ?, ?)",
         ))
         .bind(&record.name)
@@ -10006,7 +10165,7 @@ impl DatabaseStore {
         now_rfc: &str,
     ) -> Result<(), anyhow::Error> {
         let updated = sqlx::query(
-            &self.q("UPDATE namespaces SET description = ?, updated_at = ? WHERE name = ?"),
+            self.q("UPDATE namespaces SET description = ?, updated_at = ? WHERE name = ?"),
         )
         .bind(&record.description)
         .bind(now_rfc)
@@ -10016,7 +10175,7 @@ impl DatabaseStore {
         if updated.rows_affected() > 0 {
             return Ok(());
         }
-        sqlx::query(&self.q(
+        sqlx::query(self.q(
             "INSERT INTO namespaces (name, description, created_at, updated_at) \
              VALUES (?, ?, ?, ?)",
         ))
@@ -10049,7 +10208,7 @@ impl DatabaseStore {
         // The target row is inserted and the source row removed at the end, so a
         // derived-only tenant (resources but no registry row) is materialized by
         // the same statement pair as a registered one.
-        sqlx::query(&self.q(
+        sqlx::query(self.q(
             "INSERT INTO namespaces (name, description, created_at, updated_at) \
              VALUES (?, ?, ?, ?)",
         ))
@@ -10073,20 +10232,18 @@ impl DatabaseStore {
         )
         .await?;
         sqlx::query(
-            &self.q("UPDATE consumer_credential_index SET namespace = ? WHERE namespace = ?"),
+            self.q("UPDATE consumer_credential_index SET namespace = ? WHERE namespace = ?"),
         )
         .bind(new_name)
         .bind(current_name)
         .execute(&mut **tx)
         .await?;
-        sqlx::query(
-            &self.q("UPDATE consumer_identity_index SET namespace = ? WHERE namespace = ?"),
-        )
-        .bind(new_name)
-        .bind(current_name)
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(&self.q("DELETE FROM consumers WHERE namespace = ?"))
+        sqlx::query(self.q("UPDATE consumer_identity_index SET namespace = ? WHERE namespace = ?"))
+            .bind(new_name)
+            .bind(current_name)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query(self.q("DELETE FROM consumers WHERE namespace = ?"))
             .bind(current_name)
             .execute(&mut **tx)
             .await?;
@@ -10102,7 +10259,7 @@ impl DatabaseStore {
             new_name,
         )
         .await?;
-        sqlx::query(&self.q("DELETE FROM gateway_trust_bundles WHERE namespace = ?"))
+        sqlx::query(self.q("DELETE FROM gateway_trust_bundles WHERE namespace = ?"))
             .bind(current_name)
             .execute(&mut **tx)
             .await?;
@@ -10130,7 +10287,7 @@ impl DatabaseStore {
             .iter()
             .rev()
         {
-            sqlx::query(&self.q(&format!("DELETE FROM {table} WHERE namespace = ?")))
+            sqlx::query(self.q(&format!("DELETE FROM {table} WHERE namespace = ?")))
                 .bind(current_name)
                 .execute(&mut **tx)
                 .await?;
@@ -10140,7 +10297,7 @@ impl DatabaseStore {
         // authorization-scoping `namespace` column is still rewritten in place.
         for table in crate::config::namespace_registry::NAMESPACE_RENAME_SIMPLE_TABLES {
             let sql = format!("UPDATE {table} SET namespace = ? WHERE namespace = ?");
-            sqlx::query(&self.q(&sql))
+            sqlx::query(self.q(&sql))
                 .bind(new_name)
                 .bind(current_name)
                 .execute(&mut **tx)
@@ -10183,7 +10340,7 @@ impl DatabaseStore {
         self.compact_config_changes_tx(tx, current_name).await?;
         self.compact_config_changes_tx(tx, new_name).await?;
 
-        sqlx::query(&self.q("DELETE FROM namespaces WHERE name = ?"))
+        sqlx::query(self.q("DELETE FROM namespaces WHERE name = ?"))
             .bind(current_name)
             .execute(&mut **tx)
             .await?;
@@ -10210,7 +10367,7 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
-        sqlx::query(&self.q("DELETE FROM proxy_route_locks WHERE namespace = ?"))
+        sqlx::query(self.q("DELETE FROM proxy_route_locks WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut **tx)
             .await?;
@@ -10252,7 +10409,7 @@ impl DatabaseStore {
             "INSERT INTO {table} ({insert_columns}) \
              SELECT {select_expr} FROM {table} WHERE namespace = ?"
         );
-        sqlx::query(&self.q(&sql))
+        sqlx::query(self.q(&sql))
             .bind(new_name)
             .bind(current_name)
             .execute(&mut **tx)
@@ -10325,7 +10482,7 @@ impl DatabaseStore {
         self.delete_namespace_guard_rows_tx(&mut tx, name).await?;
         check_namespace_registry_fault(fault, RegistryPhase::Ancillary)?;
 
-        sqlx::query(&self.q("DELETE FROM namespaces WHERE name = ?"))
+        sqlx::query(self.q("DELETE FROM namespaces WHERE name = ?"))
             .bind(name)
             .execute(&mut *tx)
             .await?;
@@ -10369,7 +10526,7 @@ impl DatabaseStore {
         if ids.is_empty() {
             return Ok(());
         }
-        sqlx::query(&self.q("DELETE FROM gateway_trust_bundles WHERE namespace = ?"))
+        sqlx::query(self.q("DELETE FROM gateway_trust_bundles WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut **tx)
             .await?;
@@ -10513,7 +10670,7 @@ impl DatabaseStore {
                 .transpose()?;
             let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(u)?;
 
-            sqlx::query(&self.q("INSERT INTO upstreams \
+            sqlx::query(self.q("INSERT INTO upstreams \
                  (labels, id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, \
                   health_checks, service_discovery, subsets, backend_tls_client_cert_path, \
                   backend_tls_client_key_path, backend_tls_verify_server_cert, \
@@ -10549,7 +10706,7 @@ impl DatabaseStore {
         // This SQL differs from `Self::PROXY_INSERT_SQL` only by the addition of
         // the `api_spec_id` column before `created_at`.  When adding a new column
         // to `proxies`, update BOTH this query AND `Self::PROXY_INSERT_SQL` (and
-        // the corresponding `.bind()` chains in `create_proxy`, `batch_create_proxies_chunk`,
+        // the corresponding `.bind()` chains in `create_proxy`, `insert_proxies_in_tx`,
         // and the `replace_api_spec_bundle` UPDATE path).
         {
             let p = &bundle.proxy;
@@ -10567,113 +10724,90 @@ impl DatabaseStore {
             };
             let stream_match_json = serialize_stream_match(p)?;
 
-            sqlx::query(&self.q("INSERT INTO proxies \
-                 (labels, id, namespace, name, hosts, listen_path, backend_scheme, backend_host, \
-                  backend_port, backend_path, strip_listen_path, preserve_host_header, \
-                  backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, \
-                  backend_tls_client_cert_path, backend_tls_client_key_path, \
-                  backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, \
-                  dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, upstream_subset, \
-                  circuit_breaker, retry, response_body_mode, \
-                  pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, \
-                  pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, \
-                  pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, \
-                  pool_http2_initial_connection_window_size, pool_http2_adaptive_window, \
-                  pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
-                  pool_http3_connections_per_backend, pool_max_requests_per_connection, \
-                  listen_port, frontend_tls, passthrough, \
-                  udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
-                  websocket_permessage_deflate, allow_path_parameters, \
-                  allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
-                  stream_proxy_protocol, backend_proxy_protocol, stream_match, \
-                  api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
-            .bind(serde_json::to_string(&p.labels)?)
-            .bind(&p.id)
-            .bind(&p.namespace)
-            .bind(&p.name)
-            .bind(&hosts_json)
-            .bind(&p.listen_path)
-            .bind(p.effective_scheme().to_scheme_str())
-            .bind(&p.backend_host)
-            .bind(p.backend_port as i32)
-            .bind(&p.backend_path)
-            .bind(if p.strip_listen_path { 1i32 } else { 0 })
-            .bind(if p.preserve_host_header { 1i32 } else { 0 })
-            .bind(p.backend_connect_timeout_ms as i64)
-            .bind(p.backend_read_timeout_ms as i64)
-            .bind(p.backend_write_timeout_ms as i64)
-            .bind(&p.backend_tls_client_cert_path)
-            .bind(&p.backend_tls_client_key_path)
-            .bind(if p.backend_tls_verify_server_cert {
-                1i32
-            } else {
-                0
-            })
-            .bind(&p.backend_tls_server_ca_cert_path)
-            .bind(&p.dns_override)
-            .bind(p.dns_cache_ttl_seconds.map(|v| v as i64))
-            .bind(match p.auth_mode {
-                AuthMode::Multi => "multi",
-                _ => "single",
-            })
-            .bind(&p.upstream_id)
-            .bind(&p.upstream_subset)
-            .bind(&circuit_breaker_json)
-            .bind(&retry_json)
-            .bind(response_body_mode_str)
-            .bind(p.pool_idle_timeout_seconds.map(|v| v as i64))
-            .bind(
-                p.pool_enable_http_keep_alive
-                    .map(|v| if v { 1i32 } else { 0 }),
-            )
-            .bind(p.pool_enable_http2.map(|v| if v { 1i32 } else { 0 }))
-            .bind(p.pool_tcp_keepalive_seconds.map(|v| v as i64))
-            .bind(p.pool_http2_keep_alive_interval_seconds.map(|v| v as i64))
-            .bind(p.pool_http2_keep_alive_timeout_seconds.map(|v| v as i64))
-            .bind(p.pool_http2_initial_stream_window_size.map(|v| v as i64))
-            .bind(
-                p.pool_http2_initial_connection_window_size
-                    .map(|v| v as i64),
-            )
-            .bind(
-                p.pool_http2_adaptive_window
-                    .map(|v| if v { 1i32 } else { 0 }),
-            )
-            .bind(p.pool_http2_max_frame_size.map(|v| v as i64))
-            .bind(p.pool_http2_max_concurrent_streams.map(|v| v as i64))
-            .bind(p.pool_http3_connections_per_backend.map(|v| v as i64))
-            .bind(p.pool_max_requests_per_connection.map(|v| v as i64))
-            .bind(p.listen_port.map(|v| v as i32))
-            .bind(if p.frontend_tls { 1i32 } else { 0 })
-            .bind(if p.passthrough { 1i32 } else { 0 })
-            .bind(p.udp_idle_timeout_seconds as i64)
-            .bind(p.tcp_idle_timeout_seconds.map(|v| v as i64))
-            .bind(p.websocket_idle_timeout_seconds.map(|v| v as i64))
-            .bind(p.websocket_permessage_deflate.as_str())
-            .bind(if p.allow_path_parameters { 1i32 } else { 0 })
-            .bind(
-                p.allowed_methods
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()?,
-            )
-            .bind(if p.allowed_ws_origins.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_string(&p.allowed_ws_origins)?)
-            })
-            .bind(p.udp_max_response_amplification_factor.map(|v| v as f64))
-            .bind(p.stream_proxy_protocol.map(|v| if v { 1i32 } else { 0 }))
-            .bind(p.backend_proxy_protocol.map(|v| v.as_str()))
-            .bind(&stream_match_json)
-            .bind(&spec.id)
-            .bind(p.created_at.to_rfc3339())
-            .bind(p.updated_at.to_rfc3339())
-            .execute(&mut *tx)
-            .await?;
+            sqlx::query(self.q(Self::PROXY_INSERT_WITH_API_SPEC_ID_SQL))
+                .bind(serde_json::to_string(&p.labels)?)
+                .bind(&p.id)
+                .bind(&p.namespace)
+                .bind(&p.name)
+                .bind(&hosts_json)
+                .bind(&p.listen_path)
+                .bind(p.effective_scheme().to_scheme_str())
+                .bind(&p.backend_host)
+                .bind(p.backend_port as i32)
+                .bind(&p.backend_path)
+                .bind(if p.strip_listen_path { 1i32 } else { 0 })
+                .bind(if p.preserve_host_header { 1i32 } else { 0 })
+                .bind(p.backend_connect_timeout_ms as i64)
+                .bind(p.backend_read_timeout_ms as i64)
+                .bind(p.backend_write_timeout_ms as i64)
+                .bind(&p.backend_tls_client_cert_path)
+                .bind(&p.backend_tls_client_key_path)
+                .bind(if p.backend_tls_verify_server_cert {
+                    1i32
+                } else {
+                    0
+                })
+                .bind(&p.backend_tls_server_ca_cert_path)
+                .bind(&p.dns_override)
+                .bind(p.dns_cache_ttl_seconds.map(|v| v as i64))
+                .bind(match p.auth_mode {
+                    AuthMode::Multi => "multi",
+                    _ => "single",
+                })
+                .bind(&p.upstream_id)
+                .bind(&p.upstream_subset)
+                .bind(&circuit_breaker_json)
+                .bind(&retry_json)
+                .bind(response_body_mode_str)
+                .bind(p.pool_idle_timeout_seconds.map(|v| v as i64))
+                .bind(
+                    p.pool_enable_http_keep_alive
+                        .map(|v| if v { 1i32 } else { 0 }),
+                )
+                .bind(p.pool_enable_http2.map(|v| if v { 1i32 } else { 0 }))
+                .bind(p.pool_tcp_keepalive_seconds.map(|v| v as i64))
+                .bind(p.pool_http2_keep_alive_interval_seconds.map(|v| v as i64))
+                .bind(p.pool_http2_keep_alive_timeout_seconds.map(|v| v as i64))
+                .bind(p.pool_http2_initial_stream_window_size.map(|v| v as i64))
+                .bind(
+                    p.pool_http2_initial_connection_window_size
+                        .map(|v| v as i64),
+                )
+                .bind(
+                    p.pool_http2_adaptive_window
+                        .map(|v| if v { 1i32 } else { 0 }),
+                )
+                .bind(p.pool_http2_max_frame_size.map(|v| v as i64))
+                .bind(p.pool_http2_max_concurrent_streams.map(|v| v as i64))
+                .bind(p.pool_http3_connections_per_backend.map(|v| v as i64))
+                .bind(p.listen_port.map(|v| v as i32))
+                .bind(if p.frontend_tls { 1i32 } else { 0 })
+                .bind(if p.passthrough { 1i32 } else { 0 })
+                .bind(p.udp_idle_timeout_seconds as i64)
+                .bind(p.tcp_idle_timeout_seconds.map(|v| v as i64))
+                .bind(p.websocket_idle_timeout_seconds.map(|v| v as i64))
+                .bind(p.websocket_permessage_deflate.as_str())
+                .bind(if p.allow_path_parameters { 1i32 } else { 0 })
+                .bind(
+                    p.allowed_methods
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                )
+                .bind(if p.allowed_ws_origins.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&p.allowed_ws_origins)?)
+                })
+                .bind(p.udp_max_response_amplification_factor.map(|v| v as f64))
+                .bind(p.stream_proxy_protocol.map(|v| if v { 1i32 } else { 0 }))
+                .bind(p.backend_proxy_protocol.map(|v| v.as_str()))
+                .bind(&stream_match_json)
+                .bind(&spec.id)
+                .bind(p.created_at.to_rfc3339())
+                .bind(p.updated_at.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
 
             // NOTE: proxy_plugins junction rows are inserted AFTER plugin_configs
             // below (step 3) to satisfy the FK: plugin_config_id REFERENCES
@@ -10694,7 +10828,7 @@ impl DatabaseStore {
                 crate::config::types::PluginScope::ProxyGroup => "proxy_group",
                 crate::config::types::PluginScope::Global => "global",
             };
-            sqlx::query(&self.q("INSERT INTO plugin_configs \
+            sqlx::query(self.q("INSERT INTO plugin_configs \
                  (labels, id, namespace, plugin_name, config, scope, proxy_id, enabled, \
                   priority_override, trigger_json, api_spec_id, created_at, updated_at) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
@@ -10720,7 +10854,7 @@ impl DatabaseStore {
         {
             let p = &bundle.proxy;
             for assoc in &p.plugins {
-                sqlx::query(&self.q(
+                sqlx::query(self.q(
                     "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) \
                      VALUES (?, ?, ?)",
                 ))
@@ -10919,7 +11053,7 @@ impl DatabaseStore {
                 crate::config::types::SpecFormat::Json => "json",
                 crate::config::types::SpecFormat::Yaml => "yaml",
             };
-            sqlx::query(&self.q("UPDATE api_specs SET \
+            sqlx::query(self.q("UPDATE api_specs SET \
                  spec_content = ?, content_encoding = ?, content_hash = ?, \
                  uncompressed_size = ?, resource_hash = ?, \
                  external_ref_snapshot = ?, external_ref_digest = ?, \
@@ -10998,7 +11132,7 @@ impl DatabaseStore {
         let retained_generated_rows = if precondition.is_some() {
             let mut rows = Vec::new();
             for table in ["proxies", "plugin_configs", "upstreams"] {
-                let stored = sqlx::query(&self.q(&format!(
+                let stored = sqlx::query(self.q(&format!(
                     "SELECT * FROM {table} WHERE namespace = ? AND api_spec_id = ?"
                 )))
                 .bind(&spec.namespace)
@@ -11008,7 +11142,7 @@ impl DatabaseStore {
                 rows.extend(stored.into_iter().map(|row| (table, row)));
             }
             let associations = sqlx::query(
-                &self.q("SELECT * FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?"),
+                self.q("SELECT * FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?"),
             )
             .bind(&spec.namespace)
             .bind(&spec.proxy_id)
@@ -11041,7 +11175,7 @@ impl DatabaseStore {
         // Delete only spec-owned plugin_configs. Hand-added plugins (api_spec_id IS NULL)
         // are intentionally preserved. The proxy itself is updated in place (not deleted)
         // so FK cascades do not wipe hand-added plugins.
-        sqlx::query(&self.q("DELETE FROM plugin_configs WHERE api_spec_id = ? AND namespace = ?"))
+        sqlx::query(self.q("DELETE FROM plugin_configs WHERE api_spec_id = ? AND namespace = ?"))
             .bind(&spec.id)
             .bind(&spec.namespace)
             .execute(&mut *tx)
@@ -11050,7 +11184,7 @@ impl DatabaseStore {
         // Fix 3: proxies.upstream_id FK is ON DELETE RESTRICT (not SET NULL).
         // We must clear proxy.upstream_id BEFORE deleting the old upstream row,
         // otherwise the DELETE violates the FK and rolls back the transaction.
-        sqlx::query(&self.q("UPDATE proxies SET upstream_id = NULL \
+        sqlx::query(self.q("UPDATE proxies SET upstream_id = NULL \
                  WHERE id = ? AND api_spec_id = ? AND namespace = ?"))
         .bind(&spec.proxy_id)
         .bind(&spec.id)
@@ -11059,7 +11193,7 @@ impl DatabaseStore {
         .await?;
 
         // Now safe to delete spec-owned upstreams — no proxy references them.
-        sqlx::query(&self.q("DELETE FROM upstreams WHERE api_spec_id = ? AND namespace = ?"))
+        sqlx::query(self.q("DELETE FROM upstreams WHERE api_spec_id = ? AND namespace = ?"))
             .bind(&spec.id)
             .bind(&spec.namespace)
             .execute(&mut *tx)
@@ -11096,7 +11230,7 @@ impl DatabaseStore {
                 .transpose()?;
             let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(u)?;
 
-            sqlx::query(&self.q("INSERT INTO upstreams \
+            sqlx::query(self.q("INSERT INTO upstreams \
                  (labels, id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, \
                   health_checks, service_discovery, subsets, backend_tls_client_cert_path, \
                   backend_tls_client_key_path, backend_tls_verify_server_cert, \
@@ -11146,7 +11280,7 @@ impl DatabaseStore {
             };
             let stream_match_json = serialize_stream_match(p)?;
 
-            sqlx::query(&self.q("UPDATE proxies SET labels=?, \
+            sqlx::query(self.q("UPDATE proxies SET labels=?, \
                  namespace = ?, name = ?, hosts = ?, listen_path = ?, backend_scheme = ?, \
                  backend_host = ?, backend_port = ?, backend_path = ?, \
                  strip_listen_path = ?, preserve_host_header = ?, \
@@ -11166,7 +11300,6 @@ impl DatabaseStore {
                  pool_http2_adaptive_window = ?, pool_http2_max_frame_size = ?, \
                  pool_http2_max_concurrent_streams = ?, \
                  pool_http3_connections_per_backend = ?, \
-                 pool_max_requests_per_connection = ?, \
                  listen_port = ?, frontend_tls = ?, passthrough = ?, \
                  udp_idle_timeout_seconds = ?, tcp_idle_timeout_seconds = ?, \
                  websocket_idle_timeout_seconds = ?, websocket_permessage_deflate = ?, \
@@ -11230,7 +11363,6 @@ impl DatabaseStore {
             .bind(p.pool_http2_max_frame_size.map(|v| v as i64))
             .bind(p.pool_http2_max_concurrent_streams.map(|v| v as i64))
             .bind(p.pool_http3_connections_per_backend.map(|v| v as i64))
-            .bind(p.pool_max_requests_per_connection.map(|v| v as i64))
             .bind(p.listen_port.map(|v| v as i32))
             .bind(if p.frontend_tls { 1i32 } else { 0 })
             .bind(if p.passthrough { 1i32 } else { 0 })
@@ -11271,7 +11403,7 @@ impl DatabaseStore {
                 crate::config::types::PluginScope::ProxyGroup => "proxy_group",
                 crate::config::types::PluginScope::Global => "global",
             };
-            sqlx::query(&self.q("INSERT INTO plugin_configs \
+            sqlx::query(self.q("INSERT INTO plugin_configs \
                  (labels, id, namespace, plugin_name, config, scope, proxy_id, enabled, \
                   priority_override, trigger_json, api_spec_id, created_at, updated_at) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
@@ -11303,7 +11435,7 @@ impl DatabaseStore {
             .collect();
         for previous_id in &previous_declared_assoc_ids {
             if !desired_assoc_ids.contains(previous_id) {
-                sqlx::query(&self.q("DELETE FROM proxy_plugins \
+                sqlx::query(self.q("DELETE FROM proxy_plugins \
                      WHERE namespace = ? AND proxy_id = ? AND plugin_config_id = ?"))
                 .bind(&spec.namespace)
                 .bind(&bundle.proxy.id)
@@ -11316,7 +11448,7 @@ impl DatabaseStore {
             if precondition.is_some() {
                 continue;
             }
-            sqlx::query(&self.q("DELETE FROM proxy_plugins \
+            sqlx::query(self.q("DELETE FROM proxy_plugins \
                  WHERE namespace = ? AND proxy_id = ? AND plugin_config_id = ?"))
             .bind(&spec.namespace)
             .bind(&bundle.proxy.id)
@@ -11326,7 +11458,7 @@ impl DatabaseStore {
         }
         // Re-insert — plugin_configs rows now exist (inserted above), so FK is satisfied.
         for assoc in &bundle.proxy.plugins {
-            let exists = sqlx::query(&self.q("SELECT 1 FROM proxy_plugins \
+            let exists = sqlx::query(self.q("SELECT 1 FROM proxy_plugins \
                 WHERE namespace = ? AND proxy_id = ? AND plugin_config_id = ?"))
             .bind(&spec.namespace)
             .bind(&bundle.proxy.id)
@@ -11335,7 +11467,7 @@ impl DatabaseStore {
             .await?
             .is_some();
             if !exists {
-                sqlx::query(&self.q("INSERT INTO proxy_plugins \
+                sqlx::query(self.q("INSERT INTO proxy_plugins \
                     (namespace, proxy_id, plugin_config_id) VALUES (?, ?, ?)"))
                 .bind(&spec.namespace)
                 .bind(&bundle.proxy.id)
@@ -11357,7 +11489,7 @@ impl DatabaseStore {
             crate::config::types::SpecFormat::Json => "json",
             crate::config::types::SpecFormat::Yaml => "yaml",
         };
-        sqlx::query(&self.q("UPDATE api_specs SET \
+        sqlx::query(self.q("UPDATE api_specs SET \
              proxy_id = ?, spec_content = ?, content_encoding = ?, content_hash = ?, \
              uncompressed_size = ?, \
              spec_format = ?, spec_version = ?, title = ?, info_version = ?, \
@@ -11476,17 +11608,15 @@ impl DatabaseStore {
         // rebuilt and hand-added links have survived the replacement.
         let (old_plugins, new_plugins) = if table == "proxies" {
             let previous = previous_proxy.ok_or(DeploymentGraphInvalid)?;
-            let mut associations = self
-                .load_proxy_plugin_associations_for_namespace_tx(
+            let associations = self
+                .load_proxy_plugin_associations_for_proxy_tx(
                     &previous.namespace,
+                    &previous.id,
                     "deployment preservation",
                     tx,
                 )
                 .await?;
-            (
-                previous.plugins.clone(),
-                associations.remove(&previous.id).unwrap_or_default(),
-            )
+            (previous.plugins.clone(), associations)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -11564,7 +11694,7 @@ impl DatabaseStore {
         spec: &crate::config::types::ApiSpec,
         previous_declared_assoc_ids: &HashSet<String>,
     ) -> Result<Option<String>, anyhow::Error> {
-        let plugin_rows: Vec<AnyRow> = sqlx::query(&self.q(concat!(
+        let plugin_rows: Vec<AnyRow> = sqlx::query(self.q(concat!(
             "SELECT * FROM plugin_configs ",
             "WHERE namespace = ? AND api_spec_id = ? ",
             "ORDER BY created_at ASC, id ASC"
@@ -11593,7 +11723,7 @@ impl DatabaseStore {
         relevant_assoc_ids.extend(desired_assoc_ids.iter().cloned());
 
         let assoc_rows: Vec<AnyRow> =
-            sqlx::query(&self.q(
+            sqlx::query(self.q(
                 "SELECT plugin_config_id FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?",
             ))
             .bind(&spec.namespace)
@@ -11613,7 +11743,7 @@ impl DatabaseStore {
         }
 
         let proxy_row: Option<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM proxies WHERE id = ? AND namespace = ? AND api_spec_id = ?"),
+            self.q("SELECT * FROM proxies WHERE id = ? AND namespace = ? AND api_spec_id = ?"),
         )
         .bind(&spec.proxy_id)
         .bind(&spec.namespace)
@@ -11634,7 +11764,7 @@ impl DatabaseStore {
         proxy.normalize_fields();
 
         let upstream_rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM upstreams WHERE namespace = ? AND api_spec_id = ?"))
+            sqlx::query(self.q("SELECT * FROM upstreams WHERE namespace = ? AND api_spec_id = ?"))
                 .bind(&spec.namespace)
                 .bind(&spec.id)
                 .fetch_all(&mut **tx)
@@ -11667,7 +11797,7 @@ impl DatabaseStore {
         spec_id: &str,
         spec_proxy_id: &str,
     ) -> Result<(), anyhow::Error> {
-        let row: Option<AnyRow> = sqlx::query(&self.q(concat!(
+        let row: Option<AnyRow> = sqlx::query(self.q(concat!(
             "SELECT p.id AS proxy_id, p.upstream_id AS upstream_id ",
             "FROM proxies p ",
             // Upstream identity is (namespace, id) since issue #4627, so the
@@ -11705,13 +11835,12 @@ impl DatabaseStore {
         // scan and allowing replace/delete to commit with dangling external
         // references (issue #3210). The empty-set fast path is only for a
         // query that truly returned no rows.
-        let upstream_rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT id FROM upstreams WHERE namespace = ? AND api_spec_id = ?"),
-        )
-        .bind(namespace)
-        .bind(spec_id)
-        .fetch_all(&mut **tx)
-        .await?;
+        let upstream_rows: Vec<AnyRow> =
+            sqlx::query(self.q("SELECT id FROM upstreams WHERE namespace = ? AND api_spec_id = ?"))
+                .bind(namespace)
+                .bind(spec_id)
+                .fetch_all(&mut **tx)
+                .await?;
         if upstream_rows.is_empty() {
             return Ok(());
         }
@@ -11720,7 +11849,7 @@ impl DatabaseStore {
             let id = row.try_get::<String, _>("id").map_err(|e| {
                 anyhow::Error::from(e).context(format!(
                     "operation=ensure_no_external_spec_upstream_refs resource=upstreams \
-                     namespace={namespace} api_spec_id={spec_id} column=id: \
+                     namespace={namespace:?} api_spec_id={spec_id:?} column=id: \
                      failed to decode spec-owned upstream id required for external reference checks"
                 ))
             })?;
@@ -11730,7 +11859,7 @@ impl DatabaseStore {
         // Namespace-scoped for the same reason as
         // `mesh_route_dispatch_plugin_configs_tx`: a same-id upstream in
         // another tenant is not a reference to this spec's upstream.
-        let plugin_rows: Vec<AnyRow> = sqlx::query(&self.q("SELECT * FROM plugin_configs \
+        let plugin_rows: Vec<AnyRow> = sqlx::query(self.q("SELECT * FROM plugin_configs \
              WHERE namespace = ? AND plugin_name = ? AND enabled = 1"))
         .bind(namespace)
         .bind("mesh_route_dispatch")
@@ -11776,7 +11905,7 @@ impl DatabaseStore {
         let tags_json = serialize_api_spec_string_list(&spec.id, "tags", &spec.tags)?;
         let server_urls_json =
             serialize_api_spec_string_list(&spec.id, "server_urls", &spec.server_urls)?;
-        sqlx::query(&self.q("INSERT INTO api_specs \
+        sqlx::query(self.q("INSERT INTO api_specs \
              (id, namespace, proxy_id, spec_version, spec_format, spec_content, \
               content_encoding, uncompressed_size, content_hash, title, info_version, \
               description, contact_name, contact_email, license_name, license_identifier, \
@@ -11820,7 +11949,7 @@ impl DatabaseStore {
         id: &str,
     ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
         let row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM api_specs WHERE namespace = ? AND id = ?"))
+            sqlx::query(self.q("SELECT * FROM api_specs WHERE namespace = ? AND id = ?"))
                 .bind(namespace)
                 .bind(id)
                 .fetch_optional(&self.pool())
@@ -11838,7 +11967,7 @@ impl DatabaseStore {
         proxy_id: &str,
     ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
         let row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM api_specs WHERE namespace = ? AND proxy_id = ?"))
+            sqlx::query(self.q("SELECT * FROM api_specs WHERE namespace = ? AND proxy_id = ?"))
                 .bind(namespace)
                 .bind(proxy_id)
                 .fetch_optional(&self.pool())
@@ -12057,7 +12186,7 @@ impl DatabaseStore {
 
         // Find the proxy_id for this spec.
         let row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT proxy_id FROM api_specs WHERE namespace = ? AND id = ?"))
+            sqlx::query(self.q("SELECT proxy_id FROM api_specs WHERE namespace = ? AND id = ?"))
                 .bind(namespace)
                 .bind(id)
                 .fetch_optional(&mut *tx)
@@ -12121,7 +12250,7 @@ impl DatabaseStore {
         // Delete spec-owned plugin_configs by api_spec_id (belt-and-suspenders;
         // the proxy FK cascade below would handle proxy-scoped ones, but
         // being explicit ensures correctness even if FK enforcement is disabled).
-        sqlx::query(&self.q("DELETE FROM plugin_configs WHERE api_spec_id = ? AND namespace = ?"))
+        sqlx::query(self.q("DELETE FROM plugin_configs WHERE api_spec_id = ? AND namespace = ?"))
             .bind(id)
             .bind(namespace)
             .execute(&mut *tx)
@@ -12130,7 +12259,7 @@ impl DatabaseStore {
         // Delete the proxy. FK ON DELETE CASCADE on api_specs.proxy_id removes
         // the api_specs row. FK ON DELETE CASCADE on plugin_configs.proxy_id
         // removes any remaining proxy-scoped plugins.
-        sqlx::query(&self.q("DELETE FROM proxies WHERE id = ? AND namespace = ?"))
+        sqlx::query(self.q("DELETE FROM proxies WHERE id = ? AND namespace = ?"))
             .bind(&proxy_id)
             .bind(namespace)
             .execute(&mut *tx)
@@ -12144,7 +12273,7 @@ impl DatabaseStore {
             .await?;
 
         // Delete spec-owned upstream (no FK cascade on this path).
-        sqlx::query(&self.q("DELETE FROM upstreams WHERE api_spec_id = ? AND namespace = ?"))
+        sqlx::query(self.q("DELETE FROM upstreams WHERE api_spec_id = ? AND namespace = ?"))
             .bind(id)
             .bind(namespace)
             .execute(&mut *tx)
@@ -12152,7 +12281,7 @@ impl DatabaseStore {
 
         // Defensive explicit delete of the api_specs row in case the FK
         // cascade did not fire (e.g. SQLite with foreign_keys OFF).
-        sqlx::query(&self.q("DELETE FROM api_specs WHERE id = ? AND namespace = ?"))
+        sqlx::query(self.q("DELETE FROM api_specs WHERE id = ? AND namespace = ?"))
             .bind(id)
             .bind(namespace)
             .execute(&mut *tx)
@@ -12191,7 +12320,7 @@ impl DatabaseStore {
         spec_id: &str,
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
         let start = std::time::Instant::now();
-        let rows: Vec<AnyRow> = sqlx::query(&self.q(concat!(
+        let rows: Vec<AnyRow> = sqlx::query(self.q(concat!(
             "SELECT * FROM plugin_configs ",
             "WHERE namespace = ? AND api_spec_id = ? ",
             "ORDER BY created_at ASC, id ASC"
@@ -12221,7 +12350,7 @@ impl DatabaseStore {
         spec_id: &str,
     ) -> Result<Vec<Upstream>, anyhow::Error> {
         let start = std::time::Instant::now();
-        let rows: Vec<AnyRow> = sqlx::query(&self.q(concat!(
+        let rows: Vec<AnyRow> = sqlx::query(self.q(concat!(
             "SELECT * FROM upstreams ",
             "WHERE namespace = ? AND api_spec_id = ? ",
             "ORDER BY created_at ASC, id ASC"
@@ -12262,7 +12391,7 @@ impl DatabaseStore {
         } else {
             " ON CONFLICT (id) DO NOTHING"
         };
-        sqlx::query(&self.q(&format!(
+        sqlx::query(self.q(&format!(
             "INSERT INTO audit_events \
              (id, ts, actor, action, resource_type, resource_id, namespace, \
               namespace_at_event, source_address, request_id, outcome, diff) \
@@ -12311,6 +12440,42 @@ impl DatabaseStore {
     pub async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
         self.prune_audit_events_with_mode(namespace, /* force_max_rows */ true)
             .await
+    }
+
+    /// Periodic age-retention sweep across every namespace that holds audit
+    /// rows (see [`DatabaseBackend::prune_expired_audit_events`]). Namespaces
+    /// are walked one index seek at a time on
+    /// `idx_audit_events_namespace_ts_id`, never with a full `DISTINCT` scan.
+    pub async fn prune_expired_audit_events(&self) -> Result<u64, anyhow::Error> {
+        let Some(days) = self.audit_retention.retention_days else {
+            return Ok(0);
+        };
+        let start = std::time::Instant::now();
+        let first_sql = self.q("SELECT namespace FROM audit_events ORDER BY namespace LIMIT 1");
+        let next_sql = self
+            .q("SELECT namespace FROM audit_events WHERE namespace > ? ORDER BY namespace LIMIT 1");
+        let mut deleted = 0u64;
+        let mut previous: Option<String> = None;
+        loop {
+            let row = match previous.as_deref() {
+                None => sqlx::query(&first_sql).fetch_optional(&self.pool()).await?,
+                Some(after) => {
+                    sqlx::query(&next_sql)
+                        .bind(after)
+                        .fetch_optional(&self.pool())
+                        .await?
+                }
+            };
+            let Some(row) = row else {
+                break;
+            };
+            let namespace: String = row.try_get("namespace")?;
+            deleted =
+                deleted.saturating_add(self.prune_audit_events_by_age(&namespace, days).await?);
+            previous = Some(namespace);
+        }
+        self.check_slow_query("prune_expired_audit_events", start);
+        Ok(deleted)
     }
 
     async fn prune_audit_events_with_mode(
@@ -12412,7 +12577,7 @@ impl DatabaseStore {
         Ok((total, hit_batch_budget))
     }
 
-    fn audit_age_delete_sql(&self) -> String {
+    fn audit_age_delete_sql(&self) -> FerrumSql {
         let batch = crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE;
         match self.db_type.as_str() {
             "postgres" => self.q(&format!(
@@ -12423,24 +12588,24 @@ impl DatabaseStore {
                      LIMIT {batch}\
                  )"
             )),
-            "sqlite" => format!(
+            "sqlite" => self.q(&format!(
                 "DELETE FROM audit_events WHERE rowid IN (\
                      SELECT rowid FROM audit_events \
                      WHERE namespace = ? AND ts < ? \
                      ORDER BY ts ASC, id ASC \
                      LIMIT {batch}\
                  )"
-            ),
-            _ => format!(
+            )),
+            _ => self.q(&format!(
                 "DELETE FROM audit_events \
                  WHERE namespace = ? AND ts < ? \
                  ORDER BY ts ASC, id ASC \
                  LIMIT {batch}"
-            ),
+            )),
         }
     }
 
-    fn audit_max_rows_delete_sql(&self) -> String {
+    fn audit_max_rows_delete_sql(&self) -> FerrumSql {
         let batch = crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE;
         // Include the boundary row itself: it is the first excess event under
         // newest-first OFFSET max_rows, so `(ts, id) <= boundary` is correct.
@@ -12453,20 +12618,20 @@ impl DatabaseStore {
                      LIMIT {batch}\
                  )"
             )),
-            "sqlite" => format!(
+            "sqlite" => self.q(&format!(
                 "DELETE FROM audit_events WHERE rowid IN (\
                      SELECT rowid FROM audit_events \
                      WHERE namespace = ? AND (ts < ? OR (ts = ? AND id <= ?)) \
                      ORDER BY ts ASC, id ASC \
                      LIMIT {batch}\
                  )"
-            ),
-            _ => format!(
+            )),
+            _ => self.q(&format!(
                 "DELETE FROM audit_events \
                  WHERE namespace = ? AND (ts < ? OR (ts = ? AND id <= ?)) \
                  ORDER BY ts ASC, id ASC \
                  LIMIT {batch}"
-            ),
+            )),
         }
     }
 
@@ -12735,13 +12900,12 @@ impl DatabaseBackend for DatabaseStore {
     }
 
     fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {
-        let primary = self.pool.load();
+        let (primary, topology) = self.failover_topology.handle_and_status();
         let size = primary.size();
         let idle = primary.num_idle() as u32;
 
-        let replica = self
-            .failover_topology
-            .primary_active()
+        let replica = topology
+            .primary_active
             .then(|| self.read_replica_pool.load_full())
             .flatten()
             .map(|rp| {
@@ -12852,6 +13016,13 @@ impl DatabaseBackend for DatabaseStore {
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error> {
         DatabaseStore::load_namespace_policy_graph(self, namespace).await
+    }
+
+    async fn load_namespace_tls_reference_graph(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        DatabaseStore::load_namespace_tls_reference_graph(self, namespace).await
     }
 
     async fn load_namespace_policy_neighborhood(
@@ -12989,6 +13160,55 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn delete_plugin_config(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         DatabaseStore::delete_plugin_config(self, namespace, id).await
+    }
+
+    async fn update_plugin_config_expected(
+        &self,
+        pc: &PluginConfig,
+        expected: &BTreeSet<String>,
+    ) -> Result<bool, anyhow::Error> {
+        self.update_plugin_config_inner(pc, Some(expected)).await
+    }
+
+    async fn delete_plugin_config_expected(
+        &self,
+        namespace: &str,
+        id: &str,
+        expected: &BTreeSet<String>,
+    ) -> Result<bool, anyhow::Error> {
+        self.delete_plugin_config_inner(namespace, id, Some(expected))
+            .await
+    }
+
+    async fn list_plugin_config_referencing_proxy_ids(
+        &self,
+        namespace: &str,
+        plugin_id: &str,
+    ) -> Result<BTreeSet<String>, anyhow::Error> {
+        let ids: Vec<String> =
+            sqlx::query_scalar(self.q(
+                "SELECT proxy_id FROM proxy_plugins WHERE namespace = ? AND plugin_config_id = ?",
+            ))
+            .bind(namespace)
+            .bind(plugin_id)
+            .fetch_all(&self.pool())
+            .await?;
+        Ok(ids.into_iter().collect())
+    }
+
+    async fn list_proxy_scoped_plugin_config_ids(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<BTreeSet<String>, anyhow::Error> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            self.q("SELECT id FROM plugin_configs WHERE namespace = ? AND proxy_id = ?"),
+        )
+        .bind(namespace)
+        .bind(proxy_id)
+        .fetch_all(&self.pool())
+        .await?;
+        Ok(ids.into_iter().collect())
     }
 
     async fn get_plugin_config(
@@ -13191,14 +13411,6 @@ impl DatabaseBackend for DatabaseStore {
         mode: &BatchConfigWriteMode,
     ) -> Result<AtomicBatchCounts, anyhow::Error> {
         DatabaseStore::batch_create_config_graph_atomically(self, graph, mode).await
-    }
-
-    async fn batch_create_proxies(
-        &self,
-        proxies: &[Proxy],
-        mode: &BatchConfigWriteMode,
-    ) -> Result<usize, anyhow::Error> {
-        DatabaseStore::batch_create_proxies(self, proxies, mode).await
     }
 
     async fn batch_create_proxies_without_plugins(
@@ -13522,6 +13734,10 @@ impl DatabaseBackend for DatabaseStore {
     async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
         DatabaseStore::prune_audit_events(self, namespace).await
     }
+
+    async fn prune_expired_audit_events(&self) -> Result<u64, anyhow::Error> {
+        DatabaseStore::prune_expired_audit_events(self).await
+    }
 }
 
 /// Parse a stored backend scheme string into the canonical 6-variant
@@ -13543,14 +13759,62 @@ pub(crate) fn parse_scheme(s: &str) -> Result<BackendScheme, String> {
     }
 }
 
-pub(crate) fn parse_auth_mode(s: &str) -> AuthMode {
-    match s.to_lowercase().as_str() {
-        "multi" => AuthMode::Multi,
-        _ => AuthMode::Single,
+/// Parse a stored `plugin_configs.scope` value. Exact match on the values the
+/// writers store; anything else is a row-decode failure, never `Global`
+/// (issue #7192). The raw column is not embedded in the error.
+pub(crate) fn parse_plugin_scope(s: &str) -> Result<PluginScope, String> {
+    match s {
+        "global" => Ok(PluginScope::Global),
+        "proxy" => Ok(PluginScope::Proxy),
+        "proxy_group" => Ok(PluginScope::ProxyGroup),
+        _ => Err("unsupported scope (expected one of: global, proxy, proxy_group)".to_string()),
     }
 }
 
-/// Parse a proxy row into a Proxy struct (shared by load_proxies and get_proxy).
+/// Strict `proxies.auth_mode` decode (issue #7192): an unknown value rejects
+/// the row instead of silently becoming `single`, matching MongoDB's strict
+/// serde enum. The raw column is never echoed.
+pub(crate) fn parse_auth_mode(s: &str) -> Result<AuthMode, String> {
+    match s.to_lowercase().as_str() {
+        "single" => Ok(AuthMode::Single),
+        "multi" => Ok(AuthMode::Multi),
+        _ => Err("unsupported auth_mode (expected one of: single, multi)".to_string()),
+    }
+}
+
+/// Strict `proxies.response_body_mode` decode (issue #7192).
+fn parse_response_body_mode(s: &str) -> Result<ResponseBodyMode, String> {
+    match s {
+        "stream" => Ok(ResponseBodyMode::Stream),
+        "buffer" => Ok(ResponseBodyMode::Buffer),
+        _ => Err("unsupported response_body_mode (expected one of: stream, buffer)".to_string()),
+    }
+}
+
+/// Decode a NOT NULL integer flag column (`0`/non-zero). A decode failure
+/// rejects the row instead of inventing the schema default (issue #7192).
+fn required_flag_column(row: &AnyRow, column: &str) -> Result<bool, anyhow::Error> {
+    Ok(row.try_get::<i32, _>(column)? != 0)
+}
+
+/// Decode a nullable integer flag column; SQL NULL is `None`, a decode
+/// failure rejects the row (issue #7192).
+fn optional_flag_column(row: &AnyRow, column: &str) -> Result<Option<bool>, anyhow::Error> {
+    Ok(row.try_get::<Option<i32>, _>(column)?.map(|v| v != 0))
+}
+
+/// Decode a nullable integer column; SQL NULL is `None`, a decode failure
+/// rejects the row (issue #7192).
+fn optional_i64_column(row: &AnyRow, column: &str) -> Result<Option<i64>, anyhow::Error> {
+    Ok(row.try_get::<Option<i64>, _>(column)?)
+}
+
+/// Decode a port column, rejecting a value outside `0..=65535` instead of
+/// clamping it to a different port (issue #7192).
+fn port_from_column(value: i32, column: &str) -> Result<u16, anyhow::Error> {
+    u16::try_from(value).map_err(|_| anyhow::anyhow!("{column} is out of range"))
+}
+
 fn serialize_stream_match(proxy: &Proxy) -> Result<Option<String>, anyhow::Error> {
     proxy
         .stream_match
@@ -13566,6 +13830,7 @@ fn serialize_stream_match(proxy: &Proxy) -> Result<Option<String>, anyhow::Error
         })
 }
 
+/// Parse a proxy row into a Proxy struct.
 fn row_to_proxy(
     row: &AnyRow,
     id: String,
@@ -13604,7 +13869,7 @@ fn row_to_proxy_inner(
         labels: config_decode::from_json_str(&required_utf8_text_column(row, "labels")?)?,
         id,
         namespace: row_namespace_or_default(row),
-        name: row.try_get("name").ok(),
+        name: optional_utf8_text_column(row, "name")?,
         hosts,
         // Propagate decode errors — silently defaulting to None would turn a
         // malformed listen_path into a host-only proxy and change routing
@@ -13618,25 +13883,19 @@ fn row_to_proxy_inner(
         // even when no normalization pass runs.
         dispatch_kind: DispatchKind::from(backend_scheme),
         backend_host: row.try_get("backend_host")?,
-        backend_port: row
-            .try_get::<i32, _>("backend_port")
-            .map(|v| v.clamp(0, 65535) as u16)
-            .unwrap_or(80),
+        // Every NOT NULL column below is decoded with `?`: inventing the
+        // schema default on a decode failure would send traffic to port 80,
+        // drop a frontend-TLS listener to plaintext, and so on (issue #7192).
+        // The row is rejected and the last good config stays live.
+        backend_port: port_from_column(row.try_get::<i32, _>("backend_port")?, "backend_port")
+            .map_err(|e| anyhow::anyhow!("Proxy {:?}: {}", pid, e))?,
         backend_path: optional_utf8_text_column(row, "backend_path")?,
-        strip_listen_path: row.try_get::<i32, _>("strip_listen_path").unwrap_or(1) != 0,
-        preserve_host_header: row.try_get::<i32, _>("preserve_host_header").unwrap_or(0) != 0,
-        backend_connect_timeout_ms: row
-            .try_get::<i64, _>("backend_connect_timeout_ms")
-            .map(|v| v.max(0) as u64)
-            .unwrap_or(5000),
-        backend_read_timeout_ms: row
-            .try_get::<i64, _>("backend_read_timeout_ms")
-            .map(|v| v.max(0) as u64)
-            .unwrap_or(30000),
-        backend_write_timeout_ms: row
-            .try_get::<i64, _>("backend_write_timeout_ms")
-            .map(|v| v.max(0) as u64)
-            .unwrap_or(30000),
+        strip_listen_path: required_flag_column(row, "strip_listen_path")?,
+        preserve_host_header: required_flag_column(row, "preserve_host_header")?,
+        backend_connect_timeout_ms: row.try_get::<i64, _>("backend_connect_timeout_ms")?.max(0)
+            as u64,
+        backend_read_timeout_ms: row.try_get::<i64, _>("backend_read_timeout_ms")?.max(0) as u64,
+        backend_write_timeout_ms: row.try_get::<i64, _>("backend_write_timeout_ms")?.max(0) as u64,
         // Propagate decode errors — silently defaulting to None would disable
         // backend mTLS (client cert/key) or swap the trust anchor from a custom
         // CA to the global bundle/webpki. `Option<String>` already represents
@@ -13647,10 +13906,10 @@ fn row_to_proxy_inner(
             "backend_tls_client_cert_path",
         )?,
         backend_tls_client_key_path: optional_utf8_text_column(row, "backend_tls_client_key_path")?,
-        backend_tls_verify_server_cert: row
-            .try_get::<i32, _>("backend_tls_verify_server_cert")
-            .unwrap_or(1)
-            != 0,
+        backend_tls_verify_server_cert: required_flag_column(
+            row,
+            "backend_tls_verify_server_cert",
+        )?,
         backend_tls_server_ca_cert_path: optional_utf8_text_column(
             row,
             "backend_tls_server_ca_cert_path",
@@ -13658,11 +13917,9 @@ fn row_to_proxy_inner(
         // DNS override redirects egress; silently dropping it can send traffic
         // to an unintended resolved address.
         dns_override: optional_utf8_text_column(row, "dns_override")?,
-        dns_cache_ttl_seconds: row
-            .try_get::<i64, _>("dns_cache_ttl_seconds")
-            .ok()
-            .map(|v| v as u64),
-        auth_mode: parse_auth_mode(&auth_mode_str),
+        dns_cache_ttl_seconds: optional_i64_column(row, "dns_cache_ttl_seconds")?.map(|v| v as u64),
+        auth_mode: parse_auth_mode(&auth_mode_str)
+            .map_err(|e| anyhow::anyhow!("Proxy {:?}: {}", pid, e))?,
         plugins,
         // Propagate decode errors — silently defaulting to None would detach
         // the proxy from its load-balanced upstream and fall back to
@@ -13688,70 +13945,54 @@ fn row_to_proxy_inner(
             ),
             None => None,
         },
-        response_body_mode: row
-            .try_get::<String, _>("response_body_mode")
-            .ok()
-            .map(|s| match s.as_str() {
-                "buffer" => ResponseBodyMode::Buffer,
-                _ => ResponseBodyMode::Stream,
-            })
-            .unwrap_or_default(),
-        pool_idle_timeout_seconds: row
-            .try_get::<i64, _>("pool_idle_timeout_seconds")
-            .ok()
+        response_body_mode: parse_response_body_mode(&required_utf8_text_column(
+            row,
+            "response_body_mode",
+        )?)
+        .map_err(|e| anyhow::anyhow!("Proxy {:?}: {}", pid, e))?,
+        pool_idle_timeout_seconds: optional_i64_column(row, "pool_idle_timeout_seconds")?
             .map(|v| v as u64),
-        pool_enable_http_keep_alive: row
-            .try_get::<i32, _>("pool_enable_http_keep_alive")
-            .ok()
-            .map(|v| v != 0),
-        pool_enable_http2: row
-            .try_get::<i32, _>("pool_enable_http2")
-            .ok()
-            .map(|v| v != 0),
-        pool_tcp_keepalive_seconds: row
-            .try_get::<i64, _>("pool_tcp_keepalive_seconds")
-            .ok()
+        pool_enable_http_keep_alive: optional_flag_column(row, "pool_enable_http_keep_alive")?,
+        pool_enable_http2: optional_flag_column(row, "pool_enable_http2")?,
+        pool_tcp_keepalive_seconds: optional_i64_column(row, "pool_tcp_keepalive_seconds")?
             .map(|v| v as u64),
-        pool_http2_keep_alive_interval_seconds: row
-            .try_get::<i64, _>("pool_http2_keep_alive_interval_seconds")
-            .ok()
-            .map(|v| v as u64),
-        pool_http2_keep_alive_timeout_seconds: row
-            .try_get::<i64, _>("pool_http2_keep_alive_timeout_seconds")
-            .ok()
-            .map(|v| v as u64),
-        pool_http2_initial_stream_window_size: row
-            .try_get::<i64, _>("pool_http2_initial_stream_window_size")
-            .ok()
+        pool_http2_keep_alive_interval_seconds: optional_i64_column(
+            row,
+            "pool_http2_keep_alive_interval_seconds",
+        )?
+        .map(|v| v as u64),
+        pool_http2_keep_alive_timeout_seconds: optional_i64_column(
+            row,
+            "pool_http2_keep_alive_timeout_seconds",
+        )?
+        .map(|v| v as u64),
+        pool_http2_initial_stream_window_size: optional_i64_column(
+            row,
+            "pool_http2_initial_stream_window_size",
+        )?
+        .map(|v| v as u32),
+        pool_http2_initial_connection_window_size: optional_i64_column(
+            row,
+            "pool_http2_initial_connection_window_size",
+        )?
+        .map(|v| v as u32),
+        pool_http2_adaptive_window: optional_flag_column(row, "pool_http2_adaptive_window")?,
+        pool_http2_max_frame_size: optional_i64_column(row, "pool_http2_max_frame_size")?
             .map(|v| v as u32),
-        pool_http2_initial_connection_window_size: row
-            .try_get::<i64, _>("pool_http2_initial_connection_window_size")
-            .ok()
-            .map(|v| v as u32),
-        pool_http2_adaptive_window: row
-            .try_get::<i32, _>("pool_http2_adaptive_window")
-            .ok()
-            .map(|v| v != 0),
-        pool_http2_max_frame_size: row
-            .try_get::<i64, _>("pool_http2_max_frame_size")
-            .ok()
-            .map(|v| v as u32),
-        pool_http2_max_concurrent_streams: row
-            .try_get::<i64, _>("pool_http2_max_concurrent_streams")
-            .ok()
-            .map(|v| v as u32),
-        pool_http3_connections_per_backend: row
-            .try_get::<i64, _>("pool_http3_connections_per_backend")
-            .ok()
-            .map(|v| v.max(1) as usize),
+        pool_http2_max_concurrent_streams: optional_i64_column(
+            row,
+            "pool_http2_max_concurrent_streams",
+        )?
+        .map(|v| v as u32),
+        pool_http3_connections_per_backend: optional_i64_column(
+            row,
+            "pool_http3_connections_per_backend",
+        )?
+        .map(|v| v.max(1) as usize),
         // Derived-only: `h2_upgrade_policy` is projected from the mesh
         // DestinationRule port overrides at dispatch time, never persisted as a
         // proxy column, so a DB-loaded proxy always starts at `None`.
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: row
-            .try_get::<i64, _>("pool_max_requests_per_connection")
-            .ok()
-            .map(|v| v.max(0) as u64),
         // Derived-only: `pool_http1_max_pending_requests` is projected from the
         // mesh DestinationRule port overrides at dispatch time, never persisted
         // as a proxy column, so a DB-loaded proxy always starts at `None`.
@@ -13760,25 +14001,19 @@ fn row_to_proxy_inner(
         // failure to None would broaden traffic across all upstream targets.
         upstream_subset: optional_utf8_text_column(row, "upstream_subset")?,
         listen_port: row
-            .try_get::<i32, _>("listen_port")
-            .ok()
-            .map(|v| v.clamp(0, 65535) as u16),
-        frontend_tls: row.try_get::<i32, _>("frontend_tls").unwrap_or(0) != 0,
-        passthrough: row.try_get::<i32, _>("passthrough").unwrap_or(0) != 0,
-        udp_idle_timeout_seconds: row
-            .try_get::<i64, _>("udp_idle_timeout_seconds")
-            .map(|v| v.max(0) as u64)
-            .unwrap_or(60),
-        tcp_idle_timeout_seconds: row
-            .try_get::<i64, _>("tcp_idle_timeout_seconds")
-            .ok()
+            .try_get::<Option<i32>, _>("listen_port")?
+            .map(|v| port_from_column(v, "listen_port"))
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("Proxy {:?}: {}", pid, e))?,
+        frontend_tls: required_flag_column(row, "frontend_tls")?,
+        passthrough: required_flag_column(row, "passthrough")?,
+        udp_idle_timeout_seconds: row.try_get::<i64, _>("udp_idle_timeout_seconds")?.max(0) as u64,
+        tcp_idle_timeout_seconds: optional_i64_column(row, "tcp_idle_timeout_seconds")?
             .map(|v| v.max(0) as u64),
-        websocket_idle_timeout_seconds: row
-            .try_get::<i64, _>("websocket_idle_timeout_seconds")
-            .ok()
+        websocket_idle_timeout_seconds: optional_i64_column(row, "websocket_idle_timeout_seconds")?
             .map(|v| v.max(0) as u64),
         websocket_permessage_deflate: decode_websocket_permessage_deflate(row, &pid)?,
-        allow_path_parameters: row.try_get::<i32, _>("allow_path_parameters").unwrap_or(0) != 0,
+        allow_path_parameters: required_flag_column(row, "allow_path_parameters")?,
         allowed_methods: match optional_utf8_text_column(row, "allowed_methods")? {
             Some(s) => Some(
                 config_decode::from_json_str::<Vec<String>>(&s).map_err(|e| {
@@ -13849,10 +14084,7 @@ fn row_to_proxy_inner(
         // `load_full_config` / `load_incremental_config` strip it
         // explicitly via `strip_api_spec_id_from_runtime_config(&mut cfg)`
         // before returning — see Wave 1A's hot-path isolation invariant.
-        api_spec_id: row
-            .try_get::<Option<String>, _>("api_spec_id")
-            .ok()
-            .flatten(),
+        api_spec_id: optional_utf8_text_column(row, "api_spec_id")?,
         resolved_tls: Default::default(),
         // Populated by `GatewayConfig::resolve_dispatch_port_overrides()` after
         // upstreams are loaded and any mesh DR overrides applied.
@@ -13870,10 +14102,11 @@ fn required_utf8_text_column(row: &AnyRow, column: &str) -> Result<String, anyho
     match row.try_get::<String, _>(column) {
         Ok(value) => Ok(value),
         Err(text_error) => {
-            // sqlx Any maps MySQL TEXT-family wire types (including
-            // MEDIUMTEXT) to its generic BLOB type. Decode those bytes
-            // explicitly, but still reject invalid UTF-8 rather than hiding a
-            // corrupt JSON/config value behind a default.
+            // SQLx 0.8's Any driver mapped MySQL TEXT-family wire types
+            // (including MEDIUMTEXT) to its generic BLOB type; 0.9 reports a
+            // non-binary collation as text. Accept bytes too, but still
+            // reject invalid UTF-8 rather than hiding a corrupt JSON/config
+            // value behind a default.
             let bytes: Vec<u8> = row.try_get(column).map_err(|blob_error| {
                 anyhow::anyhow!(
                     "column `{column}` could not be decoded as SQL text ({text_error}) \
@@ -13977,8 +14210,8 @@ fn optional_utf8_text_column(row: &AnyRow, column: &str) -> Result<Option<String
                 .map(Some)
                 .map_err(|error| anyhow::anyhow!("column `{column}` is not valid UTF-8: {error}")),
             Err(blob_opt_error) => {
-                // Some MySQL/sqlx-Any paths surface non-NULL TEXT-family values
-                // as a bare BLOB rather than Option<BLOB>.
+                // Some MySQL/sqlx-Any paths (SQLx 0.8) surfaced non-NULL
+                // TEXT-family values as a bare BLOB rather than Option<BLOB>.
                 let bytes: Vec<u8> = row.try_get(column).map_err(|blob_error| {
                     anyhow::anyhow!(
                         "column `{column}` could not be decoded as optional SQL text \
@@ -14042,7 +14275,8 @@ fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, any
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
         username: row.try_get("username")?,
-        custom_id: row.try_get("custom_id").ok(),
+        // An identity column: a decode failure must not silently drop it.
+        custom_id: optional_utf8_text_column(row, "custom_id")?,
         credentials,
         acl_groups,
         created_at: parse_datetime_column(row, "created_at"),
@@ -14126,32 +14360,29 @@ fn row_to_plugin_config_inner(
         namespace: row_namespace_or_default(row),
         plugin_name: row.try_get("plugin_name")?,
         config: config_val,
-        scope: match scope_str.as_str() {
-            "proxy" => PluginScope::Proxy,
-            "proxy_group" => PluginScope::ProxyGroup,
-            _ => PluginScope::Global,
-        },
-        proxy_id: row.try_get("proxy_id").ok(),
-        enabled: row.try_get::<i32, _>("enabled").unwrap_or(1) != 0,
+        // Strict (issue #7192): an unknown scope used to become `Global`,
+        // widening a proxy-scoped plugin to every proxy in the namespace; a
+        // `proxy_id` decode failure detached it and an `enabled` decode
+        // failure enabled it. MongoDB rejects the same values through serde.
+        scope: parse_plugin_scope(&scope_str)
+            .map_err(|reason| anyhow::anyhow!("PluginConfig {:?}: {}", id_preview, reason))?,
+        proxy_id: optional_utf8_text_column(row, "proxy_id")?,
+        enabled: row.try_get::<i32, _>("enabled")? != 0,
+        // A decode failure must not silently drop the override and change
+        // plugin execution order (issue #7192).
         priority_override: row
-            .try_get::<Option<i32>, _>("priority_override")
-            .ok()
-            .flatten()
+            .try_get::<Option<i32>, _>("priority_override")?
             .map(|v| v.clamp(0, 10_000) as u16),
         trigger,
         // See row_to_proxy for the rationale: preserve here so admin reads
         // get the real owning spec id; runtime callers strip via
         // strip_api_spec_id_from_runtime_config.
-        api_spec_id: row
-            .try_get::<Option<String>, _>("api_spec_id")
-            .ok()
-            .flatten(),
+        api_spec_id: optional_utf8_text_column(row, "api_spec_id")?,
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })
 }
 
-/// Parse an upstream row into an Upstream struct.
 /// Decode one `gateway_trust_bundles` row (issue #3727).
 ///
 /// Failures are reported through the shared row-decode rejection marker so a
@@ -14262,6 +14493,7 @@ fn row_to_gateway_trust_bundle_inner(
     })
 }
 
+/// Parse an upstream row into an Upstream struct.
 fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
     let id_preview: String = row
         .try_get("id")
@@ -14340,10 +14572,8 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         };
 
     // Parse backend TLS fields
-    let backend_tls_verify_server_cert: bool = row
-        .try_get::<i32, _>("backend_tls_verify_server_cert")
-        .map(|v| v != 0)
-        .unwrap_or(true);
+    let backend_tls_verify_server_cert =
+        required_flag_column(row, "backend_tls_verify_server_cert")?;
 
     let subsets = match optional_utf8_text_column(row, "subsets")? {
         Some(s) => Some(config_decode::from_json_str(&s).map_err(|e| {
@@ -14373,7 +14603,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         labels: config_decode::from_json_str(&required_utf8_text_column(row, "labels")?)?,
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
-        name: row.try_get("name").ok(),
+        name: optional_utf8_text_column(row, "name")?,
         targets,
         algorithm,
         hash_on: optional_utf8_text_column(row, "hash_on")?,
@@ -14428,6 +14658,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     })
 }
@@ -14485,9 +14716,11 @@ fn row_to_api_spec_with_content(
     use crate::config::types::{ApiSpec, SpecFormat};
 
     let spec_format_str: String = row.try_get("spec_format")?;
+    // Strict (issue #7192): an unknown stored format is not silently YAML.
     let spec_format = match spec_format_str.as_str() {
         "json" => SpecFormat::Json,
-        _ => SpecFormat::Yaml,
+        "yaml" => SpecFormat::Yaml,
+        _ => anyhow::bail!("unsupported api_specs.spec_format (expected one of: json, yaml)"),
     };
     let uncompressed_size: i64 = row.try_get("uncompressed_size")?;
 
@@ -14802,24 +15035,17 @@ mod proxy_insert_sql_drift_tests {
         );
     }
 
-    /// The `submit_api_spec_bundle` INSERT is built inline (it carries an
-    /// extra `api_spec_id` column), so we mirror its SQL skeleton here and
-    /// assert the same `?` count contract. If the inline SQL in
-    /// `submit_api_spec_bundle` drifts, edit BOTH this fixture and the
-    /// `PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT` constant.
+    /// The spec-owned proxy INSERT carries an extra `api_spec_id` column;
+    /// count the statement `restore_api_spec_bundle_inner` executes.
     #[test]
     fn submit_api_spec_bundle_proxy_insert_placeholder_count_matches_const() {
-        // VALUES list has one `?` per column; we lifted this row count from
-        // the actual INSERT in submit_api_spec_bundle. Update if columns
-        // change there.
-        let values_clause = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-        let placeholders = values_clause.matches('?').count();
+        let placeholders = DatabaseStore::PROXY_INSERT_WITH_API_SPEC_ID_SQL
+            .matches('?')
+            .count();
         assert_eq!(
             placeholders,
             DatabaseStore::PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT,
-            "submit_api_spec_bundle proxy INSERT placeholder count must match \
+            "spec-owned proxy INSERT placeholder count must match \
              PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT — see drift-prevention contract",
         );
     }

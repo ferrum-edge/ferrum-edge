@@ -13,7 +13,7 @@
 //!   removing one tenant's proxy must not prune the other's.
 //! - Lock-free hot path: `DashMap` sharded reads + `AtomicU64` CAS loops only.
 //! - Zero allocation on hot path: `get_buffer_size()` / `get_batch_limit()` do
-//!   one DashMap read + two atomic loads + three comparisons. The
+//!   one DashMap read + one atomic load + three comparisons. The
 //!   `namespace|id` lookup key is written into a reusable thread-local scratch
 //!   buffer instead of a per-event `format!`.
 //! - `record_connection()` / `record_batch_cycle()` allocate only on first-seen
@@ -22,6 +22,7 @@
 use dashmap::DashMap;
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::db_backend::{namespaced_runtime_key, write_namespaced_runtime_key};
@@ -72,10 +73,6 @@ const BATCH_TIER_THRESHOLDS: [u64; 3] = [
 
 // ── Per-proxy state ─────────────────────────────────────────────────────────
 
-/// Jitter EWMA threshold (microseconds) above which buffer tier is bumped.
-/// 10ms of inter-arrival jitter indicates lossy/variable real-time traffic.
-const JITTER_BUMP_THRESHOLD_US: u64 = 10_000;
-
 /// Per-proxy EWMA state. All fields are atomic for lock-free concurrent access.
 struct ProxyBufferState {
     /// EWMA of total bytes per connection (both directions summed).
@@ -88,8 +85,6 @@ struct ProxyBufferState {
     dgram_ewma: AtomicU64,
     /// Number of batch cycles recorded.
     dgram_sample_count: AtomicU64,
-    /// EWMA of inter-arrival jitter in microseconds (for UDP real-time traffic).
-    jitter_ewma: AtomicU64,
 }
 
 impl ProxyBufferState {
@@ -99,7 +94,6 @@ impl ProxyBufferState {
             bytes_sample_count: AtomicU64::new(0),
             dgram_ewma: AtomicU64::new(UNSET),
             dgram_sample_count: AtomicU64::new(0),
-            jitter_ewma: AtomicU64::new(UNSET),
         }
     }
 }
@@ -175,6 +169,50 @@ fn with_namespaced_key<R>(namespace: &str, proxy_id: &str, f: impl FnOnce(&str) 
 
 // ── Public tracker ──────────────────────────────────────────────────────────
 
+/// Lock-free handle to a single `(namespace, proxy_id)` entry in
+/// [`AdaptiveBufferTracker`].
+///
+/// Acquired once at listener or session setup so the UDP hot path reads and
+/// updates the per-proxy EWMA with a direct atomic operation instead of
+/// taking a shared `DashMap` shard read lock on every reply datagram.
+#[derive(Clone)]
+pub struct ProxyAdaptiveHandle {
+    state: Arc<ProxyBufferState>,
+    alpha_fp: u64,
+    default_batch_limit: usize,
+    batch_enabled: bool,
+}
+
+impl ProxyAdaptiveHandle {
+    /// Returns the recommended UDP batch limit for this proxy without touching
+    /// the `DashMap` or thread-local key scratch buffer.
+    #[inline]
+    pub fn get_batch_limit(&self) -> usize {
+        if !self.batch_enabled {
+            return self.default_batch_limit;
+        }
+        let ewma = self.state.dgram_ewma.load(Ordering::Relaxed);
+        if ewma == UNSET {
+            return self.default_batch_limit;
+        }
+        let tier = select_tier(ewma, &BATCH_TIER_THRESHOLDS);
+        BATCH_TIER_LIMITS[tier]
+    }
+
+    /// Record datagrams drained in one UDP batch cycle directly on the cached
+    /// per-proxy state.
+    #[inline]
+    pub fn record_batch_cycle(&self, datagrams_drained: u64) {
+        if !self.batch_enabled {
+            return;
+        }
+        update_ewma(&self.state.dgram_ewma, datagrams_drained, self.alpha_fp);
+        self.state
+            .dgram_sample_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Adaptive buffer and batch limit tracker.
 ///
 /// Maintains per-proxy EWMA of bytes-per-connection and datagrams-per-batch-cycle,
@@ -182,7 +220,7 @@ fn with_namespaced_key<R>(namespace: &str, proxy_id: &str, f: impl FnOnce(&str) 
 pub struct AdaptiveBufferTracker {
     /// Per-proxy state, keyed by the namespace-qualified `namespace|id` runtime
     /// key so same-id proxies in different namespaces stay isolated.
-    state: DashMap<String, ProxyBufferState>,
+    state: DashMap<String, Arc<ProxyBufferState>>,
     /// EWMA alpha as fixed-point (e.g., 300 = 0.3).
     alpha_fp: u64,
     /// Minimum buffer size (floor).
@@ -200,6 +238,15 @@ pub struct AdaptiveBufferTracker {
 }
 
 impl AdaptiveBufferTracker {
+    /// Re-shard the per-proxy state map with the operator's
+    /// `FERRUM_POOL_SHARD_AMOUNT` (`pool_shard_amount(env_config.pool_shard_amount)`).
+    /// The map is read and written per connection, so it follows the hot-path
+    /// `DashMap` sizing rule. Call before the tracker records anything.
+    pub fn with_shard_amount(mut self, shard_amount: usize) -> Self {
+        self.state = DashMap::with_shard_amount(shard_amount);
+        self
+    }
+
     /// Create a new tracker with the given configuration.
     ///
     /// `alpha_fp` is clamped to `[1, 999]`. `min_buffer_size` and `max_buffer_size`
@@ -222,7 +269,7 @@ impl AdaptiveBufferTracker {
         let default_batch_limit = default_batch_limit.max(1);
 
         Self {
-            state: DashMap::new(),
+            state: DashMap::with_shard_amount(crate::util::sharding::pool_shard_amount(0)),
             alpha_fp,
             min_buffer_size,
             max_buffer_size,
@@ -270,8 +317,29 @@ impl AdaptiveBufferTracker {
             let entry = self
                 .state
                 .entry(namespaced_runtime_key(namespace, proxy_id))
-                .or_insert_with(ProxyBufferState::new);
+                .or_insert_with(|| Arc::new(ProxyBufferState::new()));
             update(&entry);
+        }
+    }
+
+    /// Acquire a lock-free handle to the per-proxy EWMA state for
+    /// `(namespace, proxy_id)`, creating the entry on first sight.
+    pub fn proxy_handle(&self, namespace: &str, proxy_id: &str) -> ProxyAdaptiveHandle {
+        let state = with_namespaced_key(namespace, proxy_id, |key| {
+            self.state.get(key).map(|entry| Arc::clone(&entry))
+        })
+        .unwrap_or_else(|| {
+            let entry = self
+                .state
+                .entry(namespaced_runtime_key(namespace, proxy_id))
+                .or_insert_with(|| Arc::new(ProxyBufferState::new()));
+            Arc::clone(&entry)
+        });
+        ProxyAdaptiveHandle {
+            state,
+            alpha_fp: self.alpha_fp,
+            default_batch_limit: self.default_batch_limit,
+            batch_enabled: self.batch_enabled,
         }
     }
 
@@ -280,32 +348,21 @@ impl AdaptiveBufferTracker {
     /// Returns the recommended buffer size for a new connection on the given
     /// namespace-qualified proxy.
     ///
-    /// Hot path: one DashMap read + two atomic loads + three comparisons.
+    /// Hot path: one DashMap read + one atomic load + three comparisons.
     /// Returns `default_buffer_size` when disabled or no data for this proxy.
     pub fn get_buffer_size(&self, namespace: &str, proxy_id: &str) -> usize {
         if !self.buffer_enabled {
             return self.default_buffer_size;
         }
-        // Read both EWMAs under one lookup: the jitter bump below needs the
-        // same entry, and a second lookup would double the hot-path cost.
-        let Some((ewma, jitter_ewma)) = self.read_state(namespace, proxy_id, |entry| {
-            (
-                entry.bytes_ewma.load(Ordering::Relaxed),
-                entry.jitter_ewma.load(Ordering::Relaxed),
-            )
+        let Some(ewma) = self.read_state(namespace, proxy_id, |entry| {
+            entry.bytes_ewma.load(Ordering::Relaxed)
         }) else {
             return self.default_buffer_size;
         };
         if ewma == UNSET {
             return self.default_buffer_size;
         }
-        let mut tier = select_tier(ewma, &BUFFER_TIER_THRESHOLDS);
-        // If jitter EWMA > 10ms, bump up one tier for safety margin.
-        // High jitter indicates lossy/variable real-time traffic that benefits
-        // from larger buffers to absorb burst arrivals.
-        if jitter_ewma != UNSET && jitter_ewma > JITTER_BUMP_THRESHOLD_US && tier < 3 {
-            tier += 1;
-        }
+        let tier = select_tier(ewma, &BUFFER_TIER_THRESHOLDS);
         BUFFER_TIER_SIZES[tier].clamp(self.min_buffer_size, self.max_buffer_size)
     }
 
@@ -320,21 +377,6 @@ impl AdaptiveBufferTracker {
         self.update_state(namespace, proxy_id, |entry| {
             update_ewma(&entry.bytes_ewma, total_bytes, self.alpha_fp);
             entry.bytes_sample_count.fetch_add(1, Ordering::Relaxed);
-        });
-    }
-
-    // ── Jitter tracking (UDP real-time traffic) ──────────────────────────
-
-    /// Record an inter-arrival jitter measurement for a UDP session.
-    /// Jitter is |actual_interval - expected_interval| in microseconds.
-    /// Used to adapt UDP buffers for real-time traffic (VoIP, gaming).
-    #[allow(dead_code)] // Wired into UDP proxy path incrementally.
-    pub fn record_jitter(&self, namespace: &str, proxy_id: &str, jitter_us: u64) {
-        if !self.buffer_enabled {
-            return;
-        }
-        self.update_state(namespace, proxy_id, |entry| {
-            update_ewma(&entry.jitter_ewma, jitter_us, self.alpha_fp);
         });
     }
 
@@ -416,6 +458,23 @@ mod tests {
         assert_eq!(select_tier(999, &BATCH_TIER_THRESHOLDS), 2);
         assert_eq!(select_tier(1000, &BATCH_TIER_THRESHOLDS), 3);
         assert_eq!(select_tier(50000, &BATCH_TIER_THRESHOLDS), 3);
+    }
+
+    /// Issue #7207: the per-connection state map follows the hot-path
+    /// `DashMap` sizing rule and honours the operator shard override.
+    #[test]
+    fn with_shard_amount_resizes_the_state_map() {
+        use dashmap::Map;
+        let tracker = AdaptiveBufferTracker::new(true, true, 300, 8192, 262_144, 65_536, 64)
+            .with_shard_amount(crate::util::sharding::pool_shard_amount(4));
+        assert_eq!(tracker.state._shard_count(), 4);
+        tracker.record_connection("ns", "proxy", 100_000);
+        assert!(tracker.get_buffer_size("ns", "proxy") >= 8192);
+        let default = AdaptiveBufferTracker::new(true, true, 300, 8192, 262_144, 65_536, 64);
+        assert_eq!(
+            default.state._shard_count(),
+            crate::util::sharding::pool_shard_amount(0)
+        );
     }
 
     #[test]
@@ -520,18 +579,6 @@ mod tests {
     }
 
     #[test]
-    fn jitter_bumps_buffer_tier_when_above_threshold() {
-        let tracker = AdaptiveBufferTracker::new(true, true, 300, 8192, 262_144, 65_536, 64);
-
-        tracker.record_connection(NS, "p1", 32 * 1024);
-        tracker.record_jitter(NS, "p1", JITTER_BUMP_THRESHOLD_US);
-        assert_eq!(tracker.get_buffer_size(NS, "p1"), 32 * 1024);
-
-        tracker.record_jitter(NS, "p1", JITTER_BUMP_THRESHOLD_US + 4);
-        assert_eq!(tracker.get_buffer_size(NS, "p1"), 64 * 1024);
-    }
-
-    #[test]
     fn batch_limit_uses_defaults_when_disabled_or_unsampled() {
         let disabled = AdaptiveBufferTracker::new(true, false, 300, 8192, 262_144, 65_536, 128);
         disabled.record_batch_cycle(NS, "p1", 10_000);
@@ -572,17 +619,9 @@ mod tests {
 
         tracker.record_connection(NS, "keep", 1024);
         tracker.record_batch_cycle(NS, "drop", 100);
-        tracker.record_jitter(NS, "drop", 20_000);
         tracker.prune_missing(&[(NS, "keep")]);
 
         assert!(tracker.state.get(&state_key(NS, "keep")).is_some());
         assert!(tracker.state.get(&state_key(NS, "drop")).is_none());
-    }
-
-    #[test]
-    fn test_record_jitter_disabled() {
-        let tracker = AdaptiveBufferTracker::new(false, false, 300, 8192, 262_144, 65_536, 64);
-        tracker.record_jitter(NS, "p1", 15_000);
-        assert!(tracker.state.get(&state_key(NS, "p1")).is_none());
     }
 }

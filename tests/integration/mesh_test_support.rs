@@ -38,7 +38,7 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::modes::mesh::{
     MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, MeshTrafficDirection,
-    prepare_gateway_config_for_mesh,
+    prepare_gateway_config_via_mesh_slice_with_fixtures,
 };
 use ferrum_edge::proxy::{
     ProxyState, start_proxy_listener_with_bound_listener,
@@ -383,7 +383,6 @@ pub fn http_proxy(id: &str, host: &str, backend_port: u16) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -452,13 +451,15 @@ pub fn http_upstream(id: &str, host: &str, port: u16) -> Upstream {
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
 
 /// Build an empty `GatewayConfig` with `mesh: Some(MeshConfig{...})` and the
 /// supplied proxies/upstreams/policies attached. Callers feed the result to
-/// [`prepare_gateway_config_for_mesh`] before constructing `ProxyState`.
+/// [`prepare_gateway_config_via_mesh_slice_with_fixtures`] before constructing
+/// `ProxyState`.
 pub fn gateway_config_with_mesh(
     proxies: Vec<Proxy>,
     upstreams: Vec<Upstream>,
@@ -466,6 +467,7 @@ pub fn gateway_config_with_mesh(
 ) -> GatewayConfig {
     GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "test".to_string(),
         proxies,
         upstreams,
@@ -504,9 +506,11 @@ pub fn mesh_config_with(
 }
 
 /// Prepare a mesh-mode `ProxyState` for `proxies` and `upstreams`, with the
-/// supplied `MeshConfig`. Runs the full `prepare_gateway_config_for_mesh`
-/// pipeline so plugin injection, locality projection, and DR materialisation
-/// all match production. The returned tuple shares the same shape as
+/// supplied `MeshConfig`. The mesh view is built from the projected slice as in
+/// production (`prepare_gateway_config_via_mesh_slice_with_fixtures`), and the
+/// supplied proxies and upstreams, which no slice carries, are added as test
+/// fixtures, so plugin injection, locality projection, and DR materialisation
+/// run the production pipeline. The returned tuple shares the same shape as
 /// [`ProxyState::new`] so callers can also keep the health-check task
 /// handles if they ever want to.
 pub fn build_mesh_proxy_state(
@@ -516,7 +520,8 @@ pub fn build_mesh_proxy_state(
     mesh: MeshConfig,
 ) -> ProxyState {
     let config = gateway_config_with_mesh(proxies, upstreams, mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, runtime).expect("mesh-prepared config");
+    let prepared = prepare_gateway_config_via_mesh_slice_with_fixtures(config, runtime)
+        .expect("mesh-prepared config");
     let env_config = EnvConfig {
         mode: OperatingMode::Mesh,
         log_level: "error".to_string(),

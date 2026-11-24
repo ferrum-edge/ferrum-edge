@@ -4,6 +4,7 @@
 import importlib.util
 import io
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +14,59 @@ SPEC = importlib.util.spec_from_file_location(
 )
 resources = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(resources)
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import verify_cross_build_policy as policy  # noqa: E402
+
+
+class Arm64ReleaseContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source, cls.job, *cls.hashes = policy.WORKFLOW_CONTRACTS[1]
+        cls.workflow, errors = policy.load_workflow(
+            Path(__file__).resolve().parents[2] / "workflows/release.yml", cls.source,
+        )
+        if errors:
+            raise AssertionError(errors)
+
+    def test_swap_producer_matches_the_frozen_contract(self):
+        self.assertEqual(policy.validate_workflow_contract(
+            self.workflow, self.source, self.job, *self.hashes,
+        ), [])
+
+    def test_swap_is_verified_and_observed_before_the_unchanged_build(self):
+        markers = [
+            "sudo -n fallocate -l 32G /swapfile-ferrum-release",
+            "sudo -n chmod 600 /swapfile-ferrum-release",
+            "sudo -n mkswap /swapfile-ferrum-release",
+            "sudo -n swapon /swapfile-ferrum-release",
+            "sudo -n swapon --show --bytes",
+            "END {exit !found}' /proc/swaps",
+            "END {exit !found}' /proc/meminfo",
+            "collect_release_build_resources.py --phase before",
+            "Build release binary with a fixed empty Cross environment",
+            "collect_release_build_resources.py --phase after",
+        ]
+        positions = [self.workflow.index(marker) for marker in markers]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_swap_and_deadline_tampering_fail_closed(self):
+        mutations = (
+            ("fallocate -l 32G", "fallocate -l 1G"),
+            ("sudo -n swapon /swapfile-ferrum-release", "true"),
+            ("sudo -n swapon /swapfile-ferrum-release", "sudo -n swapon /swapfile-ferrum-release || true"),
+            ("END {exit !found}' /proc/swaps", "END {exit 0}' /proc/swaps"),
+            ("END {exit !found}' /proc/meminfo", "END {exit 0}' /proc/meminfo"),
+            ("timeout-minutes: 240", "timeout-minutes: 360"),
+        )
+        for original, replacement in mutations:
+            with self.subTest(original=original, replacement=replacement):
+                self.assertIn(original, self.workflow)
+                errors = policy.validate_workflow_contract(
+                    self.workflow.replace(original, replacement, 1),
+                    self.source, self.job, *self.hashes,
+                )
+                self.assertTrue(any("protected job" in error for error in errors), errors)
 
 
 class ResourceObservationTests(unittest.TestCase):

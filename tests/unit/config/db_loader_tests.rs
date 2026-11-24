@@ -1,12 +1,13 @@
 use ferrum_edge::_test_support::{
     DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionTestHooks,
     await_pool_connect_with_timeout, database_store_reconnect_as_failover_for_test,
-    database_store_set_reconnect_transition_hooks_for_test, db_code_is_transient, db_diff_removed,
+    database_store_set_reconnect_transition_hooks_for_test, db_code_is_transient,
     db_mongo_error_is_transient, db_mysql_error_number_is_transient,
     db_wrap_mysql_isolation_read_error, effective_pool_connect_timeout_seconds,
     is_config_validation_rejection, lock_wait_timeout_sql, mysql_config_change_lock_insert_sql,
     mysql_mtls_dns_admission_lock_insert_sql, mysql_proxy_route_lock_insert_sql, parse_auth_mode,
-    parse_scheme, statement_timeout_sql, validate_tcp_connection_throttle_attachments,
+    parse_plugin_scope, parse_scheme, statement_timeout_sql,
+    validate_tcp_connection_throttle_attachments,
 };
 use ferrum_edge::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, checked_next_config_topology_epoch,
@@ -28,7 +29,6 @@ use ferrum_edge::config::types::{
 use serde_json::json;
 use sqlx::error::{DatabaseError, ErrorKind};
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
@@ -195,6 +195,7 @@ fn make_upstream(id: &str) -> Upstream {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -403,62 +404,6 @@ fn test_db_pool_config_default() {
     assert_eq!(config.statement_timeout_seconds, 30);
 }
 
-// ── diff_removed ─────────────────────────────────────────────────────────────
-
-#[test]
-fn test_diff_removed_empty_sets() {
-    let known = HashSet::new();
-    let current = HashSet::new();
-    assert!(db_diff_removed(&known, &current).is_empty());
-}
-
-#[test]
-fn test_diff_removed_no_deletions() {
-    let known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-    let current = known.clone();
-    assert!(db_diff_removed(&known, &current).is_empty());
-}
-
-#[test]
-fn test_diff_removed_all_deleted() {
-    let known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-    let current = HashSet::new();
-    let mut removed = db_diff_removed(&known, &current);
-    removed.sort();
-    assert_eq!(removed, vec!["a", "b", "c"]);
-}
-
-#[test]
-fn test_diff_removed_partial_deletion() {
-    let known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-    let current: HashSet<String> = ["a", "c"].iter().map(|s| s.to_string()).collect();
-    let removed = db_diff_removed(&known, &current);
-    assert_eq!(removed, vec!["b"]);
-}
-
-#[test]
-fn test_diff_removed_current_has_new_ids() {
-    let known: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
-    let current: HashSet<String> = ["a", "b", "d", "e"].iter().map(|s| s.to_string()).collect();
-    assert!(db_diff_removed(&known, &current).is_empty());
-}
-
-#[test]
-fn test_diff_removed_known_empty_current_has_items() {
-    let known = HashSet::new();
-    let current: HashSet<String> = ["x", "y"].iter().map(|s| s.to_string()).collect();
-    assert!(db_diff_removed(&known, &current).is_empty());
-}
-
-#[test]
-fn test_diff_removed_mixed_additions_and_deletions() {
-    let known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-    let current: HashSet<String> = ["b", "d", "e"].iter().map(|s| s.to_string()).collect();
-    let mut removed = db_diff_removed(&known, &current);
-    removed.sort();
-    assert_eq!(removed, vec!["a", "c"]);
-}
-
 // ── parse_scheme ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -502,24 +447,222 @@ fn test_parse_scheme_rejects_unknown_or_removed_aliases() {
     }
 }
 
+// ── parse_plugin_scope ───────────────────────────────────────────────────────
+
+/// Issue #7192: an unknown stored plugin scope is a row-decode failure, never
+/// `Global` (which widened a proxy-scoped plugin to every proxy).
+#[test]
+fn test_parse_plugin_scope_is_exact() {
+    assert_eq!(parse_plugin_scope("global").unwrap(), PluginScope::Global);
+    assert_eq!(parse_plugin_scope("proxy").unwrap(), PluginScope::Proxy);
+    assert_eq!(
+        parse_plugin_scope("proxy_group").unwrap(),
+        PluginScope::ProxyGroup
+    );
+    for value in [
+        "Proxy",
+        "PROXY",
+        "Global",
+        "proxy-group",
+        "proxy ",
+        "",
+        "consumer",
+    ] {
+        let err = parse_plugin_scope(value).expect_err(&format!(
+            "{value:?} should not be accepted as a plugin scope"
+        ));
+        assert!(
+            err.contains("unsupported scope"),
+            "scope rejection must stay actionable: {err}"
+        );
+        assert!(
+            value.trim().is_empty() || !err.contains(value),
+            "scope rejection must not embed the raw column body: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unknown_plugin_scope_rejects_the_row_instead_of_widening_to_global() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let db_url = format!(
+        "sqlite:{}?mode=rwc",
+        directory.path().join("scope.db").display()
+    );
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    store
+        .create_plugin_config(&make_global_tcp_throttle("scope-7192"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE plugin_configs SET scope = 'Proxy' WHERE id = ?")
+        .bind("scope-7192")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+    let error = store.load_full_config("ferrum").await.unwrap_err();
+    assert!(ferrum_edge::_test_support::is_row_decode_rejection(&error));
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("unsupported scope"), "{rendered}");
+    assert!(
+        store
+            .get_plugin_config("ferrum", "scope-7192")
+            .await
+            .is_err(),
+        "a point read must fail closed too"
+    );
+}
+
+/// Issue #7192: the plugin-config row mapper and the association reference
+/// lookup decode `scope` strictly, and `proxy_id` / `enabled` propagate decode
+/// failures instead of detaching or enabling the plugin.
+#[test]
+fn plugin_config_row_mappers_decode_scope_proxy_id_and_enabled_strictly() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    let mapper = source
+        .split("fn row_to_plugin_config_inner(")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfn ").next())
+        .expect("row_to_plugin_config_inner body");
+    assert!(
+        mapper.contains("parse_plugin_scope(&scope_str)"),
+        "{mapper}"
+    );
+    assert!(
+        mapper.contains("proxy_id: optional_utf8_text_column(row, \"proxy_id\")?"),
+        "{mapper}"
+    );
+    assert!(
+        mapper.contains("enabled: row.try_get::<i32, _>(\"enabled\")? != 0"),
+        "{mapper}"
+    );
+    assert!(!mapper.contains("_ => PluginScope::Global"), "{mapper}");
+
+    let refs = source
+        .split("async fn load_plugin_config_refs_from_pool(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    }\n").next())
+        .expect("load_plugin_config_refs_from_pool body");
+    assert!(refs.contains("parse_plugin_scope(&scope_raw)"), "{refs}");
+    assert!(!refs.contains("_ => PluginScope::Global"), "{refs}");
+}
+
 // ── parse_auth_mode ──────────────────────────────────────────────────────────
 
 #[test]
 fn test_parse_auth_mode_known_values() {
-    assert!(matches!(parse_auth_mode("single"), AuthMode::Single));
-    assert!(matches!(parse_auth_mode("multi"), AuthMode::Multi));
+    assert!(matches!(parse_auth_mode("single"), Ok(AuthMode::Single)));
+    assert!(matches!(parse_auth_mode("multi"), Ok(AuthMode::Multi)));
 }
 
 #[test]
 fn test_parse_auth_mode_case_insensitive() {
-    assert!(matches!(parse_auth_mode("MULTI"), AuthMode::Multi));
-    assert!(matches!(parse_auth_mode("Single"), AuthMode::Single));
+    assert!(matches!(parse_auth_mode("MULTI"), Ok(AuthMode::Multi)));
+    assert!(matches!(parse_auth_mode("Single"), Ok(AuthMode::Single)));
 }
 
+/// Issue #7192: an unknown stored auth mode rejects the row instead of
+/// silently becoming `single`; the raw value is never echoed.
 #[test]
-fn test_parse_auth_mode_unknown_defaults_to_single() {
-    assert!(matches!(parse_auth_mode("unknown"), AuthMode::Single));
-    assert!(matches!(parse_auth_mode(""), AuthMode::Single));
+fn test_parse_auth_mode_unknown_is_rejected() {
+    let error = parse_auth_mode("unknown-mode-7192").expect_err("unknown auth_mode");
+    assert!(error.contains("unsupported auth_mode"), "{error}");
+    assert!(!error.contains("unknown-mode-7192"), "{error}");
+    assert!(parse_auth_mode("").is_err());
+}
+
+/// Issue #7218 keeps #5454's grandfathering in database mode: a stored proxy
+/// row whose `allowed_ws_origins` holds the CORS-style `*` or a non-origin
+/// entry still loads (warn-only), while file mode refuses the same value.
+#[tokio::test]
+async fn database_mode_keeps_loading_stored_star_and_non_origin_allowed_ws_origins() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let db_url = format!(
+        "sqlite:{}?mode=rwc",
+        directory.path().join("ws-origins.db").display()
+    );
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    let mut proxy = make_http_proxy("ws-origins-7218");
+    let stored = vec![
+        "*".to_string(),
+        "not an origin".to_string(),
+        "https://app.example.com".to_string(),
+    ];
+    proxy.allowed_ws_origins = stored.clone();
+    assert!(
+        !proxy.allowed_ws_origins_admission_errors().is_empty(),
+        "the stored value is one admission and file mode refuse"
+    );
+    store.create_proxy(&proxy).await.unwrap();
+
+    let config = store
+        .load_full_config("ferrum")
+        .await
+        .expect("database mode must keep loading a grandfathered allowed_ws_origins row");
+    let loaded = config
+        .proxies
+        .iter()
+        .find(|candidate| candidate.id == "ws-origins-7218")
+        .expect("the grandfathered proxy is still served");
+    assert_eq!(loaded.allowed_ws_origins, stored);
+}
+
+/// Issue #7192: proxy columns that used to fall back to a default on a decode
+/// failure (or an unknown enum value) now reject the row, so the last good
+/// config stays live instead of serving plaintext / single-auth / streaming
+/// behaviour nobody configured.
+#[tokio::test]
+async fn corrupt_proxy_columns_reject_the_row_instead_of_defaulting() {
+    for (column, value, marker) in [
+        ("frontend_tls", "yes", "frontend_tls"),
+        ("auth_mode", "bogus", "unsupported auth_mode"),
+        (
+            "response_body_mode",
+            "chunked",
+            "unsupported response_body_mode",
+        ),
+    ] {
+        let directory = tempfile::TempDir::new().unwrap();
+        let db_url = format!(
+            "sqlite:{}?mode=rwc",
+            directory.path().join("proxy-columns.db").display()
+        );
+        let store =
+            DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+                .await
+                .unwrap();
+        store
+            .create_proxy(&make_http_proxy("cols-7192"))
+            .await
+            .unwrap();
+        store
+            .load_full_config("ferrum")
+            .await
+            .expect("an intact row loads");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE proxies SET {column} = ? WHERE id = ?"
+        )))
+        .bind(value)
+        .bind("cols-7192")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+        let error = store
+            .load_full_config("ferrum")
+            .await
+            .expect_err("a corrupt column must reject the load");
+        assert!(
+            ferrum_edge::_test_support::is_row_decode_rejection(&error),
+            "{column}"
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(marker), "{column}: {rendered}");
+    }
 }
 
 // ── statement_timeout_sql ───────────────────────────────────────────────────
@@ -773,26 +916,30 @@ async fn consumer_credential_index_enforces_keyauth_uniqueness() {
         .unwrap();
 
     let mut c1 = make_consumer("c1", "alice");
-    c1.credentials
-        .insert("keyauth".to_string(), json!([{ "key": "shared-key" }]));
+    c1.credentials.insert(
+        "keyauth".to_string(),
+        json!([{ "key": "shared-key-0123456789" }]),
+    );
     store.create_consumer(&c1).await.unwrap();
 
     assert!(
         !store
-            .check_keyauth_key_unique("ferrum", "shared-key", None)
+            .check_keyauth_key_unique("ferrum", "shared-key-0123456789", None)
             .await
             .unwrap()
     );
     assert!(
         store
-            .check_keyauth_key_unique("ferrum", "shared-key", Some("c1"))
+            .check_keyauth_key_unique("ferrum", "shared-key-0123456789", Some("c1"))
             .await
             .unwrap()
     );
 
     let mut c2 = make_consumer("c2", "bob");
-    c2.credentials
-        .insert("keyauth".to_string(), json!([{ "key": "shared-key" }]));
+    c2.credentials.insert(
+        "keyauth".to_string(),
+        json!([{ "key": "shared-key-0123456789" }]),
+    );
     let err = store
         .create_consumer(&c2)
         .await
@@ -1351,9 +1498,10 @@ async fn persistent_admission_guard_blocks_other_sqlite_admin_writers_across_bat
         .await
         .unwrap()
         .unwrap();
-    guarded_consumer
-        .credentials
-        .insert("keyauth".to_string(), json!([{ "key": "guarded-key" }]));
+    guarded_consumer.credentials.insert(
+        "keyauth".to_string(),
+        json!([{ "key": "guarded-key-0123456789" }]),
+    );
     DatabaseBackend::update_consumer(&store_a, &guarded_consumer, &guarded_mode)
         .await
         .expect("the pre-read guard owner must be able to persist the credential update");
@@ -1415,44 +1563,55 @@ async fn persistent_admission_guard_blocks_other_sqlite_admin_writers_across_bat
 }
 
 #[tokio::test]
-async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_whitespace_index_rows() {
+async fn mtls_uniqueness_is_answered_by_the_credential_index() {
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let db_path = temp_dir
-        .path()
-        .join("consumer_legacy_mtls_identity_index.db");
+    let db_path = temp_dir.path().join("consumer_mtls_identity_indexed.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
     let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
         .await
         .unwrap();
 
-    let mut consumer = make_consumer("legacy", "alice");
-    consumer.credentials.insert(
+    let mut owner = make_consumer("owner", "alice");
+    owner.credentials.insert(
         "mtls_auth".to_string(),
         json!([{ "identity": " API.Example.COM " }]),
     );
-    store.create_consumer(&consumer).await.unwrap();
+    store.create_consumer(&owner).await.unwrap();
+    store
+        .create_consumer(&make_consumer("other", "bob"))
+        .await
+        .unwrap();
 
-    // Simulate an index row written before surrounding whitespace was
-    // canonicalized. A trimmed exact lookup misses this row, so admission must
-    // inspect the authoritative Consumer record instead of treating it as unique.
-    sqlx::query(
-        "UPDATE consumer_credential_index SET credential_hash = ? \
-         WHERE namespace = ? AND consumer_id = ? AND credential_type = ?",
-    )
-    .bind("legacy-case-sensitive-hash")
-    .bind("ferrum")
-    .bind("legacy")
-    .bind("mtls_auth")
-    .execute(&store.pool())
-    .await
-    .unwrap();
-
-    assert!(
-        !store
-            .check_mtls_identity_unique("ferrum", "API.Example.COM", None)
-            .await
-            .unwrap()
-    );
+    // Another consumer's identity is a conflict, with or without surrounding
+    // whitespace on either side; matching stays exact (no case folding).
+    for probe in [
+        "API.Example.COM",
+        "  API.Example.COM\t",
+        " API.Example.COM ",
+    ] {
+        assert!(
+            !store
+                .check_mtls_identity_unique("ferrum", probe, None)
+                .await
+                .unwrap(),
+            "{probe:?} must conflict with the owner's identity"
+        );
+        assert!(
+            !store
+                .check_mtls_identity_unique("ferrum", probe, Some("other"))
+                .await
+                .unwrap(),
+            "{probe:?} must conflict when a different consumer is excluded"
+        );
+        // A PUT that keeps its own identity excludes itself and is admitted.
+        assert!(
+            store
+                .check_mtls_identity_unique("ferrum", probe, Some("owner"))
+                .await
+                .unwrap(),
+            "{probe:?} must be admitted for the excluded owner"
+        );
+    }
     assert!(
         store
             .check_mtls_identity_unique("ferrum", "api.example.com", None)
@@ -1461,36 +1620,37 @@ async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_whitespace_index_row
     );
     assert!(
         store
-            .check_mtls_identity_unique("ferrum", "API.Example.COM", Some("legacy"))
+            .check_mtls_identity_unique("other-namespace", "API.Example.COM", None)
             .await
             .unwrap()
     );
 
+    // The check reads only the index, never `consumers.credentials`: an
+    // undecodable stored body neither fails the lookup nor hides the owner.
     sqlx::query("UPDATE consumers SET credentials = ? WHERE namespace = ? AND id = ?")
         .bind("not-json")
         .bind("ferrum")
-        .bind("legacy")
+        .bind("owner")
         .execute(&store.pool())
         .await
         .unwrap();
-    let error = store
-        .check_mtls_identity_unique("ferrum", "other.example.com", None)
-        .await
-        .expect_err("malformed stored credentials must fail uniqueness closed");
-    assert!(
-        error
-            .to_string()
-            .contains("failed to parse credentials JSON")
-    );
-    // Excluding the undecodable row itself must not fail — PUT overwrite
-    // repair with mTLS credentials needs to skip its own corrupt body
-    // (issue #2997).
     assert!(
         store
-            .check_mtls_identity_unique("ferrum", "other.example.com", Some("legacy"))
+            .check_mtls_identity_unique("ferrum", "other.example.com", None)
             .await
-            .expect("excluded undecodable consumer must not block self uniqueness"),
-        "excluded undecodable consumer is not a conflict"
+            .unwrap()
+    );
+    assert!(
+        !store
+            .check_mtls_identity_unique("ferrum", "API.Example.COM", None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .check_mtls_identity_unique("ferrum", "API.Example.COM", Some("owner"))
+            .await
+            .unwrap()
     );
 }
 
@@ -1694,18 +1854,20 @@ async fn consumer_credential_index_updates_on_consumer_update() {
         .unwrap();
 
     let mut consumer = make_consumer("c1", "alice");
-    consumer
-        .credentials
-        .insert("keyauth".to_string(), json!([{ "key": "old-key" }]));
+    consumer.credentials.insert(
+        "keyauth".to_string(),
+        json!([{ "key": "old-key-0123456789" }]),
+    );
     consumer.credentials.insert(
         "mtls_auth".to_string(),
         json!([{ "identity": "spiffe://example.test/ns/default/sa/alice" }]),
     );
     store.create_consumer(&consumer).await.unwrap();
 
-    consumer
-        .credentials
-        .insert("keyauth".to_string(), json!([{ "key": "new-key" }]));
+    consumer.credentials.insert(
+        "keyauth".to_string(),
+        json!([{ "key": "new-key-0123456789" }]),
+    );
     consumer.credentials.insert(
         "mtls_auth".to_string(),
         json!([{ "identity": "spiffe://example.test/ns/default/sa/alice-v2" }]),
@@ -1717,13 +1879,13 @@ async fn consumer_credential_index_updates_on_consumer_update() {
 
     assert!(
         store
-            .check_keyauth_key_unique("ferrum", "old-key", None)
+            .check_keyauth_key_unique("ferrum", "old-key-0123456789", None)
             .await
             .unwrap()
     );
     assert!(
         !store
-            .check_keyauth_key_unique("ferrum", "new-key", None)
+            .check_keyauth_key_unique("ferrum", "new-key-0123456789", None)
             .await
             .unwrap()
     );
@@ -2274,6 +2436,52 @@ async fn read_replica_tracks_primary_topology_across_failover_and_failback() {
         store.list_namespaces().await.unwrap(),
         vec!["ferrum".to_string(), "replica-ns".to_string()],
         "the configured read replica should become eligible again after primary failback"
+    );
+}
+
+#[tokio::test]
+async fn set_read_replica_url_defers_the_dial_to_the_reconnect_path() {
+    // Startup records the replica URL without dialing it, so an unreachable
+    // replica cannot delay the authoritative primary load, and then connects it
+    // in the background through the same `reconnect_read_replica` path the poll
+    // scheduler uses. Until then admin reads stay on primary.
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_url = format!(
+        "sqlite:{}?mode=rwc",
+        temp_dir.path().join("primary.db").to_string_lossy()
+    );
+    let replica_url = format!(
+        "sqlite:{}?mode=rwc",
+        temp_dir.path().join("replica.db").to_string_lossy()
+    );
+    seed_sqlite_namespace(&primary_url, "primary-ns").await;
+    seed_sqlite_namespace(&replica_url, "replica-ns").await;
+
+    let mut store =
+        DatabaseStore::connect_with_pool_config("sqlite", &primary_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+    store.set_read_replica_url(&replica_url);
+    assert!(
+        !store.read_replica_available(),
+        "recording the replica URL must not dial it"
+    );
+    assert!(
+        !store.read_replica_suppressed(),
+        "a recorded replica on the primary topology must stay eligible for reconnect"
+    );
+    let before = store.list_namespaces().await.unwrap();
+    assert!(
+        before.contains(&"primary-ns".to_string()) && !before.contains(&"replica-ns".to_string()),
+        "admin reads must use primary until the replica connects: {before:?}"
+    );
+
+    store.reconnect_read_replica(&replica_url).await.unwrap();
+    assert!(store.read_replica_available());
+    let after = store.list_namespaces().await.unwrap();
+    assert!(
+        after.contains(&"replica-ns".to_string()) && !after.contains(&"primary-ns".to_string()),
+        "admin reads must use the replica once its pool is published: {after:?}"
     );
 }
 
@@ -2837,11 +3045,12 @@ async fn failover_write_gate_fences_primary_after_opt_in_admission() {
     );
 }
 
-/// Issue #3001: a primary reconnect that pauses after pool publication (the
-/// deferred-migration window) must not let a concurrent failover publish and
-/// then be overwritten by a delayed `mark_primary` — that left the active pool
-/// on failover while `primary_active=true` and made `check_write_allowed` fail
-/// open. Rendezvous via test seams; no sleeps.
+/// Issue #3001: a primary reconnect that pauses while holding the transition
+/// lock must not let a concurrent failover publish and then be overwritten by
+/// a delayed primary finalization — that left the active pool on failover
+/// while `primary_active=true` and made `check_write_allowed` fail open. Since
+/// issue #7061 the pool and topology are published in one store, so the paused
+/// primary is already consistent. Rendezvous via test seams; no sleeps.
 #[tokio::test]
 async fn delayed_primary_reconnect_cannot_overwrite_later_failover_topology() {
     use ferrum_edge::config::db_backend::DatabaseBackend;
@@ -2930,8 +3139,13 @@ async fn delayed_primary_reconnect_cannot_overwrite_later_failover_topology() {
         .await
         .expect("primary reconnect must enter while_holding under the transition mutex");
     assert!(
-        !store.failover_topology_status().primary_active,
-        "primary must stay fail-closed until mark_primary after the deferred window"
+        store.failover_topology_status().primary_active,
+        "the primary pool and its topology are published together (issue #7061)"
+    );
+    assert_eq!(
+        store.list_namespaces().await.unwrap(),
+        vec!["ferrum".to_string(), "primary-ns".to_string()],
+        "the published pool must match the published primary topology"
     );
 
     let failover_store = store.clone();
@@ -4278,12 +4492,14 @@ async fn row_decode_diagnostics_withhold_ids_in_outer_and_inner_reasons() {
             }
             _ => unreachable!(),
         }
-        sqlx::query(&format!("UPDATE {table} SET {column} = ? WHERE id = ?"))
-            .bind(malformed)
-            .bind(token)
-            .execute(&store.pool())
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {table} SET {column} = ? WHERE id = ?"
+        )))
+        .bind(malformed)
+        .bind(token)
+        .execute(&store.pool())
+        .await
+        .unwrap();
         let error = store.load_full_config("ferrum").await.unwrap_err();
         assert!(ferrum_edge::_test_support::is_row_decode_rejection(&error));
         let rendered = ferrum_edge::startup::render_startup_error(error, &[]);
@@ -4433,5 +4649,118 @@ fn mongo_standalone_route_bucket_candidates_scope_by_listen_port() {
             && body.contains("i32::from(port)")
             && body.contains("Bson::Null"),
         "standalone Mongo bucket lookup must scope by listen_port:\n{body}"
+    );
+}
+
+/// Overwrite the stored core V001 checksum in a migrated SQLite file and
+/// return the previous value, so the next migration run on that file fails
+/// closed with `checksum_mismatch` until the original is written back.
+async fn set_sqlite_core_migration_checksum(db_url: &str, checksum: &str) -> String {
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(db_url)
+        .await
+        .unwrap();
+    let previous: String =
+        sqlx::query_scalar("SELECT checksum FROM _ferrum_migrations WHERE version = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE _ferrum_migrations SET checksum = ? WHERE version = 1")
+        .bind(checksum)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    previous
+}
+
+/// Issue #7033: deferred (offline-bootstrap) migrations used to run after the
+/// primary pool was swapped in, so a migration failure returned `Err` with the
+/// primary pool live while topology still reported failover. Migrations now
+/// run against the staged pool first: a failure must leave the failover pool
+/// and topology fully intact, and a later successful failback must apply the
+/// deferred migrations and mark primary.
+#[tokio::test]
+async fn failback_deferred_migration_failure_keeps_failover_pool_and_topology() {
+    use ferrum_edge::_test_support::database_store_set_migrations_pending_for_test;
+    use ferrum_edge::config::db_backend::primary_failback_fenced;
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let primary_rw_url = format!("sqlite:{}?mode=rw", primary_path.to_string_lossy());
+    let primary_create_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+
+    let mut store = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_rw_url,
+        std::slice::from_ref(&failover_url),
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    store.set_failover_allow_writes(true);
+    seed_sqlite_namespace(&failover_url, "failover-ns").await;
+    seed_sqlite_namespace(&primary_create_url, "primary-ns").await;
+    let original_checksum =
+        set_sqlite_core_migration_checksum(&primary_create_url, "tampered-7033").await;
+    database_store_set_migrations_pending_for_test(&store, true);
+
+    let before = store.failover_topology_status();
+    assert!(!before.primary_active, "startup must land on failover");
+    assert!(before.allow_writes);
+    assert!(!before.primary_failback_fenced);
+
+    let error = store
+        .reconnect(&primary_rw_url)
+        .await
+        .expect_err("failback must fail when the deferred migrations fail");
+    assert!(
+        format!("{error:#}").contains("checksum_mismatch"),
+        "failback must surface the migration failure: {error:#}"
+    );
+    assert!(
+        !primary_failback_fenced(&error),
+        "a migration failure is not the failback fence: {error:#}"
+    );
+
+    let after = store.failover_topology_status();
+    assert!(
+        !after.primary_active,
+        "a failed failback must leave topology on failover"
+    );
+    assert_eq!(after.active_url_redacted, before.active_url_redacted);
+    assert_eq!(after.failover_since_unix_ms, before.failover_since_unix_ms);
+    assert!(!after.primary_failback_fenced);
+    let namespaces = store.list_namespaces().await.unwrap();
+    assert!(
+        namespaces.contains(&"failover-ns".to_string())
+            && !namespaces.contains(&"primary-ns".to_string()),
+        "the failover pool must stay the active pool after a failed failback: {namespaces:?}"
+    );
+
+    // Once the primary's migration history is repaired, failback succeeds,
+    // applies the still-pending deferred migrations and marks primary.
+    set_sqlite_core_migration_checksum(&primary_create_url, &original_checksum).await;
+    store
+        .reconnect(&primary_rw_url)
+        .await
+        .expect("failback must succeed once the deferred migrations succeed");
+    let status = store.failover_topology_status();
+    assert!(status.primary_active);
+    assert!(status.failover_since_unix_ms.is_none());
+    assert!(!status.primary_failback_fenced);
+    let namespaces = store.list_namespaces().await.unwrap();
+    assert!(
+        namespaces.contains(&"primary-ns".to_string())
+            && !namespaces.contains(&"failover-ns".to_string()),
+        "the primary pool must be active after the successful failback: {namespaces:?}"
+    );
+    assert!(
+        !store.maybe_apply_deferred_migrations().await.unwrap(),
+        "the successful failback must have consumed the deferred migrations"
     );
 }

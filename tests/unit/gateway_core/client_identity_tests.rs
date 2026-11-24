@@ -11,11 +11,9 @@
 //! that connection migration refreshes.
 
 use ferrum_edge::util::client_identity::{
-    canonical_client_ip_text, canonical_ip, canonical_ip_arc, canonical_ip_string,
-    canonical_socket_addr, parse_canonical_client_ip, parse_client_ip_literal,
-    rate_limit_ip_string,
+    canonical_ip, canonical_ip_arc, canonical_ip_string, canonical_socket_addr,
+    parse_canonical_client_ip, parse_client_ip_literal, rate_limit_ip_string,
 };
-use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 fn ip(value: &str) -> IpAddr {
@@ -120,21 +118,6 @@ fn canonical_socket_addr_folds_the_address_and_keeps_the_port() {
 }
 
 // ── Text identities ──────────────────────────────────────────────────
-
-#[test]
-fn canonical_text_folds_mapped_and_borrows_everything_else() {
-    assert_eq!(canonical_client_ip_text("::ffff:192.0.2.10"), "192.0.2.10");
-    assert_eq!(canonical_client_ip_text("::FFFF:192.0.2.10"), "192.0.2.10");
-    // Already-canonical gateway identities are returned untouched, without an
-    // allocation — the hot-path contract for per-connection key building.
-    for value in ["192.0.2.10", "2001:db8::10", "consumer:alice"] {
-        assert!(
-            matches!(canonical_client_ip_text(value), Cow::Borrowed(_)),
-            "already-canonical identity must be borrowed: {value}"
-        );
-        assert_eq!(canonical_client_ip_text(value), value);
-    }
-}
 
 #[test]
 fn parse_canonical_client_ip_folds_bracketed_and_zoned_literals() {

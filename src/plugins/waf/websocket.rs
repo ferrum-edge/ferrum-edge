@@ -20,12 +20,15 @@
 //!   bounded by the parser
 //!   (`FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES` /
 //!   `..._SECONDS`), so this hook never has to hold partial state.
-//! * **Compression** — the gateway never negotiates `permessage-deflate`. The
-//!   client's `Sec-WebSocket-Extensions` offer is stripped before the backend
-//!   handshake (`is_websocket_backend_strip_header`) and no negotiated
-//!   extension is echoed back to the client
-//!   (`WEBSOCKET_TRANSPORT_MANAGED_RESPONSE_HEADERS`), so no `rsv1` payload can
-//!   exist end to end on any frontend.
+//! * **Compression** — under the default `websocket_permessage_deflate:
+//!   strip`, the client's `Sec-WebSocket-Extensions` offer is stripped before
+//!   the backend handshake (`headers::is_websocket_backend_request_strip_header`)
+//!   and no negotiated extension is echoed back to the client
+//!   (`WEBSOCKET_TRANSPORT_MANAGED_RESPONSE_HEADERS`). With `terminate` the
+//!   gateway negotiates `permessage-deflate` with each peer itself and inflates
+//!   every message before the relay parses it. `passthrough` is refused at
+//!   config validation on any proxy where a `waf` is effective. Either way this
+//!   hook only ever sees uncompressed message payloads.
 //! * **Size** — the relay's parser ceilings (`EffectiveWsSizeLimits`) bound the
 //!   largest message that can ever reach this hook; the WAF's own
 //!   `max_scan_bytes` / `on_body_too_large` policy then decides an
@@ -73,7 +76,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use super::rules::{RuleAction, Severity};
-use super::scan::{ScanOutcome, ScanSubject};
+use super::scan::{BodyExtent, ScanOutcome, ScanSubject};
 use super::{BodyDirection, GlobalMode, TimeoutAction, TooLargeAction, Waf};
 use crate::plugins::{
     Plugin, ProxyProtocol, RequestContext, WebSocketFrameDirection, WebSocketSizeLimits,
@@ -141,11 +144,12 @@ impl WsSessionPolicy {
             inspect_client_to_backend && waf.has_enforcing_body_policy(BodyDirection::Request, ctx);
         let enforcing_backend_to_client = inspect_backend_to_client
             && waf.has_enforcing_body_policy(BodyDirection::Response, ctx);
-        // The `(mode == enforce && on_body_too_large == block)` term both HTTP
-        // body predicates OR in: a strict size cap is a blocking body
-        // disposition on its own, independent of per-rule `action`.
-        let strict_size_cap = waf.config.mode == GlobalMode::Enforce
-            && waf.config.on_body_too_large == TooLargeAction::Block;
+        // The `(on_body_too_large == block && strict_block_applies)` term both
+        // HTTP body predicates OR in: a strict size cap is a blocking body
+        // disposition on its own, independent of per-rule `action`, unless a
+        // `header_present` secret exempted the upgrade request.
+        let strict_size_cap =
+            waf.config.on_body_too_large == TooLargeAction::Block && waf.strict_block_applies(ctx);
         Self {
             suppressed_by_request: waf.exemptions.suppresses_rule_for_request(ctx),
             rule_conditions: waf
@@ -217,8 +221,8 @@ fn body_direction(direction: WebSocketFrameDirection) -> BodyDirection {
 
 pub(super) fn direction_label(direction: WebSocketFrameDirection) -> &'static str {
     match direction {
-        WebSocketFrameDirection::ClientToBackend => "client->backend",
-        WebSocketFrameDirection::BackendToClient => "backend->client",
+        WebSocketFrameDirection::ClientToBackend => "client_to_backend",
+        WebSocketFrameDirection::BackendToClient => "backend_to_client",
     }
 }
 
@@ -279,7 +283,11 @@ impl WafWsSession {
             TooLargeAction::Skip => return Err(None),
             TooLargeAction::ScanTruncated => false,
             TooLargeAction::FailClosed => self.policy.enforces(governed),
-            TooLargeAction::Block => self.waf.config.mode == GlobalMode::Enforce,
+            // A `header_present` secret on the upgrade request exempts the
+            // session from the strict cap too, as `Waf::clamp_body` does.
+            TooLargeAction::Block => {
+                self.waf.config.mode == GlobalMode::Enforce && !self.policy.suppressed_by_request
+            }
         };
         // A block is terminal for the session and always recorded. The
         // non-blocking prefix-scan arm is a lost-coverage signal that can
@@ -448,7 +456,9 @@ impl WafWsSession {
             return None;
         }
         let block = match self.waf.config.on_scan_timeout {
-            TimeoutAction::Block => true,
+            // A `header_present`-exempt session is not closed on a clean but
+            // late message either, mirroring `Waf::finish_timeout`.
+            TimeoutAction::Block => !self.policy.suppressed_by_request,
             TimeoutAction::FailClosed => self.policy.timeout_enforces(body_direction(direction)),
             TimeoutAction::Allow | TimeoutAction::LogAndAllow => false,
         };
@@ -477,14 +487,47 @@ impl WafWsSession {
     }
 }
 
+impl Waf {
+    /// Bind this instance to the upgrade `ctx` exactly as the relay does and
+    /// decide a CLEAN message in `direction` whose scan missed its deadline;
+    /// `true` when the session closes. Not a production API: external tests
+    /// use it to pin the WebSocket `on_scan_timeout` disposition without
+    /// depending on how long a real scan takes.
+    #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests
+    pub fn ws_clean_timed_out_message_closes_for_test(
+        self: Arc<Self>,
+        ctx: &RequestContext,
+        direction: WebSocketFrameDirection,
+    ) -> bool {
+        let policy = WsSessionPolicy::from_upgrade(&self, ctx);
+        let session = WafWsSession { waf: self, policy };
+        let outcome = ScanOutcome {
+            timed_out: true,
+            ..ScanOutcome::default()
+        };
+        session
+            .finish("test-proxy", 0, direction, &outcome)
+            .is_some()
+    }
+}
+
 #[async_trait]
 impl Plugin for WafWsSession {
     fn name(&self) -> &str {
         self.waf.name()
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         self.waf.priority()
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
@@ -538,21 +581,23 @@ impl Plugin for WafWsSession {
             return None;
         }
 
+        let message_len = payload.len();
         let payload = match self.clamp(proxy_id, connection_id, direction, payload) {
             Ok(value) => value,
             Err(terminal) => return terminal,
         };
+        let extent = BodyExtent::of(payload.len() < message_len);
 
         // The scan subject is built inside the closure so nothing but `&self`
         // (and the message slice) is held across the budget yield.
         let outcome = self
             .waf
-            .run_body_scan_with_budget(|| {
+            .run_body_scan_with_budget_for_len(payload.len(), || {
                 let subject = ScanSubject::WebSocketSession(&self.policy);
                 match governed {
-                    BodyDirection::Request => {
-                        self.waf.scan_request_body_rules(subject, payload, None)
-                    }
+                    BodyDirection::Request => self
+                        .waf
+                        .scan_request_body_rules(subject, payload, None, extent),
                     BodyDirection::Response => {
                         self.waf.scan_response_body_rules(subject, payload, None)
                     }

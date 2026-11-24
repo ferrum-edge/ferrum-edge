@@ -366,11 +366,14 @@ docker run -d \
   -e FERRUM_MODE=database \
   -e FERRUM_DB_TYPE=mysql \
   -e FERRUM_DB_TLS_MODE=verify-full \
-  -e FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.crt \
+  -e FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.pem \
   -e FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
   -v $(pwd)/certs:/certs:ro \
   ferrum-edge
 ```
+
+The gateway trusts the same `certs/ca.pem` that MySQL loads with `--ssl-ca`;
+that CA must be the one that signed `server-cert.pem`.
 
 ## MongoDB
 
@@ -450,7 +453,7 @@ docker run -d --name ferrum-edge \
   -e FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key \
   -e FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret" \
   -v /path/to/certs:/certs:ro \
-  docker.io/ferrumedge/ferrum-edge:0.9.17
+  docker.io/ferrumedge/ferrum-edge:0.9.21
 ```
 
 **Note on MongoDB URL path vs `FERRUM_MONGO_DATABASE`:** The database name in the URL path (e.g., `mongodb://host/mydb`) is the **auth database** — where MongoDB looks up credentials. `FERRUM_MONGO_DATABASE` controls which database the gateway stores config in. For authenticated connections, use `?authSource=admin` (or your auth DB) and set `FERRUM_MONGO_DATABASE` separately. For no-auth dev setups, the URL path is ignored.

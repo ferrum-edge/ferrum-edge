@@ -38,7 +38,7 @@
 //! always rolled back.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use tokio::sync::Notify;
@@ -56,7 +56,6 @@ pub type DeliveryCallback = Arc<dyn Fn(DispatchSettle) + Send + Sync>;
 /// Tracks in-flight dispatch tasks for one plugin-instance generation.
 #[derive(Debug)]
 pub struct DispatchGeneration {
-    id: u64,
     admitting: AtomicBool,
     /// Cooperative cancel: set on retire/Drop so retry loops stop.
     cancelled: AtomicBool,
@@ -71,17 +70,15 @@ pub struct DispatchGeneration {
     /// retirement immediately instead of on a polling cadence.
     cancel_signal: Notify,
     metrics: Arc<DeliveryMetrics>,
-    next_task_id: AtomicU64,
 }
 
 impl DispatchGeneration {
-    pub fn new(id: u64) -> Arc<Self> {
-        Self::with_metrics(id, Arc::clone(global_metrics()))
+    pub fn new() -> Arc<Self> {
+        Self::with_metrics(Arc::clone(global_metrics()))
     }
 
-    pub fn with_metrics(id: u64, metrics: Arc<DeliveryMetrics>) -> Arc<Self> {
+    pub fn with_metrics(metrics: Arc<DeliveryMetrics>) -> Arc<Self> {
         Arc::new(Self {
-            id,
             admitting: AtomicBool::new(true),
             cancelled: AtomicBool::new(false),
             active_spawns: AtomicUsize::new(0),
@@ -89,12 +86,7 @@ impl DispatchGeneration {
             drained: Notify::new(),
             cancel_signal: Notify::new(),
             metrics,
-            next_task_id: AtomicU64::new(1),
         })
-    }
-
-    pub fn id(&self) -> u64 {
-        self.id
     }
 
     pub fn is_admitting(&self) -> bool {
@@ -111,11 +103,6 @@ impl DispatchGeneration {
 
     pub fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::Acquire)
-    }
-
-    /// Stop admitting new work without cancelling in-flight tasks.
-    pub fn close_admission(&self) {
-        self.admitting.store(false, Ordering::Release);
     }
 
     /// Stop admitting and signal cooperative cancel to every in-flight task.
@@ -290,13 +277,11 @@ impl DispatchGeneration {
                 invoke_delivery_callback(
                     &callback,
                     DispatchSettle::Abandoned(AbandonReason::GenerationClosed),
-                    channel_type,
                 );
             }
             return false;
         }
         let generation = Arc::clone(self);
-        let _task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
 
         // Reserve local drain accounting before asking the delivery registry so
         // a successful handoff cannot race a zero in-flight read on Drop. The
@@ -406,13 +391,6 @@ impl DispatchSettle {
     pub const fn is_success(self) -> bool {
         matches!(self, Self::Succeeded)
     }
-
-    pub const fn abandon_reason(self) -> Option<AbandonReason> {
-        match self {
-            Self::Abandoned(reason) => Some(reason),
-            _ => None,
-        }
-    }
 }
 
 /// Shared exactly-once settlement edge. The caller keeps a reference until the
@@ -505,7 +483,7 @@ impl DeliveryTaskSettlement {
             }
         }
         if let Some(callback) = self.on_settle.as_ref() {
-            invoke_delivery_callback(callback, outcome, self.channel_type);
+            invoke_delivery_callback(callback, outcome);
         }
         // A drained generation guarantees producer settlement is complete, not
         // merely that the transport future returned.
@@ -513,11 +491,7 @@ impl DeliveryTaskSettlement {
     }
 }
 
-pub(crate) fn invoke_delivery_callback(
-    callback: &DeliveryCallback,
-    outcome: DispatchSettle,
-    _channel_type: &'static str,
-) {
+pub(crate) fn invoke_delivery_callback(callback: &DeliveryCallback, outcome: DispatchSettle) {
     // Shipping profiles set `panic = "abort"` (issue #4166): a panicking
     // settle callback terminates the process. There is no unwind boundary.
     callback(outcome);

@@ -3,16 +3,35 @@
 //! This module provides a reusable SigV4 implementation for any AWS service.
 //! Used by `serverless_function` (Lambda) and `ai_federation` (Bedrock).
 
-use crate::fips::approved::{HmacSha256, Sha256};
+use super::cert_hash::sha256_hex_lower;
+use crate::fips::approved::HmacSha256;
 use url::Url;
 
 /// AWS credentials and region for SigV4 signing.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AwsSigV4Config {
     pub region: String,
     pub access_key_id: String,
     pub secret_access_key: String,
     pub session_token: Option<String>,
+}
+
+/// Hand-written so `{:?}` on any config that embeds signing credentials never
+/// prints the secret key or session token. The access key id is an
+/// identifier, not a secret, and stays visible for diagnosis.
+impl std::fmt::Debug for AwsSigV4Config {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AwsSigV4Config")
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"[REDACTED]")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 /// URI-encode a string per AWS SigV4 rules.
@@ -125,13 +144,6 @@ fn canonical_signed_host(parsed_url: &Url) -> Result<String, String> {
     }
 }
 
-/// SHA-256 hash of data, returned as lowercase hex.
-pub fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
-}
-
 /// HMAC-SHA256 keyed hash.
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
     let mut mac = HmacSha256::new_from_slice(key)
@@ -187,7 +199,7 @@ pub fn sign_request(
     let canonical_uri = uri_encode(parsed_url.path(), false);
     let canonical_querystring = canonical_query_string(parsed_url.query().unwrap_or(""));
 
-    let payload_hash = sha256_hex(payload);
+    let payload_hash = sha256_hex_lower(payload);
 
     // Canonical headers (must be sorted alphabetically by header name).
     // When a session token is present, x-amz-security-token is included.
@@ -228,7 +240,7 @@ pub fn sign_request(
         "AWS4-HMAC-SHA256\n{}\n{}\n{}",
         amz_date,
         credential_scope,
-        sha256_hex(canonical_request.as_bytes())
+        sha256_hex_lower(canonical_request.as_bytes())
     );
 
     let signing_key = derive_signing_key(
@@ -276,6 +288,17 @@ mod tests {
             .with_ymd_and_hms(2024, 1, 15, 12, 0, 0)
             .single()
             .expect("fixed timestamp should be valid")
+    }
+
+    #[test]
+    fn debug_output_redacts_signing_secrets() {
+        let mut config = config();
+        config.session_token = Some("session-token-value".to_string());
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("wJalrXUtnFEMI"), "{rendered}");
+        assert!(!rendered.contains("session-token-value"), "{rendered}");
+        assert!(rendered.contains("AKIAIOSFODNN7EXAMPLE"), "{rendered}");
+        assert!(rendered.contains("us-east-1"), "{rendered}");
     }
 
     fn authorization_for(url: &str) -> String {

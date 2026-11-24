@@ -32,7 +32,6 @@ use crate::tls::shared_store::{
 use crate::tls::source::MaterialKind;
 
 const STORE_FILE_NAME: &str = "managed-tls.json";
-const DEFAULT_STORE_DIR: &str = "./ferrum-managed-tls";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -265,15 +264,8 @@ impl ManagedTlsStore {
         Self::open_with_limits(dir, max_material_bytes, max_records, None)
     }
 
-    /// Open a managed store with explicit material and record ceilings.
-    ///
-    /// Production callers should prefer [`Self::open`], which snapshots the
-    /// validated runtime policy. Tests inject small finite limits here instead
-    /// of mutating process-global policy state. Rejects `0` material bytes and
-    /// caps values above the hard maxima before any store I/O.
-    ///
-    /// `max_document_bytes` of `None` uses `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`.
-    #[allow(dead_code)] // External unit tests; production uses open.
+    /// As [`Self::open`], with an explicit material ceiling (the record ceiling
+    /// still comes from the environment).
     pub fn open_with_material_limit(
         dir: impl Into<PathBuf>,
         max_material_bytes: usize,
@@ -283,7 +275,15 @@ impl ManagedTlsStore {
         Self::open_with_limits(dir, max_material_bytes, max_records, None)
     }
 
-    /// Open with explicit material, record, and optional document ceilings.
+    /// Open a managed store with explicit material, record, and optional
+    /// document ceilings.
+    ///
+    /// Production callers should prefer [`Self::open`], which snapshots the
+    /// validated runtime policy. Tests inject small finite limits here instead
+    /// of mutating process-global policy state. Rejects `0` material bytes and
+    /// caps values above the hard maxima before any store I/O.
+    ///
+    /// `max_document_bytes` of `None` uses `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`.
     pub fn open_with_limits(
         dir: impl Into<PathBuf>,
         max_material_bytes: usize,
@@ -319,7 +319,6 @@ impl ManagedTlsStore {
     }
 
     /// Configured logical record admission ceiling.
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn max_records(&self) -> usize {
         self.max_records
     }
@@ -328,7 +327,6 @@ impl ManagedTlsStore {
     ///
     /// Non-secret; exposed so operators and tests can observe that a write
     /// committed and that another instance's write became visible.
-    #[allow(dead_code)]
     pub fn store_version(&self) -> Result<u64, ManagedTlsError> {
         Ok(self.file.version()?)
     }
@@ -411,7 +409,39 @@ impl ManagedTlsStore {
         })
     }
 
-    #[allow(dead_code)] // External unit tests; production uses material_with_limit.
+    /// Delete `id` only while `still_authorized` holds (issue #7394).
+    ///
+    /// The check runs under the store's exclusive lock immediately before the
+    /// record is removed, and again after the removal has been persisted. If
+    /// it fails before, nothing changes; if it fails after (the caller's lease
+    /// lapsed while persistence I/O stalled), the record is restored before
+    /// the lock is released. Either way the result is `Ok(None)`, so a delete
+    /// made without authority is never left in place or reported as done.
+    pub fn delete_if_authorized(
+        &self,
+        id: &str,
+        still_authorized: impl Fn() -> bool,
+    ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
+        validate_managed_id(id)?;
+        let id = id.to_string();
+        let outcome = self.file.mutate_if_confirmed(
+            |document| {
+                if !document.records.contains_key(&id) {
+                    return Err(ManagedTlsError::NotFound(id.clone()));
+                }
+                if !still_authorized() {
+                    return Ok((false, None));
+                }
+                match document.records.remove(&id) {
+                    Some(record) => Ok((true, Some(record))),
+                    None => Err(ManagedTlsError::NotFound(id.clone())),
+                }
+            },
+            &still_authorized,
+        )?;
+        Ok(outcome.flatten())
+    }
+
     pub fn material(
         &self,
         identifier: &str,
@@ -695,6 +725,17 @@ pub(crate) fn validate_source_reference_kind(
     field_kind: MaterialKind,
 ) -> Result<(), ManagedTlsError> {
     ManagedSourceReference::parse(identifier, field_kind).map(|_| ())
+}
+
+/// The record id a `managed://` JWKS reference names (the identifier after the
+/// scheme, for example `jwks/<id>#jwks`), after the same grammar and kind
+/// checks every managed load applies. Reads nothing from the store.
+///
+/// Used by the JWKS consumers (`jwks_auth`, `oidc_relying_party`) to refuse a
+/// non-JWKS fragment or collection at config load and to canonicalize every
+/// accepted spelling onto one shared key store (issue #7277).
+pub fn jwks_reference_record_id(identifier: &str) -> Result<String, ManagedTlsError> {
+    ManagedSourceReference::parse(identifier, MaterialKind::Jwks).map(|reference| reference.id)
 }
 
 impl ManagedSourceReference {
@@ -1040,25 +1081,36 @@ fn validate_managed_id(id: &str) -> Result<(), ManagedTlsError> {
     validate_resource_id(id).map_err(ManagedTlsError::InvalidId)
 }
 
-fn managed_store_dir_from_env() -> PathBuf {
-    let path = crate::config::env_config::tls_managed_store_path_from_env();
-    if path.is_empty() {
-        PathBuf::from(DEFAULT_STORE_DIR)
-    } else {
-        PathBuf::from(path)
-    }
-}
+/// Only a successfully opened store is cached. Opening reads and parses the
+/// authoritative document, so a failure (unreadable, torn, or oversized
+/// `managed-tls.json`, an unwritable store directory) must not be latched for
+/// the process lifetime: every consumer (managed JWKS key stores, `managed://`
+/// TLS sources, `/admin/tls/*`) would otherwise stay unavailable after the
+/// store is repaired, until a restart.
+static GLOBAL_MANAGED_TLS_STORE: OnceLock<Arc<ManagedTlsStore>> = OnceLock::new();
+/// Serializes open attempts so concurrent first callers open the store once.
+static GLOBAL_MANAGED_TLS_STORE_OPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-static GLOBAL_MANAGED_TLS_STORE: OnceLock<Result<Arc<ManagedTlsStore>, String>> = OnceLock::new();
-
+/// The process managed TLS store (`FERRUM_TLS_MANAGED_STORE_PATH`).
+///
+/// The first successful open is cached; a failed open is retried by the next
+/// call, so a store that is repaired after a failure is picked up without a
+/// restart. Blocking: an open reads the store document.
 pub fn global_store() -> Result<Arc<ManagedTlsStore>, String> {
-    GLOBAL_MANAGED_TLS_STORE
-        .get_or_init(|| {
-            ManagedTlsStore::open(managed_store_dir_from_env())
-                .map(Arc::new)
-                .map_err(|error| error.to_string())
-        })
-        .clone()
+    if let Some(store) = GLOBAL_MANAGED_TLS_STORE.get() {
+        return Ok(Arc::clone(store));
+    }
+    let _open = GLOBAL_MANAGED_TLS_STORE_OPEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(store) = GLOBAL_MANAGED_TLS_STORE.get() {
+        return Ok(Arc::clone(store));
+    }
+    let store = Arc::new(
+        ManagedTlsStore::open(crate::tls::store_dir::managed_store_dir())
+            .map_err(|error| error.to_string())?,
+    );
+    Ok(Arc::clone(GLOBAL_MANAGED_TLS_STORE.get_or_init(|| store)))
 }
 
 #[cfg(test)]

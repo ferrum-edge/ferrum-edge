@@ -24,6 +24,10 @@ TOXIPROXY_ACCEPTED_CLIENT_FIELDS = frozenset(
 MAX_FIXTURE_COUNT = 999_999_999_999_999_999
 
 
+_BASE64_LINE_RE = re.compile(r"[A-Za-z0-9+/=]+")
+_TOXIPROXY_NAME_RE = re.compile(r"[a-z0-9-]{1,64}")
+
+
 def timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -139,7 +143,7 @@ def bundle_b64der() -> None:
             encoded = None
         elif encoded is None:
             raise SystemExit("unexpected content outside SPIRE certificate")
-        elif re.fullmatch(r"[A-Za-z0-9+/=]+", line) is None:
+        elif _BASE64_LINE_RE.fullmatch(line) is None:
             raise SystemExit("invalid certificate line in SPIRE bundle")
         else:
             encoded.append(line)
@@ -184,7 +188,7 @@ def prometheus_value(metric: str, selector: str) -> None:
 
 
 def toxiproxy_accepted_client_count(proxy: str) -> None:
-    if re.fullmatch(r"[a-z0-9-]{1,64}", proxy) is None:
+    if _TOXIPROXY_NAME_RE.fullmatch(proxy) is None:
         raise SystemExit("invalid Toxiproxy fixture proxy name")
 
     count = 0

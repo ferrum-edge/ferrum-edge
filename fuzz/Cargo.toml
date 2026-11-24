@@ -30,8 +30,10 @@ proptest = "=1.6.0"
 # This is an isolated Cargo workspace, so it does not inherit the root
 # workspace's patched protocol and security dependencies. Keep these paths in
 # lockstep with the root `[patch.crates-io]` table or the fuzz lane would
-# compile and exercise different code from the production binary.
+# compile and exercise different code from the production binary
+# (tests/unit/gateway_core/fuzz_target_schedule_parity_tests.rs enforces it).
 [patch.crates-io]
+sqlx-core = { path = "../vendor/sqlx-core-0.9.1-ferrum-patched" }
 reqwest = { path = "../vendor/reqwest-0.13.4-ferrum-patched" }
 h3 = { path = "../vendor/h3-0.0.8-ferrum-patched" }
 h3-quinn = { path = "../vendor/h3-quinn-0.0.10-ferrum-patched" }
@@ -91,16 +93,82 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ocsp_response"
+path = "fuzz_targets/ocsp_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jwt_svid"
+path = "fuzz_targets/jwt_svid.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_material"
+path = "fuzz_targets/tls_material.rs"
+test = false
+doc = false
+bench = false
+
+# Sanitizer build profiles.
+#
+# `cargo fuzz run` (cargo-fuzz 0.13.1, as pinned in fuzz-smoke-main.yml and
+# fuzz.yml) builds with `cargo build --release`, so `[profile.release]` below is
+# the profile both libFuzzer lanes compile with ("Finished `release` profile" in
+# the hosted log). cargo-fuzz passes `--config 'profile.release.debug="line-tables-only"'`
+# plus `-Ccodegen-units=16`, ASan, and SanitizerCoverage via RUSTFLAGS, without
+# setting `-Copt-level`, so the `opt-level` settings here take effect. This crate
+# has no ancestor workspace, so it is its own workspace root and these profiles apply.
+#
+# At Cargo's release default of `opt-level = 3`, compiling the `ferrum-edge`
+# library with ASan + SanCov drove largest-process RSS to 14.66 GiB (with 2.33 GiB
+# host swap used) and host swap to 9.26 GiB (with 12.53 GiB largest-process RSS)
+# on a 15.6 GiB runner (MemAvailable 0.17 GiB, ~48.6 GiB of swap I/O, 39 minutes
+# for that one crate in run 44461627224), and the smoke lane lost the runner in
+# 5 of 30 pushes to main. `ferrum-edge` is the crate that held the peak:
+#
+# - `[profile.release.package.ferrum-edge]` drops that crate (and the generic
+#   instances emitted during its compilation) to `opt-level = 1`. A package
+#   override applies to any package in the graph, including this non-member path
+#   dependency, and leaves `panic`/`lto` (which overrides cannot set) with the
+#   profile. O1 is the floor clang's AddressSanitizer documentation gives for
+#   reasonable performance: it keeps trivial-helper inlining and basic scalar
+#   cleanups without O3's aggressive inlining, unrolling, and vectorization,
+#   which multiply the IR LLVM holds (and instruments) for each codegen unit.
+# - Target dependencies and the fuzz target binaries stay at `opt-level = 2`
+#   (host build scripts and proc macros keep Cargo's O0 default). Those crates
+#   were never the memory peak, so dropping everything to O1 would slow
+#   dependencies for little peak-memory gain.
+# - `debug = "line-tables-only"` aligns direct `cargo build --release` builds
+#   with what cargo-fuzz 0.13.1 already passes to the hosted lanes, keeping
+#   file:line and inlined-frame data for ASan and libFuzzer stack traces.
+#
+# Historical O3 timings showed headroom (the smoke's `-runs=512` finished in
+# 0-2 seconds per target against the 8 second cap); O1 execution speed and
+# memory savings are verified from hosted `Fuzz build resources:` logs and each
+# target's `Done 512 runs` output. The weekly lane is time-bounded
+# (`-max_total_time=300`), so slower execution lowers its execution count.
+# `[profile.fuzz]` and `[profile.fuzz-with-sanitizer]` are not selected by
+# cargo-fuzz 0.13.1; they inherit `release` (including the package override) so
+# any build that does select them gets the same profile.
 [profile.release]
-debug = 1
+opt-level = 2
+debug = "line-tables-only"
+
+[profile.release.package.ferrum-edge]
+opt-level = 1
 
 [profile.dev]
 debug = 1
 
 [profile.fuzz]
 inherits = "release"
-debug = 1
+debug = "line-tables-only"
 
 [profile.fuzz-with-sanitizer]
 inherits = "release"
-debug = 1
+debug = "line-tables-only"

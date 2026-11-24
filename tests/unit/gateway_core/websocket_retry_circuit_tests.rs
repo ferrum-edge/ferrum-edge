@@ -38,8 +38,8 @@ fn assert_websocket_success_records_against_current_key(src: &str, path_label: &
         .unwrap_or_else(|| panic!("{path_label}: success accounting block not found"));
     let success_tail = &src[success_start..];
     let record_success = success_tail
-        .find("cb.record_success(cb_probe.take_slot())")
-        .unwrap_or_else(|| panic!("{path_label}: record_success call not found"));
+        .find("BreakerOutcome::Success")
+        .unwrap_or_else(|| panic!("{path_label}: success settle call not found"));
     let success_block = &success_tail[..record_success];
 
     assert!(

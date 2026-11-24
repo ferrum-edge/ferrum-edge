@@ -36,7 +36,6 @@ use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, EnvConfig, Opera
 use ferrum_edge::modes::file::{ServeOptions, serve};
 use jsonwebtoken::Algorithm;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
@@ -152,11 +151,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
         background_drain_timeout: Some(Duration::from_secs(5)),
     };
 
-    let (shutdown_tx, _) = watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
-        let _ = signal_tx.send(true);
+        signal_tx.shutdown();
     });
 
     let handles = serve(env_config, config, opts, shutdown_tx)

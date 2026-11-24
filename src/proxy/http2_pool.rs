@@ -9,10 +9,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use hyper::client::conn::{http1, http2};
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -118,6 +118,7 @@ use crate::backend_conn_limit::{PooledConnectionAdmission, SharedBackendConnecti
 use crate::config::PoolConfig;
 use crate::config::types::{GatewayConfig, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
+use crate::pool::shard_fill::{ShardCreateBackoff, ShardCreateGuard, ShardFill, ShardRing};
 use crate::pool::{GenericPool, PoolCreateCaller, PoolManager};
 use crate::proxy::body::{DirectH1RequestBody, DirectH2RequestBody};
 use crate::tls::TlsPolicy;
@@ -156,6 +157,7 @@ thread_local! {
 /// so in-path 413 enforcement is unchanged. The limiter treats
 /// `max_bytes = 0` as deny-all — callers must never pass the operator
 /// spelling `0` into it (issue #3942).
+///
 /// One checked-out direct-H2 transport.
 ///
 /// Its socket is deliberately not exposed for a per-request post-EOS drain
@@ -164,16 +166,33 @@ thread_local! {
 /// request.
 ///
 /// Deref/DerefMut to the sender so every existing `ready()` / `send_request()` /
-/// `is_closed()` call site is unchanged; cloning is one `Arc` bump on top of
-/// hyper's own clone.
+/// `is_closed()` call site is unchanged; cloning is hyper's own sender clone.
 #[derive(Clone, Debug)]
 pub struct Http2Sender {
     inner: http2::SendRequest<DirectH2RequestBody>,
+    /// The backend's current `SETTINGS_MAX_CONCURRENT_STREAMS`, kept current
+    /// by this connection's driver. An open hyper HTTP/2 sender reports ready
+    /// however many streams it carries, so this is what tells the pool that a
+    /// backend allows no new streams (a draining limit of 0) or fewer than a
+    /// frontend connection wants to pin.
+    peer_max_streams: Arc<AtomicUsize>,
 }
 
 impl Http2Sender {
-    pub(crate) fn new(inner: http2::SendRequest<DirectH2RequestBody>) -> Self {
-        Self { inner }
+    pub(crate) fn new(
+        inner: http2::SendRequest<DirectH2RequestBody>,
+        peer_max_streams: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            inner,
+            peer_max_streams,
+        }
+    }
+
+    /// The backend's current `SETTINGS_MAX_CONCURRENT_STREAMS` as the
+    /// connection driver last saw it.
+    pub fn peer_max_concurrent_streams(&self) -> usize {
+        self.peer_max_streams.load(Ordering::Relaxed)
     }
 
     /// No per-request socket is available for this multiplexed transport.
@@ -475,7 +494,7 @@ impl Http2PoolManager {
 
                 let io = TokioIo::new(tls_stream);
                 let builder = Self::build_h2_builder(pool_config);
-                let (sender, conn) = builder.handshake(io).await.map_err(|e| {
+                let (sender, mut conn) = builder.handshake(io).await.map_err(|e| {
                     Http2PoolError::BackendUnavailable {
                         message: format!("h2 handshake failed: {}", e),
                         source: Some(BackendUnavailableSource::Hyper(e)),
@@ -484,17 +503,27 @@ impl Http2PoolManager {
 
                 // ALPN has already proved H2 for this TLS candidate.
                 let observation = H2DriverObservation::new("backend_h2_tls");
+                let peer_max_streams = Arc::new(AtomicUsize::new(conn.current_max_send_streams()));
+                let driver_peer_max_streams = Arc::clone(&peer_max_streams);
                 tokio::spawn(async move {
                     // The `maxConnections` slot lives exactly as long as the
                     // connection driver, i.e. as long as the socket is open.
                     let _conn_slot = conn_slot;
-                    let result = conn.await;
+                    let result = crate::proxy::grpc_proxy::drive_sampling_peer_max_streams(
+                        &mut conn,
+                        |conn| conn.current_max_send_streams(),
+                        &driver_peer_max_streams,
+                    )
+                    .await;
                     observation.finish(result.as_ref().err().map(|e| e as &dyn std::error::Error));
                     if let Err(e) = result {
                         debug!("http2_pool: TLS connection closed: {}", e);
                     }
                 });
-                Ok(Http2CandidateOutcome::Established(Http2Sender::new(sender)))
+                Ok(Http2CandidateOutcome::Established(Http2Sender::new(
+                    sender,
+                    peer_max_streams,
+                )))
             }
         })
         .await
@@ -537,35 +566,10 @@ impl Http2PoolManager {
         })?
     }
 
+    /// The direct-H2 pool's HTTP/2 client builder: the shared `PoolConfig`
+    /// builder every H2 pool family uses.
     fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
-        let mut builder = http2::Builder::new(TokioExecutor::new());
-        builder.timer(TokioTimer::new());
-
-        if pool_config.enable_http2 {
-            builder
-                .keep_alive_interval(Duration::from_secs(
-                    pool_config.http2_keep_alive_interval_seconds,
-                ))
-                .keep_alive_timeout(Duration::from_secs(
-                    pool_config.http2_keep_alive_timeout_seconds,
-                ))
-                .max_concurrent_reset_streams(4096);
-        }
-
-        builder
-            .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
-            .initial_connection_window_size(pool_config.http2_initial_connection_window_size)
-            .adaptive_window(pool_config.http2_adaptive_window)
-            .max_frame_size(pool_config.http2_max_frame_size);
-
-        if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            // Cap server-initiated streams (push) and preserve the operator's
-            // initial outbound concurrency bound until peer SETTINGS arrive.
-            builder.max_concurrent_streams(max_streams);
-            builder.initial_max_send_streams(max_streams as usize);
-        }
-
-        builder
+        crate::pool::hyper_h2_client_builder(pool_config)
     }
 
     /// Cached backend rustls config for this proxy's TLS identity. A miss is
@@ -590,7 +594,7 @@ impl Http2PoolManager {
                     let mut tls_config = inputs.builder().build_rustls()?;
                     // Advertise both `h2` and `http/1.1` — the backend picks.
                     // If it picks h2 we use this pool; if it picks http/1.1 the
-                    // caller (create_tls_connection) returns
+                    // caller (`create_connection`) returns
                     // `BackendSelectedHttp1` so the dispatcher can route via
                     // reqwest. Advertising only `h2` would fail the handshake
                     // against h1-only servers with no graceful recovery.
@@ -644,17 +648,19 @@ impl Http2PoolManager {
     }
 
     fn effective_client_cert_path<'a>(&'a self, proxy: &'a Proxy) -> Option<&'a str> {
-        proxy.resolved_tls.client_cert_path.as_deref().or(self
-            .global_env_config
-            .backend_tls_client_cert_path
-            .as_deref())
+        proxy.resolved_tls.effective_client_cert_path(
+            self.global_env_config
+                .backend_tls_client_cert_path
+                .as_deref(),
+        )
     }
 
     fn effective_client_key_path<'a>(&'a self, proxy: &'a Proxy) -> Option<&'a str> {
-        proxy.resolved_tls.client_key_path.as_deref().or(self
-            .global_env_config
-            .backend_tls_client_key_path
-            .as_deref())
+        proxy.resolved_tls.effective_client_key_path(
+            self.global_env_config
+                .backend_tls_client_key_path
+                .as_deref(),
+        )
     }
 
     fn write_pool_key(
@@ -712,6 +718,18 @@ impl Http2PoolManager {
 pub struct Http2ConnectionPool {
     pool: Arc<GenericPool<Http2PoolManager>>,
     rr_counters: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    /// Shard keys whose create failed or was cancelled, with the failure time.
+    /// Until the cooldown passes, a missing or closed preferred shard listed
+    /// here is borrowed around without another create (a DestinationRule
+    /// `maxConnections` below the shard count, or a backend refusing new
+    /// connections). Consulted only when the preferred shard is missing or
+    /// closed. Shared with the detached shard fills.
+    shard_create_backoff: Arc<ShardCreateBackoff>,
+    /// Shard keys with a detached background create in flight: a request
+    /// whose preferred shard is missing or closed borrows a ready sibling and
+    /// starts at most one create per key here. Each entry holds one permit of
+    /// the pool's small background-create budget.
+    shard_fills: Arc<DashMap<String, ()>>,
     /// Exclusive-checkout HTTP/1.1 lanes (issue #5588).
     h1: Arc<Http1Lanes>,
 }
@@ -796,6 +814,8 @@ impl Http2ConnectionPool {
         Self {
             pool: GenericPool::new(manager, global_pool_config, cleanup_interval, shards),
             rr_counters: Arc::new(DashMap::with_shard_amount(shards)),
+            shard_create_backoff: Arc::new(ShardCreateBackoff::new(shards)),
+            shard_fills: Arc::new(DashMap::with_shard_amount(shards)),
             h1,
         }
     }
@@ -854,7 +874,6 @@ impl Http2ConnectionPool {
         self.h1.clear();
     }
 
-    #[allow(dead_code)] // exercised from integration/unit tests
     pub fn pool_key_for_warmup(proxy: &Proxy) -> String {
         pool_key_owned(proxy, None, &PoolConfig::default())
     }
@@ -865,7 +884,6 @@ impl Http2ConnectionPool {
     /// `pool_key_for_warmup` is this with `svid_generation = None` and
     /// `PoolConfig::default()`. Runtime `get_sender` uses the pool manager's
     /// global instead of reconstructing `PoolConfig` a second time.
-    #[allow(dead_code)] // exercised from unit/integration tests
     pub fn pool_key_with_global(
         proxy: &Proxy,
         svid_generation: Option<u64>,
@@ -876,7 +894,6 @@ impl Http2ConnectionPool {
 
     /// TLS-config cache key (no host/port). Used by unit tests to prove two
     /// endpoints sharing trust material reuse one `ClientConfig`.
-    #[allow(dead_code)] // exercised from unit tests
     pub fn tls_config_cache_key_for_warmup(proxy: &Proxy, svid_generation: Option<u64>) -> String {
         backend_tls_config_cache_key(
             &proxy.resolved_tls,
@@ -933,7 +950,6 @@ impl Http2ConnectionPool {
         self.pool.manager().tls_configs.retain_keys(&live_tls_keys);
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn insert_rr_counter_for_tests(&self, key: impl Into<String>) {
         self.rr_counters
             .insert(key.into(), Arc::new(AtomicUsize::new(0)));
@@ -943,7 +959,6 @@ impl Http2ConnectionPool {
     /// post-insert stale-generation removal. Used by integration tests to
     /// prove insert-before-retire and retire-before-insert without a live
     /// backend handshake.
-    #[allow(dead_code)] // exercised from integration tests
     pub fn get_or_seed_rr_counter_for_tests(
         &self,
         key: &str,
@@ -957,22 +972,275 @@ impl Http2ConnectionPool {
         )
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn rr_counter_len(&self) -> usize {
         self.rr_counters.len()
     }
 
-    #[allow(dead_code)] // exercised from unit tests
+    /// Background shard creates currently in flight.
+    pub fn shard_fills_in_flight(&self) -> usize {
+        self.shard_fills.len()
+    }
+
+    /// Shard keys currently backed off after a failed or cancelled create.
+    pub fn shard_create_backoff_len(&self) -> usize {
+        self.shard_create_backoff.backed_off_keys()
+    }
+
+    /// Create the missing or closed shard `key` on a detached task while the
+    /// current request is served by a ready sibling. Single-flight per key,
+    /// and only while the pool's small background-create budget has a free
+    /// permit: a fill already in flight, or no free permit, makes this a
+    /// no-op and a later borrow tries again. A fill never waits for or holds a
+    /// request-path creation permit. The create goes through the pool's
+    /// coalesced creation path (so it also joins, or is joined by, an awaited
+    /// create of the same key), re-checks the shard's create cooldown before
+    /// dialling, and records a failure on that cooldown. Runs only on the
+    /// borrow path, never for a warm hit on the preferred shard.
+    fn spawn_shard_fill(
+        &self,
+        proxy: &Proxy,
+        svid_generation: Option<u64>,
+        key: &str,
+        ring: ShardRing,
+    ) {
+        // A create of this key already pending (an awaited request-path create
+        // or another fill) will publish the shard anyway: joining it would
+        // only hold a background permit that another key's fill could use.
+        if self.shard_fills.contains_key(key) || self.pool.has_pending_creation(key) {
+            return;
+        }
+        // Sample the drain epoch now, not when the detached task first runs,
+        // so a drain in between fences this create. Then make sure the SVID
+        // generation the request captured (and built `key` from) is still
+        // current: a rotation advances the generation before it drains, so
+        // either this check sees the advance or the drain's epoch bump comes
+        // after the sample. Without both, a fill scheduled across a
+        // generation drain could publish under the drained generation's key
+        // and hold a `maxConnections` slot the current generation needs.
+        let drain_epoch = self.pool.drain_epoch();
+        if self.pool.manager().svid_generation_for_proxy(proxy) != svid_generation {
+            return;
+        }
+        let Some(permit) = self.pool.try_background_create_permit() else {
+            return;
+        };
+        match self.shard_fills.entry(key.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => return,
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(());
+            }
+        }
+        let fill = ShardFill {
+            fills: Arc::clone(&self.shard_fills),
+            key: key.to_owned(),
+        };
+        let pool = Arc::clone(&self.pool);
+        let backoff = Arc::clone(&self.shard_create_backoff);
+        // Cold path: at most one clone per in-flight fill, not per request.
+        let proxy = proxy.clone();
+        tokio::spawn(async move {
+            let key = fill.key.clone();
+            let manager = Arc::clone(pool.manager());
+            let create_backoff = Arc::clone(&backoff);
+            let filled: Result<Http2Sender, Http2PoolError> = pool
+                .create_or_get_existing_owned_in_background(
+                    key,
+                    permit,
+                    drain_epoch,
+                    PoolCreateCaller::Request,
+                    |_| {},
+                    |_| {},
+                    // A create of this shard that failed after the fill was
+                    // started leaves the sibling serving: no second dial.
+                    |key| {
+                        if backoff.backed_off(key) {
+                            Self::ready_sibling(&pool, key, ring)
+                        } else {
+                            None
+                        }
+                    },
+                    |key, _attempt| async move {
+                        let mut guard = ShardCreateGuard {
+                            backoff: &create_backoff,
+                            key: Some(key),
+                        };
+                        let created = manager.create_connection(&proxy, svid_generation).await;
+                        if created.is_ok() {
+                            guard.key = None;
+                        }
+                        created
+                    },
+                )
+                .await;
+            if let Err(error) = filled {
+                debug!("http2_pool: background shard create failed: {}", error);
+            }
+            drop(fill);
+        });
+    }
+
+    /// A ready shard other than the ring's preferred one.
+    fn ready_sibling(
+        pool: &GenericPool<Http2PoolManager>,
+        key: &str,
+        ring: ShardRing,
+    ) -> Option<Http2Sender> {
+        let ShardRing {
+            base_len,
+            start,
+            shards,
+        } = ring;
+        // Cold creator recheck only. Reuse the thread-local key buffer rather
+        // than allocating one key per sibling, and never alias the borrowed
+        // sender into the failed shard's cache entry.
+        HTTP2_POOL_KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            buf.push_str(&key[..base_len]);
+            for offset in 1..shards {
+                write_http2_shard_key_inplace(&mut buf, base_len, (start + offset) % shards);
+                // Skip a sibling allowing no new streams, as the probe does:
+                // the request would queue inside h2.
+                if let Some(mut sender) = pool.cached(&buf)
+                    && matches!(
+                        futures_util::FutureExt::now_or_never(sender.ready()),
+                        Some(Ok(()))
+                    )
+                    && sender.peer_max_concurrent_streams() != 0
+                {
+                    return Some(sender);
+                }
+            }
+            None
+        })
+    }
+
+    fn round_robin_start(
+        &self,
+        base_key: &str,
+        svid_generation: Option<u64>,
+        shard_count: usize,
+    ) -> usize {
+        let rr = get_or_seed_rr_counter(
+            &self.rr_counters,
+            base_key,
+            svid_generation,
+            &self.pool.manager().backend_svid_generation,
+        );
+        rr.fetch_add(1, Ordering::Relaxed) % shard_count
+    }
+
+    /// One synchronous sweep of the shard ring from `start`. `now_or_never`
+    /// never awaits, so there is no per-shard stall.
+    ///
+    /// An open hyper HTTP/2 sender always reports ready, however many streams
+    /// it carries, so "the first ready shard" alone would keep every request
+    /// on the first connection ever opened (the startup capability probe's)
+    /// and the pool would never reach `http2_connections_per_host`: one
+    /// connection task here, and one on the backend, would then carry every
+    /// stream. With `widen`, a missing or closed `start` shard (not on a
+    /// create cooldown) is swept past: a ready sibling is returned as
+    /// [`ShardProbe::Borrowed`] so the caller fills the shard in the
+    /// background, and only a ring with no usable shard falls through to the
+    /// awaited create.
+    fn probe_shards(
+        &self,
+        key_buf: &mut String,
+        base_len: usize,
+        start: usize,
+        shard_count: usize,
+        widen: bool,
+        affinity_open_streams: Option<usize>,
+    ) -> ShardProbe {
+        #[cfg(feature = "bench-pool-profile")]
+        let mut saw_busy = false;
+        let mut fill_start = false;
+        for offset in 0..shard_count {
+            let shard = (start + offset) % shard_count;
+            Self::write_shard_key_inplace(key_buf, base_len, shard);
+
+            crate::profile_pool_event!(Probe);
+            let cached = crate::profile_pool_sync!(Probe, self.pool.cached(key_buf));
+            if let Some(mut sender) = cached {
+                match crate::profile_pool_ready!(futures_util::FutureExt::now_or_never(
+                    sender.ready()
+                )) {
+                    Some(Ok(())) => {
+                        let peer_max = sender.peer_max_concurrent_streams();
+                        // A backend allowing no new streams (a draining
+                        // `SETTINGS_MAX_CONCURRENT_STREAMS` of 0) would queue
+                        // the request inside h2: skip it like a busy shard,
+                        // so a sibling serves the request and nothing pins
+                        // to it.
+                        if peer_max == 0 {
+                            #[cfg(feature = "bench-pool-profile")]
+                            {
+                                saw_busy = true;
+                            }
+                            continue;
+                        }
+                        // The frontend connection already has more open
+                        // streams than this backend allows it to pin.
+                        if offset == 0
+                            && affinity_open_streams.is_some_and(|open_streams| {
+                                open_streams
+                                    > crate::proxy::frontend_affinity::affinity_stream_limit(
+                                        peer_max,
+                                    )
+                            })
+                        {
+                            return ShardProbe::OverPeerLimit;
+                        }
+                        crate::profile_pool_event!(WarmHit);
+                        return if fill_start {
+                            ShardProbe::Borrowed(sender)
+                        } else {
+                            ShardProbe::Ready(sender)
+                        };
+                    }
+                    Some(Err(_)) => {
+                        self.pool.invalidate(key_buf);
+                        // A closed preferred shard is refilled, as a missing
+                        // one is below.
+                        if offset == 0 && widen {
+                            fill_start = !self.shard_create_backoff.backed_off(key_buf);
+                        }
+                    }
+                    // Not ready yet. Skip — phase 2's coalesced create checks
+                    // `cached()` first; the existing sender is still healthy
+                    // (`!is_closed()`), so the create closure never runs and
+                    // the pool does NOT grow beyond the shard ring.
+                    None => {
+                        #[cfg(feature = "bench-pool-profile")]
+                        {
+                            saw_busy = true;
+                        }
+                    }
+                }
+            } else if offset == 0 && widen {
+                // The preferred shard does not exist yet. A shard whose create
+                // failed recently is borrowed around without a new create.
+                fill_start = !self.shard_create_backoff.backed_off(key_buf);
+            }
+        }
+
+        #[cfg(feature = "bench-pool-profile")]
+        crate::pool_profile::event(if saw_busy {
+            crate::pool_profile::Event::BusyFallback
+        } else {
+            crate::pool_profile::Event::MissFallback
+        });
+        ShardProbe::Miss
+    }
+
     pub fn contains_rr_counter(&self, key: &str) -> bool {
         self.rr_counters.contains_key(key)
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn backend_tls_config_cache(&self) -> &BackendTlsConfigCache {
         &self.pool.manager().tls_configs
     }
 
-    #[allow(dead_code)]
     pub fn write_shard_key(buf: &mut String, base_key: &str, shard: usize) {
         buf.clear();
         buf.push_str(base_key);
@@ -1046,89 +1314,99 @@ impl Http2ConnectionPool {
             .map_err(backend_tls_config_error)?;
         let pool_config = self.pool.manager().global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
+        // A capability probe only has to prove the target speaks h2: it takes
+        // whichever shard is ready and never widens the pool.
+        let widen = caller == PoolCreateCaller::Request;
 
         // Phase 1 (synchronous): build the pool key in the thread-local
-        // buffer, pick a starting shard via the per-host RR counter, and
-        // probe every shard for an immediately-ready sender. On a cache hit
-        // we return early without ever cloning the key. On a miss we clone
-        // the buffer once into `selected_key` so the await below has an
-        // owned String to hand to `create_or_get_existing_owned`.
+        // buffer, pick the preferred shard, and probe the ring from it for an
+        // immediately-ready sender. On a cache hit we return early without
+        // ever cloning the key. On a miss we clone the buffer once into
+        // `selected_key` so the await below has an owned String to hand to
+        // the coalesced create.
         //
         // The closure body is synchronous — `now_or_never(sender.ready())`
         // polls once without yielding, and DashMap lookups never await — so
         // the `RefCell::borrow_mut()` lifetime stays inside this block.
+        //
+        // The drain epoch is sampled BEFORE the SVID generation is read: a
+        // rotation advances the generation before it drains, so a generation
+        // read here is either current when the drain runs or the drain's
+        // epoch bump comes after this sample and fences the create below.
+        let drain_epoch = self.pool.drain_epoch();
         let svid_generation = self.pool.manager().svid_generation_for_proxy(proxy);
         let phase1 = crate::profile_pool_sync!(Phase1, {
             self.with_pool_key(proxy, svid_generation, |key_buf| -> Phase1 {
                 let base_len = key_buf.len();
 
-                // Round-robin counter is per-host, but on FIRST access we seed it
+                // The preferred shard. An HTTP/2 frontend connection under its
+                // affinity bound keeps its streams on its own shard
+                // (`frontend_affinity`), as the gRPC pool does; one over it,
+                // and every other request, takes the per-host round-robin
+                // shard. On FIRST access the round-robin counter is seeded
                 // with a thread-local PRNG offset so a burst of concurrent
                 // requests on a cold pool does not land all on shard 0 before
                 // the atomic counter wraps around. `AtomicUsize::fetch_add(1,
-                // Relaxed)` is wait-free after the seed — the seed only matters
-                // for the first `shard_count` picks per host on this gateway.
-                let start = crate::profile_pool_sync!(Rr, {
-                    let rr = get_or_seed_rr_counter(
-                        &self.rr_counters,
-                        &key_buf[..base_len],
-                        svid_generation,
-                        &self.pool.manager().backend_svid_generation,
-                    );
-                    rr.fetch_add(1, Ordering::Relaxed) % shard_count
+                // Relaxed)` is wait-free after the seed.
+                let (mut start, mut affinity_open_streams) = crate::profile_pool_sync!(Rr, {
+                    use crate::proxy::frontend_affinity::{ShardStart, shard_start};
+                    match shard_start(shard_count) {
+                        ShardStart::Affinity {
+                            shard,
+                            open_streams,
+                        } => (shard, Some(open_streams)),
+                        ShardStart::Spill | ShardStart::Unscoped => (
+                            self.round_robin_start(
+                                &key_buf[..base_len],
+                                svid_generation,
+                                shard_count,
+                            ),
+                            None,
+                        ),
+                    }
                 });
 
-                // Cheap probe pass — any shard whose cached sender is
-                // immediately ready wins. `now_or_never` never awaits, so this
-                // is a quick sweep of the shard ring with no per-shard stall.
-                #[cfg(feature = "bench-pool-profile")]
-                let mut saw_busy = false;
-                for offset in 0..shard_count {
-                    let shard = (start + offset) % shard_count;
-                    Self::write_shard_key_inplace(key_buf, base_len, shard);
-
-                    crate::profile_pool_event!(Probe);
-                    if let Some(mut sender) =
-                        crate::profile_pool_sync!(Probe, self.pool.cached(key_buf))
-                    {
-                        match crate::profile_pool_ready!(futures_util::FutureExt::now_or_never(
-                            sender.ready()
-                        )) {
-                            Some(Ok(())) => {
-                                crate::profile_pool_event!(WarmHit);
-                                return Phase1::Hit(sender);
-                            }
-                            Some(Err(_)) => {
-                                self.pool.invalidate(key_buf);
-                            }
-                            // Shard exists but is mid-send. Previously we
-                            // stashed the first such sender and `timeout(5ms,
-                            // ready())`ed on it, which serialized ~100-
-                            // concurrent bursts onto the already-busy shard and
-                            // net-pessimized throughput (5 MB/100-conc HTTP/2
-                            // stuck at 81 RPS vs direct 232). Skip — phase 2's
-                            // `create_or_get_existing_owned` checks `cached()`
-                            // first; the existing sender is still healthy
-                            // (`!is_closed()`), so the create closure never runs
-                            // and the pool does NOT grow beyond the shard ring.
-                            // Callers queue on the start shard's existing sender
-                            // via H2 readiness / stream-cap backpressure.
-                            None => {
-                                #[cfg(feature = "bench-pool-profile")]
-                                {
-                                    saw_busy = true;
-                                }
-                            }
+                loop {
+                    match self.probe_shards(
+                        key_buf,
+                        base_len,
+                        start,
+                        shard_count,
+                        widen,
+                        affinity_open_streams,
+                    ) {
+                        ShardProbe::Ready(sender) => return Phase1::Hit(sender),
+                        // The preferred shard is missing or closed: the ready
+                        // sibling serves the request at once and the shard is
+                        // created in the background, so the pool widens
+                        // without a request waiting on a dial.
+                        ShardProbe::Borrowed(sender) => {
+                            Self::write_shard_key_inplace(key_buf, base_len, start);
+                            let ring = ShardRing {
+                                base_len,
+                                start,
+                                shards: shard_count,
+                            };
+                            self.spawn_shard_fill(proxy, svid_generation, key_buf, ring);
+                            return Phase1::Hit(sender);
                         }
+                        // The connection's own shard is ready, but the
+                        // connection already has as many open streams as that
+                        // backend allows: spill this request round-robin.
+                        ShardProbe::OverPeerLimit => {
+                            start = crate::profile_pool_sync!(Rr, {
+                                self.round_robin_start(
+                                    &key_buf[..base_len],
+                                    svid_generation,
+                                    shard_count,
+                                )
+                            });
+                            affinity_open_streams = None;
+                        }
+                        ShardProbe::Miss => break,
                     }
                 }
 
-                #[cfg(feature = "bench-pool-profile")]
-                crate::pool_profile::event(if saw_busy {
-                    crate::pool_profile::Event::BusyFallback
-                } else {
-                    crate::pool_profile::Event::MissFallback
-                });
                 Self::write_shard_key_inplace(key_buf, base_len, start);
                 // Clone the selected key for the asynchronous fallback. Cold
                 // pending-registration and creation paths can allocate further keys.
@@ -1155,25 +1433,57 @@ impl Http2ConnectionPool {
         crate::profile_pool_event!(Fallback);
         let manager = Arc::clone(self.pool.manager());
         let acquired = crate::profile_pool_future!(FallbackPoll, {
-            self.pool
-                .create_or_get_existing_owned_as(selected_key, caller, |key| async move {
-                    let _ = key;
+            self.pool.create_or_get_existing_owned_with_recovery(
+                selected_key,
+                drain_epoch,
+                caller,
+                |_| {},
+                |_| {},
+                // A create of this shard that failed moments ago leaves a
+                // sibling serving when one has become ready since: no redial.
+                |key| {
+                    if widen && self.shard_create_backoff.backed_off(key) {
+                        let ring = ShardRing {
+                            base_len,
+                            start,
+                            shards: shard_count,
+                        };
+                        Self::ready_sibling(&self.pool, key, ring)
+                    } else {
+                        None
+                    }
+                },
+                |key, _attempt| async move {
+                    let mut guard = ShardCreateGuard {
+                        backoff: &self.shard_create_backoff,
+                        key: widen.then_some(key),
+                    };
                     // Only the creator runs this closure, so the connection
                     // this attempt waits on is one it set up (issue #5864).
                     let setup_started =
                         crate::plugins::otel_tracing::backend_connection_setup_clock();
                     let created = manager.create_connection(proxy, svid_generation).await;
                     if created.is_ok() {
+                        guard.key = None;
                         crate::plugins::otel_tracing::note_backend_connection_established_since(
                             setup_started,
                         );
                     }
                     created
-                })
+                },
+            )
         });
         match acquired {
             Ok(sender) => Ok(sender),
-            Err(err) => {
+            // Only a `maxConnections` refusal (the creator's, or a coalesced
+            // waiter's rebuilt from `SharedPoolCreateKind::MaxConnections`)
+            // reuses an already-established shard, so a cap below the shard
+            // count converges on `cap` connections. Any other create failure
+            // (TLS, ALPN `http/1.1`, refused connect, ...) surfaces, rather
+            // than being masked by a still-open sibling for as long as one
+            // lives — which would also answer a capability probe `Ok` for a
+            // target whose new connections fail (issue #7181).
+            Err(err @ Http2PoolError::MaxConnectionsExceeded { .. }) => {
                 // Phase 2 (synchronous re-borrow): rebuild the pool key in
                 // the same thread-local buffer and probe alternative shards.
                 // The proxy outlives this future and is read-only, so the
@@ -1199,6 +1509,7 @@ impl Http2ConnectionPool {
                     None => Err(err),
                 }
             }
+            Err(err) => Err(err),
         }
     }
 }
@@ -1241,28 +1552,158 @@ impl IdleH1 {
     }
 }
 
-/// Idle connections for one lane key. Lock-free: many concurrent requests to
-/// one backend all check in and out of the same lane.
+/// Idle connections for one lane key.
+///
+/// Oldest first: checkout takes the newest (LIFO), so the connections a burst
+/// left behind sit at the bottom unused and close once idle for the idle
+/// timeout, instead of being kept warm by round-robin reuse (issue #6793). The
+/// vector keeps its capacity across reuse, so a warm lane allocates nothing
+/// per request. Checkout and check-in hold the lock for one push or pop; the
+/// sweep holds it for one in-place scan of at most `max_idle` entries and
+/// retirement for one take. Connections are always dropped outside it.
 struct Http1Lane {
-    idle: crossbeam_queue::ArrayQueue<IdleH1>,
-    /// Bumped when a drain withdraws this lane. A checkout taken under an older
-    /// generation is never checked back in, so an exchange that outlived the
-    /// drain cannot repopulate the pool with a connection it meant to retire.
-    /// Per lane, so a reload or SVID rotation that withdraws one backend does
-    /// not discard every other backend's in-flight connections.
-    generation: AtomicU64,
+    idle: std::sync::Mutex<Vec<IdleH1>>,
+    max_idle: usize,
+    counters: Arc<Http1PoolCounters>,
+    /// Set, under the lane lock, when a drain withdraws this lane, which it
+    /// also removes from the map: a retired lane is never used again. A
+    /// check-in reads it under the same lock, so a connection checked in
+    /// during or after a drain either lands before the drain takes the idle
+    /// set (and is retired with it) or is refused, however long ago its
+    /// checkout found the lane. An exchange that outlived the drain therefore
+    /// cannot repopulate the pool with a connection it meant to retire. Per
+    /// lane, so a reload or SVID rotation that withdraws one backend does not
+    /// discard every other backend's in-flight connections.
+    ///
+    /// Also set from birth on the lane handed to a checkout that straddled a
+    /// drain before its lane existed (see [`Http1Lanes::lane_for_key`]): that
+    /// lane never enters the map and refuses its one check-in.
+    retired: AtomicBool,
 }
 
 impl Http1Lane {
-    fn retire(&self) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        while self.idle.pop().is_some() {}
+    fn idle(&self) -> std::sync::MutexGuard<'_, Vec<IdleH1>> {
+        // Nothing that holds this lock can panic (a push, pop, length read,
+        // take or in-place extraction of plain values), so a poisoned guard
+        // still protects a consistent vector.
+        self.idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    fn retire(&self) {
+        let retired = {
+            let mut idle = self.idle();
+            self.retired.store(true, Ordering::Release);
+            std::mem::take(&mut *idle)
+        };
+        self.counters
+            .evicted_retired
+            .fetch_add(retired.len() as u64, Ordering::Relaxed);
+        drop(retired);
+    }
+
+    /// Pool `entry` unless the lane is retired or already holds its ceiling;
+    /// a refused entry is handed back and the caller drops the connection.
+    fn push_idle(&self, entry: IdleH1) -> Result<(), (IdleH1, Refused)> {
+        let mut idle = self.idle();
+        if self.retired.load(Ordering::Acquire) {
+            return Err((entry, Refused::Retired));
+        }
+        if idle.len() >= self.max_idle {
+            return Err((entry, Refused::Full));
+        }
+        idle.push(entry);
+        Ok(())
+    }
+
+    /// The most recently pooled connection.
+    fn pop_idle(&self) -> Option<IdleH1> {
+        self.idle().pop()
+    }
+
+    fn idle_len(&self) -> usize {
+        self.idle().len()
+    }
+
+    /// Remove closed and expired entries in place, keeping the rest in order
+    /// and the vector's capacity, and hand them back so they drop outside the
+    /// lock.
+    fn take_stale(&self, now: std::time::Instant) -> Vec<IdleH1> {
+        self.idle()
+            .extract_if(.., |entry| entry.sender.is_closed() || entry.expired(now))
+            .collect()
+    }
+}
+
+/// Why a lane refused a check-in.
+enum Refused {
+    /// A drain retired the lane while the connection was checked out.
+    Retired,
+    /// The lane already holds `max_idle` connections.
+    Full,
+}
+
+/// Lifetime counters of one direct HTTP/1.1 pool, shared by its lanes
+/// (issue #6793).
+#[derive(Default)]
+pub(crate) struct Http1PoolCounters {
+    opened: AtomicU64,
+    reused: AtomicU64,
+    evicted_ceiling: AtomicU64,
+    evicted_expired: AtomicU64,
+    evicted_closed: AtomicU64,
+    evicted_retired: AtomicU64,
+}
+
+impl Http1PoolCounters {
+    fn count(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count an idle connection the pool discards: closed by the backend (or
+    /// no longer ready), or idle past its timeout.
+    fn count_discarded(&self, idle: &IdleH1, now: std::time::Instant) {
+        if idle.sender.is_closed() || !idle.sender.is_ready() {
+            Self::count(&self.evicted_closed);
+        } else if idle.expired(now) {
+            Self::count(&self.evicted_expired);
+        }
+    }
+}
+
+/// One scrape of the direct HTTP/1.1 pool (issue #6793).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Http1PoolStats {
+    /// Idle connections across every lane at scrape time.
+    pub idle_connections: usize,
+    /// Connections dialed: on an empty idle set, or fresh to replay an idle
+    /// keep-alive race.
+    pub connections_opened: u64,
+    /// Checkouts served from the idle set, counted before the request is sent.
+    pub connections_reused: u64,
+    /// Connections dropped at check-in because their lane held its ceiling.
+    pub evicted_ceiling: u64,
+    /// Idle connections closed after `idle_timeout`.
+    pub evicted_expired: u64,
+    /// Idle connections discarded because the backend closed them.
+    pub evicted_closed: u64,
+    /// Idle connections closed because a reload, certificate rotation or pool
+    /// clear withdrew their backend.
+    pub evicted_retired: u64,
 }
 
 pub(crate) struct Http1Lanes {
     lanes: DashMap<String, Arc<Http1Lane>>,
     max_idle_per_host: usize,
+    counters: Arc<Http1PoolCounters>,
+    /// Bumped by every pass that retires lanes ([`Self::clear`],
+    /// [`Self::retain_keys`]) before it retires one. A checkout samples it
+    /// before it reads the SVID generation its lane key carries, and a lane
+    /// enters the map only while the value is unchanged (see
+    /// [`Self::lane_for_key`]). Written only by those passes, so the sample is
+    /// a shared read.
+    drain_epoch: AtomicU64,
 }
 
 impl Http1Lanes {
@@ -1270,19 +1711,59 @@ impl Http1Lanes {
         Self {
             lanes: DashMap::with_shard_amount(shards),
             max_idle_per_host: max_idle_per_host.max(1),
+            counters: Arc::new(Http1PoolCounters::default()),
+            drain_epoch: AtomicU64::new(0),
         }
     }
 
-    fn lane_for_key(&self, key: &str) -> Arc<Http1Lane> {
+    /// The current drain epoch. A checkout samples this FIRST, before it
+    /// reads the SVID generation its lane key carries: a drain runs after
+    /// what it retires has advanced and bumps the epoch before it retires a
+    /// lane, so a generation read after the sample is either current or the
+    /// drain's bump comes after the sample. One shared atomic load.
+    fn drain_epoch(&self) -> u64 {
+        self.drain_epoch.load(Ordering::Acquire)
+    }
+
+    /// The lane for `key`, for a checkout whose [`Self::drain_epoch`] sample,
+    /// taken before it read the SVID generation in `key`, is `drain_epoch`.
+    ///
+    /// A lane already in the map is returned as it is. A drain retires the
+    /// lanes it withdraws under their own lock, so a connection checked in to
+    /// one is refused however its checkout raced the drain; and no lane a
+    /// drain withdrew can be found here afterwards, because only a checkout
+    /// that sampled after that drain can have put one back.
+    ///
+    /// A lane that is not in the map is inserted only if no drain has run
+    /// since the sample. Otherwise this checkout straddled a drain: the drain
+    /// retired the lanes that existed, and a lane inserted now would pool
+    /// this checkout's connection under a key the drain may just have
+    /// withdrawn (an SVID generation no later checkout asks for). It gets a
+    /// lane that is retired from birth and never enters the map, so its
+    /// connection serves this one request and is closed at check-in. The
+    /// epoch is read under the map's shard lock, which a drain's removal pass
+    /// takes after its bump: an insert that still saw the old epoch is seen,
+    /// and retired, by that pass.
+    fn lane_for_key(&self, key: &str, drain_epoch: u64) -> Arc<Http1Lane> {
         if let Some(lane) = self.lanes.get(key) {
             return Arc::clone(&lane);
         }
-        Arc::clone(&self.lanes.entry(key.to_owned()).or_insert_with(|| {
-            Arc::new(Http1Lane {
-                idle: crossbeam_queue::ArrayQueue::new(self.max_idle_per_host),
-                generation: AtomicU64::new(0),
-            })
-        }))
+        match self.lanes.entry(key.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => Arc::clone(occupied.get()),
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                let fenced = self.drain_epoch.load(Ordering::Acquire) != drain_epoch;
+                let lane = Arc::new(Http1Lane {
+                    idle: std::sync::Mutex::new(Vec::new()),
+                    max_idle: self.max_idle_per_host,
+                    counters: Arc::clone(&self.counters),
+                    retired: AtomicBool::new(fenced),
+                });
+                if !fenced {
+                    vacant.insert(Arc::clone(&lane));
+                }
+                lane
+            }
+        }
     }
 
     /// Pool a connection whose exchange completed. A sender that is not ready
@@ -1293,20 +1774,21 @@ impl Http1Lanes {
     /// hyper reports it idle — the same rule as the Unix-socket pool's
     /// `checkin_h1_when_idle`.
     fn checkin(checkout: Http1Checkout) {
-        if checkout.sender.is_closed()
-            || checkout.lane.generation.load(Ordering::Acquire) != checkout.generation
-        {
+        if checkout.sender.is_closed() {
             return;
         }
         if checkout.sender.is_ready() {
             Self::push_idle(checkout);
             return;
         }
+        // No point waiting for a lane a drain already retired; `push_idle`
+        // checks again under the lane lock once the wait ends.
+        if checkout.lane.retired.load(Ordering::Acquire) {
+            return;
+        }
         let mut checkout = checkout;
         tokio::spawn(async move {
-            if checkout.sender.ready().await.is_ok()
-                && checkout.lane.generation.load(Ordering::Acquire) == checkout.generation
-            {
+            if checkout.sender.ready().await.is_ok() {
                 Self::push_idle(checkout);
             }
         });
@@ -1320,24 +1802,44 @@ impl Http1Lanes {
             idle_timeout,
             ..
         } = checkout;
-        // A full lane drops the connection (the oldest-wins tradeoff of a
-        // bounded idle set); `push` hands the entry back and it drops here.
-        let _ = lane.idle.push(IdleH1 {
+        // A refused entry is handed back and drops here, outside the lane
+        // lock. A retired lane's refusal is not an idle eviction: the
+        // connection was never idle in it.
+        let pushed = lane.push_idle(IdleH1 {
             sender,
             socket,
             idle_since: std::time::Instant::now(),
             idle_timeout,
         });
+        if let Err((_, Refused::Full)) = pushed {
+            Http1PoolCounters::count(&lane.counters.evicted_ceiling);
+        }
     }
 
+    /// Retire every lane. The epoch bump comes BEFORE the removal pass (see
+    /// [`Self::lane_for_key`]). Cold path.
     fn clear(&self) {
+        self.drain_epoch.fetch_add(1, Ordering::AcqRel);
         self.lanes.retain(|_, lane| {
             lane.retire();
             false
         });
     }
 
+    /// Retire the lanes whose key `keep` rejects. Checkouts already under way
+    /// are fenced as in [`Self::clear`], for every key that has no lane yet:
+    /// a selective pass is rare, and a checkout it fences needlessly only
+    /// loses the reuse of one connection. Cold path.
+    ///
+    /// Two callers: a generation drain, which the fence makes complete, and
+    /// the config-publication prune of withdrawn backends
+    /// (`retain_live_from_config`). The prune gets the same fence for a
+    /// checkout that straddles it, but no more than that: a request still
+    /// running on the previous config can start a checkout afterwards and
+    /// open a withdrawn backend's lane, which the idle sweep closes, as
+    /// before.
     fn retain_keys(&self, mut keep: impl FnMut(&str) -> bool) {
+        self.drain_epoch.fetch_add(1, Ordering::AcqRel);
         self.lanes.retain(|key, lane| {
             let kept = keep(key);
             if !kept {
@@ -1352,19 +1854,28 @@ impl Http1Lanes {
     fn sweep(&self) {
         let now = std::time::Instant::now();
         self.lanes.retain(|_, lane| {
-            for _ in 0..lane.idle.len() {
-                let Some(idle) = lane.idle.pop() else { break };
-                if idle.sender.is_closed() || idle.expired(now) {
-                    continue;
-                }
-                let _ = lane.idle.push(idle);
+            for stale in lane.take_stale(now) {
+                lane.counters.count_discarded(&stale, now);
             }
-            !lane.idle.is_empty() || Arc::strong_count(lane) > 1
+            lane.idle_len() > 0 || Arc::strong_count(lane) > 1
         });
     }
 
     fn idle_connections(&self) -> usize {
-        self.lanes.iter().map(|lane| lane.idle.len()).sum()
+        self.lanes.iter().map(|lane| lane.idle_len()).sum()
+    }
+
+    fn stats(&self) -> Http1PoolStats {
+        let counters = &self.counters;
+        Http1PoolStats {
+            idle_connections: self.idle_connections(),
+            connections_opened: counters.opened.load(Ordering::Relaxed),
+            connections_reused: counters.reused.load(Ordering::Relaxed),
+            evicted_ceiling: counters.evicted_ceiling.load(Ordering::Relaxed),
+            evicted_expired: counters.evicted_expired.load(Ordering::Relaxed),
+            evicted_closed: counters.evicted_closed.load(Ordering::Relaxed),
+            evicted_retired: counters.evicted_retired.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -1374,7 +1885,6 @@ pub struct Http1Checkout {
     pub sender: Http1Sender,
     socket: BackendSocket,
     reused: bool,
-    generation: u64,
     idle_timeout: Duration,
 }
 
@@ -1708,13 +2218,39 @@ impl Http2ConnectionPool {
     /// (`resolve_backend_connection_proxy_for_target`). With `fresh`, the idle
     /// set is skipped: used once to replay a request whose reused connection
     /// closed before the request reached the wire.
-    pub async fn checkout_h1(
+    ///
+    /// Not an `async fn`: it hands back the seamed checkout's future itself,
+    /// with a hook that does nothing, so the seam adds no state and no poll
+    /// to a request's checkout.
+    pub fn checkout_h1(
         &self,
         proxy: &Proxy,
         tls: bool,
         connect_timeout: Duration,
         fresh: bool,
-    ) -> Result<Http1Checkout, Http2PoolError> {
+    ) -> impl std::future::Future<Output = Result<Http1Checkout, Http2PoolError>> {
+        self.checkout_h1_seamed(proxy, tls, connect_timeout, fresh, || {})
+    }
+
+    /// The production HTTP/1.1 checkout body, with one test seam: a hook run
+    /// after the drain-epoch sample and the SVID generation read, and BEFORE
+    /// the lane lookup.
+    ///
+    /// Everything between the sample and the lookup is synchronous, so a drain
+    /// can only land there from another thread and no test can place one
+    /// there by timing. Production passes a hook that does nothing, so a test
+    /// through here exercises the production path rather than a parallel one.
+    pub(crate) async fn checkout_h1_seamed<F>(
+        &self,
+        proxy: &Proxy,
+        tls: bool,
+        connect_timeout: Duration,
+        fresh: bool,
+        before_lane_lookup: F,
+    ) -> Result<Http1Checkout, Http2PoolError>
+    where
+        F: FnOnce(),
+    {
         // A refused destination's TLS lane fails before the idle set and the
         // bounded TLS build queue. Its plaintext lane is unaffected.
         if tls {
@@ -1722,11 +2258,18 @@ impl Http2ConnectionPool {
                 .map_err(backend_tls_config_error)?;
         }
         let manager = self.pool.manager();
+        // The lane map's drain epoch is sampled BEFORE the SVID generation is
+        // read: a rotation advances the generation before it drains, so a
+        // generation read here is either current when the drain runs, or the
+        // drain's bump comes after this sample and `lane_for_key` keeps this
+        // checkout's lane out of the map.
+        let drain_epoch = self.h1.drain_epoch();
         let svid_generation = if tls {
             manager.svid_generation_for_proxy(proxy)
         } else {
             None
         };
+        before_lane_lookup();
         let enable_keepalive = proxy
             .pool_enable_http_keep_alive
             .unwrap_or(manager.global_pool_config.enable_http_keep_alive);
@@ -1750,25 +2293,25 @@ impl Http2ConnectionPool {
                 manager.effective_client_key_path(proxy),
                 svid_generation,
             );
-            self.h1.lane_for_key(&buf)
+            self.h1.lane_for_key(&buf, drain_epoch)
         });
-        let generation = lane.generation.load(Ordering::Acquire);
         if !fresh {
             let now = std::time::Instant::now();
-            while let Some(idle) = lane.idle.pop() {
+            while let Some(idle) = lane.pop_idle() {
                 // Only ready senders are pooled; one that is no longer ready
                 // or open is closing, and waiting on it would park this
                 // request behind a connection that will never serve it.
                 if idle.sender.is_closed() || !idle.sender.is_ready() || idle.expired(now) {
+                    lane.counters.count_discarded(&idle, now);
                     continue;
                 }
+                Http1PoolCounters::count(&lane.counters.reused);
                 crate::plugins::otel_tracing::note_backend_connection_reused();
                 return Ok(Http1Checkout {
                     lane,
                     sender: idle.sender,
                     socket: idle.socket,
                     reused: true,
-                    generation,
                     idle_timeout,
                 });
             }
@@ -1781,21 +2324,40 @@ impl Http2ConnectionPool {
             Box::pin(manager.create_h1_connection(proxy, tls, svid_generation, connect_timeout))
                 .await?;
         crate::plugins::otel_tracing::note_backend_connection_established_since(setup_started);
+        Http1PoolCounters::count(&lane.counters.opened);
         Ok(Http1Checkout {
             lane,
             sender,
             socket,
             reused: false,
-            generation,
             idle_timeout,
         })
     }
 
     /// Idle direct-H1 connections across all lanes.
-    #[allow(dead_code)] // exercised from tests
     pub fn h1_idle_connections(&self) -> usize {
         self.h1.idle_connections()
     }
+
+    /// Idle connections and lifetime dial, reuse and eviction counts of the
+    /// direct HTTP/1.1 pool (issue #6793).
+    pub fn h1_pool_stats(&self) -> Http1PoolStats {
+        self.h1.stats()
+    }
+}
+
+/// Outcome of one shard-ring sweep in `get_sender`.
+enum ShardProbe {
+    /// A usable shard was immediately ready; nothing to fill.
+    Ready(Http2Sender),
+    /// The start shard was missing or closed and a ready sibling serves the
+    /// request; the start shard is created in the background.
+    Borrowed(Http2Sender),
+    /// The affinity shard is ready but its backend allows fewer concurrent
+    /// streams than the frontend connection has open; spill instead.
+    OverPeerLimit,
+    /// No usable shard was immediately ready.
+    Miss,
 }
 
 /// Outcome of the synchronous phase-1 sweep in `get_sender`.
@@ -2292,7 +2854,7 @@ pub enum Http2PoolError {
     /// connection may be opened. Classified
     /// [`crate::retry::ErrorClass::BackendConnectionLimit`] — pre-wire AND
     /// health-neutral, matching the raw-TCP path where an over-cap dial fails
-    /// before relay, records `cb.record_neutral()`, and `retry_on_connect_failure`
+    /// before relay, settles the breaker `Neutral`, and `retry_on_connect_failure`
     /// may rotate to another LB target (with its own lane). `get_sender()` first
     /// falls back to any already-established shard, so a capped destination
     /// keeps serving by multiplexing rather than failing.
@@ -2505,8 +3067,8 @@ impl From<crate::pool::SharedPoolCreateError> for Http2PoolError {
             },
             // Coalesced waiters must see the SAME typed over-cap refusal the
             // creator produced, so `get_sender`'s already-established-shard
-            // fallback and `classify_http2_pool_error`'s pre-wire
-            // `ConnectionPoolError` apply to them identically. Reconstructing it
+            // fallback and `classify_http2_pool_error`'s pre-wire, health-neutral
+            // `BackendConnectionLimit` apply to them identically. Reconstructing it
             // as `BackendUnavailable` would keep the ErrorClass but lose the
             // structural signal.
             SharedPoolCreateKind::MaxConnections => Self::MaxConnectionsExceeded { message },
@@ -2850,7 +3412,6 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
-            pool_max_requests_per_connection: None,
             pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,

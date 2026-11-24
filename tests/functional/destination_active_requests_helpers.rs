@@ -4,7 +4,7 @@
 //!
 //! Every test that consumes this module starts a REAL in-process Ferrum
 //! gateway (`ferrum_edge::modes::file::serve`) over a config that has been
-//! through `prepare_gateway_config_for_mesh`, so the DestinationRule → dispatch
+//! through `prepare_gateway_config_via_mesh_slice_with_fixtures`, so the DestinationRule → dispatch
 //! policy → admission-funnel chain is exercised end to end rather than
 //! asserted from source text. The observable contract in every case is:
 //!
@@ -28,7 +28,8 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::modes::file::ServeOptions;
 use ferrum_edge::modes::mesh::{
-    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
+    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
+    prepare_gateway_config_via_mesh_slice_with_fixtures,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -68,13 +69,13 @@ pub(super) struct RunningGateway {
     pub http_port: u16,
     /// HTTPS/QUIC listener port. `0` when HTTP/3 was not requested.
     pub https_port: u16,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: ferrum_edge::overload::ShutdownSender,
     join: JoinHandle<()>,
 }
 
 impl RunningGateway {
     pub async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.shutdown();
         match timeout(Duration::from_secs(10), self.join).await {
             Ok(Ok(())) => {}
             Ok(Err(join_err)) => panic!("destination-breaker gateway task panicked: {join_err}"),
@@ -127,11 +128,11 @@ pub(super) async fn start_gateway(
         ..EnvConfig::default()
     };
 
-    let prepared = prepare_gateway_config_for_mesh(config, &mesh_runtime_config()).map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("mesh preparation failed: {e}").into()
-        },
-    )?;
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &mesh_runtime_config())
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("mesh preparation failed: {e}").into()
+            })?;
 
     let jwt_manager = JwtManager::new(JwtConfig {
         secret: JWT_SECRET.to_string(),
@@ -149,7 +150,9 @@ pub(super) async fn start_gateway(
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let handles = ferrum_edge::modes::file::serve(env_config, prepared, opts, shutdown_tx.clone())
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -174,7 +177,7 @@ pub(super) async fn start_gateway(
 /// Used by the setup gates so a translation regression fails as a config
 /// assertion instead of as a confusing traffic assertion.
 pub(super) fn prepare_for_assertions(config: GatewayConfig) -> GatewayConfig {
-    prepare_gateway_config_for_mesh(config, &mesh_runtime_config())
+    prepare_gateway_config_via_mesh_slice_with_fixtures(config, &mesh_runtime_config())
         .expect("mesh preparation for assertions")
 }
 

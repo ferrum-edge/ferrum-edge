@@ -255,3 +255,170 @@ fn frontend_and_backend_future_state_stays_within_the_stack_budget() {
         );
     }
 }
+
+/// The listener's service future stores the frontend future, and the affinity
+/// scopes pass it along by value. It must stay a pointer: stored inline, its
+/// state was copied by each of those layers, and the service future that
+/// carried the copies was itself copied twice more per request, when hyper and
+/// the runtime spawn the HTTP/2 stream.
+#[test]
+fn the_frontend_boundary_future_is_a_pointer_to_the_frontend_state() {
+    let [frontend_boundary, frontend, ..] =
+        ferrum_edge::proxy::request_stack_test_support::future_sizes();
+    assert_eq!(
+        frontend_boundary,
+        std::mem::size_of::<usize>(),
+        "the frontend future the listeners store must be boxed, not {frontend_boundary} bytes inline"
+    );
+    assert!(
+        frontend > frontend_boundary,
+        "the concrete frontend state ({frontend} bytes) is what the pointer keeps out of the service future"
+    );
+}
+
+/// A bounded child the handler keeps inline is written straight into its slot
+/// of the handler's state. A factory that returns the child by value makes the
+/// caller copy the whole state machine out of a stack temporary: 18 KiB per
+/// request for the backend attempt.
+#[test]
+fn bounded_inline_children_are_constructed_in_their_final_slot() {
+    // Code only: a comment that names one of the counted calls must not
+    // change a count.
+    fn squeezed(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let (_, after_start) = source
+            .split_once(start)
+            .unwrap_or_else(|| panic!("`{start}` must exist"));
+        let (region, _) = after_start
+            .split_once(end)
+            .unwrap_or_else(|| panic!("`{start}` must be bounded by `{end}`"));
+        region
+    }
+
+    let src = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        !src.contains("fn construct_proxy_future<"),
+        "an inline child must not be returned by value from an out-of-line factory"
+    );
+    // The same shape under any other name: a factory that takes a constructor
+    // and returns what it built by value.
+    let by_value_factory = "impl FnOnce() -> F) -> F {";
+    assert!(
+        !src.contains(by_value_factory),
+        "no factory in the HTTP/1.1 and HTTP/2 proxy path may return its child by value"
+    );
+    // The HTTP/3 backend client keeps the one remaining by-value factory: its
+    // exchange futures have not been profiled, so it is named here instead of
+    // converted. Converting it, or adding another, has to update this.
+    let h3_client = include_str!("../../../src/http3/client.rs");
+    assert_eq!(
+        h3_client.matches(by_value_factory).count(),
+        1,
+        "construct_h3_future is the only known by-value child factory left"
+    );
+    assert!(
+        h3_client.contains(
+            "fn construct_h3_future<F: std::future::Future>(construct: impl FnOnce() -> F) -> F {"
+        ),
+        "the remaining by-value factory is construct_h3_future"
+    );
+    assert!(
+        src.contains("#[inline(never)]\nfn construct_proxy_future_in<"),
+        "construct_proxy_future_in must stay an out-of-line factory"
+    );
+    let factory = between(src, "fn construct_proxy_future_in<", "\n}\n");
+    assert!(
+        factory.contains("slot.set(Some(construct()));"),
+        "the factory must write the child through the caller's slot"
+    );
+
+    let handler = squeezed(between(
+        src,
+        "\nasync fn handle_proxy_request_inner(",
+        "\nasync fn proxy_to_backend(",
+    ));
+    let attempt_in_slot = "construct_proxy_future_in(attempt_slot.as_mut(), || { proxy_to_backend(";
+    assert_eq!(
+        handler.matches(attempt_in_slot).count(),
+        2,
+        "the retry-configured and the single-attempt dispatch each build their attempt in a slot"
+    );
+    assert_eq!(
+        handler.matches("proxy_to_backend(").count(),
+        2,
+        "the handler awaits exactly those two backend attempts inline; another call site needs its own slot"
+    );
+
+    let dispatch = squeezed(between(
+        src,
+        "\nasync fn proxy_to_backend(",
+        "\nasync fn proxy_to_backend_direct_h1(",
+    ));
+    for child in ["proxy_to_backend_http2(", "proxy_to_backend_direct_h1("] {
+        let child_in_slot =
+            format!("construct_proxy_future_in(dispatch_slot.as_mut(), || {{ {child}");
+        assert_eq!(
+            dispatch.matches(child_in_slot.as_str()).count(),
+            1,
+            "{child} must be built in its slot of the backend attempt"
+        );
+        assert_eq!(
+            dispatch.matches(child).count(),
+            1,
+            "{child} must not also be awaited by value in the backend attempt"
+        );
+    }
+
+    assert!(
+        src.contains("#[inline(never)]\nfn construct_frontend_proxy_request("),
+        "construct_frontend_proxy_request must stay an out-of-line factory"
+    );
+    let frontend = between(src, "fn construct_frontend_proxy_request(", "\n}\n");
+    assert!(
+        frontend.contains("Box::pin(handle_proxy_request_on_frontend_port("),
+        "the frontend future must be built directly in its box"
+    );
+}
+
+/// A final-request-body hook context is a whole `RequestContext`, about 3 KiB.
+/// The handler keeps several of them across awaits and moves them between
+/// slots with `Option::take`. In the release build that move was a copy of
+/// the full value on every request, including when the slot is empty: the
+/// normal case, with no body-hook plugin. Boxed, an empty slot is a null
+/// pointer and a move is eight bytes whatever the optimizer does.
+#[test]
+fn body_hook_contexts_are_boxed_in_the_request_handler() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let (_, after_start) = src
+        .split_once("\nasync fn handle_proxy_request_inner(")
+        .expect("handle_proxy_request_inner must exist");
+    let (handler, _) = after_start
+        .split_once("\nasync fn proxy_to_backend(")
+        .expect("handle_proxy_request_inner must be bounded by proxy_to_backend");
+    assert_eq!(
+        handler
+            .matches(".then(|| Box::new(ctx.clone_for_final_request_body_hooks()))")
+            .count(),
+        3,
+        "the handler's three body-hook contexts are created boxed"
+    );
+    assert_eq!(
+        handler
+            .matches("clone_for_final_request_body_hooks()")
+            .count(),
+        3,
+        "a body-hook context the handler creates must not be stored inline"
+    );
+    assert!(
+        std::mem::size_of::<Option<Box<ferrum_edge::plugins::RequestContext>>>()
+            < std::mem::size_of::<ferrum_edge::plugins::RequestContext>() / 100,
+        "an inline slot costs a whole RequestContext; a boxed one a pointer"
+    );
+}

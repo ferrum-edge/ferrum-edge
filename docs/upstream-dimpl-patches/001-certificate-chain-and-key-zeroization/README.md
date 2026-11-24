@@ -10,14 +10,14 @@
 | Registry checksum | `ef7eed0cf766b110880acdd89a860061dee42ed5f64df0fa43c80203e4f60916` |
 | Upstream source commit | [`37bb0fa83f4167420729de5ea71c61852f82e9ed`](https://github.com/algesten/dimpl/commit/37bb0fa83f4167420729de5ea71c61852f82e9ed) |
 | License | MIT OR Apache-2.0 (both license files are retained in the vendor directory) |
-| Latest upstream audited | 0.7.2 (`ba6aa42b0c64c3e5311a2afad224b32db1ee129d21c63daaaf8ea747b846cdbc`) |
+| Latest upstream audited | 0.9.0 (`b2c7b707106416bb46237cf25b702975015079fc5fa8791232b639bc4619c2de`), re-audited 2026-11-10 with 0.8.0 (`df69b372e2de9011f8c22a58d1b5f5afa1752041bc5c0ae6b8a126aadaea5ed2`); see [Upstream re-audit](#upstream-re-audit) |
 | State | Applied through `vendor/dimpl-0.6.1-ferrum-patched` and `[patch.crates-io]` |
 | Upstream issue / PR | Deliberate fork — unfiled; governed by the [fork policy](../../dependency-policy.md#deliberate-fork-policy-and-sla) |
 | Owner | `@jeremyjpj0916` |
 
 ## Why the patch is required
 
-Published `dimpl` versions through 0.7.2 accept one local DER certificate and
+Published `dimpl` versions through 0.9.0 accept one local DER certificate and
 serialize only that certificate in DTLS 1.2 and 1.3. A configured
 leaf/intermediate bundle is therefore silently reduced to its leaf before the
 dependency sees it, and a peer that trusts only the root cannot build a path.
@@ -26,6 +26,17 @@ The published credential type also stores private-key DER in `Vec<u8>`.
 Endpoint construction, clone-based configuration caches, auto-negotiation,
 protocol fallback, replacement, and shutdown can retain or release ordinary
 heap copies without clearing them.
+
+Published 0.6.1 also sends a DTLS 1.3 `CertificateRequest` whose
+`certificate_authorities` extension carries a zero-length authorities list.
+RFC 8446 §4.2.4 makes the extension optional but requires a non-empty list
+(`DistinguishedName authorities<3..2^16-1>`) when it is present, so strict
+peers (dimpl 0.8.0+, Chrome/BoringSSL) treat the encrypted flight as malformed
+and the required-client-certificate handshake never completes (issue #7000).
+Upstream fixed this in
+[algesten/dimpl#153](https://github.com/algesten/dimpl/pull/153), first
+released in 0.7.0; this copy backports it because the chain and zeroization
+changes keep Ferrum on 0.6.1.
 
 No compatible upstream release provides both full-chain transport and
 drop-time key clearing, so a gateway-only wrapper cannot establish either
@@ -52,7 +63,17 @@ The patch:
 - wraps temporary SEC1-to-PKCS#8 encodings in zeroizing storage and uses
   `pkcs8::SecretDocument` for PEM decoding; and
 - rejects incoming certificate lists beyond parser capacity instead of
-  panicking; and
+  panicking;
+- backports upstream algesten/dimpl#153 verbatim (except its `CHANGELOG.md`
+  line): the DTLS 1.3 `CertificateRequest` omits the optional
+  `certificate_authorities` extension instead of sending an empty list,
+  keeps the required `signature_algorithms` extension, and leaves
+  `require_client_certificate` and Ferrum's certificate verification
+  unchanged (dimpl has no configured CA names to advertise, so omission is
+  the only valid encoding);
+- passes a `DtlsCertificateChain` to `Engine::new` in the inline
+  `dtls13::engine` test helper, so the crate's `--lib` test target compiles
+  against the constructor signature this patch changed; and
 - makes documentation-only corrections to the vendored `README.md` /
   `CLAUDE.md` Sans-IO poll-loop illustrations so they cover every current
   `Output` variant and drain to `Timeout` before acting on `CloseNotify`
@@ -92,6 +113,33 @@ constructor and in each constructor's "Panics" section. Ferrum's loader
 (`src/dtls/mod.rs`) satisfies the prerequisite: it parses the key with the
 build-selected signing provider and with dimpl's key provider before
 returning a chain, so no Ferrum loader path reaches the constructor panic.
+
+## Upstream re-audit
+
+Re-audited 2026-11-10 against the retirement trigger (full-chain DTLS 1.2/1.3
+transport, peer-chain output, and drop-time key zeroization on every ownership
+path) for registry 0.8.0, which Ferrum already resolves as the `strict_dimpl`
+dev-dependency (`Cargo.lock` checksum
+`df69b372e2de9011f8c22a58d1b5f5afa1752041bc5c0ae6b8a126aadaea5ed2`), and for
+0.9.0, the newest upstream tag at the time
+(`b2c7b707106416bb46237cf25b702975015079fc5fa8791232b639bc4619c2de`).
+Neither meets it, so the fork stays:
+
+- **Chain transport: no.** `DtlsCertificate` is still
+  `{ certificate: Vec<u8>, private_key: Vec<u8> }` (`src/lib.rs`), one DER
+  certificate. DTLS 1.2 `get_client_certificate` (`src/dtls12/context.rs`)
+  pushes exactly one `Asn1Cert`, and the DTLS 1.3
+  `handshake_create_certificate` (`src/dtls13/client.rs`, and the server's
+  Certificate message) serializes a one-entry `certificate_list`.
+- **Key zeroization: no.** The private key is still a plain `Vec<u8>` that
+  `#[derive(Clone)]` copies; neither release depends on `zeroize` or clears
+  key bytes on drop.
+- **Peer-chain output:** both releases parse the peer's whole
+  `certificate_list`, but the local-chain and key-clearing gaps above already
+  fail the trigger.
+
+Re-audit when a release changes `DtlsCertificate` or the Certificate
+serializers.
 
 ## Provenance and audit artifacts
 
@@ -141,6 +189,26 @@ MIT/Apache-2.0 license is already allowed.
   does not claim erasure while a closed endpoint is still retained.
 - The `test-hooks` feature invokes a post-zeroization observer while the
   allocation is still live. Tests never inspect freed memory.
+- `dtls13::server::tests::certificate_request_omits_empty_certificate_authorities`
+  (upstream's #153 regression, run by the `Vendored Patch Regressions` CI job
+  — which executes `ci.yml` from `main` through the trusted required-workflows
+  ruleset, so the step runs once it is on `main` — with `cargo test --manifest-path vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml --lib certificate_request_omits_empty_certificate_authorities`)
+  parses the serialized `CertificateRequest` and fails if a
+  `certificate_authorities` extension is emitted. Before the backport it fails
+  on `!extension_types.contains(&ExtensionType::CertificateAuthorities)`.
+- `tests/integration/dtls_integration_tests.rs`
+  `test_frontend_dtls13_client_auth_interoperates_with_strict_certificate_request_parser`
+  drives registry dimpl 0.8.0 (the `strict_dimpl` dev-dependency, which
+  rejects an empty authorities list with `LengthValue`) as an independent
+  DTLS 1.3 client against Ferrum's real mTLS listener and client-CA verifier.
+  A certificate from the trusted CA must complete the handshake and
+  round-trip application data. Before the backport it never connects. A
+  certificate from an untrusted CA and an empty client `Certificate` (which
+  dimpl completes the handshake on, leaving Ferrum's verified-certificate gate
+  to refuse it) must each reach the certificate stage, which the strict
+  client's `Connected` proves, and still never be delivered through
+  `accept()` or relayed. The vendored client tolerates the empty list, so the
+  vendored-client tests cannot catch this regression on their own.
 - `tests/integration/dtls_integration_tests.rs` configures
   root → intermediate → leaf, trusts only the root, and completes a real
   Ferrum handshake because the intermediate is transmitted.
@@ -161,8 +229,12 @@ Retire the vendor copy only after a compatible upstream release:
    endpoint, is not required to erase it); and
 4. preserves Ferrum's supported ECDSA P-256/P-384 and constructor APIs.
 
-Then remove the `[patch.crates-io]` rows (root `Cargo.toml` and
-`tests/performance/mesh/Cargo.toml`), the vendor directory, its
+Any such release already contains the #153 `CertificateRequest` fix (0.7.0
+and later), so the backport adds no retirement condition of its own.
+
+Then remove the `[patch.crates-io]` rows (root `Cargo.toml`, `fuzz/Cargo.toml`
+and `tests/performance/mesh/Cargo.toml`), regenerate the three lockfiles while
+the vendor copy still exists, then remove the vendor directory, its
 `vendor/VENDOR_INTEGRITY.sha256` entries and `GOVERNED_VENDOR_LOCKFILES`
 allowlist entry, the `Vendored Patch Regressions` CI step, the inventory row in
 `docs/dependency-policy.md`, and the entry in

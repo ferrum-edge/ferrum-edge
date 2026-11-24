@@ -83,6 +83,11 @@ fn process_private_tls_managed_store_path() -> String {
 
 /// Default bound on waiting for the shared managed-TLS/ACME store lock.
 pub const DEFAULT_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 10;
+
+/// Upper bound for `FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS` (24 hours, the
+/// same ceiling as `FERRUM_SHUTDOWN_DRAIN_SECONDS`). Larger values are refused
+/// at the configuration boundary instead of silently never firing.
+pub const MAX_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS: u64 = 86_400;
 /// Settings key for that bound.
 pub const TLS_STORE_LOCK_TIMEOUT_KEY: &str = "FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS";
 const MIN_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 1;
@@ -333,6 +338,200 @@ pub fn parse_mesh_tenant_tls_file_roots(
         }
     }
     Ok(roots)
+}
+
+/// Settings key for the operator opt-in that re-allows `kafka_logging`
+/// `producer_config` keys which load native code, run a host command, or read
+/// a gateway file (issue #6539).
+pub const KAFKA_ALLOW_NATIVE_CONFIG_KEY: &str = "FERRUM_KAFKA_ALLOW_NATIVE_CONFIG";
+
+/// Pure parse/validation for `FERRUM_KAFKA_ALLOW_NATIVE_CONFIG`.
+///
+/// Unset or blank is `false`. Only `true`/`false` (and `1`/`0`, `yes`/`no`,
+/// case-insensitive) are accepted; anything else is an error so a typo cannot
+/// read as either answer.
+pub fn parse_kafka_allow_native_config(raw: Option<&str>) -> Result<bool, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(false),
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(true),
+            "false" | "0" | "no" => Ok(false),
+            _ => Err(format!(
+                "{KAFKA_ALLOW_NATIVE_CONFIG_KEY} must be true or false"
+            )),
+        },
+    }
+}
+
+/// Whether this process allows `kafka_logging` native `producer_config` keys.
+///
+/// Resolved with the same env-over-`ferrum.conf` precedence `EnvConfig` uses,
+/// at each plugin admission, so every admission path in the process (admin
+/// writes, file and database loads, data-plane updates) gives one answer.
+/// `EnvConfig` refuses startup on a malformed value; if one is seen here
+/// anyway, the answer is `false`.
+pub fn kafka_native_config_allowed() -> bool {
+    parse_kafka_allow_native_config(
+        crate::config::conf_file::resolve_ferrum_var(KAFKA_ALLOW_NATIVE_CONFIG_KEY).as_deref(),
+    )
+    .unwrap_or(false)
+}
+
+/// Settings key for the operator attestation that lets `kafka_logging` run
+/// under a backend egress policy that can deny addresses.
+pub const KAFKA_ALLOWED_BROKERS_KEY: &str = "FERRUM_KAFKA_ALLOWED_BROKERS";
+
+/// One `host:port` entry of [`KafkaBrokerAllowance`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KafkaAllowedBrokerEndpoint {
+    /// Lowercased host, IPv6 brackets removed.
+    host: String,
+    /// The host as an IP when it is an IP literal.
+    ip: Option<std::net::IpAddr>,
+    port: u16,
+}
+
+/// Node-operator attestation of the Kafka brokers `kafka_logging` may reach
+/// under a restrictive backend egress policy (`FERRUM_KAFKA_ALLOWED_BROKERS`).
+///
+/// librdkafka resolves bootstrap hostnames itself and dials every broker the
+/// cluster advertises in metadata, outside Ferrum's resolver, and the pinned
+/// client has no connect/resolve hook. Ferrum therefore cannot screen those
+/// dials. This allowance is the operator's statement that the listed brokers
+/// — and the cluster they advertise — are trusted destinations. Admission
+/// checks that every `broker_list` entry is listed; literal broker IPs still
+/// go through the dangerous-range baseline. It never relaxes the policy for
+/// any other client.
+#[derive(Debug, Clone, Default)]
+pub struct KafkaBrokerAllowance {
+    endpoints: Vec<KafkaAllowedBrokerEndpoint>,
+    cidrs: CidrSet,
+}
+
+impl KafkaBrokerAllowance {
+    /// True when the operator listed nothing (the default).
+    pub fn is_empty(&self) -> bool {
+        self.endpoints.is_empty() && self.cidrs.is_empty()
+    }
+
+    /// Whether the bootstrap destination `host:port` is attested.
+    ///
+    /// `host` is the unbracketed host librdkafka will dial and `literal_ip`
+    /// is its address when the host is an IP literal. A hostname is covered
+    /// only by an exact (ASCII case-insensitive) `host:port` entry; an IP
+    /// literal is covered by an equal `ip:port` entry or by a listed CIDR/IP.
+    pub fn covers(&self, host: &str, literal_ip: Option<std::net::IpAddr>, port: u16) -> bool {
+        match literal_ip {
+            Some(ip) => {
+                self.cidrs.contains(&ip)
+                    || self
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.port == port && endpoint.ip == Some(ip))
+            }
+            None => self.endpoints.iter().any(|endpoint| {
+                endpoint.port == port
+                    && endpoint.ip.is_none()
+                    && endpoint.host.eq_ignore_ascii_case(host)
+            }),
+        }
+    }
+}
+
+/// Parse `FERRUM_KAFKA_ALLOWED_BROKERS`.
+///
+/// Unset or blank is an empty allowance. Entries are comma-separated and each
+/// is `host:port`, `ip:port`, `[ipv6]:port`, a bare IP, or a CIDR. A malformed
+/// entry, an empty entry, or a CIDR list that covers a whole address family is
+/// an error, so a typo cannot widen or silently drop the attestation.
+pub fn parse_kafka_allowed_brokers(raw: Option<&str>) -> Result<KafkaBrokerAllowance, String> {
+    let Some(raw) = raw else {
+        return Ok(KafkaBrokerAllowance::default());
+    };
+    if raw.trim().is_empty() {
+        return Ok(KafkaBrokerAllowance::default());
+    }
+    let mut endpoints = Vec::new();
+    let mut cidr_entries: Vec<&str> = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(format!(
+                "{KAFKA_ALLOWED_BROKERS_KEY} contains an empty entry (check for a doubled or \
+                 trailing comma)"
+            ));
+        }
+        if entry.contains('/') || entry.parse::<std::net::IpAddr>().is_ok() {
+            cidr_entries.push(entry);
+            continue;
+        }
+        endpoints.push(parse_kafka_allowed_broker_endpoint(entry)?);
+    }
+    let cidrs = CidrSet::parse_strict(&cidr_entries.join(","))
+        .map_err(|error| format!("{KAFKA_ALLOWED_BROKERS_KEY}: {error}"))?;
+    if cidrs.permits_all_family() {
+        return Err(format!(
+            "{KAFKA_ALLOWED_BROKERS_KEY} must not cover an entire address family; list the \
+             brokers (or their subnets) the Kafka cluster actually advertises"
+        ));
+    }
+    Ok(KafkaBrokerAllowance { endpoints, cidrs })
+}
+
+fn parse_kafka_allowed_broker_endpoint(entry: &str) -> Result<KafkaAllowedBrokerEndpoint, String> {
+    let shape_error = || {
+        format!(
+            "{KAFKA_ALLOWED_BROKERS_KEY} entry {entry:?} must be host:port, ip:port, \
+             [ipv6]:port, an IP, or a CIDR"
+        )
+    };
+    let (host, port, bracketed) = if let Some(rest) = entry.strip_prefix('[') {
+        let (host, after) = rest.split_once(']').ok_or_else(shape_error)?;
+        let port = after.strip_prefix(':').ok_or_else(shape_error)?;
+        (host, port, true)
+    } else {
+        let (host, port) = entry.rsplit_once(':').ok_or_else(shape_error)?;
+        if host.contains(':') {
+            return Err(format!(
+                "{KAFKA_ALLOWED_BROKERS_KEY} entry {entry:?}: write an IPv6 broker as [ipv6]:port"
+            ));
+        }
+        (host, port, false)
+    };
+    let port = port
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(shape_error)?;
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+    {
+        return Err(shape_error());
+    }
+    let ip = host.parse::<std::net::IpAddr>().ok();
+    if bracketed != matches!(ip, Some(std::net::IpAddr::V6(_))) {
+        return Err(shape_error());
+    }
+    Ok(KafkaAllowedBrokerEndpoint {
+        host: host.to_ascii_lowercase(),
+        ip,
+        port,
+    })
+}
+
+/// This process's `FERRUM_KAFKA_ALLOWED_BROKERS` attestation.
+///
+/// Resolved with the same env-over-`ferrum.conf` precedence `EnvConfig` uses,
+/// at each plugin admission, so every admission path in the process gives one
+/// answer. `EnvConfig` refuses startup on a malformed value; if one is seen
+/// here anyway, the allowance is empty (fail closed).
+pub fn kafka_allowed_brokers() -> KafkaBrokerAllowance {
+    parse_kafka_allowed_brokers(
+        crate::config::conf_file::resolve_ferrum_var(KAFKA_ALLOWED_BROKERS_KEY).as_deref(),
+    )
+    .unwrap_or_default()
 }
 
 /// Settings key for the shared TLS state document byte ceiling.
@@ -703,8 +902,8 @@ pub fn tls_acme_max_accounts_from_env() -> Result<usize, String> {
 
 /// Pure parse for `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY`.
 ///
-/// `0` is valid and means retain no terminal order history (active/recoverable
-/// orders are never pruned by this setting).
+/// `0` is valid and means retain no terminal order history (active orders are
+/// never pruned by this setting).
 pub fn parse_tls_acme_terminal_order_history(raw: Option<&str>) -> Result<usize, String> {
     parse_bounded_usize_setting(
         TLS_ACME_TERMINAL_ORDER_HISTORY_KEY,
@@ -812,8 +1011,6 @@ fn validate_discovery_body_limits(limits: DiscoveryBodyLimits) -> Result<(), Str
 /// TLS values are unresolved source references; use [`Self::connect_lazy`]
 /// rather than passing this URL directly to SQLx.
 #[derive(Clone, PartialEq, Eq)]
-// Public custom-plugin API; the binary test target may compile without opt-in plugins.
-#[allow(dead_code)]
 pub struct EffectiveSqlBackend {
     pub db_type: String,
     pub effective_url: String,
@@ -823,7 +1020,6 @@ impl EffectiveSqlBackend {
     /// Build a lazy SQL pool with pool-owned TLS material, without dialing.
     /// Source reads use the shared detached-reader fence and the supplied
     /// timeout (seconds; zero disables the bound). Errors fail closed.
-    #[allow(dead_code)] // Public custom-plugin API; examples are opt-in.
     pub async fn connect_lazy(
         &self,
         options: sqlx::any::AnyPoolOptions,
@@ -866,7 +1062,6 @@ pub enum OperatingMode {
 }
 
 impl OperatingMode {
-    #[allow(dead_code)] // Used by integration/unit tests via the lib crate
     pub fn from_env() -> Result<Self, String> {
         Self::resolve(&ConfFile::default())
     }
@@ -1638,6 +1833,28 @@ impl BackendEgressPolicy {
             && self.deny_cidrs.is_empty()
             && !self.block_dangerous
     }
+
+    /// The dangerous-range baseline verdict for `addr` alone, after the
+    /// explicit `FERRUM_BACKEND_ALLOW_CIDRS` escape hatch: `deny_reason`
+    /// precedence with `FERRUM_BACKEND_DENY_CIDRS` and the
+    /// `FERRUM_BACKEND_ALLOW_IPS` mode taken out.
+    ///
+    /// For operator attestations that may waive the deny list and the mode
+    /// filter for a specific destination (`FERRUM_KAFKA_ALLOWED_BROKERS`) but
+    /// must never waive the metadata/link-local/multicast/unspecified baseline.
+    /// Admission-time only: it clones the allow list.
+    pub fn dangerous_range_reason(&self, addr: &std::net::IpAddr) -> Option<&'static str> {
+        if !self.block_dangerous {
+            return None;
+        }
+        Self {
+            allow_ips: BackendAllowIps::Both,
+            allow_cidrs: self.allow_cidrs.clone(),
+            deny_cidrs: CidrSet::default(),
+            block_dangerous: true,
+        }
+        .deny_reason(addr)
+    }
 }
 
 impl std::fmt::Display for BackendEgressPolicy {
@@ -1692,7 +1909,6 @@ fn resolve_tls_source_override(
 /// conf-aware resolver for consumers that do not hold the `ConfFile` used by
 /// `EnvConfig::from_env_with_conf`.
 // Used by the public SQL-backend resolver when an opt-in plugin is compiled.
-#[allow(dead_code)]
 fn resolve_cached_tls_source_override(source_key: &str, path_key: &str) -> Option<String> {
     let path_value = crate::config::conf_file::resolve_ferrum_var(path_key);
     match crate::config::conf_file::resolve_ferrum_var(source_key) {
@@ -1707,24 +1923,6 @@ fn resolve_cached_tls_source_override(source_key: &str, path_key: &str) -> Optio
             Some(source_value)
         }
         None => path_value,
-    }
-}
-
-fn resolve_tls_key_exchange_groups(
-    configured: Option<String>,
-    legacy_curves: Option<String>,
-) -> Option<String> {
-    match (configured, legacy_curves) {
-        (Some(value), Some(legacy)) => {
-            if value != legacy {
-                tracing::warn!(
-                    "FERRUM_TLS_KEY_EXCHANGE_GROUPS is set; it overrides FERRUM_TLS_CURVES"
-                );
-            }
-            Some(value)
-        }
-        (Some(value), None) => Some(value),
-        (None, legacy) => legacy,
     }
 }
 
@@ -1816,26 +2014,123 @@ impl std::fmt::Display for AutoBool {
     }
 }
 
+/// Process-wide compression admission policy: the gzip/Brotli codec gates
+/// and the gateway request-body ceiling that compression plugin
+/// construction is cross-checked against.
+///
+/// Single typed source for these three values (issue #6651 item 3): serving
+/// paths take them from the parsed [`EnvConfig`]; validation/library paths
+/// that never built an `EnvConfig` use [`Self::from_process_env`], which
+/// parses through the same `EnvValue` implementations and refuses a typo'd
+/// value instead of silently falling back to a default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressionAdmissionPolicy {
+    pub gzip_enabled: bool,
+    pub brotli_enabled: bool,
+    pub max_request_body_size_bytes: usize,
+}
+
+impl Default for CompressionAdmissionPolicy {
+    fn default() -> Self {
+        // Mirror the `EnvConfig` field defaults for the same variables.
+        Self {
+            gzip_enabled: true,
+            brotli_enabled: true,
+            max_request_body_size_bytes: 10_485_760,
+        }
+    }
+}
+
+impl CompressionAdmissionPolicy {
+    pub fn from_env_config(env_config: &EnvConfig) -> Self {
+        Self {
+            gzip_enabled: env_config.compression_gzip_enabled,
+            brotli_enabled: env_config.compression_brotli_enabled,
+            max_request_body_size_bytes: env_config.max_request_body_size_bytes,
+        }
+    }
+
+    /// Resolve the policy from the process environment/conf file without a
+    /// full `EnvConfig` parse (library and validation entry points). An
+    /// unparseable value is an error naming the variable, exactly as
+    /// `EnvConfig::from_env` would refuse it at startup.
+    pub fn from_process_env() -> Result<Self, String> {
+        // Load the conf file fallibly first: `resolve_ferrum_var` resolves a
+        // sticky conf-load failure to `None`, which would silently become
+        // defaults here while `EnvConfig::from_env` refuses the same file.
+        let conf = crate::config::conf_file::ConfFile::load()?;
+        let resolve = |key: &str| -> Option<String> {
+            match std::env::var(key) {
+                Ok(val) => Some(val),
+                Err(_) => conf.get(key).map(str::to_string),
+            }
+        };
+        Self::from_resolved(
+            resolve("FERRUM_COMPRESSION_GZIP_ENABLED").as_deref(),
+            resolve("FERRUM_COMPRESSION_BROTLI_ENABLED").as_deref(),
+            resolve("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES").as_deref(),
+        )
+    }
+
+    /// Build the policy from already-resolved variable values (`None` =
+    /// unset), through the same `EnvValue` parsers `EnvConfig` uses.
+    pub fn from_resolved(
+        gzip_enabled: Option<&str>,
+        brotli_enabled: Option<&str>,
+        max_request_body_size_bytes: Option<&str>,
+    ) -> Result<Self, String> {
+        use env_config_macro::EnvValue;
+        fn parse_or_default<T: EnvValue>(
+            key: &str,
+            raw: Option<&str>,
+            default: T,
+        ) -> Result<T, String> {
+            match raw {
+                Some(raw) => T::parse_env(raw, key),
+                None => Ok(default),
+            }
+        }
+        let defaults = Self::default();
+        Ok(Self {
+            gzip_enabled: parse_or_default(
+                "FERRUM_COMPRESSION_GZIP_ENABLED",
+                gzip_enabled,
+                defaults.gzip_enabled,
+            )?,
+            brotli_enabled: parse_or_default(
+                "FERRUM_COMPRESSION_BROTLI_ENABLED",
+                brotli_enabled,
+                defaults.brotli_enabled,
+            )?,
+            max_request_body_size_bytes: parse_or_default(
+                "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
+                max_request_body_size_bytes,
+                defaults.max_request_body_size_bytes,
+            )?,
+        })
+    }
+}
+
 /// All environment-driven configuration.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Some fields are used only in specific modes or feature paths.
 pub struct EnvConfig {
     pub mode: OperatingMode,
     /// Namespace this gateway instance loads and manages. Resources from other
     /// namespaces are ignored. Default: "ferrum".
     pub namespace: String,
+    /// `FERRUM_LOG_LEVEL` as admitted by configuration parsing. Default:
+    /// "warn". Runtime tracing is initialised from the same variable before
+    /// `EnvConfig` is parsed (`gateway_entry.rs`), so this copy only records
+    /// the setting.
     pub log_level: String,
     /// Per-sink admitted record limit for process logging. Stdout/access logs
     /// share one sink and stderr owns another. Default: 4096.
     /// Note: consumed in main() before EnvConfig is constructed (tracing must init
     /// first), but stored here for completeness alongside other FERRUM_* vars.
-    #[allow(dead_code)]
     pub log_buffer_capacity: usize,
     /// Per-sink aggregate reserved-byte budget. Default: 32 MiB.
-    #[allow(dead_code)]
     pub log_buffer_bytes: usize,
     /// Maximum serialized bytes in one process log record. Default: 64 KiB.
-    #[allow(dead_code)]
     pub log_max_record_bytes: usize,
     /// Shared observability lifecycle and per-process-sink drain timeout.
     /// Default: 2000 ms.
@@ -2007,11 +2302,18 @@ pub struct EnvConfig {
     /// through `create_jwt_manager_from_env()`; this field is the startup
     /// validation.
     pub admin_jwt_viewer_namespaces: Option<String>,
+    /// Optional `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`: the key root
+    /// for `GET /config/export` credential fingerprints
+    /// (GHSA-crqx-mp2f-v8c8). At least 32 characters, and distinct from
+    /// `FERRUM_ADMIN_JWT_SECRET`, `FERRUM_ADMIN_JWT_VIEWER_SECRET`, and
+    /// `FERRUM_CP_DP_GRPC_JWT_SECRET`. Unset uses a random per-process key.
+    /// The admin plane reads it through `create_jwt_manager_from_env()`; this
+    /// field is the startup validation.
+    pub admin_config_export_fingerprint_secret: Option<String>,
     /// JWT issuer claim (iss) for Admin API tokens. Tokens with a different issuer
     /// are rejected during verification. Default: "ferrum-edge".
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs` for use sites
     /// that don't have `EnvConfig` in scope (e.g., `create_jwt_manager_from_env()`).
-    #[allow(dead_code)]
     pub admin_jwt_issuer: String,
     /// Maximum accepted TTL in seconds for externally minted Admin API JWT tokens.
     ///
@@ -2025,13 +2327,12 @@ pub struct EnvConfig {
     /// lifetime cap entirely; a value above `i64::MAX` is rejected as invalid
     /// rather than treated as unlimited. Default: 3600.
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs`.
-    #[allow(dead_code)]
     pub admin_jwt_max_ttl: u64,
     /// Optional required `aud` (audience) claim for externally minted Admin API
     /// JWT tokens. When set, verification requires the token to carry an `aud`
-    /// claim matching this value; when unset (default), audience is not checked.
+    /// claim matching this value; when unset (default), tokens that carry an
+    /// `aud` claim are rejected.
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs`.
-    #[allow(dead_code)]
     pub admin_jwt_audience: Option<String>,
 
     // Database
@@ -2226,7 +2527,9 @@ pub struct EnvConfig {
     /// contents instead of minting its own token, so the signing key never
     /// exists on the data plane at all. The file is re-read on every connection
     /// attempt, so a rotating projected token is picked up without a restart.
-    /// DP / mesh / xDS client side.
+    /// Mesh (native / xDS) client side only: `validate()` refuses it in `dp`
+    /// mode, whose random per-process `node_id` can never match the token's
+    /// `sub` (issue #7273).
     pub dp_cp_grpc_token_file: Option<String>,
     /// Comma-separated, priority-ordered list of CP gRPC URLs for DP failover.
     /// The DP connects to the first URL and fails over to subsequent URLs when
@@ -2542,7 +2845,8 @@ pub struct EnvConfig {
     pub mesh_sidecar_enforced_dry_run: bool,
     /// When `true`, and only when `FERRUM_MESH_SIDECAR_ENFORCED=true`, the
     /// slice builder also narrows `workloads` to SPIFFE identities referenced
-    /// by admitted services. Default `false` for a one-release rollout window.
+    /// by admitted services. Default `true` (issue #7243); `false` is the
+    /// explicit off switch.
     pub mesh_sidecar_identity_narrowing: bool,
     /// CP-side: ordering domain this control plane advertises for authoritative
     /// mesh config revisions (`FERRUM_MESH_CONFIG_AUTHORITY_ID`, issue #2473).
@@ -2674,14 +2978,9 @@ pub struct EnvConfig {
     /// rather than black-holing. Only affects mesh upstreams. Sourced from
     /// `FERRUM_MESH_LOCALITY_LB_STRICT`.
     pub mesh_locality_lb_strict: bool,
-    /// Node-waypoint cgroup-inode lifecycle sweep interval (seconds).
-    /// Identities enrolled with a cgroup v2 path are evicted when the
-    /// cgroup is gone or its inode/fingerprint changes (pod restart,
-    /// including inode-reuse cases). Set to `0` to disable. Defaults to `30`.
-    pub mesh_node_waypoint_cgroup_sweep_interval_secs: u64,
-    /// Node-waypoint lazy identity GC interval (seconds). Identities enrolled
-    /// without a cgroup binding are evicted when no live cookie record and no
-    /// open connection still references the pod. Set to `0` to disable.
+    /// Node-waypoint lazy identity GC interval (seconds). Lazily enrolled
+    /// identities are evicted when no live cookie record and no open
+    /// connection still references the pod. Set to `0` to disable.
     /// Defaults to `30`.
     pub mesh_node_waypoint_idle_gc_interval_secs: u64,
     /// Directory where the node-agent publishes the enrolled-pod registry (one
@@ -2768,11 +3067,14 @@ pub struct EnvConfig {
     // Kubernetes CRD controller (Layer 8)
     /// Enable the Kubernetes CRD controller in CP mode. When true, the CP
     /// watches Istio and Gateway API CRDs and reconciles them into Ferrum
-    /// config via `translate_k8s_objects()`. Default: false.
+    /// config via `translate_k8s_objects()`. Default: `true` when running
+    /// inside a Kubernetes pod (`KUBERNETES_SERVICE_HOST` set), `false`
+    /// otherwise; an explicit value always wins.
     pub k8s_controller_enabled: bool,
-    /// Enable core Kubernetes Pod/Service/EndpointSlice discovery. Default:
-    /// false for one release; when true, CP also watches core resources and
-    /// derives mesh services/workloads from ready pods.
+    /// Enable core Kubernetes Pod/Service/EndpointSlice discovery. Same
+    /// in-cluster default as `k8s_controller_enabled`; when true, the CP also
+    /// watches core resources and derives mesh services/workloads from ready
+    /// pods.
     pub k8s_pod_discovery_enabled: bool,
     /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`. Let a Gateway API
     /// backendRef to a selector-less Service in the route's own namespace
@@ -2948,7 +3250,7 @@ pub struct EnvConfig {
     /// 0 = disabled (always stream). Default: 65536 (64 KiB).
     pub response_buffer_cutoff_bytes: usize,
     /// Target chunk size (bytes) for HTTP/2 response body coalescing.
-    /// The `CoalescingH2Body` adapter accumulates small HTTP/2 DATA frames into
+    /// The `Coalescing<S>` adapter accumulates small HTTP/2 DATA frames into
     /// chunks of at least this size before forwarding to the client, reducing
     /// per-frame overhead on gRPC and HTTP/2 direct pool paths.
     /// Default: 131072 (128 KiB). Minimum: 16384 (16 KiB). Maximum: 1048576 (1 MiB).
@@ -3079,6 +3381,14 @@ pub struct EnvConfig {
     /// after that first request is not closed. `0` disables the bound.
     /// Default: 10 seconds.
     pub http_header_read_timeout_seconds: u64,
+    /// Downstream write-stall bound for HTTP/1.1 and HTTP/2 proxy client
+    /// connections, in seconds (`FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS`).
+    ///
+    /// The connection is closed when the gateway has bytes to write and the
+    /// client transport accepts none of them for this long (nginx
+    /// `send_timeout` semantics). Any write the transport accepts re-arms it.
+    /// `0` disables it. Default: 60.
+    pub http_client_write_timeout_seconds: u64,
     /// Frontend TLS handshake timeout in seconds. Applies before HTTP header
     /// parsing, so slow TLS handshakes cannot hold connection slots forever.
     /// 0 = disabled (no timeout). Default: 10 seconds.
@@ -3509,6 +3819,15 @@ pub struct EnvConfig {
     /// Pinning it means a future build that changed integrations cannot
     /// silently satisfy an existing FIPS deployment contract.
     pub fips_required_provider: String,
+    /// Requested TLS record-layer cipher-suite backend on the ordinary build:
+    /// "auto" (default), "ring", or "aws-lc".
+    ///
+    /// `auto` chooses by CPU: AWS-LC's suites where its AVX-512 AES-GCM
+    /// measurably wins, `ring`'s everywhere else. Like the FIPS request, it is
+    /// acted on at provider bootstrap, before `ferrum.conf` is readable, so it
+    /// must be supplied through the process environment. See
+    /// `crate::fips::aead_backend`.
+    pub tls_aead_backend: String,
 
     // TLS Hardening
     /// Minimum TLS version: "1.2" or "1.3" (default: "1.2")
@@ -3591,7 +3910,6 @@ pub struct EnvConfig {
 
     // Stream proxy (TCP/UDP)
     /// Bind address for TCP/UDP stream proxy listeners (default: 0.0.0.0).
-    #[allow(dead_code)] // Used in Phase 2 (stream listener startup)
     pub stream_proxy_bind_address: String,
     /// Trusted listener-side gateway identity used by VirtualService L4
     /// `gateways` predicates. `None` means no binding, so those predicates
@@ -3663,9 +3981,8 @@ pub struct EnvConfig {
     /// plugin is enabled; must be a unique random value of at least 32 bytes.
     /// There is no default. Rotating it invalidates all existing Basic-auth
     /// password hashes.
-    /// Note: Also resolved via `resolve_ferrum_var()` in `basic_auth.rs` and
-    /// `admin/mod.rs` for use sites that don't have `EnvConfig` in scope.
-    #[allow(dead_code)]
+    /// Note: `basic_auth.rs` also resolves it via `resolve_ferrum_var()` because
+    /// the plugin has no `EnvConfig` in scope; `fips::policy` reads this field.
     pub basic_auth_hmac_secret: Option<String>,
 
     /// Shared secret authenticating the datagram client-address envelope on
@@ -4115,7 +4432,7 @@ impl Default for EnvConfig {
         Self {
             mode: OperatingMode::File,
             namespace: "ferrum".into(),
-            log_level: "error".into(),
+            log_level: "warn".into(),
             log_buffer_capacity: crate::logging::LOG_BUFFER_CAPACITY_DEFAULT,
             log_buffer_bytes: crate::logging::LOG_BUFFER_BYTES_DEFAULT,
             log_max_record_bytes: crate::logging::LOG_MAX_RECORD_BYTES_DEFAULT,
@@ -4157,6 +4474,7 @@ impl Default for EnvConfig {
             admin_jwt_secret: None,
             admin_jwt_viewer_secret: None,
             admin_jwt_viewer_namespaces: None,
+            admin_config_export_fingerprint_secret: None,
             admin_jwt_issuer: "ferrum-edge".into(),
             admin_jwt_max_ttl: 3600,
             admin_jwt_audience: None,
@@ -4268,7 +4586,7 @@ impl Default for EnvConfig {
             mesh_outbound_registry_reject_status: 502,
             mesh_sidecar_enforced: false,
             mesh_sidecar_enforced_dry_run: false,
-            mesh_sidecar_identity_narrowing: false,
+            mesh_sidecar_identity_narrowing: true,
             mesh_config_authority_id: crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID
                 .to_string(),
             mesh_config_k8s_authority_id: String::new(),
@@ -4288,7 +4606,6 @@ impl Default for EnvConfig {
             mesh_remote_discovery_credentials: None,
             mesh_cluster_audience: None,
             mesh_locality_lb_strict: false,
-            mesh_node_waypoint_cgroup_sweep_interval_secs: 30,
             mesh_node_waypoint_idle_gc_interval_secs: 30,
             mesh_node_waypoint_pod_registry_dir: "/run/ferrum/node-waypoint-pods".to_string(),
             mesh_app_probe_max_connections:
@@ -4361,6 +4678,7 @@ impl Default for EnvConfig {
             websocket_permessage_deflate_max_message_bytes: 1_048_576,
             max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
+            http_client_write_timeout_seconds: 60,
             frontend_tls_handshake_timeout_seconds: 10,
             dns_overrides: HashMap::new(),
             dns_resolver_address: None,
@@ -4459,6 +4777,7 @@ impl Default for EnvConfig {
             adaptive_batch_limit_default: 6_000,
             fips_mode: "off".into(),
             fips_required_provider: crate::fips::SUPPORTED_PROVIDER_ID.into(),
+            tls_aead_backend: "auto".into(),
             tls_min_version: "1.2".into(),
             tls_max_version: "1.3".into(),
             tls_cipher_suites: None,
@@ -4655,6 +4974,7 @@ impl EnvConfig {
                 => required_for(["database", "cp", "dp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
             admin_jwt_viewer_secret: Option<String> = "FERRUM_ADMIN_JWT_VIEWER_SECRET";
             admin_jwt_viewer_namespaces: Option<String> = "FERRUM_ADMIN_JWT_VIEWER_NAMESPACES";
+            admin_config_export_fingerprint_secret: Option<String> = "FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET";
             admin_jwt_issuer: String = "FERRUM_ADMIN_JWT_ISSUER" => "ferrum-edge".to_string();
             admin_jwt_max_ttl: u64 = "FERRUM_ADMIN_JWT_MAX_TTL" => 3600u64;
             admin_jwt_audience: Option<String> = "FERRUM_ADMIN_JWT_AUDIENCE";
@@ -4674,6 +4994,12 @@ impl EnvConfig {
                 => crate::admin::audit::AUDIT_RETAINED_MAX_RECORDS_DEFAULT;
             admin_audit_max_delivery_attempts: u32 = "FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS"
                 => crate::admin::audit::AUDIT_MAX_DELIVERY_ATTEMPTS_DEFAULT;
+            admin_audit_local_retention_max_records: u64
+                = "FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS"
+                => crate::admin::audit::AUDIT_LOCAL_RETENTION_MAX_RECORDS_DEFAULT;
+            admin_audit_local_retention_max_bytes: u64
+                = "FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES"
+                => crate::admin::audit::AUDIT_LOCAL_RETENTION_MAX_BYTES_DEFAULT;
             admin_require_namespace_claim: bool = "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM" => false;
             gateway_listener_failure_fails_readiness: bool
                 = "FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS" => false;
@@ -4786,6 +5112,13 @@ impl EnvConfig {
             spool_max_records: admin_audit_spool_max_records,
             retained_max_records: admin_audit_retained_max_records,
             max_delivery_attempts: admin_audit_max_delivery_attempts,
+            // Resolved from `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` at first write,
+            // like the backup fallback file it sits beside.
+            local_retention_dir: None,
+            local_retention: crate::admin::audit::LocalAuditRetentionBounds {
+                max_records: admin_audit_local_retention_max_records,
+                max_bytes: admin_audit_local_retention_max_bytes,
+            },
         };
         admin_audit_pipeline.validate()?;
         if resolve_var(conf, "FERRUM_DB_POLL_INTERVAL")
@@ -4923,7 +5256,7 @@ impl EnvConfig {
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
             mesh_sidecar_enforced_dry_run: bool = "FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN" => false;
-            mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
+            mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => true;
             mesh_config_authority_id: String = "FERRUM_MESH_CONFIG_AUTHORITY_ID" => crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID.to_string();
             mesh_config_k8s_authority_id: String = "FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID" => String::new();
             mesh_config_revision_adopt_secs: u64 = "FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS" => crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS;
@@ -4941,7 +5274,6 @@ impl EnvConfig {
             mesh_remote_discovery_credentials: Option<String> = "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS";
             mesh_cluster_audience: Option<String> = "FERRUM_MESH_CLUSTER_AUDIENCE";
             mesh_locality_lb_strict: bool = "FERRUM_MESH_LOCALITY_LB_STRICT" => false;
-            mesh_node_waypoint_cgroup_sweep_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS" => 30u64;
             mesh_node_waypoint_idle_gc_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS" => 30u64;
             mesh_node_waypoint_pod_registry_dir: String = "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" => "/run/ferrum/node-waypoint-pods".to_string();
             mesh_app_probe_max_connections: usize = "FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS" => crate::modes::mesh::app_probe::DEFAULT_APP_PROBE_MAX_CONNECTIONS;
@@ -5022,6 +5354,7 @@ impl EnvConfig {
             websocket_permessage_deflate_max_message_bytes: usize = "FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES" => 1_048_576usize;
             max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
             http_header_read_timeout_seconds: u64 = "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS" => 10u64;
+            http_client_write_timeout_seconds: u64 = "FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS" => 60u64;
             frontend_tls_handshake_timeout_seconds: u64 = "FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS" => 10u64;
         }
 
@@ -5124,12 +5457,12 @@ impl EnvConfig {
             adaptive_batch_limit_default: usize = "FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT" => 6_000usize, max(1usize);
             fips_mode: String = "FERRUM_FIPS_MODE" => "off".to_string();
             fips_required_provider: String = "FERRUM_FIPS_REQUIRED_PROVIDER" => crate::fips::SUPPORTED_PROVIDER_ID.to_string();
+            tls_aead_backend: String = "FERRUM_TLS_AEAD_BACKEND" => "auto".to_string();
             tls_min_version: String = "FERRUM_TLS_MIN_VERSION" => "1.2".to_string();
             tls_max_version: String = "FERRUM_TLS_MAX_VERSION" => "1.3".to_string();
             tls_cipher_suites: Option<String> = "FERRUM_TLS_CIPHER_SUITES";
             tls_prefer_server_cipher_order: bool = "FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER" => true;
             tls_key_exchange_groups: Option<String> = "FERRUM_TLS_KEY_EXCHANGE_GROUPS";
-            tls_curves_legacy: Option<String> = "FERRUM_TLS_CURVES";
             tls_session_cache_size: usize = "FERRUM_TLS_SESSION_CACHE_SIZE" => 4096usize;
             tls_cert_expiry_warning_days: u64 = "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS" => 30u64;
             tls_crl_expiry_warning_days: u64 = "FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS" => 30u64;
@@ -5155,6 +5488,15 @@ impl EnvConfig {
             resolve_var(conf, MESH_TENANT_TLS_FILE_ROOTS_KEY).as_deref(),
         )?;
         crate::tls::source::install_mesh_tenant_tls_file_roots(mesh_tenant_tls_file_roots)?;
+
+        // `kafka_logging` reads the opt-in at admission; validate it here so a
+        // malformed value refuses startup instead of reading as `false`.
+        parse_kafka_allow_native_config(
+            resolve_var(conf, KAFKA_ALLOW_NATIVE_CONFIG_KEY).as_deref(),
+        )?;
+        // Same for the broker attestation: a malformed list must refuse
+        // startup rather than read as an empty allowance.
+        parse_kafka_allowed_brokers(resolve_var(conf, KAFKA_ALLOWED_BROKERS_KEY).as_deref())?;
 
         let (tls_source_max_blocking_concurrency, tls_source_load_timeout_seconds) =
             parse_tls_source_execution_policy(
@@ -5221,8 +5563,7 @@ impl EnvConfig {
             }
             None => None,
         };
-        let tls_curves =
-            resolve_tls_key_exchange_groups(tls_key_exchange_groups, tls_curves_legacy);
+        let tls_curves = tls_key_exchange_groups;
 
         env_config! {
             conf = conf, mode = &mode;
@@ -5729,6 +6070,7 @@ impl EnvConfig {
             admin_jwt_secret,
             admin_jwt_viewer_secret,
             admin_jwt_viewer_namespaces,
+            admin_config_export_fingerprint_secret,
             admin_jwt_issuer,
             admin_jwt_max_ttl,
             admin_jwt_audience,
@@ -5847,7 +6189,6 @@ impl EnvConfig {
             mesh_remote_discovery_credentials,
             mesh_cluster_audience,
             mesh_locality_lb_strict,
-            mesh_node_waypoint_cgroup_sweep_interval_secs,
             mesh_node_waypoint_idle_gc_interval_secs,
             mesh_node_waypoint_pod_registry_dir,
             mesh_app_probe_max_connections,
@@ -5912,6 +6253,7 @@ impl EnvConfig {
             websocket_permessage_deflate_max_message_bytes,
             max_credentials_per_type,
             http_header_read_timeout_seconds,
+            http_client_write_timeout_seconds,
             frontend_tls_handshake_timeout_seconds,
             dns_overrides,
             dns_resolver_address,
@@ -6000,6 +6342,7 @@ impl EnvConfig {
             adaptive_batch_limit_default,
             fips_mode,
             fips_required_provider,
+            tls_aead_backend,
             tls_min_version,
             tls_max_version,
             tls_cipher_suites,
@@ -6126,8 +6469,6 @@ impl EnvConfig {
         Ok(config)
     }
 
-    /// Build a `SocketAddr` from the proxy bind address and the given port.
-    /// The bind address is validated at config load time, so the parse is safe.
     /// Build an [`OverloadConfig`] from the parsed env vars.
     pub fn overload_config(&self) -> crate::overload::OverloadConfig {
         crate::overload::OverloadConfig {
@@ -6291,6 +6632,8 @@ impl EnvConfig {
         Ok(())
     }
 
+    /// Build a `SocketAddr` from the proxy bind address and the given port.
+    /// The bind address is validated at config load time, so the parse is safe.
     pub fn proxy_socket_addr(&self, port: u16) -> std::net::SocketAddr {
         let ip: std::net::IpAddr = self
             .proxy_bind_address
@@ -6445,11 +6788,6 @@ impl EnvConfig {
                 &self.admin_bind_address
             ),
         ))
-    }
-
-    /// Returns the resolved list of CP gRPC URLs for DP failover, priority-ordered.
-    pub fn resolved_dp_cp_grpc_urls(&self) -> Vec<String> {
-        self.dp_cp_grpc_urls.clone()
     }
 
     /// Seconds the shutdown signal handler holds the accept loops open after
@@ -6881,8 +7219,6 @@ impl EnvConfig {
     ///
     /// MongoDB is rejected because callers need a SQL pool. Errors never include
     /// the raw database URL or credentials.
-    // Public custom-plugin API; not every binary artifact opts a SQL consumer in.
-    #[allow(dead_code)]
     pub fn resolve_effective_sql_backend() -> Result<EffectiveSqlBackend, String> {
         use env_config_macro::EnvValue;
 
@@ -6919,7 +7255,6 @@ impl EnvConfig {
     /// process environment / `ferrum.conf`. This method is useful for tests that
     /// construct a partial [`EnvConfig`] without opening a network connection.
     // Public custom-plugin API and external-test helper.
-    #[allow(dead_code)]
     pub fn effective_sql_backend(&self) -> Result<EffectiveSqlBackend, String> {
         let db_type = self
             .db_type
@@ -7157,6 +7492,12 @@ impl EnvConfig {
     }
 
     fn validate(&mut self) -> Result<(), String> {
+        // The identity guardrail flags are read from the process environment
+        // only (never `EnvConfig`), but a typo must still fail loudly — e.g.
+        // `FERRUM_MESH_PRODUCTION_MODE=yes` must not fall through to the
+        // non-production posture and let a dev opt-out re-open a gate
+        // (issue #7237). One strict parser covers all five flags.
+        crate::identity::validate_guardrail_env()?;
         // Reserved: the offload runtime exists but is not wired at startup.
         // A nonzero value used to parse and then do nothing; fail closed so
         // operators cannot tune a knob that is silently ignored.
@@ -7194,6 +7535,20 @@ impl EnvConfig {
             crate::proxy::stream_match::validate_canonical_gateway_ref(gateway_ref)
                 .map_err(|e| format!("FERRUM_STREAM_GATEWAY_REF: {e}"))?;
         }
+        // The pseudonym is written verbatim as the `received-by` element of
+        // every `Via` header the gateway emits (`1.1 <pseudonym>`). Accept only
+        // RFC 9110 §7.6.3 `received-by` syntax (`pseudonym [":" port]`,
+        // pseudonym a token): anything else is malformed `Via` on the wire, and
+        // control characters are not representable as a header value at all,
+        // which made the response builder reject every response carrying it
+        // (#6775). Fail at startup instead.
+        if !is_valid_via_received_by(&self.via_pseudonym) {
+            return Err(
+                "FERRUM_VIA_PSEUDONYM must be an RFC 9110 token, optionally followed by \
+                 ':' and optional digits (letters, digits and !#$%&'*+-.^_`|~ only; no spaces)"
+                    .into(),
+            );
+        }
         // Sidecar-ingress Unix transport capacity (issue #3731). `0` is the
         // explicit "no bound" opt-out; anything above the ceiling could not be
         // reached before the process file-descriptor limit anyway, so accepting
@@ -7205,6 +7560,15 @@ impl EnvConfig {
             return Err(format!(
                 "FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS must be 0 (no bound) or at most {}",
                 crate::proxy::unix_backend_pool::MAX_UNIX_INGRESS_MAX_CONNECTIONS
+            ));
+        }
+
+        // A value too large to add to an `Instant` would silently never fire,
+        // leaving slow-read exhaustion unbounded while claiming a bound.
+        if self.http_client_write_timeout_seconds > MAX_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS {
+            return Err(format!(
+                "FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS must be at most \
+                 {MAX_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS} seconds (0 disables the bound)"
             ));
         }
 
@@ -7336,8 +7700,13 @@ impl EnvConfig {
         //
         // - CP with `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH`: the bundle carries
         //   the verification credentials, so the shared secret is optional.
-        // - DP/mesh with `FERRUM_DP_CP_GRPC_TOKEN_FILE`: the node presents an
+        // - Mesh with `FERRUM_DP_CP_GRPC_TOKEN_FILE`: the node presents an
         //   externally issued token and never mints one, so it needs no secret.
+        // - A stock DP cannot use a token file at all (issue #7273): it sends a
+        //   random per-process `node_id`, and `ConfigSync.Subscribe` requires
+        //   the token's `sub` to equal it, so the CP refuses every subscription.
+        //   Refuse the setting here instead of starting a DP that loops on
+        //   `PERMISSION_DENIED` and never receives config.
         //
         // Whenever a secret *is* configured it still has to clear the minimum
         // length, on every mode — the macro used to enforce that only where it
@@ -7368,14 +7737,20 @@ impl EnvConfig {
                     );
                 }
             }
-            OperatingMode::DataPlane
-                if !has_cp_dp_secret && self.dp_cp_grpc_token_file.is_none() =>
-            {
-                return Err(
-                    "FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode unless \
-                            FERRUM_DP_CP_GRPC_TOKEN_FILE supplies an externally issued token"
-                        .into(),
-                );
+            OperatingMode::DataPlane => {
+                if self.dp_cp_grpc_token_file.is_some() {
+                    return Err(
+                        "FERRUM_DP_CP_GRPC_TOKEN_FILE is not supported in dp mode: a DP \
+                         sends a random per-process node_id and ConfigSync.Subscribe requires \
+                         the token's sub to equal it, so the CP would refuse the token. Use \
+                         FERRUM_CP_DP_GRPC_JWT_SECRET (plus FERRUM_CP_DP_GRPC_JWT_KEY_ID \
+                         against a trust-bundle CP) instead"
+                            .into(),
+                    );
+                }
+                if !has_cp_dp_secret {
+                    return Err("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode".into());
+                }
             }
             _ => {}
         }
@@ -7537,10 +7912,7 @@ impl EnvConfig {
                                     .into(),
                             );
                         }
-                        let bootstrap_dev = std::env::var("FERRUM_MESH_CA_BOOTSTRAP_DEV")
-                            .map(|v| v.eq_ignore_ascii_case("true"))
-                            .unwrap_or(false);
-                        if !bootstrap_dev {
+                        if !crate::identity::ca::bootstrap::dev_bootstrap_opted_in() {
                             return Err(
                                 "FERRUM_MESH_CA_BACKEND=internal requires FERRUM_MESH_CA_BOOTSTRAP_DEV=true \
                                  (dev/test only) to bootstrap its self-signed root"
@@ -7643,19 +8015,6 @@ impl EnvConfig {
                              FERRUM_MESH_ALLOW_STATIC_ID=true enables the proof-free static fallback"
                                 .into(),
                         );
-                    }
-                }
-                // Validate the production-mode flag value loudly — like
-                // `EnvConfig`'s bool parser — so a typo (e.g. `tru` / `yes`)
-                // can't silently fall through to the non-production posture and
-                // let the dev opt-out re-open the no-identity gate.
-                if let Ok(raw) = std::env::var("FERRUM_MESH_PRODUCTION_MODE") {
-                    let v = raw.trim().to_ascii_lowercase();
-                    if !matches!(v.as_str(), "" | "true" | "false" | "1" | "0") {
-                        return Err(format!(
-                            "Invalid FERRUM_MESH_PRODUCTION_MODE value {raw:?}. \
-                             Expected true, false, 1, or 0"
-                        ));
                     }
                 }
                 if crate::identity::production_mode() {
@@ -7949,6 +8308,18 @@ impl EnvConfig {
         crate::fips::verify_resolved_mode(fips_mode)?;
         crate::fips::policy::check_env_config(self)?;
 
+        // ── TLS record-layer backend ────────────────────────────────────
+        //
+        // Same two steps as the FIPS request above, for the same reason: the
+        // backend is fixed when the provider is installed, before `ferrum.conf`
+        // is readable. A malformed value is a configuration error; a value
+        // this build cannot honour (`ring` on the FIPS profile), or one that
+        // arrived after bootstrap and differs from what bootstrap selected,
+        // is refused rather than ignored.
+        let tls_aead_backend =
+            crate::fips::aead_backend::AeadBackendRequest::parse(&self.tls_aead_backend)?;
+        crate::fips::aead_backend::verify_resolved_request(tls_aead_backend)?;
+
         // Validate TLS version settings
         match self.tls_min_version.as_str() {
             "1.2" | "1.3" => {}
@@ -7998,6 +8369,22 @@ impl EnvConfig {
                 crate::startup::quoted_config_value(
                     "FERRUM_ADMIN_BIND_ADDRESS",
                     &self.admin_bind_address
+                )
+            ));
+        }
+        // Stream listeners must never fall back to another bind address: a
+        // typo meant to keep TCP/UDP/DTLS listeners on loopback would
+        // otherwise expose them on the proxy bind address (0.0.0.0).
+        if self
+            .stream_proxy_bind_address
+            .parse::<std::net::IpAddr>()
+            .is_err()
+        {
+            return Err(format!(
+                "Invalid FERRUM_STREAM_PROXY_BIND_ADDRESS {}. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
+                crate::startup::quoted_config_value(
+                    "FERRUM_STREAM_PROXY_BIND_ADDRESS",
+                    &self.stream_proxy_bind_address
                 )
             ));
         }
@@ -8111,6 +8498,36 @@ impl EnvConfig {
                     "FERRUM_ADMIN_JWT_VIEWER_SECRET and FERRUM_CP_DP_GRPC_JWT_SECRET must be \
                      distinct secrets; identical HMAC keys are rejected because issuer claims \
                      do not domain-separate shared signing material"
+                        .into(),
+                );
+            }
+        }
+
+        // The configuration-export fingerprint secret keys MACs that every
+        // export reader (viewer-key tokens included) receives, so it must be
+        // strong and must not reuse any JWT signing secret: reuse would hand
+        // readers an offline verifier for guesses of that signing secret
+        // (GHSA-crqx-mp2f-v8c8). Diagnostics name settings, never values.
+        if let Some(fingerprint_secret) = self
+            .admin_config_export_fingerprint_secret
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            if fingerprint_secret.len() < crate::config::types::MIN_JWT_SECRET_LENGTH {
+                return Err(format!(
+                    "FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET must be at least {} characters (got {})",
+                    crate::config::types::MIN_JWT_SECRET_LENGTH,
+                    fingerprint_secret.len()
+                ));
+            }
+            let signing_secrets = [
+                self.admin_jwt_secret.as_deref(),
+                self.admin_jwt_viewer_secret.as_deref(),
+                self.cp_dp_grpc_jwt_secret.as_deref(),
+            ];
+            if signing_secrets.contains(&Some(fingerprint_secret)) {
+                return Err(
+                    crate::admin::jwt_auth::ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_REUSED_ERROR
                         .into(),
                 );
             }
@@ -8349,9 +8766,66 @@ impl EnvConfig {
         // A TLS source must not select material of another kind (issue #5959).
         self.validate_tls_source_field_kinds()?;
 
+        // ACME auto-renewal in a mode that never runs the scheduler (#7251).
+        self.validate_acme_renewal_mode()?;
+
         // ACME auto-renewal that can never reach the listener (issue #4506).
         self.validate_acme_renewal_reachability()?;
 
+        // ACME auto-renewal with a challenge type it cannot prepare (#7194).
+        self.validate_acme_renewal_challenge_type()?;
+
+        Ok(())
+    }
+
+    /// Refuse `FERRUM_ACME_AUTO_RENEW_ENABLED=true` in a mode that never runs
+    /// the ACME renewal scheduler (issue #7251).
+    ///
+    /// Only database, file and dp modes start the scheduler. Everywhere else the
+    /// flag used to validate clean and then never renew, so an `acme://`
+    /// certificate expired with no warning. Mesh mode in particular treats
+    /// operator frontend TLS (`FERRUM_FRONTEND_TLS_CERT_PATH` / `KEY_PATH`) as
+    /// static input with no live reload, so a renewal there could never reach
+    /// its listener even if a scheduler ran. The mode itself is not echoed:
+    /// `FERRUM_MODE` may be an externally resolved secret.
+    pub fn validate_acme_renewal_mode(&self) -> Result<(), String> {
+        if !self.acme_auto_renew_enabled
+            || matches!(
+                self.mode,
+                OperatingMode::Database | OperatingMode::File | OperatingMode::DataPlane
+            )
+        {
+            return Ok(());
+        }
+        Err(
+            "FERRUM_ACME_AUTO_RENEW_ENABLED=true is supported only in `database`, `file`, and \
+             `dp` modes; this mode never runs the ACME renewal scheduler, so certificates would \
+             silently stop renewing"
+                .to_string(),
+        )
+    }
+
+    /// Reject `FERRUM_ACME_RENEW_CHALLENGE_TYPE` values the renewal scheduler
+    /// cannot parse while `FERRUM_ACME_AUTO_RENEW_ENABLED=true` (issue #7194).
+    ///
+    /// The scheduler used to log one warning and not start, so a typo passed
+    /// `ferrum-edge validate` and renewal silently stopped until the
+    /// certificate expired. Like [`Self::validate_acme_renewal_reachability`],
+    /// automation that cannot renew must not start silently. The configured
+    /// value is withheld from the message.
+    pub fn validate_acme_renewal_challenge_type(&self) -> Result<(), String> {
+        if !self.acme_auto_renew_enabled {
+            return Ok(());
+        }
+        if crate::tls::acme::AcmeRenewalChallengeType::parse(&self.acme_renew_challenge_type)
+            .is_none()
+        {
+            return Err(
+                "FERRUM_ACME_RENEW_CHALLENGE_TYPE must be one of `http01`, `tls_alpn01`, or \
+                 `dns01` when FERRUM_ACME_AUTO_RENEW_ENABLED=true"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -9286,6 +9760,23 @@ impl EnvConfig {
     }
 }
 
+/// RFC 9110 §7.6.3 `received-by` as Ferrum emits it from
+/// `FERRUM_VIA_PSEUDONYM`: a non-empty `token`, optionally followed by
+/// `:<port>` where `port = *DIGIT` (RFC 3986 §3.2.3), which admits an empty
+/// port.
+fn is_valid_via_received_by(value: &str) -> bool {
+    fn is_tchar(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+    }
+    let (pseudonym, port) = match value.split_once(':') {
+        Some((pseudonym, port)) => (pseudonym, Some(port)),
+        None => (value, None),
+    };
+    !pseudonym.is_empty()
+        && pseudonym.bytes().all(is_tchar)
+        && port.is_none_or(|port| port.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// Resolve the effective authoritative client-IP header for cold paths that
 /// do not own an `EnvConfig` (notably CP snapshot and admin admission). This
 /// uses the same env-over-conf precedence as startup and matches the lowercase
@@ -9299,25 +9790,6 @@ pub(crate) fn resolve_real_ip_header() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tls_key_exchange_groups_prefer_canonical_env_name() {
-        assert_eq!(
-            resolve_tls_key_exchange_groups(
-                Some("X25519,secp384r1".to_string()),
-                Some("secp256r1".to_string()),
-            ),
-            Some("X25519,secp384r1".to_string())
-        );
-    }
-
-    #[test]
-    fn tls_key_exchange_groups_accept_legacy_curves_alias() {
-        assert_eq!(
-            resolve_tls_key_exchange_groups(None, Some("X25519,secp256r1".to_string())),
-            Some("X25519,secp256r1".to_string())
-        );
-    }
 
     #[test]
     fn existing_db_tls_url_params_detects_sql_tls_options_case_insensitively() {

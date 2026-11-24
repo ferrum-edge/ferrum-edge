@@ -56,6 +56,20 @@
 //! `/namespaces` registry, independently of
 //! `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`. Primary-key tokens are never
 //! affected. Unset keeps the viewer key fleet-wide.
+//!
+//! # Configuration-export fingerprint key
+//! (`FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`)
+//!
+//! `GET /config/export` replaces withheld credentials with keyed fingerprints
+//! and is served to viewer-key tokens. Its key therefore comes from neither
+//! signing secret (GHSA-crqx-mp2f-v8c8): a fingerprint keyed by
+//! `FERRUM_ADMIN_JWT_SECRET` over a value the reader knows would be an offline
+//! verifier for guesses of the secret that mints `admin` tokens, and one keyed
+//! by `FERRUM_ADMIN_JWT_VIEWER_SECRET` would let the reader compute
+//! fingerprints of guessed credentials itself. The dedicated secret must
+//! differ from both and from `FERRUM_CP_DP_GRPC_JWT_SECRET`; unset, each
+//! [`JwtManager`] uses a random key, so fingerprints are stable only within
+//! one process.
 
 use jsonwebtoken::{
     Algorithm, DecodingKey, TokenData, Validation, decode, errors::Error as JwtEncodeError,
@@ -188,8 +202,9 @@ impl AdminClaims {
     /// identical claim shapes (single string or array of strings). A missing
     /// claim yields `AllowedNamespaces::empty()`; malformed shapes are
     /// rejected (fail-closed) rather than treated as absent — a garbled
-    /// tenancy claim must never widen access. Only *enforced* against the
-    /// requested namespace when `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`.
+    /// tenancy claim must never widen access. A present claim always bounds the
+    /// token; `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` additionally refuses
+    /// claim-less tokens on namespace-scoped routes.
     pub fn allowed_namespaces(&self) -> Result<crate::grpc::auth::AllowedNamespaces, String> {
         crate::grpc::auth::parse_ns_claim(&self.additional)
     }
@@ -407,6 +422,13 @@ pub struct JwtManager {
     /// Optional `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`: the namespaces tokens
     /// verified by `viewer_secret` may read.
     viewer_namespace_ceiling: Option<ViewerNamespaceCeiling>,
+    /// Optional `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`, kept only to
+    /// refuse a later viewer secret equal to it.
+    config_export_fingerprint_secret: Option<String>,
+    /// Key for `GET /config/export` fingerprints: derived from
+    /// `config_export_fingerprint_secret` when configured, otherwise random
+    /// for this manager. Never derived from an admin signing secret.
+    config_export_fingerprint_key: Option<crate::fips::approved::HmacSha256Key>,
 }
 
 impl JwtManager {
@@ -416,6 +438,8 @@ impl JwtManager {
             config,
             viewer_secret: None,
             viewer_namespace_ceiling: None,
+            config_export_fingerprint_secret: None,
+            config_export_fingerprint_key: random_config_export_fingerprint_key(),
         }
     }
 
@@ -440,8 +464,58 @@ impl JwtManager {
                 ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR.to_string(),
             ));
         }
+        if self.config_export_fingerprint_secret.as_deref() == Some(viewer_secret.as_str()) {
+            return Err(JwtError::VerificationFailed(
+                ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_REUSED_ERROR.to_string(),
+            ));
+        }
         self.viewer_secret = Some(viewer_secret);
         Ok(self)
+    }
+
+    /// Key `GET /config/export` fingerprints from a dedicated secret
+    /// (`FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`), so replicas that
+    /// share it publish comparable fingerprints.
+    ///
+    /// Refuses a secret shorter than
+    /// [`crate::config::types::MIN_JWT_SECRET_LENGTH`] and one equal to the
+    /// primary or viewer signing secret: export readers would otherwise hold
+    /// MACs under a signing key (an offline verifier for guesses of it), or
+    /// could compute fingerprints of guessed credentials. Error text never
+    /// carries any secret.
+    pub fn with_config_export_fingerprint_secret(
+        mut self,
+        fingerprint_secret: String,
+    ) -> Result<Self, JwtError> {
+        if fingerprint_secret.len() < crate::config::types::MIN_JWT_SECRET_LENGTH {
+            return Err(JwtError::VerificationFailed(format!(
+                "{ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_ENV} must be at least {} characters (got {})",
+                crate::config::types::MIN_JWT_SECRET_LENGTH,
+                fingerprint_secret.len()
+            )));
+        }
+        if fingerprint_secret == self.config.secret
+            || self.viewer_secret.as_deref() == Some(fingerprint_secret.as_str())
+        {
+            return Err(JwtError::VerificationFailed(
+                ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_REUSED_ERROR.to_string(),
+            ));
+        }
+        let key =
+            crate::admin::config_export::fingerprint_key(&fingerprint_secret).ok_or_else(|| {
+                JwtError::VerificationFailed(format!(
+                    "{ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_ENV} could not derive a key"
+                ))
+            })?;
+        self.config_export_fingerprint_secret = Some(fingerprint_secret);
+        self.config_export_fingerprint_key = Some(key);
+        Ok(self)
+    }
+
+    /// Whether `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` is configured
+    /// (otherwise export fingerprints use a random per-process key).
+    pub fn has_config_export_fingerprint_secret(&self) -> bool {
+        self.config_export_fingerprint_secret.is_some()
     }
 
     /// Whether a role-ceiling viewer secret is configured.
@@ -465,14 +539,16 @@ impl JwtManager {
 
     /// Key for `GET /config/export` credential fingerprints.
     ///
-    /// Derived from the primary admin JWT secret only — never from
-    /// `FERRUM_ADMIN_JWT_VIEWER_SECRET` — so the viewer-tier credential that
-    /// the export is designed for cannot compute (and therefore cannot
-    /// dictionary-test) a fingerprint. `None` when no secret is configured.
+    /// Derived from `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` when it is
+    /// configured, otherwise random for this manager — never from either admin
+    /// signing secret (GHSA-crqx-mp2f-v8c8). The viewer-tier credential the
+    /// export is designed for can therefore neither compute (and so
+    /// dictionary-test) a fingerprint nor use one to test guesses of
+    /// `FERRUM_ADMIN_JWT_SECRET`. `None` only if key derivation failed.
     pub(crate) fn config_export_fingerprint_key(
         &self,
     ) -> Option<crate::fips::approved::HmacSha256Key> {
-        crate::admin::config_export::fingerprint_key(&self.config.secret)
+        self.config_export_fingerprint_key.clone()
     }
 
     /// Key for admin resource `ETag`s, derived from the admin JWT secret so
@@ -537,7 +613,9 @@ impl JwtManager {
         secret: &str,
         algorithm: Algorithm,
     ) -> Result<TokenData<AdminClaims>, JwtEncodeError> {
-        let key = DecodingKey::from_secret(secret.as_bytes());
+        // jsonwebtoken 12 refuses an empty HMAC key; that error rejects the
+        // token like any other verification failure.
+        let key = DecodingKey::from_secret(secret.as_bytes())?;
 
         // Configure validation with required claims. `Validation::new` makes
         // `algorithm` the only accepted `alg`, so the header cannot select a
@@ -581,6 +659,21 @@ impl JwtManager {
 
         // Decode and validate
         let token_data = decode::<AdminClaims>(token, &key, &validation)?;
+
+        // jsonwebtoken 12 rejects a number, object, or mixed-array `aud`
+        // itself (`InvalidClaimFormat`, or `MissingRequiredClaim` when an
+        // audience is configured) but reads `"aud": null` as absent; re-check
+        // the shape so the strict audience contract above holds for every JSON
+        // form, `null` included. Applies to both the primary and the viewer
+        // key tier.
+        if !crate::plugins::utils::jwt_verifier::audience_claim_is_acceptable(
+            &token_data.claims.additional,
+            self.config.audience.is_some(),
+        ) {
+            return Err(jsonwebtoken::errors::Error::from(
+                jsonwebtoken::errors::ErrorKind::InvalidAudience,
+            ));
+        }
 
         // Enforce max TTL.
         //
@@ -698,8 +791,35 @@ impl JwtManager {
         let token =
             Self::extract_token_from_header(auth_header).ok_or(JwtError::InvalidHeaderFormat)?;
 
-        self.verify_token(&token)
-            .map_err(|e: JwtEncodeError| JwtError::VerificationFailed(e.to_string()))
+        self.verify_token(&token).map_err(|e: JwtEncodeError| {
+            JwtError::VerificationFailed(verification_failure_category(&e).to_string())
+        })
+    }
+}
+
+/// Bounded, payload-free name for a token verification failure.
+///
+/// `jsonwebtoken`'s `Display` embeds serde/base64/UTF-8 error text, which can
+/// quote attacker-chosen header or claim values (for example an unknown
+/// `alg`), so only the error kind's name ever leaves this module.
+fn verification_failure_category(error: &JwtEncodeError) -> &'static str {
+    use jsonwebtoken::errors::ErrorKind;
+    match error.kind() {
+        ErrorKind::InvalidToken => "InvalidToken",
+        ErrorKind::InvalidSignature => "InvalidSignature",
+        ErrorKind::ExpiredSignature => "ExpiredSignature",
+        ErrorKind::ImmatureSignature => "ImmatureSignature",
+        ErrorKind::InvalidIssuer => "InvalidIssuer",
+        ErrorKind::InvalidAudience => "InvalidAudience",
+        ErrorKind::InvalidSubject => "InvalidSubject",
+        ErrorKind::InvalidAlgorithm => "InvalidAlgorithm",
+        ErrorKind::MissingAlgorithm => "MissingAlgorithm",
+        ErrorKind::MissingRequiredClaim(_) => "MissingRequiredClaim",
+        ErrorKind::InvalidClaimFormat(_) => "InvalidClaimFormat",
+        ErrorKind::Json(_) => "Json",
+        ErrorKind::Utf8(_) => "Utf8",
+        ErrorKind::Base64(_) => "Base64",
+        _ => "Other",
     }
 }
 
@@ -805,7 +925,8 @@ pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
         resolve_ferrum_var("FERRUM_ADMIN_JWT_ISSUER").unwrap_or_else(|| "ferrum-edge".to_string());
 
     // Optional: when set (and non-empty), Admin API tokens must carry a
-    // matching `aud` claim. Unset ⇒ audience is not validated.
+    // matching `aud` claim. Unset ⇒ tokens without `aud` are accepted and tokens
+    // that carry one are rejected (see `JwtConfig::audience`).
     let audience = resolve_ferrum_var("FERRUM_ADMIN_JWT_AUDIENCE").filter(|s| !s.is_empty());
 
     let config = JwtConfig {
@@ -836,8 +957,32 @@ pub const ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR: &str = "FERRUM_ADMIN_JWT
      would let a viewer-secret holder mint tokens the primary key accepts without the viewer \
      role ceiling";
 
-/// Attach `FERRUM_ADMIN_JWT_VIEWER_SECRET` and
-/// `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` (from env/`ferrum.conf`) when set.
+/// Environment variable naming the `GET /config/export` fingerprint secret.
+pub const ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_ENV: &str =
+    "FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET";
+
+/// Message for a configuration-export fingerprint secret that reuses a JWT
+/// signing secret. Names the settings and no value.
+pub const ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_REUSED_ERROR: &str = "FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET must differ from FERRUM_ADMIN_JWT_SECRET, \
+     FERRUM_ADMIN_JWT_VIEWER_SECRET, and FERRUM_CP_DP_GRPC_JWT_SECRET; export readers would \
+     otherwise receive MACs keyed by a JWT signing secret";
+
+/// A random fingerprint key for a manager without
+/// `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`: unguessable, and stable
+/// only for the life of this manager.
+fn random_config_export_fingerprint_key() -> Option<crate::fips::approved::HmacSha256Key> {
+    let random_secret = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    crate::admin::config_export::fingerprint_key(&random_secret)
+}
+
+/// Attach `FERRUM_ADMIN_JWT_VIEWER_SECRET`,
+/// `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, and
+/// `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` (from env/`ferrum.conf`)
+/// when set.
 fn with_viewer_secret_from_env(manager: JwtManager) -> Result<JwtManager, JwtError> {
     use crate::config::conf_file::resolve_ferrum_var;
 
@@ -846,6 +991,21 @@ fn with_viewer_secret_from_env(manager: JwtManager) -> Result<JwtManager, JwtErr
     let manager = match viewer_secret {
         Some(viewer_secret) => manager.with_viewer_secret(viewer_secret)?,
         None => manager,
+    };
+    let fingerprint_secret =
+        resolve_ferrum_var(ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_ENV).filter(|s| !s.is_empty());
+    let manager = match fingerprint_secret {
+        Some(fingerprint_secret) => {
+            manager.with_config_export_fingerprint_secret(fingerprint_secret)?
+        }
+        None => {
+            tracing::info!(
+                "FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET is not set; GET /config/export \
+                 fingerprints use a random per-process key and are not comparable across \
+                 replicas or restarts"
+            );
+            manager
+        }
     };
     match resolve_ferrum_var(ADMIN_JWT_VIEWER_NAMESPACES_ENV) {
         Some(raw) => {

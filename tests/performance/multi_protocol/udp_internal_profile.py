@@ -20,12 +20,15 @@ PREFIX = "ferrum_udp_profile_"
 FIELDS = set(SCHEMA["counters"] + SCHEMA["metadata"])
 
 
+_PROFILE_METRIC_RE = re.compile(r"ferrum_udp_profile_([a-z0-9_]+) ([0-9]+)")
+
+
 def parse_metrics(text):
     counters = {}
     for line in text.splitlines():
         if not line.startswith(PREFIX):
             continue
-        match = re.fullmatch(r"ferrum_udp_profile_([a-z0-9_]+) ([0-9]+)", line)
+        match = _PROFILE_METRIC_RE.fullmatch(line)
         if not match or match[1] not in FIELDS or match[1] in counters:
             raise ValueError("unknown, duplicate or malformed UDP profile metric")
         value = int(match[2])

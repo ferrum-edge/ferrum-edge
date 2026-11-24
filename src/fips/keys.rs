@@ -57,19 +57,6 @@ pub const MIN_RSA_MODULUS_BITS: usize = 2048;
 /// approved profile needs one.
 pub const MAX_RSA_MODULUS_BITS: usize = 8192;
 
-/// Approved elliptic-curve field sizes, in bits: P-256, P-384, P-521.
-///
-/// These are the NIST prime curves of FIPS 186-5 / SP 800-186. Curve25519 and
-/// Curve448 are absent: they are not approved for the ECDSA/ECDH schemes in
-/// SP 800-56A, which is also why `fips::policy::FIPS_DEFAULT_KX_GROUPS` omits
-/// X25519.
-///
-/// P-521 is admitted for *certificates* even though `ES512` is refused for
-/// JWS. That is not an inconsistency: the JWS exclusion is about the
-/// `jsonwebtoken` backend's implementation contract, while a P-521 certificate
-/// is handled by the rustls provider, which classifies `secp521r1` itself.
-pub const APPROVED_EC_FIELD_BITS: &[usize] = &[256, 384, 521];
-
 /// Upper bound on how much of a surface label a diagnostic reproduces.
 pub const MAX_SURFACE_LABEL_CHARS: usize = 64;
 
@@ -264,20 +251,51 @@ pub fn check_rsa_modulus_bits(bits: usize, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Admit a JWK RSA modulus, when FIPS mode is enforced.
+/// Admit an RSA modulus for JWT signature verification, on every profile.
+///
+/// jsonwebtoken's `aws_lc_rs` backend (the only one Ferrum compiles) verifies
+/// RS*/PS* only with RSA keys of [`MIN_RSA_MODULUS_BITS`]–[`MAX_RSA_MODULUS_BITS`]
+/// bits. A key outside that window still decodes, but every token signed with
+/// it would then fail verification as if it were forged. Admission points call
+/// this so such a key is refused up front, with its size named. Not gated on
+/// FIPS mode: the limit is the backend's, so it applies to both profiles.
+pub fn check_jwt_rsa_verification_modulus(
+    modulus: &[u8],
+    surface_label: &str,
+) -> Result<(), String> {
+    let bits = unsigned_be_bit_length(modulus);
+    if (MIN_RSA_MODULUS_BITS..=MAX_RSA_MODULUS_BITS).contains(&bits) {
+        return Ok(());
+    }
+    let label = bounded_label(surface_label);
+    Err(format!(
+        "{label}: the RSA public key is {bits} bits. JWT signatures are verified with AWS-LC, \
+         which accepts only RSA keys of {MIN_RSA_MODULUS_BITS}-{MAX_RSA_MODULUS_BITS} bits, so \
+         every token signed with this key would fail verification."
+    ))
+}
+
+/// [`check_jwt_rsa_verification_modulus`] over a PKCS#1 `RSAPublicKey` DER,
+/// the form jsonwebtoken stores for an RSA PEM public key (it unwraps an SPKI
+/// `PUBLIC KEY` to this).
+pub fn check_jwt_rsa_verification_pkcs1_der(der: &[u8], surface_label: &str) -> Result<(), String> {
+    let parsed = x509_parser::public_key::RSAPublicKey::from_der(der);
+    match parsed {
+        // `[]`: trailing bytes after the DER structure are refused.
+        Ok(([], key)) => check_jwt_rsa_verification_modulus(key.modulus, surface_label),
+        _ => Err(format!(
+            "{}: the RSA public key could not be parsed, so its size cannot be checked.",
+            bounded_label(surface_label)
+        )),
+    }
+}
+
+/// Admit a JWK RSA modulus under the FIPS key policy.
 ///
 /// `modulus` is the decoded, unsigned big-endian `n` member of an RFC 7518 RSA
 /// JWK — public material only. JWKs are fetched from an operator-configured
 /// issuer, so a weak signing key admitted here would let that issuer's
 /// compromise become Ferrum's authentication failure.
-pub fn check_jwk_rsa_modulus(modulus: &[u8]) -> Result<(), String> {
-    if !super::is_enforcing() {
-        return Ok(());
-    }
-    check_jwk_rsa_modulus_enforced(modulus)
-}
-
-/// The enforced half of [`check_jwk_rsa_modulus`].
 pub fn check_jwk_rsa_modulus_enforced(modulus: &[u8]) -> Result<(), String> {
     check_rsa_modulus_bits(unsigned_be_bit_length(modulus), "JWKS RSA signing key")
 }
@@ -325,15 +343,7 @@ fn check_rsa_public_exponent_enforced(exponent: &[u8], surface_label: &str) -> R
 /// would just move the failure later.
 pub const APPROVED_JWK_EC_CURVES: &[&str] = &["P-256", "P-384"];
 
-/// Admit a JWK elliptic curve, when FIPS mode is enforced.
-pub fn check_jwk_ec_curve(curve: &str) -> Result<(), String> {
-    if !super::is_enforcing() {
-        return Ok(());
-    }
-    check_jwk_ec_curve_enforced(curve)
-}
-
-/// The enforced half of [`check_jwk_ec_curve`].
+/// Admit a JWK elliptic curve under the FIPS key policy.
 pub fn check_jwk_ec_curve_enforced(curve: &str) -> Result<(), String> {
     // RFC 7518 registry values are case-sensitive. Requiring the exact token
     // keeps this admission decision identical to the downstream algorithm
@@ -385,4 +395,30 @@ pub fn check_jwk_ec_public_key_enforced(
         ));
     }
     Ok(())
+}
+
+/// Admit an OKP (Ed25519 / `EdDSA`) JWK, when FIPS mode is enforced.
+///
+/// JWKS stores and DPoP proofs accept Ed25519 keys on the default profile.
+/// While FIPS mode is enforced the decision follows
+/// [`super::policy::APPROVED_JWT_ALGORITHMS`], which deliberately omits
+/// `EdDSA` — see that constant for why — so admitting the key would only move
+/// the refusal to first use.
+pub fn check_jwk_okp_public_key() -> Result<(), String> {
+    if !super::is_enforcing() {
+        return Ok(());
+    }
+    check_jwk_okp_public_key_enforced()
+}
+
+/// The enforced half of [`check_jwk_okp_public_key`].
+pub fn check_jwk_okp_public_key_enforced() -> Result<(), String> {
+    if super::policy::is_approved_jwt_algorithm("EdDSA") {
+        return Ok(());
+    }
+    Err(format!(
+        "JWKS OKP signing key (Ed25519 / EdDSA) is not admitted while FIPS mode is enforced. \
+         Approved JWT algorithms: {}.",
+        super::policy::APPROVED_JWT_ALGORITHMS.join(", ")
+    ))
 }

@@ -46,8 +46,8 @@
 //!    resolves `/api name`, which is the same policy/backend semantic
 //!    mismatch this module exists to remove. Decoding it is not an answer
 //!    either: the decoded byte is one the backend URL parser cannot carry at
-//!    all (space, controls) or one it percent-encodes again (`"`, `{`, `}`,
-//!    non-ASCII), so the forwarded request line would not be the canonical
+//!    all (space, controls) or one it percent-encodes again (`"`, `^`, `{`,
+//!    `}`, non-ASCII), so the forwarded request line would not be the canonical
 //!    string. Refusing keeps the *decoded* alphabet to bytes that survive that
 //!    parser byte-for-byte. See "Literal non-`pchar` bytes" below for what this
 //!    rule does and does not say about a byte sent literally.
@@ -155,7 +155,7 @@
 //!
 //! That asymmetry is deliberate and safe, but it bounds what the contract above
 //! claims. The `url` crate's path percent-encode set covers controls,
-//! space, `"`, `<`, `>`, `` ` ``, `#`, `?`, `{`, `}`, and every non-ASCII byte,
+//! space, `"`, `<`, `>`, `` ` ``, `#`, `?`, `^`, `{`, `}`, and every non-ASCII byte,
 //! so when a canonical path carrying a literal one of those is parsed into the
 //! backend URL, the forwarded request line is the percent-encoded spelling
 //! rather than the canonical bytes. Percent-encoding only ever expands one byte

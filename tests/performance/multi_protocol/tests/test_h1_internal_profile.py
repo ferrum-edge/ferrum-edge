@@ -14,6 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import h1_internal_profile as profile
 
 
+_RUST_SCHEMA_ENTRY_RE = re.compile(r'^    "([a-z0-9_]+)",$', re.M)
+
+
 def values():
     result = dict.fromkeys(profile.FIELDS, 0)
     result.update(schema=1, pid=1, allocator_installed=1, slot_capacity=128, registered_slots=2)
@@ -370,6 +373,8 @@ def diagnostic_campaign(root):
             identity = profile.gateway_identity(runtime)
         sample = traffic_sample(gateway, 1, 5242880, identity["host_pid"] if identity else 31)
         client = dict(pid=1000 + position, role="client", complete_bracket=True, cpu_seconds=1.0,
+                      user_cpu_seconds=0.6, system_cpu_seconds=0.4,
+                      voluntary_ctxt_switches=10, nonvoluntary_ctxt_switches=2,
                       peak_rss_bytes=1024, rss_scope="process lifetime high-water mark at measurement end",
                       bracket_secs=30.001, boundary_slack_secs=0.001)
         sample.update(duration_secs=30, rps=100 / 30, drain_requests=0)
@@ -403,7 +408,7 @@ class H1InternalProfileTests(unittest.TestCase):
     def test_literal_rust_and_sampler_schema_match(self):
         root = Path(__file__).resolve().parents[4]
         source = (root / "src/h1_profile/schema.rs").read_text()
-        names = re.findall(r'^    "([a-z0-9_]+)",$', source, re.M)
+        names = _RUST_SCHEMA_ENTRY_RE.findall(source)
         self.assertEqual(names, profile.SCHEMA["counters"])
         self.assertEqual(len(set(names)), 206)
         self.assertEqual(len(profile.FIELDS), 214)

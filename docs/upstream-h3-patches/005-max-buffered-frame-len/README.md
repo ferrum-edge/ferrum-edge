@@ -8,8 +8,8 @@
 | Target crate | `h3` |
 | Target version | 0.0.8 |
 | State | **Applied via vendored crate at `vendor/h3-0.0.8-ferrum-patched`** |
-| Upstream issue | _Deliberate fork — unfiled upstream (see hand-off below + [policy](../../dependency-policy.md#deliberate-fork-policy-and-sla))_ |
-| Upstream PR | _Deliberate fork — unfiled upstream; no published fork ref yet (see hand-off below + [policy](../../dependency-policy.md#deliberate-fork-policy-and-sla))_ |
+| Upstream issue | Reported privately to hyperium (security advisory report, 2026-11-14); no public upstream issue while the report is under embargo (see hand-off below) |
+| Upstream PR | _None yet — no published fork ref; the fix is offered once the maintainers accept the report (see hand-off below)_ |
 | Tracks | Ferrum Edge HTTP/3 unauthenticated declared-frame-length OOM (#4261) |
 
 ## Why this directory exists
@@ -77,16 +77,25 @@ The same shape works with:
 
 ## Hand-off - how to file upstream
 
-1. Open an upstream issue in `hyperium/h3` using `issue.md`. Coordinate
-   disclosure first: this is a remotely triggerable memory-exhaustion bug in a
-   published crate, so prefer the repository's private advisory channel over a
-   public issue.
-2. Replace the `Fixes #NNN` placeholder in `pr-description.md`.
-3. Apply `h3-max-buffered-frame-len.patch` to an h3 checkout and run
+1. Disclosure (done). This directory, including the reproduction in
+   `issue.md`, was published with the fix on 2026-08-28, before any private
+   report reached the maintainers, so the usual private-first order could not
+   be followed. On 2026-11-14 the bug was reported privately to hyperium
+   (security advisory report), citing the already-public material. The report's
+   identifier is not recorded here while it is under embargo.
+   `docs/vendored-patch-lifecycle.json` records it as
+   `upstream.filing: reported_privately` with the channel and date.
+2. Follow the maintainers' lead on the advisory: if they want a public issue,
+   open it in `hyperium/h3` from `issue.md` and record its number here, in the
+   lifecycle `upstream.issue_number`, and in the `docs/dependency-policy.md`
+   inventory row.
+3. Replace the `Fixes #NNN` placeholder in `pr-description.md`.
+4. Apply `h3-max-buffered-frame-len.patch` to an h3 checkout and run
    `cargo test -p h3`.
-4. Push a fork branch, for example `feat/max-buffered-frame-len`.
-5. Open the PR with `pr-description.md` and update this README with the issue
-   and PR numbers.
+5. Push a fork branch, for example `feat/max-buffered-frame-len`.
+6. Open the PR with `pr-description.md`, update this README with the PR number,
+   and move the lifecycle entry to `upstream.filing: filed` with its
+   `pr_number` (dropping `private_report`).
 
 ## Retirement
 
@@ -104,8 +113,9 @@ Once such a release exists:
 2. Keep the vendored h3 crate until patches 001, 002, 003, and 004 are also
    retired (co-retirement group `h3-all`).
 3. When all active h3 patches are available upstream, remove the h3
-   `[patch.crates-io]` entry (root and `tests/performance/mesh/Cargo.toml`)
-   and delete `vendor/h3-0.0.8-ferrum-patched`.
+   `[patch.crates-io]` entry (root, `fuzz/Cargo.toml` and
+   `tests/performance/mesh/Cargo.toml`), regenerate the three lockfiles, and
+   then delete `vendor/h3-0.0.8-ferrum-patched`.
 4. Move this directory under
    `docs/upstream-h3-patches/_retired/005-max-buffered-frame-len/` with a
    `STATUS.md` noting the upstream merge and release.

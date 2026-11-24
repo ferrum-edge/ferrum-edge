@@ -17,6 +17,14 @@ from urllib.parse import urlparse
 MULTI_PROTOCOL_DIR = Path(__file__).resolve().parents[1]
 RUNNER = MULTI_PROTOCOL_DIR / "run_protocol_test.sh"
 
+_BENCH_EXTRA_RE = re.compile(r'^\s*bench_extra="(?P<value>[^"]*)"', re.MULTILINE)
+_BACKEND_SCHEME_RE = re.compile(r"backend_scheme:\s*(\S+)")
+_BACKEND_PORT_RE = re.compile(r"backend_port:\s*(\d+)")
+_LISTEN_PATH_RE = re.compile(r'listen_path:\s*"([^"]+)"')
+_ENVOY_PORT_VALUE_RE = re.compile(r"port_value:\s*(\d+)\s*\}")
+_ENVOY_PREFIX_MATCH_RE = re.compile(r'match:\s*\{\s*prefix:\s*"([^"]+)"\s*\}')
+
+
 def selected_legs(proto):
     text = RUNNER.read_text()
     match = re.search(
@@ -38,24 +46,24 @@ def selected_legs(proto):
         "ferrum_config": Path(grab("ferrum_config").replace("$SCRIPT_DIR", str(MULTI_PROTOCOL_DIR))),
         "envoy_config": Path(grab("envoy_config").replace("$SCRIPT_DIR", str(MULTI_PROTOCOL_DIR))),
     }
-    extra = re.search(r'^\s*bench_extra="(?P<value>[^"]*)"', body, re.MULTILINE)
+    extra = _BENCH_EXTRA_RE.search(body)
     legs["bench_extra"] = extra.group("value") if extra else ""
     return legs
 
 
 def first_ferrum_upstream(config_path):
     text = config_path.read_text()
-    scheme = re.search(r"backend_scheme:\s*(\S+)", text).group(1)
-    port = int(re.search(r"backend_port:\s*(\d+)", text).group(1))
-    listen_path = re.search(r'listen_path:\s*"([^"]+)"', text)
+    scheme = _BACKEND_SCHEME_RE.search(text).group(1)
+    port = int(_BACKEND_PORT_RE.search(text).group(1))
+    listen_path = _LISTEN_PATH_RE.search(text)
     return scheme, port, listen_path.group(1) if listen_path else None
 
 
 def envoy_upstream(config_path):
     text = config_path.read_text()
     # The cluster endpoint is the last socket_address port (after admin/listener).
-    ports = re.findall(r"port_value:\s*(\d+)\s*\}", text)
-    prefixes = re.findall(r'match:\s*\{\s*prefix:\s*"([^"]+)"\s*\}', text)
+    ports = _ENVOY_PORT_VALUE_RE.findall(text)
+    prefixes = _ENVOY_PREFIX_MATCH_RE.findall(text)
     return int(ports[-1]), "UpstreamTlsContext" in text, prefixes
 
 

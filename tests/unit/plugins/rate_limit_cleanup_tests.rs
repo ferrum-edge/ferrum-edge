@@ -1,9 +1,9 @@
 //! Controllable-time coverage for shared rate-limit consumer cleanup wrappers (#2316).
 //!
 //! These tests invoke each plugin's sampled/cooldown cleanup path through
-//! `_test_support` hooks — not `LocalLimiter::prune_stale_at` directly — so an
-//! omitted or reversed `prune_stale_at`/`enforce_capacity` branch fails.
-//! Over-cap cleanup must reclaim idle keys only; live budgets survive
+//! `_test_support` hooks — not `LocalLimiter::prune_stale_at` directly — so a
+//! wrapper that skips or mis-schedules its prune fails. Cleanup under capacity
+//! pressure must reclaim idle keys only; live budgets survive
 //! (GHSA-3xxf-5m26-c8pv).
 
 use ferrum_edge::_test_support::RateLimitCleanupHarness;
@@ -99,7 +99,7 @@ fn rate_limiting_wrapper_prunes_stale_and_preserves_active_over_cap() {
     h.seed_rate_limiting("ip:a", active_at);
     h.seed_rate_limiting("ip:b", active_at);
     h.seed_rate_limiting("ip:c", active_at);
-    h.rate_limiting_apply_branch(active_at, true, 1);
+    h.rate_limiting_prune_stale(active_at);
     assert_eq!(h.rate_limiting_tracked(), Some(4));
     assert!(h.rate_limiting_contains("ip:3"));
     assert!(h.rate_limiting_contains("ip:a"));
@@ -125,7 +125,7 @@ fn ai_wrapper_prunes_stale_and_preserves_active_over_cap() {
 
     h.seed_ai("consumer:x", active_at);
     h.seed_ai("consumer:y", active_at);
-    h.ai_apply_branch(active_at, true, 1);
+    h.ai_prune_stale(active_at);
     assert_eq!(h.ai_tracked(), Some(3));
     assert!(h.ai_contains("consumer:c"));
     assert!(!h.seed_ai_with_cap("consumer:new", active_at, 1));
@@ -150,7 +150,7 @@ fn graphql_wrapper_prunes_stale_and_preserves_active_over_cap() {
 
     h.seed_graphql("gql:a", active_at);
     h.seed_graphql("gql:b", active_at);
-    h.graphql_apply_branch(active_at, true, 1);
+    h.graphql_prune_stale(active_at);
     assert_eq!(h.graphql_tracked(), Some(3));
     assert!(h.graphql_contains("gql:3"));
     assert!(!h.seed_graphql_with_cap("gql:new", active_at, 1));
@@ -175,7 +175,7 @@ fn grpc_wrapper_prunes_stale_and_preserves_active_over_cap() {
 
     h.seed_grpc("grpc:a", active_at);
     h.seed_grpc("grpc:b", active_at);
-    h.grpc_apply_branch(active_at, true, 1);
+    h.grpc_prune_stale(active_at);
     assert_eq!(h.grpc_tracked(), Some(3));
     assert!(h.grpc_contains("grpc:3"));
     assert!(!h.seed_grpc_with_cap("grpc:new", active_at, 1));
@@ -206,7 +206,7 @@ fn ws_sampled_cooldown_path_prunes_stale_preserves_active_below_cap() {
 
     h.seed_ws(10, active_at);
     h.seed_ws(11, active_at);
-    h.ws_apply_branch(active_at, true, 1);
+    h.ws_prune_stale(active_at);
     assert_eq!(h.ws_tracked(), Some(3));
     assert!(h.ws_contains(3));
     assert!(!h.seed_ws_with_cap(12, active_at, 1));

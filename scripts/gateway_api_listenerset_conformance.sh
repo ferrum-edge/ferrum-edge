@@ -221,19 +221,10 @@ run_blackbox() {
   echo "ListenerSet without allowedListeners reported Accepted=False/NotAllowed" >> "$report"
 
   kubectl -n "$DP_GATEWAY_NAMESPACE" delete listenerset ferrum-blackbox-listenerset --wait=true
-  local withdrawn=0
-  for _ in $(seq 1 45); do
-    code="$(curl_status "$LISTENERSET_HOST" "$LISTENERSET_PATH")"
-    if [ "$code" != "200" ]; then
-      withdrawn=1
-      break
-    fi
-    sleep 2
-  done
-  if [ "$withdrawn" -ne 1 ]; then
-    echo "deleted ListenerSet kept serving ${LISTENERSET_HOST}${LISTENERSET_PATH}" >&2
-    return 1
-  fi
+  # Positive evidence of withdrawal: the still-running gateway must answer
+  # the withdrawn host with its no-route 404. A curl failure ('000'), a 5xx
+  # from a crashed or restarting gateway, or any other code is not proof.
+  wait_for_status "404" "withdraw" | tee -a "$report"
   echo "deleted ListenerSet withdrew ${LISTENERSET_HOST}${LISTENERSET_PATH}" >> "$report"
 }
 

@@ -36,6 +36,18 @@ pub use istio::{MAX_L4_CANDIDATE_PROXIES, MAX_PROJECTED_L4_PROXIES};
 // the translator's "emit cors plugin vs. leave unprojected" decision and the
 // status writer's deferred-field reporting use one predicate and never diverge.
 pub(crate) use istio::cors_policy_translatable;
+// Shared with the Istio status writer the same way: Istio-valid retry settings
+// the translator accepts without enforcing, and Telemetry entries past the
+// first translated one, are reported by the same predicates that decide them.
+pub(crate) use istio::{telemetry_deferred_fields, virtual_service_retry_deferred_fields};
+// Same for `http[].mirror` / `http[].mirrors` that are valid Istio but not
+// projected (GHSA-gcwp-xp94-4pcv).
+pub(crate) use istio::{
+    virtual_service_route_mirror_is_deferred, virtual_service_route_mirrors_are_deferred,
+};
+// Same for the mesh binding of a VirtualService's `http[]` routes (issue #7390):
+// the status writer reports where they apply from the predicate that decides it.
+pub(crate) use istio::virtual_service_binds_mesh;
 // Shared with the Istio status writer the same way: Sidecar `ingress[]`
 // classification used by resolution and deferred-field reporting is one
 // predicate, so modeled HTTP and stream listeners cannot be reported deferred.
@@ -48,12 +60,16 @@ pub(crate) use istio::{
 // fail-closed REGISTRY_ONLY degradation is never enforced without being reported
 // (nor reported without being enforced).
 pub(crate) use istio::{SidecarOutboundPolicy, classify_sidecar_outbound_traffic_policy};
+// The status writer reports a rejected Sidecar's fail-closed marker from the
+// same constructor the translation publishes (GHSA-2r85-85hh-23mw).
+pub(crate) use istio::refused_sidecar;
 // Shared with the Istio status writer the same way: the ServiceEntry UDP-port
 // classification used by translation/materialization (a `protocol: UDP` port is
-// classified `AppProtocol::Udp` and its egress materialization is deferred/inert
-// in F3 §3.3 stage 1) and by the status writer's deferred-field reporting is one
-// predicate, so a UDP ServiceEntry is never reported as fully accepted while its
-// egress lane is silently skipped.
+// classified `AppProtocol::Udp`; external UDP egress materializes only on the
+// EgressGateway allowlist and the Sidecar/Ambient STATIC-endpoint routes, issue
+// #3263) and by the status writer's deferred-field reporting is one predicate,
+// so a UDP ServiceEntry is never reported as fully accepted without its egress
+// conditions.
 pub(crate) use istio::service_entry_port_protocol_is_udp;
 // Same shared-predicate contract for the stream-family egress wildcard-host
 // refusal (issue #4535): a wildcard `spec.hosts[]` element with no declared
@@ -61,6 +77,9 @@ pub(crate) use istio::service_entry_port_protocol_is_udp;
 // dispatch concretizes the target per request instead), so the status writer
 // reports it as deferred through the SAME predicate rather than re-deriving it.
 pub(crate) use istio::service_entry_spec_has_unresolvable_stream_wildcard_host;
+// Same contract for address-less `endpoints[]` that name a `network`: skipped by
+// the translator and reported as deferred by the status writer.
+pub(crate) use istio::service_entry_endpoint_is_network_gateway_only;
 
 use std::collections::{HashMap, HashSet};
 
@@ -149,8 +168,9 @@ pub struct K8sTranslationOptions {
     pub prefer_istio_on_overlap: bool,
     pub istio_root_namespace: String,
     pub cluster_domain: String,
-    /// Opt-in core Kubernetes Pod/Service/EndpointSlice discovery. Default
-    /// false for the first rollout so operators can enable it deliberately.
+    /// Core Kubernetes Pod/Service/EndpointSlice discovery. Defaults to false
+    /// on this options struct; the env-level default
+    /// (`FERRUM_K8S_POD_DISCOVERY_ENABLED`) is true inside a pod.
     pub pod_discovery_enabled: bool,
     /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`. When true, a
     /// Gateway API backendRef to a selector-less Service in the route's own
@@ -702,6 +722,18 @@ pub(crate) enum SourceKind {
     GatewayApi,
 }
 
+/// What [`K8sAccumulator::upsert_proxy`] did with a candidate proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyUpsert {
+    /// No proxy held the `(namespace, id)`; the candidate was added.
+    Inserted,
+    /// The candidate replaced the proxy that held the `(namespace, id)`.
+    Replaced,
+    /// The candidate was dropped; the proxy already holding the
+    /// `(namespace, id)` (or none, for an empty key) stays.
+    Ignored,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct K8sResourceKey {
     pub api_version: String,
@@ -1076,6 +1108,14 @@ pub(crate) struct K8sAccumulator {
     /// replacing, merging into, or attaching plugins to the owner's resource.
     pub(crate) gateway_api_route_proxy_owners: HashMap<NamespacedResourceId, K8sResourceKey>,
     pub(crate) gateway_api_route_upstream_owners: HashMap<NamespacedResourceId, K8sResourceKey>,
+    /// The VirtualService that first derived each route proxy id and route
+    /// upstream id. `resource_id` is a lossy join (`my.app` / `my-app`, or
+    /// `a` `http[1]` match 0 / `a-1` `http[0]`), so a second VirtualService
+    /// deriving an owned `(namespace, id)` is refused as a whole instead of
+    /// being silently shadowed or overwriting the owner's upstream
+    /// (GHSA-qw5p-g8jx-pmv8).
+    pub(crate) istio_virtual_service_proxy_owners: HashMap<NamespacedResourceId, K8sResourceKey>,
+    pub(crate) istio_virtual_service_upstream_owners: HashMap<NamespacedResourceId, K8sResourceKey>,
     /// Live materialization credit per attachment: the proxies that currently
     /// serve that exact claim. A merged claim is credited to the proxy it
     /// collapsed into, so withdrawing that proxy withdraws the merged claim
@@ -1102,6 +1142,13 @@ pub(crate) struct K8sAccumulator {
     /// listener this translator explicitly refused.
     pub(crate) gateway_api_listener_conflicts:
         std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerConflict>,
+    /// ListenerSet `(namespace, name)` → its index in the global Gateway API
+    /// precedence order (oldest `creationTimestamp`, then `{namespace}/{name}`),
+    /// recorded by ListenerSet admission so later physical same-port
+    /// arbitration applies the same precedence
+    /// (`listenerset::listener_claim_precedence`, GHSA-496f-3547-p3fw).
+    pub(crate) gateway_api_listenerset_precedence:
+        std::collections::BTreeMap<(String, String), u64>,
     /// Post-admission explicit-SNI collision losers and their winners.
     pub(crate) gateway_api_frontend_tls_hostname_conflicts:
         std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerKey>,
@@ -1184,12 +1231,15 @@ impl K8sAccumulator {
             gateway_api_route_proxy_attachments: HashMap::new(),
             gateway_api_route_proxy_owners: HashMap::new(),
             gateway_api_route_upstream_owners: HashMap::new(),
+            istio_virtual_service_proxy_owners: HashMap::new(),
+            istio_virtual_service_upstream_owners: HashMap::new(),
             gateway_api_materialized_route_attachments: HashMap::new(),
             gateway_api_refused_route_attachments: HashSet::new(),
             gateway_api_transport_refused_route_attachments: HashSet::new(),
             gateway_api_listener_policies: HashMap::new(),
             gateway_api_frontend_tls_listeners: Vec::new(),
             gateway_api_listener_conflicts: std::collections::BTreeMap::new(),
+            gateway_api_listenerset_precedence: std::collections::BTreeMap::new(),
             gateway_api_frontend_tls_hostname_conflicts: std::collections::BTreeMap::new(),
             gateway_api_gateway_classes: HashMap::new(),
             gateway_class_name_by_gateway: HashMap::new(),
@@ -1495,13 +1545,17 @@ impl K8sAccumulator {
         self.proxy_sources.get(&key).copied()
     }
 
-    pub(crate) fn upsert_proxy(&mut self, proxy: Proxy, source: SourceKind) {
+    /// Materialize `proxy` under its `(namespace, id)`, resolving an overlap
+    /// with an already-materialized proxy by source precedence. The returned
+    /// [`ProxyUpsert`] tells the caller whether `proxy` is now the one serving
+    /// that key, so proxy-scoped plugins can follow their proxy.
+    pub(crate) fn upsert_proxy(&mut self, proxy: Proxy, source: SourceKind) -> ProxyUpsert {
         let Some(key) = namespaced_resource_key(&proxy.namespace, &proxy.id) else {
             self.warnings.push(format!(
                 "proxy with empty namespace or id was ignored (namespace={:?}, id={:?})",
                 proxy.namespace, proxy.id
             ));
-            return;
+            return ProxyUpsert::Ignored;
         };
         if let Some(existing_source) = self.proxy_sources.get(&key).copied() {
             let istio_wins = self.options.prefer_istio_on_overlap
@@ -1516,7 +1570,7 @@ impl K8sAccumulator {
                     "Gateway API proxy {:?}/{:?} ignored because Istio resource has precedence",
                     proxy.namespace, proxy.id
                 ));
-                return;
+                return ProxyUpsert::Ignored;
             }
 
             if let Some(existing) = self.config.proxies.iter_mut().find(|candidate| {
@@ -1525,13 +1579,15 @@ impl K8sAccumulator {
                 if istio_wins || !self.options.prefer_istio_on_overlap {
                     *existing = proxy;
                     self.proxy_sources.insert(key, source);
+                    return ProxyUpsert::Replaced;
                 }
-                return;
+                return ProxyUpsert::Ignored;
             }
         }
 
         self.proxy_sources.insert(key, source);
         self.config.proxies.push(proxy);
+        ProxyUpsert::Inserted
     }
 
     /// Withdraw one already-materialized proxy and everything keyed to it.
@@ -1634,6 +1690,36 @@ impl K8sAccumulator {
         route: &K8sObject,
     ) -> bool {
         claim_route_resource_owner(&mut self.gateway_api_route_upstream_owners, key, route)
+    }
+
+    /// Claim a VirtualService route proxy id for `virtual_service`. Returns
+    /// the other VirtualService that already derived the same
+    /// `(namespace, id)`, if any.
+    pub(crate) fn claim_istio_virtual_service_proxy(
+        &mut self,
+        key: &NamespacedResourceId,
+        virtual_service: &K8sObject,
+    ) -> Option<K8sResourceKey> {
+        route_resource_owner_conflict(
+            &mut self.istio_virtual_service_proxy_owners,
+            key,
+            virtual_service,
+        )
+    }
+
+    /// Claim a VirtualService route upstream id for `virtual_service`.
+    /// Returns the other VirtualService that already derived the same
+    /// `(namespace, id)`, if any.
+    pub(crate) fn claim_istio_virtual_service_upstream(
+        &mut self,
+        key: &NamespacedResourceId,
+        virtual_service: &K8sObject,
+    ) -> Option<K8sResourceKey> {
+        route_resource_owner_conflict(
+            &mut self.istio_virtual_service_upstream_owners,
+            key,
+            virtual_service,
+        )
     }
 
     /// Report the `(route, parentRef, listener)` claims of a route proxy that
@@ -1909,19 +1995,6 @@ pub fn gateway_api_route_conflicts(
     gateway_api::route_conflicts(objects, options, Some(&acc))
 }
 
-pub fn gateway_api_route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
-    gateway_api::route_conflict_keys(object)
-}
-
-pub fn gateway_api_route_conflict_keys_with_context(
-    objects: &[K8sObject],
-    options: &K8sTranslationOptions,
-    object: &K8sObject,
-) -> Vec<GatewayApiRouteConflictKey> {
-    let acc = gateway_api_status_conflict_context(objects, options.clone());
-    gateway_api::route_conflict_keys_for_acc(object, Some(&acc))
-}
-
 pub(crate) fn gateway_api_route_conflict_keys_with_acc(
     object: &K8sObject,
     acc: &K8sAccumulator,
@@ -1959,7 +2032,7 @@ fn collect_gateway_api_status_context(objects: &[K8sObject], acc: &mut K8sAccumu
         }
     }
     let included: Vec<&K8sObject> = objects.iter().collect();
-    let _ = listenerset::collect_listenersets_from_snapshot(acc, &included);
+    listenerset::collect_listenersets_from_snapshot(acc, &included);
     // Keep status-context listener admission identical to the translation
     // pass (ListenerSet precedence + same-port physical refusal), or a
     // route's status would arbitrate against a listener the data plane refused.
@@ -2183,7 +2256,7 @@ where
     }
     // ListenerSets attach after Gateway listener policies exist so conflict
     // resolution can prefer parent Gateway listeners.
-    listenerset::collect_listenersets_from_snapshot(&mut acc, &included_objects)?;
+    listenerset::collect_listenersets_from_snapshot(&mut acc, &included_objects);
     // Every listener policy is now known, so same-port physical compatibility
     // can be decided before any route arbitrates or materializes against a
     // listener that could never have been bound.
@@ -2383,7 +2456,10 @@ pub fn translate_k8s_objects_collecting_skips(
         });
 
         match translation {
-            Ok(translation) => return Some((translation, skipped)),
+            Ok(mut translation) => {
+                carry_refused_security_resources(&mut translation, objects, &options, &skipped);
+                return Some((translation, skipped));
+            }
             Err(error) => {
                 let key = objects
                     .iter()
@@ -2421,6 +2497,90 @@ pub fn translate_k8s_objects_collecting_skips(
             }
         }
     }
+}
+
+/// Publish every refused Istio security resource as a fail-closed marker
+/// instead of dropping it.
+///
+/// Dropping a refused security resource removes enforcement from the
+/// workloads it selects. RequestAuthentication (issue #6656) would stop
+/// validating JWTs; AuthorizationPolicy, PeerAuthentication and Sidecar
+/// (GHSA-2r85-85hh-23mw) would stop denying, stop delegating to an external
+/// authorizer, lose the ALLOW implicit-deny floor, fall back from `STRICT`
+/// mTLS, or widen egress. Each kind's marker never grants more than the
+/// refused resource did; see [`istio::refused_request_authentication`],
+/// [`istio::refused_authorization_policy`],
+/// [`istio::refused_peer_authentication`] and [`istio::refused_sidecar`]. The
+/// skip map still carries the translation error, so status keeps reporting
+/// the resource as rejected.
+fn carry_refused_security_resources(
+    translation: &mut K8sTranslation,
+    objects: &[K8sObject],
+    options: &K8sTranslationOptions,
+    skipped: &std::collections::HashMap<K8sResourceKey, K8sTranslateError>,
+) {
+    let mut request_authentications = Vec::new();
+    let mut mesh_policies = Vec::new();
+    let mut peer_authentications = Vec::new();
+    let mut sidecars = Vec::new();
+    for key in skipped.keys() {
+        if !matches!(
+            key.kind.as_str(),
+            "RequestAuthentication" | "AuthorizationPolicy" | "PeerAuthentication" | "Sidecar"
+        ) {
+            continue;
+        }
+        let Some(object) = objects.iter().find(|object| {
+            object.kind == key.kind
+                && object.metadata.namespace == key.namespace
+                && object.metadata.name == key.name
+                && (key.api_version.is_empty() || object.api_version == key.api_version)
+        }) else {
+            continue;
+        };
+        // Translation dispatches these kinds to the Istio translator by kind
+        // alone, so the marker follows the same rule.
+        match key.kind.as_str() {
+            "RequestAuthentication" => {
+                request_authentications.push(istio::refused_request_authentication(options, object))
+            }
+            "AuthorizationPolicy" => {
+                mesh_policies.extend(istio::refused_authorization_policy(options, object));
+            }
+            "PeerAuthentication" => {
+                peer_authentications.push(istio::refused_peer_authentication(options, object));
+            }
+            _ => sidecars.push(istio::refused_sidecar(object)),
+        }
+    }
+    if request_authentications.is_empty()
+        && mesh_policies.is_empty()
+        && peer_authentications.is_empty()
+        && sidecars.is_empty()
+    {
+        return;
+    }
+    // Deterministic order regardless of HashMap iteration.
+    request_authentications
+        .sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+    mesh_policies
+        .sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+    peer_authentications
+        .sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+    sidecars
+        .sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+    let mesh = translation.config.mesh.get_or_insert_with(|| {
+        // Every mesh-producing object was skipped: keep the configured
+        // Istio root namespace so a mesh-wide marker stays owned by it.
+        Box::new(MeshConfig {
+            istio_root_namespace: options.istio_root_namespace.clone(),
+            ..MeshConfig::default()
+        })
+    });
+    mesh.request_authentications.extend(request_authentications);
+    mesh.mesh_policies.extend(mesh_policies);
+    mesh.peer_authentications.extend(peer_authentications);
+    mesh.sidecars.extend(sidecars);
 }
 
 fn includes_object_namespace(options: &K8sTranslationOptions, object: &K8sObject) -> bool {
@@ -2885,7 +3045,6 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time, never set by route translation.
         pool_http1_max_pending_requests: None,
@@ -2986,6 +3145,12 @@ pub(crate) fn route_response_transformer_plugin_for_proxy(
         updated_at: now,
     }
 }
+
+/// The message of the `request_termination` instance the VirtualService
+/// translator attaches to a route whose match cannot be represented. Mesh
+/// slice decode pins a carried termination body to it (issue #7440).
+pub(crate) const VIRTUAL_SERVICE_UNSUPPORTED_MATCH_TERMINATION_MESSAGE: &str =
+    "unsupported Istio VirtualService match predicate";
 
 /// Build a `request_termination` plugin config for a translated route that
 /// cannot safely be represented by Ferrum's current routing dimensions.
@@ -3138,14 +3303,15 @@ pub(crate) struct MeshRouteDispatchPolicy<'a> {
     pub redirect: Option<&'a Value>,
 }
 
-/// Translate a VirtualService `http[]` entry's `match[]` blocks into a
-/// `mesh_route_dispatch` plugin instance for the route's proxy.
+/// Translate a VirtualService `http[]` entry's `match[]` blocks into the
+/// `mesh_route_dispatch` rules for the route's proxy, returning the rules
+/// and whether any in-scope entry is URI-only.
 ///
 /// Each in-scope `match[]` entry becomes one rule. URI predicates are
 /// already captured at the proxy level via `listen_path`, so this helper
 /// extracts only the non-URI predicates (`method`, `headers`,
-/// `queryParams`). If no in-scope match entry has non-URI predicates,
-/// returns `None` — no plugin emitted.
+/// `queryParams`). If no in-scope match entry has non-URI predicates, no
+/// rule is returned for it.
 ///
 /// `listen_path` scopes the in-scope entries to this proxy: a `match[]`
 /// entry with a `uri` predicate only contributes to the proxy whose
@@ -3155,8 +3321,8 @@ pub(crate) struct MeshRouteDispatchPolicy<'a> {
 /// headers:...}]` `match[]` would bleed the `/b` header rule into the
 /// `/a` proxy, and the second P1 below would also fire.
 ///
-/// `reject_unmatched` is forced to `false` when any in-scope entry is
-/// URI-only. Istio `match[]` entries are ORed: a URI-only entry is an
+/// The caller forces `reject_unmatched` to `false` when any in-scope entry
+/// is URI-only. Istio `match[]` entries are ORed: a URI-only entry is an
 /// unconditional catch-all for its listen_path, so requests that miss
 /// every other predicate must still be allowed to fall through to the
 /// proxy's default backend. With `reject_unmatched: true` and a URI-only
@@ -3165,11 +3331,10 @@ pub(crate) struct MeshRouteDispatchPolicy<'a> {
 /// entry carries non-URI predicates, `reject_unmatched: true` is kept so
 /// e.g. a GET-only route does not silently serve POST traffic.
 ///
-/// Entries carrying predicates we cannot represent in the rule
-/// (`method.regex` / `.prefix`, `headers.X.regex` / `.prefix`,
-/// `queryParams.X.regex`, or fully-unsupported keys like `scheme`, `port`,
-/// `sourceLabels`, `gateways`, `withoutHeaders`) are skipped by the
-/// dispatch-rule extractor — they do NOT collapse onto the URI-only
+/// Entries carrying predicates we cannot represent in the rule (a malformed
+/// or uncompilable `StringMatch`, a presence-only `queryParams.X: {}`, or
+/// fully-unsupported keys like `scheme`, `sourceLabels`, `gateways`) are
+/// skipped by the dispatch-rule extractor — they do NOT collapse onto the URI-only
 /// catch-all branch. The VirtualService translator emits a separate
 /// proxy-scoped `request_termination` artifact for
 /// unsupported-only route candidates so later broader routes do not silently
@@ -3185,58 +3350,11 @@ pub(crate) struct MeshRouteDispatchPolicy<'a> {
 /// regex and the dispatch rule carries the flag so the plugin re-evaluates
 /// with ASCII case folding. Regex URI matches keep their operator-supplied
 /// regex semantics; Istio documents `ignoreUriCase` as exact/prefix-only.
-///
-/// The rule's destination overrides to the route's own destination
-/// (`backend_host`/`backend_port` or `upstream_id`). The destination is
-/// effectively the proxy's default backend, so the override is a no-op for
-/// the single-route case. The plugin is still emitted so:
-///   1. Predicate config is captured and visible via the admin API.
-///   2. Future enhancements (multi-destination canary routing collapsing
-///      multiple `http[]` entries into one proxy + multi-rule plugin) reuse
-///      the same plugin contract.
-#[allow(dead_code)]
-pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
-    proxy_id: &str,
-    namespace: &str,
-    http: &Value,
-    listen_path: Option<&str>,
-    destination: MeshRouteDispatchDestination<'_>,
-    policy: MeshRouteDispatchPolicy<'_>,
-    prepend_rules: &[Value],
-) -> Option<PluginConfig> {
-    let (mut rules, has_uri_only_match) =
-        mesh_route_dispatch_rules_for_proxy(http, listen_path, destination, policy, false);
-    if !prepend_rules.is_empty() {
-        let mut combined = Vec::with_capacity(prepend_rules.len() + rules.len());
-        combined.extend(prepend_rules.iter().cloned());
-        combined.append(&mut rules);
-        rules = combined;
-    }
-    if rules.is_empty() {
-        return None;
-    }
-
-    let current_route_has_rules = rules.len() > prepend_rules.len();
-    let reject_unmatched = current_route_has_rules && !has_uri_only_match;
-
-    mesh_route_dispatch_plugin_from_rules(proxy_id, namespace, rules, reject_unmatched)
-}
-
-#[allow(dead_code)]
-pub(crate) fn mesh_route_dispatch_uri_less_rules(
-    http: &Value,
-    destination: MeshRouteDispatchDestination<'_>,
-    policy: MeshRouteDispatchPolicy<'_>,
-) -> Vec<Value> {
-    mesh_route_dispatch_rules_for_proxy(http, None, destination, policy, true).0
-}
-
 pub(crate) fn mesh_route_dispatch_rules_for_proxy(
     http: &Value,
     listen_path: Option<&str>,
     route_destination: MeshRouteDispatchDestination<'_>,
     route_policy: MeshRouteDispatchPolicy<'_>,
-    uri_less_only: bool,
 ) -> (Vec<Value>, bool) {
     // VirtualService `headers.{request,response}.{set,add,remove}` is a
     // per-http[] (not per-match) block. Project it onto each emitted rule so
@@ -3267,10 +3385,6 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
     let mut rules = Vec::new();
     let mut has_uri_only_match = matches.is_empty();
     for entry in matches {
-        if uri_less_only && entry.get("uri").is_some() {
-            continue;
-        }
-
         // Scope to this proxy's listen_path. A match entry with a parseable
         // URI applies only to the proxy whose listen_path was built from
         // that URI; entries without a URI (or with an unsupported URI
@@ -3374,13 +3488,49 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
         if let Some(qp_obj) = entry.get("queryParams").and_then(Value::as_object) {
             let mut params = serde_json::Map::new();
             for (name, value) in qp_obj {
+                // `exact` keeps the bare-string wire shape; `prefix` / `regex`
+                // emit the tagged `StringMatch` form the plugin compiles at load.
                 if let Some(exact) = value.get("exact").and_then(Value::as_str) {
                     params.insert(name.to_string(), Value::String(exact.to_string()));
+                } else if let Some(prefix) = value.get("prefix").and_then(Value::as_str) {
+                    params.insert(name.to_string(), serde_json::json!({ "prefix": prefix }));
+                } else if let Some(regex) = value.get("regex").and_then(Value::as_str) {
+                    params.insert(name.to_string(), serde_json::json!({ "regex": regex }));
                 }
             }
             if !params.is_empty() {
                 match_criteria.insert("query_params".to_string(), Value::Object(params));
             }
+        }
+
+        // Istio `withoutHeaders`: a negated header predicate. Same operand
+        // shapes as `headers`; the presence-only `{}` entry becomes a
+        // full-match `.*`, so any present value vetoes the rule and the rule
+        // requires the header to be absent.
+        if let Some(without_obj) = entry.get("withoutHeaders").and_then(Value::as_object) {
+            let mut without = serde_json::Map::new();
+            for (name, value) in without_obj {
+                let projected = if let Some(exact) = value.get("exact").and_then(Value::as_str) {
+                    Value::String(exact.to_string())
+                } else if let Some(prefix) = value.get("prefix").and_then(Value::as_str) {
+                    serde_json::json!({ "prefix": prefix })
+                } else if let Some(regex) = value.get("regex").and_then(Value::as_str) {
+                    serde_json::json!({ "regex": regex })
+                } else if value.as_object().is_some_and(serde_json::Map::is_empty) {
+                    serde_json::json!({ "regex": ".*" })
+                } else {
+                    continue;
+                };
+                without.insert(name.to_ascii_lowercase(), projected);
+            }
+            if !without.is_empty() {
+                match_criteria.insert("without_headers".to_string(), Value::Object(without));
+            }
+        }
+
+        // Istio `port`: the destination port the client addressed.
+        if let Some(port) = entry.get("port").and_then(match_port_value) {
+            match_criteria.insert("port".to_string(), serde_json::json!(port));
         }
 
         // Istio `HTTPMatchRequest.sourceNamespace` is an exact-only string
@@ -3893,8 +4043,68 @@ fn authority_value_has_supported_predicate(value: &Value) -> bool {
     true
 }
 
+/// Query-param `StringMatch` supports `exact`, `prefix`, and `regex`, matched
+/// against the decoded backend-bound value. `prefix` / `regex` operands must be
+/// non-empty and a regex must compile under the plugin's full-match anchors, so
+/// a shape the plugin would refuse at construction fails closed here (scoped to
+/// this route) instead of rejecting the whole plugin chain. A presence-only
+/// `{}` entry stays unsupported.
 fn query_param_value_has_supported_predicate(value: &Value) -> bool {
-    string_match_has_exactly_one_supported_operator(value, &["exact"])
+    string_match_operand_is_compilable(value, false)
+}
+
+/// `withoutHeaders` entry support: the same `exact` / `prefix` / `regex`
+/// operands as `headers` (full-match regex), plus Istio's presence-only `{}`
+/// entry, which the translator projects as `{"regex": ".*"}` so the rule
+/// requires the header to be absent.
+fn without_header_value_has_supported_predicate(value: &Value) -> bool {
+    string_match_operand_is_compilable(value, true)
+}
+
+/// Whether `value` is a single-operator `StringMatch` the dispatch plugin
+/// compiles: `exact` (any string), or a non-empty `prefix` / `regex` whose
+/// regex compiles with the plugin's `\A(?:…)\z` anchoring. `allow_presence`
+/// also admits the empty `{}` object.
+fn string_match_operand_is_compilable(value: &Value, allow_presence: bool) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    if obj.is_empty() {
+        return allow_presence;
+    }
+    if obj.len() != 1 {
+        return false;
+    }
+    let Some((key, operand)) = obj.iter().next() else {
+        return false;
+    };
+    let Some(operand) = operand.as_str() else {
+        return false;
+    };
+    match key.as_str() {
+        "exact" => true,
+        "prefix" => !operand.is_empty(),
+        "regex" => !operand.is_empty() && regex::Regex::new(&format!(r"\A(?:{operand})\z")).is_ok(),
+        _ => false,
+    }
+}
+
+/// `withoutHeaders` names must be RFC 9110 tokens that stay distinct after
+/// ASCII lowercasing; the plugin refuses anything else at construction.
+fn without_headers_names_are_supported(headers: &serde_json::Map<String, Value>) -> bool {
+    let mut seen = HashSet::with_capacity(headers.len());
+    headers.keys().all(|name| {
+        http::header::HeaderName::from_bytes(name.as_bytes()).is_ok()
+            && seen.insert(name.to_ascii_lowercase())
+    })
+}
+
+/// Istio `HTTPMatchRequest.port`: an integer destination port in `1..=65535`.
+fn match_port_value(value: &Value) -> Option<u16> {
+    value
+        .as_u64()
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)
 }
 
 fn string_match_has_exactly_one_supported_operator(value: &Value, allowed: &[&str]) -> bool {
@@ -3924,6 +4134,16 @@ pub(crate) fn mesh_route_dispatch_has_supported_non_uri_predicate(entry: &Value)
     if let Some(qp) = entry.get("queryParams").and_then(Value::as_object)
         && qp.values().any(query_param_value_has_supported_predicate)
     {
+        return true;
+    }
+    if let Some(without) = entry.get("withoutHeaders").and_then(Value::as_object)
+        && without
+            .values()
+            .any(without_header_value_has_supported_predicate)
+    {
+        return true;
+    }
+    if entry.get("port").and_then(match_port_value).is_some() {
         return true;
     }
     // `sourceNamespace` is a string-typed exact predicate in the Istio CRD;
@@ -4031,13 +4251,34 @@ pub(crate) fn mesh_route_dispatch_has_unsupported_predicate(entry: &Value) -> bo
         }
     }
 
+    // `withoutHeaders` is a negated header predicate (first-class
+    // `match.without_headers`). Every entry must be a supported operand under
+    // a valid, case-distinct header name, or the whole entry fails closed.
+    if let Some(without) = entry.get("withoutHeaders") {
+        let Some(without) = without.as_object() else {
+            return true;
+        };
+        if without.is_empty()
+            || !without_headers_names_are_supported(without)
+            || without
+                .values()
+                .any(|v| !without_header_value_has_supported_predicate(v))
+        {
+            return true;
+        }
+    }
+
+    // `port` is the addressed destination port (first-class `match.port`);
+    // anything but an integer in 1..=65535 fails closed.
+    if let Some(port) = entry.get("port")
+        && match_port_value(port).is_none()
+    {
+        return true;
+    }
+
     entry.as_object().is_some_and(|obj| {
-        obj.keys().any(|key| {
-            matches!(
-                key.as_str(),
-                "scheme" | "port" | "sourceLabels" | "gateways" | "withoutHeaders"
-            )
-        })
+        obj.keys()
+            .any(|key| matches!(key.as_str(), "scheme" | "sourceLabels" | "gateways"))
     })
 }
 
@@ -4045,6 +4286,17 @@ pub(crate) fn mesh_route_dispatch_can_emit_rule(entry: &Value) -> bool {
     mesh_route_dispatch_has_supported_non_uri_predicate(entry)
         && !mesh_route_dispatch_has_unsupported_predicate(entry)
 }
+
+/// The largest whole-second value an Istio duration can project to.
+///
+/// `parse_istio_duration_ms` saturates at `u64::MAX` milliseconds. The
+/// translator rounds that up to seconds (`parse_istio_duration_secs` in
+/// `istio.rs`), for example for a VirtualService `corsPolicy.maxAge`. Mesh
+/// slice decode refuses a carried value above it (issue #7440). A change to
+/// the parser's saturation point must update this constant; the istio.rs test
+/// `istio_duration_secs_max_is_the_largest_projected_value` pins the two
+/// together.
+pub(crate) const ISTIO_DURATION_SECS_MAX: u64 = u64::MAX.div_ceil(1000);
 
 /// Parse an Istio duration string to milliseconds. Supports the same suffix
 /// set as Go's `time.ParseDuration` (`ns`, `us`, `ms`, `s`, `m`, `h`); Istio's
@@ -4254,6 +4506,7 @@ pub(crate) fn upstream_for_route_with_session(
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     };
     if let Some(session) = session {
@@ -4301,13 +4554,24 @@ fn claim_route_resource_owner(
     key: &NamespacedResourceId,
     route: &K8sObject,
 ) -> bool {
+    route_resource_owner_conflict(owners, key, route).is_none()
+}
+
+/// Claim `key` for `route`, returning the different object that already owns
+/// it. Repeated claims by the same object succeed.
+fn route_resource_owner_conflict(
+    owners: &mut HashMap<NamespacedResourceId, K8sResourceKey>,
+    key: &NamespacedResourceId,
+    route: &K8sObject,
+) -> Option<K8sResourceKey> {
     if let Some(owner) = owners.get(key) {
-        return owner.kind == route.kind
+        let same_object = owner.kind == route.kind
             && owner.namespace == route.metadata.namespace
             && owner.name == route.metadata.name;
+        return (!same_object).then(|| owner.clone());
     }
     owners.insert(key.clone(), K8sResourceKey::from_object(route));
-    true
+    None
 }
 
 /// Build a `(namespace, id)` ownership key, failing closed on empty components.

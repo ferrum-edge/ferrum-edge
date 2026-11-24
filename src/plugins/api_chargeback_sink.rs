@@ -31,6 +31,7 @@ use http::header::CONTENT_TYPE;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -46,7 +47,10 @@ use url::Url;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use super::chargeback::pricing::{ChargeComputation, PricingConfig, require_finite_charge};
-use super::chargeback::{HttpBillingOutcome, http_billing_outcome, is_websocket_handshake};
+use super::chargeback::{
+    HttpBillingOutcome, billing_principal, http_billing_outcome, is_websocket_handshake,
+    owned_principal_billing_identity, principal_billing_identity, with_principal_billing_identity,
+};
 use super::utils::byte_budget::{
     GrowableProcessReservation, JSON_STRING_WORST_CASE_EXPANSION, PayloadMaterializationError,
     ProcessByteReservation, ReservedPayload, RetainedByteCeiling, materialize_reserved_buffer,
@@ -65,6 +69,7 @@ use super::utils::{
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
 use crate::observability_delivery::DeliveryWorkerControl;
+use crate::plugins::utils::http_client::{DedicatedClientAlpn, DedicatedPluginClient};
 use crate::plugins::utils::log_schema::view::status_class;
 use crate::plugins::utils::log_schema::{
     DerivedKind, EmittedKeys, FieldSpec, MetadataPolicy, SchemaCapabilities, SchemaSerializable,
@@ -93,6 +98,12 @@ const MAX_METADATA_FIELD_LEN: usize = 256;
 const MAX_LABEL_LEN: usize = MAX_FIELD_LEN;
 /// Conservative ceiling for one owned [`ChargeEvent`] after field bounding.
 const MAX_CHARGE_EVENT_BYTES: usize = 224 + (MAX_FIELD_LEN * 16) + (MAX_METADATA_FIELD_LEN * 4);
+/// Smallest admitted `spool.max_bytes` when spooling is enabled.
+///
+/// A policy floor, not a proof that every artifact fits: a quota much smaller
+/// than this refuses ordinary failed batches and snapshot chunks so often that
+/// spooling (and, in snapshot mode, finalization) cannot be relied on.
+const MIN_SPOOL_MAX_BYTES: u64 = 1024 * 1024;
 const SPOOL_WARN_INTERVAL_SECS: i64 = 60;
 const SPOOL_JOB_WARN_EVERY: u64 = 100;
 /// Bound refreshes when another process mutates the shared spool during quota eviction.
@@ -106,8 +117,6 @@ const SPOOL_OWNER_DIGEST_DOMAIN: &[u8] = b"ferrum-edge/api_chargeback_sink/spool
 const SPOOL_OWNER_DIGEST_LEN: usize = 32;
 /// Hex characters of the ownership digest embedded in every managed filename.
 const SPOOL_OWNER_TAG_LEN: usize = 32;
-/// Owner-tag length written by the original version-1 spool format.
-const SPOOL_LEGACY_OWNER_TAG_LEN: usize = 16;
 const SPOOL_INFLIGHT_SUFFIX: &str = ".inflight";
 const SPOOL_CLAIM_MARKER: &str = ".claim-";
 const SPOOL_WRITE_MARKER: &str = ".write-";
@@ -115,7 +124,7 @@ const SPOOL_TMP_SUFFIX: &str = ".tmp";
 /// Bound recursive spool walks (day dirs + namespace depth headroom).
 const MAX_SPOOL_TRAVERSAL_DEPTH: u32 = 8;
 /// Hard cap on directory entries visited by one bounded tree walk, and on the
-/// aggregate legacy/sibling-namespace portion of the unbound-record scan.
+/// aggregate sibling-namespace portion of the unbound-record scan.
 /// Counting directories and symlinks as well as regular files prevents an
 /// attacker-controlled tree of empty directories from escaping the bound.
 const MAX_SPOOL_TRAVERSAL_ENTRIES: usize = 100_000;
@@ -340,8 +349,41 @@ fn status_cache() -> &'static ArcSwap<Option<(Instant, String)>> {
     STATUS_CACHE.get_or_init(|| ArcSwap::from_pointee(None))
 }
 
+/// Drop the cached `/charges/sink/status` body.
+///
+/// Called on every per-event enqueue and settlement, so it must stay a
+/// read-mostly no-op while the cache is already empty: only a populated cache
+/// pays the `ArcSwap` store and its fresh `Arc` allocation. A render racing an
+/// invalidation can still publish a just-stale body, which the one-second
+/// [`STATUS_CACHE_TTL`] bounds exactly as before.
 fn invalidate_status_cache() {
-    status_cache().store(Arc::new(None));
+    invalidate_status_cache_in(status_cache());
+}
+
+/// Check-then-store invalidation of one status cache cell. Returns whether a
+/// store happened.
+fn invalidate_status_cache_in(cache: &ArcSwap<Option<(Instant, String)>>) -> bool {
+    if cache.load().is_none() {
+        return false;
+    }
+    cache.store(Arc::new(None));
+    true
+}
+
+/// Exercise status-cache invalidation against a test-owned cell, returning
+/// `(empty_cell_store_skipped, populated_cell_cleared)`. A test-owned cell keeps
+/// the assertion exact while other tests render the process-global cache.
+#[doc(hidden)]
+pub fn probe_status_cache_invalidation_for_tests() -> (bool, bool) {
+    let cache: ArcSwap<Option<(Instant, String)>> = ArcSwap::from_pointee(None);
+    let before = cache.load_full();
+    let stored_on_empty = invalidate_status_cache_in(&cache);
+    let empty_cell_store_skipped = !stored_on_empty && Arc::ptr_eq(&before, &cache.load_full());
+
+    cache.store(Arc::new(Some((Instant::now(), "{}".to_string()))));
+    let stored_on_populated = invalidate_status_cache_in(&cache);
+    let populated_cell_cleared = stored_on_populated && cache.load().is_none();
+    (empty_cell_store_skipped, populated_cell_cleared)
 }
 
 fn active_snapshot_finalizations() -> &'static Mutex<BTreeMap<u64, PendingSnapshotFinalization>> {
@@ -374,7 +416,7 @@ impl PendingSnapshotFinalization {
 
     fn age_secs(&self, now: Instant) -> u64 {
         match self {
-            Self::Full(lifecycle) => lifecycle.closed_age_secs(now),
+            Self::Full(lifecycle) => lifecycle.closed_age_secs(),
             Self::Compact(recovery) => now.saturating_duration_since(recovery.closed_at).as_secs(),
         }
     }
@@ -1439,14 +1481,12 @@ impl ChargeEventProjection {
 
     /// The compiled schema. Test-visible so parity assertions can inspect it.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn schema(&self) -> &SummarySchema {
         &self.schema
     }
 
     /// Worst-case extra bytes one projected row costs.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn row_overhead_bytes(&self) -> usize {
         self.row_overhead_bytes
     }
@@ -1455,7 +1495,6 @@ impl ChargeEventProjection {
 /// Resolve and compile a charge-event projection straight from a raw plugin
 /// config. Test-facing mirror of what the constructor does.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn compile_charge_event_projection(
     config: &Value,
 ) -> Result<Option<ChargeEventProjection>, String> {
@@ -1911,7 +1950,7 @@ struct SpoolDelivery {
 }
 
 impl SpoolDelivery {
-    fn try_enqueue(&self, events: Arc<Vec<QueuedChargeEvent>>, _reason: &'static str) -> bool {
+    fn try_enqueue(&self, events: Arc<Vec<QueuedChargeEvent>>) -> bool {
         if events.is_empty() {
             return true;
         }
@@ -2281,7 +2320,7 @@ impl SnapshotLifecycle {
         }
     }
 
-    fn closed_age_secs(&self, _now: Instant) -> u64 {
+    fn closed_age_secs(&self) -> u64 {
         let closed = self.closed_at_secs.load(Ordering::Acquire);
         if closed <= 0 {
             return 0;
@@ -2647,8 +2686,8 @@ struct SinkMetrics {
     spool_replay_attempts_total: SinkCounter,
     /// Rejected rows durably handed to the private dead-letter payload store.
     spool_dead_letter_rows_total: SinkCounter,
-    /// Retained spool records this identity does not own: pre-namespace layouts
-    /// and namespaces orphaned by a destination/configuration change. Never
+    /// Retained spool records this identity does not own: namespaces orphaned
+    /// by a destination/configuration change. Never
     /// replayed, never deleted; reported so operators can reconcile them.
     spool_unbound_files: AtomicU64,
     spool_unbound_namespaces: AtomicU64,
@@ -2656,6 +2695,10 @@ struct SinkMetrics {
     snapshot_overflow_spooled_total: SinkCounter,
     snapshot_overflow_pending_total: SinkCounter,
     snapshot_cardinality_rejections_total: SinkCounter,
+    /// Snapshot charges whose record hook ran after this generation closed
+    /// snapshot admission (reload retirement or shutdown), so they were never
+    /// accumulated or spooled (issue #7112).
+    snapshot_late_charges_dropped_total: SinkCounter,
     last_success_at: AtomicI64,
     last_failure_at: AtomicI64,
     last_replay_at: AtomicI64,
@@ -2694,6 +2737,7 @@ impl Default for SinkMetrics {
             snapshot_overflow_spooled_total: SinkCounter::default(),
             snapshot_overflow_pending_total: SinkCounter::default(),
             snapshot_cardinality_rejections_total: SinkCounter::default(),
+            snapshot_late_charges_dropped_total: SinkCounter::default(),
             last_success_at: AtomicI64::new(0),
             last_failure_at: AtomicI64::new(0),
             last_replay_at: AtomicI64::new(0),
@@ -2757,6 +2801,8 @@ impl SinkMetrics {
             Some(&process.snapshot_overflow_pending_total);
         metrics.snapshot_cardinality_rejections_total.process =
             Some(&process.snapshot_cardinality_rejections_total);
+        metrics.snapshot_late_charges_dropped_total.process =
+            Some(&process.snapshot_late_charges_dropped_total);
         metrics.failure_reasons.network.process = Some(&process.failure_reasons.network);
         metrics.failure_reasons.http_4xx.process = Some(&process.failure_reasons.http_4xx);
         metrics.failure_reasons.http_5xx.process = Some(&process.failure_reasons.http_5xx);
@@ -2927,7 +2973,7 @@ struct ClickHouseFlushConfig {
 #[derive(Clone)]
 enum ClickHouseHttpClient {
     Shared(Box<PluginHttpClient>),
-    Dedicated(reqwest::Client),
+    Dedicated(DedicatedPluginClient),
 }
 
 impl ClickHouseHttpClient {
@@ -2956,7 +3002,6 @@ impl ClickHouseHttpClient {
 }
 
 impl ApiChargebackSink {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(
         raw_config: &Value,
         http_client: PluginHttpClient,
@@ -3065,16 +3110,12 @@ impl ApiChargebackSink {
         let redacted_insert_url = redacted_endpoint_url(&parsed_url);
         let password = resolve_password_ref(self.config.clickhouse.password_ref.as_deref())?;
         let http = build_clickhouse_http_client(&self.config.clickhouse, &self.http_client)?;
-        // Build the spool-replay client before staging so a TLS/file failure
-        // cannot orphan an already-staged BatchingLogger or replayer task.
-        let replay_http = if self.config.spool.enabled {
-            Some(build_clickhouse_http_client(
-                &self.config.clickhouse,
-                &self.http_client,
-            )?)
-        } else {
-            None
-        };
+        // Spool replay shares the live delivery client and its connection pool,
+        // exactly as the default (shared plugin client) arm always has. A clone
+        // of the dedicated custom-TLS client shares its pool and CRL rotation,
+        // so the TLS files are read and their warnings logged once per
+        // activation (issue #7112).
+        let replay_http = self.config.spool.enabled.then(|| http.clone());
         let metrics = Arc::new(SinkMetrics::with_process_totals());
         let generation = NEXT_SINK_GENERATION.fetch_add(1, Ordering::Relaxed);
         let spool = if self.config.spool.enabled {
@@ -3148,7 +3189,7 @@ impl ApiChargebackSink {
                     invalidate_status_cache();
                     return true;
                 }
-                let accepted = overflow_enqueue.try_enqueue(Arc::new(vec![queued]), reason);
+                let accepted = overflow_enqueue.try_enqueue(Arc::new(vec![queued]));
                 if accepted && reason == "queue high water" {
                     overflow_metrics
                         .queue_high_water_diversions_total
@@ -3171,7 +3212,7 @@ impl ApiChargebackSink {
                         // Terminal failure receives the shared batch handle; spool
                         // ownership continues under the same Arc without cloning
                         // ChargeEvent records.
-                        enqueue.try_enqueue(batch, "export failure")
+                        enqueue.try_enqueue(batch)
                     } else {
                         warn_sampled!(
                             plugin = PLUGIN_NAME,
@@ -3254,7 +3295,6 @@ impl ApiChargebackSink {
         if let (Some(spool), Some(replay_http)) = (runtime.spool.clone(), replay_http) {
             background_tasks.push(start_spool_replayer(
                 Arc::clone(&spool),
-                runtime.summary.clone(),
                 ClickHouseFlushConfig {
                     http: replay_http,
                     insert_url,
@@ -3392,7 +3432,6 @@ impl ApiChargebackSink {
     /// process-global accepted-generation registry. Staging
     /// (`start_background_tasks`) must leave this false; only
     /// [`Plugin::commit_background_tasks`] publishes ownership.
-    #[allow(dead_code)] // lifecycle tests observe pre/post-commit publication
     pub fn owns_active_sink(&self) -> bool {
         let Some(runtime) = self.runtime.get() else {
             return false;
@@ -3404,25 +3443,19 @@ impl ApiChargebackSink {
     }
 
     /// Accepted observability generation for this instance, if activated.
-    #[allow(dead_code)] // multi-instance lifecycle tests assert exact-generation removal
     pub fn active_generation(&self) -> Option<u64> {
         self.runtime.get().map(|runtime| runtime.generation)
     }
 
     /// Stable plugin-config id used for observability identity.
-    #[allow(dead_code)] // multi-instance lifecycle tests assert exact-id removal
     pub fn plugin_config_id(&self) -> &str {
         &self.plugin_config_id
     }
 
-    // The library's hidden test-support module calls this accessor; the binary
-    // compiles this module separately and cannot observe that use.
-    #[allow(dead_code)]
     pub(crate) fn snapshot_accumulator_for_tests(&self) -> Option<Arc<SnapshotAccumulator>> {
         self.snapshot_accumulator.get().cloned()
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn finalize_snapshot_for_tests(&self) -> Option<bool> {
         let lifecycle = self.snapshot_lifecycle.get()?;
         Some(
@@ -3432,7 +3465,6 @@ impl ApiChargebackSink {
         )
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn finalize_snapshot_with_held_admission_for_tests(
         &self,
         timeout: Duration,
@@ -3442,14 +3474,12 @@ impl ApiChargebackSink {
         Some(lifecycle.finalize_attempt(Instant::now() + timeout).await)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn snapshot_finalized_for_tests(&self) -> Option<bool> {
         self.snapshot_lifecycle
             .get()
             .map(|lifecycle| lifecycle.finalized.load(Ordering::Acquire))
     }
 
-    #[allow(dead_code)]
     pub(crate) fn snapshot_generation_registered_for_tests(&self) -> Option<bool> {
         let lifecycle = self.snapshot_lifecycle.get()?;
         let generations = match active_snapshot_finalizations().lock() {
@@ -3466,7 +3496,6 @@ impl ApiChargebackSink {
     }
 
     /// Force Full→Compact transfer for adversarial recovery tests.
-    #[allow(dead_code)]
     pub(crate) fn force_compact_snapshot_finalization_for_tests(&self) -> bool {
         let Some(lifecycle) = self.snapshot_lifecycle.get() else {
             return false;
@@ -3477,13 +3506,11 @@ impl ApiChargebackSink {
     }
 
     /// True when this generation is retained as compact durable recovery.
-    #[allow(dead_code)]
     pub(crate) fn snapshot_compact_recovery_registered_for_tests(&self) -> Option<bool> {
         let lifecycle = self.snapshot_lifecycle.get()?;
         Some(compact_recovery_for_generation(lifecycle.generation).is_some())
     }
 
-    #[allow(dead_code)]
     pub(crate) fn emit_snapshot_tick_for_tests(&self) -> Option<Result<usize, String>> {
         let lifecycle = self.snapshot_lifecycle.get()?;
         Some(emit_periodic_snapshot(
@@ -3497,7 +3524,6 @@ impl ApiChargebackSink {
 
     /// Drive one snapshot cardinality overflow charge through the non-blocking
     /// delivery path for tests. Returns false when no snapshot lifecycle exists.
-    #[allow(dead_code)]
     pub(crate) fn spool_snapshot_overflow_for_tests(&self, event: ChargeEvent) -> bool {
         let Some(lifecycle) = self.snapshot_lifecycle.get() else {
             return false;
@@ -3508,7 +3534,6 @@ impl ApiChargebackSink {
 
     /// Abort the owned spool-delivery worker so tests can prove queued snapshot
     /// overflow ownership re-stages on teardown before durable processing.
-    #[allow(dead_code)]
     pub(crate) fn abort_spool_delivery_for_tests(&self) -> bool {
         let Some(runtime) = self.runtime.get() else {
             return false;
@@ -3522,7 +3547,6 @@ impl ApiChargebackSink {
 
     /// Snapshot overflow counters `(spooled, pending, cardinality_rejections)`
     /// for the live generation; lets tests poll async durable-handoff outcomes.
-    #[allow(dead_code)]
     pub(crate) fn snapshot_overflow_counters_for_tests(&self) -> Option<(u64, u64, u64)> {
         let lifecycle = self.snapshot_lifecycle.get()?;
         let metrics = &lifecycle.runtime.metrics;
@@ -3542,7 +3566,6 @@ impl ApiChargebackSink {
     /// Prove compaction refuses while an admission guard is held and succeeds
     /// after the admitted hook drains. Returns
     /// `(refused_while_admitted, compacted_after_drain)`.
-    #[allow(dead_code)]
     pub(crate) fn compact_refuses_while_admitted_then_succeeds_for_tests(
         &self,
     ) -> Option<(bool, bool)> {
@@ -3564,7 +3587,6 @@ impl ApiChargebackSink {
     /// Prove Full→Compact refuses while an async overflow delivery can still
     /// stage back into the accumulator, then succeeds after delivery ownership
     /// drains.
-    #[allow(dead_code)]
     pub(crate) fn compact_refuses_while_overflow_delivery_then_succeeds_for_tests(
         &self,
     ) -> Option<(bool, bool)> {
@@ -3588,7 +3610,6 @@ impl ApiChargebackSink {
     /// after the attempt. A correct refusal reports
     /// `(false, <what was staged>, true)`: the generation kept the staged
     /// overflow it borrowed and kept its retry mechanism.
-    #[allow(dead_code)]
     pub(crate) fn compact_projection_shortfall_for_tests(&self) -> Option<(bool, usize, bool)> {
         let lifecycle = self.snapshot_lifecycle.get()?;
         lifecycle.commit();
@@ -3620,7 +3641,6 @@ impl ApiChargebackSink {
     /// correct observation is `(true, true)`. One mutex guards both directions,
     /// so this equally proves an emission cannot enter compaction's
     /// prepare→publish interval.
-    #[allow(dead_code)]
     pub(crate) fn compact_excluded_by_emission_lock_for_tests(
         &self,
         hold: Duration,
@@ -3712,8 +3732,16 @@ impl Plugin for ApiChargebackSink {
         PLUGIN_NAME
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::API_CHARGEBACK_SINK
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::LOG
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -3758,9 +3786,11 @@ impl Plugin for ApiChargebackSink {
             return;
         }
 
-        let consumer = match summary.consumer_username.as_deref() {
-            Some(c) if !c.is_empty() => c,
-            _ => return,
+        let Some(principal) = billing_principal(
+            summary.consumer_username.as_deref(),
+            summary.principal_origin,
+        ) else {
+            return;
         };
         let outcome = http_billing_outcome(summary);
         let Some(charge) = self.pricing.compute_http(
@@ -3770,36 +3800,48 @@ impl Plugin for ApiChargebackSink {
         ) else {
             return;
         };
+        // `consumer_id` keeps a mapped Consumer and unmapped external
+        // principals of distinct mechanisms/authorities apart even when their
+        // display strings match (GHSA-q9vj-rf66-3j58); it is already bounded.
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(lifecycle) = self.snapshot_lifecycle.get()
-                && let Some(_admission) = lifecycle.admit()
-            {
-                match lifecycle
-                    .accumulator
-                    .record_http(summary, consumer, outcome, charge)
-                {
-                    SnapshotRecordOutcome::Accumulated => {}
-                    SnapshotRecordOutcome::OverflowImmediate => {
-                        spool_snapshot_overflow_event(
-                            lifecycle,
-                            event_from_http_summary(
-                                summary,
-                                consumer,
-                                outcome,
-                                charge,
-                                &self.config,
-                                &self.node_id,
-                                None,
-                            ),
-                        );
+            if let Some(lifecycle) = self.snapshot_lifecycle.get() {
+                let Some(_admission) = lifecycle.admit() else {
+                    record_late_snapshot_charge(lifecycle);
+                    return;
+                };
+                // Synchronous: the identity is borrowed from the shared
+                // scratch encoding, so an accumulator hit allocates nothing.
+                with_principal_billing_identity(principal, MAX_FIELD_LEN, |consumer| {
+                    match lifecycle
+                        .accumulator
+                        .record_http(summary, consumer, outcome, charge)
+                    {
+                        SnapshotRecordOutcome::Accumulated => {}
+                        SnapshotRecordOutcome::OverflowImmediate => {
+                            // The overflow row carries the same `grpc_status`
+                            // the accumulator keys on, so one request class
+                            // never appears under two values (issue #7112).
+                            spool_snapshot_overflow_event(
+                                lifecycle,
+                                event_from_http_summary(
+                                    summary,
+                                    consumer.to_owned(),
+                                    snapshot_http_outcome(outcome),
+                                    charge,
+                                    &self.config,
+                                    &self.node_id,
+                                    None,
+                                ),
+                            );
+                        }
                     }
-                }
+                });
             }
             return;
         }
         self.enqueue(event_from_http_summary(
             summary,
-            consumer,
+            owned_principal_billing_identity(principal, MAX_FIELD_LEN),
             outcome,
             charge,
             &self.config,
@@ -3809,9 +3851,11 @@ impl Plugin for ApiChargebackSink {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        let consumer = match summary.consumer_username.as_deref() {
-            Some(c) if !c.is_empty() => c,
-            _ => return,
+        let Some(principal) = billing_principal(
+            summary.consumer_username.as_deref(),
+            summary.principal_origin,
+        ) else {
+            return;
         };
         let Some(charge) = self
             .pricing
@@ -3820,34 +3864,40 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(lifecycle) = self.snapshot_lifecycle.get()
-                && let Some(_admission) = lifecycle.admit()
-            {
-                match lifecycle
-                    .accumulator
-                    .record_stream(summary, consumer, charge)
-                {
-                    SnapshotRecordOutcome::Accumulated => {}
-                    SnapshotRecordOutcome::OverflowImmediate => {
-                        spool_snapshot_overflow_event(
-                            lifecycle,
-                            event_from_stream_summary(
-                                summary,
-                                consumer,
-                                charge,
-                                &self.config,
-                                &self.node_id,
-                                None,
-                            ),
-                        );
-                    }
-                }
+            if let Some(lifecycle) = self.snapshot_lifecycle.get() {
+                let Some(_admission) = lifecycle.admit() else {
+                    record_late_snapshot_charge(lifecycle);
+                    return;
+                };
+                with_principal_billing_identity(
+                    principal,
+                    MAX_FIELD_LEN,
+                    |consumer| match lifecycle
+                        .accumulator
+                        .record_stream(summary, consumer, charge)
+                    {
+                        SnapshotRecordOutcome::Accumulated => {}
+                        SnapshotRecordOutcome::OverflowImmediate => {
+                            spool_snapshot_overflow_event(
+                                lifecycle,
+                                event_from_stream_summary(
+                                    summary,
+                                    consumer.to_owned(),
+                                    charge,
+                                    &self.config,
+                                    &self.node_id,
+                                    None,
+                                ),
+                            );
+                        }
+                    },
+                );
             }
             return;
         }
         self.enqueue(event_from_stream_summary(
             summary,
-            consumer,
+            owned_principal_billing_identity(principal, MAX_FIELD_LEN),
             charge,
             &self.config,
             &self.node_id,
@@ -3860,9 +3910,11 @@ impl Plugin for ApiChargebackSink {
     }
 
     async fn on_ws_disconnect(&self, summary: &WsDisconnectContext) {
-        let consumer = match summary.consumer_username.as_deref() {
-            Some(c) if !c.is_empty() => c,
-            _ => return,
+        let Some(principal) = billing_principal(
+            summary.consumer_username.as_deref(),
+            summary.principal_origin,
+        ) else {
+            return;
         };
         let Some(charge) = self.pricing.compute_websocket_bandwidth(
             summary.bytes_client_to_backend,
@@ -3871,34 +3923,40 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(lifecycle) = self.snapshot_lifecycle.get()
-                && let Some(_admission) = lifecycle.admit()
-            {
-                match lifecycle
-                    .accumulator
-                    .record_websocket(summary, consumer, charge)
-                {
-                    SnapshotRecordOutcome::Accumulated => {}
-                    SnapshotRecordOutcome::OverflowImmediate => {
-                        spool_snapshot_overflow_event(
-                            lifecycle,
-                            event_from_ws_summary(
-                                summary,
-                                consumer,
-                                charge,
-                                &self.config,
-                                &self.node_id,
-                                None,
-                            ),
-                        );
-                    }
-                }
+            if let Some(lifecycle) = self.snapshot_lifecycle.get() {
+                let Some(_admission) = lifecycle.admit() else {
+                    record_late_snapshot_charge(lifecycle);
+                    return;
+                };
+                with_principal_billing_identity(
+                    principal,
+                    MAX_FIELD_LEN,
+                    |consumer| match lifecycle
+                        .accumulator
+                        .record_websocket(summary, consumer, charge)
+                    {
+                        SnapshotRecordOutcome::Accumulated => {}
+                        SnapshotRecordOutcome::OverflowImmediate => {
+                            spool_snapshot_overflow_event(
+                                lifecycle,
+                                event_from_ws_summary(
+                                    summary,
+                                    consumer.to_owned(),
+                                    charge,
+                                    &self.config,
+                                    &self.node_id,
+                                    None,
+                                ),
+                            );
+                        }
+                    },
+                );
             }
             return;
         }
         self.enqueue(event_from_ws_summary(
             summary,
-            consumer,
+            owned_principal_billing_identity(principal, MAX_FIELD_LEN),
             charge,
             &self.config,
             &self.node_id,
@@ -3952,7 +4010,6 @@ pub fn render_prometheus() -> String {
 /// on-disk inventory. Status/Prometheus scrapes never call this; external tests
 /// use it after planting files outside the writer path.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn reconcile_active_spool_usage_for_tests() {
     for runtime in active_sinks().load_full().values() {
         if let Some(spool) = runtime.spool.as_ref() {
@@ -3966,7 +4023,6 @@ pub fn reconcile_active_spool_usage_for_tests() {
 /// External tests use this to prove status/Prometheus rendering itself does not
 /// perform the walk.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn active_spool_inventory_walks_for_tests() -> u64 {
     active_sinks()
         .load_full()
@@ -4286,6 +4342,9 @@ fn render_prometheus_for_sinks(
     let snapshot_cardinality_rejections = process
         .snapshot_cardinality_rejections_total
         .load(Ordering::Relaxed);
+    let snapshot_late_charges_dropped = process
+        .snapshot_late_charges_dropped_total
+        .load(Ordering::Relaxed);
     let mut any_snapshot = false;
 
     for runtime in sinks.values() {
@@ -4450,6 +4509,7 @@ fn render_prometheus_for_sinks(
         || snapshot_overflow_spooled > 0
         || snapshot_overflow_pending > 0
         || snapshot_cardinality_rejections > 0
+        || snapshot_late_charges_dropped > 0
     {
         output.push_str("# HELP chargeback_sink_snapshot_entries Snapshot accumulator identities retained in memory.\n");
         output.push_str("# TYPE chargeback_sink_snapshot_entries gauge\n");
@@ -4480,6 +4540,12 @@ fn render_prometheus_for_sinks(
         output.push_str(&format!(
             "chargeback_sink_snapshot_cardinality_rejections_total {}\n",
             snapshot_cardinality_rejections
+        ));
+        output.push_str("# HELP chargeback_sink_snapshot_late_charges_dropped_total Snapshot charges dropped because their record hook ran after the generation closed snapshot admission (reload retirement or shutdown).\n");
+        output.push_str("# TYPE chargeback_sink_snapshot_late_charges_dropped_total counter\n");
+        output.push_str(&format!(
+            "chargeback_sink_snapshot_late_charges_dropped_total {}\n",
+            snapshot_late_charges_dropped
         ));
     }
     output.push_str(
@@ -4656,10 +4722,94 @@ impl DeliveryOutcome {
 /// Bounded ClickHouse HTTP acknowledgement after headers arrive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClickHouseAckRead {
-    /// Full body drained within the byte/time caps.
-    Complete { byte_len: u64, has_exception: bool },
+    /// Full body drained within the byte/time caps. `exception` is set when the
+    /// body carries a ClickHouse exception marker.
+    Complete {
+        byte_len: u64,
+        exception: Option<ClickHouseException>,
+    },
     /// Drain did not finish cleanly; treat as ambiguous for durability.
     Incomplete { kind: ClickHouseAckIncomplete },
+}
+
+/// A ClickHouse exception signalled under a success HTTP status, either by the
+/// `X-ClickHouse-Exception-Code` header or by an exception marker in the
+/// acknowledgement body.
+///
+/// Only the bounded numeric code is retained — never the message text — so the
+/// classification can distinguish a transient server condition from a defect
+/// in the inserted rows without ever carrying response payload into
+/// diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClickHouseException {
+    /// Parsed ClickHouse error code, or `None` when none could be read.
+    code: Option<u32>,
+}
+
+/// ClickHouse error codes that describe a transient server or availability
+/// condition rather than a defect in the inserted rows. ClickHouse can report
+/// these after it has already committed HTTP 200, so they must stay retryable
+/// instead of dead-lettering otherwise valid billing rows once the server
+/// recovers.
+///
+/// The set is ClickHouse's own client retry classification
+/// (`clickhouse-java` client-v2 `ServerException::discoverIsRetryable`):
+/// `UNEXPECTED_END_OF_FILE` (3), `FILE_DOESNT_EXIST` (107), `READONLY` (164),
+/// `TOO_MANY_SIMULTANEOUS_QUERIES` (202), `NO_FREE_CONNECTION` (203),
+/// `SOCKET_TIMEOUT` (209), `NETWORK_ERROR` (210), `MEMORY_LIMIT_EXCEEDED`
+/// (241), `TABLE_IS_READ_ONLY` (242), `TOO_MANY_PARTS` (252),
+/// `TOO_FEW_LIVE_REPLICAS` (285), `UNKNOWN_STATUS_OF_INSERT` (319),
+/// `SYSTEM_ERROR` (425), and `KEEPER_EXCEPTION` (999) — plus four more
+/// transient execution/transport conditions: `ATTEMPT_TO_READ_AFTER_EOF` (32,
+/// a truncated request body), `TIMEOUT_EXCEEDED` (159),
+/// `QUERY_WAS_CANCELLED` (394, server-side cancellation such as shutdown), and
+/// `CANNOT_SCHEDULE_TASK` (439, thread-pool exhaustion). Every other code, and
+/// an exception whose code cannot be read, stays permanent.
+const CLICKHOUSE_TRANSIENT_EXCEPTION_CODES: &[u32] = &[
+    3, 32, 107, 159, 164, 202, 203, 209, 210, 241, 242, 252, 285, 319, 394, 425, 439, 999,
+];
+
+/// Longest decimal ClickHouse error code accepted. Real codes have at most four
+/// digits; the bound keeps parsing fixed-cost on hostile acknowledgement bytes.
+const CLICKHOUSE_EXCEPTION_CODE_MAX_DIGITS: usize = 6;
+
+impl ClickHouseException {
+    fn is_transient(self) -> bool {
+        self.code
+            .is_some_and(|code| CLICKHOUSE_TRANSIENT_EXCEPTION_CODES.contains(&code))
+    }
+}
+
+/// Parse the bounded decimal ClickHouse error code at the start of `bytes`.
+fn parse_clickhouse_exception_code(bytes: &[u8]) -> Option<u32> {
+    let digits = bytes
+        .iter()
+        .take(CLICKHOUSE_EXCEPTION_CODE_MAX_DIGITS + 1)
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 || digits > CLICKHOUSE_EXCEPTION_CODE_MAX_DIGITS {
+        return None;
+    }
+    bytes.get(..digits)?.iter().try_fold(0u32, |code, byte| {
+        code.checked_mul(10)?
+            .checked_add(u32::from(byte.wrapping_sub(b'0')))
+    })
+}
+
+/// Read the `X-ClickHouse-Exception-Code` header, when present. The header is
+/// an exception signal even when its value cannot be parsed as a code.
+fn clickhouse_exception_header(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<ClickHouseException> {
+    let value = headers.get("x-clickhouse-exception-code")?;
+    Some(clickhouse_exception_from_header_value(value.as_bytes()))
+}
+
+fn clickhouse_exception_from_header_value(value: &[u8]) -> ClickHouseException {
+    let trimmed = value.trim_ascii();
+    let code =
+        parse_clickhouse_exception_code(trimmed).filter(|_| trimmed.iter().all(u8::is_ascii_digit));
+    ClickHouseException { code }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4686,8 +4836,12 @@ const CHARGE_ROW_JSON_OVERHEAD_BYTES: usize = 1_024;
 /// Conservative upper bound on the JSONEachRow request body for `batch`.
 ///
 /// Charge-event strings are raw, so JSON escaping can expand each byte six-fold.
-fn charge_body_byte_bound(
-    batch: &[ChargeEvent],
+///
+/// Generic over owned and borrowed events so the live INSERT body (built from
+/// `&ChargeEvent` borrows of queued records) and the durable spool artifact
+/// (owned events) share one bound, one validator, and one writer.
+fn charge_body_byte_bound<E: Borrow<ChargeEvent>>(
+    batch: &[E],
     projection: Option<&ChargeEventProjection>,
 ) -> Option<usize> {
     // A projection can only ADD bytes per row (renamed keys, injected static /
@@ -4698,7 +4852,8 @@ fn charge_body_byte_bound(
     for event in batch {
         total = total
             .checked_add(
-                charge_event_retained_bytes(event).checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?,
+                charge_event_retained_bytes(event.borrow())
+                    .checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?,
             )?
             .checked_add(CHARGE_ROW_JSON_OVERHEAD_BYTES)?
             .checked_add(projection_row_bytes)?;
@@ -4712,17 +4867,18 @@ fn charge_body_byte_bound(
 /// second attacker-shaped copy: it is reserved against the retained-byte ceiling
 /// before serialization and stays charged until the request (and every retry
 /// handle taken from it) is gone.
-fn materialize_charge_body(
+fn materialize_charge_body<E: Borrow<ChargeEvent>>(
     cfg: &ClickHouseFlushConfig,
-    batch: &[ChargeEvent],
+    batch: &[E],
 ) -> Result<ReservedPayload, String> {
     materialize_json_each_row(cfg.ceiling, batch, cfg.projection.as_deref())
 }
 
 /// Reject a batch whose charges cannot be represented in JSON before any
 /// attacker-shaped representation of it is allocated.
-fn validate_charge_batch(batch: &[ChargeEvent]) -> Result<(), String> {
+fn validate_charge_batch<E: Borrow<ChargeEvent>>(batch: &[E]) -> Result<(), String> {
     for event in batch {
+        let event: &ChargeEvent = event.borrow();
         for (field, value) in [
             ("charge_call", event.charge_call),
             ("charge_bytes_sent", event.charge_bytes_sent),
@@ -4749,12 +4905,13 @@ fn validate_charge_batch(batch: &[ChargeEvent]) -> Result<(), String> {
 /// a file written before a schema change replays under the schema in force when
 /// it was written. Internal identities (`SnapshotEntry` keys, spool ownership,
 /// accumulator keys) never pass through here and are untouched by projection.
-fn write_json_each_row<W: Write>(
+fn write_json_each_row<W: Write, E: Borrow<ChargeEvent>>(
     writer: &mut W,
-    batch: &[ChargeEvent],
+    batch: &[E],
     projection: Option<&ChargeEventProjection>,
 ) -> Result<(), String> {
     for (index, event) in batch.iter().enumerate() {
+        let event: &ChargeEvent = event.borrow();
         if index > 0 {
             writer
                 .write_all(b"\n")
@@ -4782,9 +4939,9 @@ fn write_json_each_row<W: Write>(
 /// Every producer of an attacker-shaped JSONEachRow representation — the HTTP
 /// delivery body and the durable spool artifact alike — goes through here, so
 /// no caller can serialize first and measure afterwards.
-fn materialize_json_each_row(
+fn materialize_json_each_row<E: Borrow<ChargeEvent>>(
     ceiling: &'static RetainedByteCeiling,
-    batch: &[ChargeEvent],
+    batch: &[E],
     projection: Option<&ChargeEventProjection>,
 ) -> Result<ReservedPayload, String> {
     validate_charge_batch(batch)?;
@@ -4800,93 +4957,13 @@ fn materialize_json_each_row(
     .map_err(|error| format!("{PLUGIN_NAME}: {}", error.reason()))
 }
 
-fn charge_body_byte_bound_refs(
-    batch: &[&ChargeEvent],
-    projection: Option<&ChargeEventProjection>,
-) -> Option<usize> {
-    let projection_row_bytes = projection.map_or(0, |p| p.row_overhead_bytes);
-    let mut total = CHARGE_ROW_JSON_OVERHEAD_BYTES;
-    for event in batch {
-        total = total
-            .checked_add(
-                charge_event_retained_bytes(event).checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?,
-            )?
-            .checked_add(CHARGE_ROW_JSON_OVERHEAD_BYTES)?
-            .checked_add(projection_row_bytes)?;
-    }
-    Some(total)
-}
-
-fn validate_charge_batch_refs(batch: &[&ChargeEvent]) -> Result<(), String> {
-    for event in batch {
-        for (field, value) in [
-            ("charge_call", event.charge_call),
-            ("charge_bytes_sent", event.charge_bytes_sent),
-            ("charge_bytes_received", event.charge_bytes_received),
-            ("charge_total", event.charge_total),
-        ] {
-            require_finite_charge(value, field).map_err(|error| {
-                format!(
-                    "{PLUGIN_NAME}: event '{}' cannot be serialized: {error}",
-                    event.event_id
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn write_json_each_row_refs<W: Write>(
-    writer: &mut W,
-    batch: &[&ChargeEvent],
-    projection: Option<&ChargeEventProjection>,
-) -> Result<(), String> {
-    for (index, event) in batch.iter().enumerate() {
-        if index > 0 {
-            writer
-                .write_all(b"\n")
-                .map_err(|error| format!("failed to write row separator: {error}"))?;
-        }
-        let result = match projection {
-            None => serde_json::to_writer(&mut *writer, event),
-            Some(projection) => serde_json::to_writer(
-                &mut *writer,
-                &SchemaView {
-                    summary: *event,
-                    schema: &projection.schema,
-                },
-            ),
-        };
-        result.map_err(|error| format!("failed to serialize charge event: {error}"))?;
-    }
-    Ok(())
-}
-
-fn materialize_json_each_row_refs(
-    ceiling: &'static RetainedByteCeiling,
-    batch: &[&ChargeEvent],
-    projection: Option<&ChargeEventProjection>,
-) -> Result<ReservedPayload, String> {
-    validate_charge_batch_refs(batch)?;
-    let bound = charge_body_byte_bound_refs(batch, projection).ok_or_else(|| {
-        format!(
-            "{PLUGIN_NAME}: {}",
-            PayloadMaterializationError::BoundOverflowed.reason()
-        )
-    })?;
-    materialize_reserved_payload(ceiling, bound, |writer| {
-        write_json_each_row_refs(writer, batch, projection)
-    })
-    .map_err(|error| format!("{PLUGIN_NAME}: {}", error.reason()))
-}
-
 async fn send_batch(
     cfg: &ClickHouseFlushConfig,
     batch: &[QueuedChargeEvent],
 ) -> Result<(), String> {
     let event_count = batch.len();
     let events: Vec<&ChargeEvent> = batch.iter().map(|queued| &queued.event).collect();
-    let body = materialize_charge_body_refs(cfg, &events).inspect_err(|error| {
+    let body = materialize_charge_body(cfg, &events).inspect_err(|error| {
         cfg.metrics
             .record_failure(FailureReason::Serialize, error.clone());
     })?;
@@ -4907,13 +4984,6 @@ async fn send_batch(
     }
 }
 
-fn materialize_charge_body_refs(
-    cfg: &ClickHouseFlushConfig,
-    batch: &[&ChargeEvent],
-) -> Result<ReservedPayload, String> {
-    materialize_json_each_row_refs(cfg.ceiling, batch, cfg.projection.as_deref())
-}
-
 async fn post_json_each_row(
     cfg: &ClickHouseFlushConfig,
     body: ReservedPayload,
@@ -4921,6 +4991,10 @@ async fn post_json_each_row(
 ) -> DeliveryOutcome {
     post_json_each_row_bytes(cfg, body.bytes(), event_count).await
 }
+
+/// Diagnostic for a delivery attempt whose plugin HTTP client could not be
+/// obtained for the current CRL generation.
+const CLIENT_UNAVAILABLE_MESSAGE: &str = "plugin HTTP client unavailable";
 
 /// Send a refcounted JSONEachRow range whose owner keeps the corresponding
 /// retained-byte reservation alive across this call.
@@ -4934,23 +5008,28 @@ async fn post_json_each_row_bytes(
     event_count: usize,
 ) -> DeliveryOutcome {
     let start = Instant::now();
-    let mut request = match &cfg.http {
-        ClickHouseHttpClient::Shared(client) => match client.get() {
-            Ok(shared) => shared.post(&cfg.insert_url),
-            Err(_) => {
-                return DeliveryOutcome::Permanent {
-                    status: 502,
-                    message: "plugin HTTP client unavailable".to_string(),
-                };
-            }
-        },
-        ClickHouseHttpClient::Dedicated(client) => client.post(&cfg.insert_url),
-    }
-    .timeout(cfg.timeout)
-    .header(CONTENT_TYPE, "application/json")
-    // `Bytes` is a refcount/range handle; retries and isolation do not copy the
-    // attacker-shaped payload owned by the caller's charged batch.
-    .body(body);
+    // An unavailable client is a local, transient condition (a CRL-generation
+    // rebuild failed and is retried on the next call), not a destination
+    // verdict on these rows. `Permanent` would make spool replay dead-letter
+    // every row ClickHouse never saw (issue #7110), so it is `Retryable`, and
+    // counted like any other failed attempt.
+    let client = match &cfg.http {
+        ClickHouseHttpClient::Shared(client) => client.get(),
+        ClickHouseHttpClient::Dedicated(client) => client.current(),
+    };
+    let Ok(client) = client else {
+        let message = CLIENT_UNAVAILABLE_MESSAGE.to_string();
+        cfg.metrics
+            .record_failure(FailureReason::Tls, message.clone());
+        return DeliveryOutcome::Retryable { message };
+    };
+    let mut request = client
+        .post(&cfg.insert_url)
+        .timeout(cfg.timeout)
+        .header(CONTENT_TYPE, "application/json")
+        // `Bytes` is a refcount/range handle; retries and isolation do not copy the
+        // attacker-shaped payload owned by the caller's charged batch.
+        .body(body);
     if let Some(username) = cfg.username.as_deref() {
         request = request.basic_auth(username, cfg.password.clone());
     }
@@ -4958,15 +5037,13 @@ async fn post_json_each_row_bytes(
     match result {
         Ok(response) => {
             let status = response.status();
-            let has_exception_header = response
-                .headers()
-                .contains_key("x-clickhouse-exception-code");
+            let exception_header = clickhouse_exception_header(response.headers());
             let ack = read_clickhouse_acknowledgement(response).await;
             classify_clickhouse_delivery(
                 cfg,
                 status,
                 ack,
-                has_exception_header,
+                exception_header,
                 event_count,
                 start.elapsed(),
             )
@@ -5005,7 +5082,7 @@ async fn read_clickhouse_acknowledgement(response: reqwest::Response) -> ClickHo
             tokio::task::yield_now().await;
             ClickHouseAckRead::Complete {
                 byte_len: bytes.len() as u64,
-                has_exception: body_has_clickhouse_exception(&bytes),
+                exception: body_clickhouse_exception(&bytes),
             }
         }
         Ok(Err(BoundedReadError::LimitExceeded { .. })) => ClickHouseAckRead::Incomplete {
@@ -5027,6 +5104,19 @@ fn body_has_clickhouse_exception(body: &[u8]) -> bool {
         .any(|marker| find_bytes_subslice(body, marker).is_some())
 }
 
+/// Classify a bounded acknowledgement body's ClickHouse exception, keeping only
+/// the numeric code that follows the `Code: ` marker.
+fn body_clickhouse_exception(body: &[u8]) -> Option<ClickHouseException> {
+    const CODE_MARKER: &[u8] = b"Code: ";
+    if !body_has_clickhouse_exception(body) {
+        return None;
+    }
+    let code = find_bytes_subslice(body, CODE_MARKER)
+        .and_then(|start| body.get(start.saturating_add(CODE_MARKER.len())..))
+        .and_then(parse_clickhouse_exception_code);
+    Some(ClickHouseException { code })
+}
+
 fn find_bytes_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
@@ -5040,7 +5130,7 @@ fn classify_clickhouse_delivery(
     cfg: &ClickHouseFlushConfig,
     status: StatusCode,
     ack: ClickHouseAckRead,
-    has_exception_header: bool,
+    exception_header: Option<ClickHouseException>,
     event_count: usize,
     elapsed: Duration,
 ) -> DeliveryOutcome {
@@ -5049,7 +5139,7 @@ fn classify_clickhouse_delivery(
             cfg,
             status,
             ack,
-            has_exception_header,
+            exception_header,
             event_count,
             elapsed,
         );
@@ -5088,45 +5178,51 @@ fn classify_success_status_acknowledgement(
     cfg: &ClickHouseFlushConfig,
     status: StatusCode,
     ack: ClickHouseAckRead,
-    has_exception_header: bool,
+    exception_header: Option<ClickHouseException>,
     event_count: usize,
     elapsed: Duration,
 ) -> DeliveryOutcome {
     let code = status.as_u16();
-    if has_exception_header {
-        let message = format!("clickhouse returned HTTP {code} with X-ClickHouse-Exception-Code");
-        cfg.metrics
-            .record_failure(FailureReason::Http4xx, message.clone());
-        return DeliveryOutcome::Permanent {
-            status: code,
-            message,
+    if let Some(header) = exception_header {
+        // The header is authoritative for the exception signal; an unreadable
+        // header code may still be recovered from a body marker.
+        let body_code = match ack {
+            ClickHouseAckRead::Complete {
+                exception: Some(body),
+                ..
+            } => body.code,
+            _ => None,
         };
+        let exception = ClickHouseException {
+            code: header.code.or(body_code),
+        };
+        return classify_success_status_exception(
+            cfg,
+            code,
+            exception,
+            "X-ClickHouse-Exception-Code",
+        );
     }
     match ack {
         ClickHouseAckRead::Complete {
             byte_len: 0,
-            has_exception: false,
+            exception: None,
         } => {
             cfg.metrics.record_success(event_count, elapsed);
             DeliveryOutcome::Delivered
         }
         ClickHouseAckRead::Complete {
-            has_exception: true,
+            exception: Some(exception),
             ..
-        } => {
-            let message = format!(
-                "clickhouse returned HTTP {code} with an exception in the acknowledgement body"
-            );
-            cfg.metrics
-                .record_failure(FailureReason::Http4xx, message.clone());
-            DeliveryOutcome::Permanent {
-                status: code,
-                message,
-            }
-        }
+        } => classify_success_status_exception(
+            cfg,
+            code,
+            exception,
+            "an exception in the acknowledgement body",
+        ),
         ClickHouseAckRead::Complete {
             byte_len,
-            has_exception: false,
+            exception: None,
         } => {
             // Non-empty success bodies are not a persistence-proof ACK for
             // INSERT JSONEachRow; keep the spool and retry idempotently.
@@ -5153,6 +5249,37 @@ fn classify_success_status_acknowledgement(
     }
 }
 
+/// Classify a ClickHouse exception reported under HTTP 200/204.
+///
+/// A known transient server condition (see
+/// [`CLICKHOUSE_TRANSIENT_EXCEPTION_CODES`]) is retryable: the spool keeps the
+/// rows and replays them with unchanged event IDs once ClickHouse recovers.
+/// Every other exception — including one whose code cannot be read — is a
+/// permanent row/schema defect. Diagnostics carry only the bounded numeric code.
+fn classify_success_status_exception(
+    cfg: &ClickHouseFlushConfig,
+    code: u16,
+    exception: ClickHouseException,
+    carrier: &'static str,
+) -> DeliveryOutcome {
+    if exception.is_transient() {
+        let exception_code = exception.code.unwrap_or_default();
+        let message = format!(
+            "clickhouse returned HTTP {code} with transient ClickHouse exception code {exception_code} in {carrier}"
+        );
+        cfg.metrics
+            .record_failure(FailureReason::Http5xx, message.clone());
+        return DeliveryOutcome::Retryable { message };
+    }
+    let message = format!("clickhouse returned HTTP {code} with {carrier}");
+    cfg.metrics
+        .record_failure(FailureReason::Http4xx, message.clone());
+    DeliveryOutcome::Permanent {
+        status: code,
+        message,
+    }
+}
+
 /// Deterministic split point for a 413 replay chunk.
 ///
 /// Prefers `batch_size` when that still shrinks the chunk; otherwise halves.
@@ -5170,7 +5297,6 @@ fn replay_split_len(len: usize, batch_size: usize) -> usize {
 /// retained-byte reservation, which is exactly the uncharged materialization
 /// [`materialize_json_each_row`] exists to prevent. External unit tests use it
 /// to build expected wire bytes.
-#[allow(dead_code)]
 pub fn serialize_json_each_row(batch: &[ChargeEvent]) -> Result<String, String> {
     serialize_json_each_row_projected(batch, None)
 }
@@ -5180,7 +5306,6 @@ pub fn serialize_json_each_row(batch: &[ChargeEvent]) -> Result<String, String> 
 /// External unit tests use this to assert that a projected wire representation
 /// matches the operator's schema while the native shape is unchanged.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn serialize_json_each_row_projected(
     batch: &[ChargeEvent],
     projection: Option<&ChargeEventProjection>,
@@ -5332,8 +5457,8 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
             "{PLUGIN_NAME}: `clickhouse.url` must not contain user-info; use `clickhouse.username`/`clickhouse.password_ref`"
         ));
     }
-    validate_clickhouse_identifier(&config.clickhouse.database, "database")?;
-    validate_clickhouse_identifier(&config.clickhouse.table, "table")?;
+    validate_clickhouse_identifier(&config.clickhouse.database, "database", 1)?;
+    validate_clickhouse_identifier(&config.clickhouse.table, "table", 2)?;
     if config.clickhouse.timeout_ms == 0 || config.clickhouse.timeout_ms > MAX_CLICKHOUSE_TIMEOUT_MS
     {
         return Err(format!(
@@ -5341,6 +5466,18 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         ));
     }
     validate_query_params(&config.clickhouse.insert_query_params)?;
+    // reqwest's rustls backend disables hostname verification only together
+    // with a pinned CA bundle (`tls_certs_only`) or with certificate
+    // verification off; anything else fails when the client is built, so the
+    // sink could never activate. Refuse it at admission instead.
+    if !config.clickhouse.tls.verify_hostname
+        && !config.clickhouse.tls.insecure_skip_verify
+        && config.clickhouse.tls.ca_file.is_none()
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: `clickhouse.tls.verify_hostname: false` requires `clickhouse.tls.ca_file` (the server certificate is still verified against that pinned bundle) or `clickhouse.tls.insecure_skip_verify: true`"
+        ));
+    }
     validate_insert_durability_settings(&config.clickhouse)?;
 
     if config.batch.size == 0 || config.batch.size > MAX_BATCH_SIZE {
@@ -5398,9 +5535,9 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         ));
     }
     if config.spool.enabled {
-        if config.spool.max_bytes == 0 {
+        if config.spool.max_bytes < MIN_SPOOL_MAX_BYTES {
             return Err(format!(
-                "{PLUGIN_NAME}: `spool.max_bytes` must be at least 1"
+                "{PLUGIN_NAME}: `spool.max_bytes` must be at least {MIN_SPOOL_MAX_BYTES} bytes (policy floor for a usable durable spool)"
             ));
         }
         if config.spool.replay_interval_secs == 0 {
@@ -5488,6 +5625,26 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         .filter(|value| !value.is_empty())
     {
         validate_plugin_secret_env_name(PASSWORD_REF_FIELD, reference)?;
+        // The password is only ever sent as the HTTP Basic password of
+        // `clickhouse.username`. Without a username the resolved secret would be
+        // silently discarded and every INSERT would go out unauthenticated.
+        if config.clickhouse.username.is_none() {
+            return Err(format!(
+                "{PLUGIN_NAME}: `clickhouse.password_ref` requires `clickhouse.username`; the password is sent as the HTTP Basic password of that user"
+            ));
+        }
+    }
+    // A blank username would send `Basic <":password">` (or an empty user),
+    // which never names the intended ClickHouse account.
+    if config
+        .clickhouse
+        .username
+        .as_deref()
+        .is_some_and(|username| username.trim().is_empty())
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: `clickhouse.username` must not be empty or whitespace when set"
+        ));
     }
     // Pair completeness is a pure Option shape, so it belongs in cold
     // admission rather than in client construction alone. Reading or parsing
@@ -5566,7 +5723,15 @@ fn parse_clickhouse_url(raw: &str) -> Result<Url, String> {
 /// so restrict them to a safe identifier charset (ASCII letters, digits,
 /// underscore, and a `.` db-qualifier) to keep operator config from injecting
 /// SQL into the export query.
-fn validate_clickhouse_identifier(value: &str, field: &str) -> Result<(), String> {
+///
+/// `max_parts` bounds the dot-separated qualification: `database` is a single
+/// identifier (1) and `table` is `table` or `database.table` (2), the only
+/// unquoted INSERT target shapes ClickHouse accepts.
+fn validate_clickhouse_identifier(
+    value: &str,
+    field: &str,
+    max_parts: usize,
+) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!(
             "{PLUGIN_NAME}: `clickhouse.{field}` must not be empty"
@@ -5579,6 +5744,29 @@ fn validate_clickhouse_identifier(value: &str, field: &str) -> Result<(), String
         return Err(format!(
             "{PLUGIN_NAME}: `clickhouse.{field}` may only contain ASCII letters, digits, underscores, and dots"
         ));
+    }
+    // The charset alone admits names ClickHouse can never parse unquoted
+    // (`123charges`, `.`, `ferrum.`, `a..b`), which would turn every INSERT
+    // into a syntax error and dead-letter every row. Each dot-separated part
+    // must be a plain identifier: nonempty and not starting with a digit.
+    if value
+        .split('.')
+        .any(|part| part.is_empty() || part.starts_with(|c: char| c.is_ascii_digit()))
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: `clickhouse.{field}` must be a ClickHouse identifier: each dot-separated part must be nonempty and must not start with a digit"
+        ));
+    }
+    if value.split('.').count() > max_parts {
+        return Err(if max_parts == 1 {
+            format!(
+                "{PLUGIN_NAME}: `clickhouse.{field}` must be a single ClickHouse identifier without dots"
+            )
+        } else {
+            format!(
+                "{PLUGIN_NAME}: `clickhouse.{field}` must be `table` or `database.table` (at most one dot)"
+            )
+        });
     }
     Ok(())
 }
@@ -5613,6 +5801,14 @@ const CREDENTIAL_QUERY_PARAM_MARKERS: &[&str] = &[
     "token",
 ];
 
+/// INSERT URL parameters the sink itself sets from `clickhouse.database` and
+/// the fixed `INSERT INTO <table> FORMAT JSONEachRow` statement. A second
+/// occurrence from `insert_query_params` would leave the executed statement or
+/// database to ClickHouse's duplicate-parameter handling — escaping the
+/// identifier confinement on `database`/`table` — so these names are reserved.
+/// Exact-match and lowercase; compared case-insensitively.
+const RESERVED_QUERY_PARAM_NAMES: &[&str] = &["database", "query"];
+
 fn validate_query_params(params: &HashMap<String, String>) -> Result<(), String> {
     for (key, value) in params {
         if key.is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
@@ -5635,6 +5831,13 @@ fn validate_query_params(params: &HashMap<String, String>) -> Result<(), String>
                  ClickHouse credentials belong in `clickhouse.username` and \
                  `clickhouse.password_ref`, which are sent as an HTTP Basic header rather than \
                  appended to the INSERT URL"
+            ));
+        }
+        if RESERVED_QUERY_PARAM_NAMES.contains(&lowered.as_str()) {
+            return Err(format!(
+                "{PLUGIN_NAME}: `clickhouse.insert_query_params` key {key:?} is reserved; the sink \
+                 sets `database` from `clickhouse.database` and `query` to its fixed INSERT \
+                 statement for `clickhouse.table`"
             ));
         }
         if value.len() > 512 || value.chars().any(char::is_control) {
@@ -5735,78 +5938,144 @@ fn build_clickhouse_http_client(
         return Ok(ClickHouseHttpClient::Shared(Box::new(shared.clone())));
     }
 
-    // Ignore ambient `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`
-    // process state (matches the shared PluginHttpClient builders). reqwest
-    // enables system-proxy discovery by default. With a proxy selected, the
-    // connector dials and screens the *proxy* while the proxy resolves and
-    // connects to the configured ClickHouse host, so the ultimate destination
-    // address never passes the `DnsCacheResolver` egress screen installed
-    // below. Inherited proxy environment must not be able to override the
-    // gateway's documented outbound address boundary.
-    let mut builder = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(Duration::from_millis(cfg.timeout_ms))
-        .timeout(Duration::from_millis(cfg.timeout_ms))
-        // Do not follow redirects: a 3xx from an allowed ClickHouse host could
-        // otherwise bounce an export to an egress-policy-denied IP (matches the
-        // shared PluginHttpClient redirect policy).
-        .redirect(reqwest::redirect::Policy::none());
-    if let Some(dns_cache) = shared.dns_cache().cloned() {
-        builder = builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache)));
-    }
     if cfg.tls.insecure_skip_verify {
         warn!(
             plugin = PLUGIN_NAME,
             "ClickHouse TLS certificate verification is disabled; use only for testing"
         );
-        builder = builder.danger_accept_invalid_certs(true);
     }
     if !cfg.tls.verify_hostname {
         warn!(
             plugin = PLUGIN_NAME,
             "ClickHouse TLS hostname verification is disabled; use only for testing"
         );
-        builder = builder.tls_danger_accept_invalid_hostnames(true);
     }
-    if let Some(ca_file) = cfg.tls.ca_file.as_ref() {
-        let pem = fs::read(ca_file)
-            .map_err(|_| format!("{PLUGIN_NAME}: failed to read `clickhouse.tls.ca_file`"))?;
-        let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|_| {
+    let ca_pem = match cfg.tls.ca_file.as_ref() {
+        Some(ca_file) => Some(
+            fs::read(ca_file)
+                .map_err(|_| format!("{PLUGIN_NAME}: failed to read `clickhouse.tls.ca_file`"))?,
+        ),
+        None => None,
+    };
+    let ca_certs = match ca_pem.as_ref() {
+        Some(pem) => Some(reqwest::Certificate::from_pem_bundle(pem).map_err(|_| {
             format!("{PLUGIN_NAME}: failed to parse `clickhouse.tls.ca_file`: invalid PEM bundle")
-        })?;
-        builder = builder.tls_certs_only(certs);
-    }
-    match (&cfg.tls.client_cert_file, &cfg.tls.client_key_file) {
+        })?),
+        None => None,
+    };
+    let identity_pem = match (&cfg.tls.client_cert_file, &cfg.tls.client_key_file) {
         (Some(cert), Some(key)) => {
-            let mut pem = fs::read(cert).map_err(|_| {
+            let cert_pem = fs::read(cert).map_err(|_| {
                 format!("{PLUGIN_NAME}: failed to read `clickhouse.tls.client_cert_file`")
             })?;
-            let mut key_pem = fs::read(key).map_err(|_| {
+            let key_pem = fs::read(key).map_err(|_| {
                 format!("{PLUGIN_NAME}: failed to read `clickhouse.tls.client_key_file`")
             })?;
-            pem.push(b'\n');
-            pem.append(&mut key_pem);
-            let identity = reqwest::Identity::from_pem(&pem).map_err(|_| {
-                format!(
-                    "{PLUGIN_NAME}: failed to parse ClickHouse client identity: invalid PEM in \
-                     `clickhouse.tls.client_cert_file` or `clickhouse.tls.client_key_file`"
-                )
-            })?;
-            builder = builder.identity(identity);
+            Some((cert_pem, key_pem))
         }
-        (None, None) => {}
+        (None, None) => None,
         _ => {
             return Err(format!(
                 "{PLUGIN_NAME}: `clickhouse.tls.client_cert_file` and `clickhouse.tls.client_key_file` must be set together"
             ));
         }
-    }
-    builder
-        .build()
+    };
+    let identity_error = || {
+        format!(
+            "{PLUGIN_NAME}: failed to parse ClickHouse client identity: invalid PEM in \
+             `clickhouse.tls.client_cert_file` or `clickhouse.tls.client_key_file`"
+        )
+    };
+    let reqwest_identity = match identity_pem.as_ref() {
+        Some((cert_pem, key_pem)) => {
+            let mut pem = cert_pem.clone();
+            pem.push(b'\n');
+            pem.extend_from_slice(key_pem);
+            Some(reqwest::Identity::from_pem(&pem).map_err(|_| identity_error())?)
+        }
+        None => None,
+    };
+    // Gateway CRLs apply only while this client verifies the server fully
+    // (issue #6651); with verification or hostname checks disabled the
+    // operator has opted out of server authentication for this sink.
+    let verify = !cfg.tls.insecure_skip_verify && cfg.tls.verify_hostname;
+    use rustls::pki_types::pem::PemObject;
+    let crl_client_auth = match identity_pem.as_ref() {
+        Some((cert_pem, key_pem)) if verify && shared.enforces_gateway_crls() => {
+            let certs = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| identity_error())?;
+            if certs.is_empty() {
+                return Err(identity_error());
+            }
+            let key = crate::tls::parse_pem_private_key(
+                key_pem,
+                "ClickHouse client key",
+                "clickhouse.tls.client_key_file",
+            )
+            .map_err(|_| identity_error())?;
+            Some((certs, key))
+        }
+        _ => None,
+    };
+
+    let dns_cache = shared.dns_cache().cloned();
+    let timeout = Duration::from_millis(cfg.timeout_ms);
+    let insecure_skip_verify = cfg.tls.insecure_skip_verify;
+    let verify_hostname = cfg.tls.verify_hostname;
+    shared
+        .dedicated_client(
+            verify,
+            ca_pem.as_deref(),
+            crl_client_auth,
+            DedicatedClientAlpn::Negotiated,
+            move |crl_tls| {
+                // Ignore ambient `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` /
+                // `NO_PROXY` process state (matches the shared PluginHttpClient
+                // builders). With a proxy selected, the connector dials and
+                // screens the *proxy* while the proxy resolves and connects to
+                // the configured ClickHouse host, so the ultimate destination
+                // address never passes the `DnsCacheResolver` egress screen
+                // installed below.
+                let mut builder = reqwest::Client::builder()
+                    .no_proxy()
+                    .connect_timeout(timeout)
+                    .timeout(timeout)
+                    // Do not follow redirects: a 3xx from an allowed ClickHouse
+                    // host could otherwise bounce an export to an
+                    // egress-policy-denied IP (matches the shared
+                    // PluginHttpClient redirect policy).
+                    .redirect(reqwest::redirect::Policy::none());
+                if let Some(dns_cache) = dns_cache.clone() {
+                    builder = builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache)));
+                }
+                match crl_tls {
+                    // CA, client identity and the live CRL verifier are all in
+                    // the preconfigured rustls config.
+                    Some(tls) => builder = builder.use_preconfigured_tls(tls),
+                    None => {
+                        if insecure_skip_verify {
+                            builder = builder.danger_accept_invalid_certs(true);
+                        }
+                        if !verify_hostname {
+                            builder = builder.tls_danger_accept_invalid_hostnames(true);
+                        }
+                        if let Some(certs) = ca_certs.clone() {
+                            builder = builder.tls_certs_only(certs);
+                        }
+                        if let Some(identity) = reqwest_identity.clone() {
+                            builder = builder.identity(identity);
+                        }
+                    }
+                }
+                builder.build().map_err(|_| {
+                    format!(
+                        "{PLUGIN_NAME}: failed to build ClickHouse HTTP client for `clickhouse.tls`"
+                    )
+                })
+            },
+        )
         .map(ClickHouseHttpClient::Dedicated)
-        .map_err(|_| {
-            format!("{PLUGIN_NAME}: failed to build ClickHouse HTTP client for `clickhouse.tls`")
-        })
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -6010,7 +6279,6 @@ impl SpoolOwner {
 
     fn matches_tag(&self, tag: &str) -> bool {
         tag == self.tag.as_ref()
-            || (tag.len() == SPOOL_LEGACY_OWNER_TAG_LEN && self.tag.starts_with(tag))
     }
 }
 
@@ -6037,11 +6305,13 @@ fn spool_owner_digest(fields: &[&str]) -> String {
 /// process-global switch, so no production sink can be steered away from the
 /// real filesystem calls.
 ///
-/// Non-`None` variants are constructed only by the external unit-test suite via
-/// [`SpoolManager::for_tests_with_owner_and_faults`]; the binary crate never
-/// builds them, so clippy's dead-code lint is expected there.
+/// Compiled only with the `test-support` cargo feature (issue #7122), which
+/// test targets enable through the crate's self dev-dependency: a production
+/// build carries no fault-injection entry point on the billing-spool
+/// fsync/rename path. Constructed by the external unit-test suite via
+/// [`SpoolManager::for_tests_with_owner_and_faults`].
+#[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SpoolFsFault {
     None,
     FileSync,
@@ -6085,10 +6355,12 @@ pub enum SpoolFinalOwnership {
     Shared,
 }
 
-/// Injectable durable-write steps for the atomic spool publish sequence.
+/// Durable-write steps for the atomic spool publish sequence.
 ///
-/// Parent-directory fsync is a Unix-only step, so the two directory hooks are
-/// unread on other targets.
+/// Production always uses [`SpoolFsOps::REAL`]; only a `test-support` build can
+/// substitute a failing step (`SpoolFsOps::with_fault`). Parent-directory
+/// fsync is a Unix-only step, so the two directory hooks are unread on other
+/// targets.
 #[derive(Clone, Copy)]
 #[cfg_attr(not(unix), allow(dead_code))]
 struct SpoolFsOps {
@@ -6111,6 +6383,7 @@ impl SpoolFsOps {
         sync_dir: real_sync_spool_dir,
     };
 
+    #[cfg(feature = "test-support")]
     fn with_fault(fault: SpoolFsFault) -> Self {
         let mut ops = Self::REAL;
         match fault {
@@ -6167,6 +6440,7 @@ fn real_sync_spool_dir(dir: &File, path: &Path) -> Result<(), String> {
     })
 }
 
+#[cfg(feature = "test-support")]
 #[allow(dead_code)] // reachable only through the test-only faulted constructors
 fn fail_sync_spool_file(_file: &File, path: &Path) -> Result<(), String> {
     Err(format!(
@@ -6175,6 +6449,7 @@ fn fail_sync_spool_file(_file: &File, path: &Path) -> Result<(), String> {
     ))
 }
 
+#[cfg(feature = "test-support")]
 #[allow(dead_code)] // reachable only through the test-only faulted constructors
 fn fail_rename_spool_file(from: &Path, to: &Path) -> Result<(), String> {
     Err(format!(
@@ -6184,6 +6459,7 @@ fn fail_rename_spool_file(from: &Path, to: &Path) -> Result<(), String> {
     ))
 }
 
+#[cfg(feature = "test-support")]
 #[allow(dead_code)] // reachable only through the test-only faulted constructors
 fn fail_open_spool_dir(path: &Path) -> Result<File, String> {
     Err(format!(
@@ -6195,6 +6471,7 @@ fn fail_open_spool_dir(path: &Path) -> Result<File, String> {
 /// Atomically replace the just-published final path with a distinct file, as a
 /// peer writer racing this attempt would. The replacement is renamed into place
 /// so the entry always names a complete file with a different inode.
+#[cfg(feature = "test-support")]
 #[allow(dead_code)] // reachable only through the test-only faulted constructors
 fn republish_final_path_as_peer(final_path: &Path) {
     let mut peer_tmp = final_path.as_os_str().to_os_string();
@@ -6207,10 +6484,11 @@ fn republish_final_path_as_peer(final_path: &Path) {
 
 /// Contents written by [`republish_final_path_as_peer`]; asserted by tests that
 /// check a peer publication survived another writer's rollback.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
-#[allow(dead_code)]
 pub const PEER_REPUBLISH_MARKER: &[u8] = b"{\"peer_republished\":true}\n";
 
+#[cfg(feature = "test-support")]
 #[allow(dead_code)] // reachable only through the test-only faulted constructors
 fn fail_sync_spool_dir(_dir: &File, path: &Path) -> Result<(), String> {
     Err(format!(
@@ -6310,14 +6588,10 @@ fn is_hostile_path_component(value: &str) -> bool {
         return true;
     }
     let lower = value.to_ascii_lowercase();
-    if lower.starts_with(r"\\?\")
+    lower.starts_with(r"\\?\")
         || lower.starts_with(r"\\.\")
         || lower.starts_with("//?/")
         || lower.starts_with("//./")
-    {
-        return true;
-    }
-    false
 }
 
 fn is_safe_literal_path_component(value: &str) -> bool {
@@ -6395,7 +6669,6 @@ fn spool_claim_lease_secs(config: &ApiChargebackSinkConfig) -> u64 {
 }
 
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn spool_claim_lease_secs_for_tests(config: &ApiChargebackSinkConfig) -> u64 {
     spool_claim_lease_secs(config)
 }
@@ -6738,7 +7011,6 @@ fn claim_stage_error(stage: &'static str, error: ClaimMutationError) -> ClaimMut
 /// is what keeps an authorization loss out of the release path.
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // external unit tests only
 pub enum ClaimMutationOutcomeForTests {
     Unauthorized(String),
     Retryable(String),
@@ -6840,7 +7112,6 @@ fn dir_identity(_meta: &fs::Metadata) -> Option<DirIdentity> {
 /// Mirrors the fields production derives from the accepted plugin config so
 /// external tests can build sibling instances without a live ClickHouse.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // constructed only by the test-only entry points below
 pub struct SpoolOwnerSpec<'a> {
     pub node_id: &'a str,
     pub plugin_config_id: &'a str,
@@ -7379,24 +7650,22 @@ impl SpoolManager {
         Ok(())
     }
 
-    #[allow(dead_code)] // external unit tests only
     pub fn for_tests(cfg: SpoolSettings, node_id: &str) -> Result<Self, String> {
         Self::for_tests_with_owner(cfg, &default_test_spool_owner_spec(node_id), 1)
     }
 
     /// [`Self::for_tests`] bound to a test-owned retained-byte ceiling.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn for_tests_with_ceiling(
         cfg: SpoolSettings,
         node_id: &str,
         ceiling: &'static RetainedByteCeiling,
     ) -> Result<Self, String> {
-        Self::for_tests_with_owner_faults_ages_and_ceiling(
+        Self::for_tests_with_ops(
             cfg,
             &default_test_spool_owner_spec(node_id),
             1,
-            SpoolFsFault::None,
+            SpoolFsOps::REAL,
             0,
             SPOOL_CLAIM_LEASE_MIN_SECS,
             ceiling,
@@ -7404,17 +7673,26 @@ impl SpoolManager {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn for_tests_with_owner(
         cfg: SpoolSettings,
         spec: &SpoolOwnerSpec<'_>,
         generation: u64,
     ) -> Result<Self, String> {
-        Self::for_tests_with_owner_and_faults(cfg, spec, generation, SpoolFsFault::None)
+        // Tests treat a foreign temp as immediately reconcilable unless a live
+        // in-process writer lease protects it.
+        Self::for_tests_with_ops(
+            cfg,
+            spec,
+            generation,
+            SpoolFsOps::REAL,
+            0,
+            SPOOL_CLAIM_LEASE_MIN_SECS,
+            process_ceiling(),
+        )
     }
 
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn for_tests_with_owner_and_faults(
         cfg: SpoolSettings,
         spec: &SpoolOwnerSpec<'_>,
@@ -7436,8 +7714,8 @@ impl SpoolManager {
     /// Same as [`Self::for_tests_with_owner_and_faults`] with explicit
     /// stale-temp and claim-lease horizons, so age-gated stranded-claim
     /// reporting is exercised without wall-clock sleeps.
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn for_tests_with_owner_faults_and_ages(
         cfg: SpoolSettings,
         spec: &SpoolOwnerSpec<'_>,
@@ -7461,6 +7739,7 @@ impl SpoolManager {
     /// test-owned retained-byte ceiling, so write-side reservation and refusal
     /// assertions stay exact while other tests in the same binary reserve
     /// against the process-global counter.
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     #[allow(dead_code, clippy::too_many_arguments)] // external unit tests only
     pub fn for_tests_with_owner_faults_ages_and_ceiling(
@@ -7468,6 +7747,30 @@ impl SpoolManager {
         spec: &SpoolOwnerSpec<'_>,
         generation: u64,
         fault: SpoolFsFault,
+        stale_temp_age_secs: u64,
+        claim_lease_secs: u64,
+        ceiling: &'static RetainedByteCeiling,
+    ) -> Result<Self, String> {
+        Self::for_tests_with_ops(
+            cfg,
+            spec,
+            generation,
+            SpoolFsOps::with_fault(fault),
+            stale_temp_age_secs,
+            claim_lease_secs,
+            ceiling,
+        )
+    }
+
+    /// Shared body of the test constructors: `fs_ops` is
+    /// [`SpoolFsOps::REAL`] except in a `test-support` build's faulted
+    /// constructors.
+    #[allow(clippy::too_many_arguments)]
+    fn for_tests_with_ops(
+        cfg: SpoolSettings,
+        spec: &SpoolOwnerSpec<'_>,
+        generation: u64,
+        fs_ops: SpoolFsOps,
         stale_temp_age_secs: u64,
         claim_lease_secs: u64,
         ceiling: &'static RetainedByteCeiling,
@@ -7490,14 +7793,10 @@ impl SpoolManager {
         // the real filesystem so an injected fault applies only to the durable
         // writes actually under test.
         manager.prepare_live_storage()?;
-        Ok(Self {
-            fs_ops: SpoolFsOps::with_fault(fault),
-            ..manager
-        })
+        Ok(Self { fs_ops, ..manager })
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn namespace_root_for_tests(&self) -> &Path {
         &self.namespace_root
     }
@@ -7507,31 +7806,26 @@ impl SpoolManager {
     /// External tests use it to plant a crashed holder's stale record and to
     /// assert that restart reconciliation clears it.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn source_credit_record_path_for_tests(&self) -> PathBuf {
         self.source_credit_path()
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn owner_tag_for_tests(&self) -> &str {
         self.owner.tag.as_ref()
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn generation_for_tests(&self) -> u64 {
         self.generation
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn prepare_live_storage_for_tests(&self) -> Result<(), String> {
         self.prepare_live_storage()
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn namespace_root_path_for_tests(
         spool_dir: &Path,
         spec: &SpoolOwnerSpec<'_>,
@@ -7540,13 +7834,11 @@ impl SpoolManager {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn owner_tag_of_spec_for_tests(spec: &SpoolOwnerSpec<'_>) -> String {
         spec.to_owner().tag.to_string()
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn encode_spool_path_component_for_tests(raw: &str) -> Result<String, String> {
         encode_spool_path_component(raw, "n")
     }
@@ -7554,7 +7846,6 @@ impl SpoolManager {
     /// Exercise the lexical containment guard that every managed create,
     /// rename, and unlink runs before touching the filesystem.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn ensure_path_within_root_for_tests(root: &Path, candidate: &Path) -> Result<(), String> {
         ensure_path_within_root(root, candidate)
     }
@@ -7562,7 +7853,6 @@ impl SpoolManager {
     /// Renew a held claim onto an explicit lease deadline so the rename half of
     /// the claim protocol is covered deterministically.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn renew_claim_at_for_tests(
         &self,
         claim: &mut SpoolClaimHandle,
@@ -7581,7 +7871,6 @@ impl SpoolManager {
     /// deterministically that an authorization loss stays
     /// [`ClaimMutationOutcomeForTests::Unauthorized`] and mutates nothing.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn probe_renew_claim_at_for_tests(
         &self,
         claim: &mut SpoolClaimHandle,
@@ -7597,7 +7886,6 @@ impl SpoolManager {
     /// Claim one replay candidate, returning `None` when another owner,
     /// generation, or process won the atomic rename first.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn claim_replay_file_for_tests(&self, path: &Path) -> Result<Option<PathBuf>, String> {
         let _guard = self.lock_spool_mutation()?;
         Ok(self
@@ -7609,7 +7897,6 @@ impl SpoolManager {
     /// Claim one replay candidate and keep the live-path lease held for the
     /// caller so tests can model an in-flight delivery across other operations.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn hold_replay_claim_for_tests(
         &self,
         path: &Path,
@@ -7619,7 +7906,6 @@ impl SpoolManager {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn release_inflight_claim_for_tests(
         &self,
         claim: &SpoolClaimHandle,
@@ -7631,13 +7917,11 @@ impl SpoolManager {
 
     /// Exercise the pure claim-marker parser without authorizing a rename.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn claim_restore_path_for_tests(claim: &Path) -> Result<PathBuf, String> {
         spool_claim_restore_path(claim)
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn list_owned_spool_files_for_tests(&self) -> Result<Vec<PathBuf>, String> {
         self.list_owned_spool_files()
     }
@@ -7648,21 +7932,18 @@ impl SpoolManager {
     /// to prove status/Prometheus scrapes read maintained counters rather than
     /// performing the walk themselves.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn reconcile_cached_usage_for_tests(&self) -> Result<SpoolStats, String> {
         self.reconcile_cached_usage()
     }
 
     /// Lock-light view of the maintained owned-file/byte gauges.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn cached_stats_for_tests(&self) -> SpoolStats {
         self.cached_stats()
     }
 
     /// How many owned-spool inventory walks this manager has performed.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn inventory_walks_for_tests(&self) -> u64 {
         self.usage.inventory_walks.load(Ordering::Relaxed)
     }
@@ -7672,7 +7953,6 @@ impl SpoolManager {
     /// External tests use this to assert multi-file reclaim is driven by one
     /// inventory/sort pass rather than a per-deletion rescan.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn evict_until_can_admit_for_tests(
         &self,
         incoming_len: u64,
@@ -7682,7 +7962,6 @@ impl SpoolManager {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn list_owned_spool_files_with_entry_limit_for_tests(
         &self,
         max_entries: usize,
@@ -7695,7 +7974,6 @@ impl SpoolManager {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn list_replayable_spool_files_for_tests(&self) -> Result<Vec<PathBuf>, String> {
         self.list_replayable_spool_files()
     }
@@ -7703,20 +7981,17 @@ impl SpoolManager {
     /// Register one managed path as live for this process, as an in-progress
     /// write or delivery would.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn hold_live_spool_path_for_tests(path: &Path) -> LiveSpoolPathGuard {
         LiveSpoolPathGuard::new(path.to_path_buf())
     }
 
     /// Build the generation-owned temp name `write_events` would use.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn write_temp_path_for_tests(&self, final_path: &Path) -> Result<PathBuf, String> {
         spool_write_temp_path(final_path, self.generation)
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn unbound_record_counts_for_tests(&self) -> (u64, u64) {
         (
             self.metrics.spool_unbound_files.load(Ordering::Relaxed),
@@ -7730,7 +8005,6 @@ impl SpoolManager {
     /// entry budget. External tests use this to prove sibling namespaces share
     /// one bound rather than each receiving a fresh traversal allowance.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn scan_unbound_records_with_entry_limit_for_tests(
         &self,
         max_entries: usize,
@@ -7910,7 +8184,6 @@ impl SpoolManager {
     /// ceiling_used_after_drop)`. Read `RetainedByteCeiling::high_water` around
     /// the call to observe the coexisting JSON + compressed peak.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn probe_spool_artifact_materialization_for_tests(
         &self,
         events: &[ChargeEvent],
@@ -8231,7 +8504,6 @@ impl SpoolManager {
 
     /// Full owned-spool inventory for external tests that need on-disk truth.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn scan_stats_for_tests(&self) -> Result<SpoolStats, String> {
         Ok(self.inventory_owned_spool_files()?.stats)
     }
@@ -8513,8 +8785,8 @@ impl SpoolManager {
             return false;
         }
         match spool_file_owner_tag(path) {
-            // Untagged retained artifacts (legacy temps, dead-letter metadata for
-            // pre-tag files) belong to this namespace and stay evictable.
+            // Untagged retained artifacts inside this namespace belong to it
+            // and stay evictable.
             None => true,
             Some(tag) => self.owner.matches_tag(tag),
         }
@@ -8997,6 +9269,45 @@ impl SpoolManager {
             .map_err(ClaimMutationError::Retryable)
     }
 
+    /// Release a claim whose replay was cancelled while it still owned the
+    /// pinned descriptor (for example a retiring generation aborting its replay
+    /// worker mid-delivery).
+    ///
+    /// Runs the same descriptor-bound release as a retryable delivery failure,
+    /// under the namespace mutation lock, so the complete original returns to
+    /// the replayable namespace with its stable event IDs. A refusal — the
+    /// pathname no longer resolves to the pinned artifact, or the lock could not
+    /// be taken — renames nothing and is reported; the claim then stays inert
+    /// exactly as any other descriptor-free claim does.
+    fn release_cancelled_claim(&self, claim: &SpoolClaimHandle) {
+        let released = self.lock_spool_mutation().and_then(|_guard| {
+            self.release_claim_bound(claim.path(), claim.artifact())
+                .map_err(ClaimMutationError::into_message)
+        });
+        match released {
+            Ok(Some(restored)) => {
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    path = %restored.display(),
+                    generation = self.generation,
+                    "Chargeback sink replay was cancelled mid-delivery; released its spool claim back to the replayable namespace"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.metrics
+                    .record_failure(FailureReason::Serialize, error.clone());
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %error,
+                    path = %claim.path().display(),
+                    generation = self.generation,
+                    "Chargeback sink replay was cancelled mid-delivery and could not release its spool claim; it is left inert for operator reconciliation"
+                );
+            }
+        }
+    }
+
     /// Remove a claim whose rows were fully delivered.
     ///
     /// Takes the spool mutation lock (writer lock plus the namespace
@@ -9052,15 +9363,15 @@ impl SpoolManager {
     }
 
     /// Count records under this node/plugin subtree that no accepted generation
-    /// owns: pre-namespace layouts and sibling namespaces left behind by a
-    /// destination/schema/Ferrum-namespace change. A node-id or plugin-config-id
+    /// owns: sibling namespaces left behind by a destination/schema/
+    /// Ferrum-namespace change. A node-id or plugin-config-id
     /// change moves to a different parent subtree and requires explicit operator
     /// discovery. Unbound records are never replayed, deleted, or rerouted.
     fn scan_unbound_records(&self) {
         let _ = self.scan_unbound_records_with_entry_limit(MAX_SPOOL_TRAVERSAL_ENTRIES);
     }
 
-    /// Scan legacy and sibling namespaces under one aggregate entry budget.
+    /// Scan sibling namespaces under one aggregate entry budget.
     ///
     /// Giving every sibling subtree a fresh [`MAX_SPOOL_TRAVERSAL_ENTRIES`]
     /// allowance would make a shared-volume maintenance tick unbounded in the
@@ -9142,7 +9453,6 @@ impl ReplayClaimOutcome {
     /// Collapse to the simple claimed/contended shape used by the test seams,
     /// where an unpinnable candidate is reported as an ordinary refusal instead
     /// of being isolated by the replay loop.
-    #[allow(dead_code)] // external unit tests only
     fn into_claimed(self) -> Result<Option<SpoolClaimHandle>, String> {
         match self {
             Self::Claimed(claim) => Ok(Some(claim)),
@@ -9182,7 +9492,6 @@ impl SpoolClaimHandle {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn claim_path_for_tests(&self) -> &Path {
         &self.path
     }
@@ -9192,7 +9501,6 @@ impl SpoolClaimHandle {
     /// External tests use this to prove exclusivity directly: across N managers
     /// and N claims of one namespace, exactly one claim can hold it.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn holds_source_credit_for_tests(&self) -> bool {
         self.credit.is_some()
     }
@@ -9200,7 +9508,6 @@ impl SpoolClaimHandle {
     /// Reserved byte count of the held credit, or `0` when this claim holds
     /// none.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn source_credit_bytes_for_tests(&self) -> u64 {
         match self.credit.as_ref() {
             Some(reservation) => reservation.reserved_bytes,
@@ -9210,7 +9517,6 @@ impl SpoolClaimHandle {
 }
 
 /// Default owner identity used by the simple test constructor.
-#[allow(dead_code)] // external unit tests only
 fn default_test_spool_owner_spec(node_id: &str) -> SpoolOwnerSpec<'_> {
     SpoolOwnerSpec {
         node_id,
@@ -9262,11 +9568,11 @@ fn spool_temp_is_stale(path: &Path, now: SystemTime, age_secs: u64) -> Result<bo
     Ok(elapsed >= Duration::from_secs(age_secs))
 }
 
-/// Parsed generation-owned atomic-write temp marker.
+/// Parsed generation-owned atomic-write temp marker. The generation segment
+/// must parse as a `u64` for the name to be recognized, but ownership is
+/// decided by the process tag alone, so the value is not retained.
 struct SpoolWriteTemp<'a> {
     process_tag: &'a str,
-    #[allow(dead_code)] // retained for diagnostics and future lease policy
-    generation: u64,
 }
 
 /// `<data-name>.write-<process_tag>-<generation>.tmp`
@@ -9285,20 +9591,16 @@ fn parse_spool_write_temp(name: &str) -> Option<SpoolWriteTemp<'_>> {
     let marker = name.strip_suffix(SPOOL_TMP_SUFFIX)?;
     let (_, attribution) = marker.rsplit_once(SPOOL_WRITE_MARKER)?;
     let (process_tag, generation) = attribution.rsplit_once('-')?;
-    if process_tag.is_empty() {
+    if process_tag.is_empty() || generation.parse::<u64>().is_err() {
         return None;
     }
-    Some(SpoolWriteTemp {
-        process_tag,
-        generation: generation.parse().ok()?,
-    })
+    Some(SpoolWriteTemp { process_tag })
 }
 
-/// Parsed in-flight replay claim marker.
+/// Parsed in-flight replay claim marker. The generation segment must parse as
+/// a `u64` for the name to be recognized; it is not retained.
 struct SpoolClaim<'a> {
     process_tag: &'a str,
-    #[allow(dead_code)] // retained for diagnostics and future lease policy
-    generation: u64,
     lease_deadline_unix: i64,
 }
 
@@ -9323,14 +9625,15 @@ fn parse_spool_claim(name: &str) -> Option<SpoolClaim<'_>> {
     let (_, attribution) = marker.rsplit_once(SPOOL_CLAIM_MARKER)?;
     let mut parts = attribution.split('-');
     let process_tag = parts.next()?;
-    let generation = parts.next()?.parse().ok()?;
+    if parts.next()?.parse::<u64>().is_err() {
+        return None;
+    }
     let lease_deadline_unix = parts.next()?.parse().ok()?;
     if process_tag.is_empty() || parts.next().is_some() {
         return None;
     }
     Some(SpoolClaim {
         process_tag,
-        generation,
         lease_deadline_unix,
     })
 }
@@ -9387,9 +9690,7 @@ fn spool_owner_tag_of_name(name: &str) -> Option<&str> {
         .strip_suffix(".ndjson.zst")
         .or_else(|| rest.strip_suffix(".ndjson"))?;
     let (_, tag) = stem.rsplit_once('.')?;
-    if matches!(tag.len(), SPOOL_LEGACY_OWNER_TAG_LEN | SPOOL_OWNER_TAG_LEN)
-        && tag.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
+    if tag.len() == SPOOL_OWNER_TAG_LEN && tag.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Some(tag)
     } else {
         None
@@ -9397,12 +9698,9 @@ fn spool_owner_tag_of_name(name: &str) -> Option<&str> {
 }
 
 /// Count spool records under this node/plugin subtree that no accepted
-/// generation owns.
-///
-/// Two shapes matter: the pre-namespace layout that wrote directly under
-/// `<spool.dir>/<node>/<day>/`, and sibling owner namespaces left behind when
-/// the ClickHouse destination, database, table, or Ferrum namespace changed.
-/// A plugin-config-id or node-id change moves to another parent subtree and is
+/// generation owns: sibling owner namespaces left behind when the ClickHouse
+/// destination, database, table, or Ferrum namespace changed. A
+/// plugin-config-id or node-id change moves to another parent subtree and is
 /// intentionally not attributed to this live instance. Discoverable records are
 /// reported, never replayed and never deleted, so an operator decides whether
 /// they still belong to the new destination.
@@ -9412,58 +9710,34 @@ fn count_unbound_spool_records(
     namespace_root: &Path,
     max_entries: usize,
 ) -> (u64, u64, bool) {
-    let node_dir = spool_dir.join(&components.node);
-    let plugin_dir = node_dir.join(&components.plugin);
+    let plugin_dir = spool_dir.join(&components.node).join(&components.plugin);
     let mut files = 0u64;
     let mut namespaces = 0u64;
     let mut remaining = max_entries;
     let mut truncated = false;
 
-    // Pre-namespace layout: `<spool.dir>/<node>/<YYYYMMDD>/*.ndjson[.zst]`.
-    // Only day-shaped directories are inspected so a sibling plugin config's own
-    // managed subtree is never counted against this instance.
-    for day_dir in child_dirs_bounded(
-        &node_dir,
-        is_spool_day_component,
+    // Sibling owner namespaces under this node/plugin: what a destination,
+    // database, table, ledger, or plugin-id change leaves behind.
+    for owner_dir in child_dirs_bounded(
+        &plugin_dir,
+        |name| name.starts_with('o'),
         &mut remaining,
         &mut truncated,
     ) {
-        let (records, complete) = count_records_in_bounded(&day_dir, &mut remaining);
-        files = files.saturating_add(records);
+        if owner_dir == namespace_root {
+            continue;
+        }
+        let (records, complete) = count_records_in_bounded(&owner_dir, &mut remaining);
+        if records > 0 {
+            namespaces = namespaces.saturating_add(1);
+            files = files.saturating_add(records);
+        }
         if !complete {
             truncated = true;
             break;
         }
     }
-
-    // Sibling owner namespaces under this node/plugin: what a destination,
-    // database, table, ledger, or plugin-id change leaves behind.
-    if !truncated {
-        for owner_dir in child_dirs_bounded(
-            &plugin_dir,
-            |name| name.starts_with('o'),
-            &mut remaining,
-            &mut truncated,
-        ) {
-            if owner_dir == namespace_root {
-                continue;
-            }
-            let (records, complete) = count_records_in_bounded(&owner_dir, &mut remaining);
-            if records > 0 {
-                namespaces = namespaces.saturating_add(1);
-                files = files.saturating_add(records);
-            }
-            if !complete {
-                truncated = true;
-                break;
-            }
-        }
-    }
     (files, namespaces, truncated)
-}
-
-fn is_spool_day_component(name: &str) -> bool {
-    name.len() == 8 && name.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Non-symlink child directories of `dir` whose name passes `accept`, charged
@@ -10676,7 +10950,6 @@ fn is_spool_data_file(path: &Path) -> bool {
     if name.ends_with(SPOOL_INFLIGHT_SUFFIX)
         || name.ends_with(SPOOL_TMP_SUFFIX)
         || name.ends_with(".corrupt")
-        || name.ends_with(".rejected")
         || name.ends_with(".rejected.ndjson")
         || name.ends_with(".meta")
     {
@@ -10692,13 +10965,9 @@ fn is_spool_temp_file(path: &Path) -> bool {
     if !name.ends_with(SPOOL_TMP_SUFFIX) {
         return false;
     }
-    // Generation/process-attributed temps written by this format, plus the
-    // pre-attribution shapes and dead-letter metadata temps that a prior
-    // release could have left behind.
-    parse_spool_write_temp(name).is_some()
-        || name.ends_with(".ndjson.tmp")
-        || name.ends_with(".ndjson.zst.tmp")
-        || name.ends_with(".rejected.meta.tmp")
+    // Generation/process-attributed record temps and dead-letter metadata
+    // temps, the two temp shapes this format writes.
+    parse_spool_write_temp(name).is_some() || name.ends_with(".rejected.meta.tmp")
 }
 
 fn is_spool_inflight_file(path: &Path) -> bool {
@@ -10756,7 +11025,6 @@ fn spool_regular_file_len(path: &Path) -> Option<u64> {
 /// path, so the frame carries the decompressed size — but without the ceiling
 /// reservation that makes the production path safe. Tests use it to predict
 /// on-disk sizes; production must never call it.
-#[allow(dead_code)] // external unit tests only
 fn encode_spool_bytes(bytes: &[u8], compression: SpoolCompression) -> Result<Vec<u8>, String> {
     match compression {
         SpoolCompression::Zstd => {
@@ -10779,7 +11047,6 @@ fn encode_spool_bytes(bytes: &[u8], compression: SpoolCompression) -> Result<Vec
 /// External tests use this to model a planted frame whose truthful declared
 /// size would exceed the replay ratio. Production must never call it.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn encode_spool_bytes_without_ratio_padding_for_tests(bytes: &[u8]) -> Result<Vec<u8>, String> {
     zstd::bulk::compress(bytes, 0)
         .map_err(|error| format!("{PLUGIN_NAME}: zstd compression failed: {error}"))
@@ -10791,7 +11058,6 @@ pub fn encode_spool_bytes_without_ratio_padding_for_tests(bytes: &[u8]) -> Resul
 /// This is the legacy / foreign-archive shape replay must still accept by
 /// falling back to the ratio clamp; no production path produces it.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn encode_spool_bytes_without_content_size_for_tests(
     bytes: &[u8],
     compression: SpoolCompression,
@@ -10883,6 +11149,7 @@ pub enum SpoolReplayHookPoint {
 /// that owns it, not a bug in the code under test.
 type SpoolWriteHookForTests = Arc<dyn Fn(SpoolWriteHookPoint, &Path) + Send + Sync + 'static>;
 
+#[cfg(feature = "test-support")]
 fn spool_write_hook_slot() -> &'static Mutex<Option<SpoolWriteHookForTests>> {
     static HOOK: OnceLock<Mutex<Option<SpoolWriteHookForTests>>> = OnceLock::new();
     HOOK.get_or_init(|| Mutex::new(None))
@@ -10893,19 +11160,29 @@ fn spool_write_hook_slot() -> &'static Mutex<Option<SpoolWriteHookForTests>> {
 /// Tests must clear the hook before finishing (including panic paths), serialize
 /// against other chargeback-sink tests that publish ACTIVE_SINKS, and ignore
 /// every point whose namespace root is not their own spool.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn set_spool_write_hook_for_tests(hook: Option<SpoolWriteHookForTests>) {
     if let Ok(mut slot) = spool_write_hook_slot().lock() {
         *slot = hook;
     }
 }
 
+#[cfg(feature = "test-support")]
 fn snapshot_spool_write_hook_for_tests() -> Option<SpoolWriteHookForTests> {
     spool_write_hook_slot()
         .lock()
         .ok()
         .and_then(|slot| slot.clone())
+}
+
+/// Without `test-support` no hook can be installed, so the per-operation
+/// check is a constant `None` the compiler folds away: production never takes
+/// the process-global hook mutex (issue #7122).
+#[cfg(not(feature = "test-support"))]
+#[inline(always)]
+fn snapshot_spool_write_hook_for_tests() -> Option<SpoolWriteHookForTests> {
+    None
 }
 
 /// Deterministic injection point inside the bounded spool tree walk.
@@ -10926,6 +11203,7 @@ pub enum SpoolWalkHookPoint {
 /// process-global and the test binary runs tests in parallel.
 type SpoolWalkHookForTests = Arc<dyn Fn(SpoolWalkHookPoint, &Path) + Send + Sync + 'static>;
 
+#[cfg(feature = "test-support")]
 fn spool_walk_hook_slot() -> &'static Mutex<Option<SpoolWalkHookForTests>> {
     static HOOK: OnceLock<Mutex<Option<SpoolWalkHookForTests>>> = OnceLock::new();
     HOOK.get_or_init(|| Mutex::new(None))
@@ -10935,14 +11213,15 @@ fn spool_walk_hook_slot() -> &'static Mutex<Option<SpoolWalkHookForTests>> {
 ///
 /// Tests must clear the hook before finishing (including panic paths) and
 /// ignore every invocation whose entry path is outside their own spool root.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn set_spool_walk_hook_for_tests(hook: Option<SpoolWalkHookForTests>) {
     if let Ok(mut slot) = spool_walk_hook_slot().lock() {
         *slot = hook;
     }
 }
 
+#[cfg(feature = "test-support")]
 fn snapshot_spool_walk_hook_for_tests() -> Option<SpoolWalkHookForTests> {
     spool_walk_hook_slot()
         .lock()
@@ -10950,8 +11229,18 @@ fn snapshot_spool_walk_hook_for_tests() -> Option<SpoolWalkHookForTests> {
         .and_then(|slot| slot.clone())
 }
 
+/// Without `test-support` no hook can be installed, so the per-operation
+/// check is a constant `None` the compiler folds away: production never takes
+/// the process-global hook mutex (issue #7122).
+#[cfg(not(feature = "test-support"))]
+#[inline(always)]
+fn snapshot_spool_walk_hook_for_tests() -> Option<SpoolWalkHookForTests> {
+    None
+}
+
 type SpoolReplayHookForTests = Arc<dyn Fn(SpoolReplayHookPoint, &Path) + Send + Sync + 'static>;
 
+#[cfg(feature = "test-support")]
 fn spool_replay_hook_slot() -> &'static Mutex<Option<SpoolReplayHookForTests>> {
     static HOOK: OnceLock<Mutex<Option<SpoolReplayHookForTests>>> = OnceLock::new();
     HOOK.get_or_init(|| Mutex::new(None))
@@ -10961,19 +11250,29 @@ fn spool_replay_hook_slot() -> &'static Mutex<Option<SpoolReplayHookForTests>> {
 ///
 /// Tests must clear the hook before finishing (including panic paths) and
 /// ignore every invocation whose claimed path is outside their own spool root.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn set_spool_replay_hook_for_tests(hook: Option<SpoolReplayHookForTests>) {
     if let Ok(mut slot) = spool_replay_hook_slot().lock() {
         *slot = hook;
     }
 }
 
+#[cfg(feature = "test-support")]
 fn snapshot_spool_replay_hook_for_tests() -> Option<SpoolReplayHookForTests> {
     spool_replay_hook_slot()
         .lock()
         .ok()
         .and_then(|slot| slot.clone())
+}
+
+/// Without `test-support` no hook can be installed, so the per-operation
+/// check is a constant `None` the compiler folds away: production never takes
+/// the process-global hook mutex (issue #7122).
+#[cfg(not(feature = "test-support"))]
+#[inline(always)]
+fn snapshot_spool_replay_hook_for_tests() -> Option<SpoolReplayHookForTests> {
+    None
 }
 
 /// Ensures [`SpoolWriteHookPoint::AfterWrite`] runs on every `write_events`
@@ -11010,7 +11309,6 @@ impl Drop for SpoolWriteHookAfterGuard {
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn encode_spool_bytes_for_tests(
     bytes: &[u8],
     compression: SpoolCompression,
@@ -11921,113 +12219,6 @@ fn open_spool_file_no_follow(path: &Path) -> Result<File, String> {
     })
 }
 
-/// One decoded spool artifact retained by the decode-only external test helper.
-///
-/// Production replay uses [`StreamingSpoolReader`] and never materializes this
-/// artifact-wide representation.
-struct ReservedSpoolArtifact {
-    text: String,
-    /// Charge on the decoded buffer. Reserved before the file is read, shrunk
-    /// to the buffer's real allocation, released on drop.
-    _text_reservation: ProcessByteReservation,
-}
-
-impl ReservedSpoolArtifact {
-    #[allow(dead_code)] // used by the external decode test helper
-    fn into_text(self) -> String {
-        self.text
-    }
-}
-
-/// Decode one spool artifact into a representation that is charged to `ceiling`
-/// for its whole life.
-///
-/// The decoded upper bound is reserved *before* the file is read, so a process
-/// already at its retained-byte ceiling refuses the artifact instead of
-/// materializing an unbounded owned copy of it.
-fn decode_spool_artifact(
-    path: &Path,
-    ceiling: &'static RetainedByteCeiling,
-) -> Result<ReservedSpoolArtifact, SpoolDecodeError> {
-    let file = File::open(path).map_err(|error| {
-        SpoolDecodeError::Unreadable(format!(
-            "{PLUGIN_NAME}: failed to open spool file '{}': {error}",
-            path.display()
-        ))
-    })?;
-    let encoded_len = file
-        .metadata()
-        .map_err(|error| {
-            SpoolDecodeError::Unreadable(format!(
-                "{PLUGIN_NAME}: failed to stat spool file '{}': {error}",
-                path.display()
-            ))
-        })?
-        .len();
-    if encoded_len > SPOOL_MAX_ARTIFACT_BYTES {
-        return Err(SpoolDecodeError::Unreadable(format!(
-            "{PLUGIN_NAME}: spool file '{}' exceeds the hard {SPOOL_MAX_ARTIFACT_BYTES}-byte artifact bound",
-            path.display()
-        )));
-    }
-    let compressed = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.contains(".ndjson.zst"));
-    // An uncompressed artifact decodes to exactly its on-disk size. Treat a
-    // zstd frame's declared content size only as a tighter bound: the header is
-    // unauthenticated, so it must never bypass the decompression-ratio limit.
-    let mut file = file;
-    let decoded_bound = if compressed {
-        let ratio_limit = spool_decompression_limit(encoded_len);
-        match read_zstd_frame_content_size(&mut file, path)? {
-            Some(declared) if declared <= SPOOL_MAX_ARTIFACT_BYTES => declared.min(ratio_limit),
-            Some(declared) => {
-                return Err(SpoolDecodeError::Unreadable(format!(
-                    "{PLUGIN_NAME}: spool file '{}' declares a {declared}-byte decoded size above the hard {SPOOL_MAX_ARTIFACT_BYTES}-byte artifact bound",
-                    path.display()
-                )));
-            }
-            None => ratio_limit,
-        }
-    } else {
-        encoded_len
-    };
-    let decoded_bound = usize::try_from(decoded_bound).map_err(|_| {
-        SpoolDecodeError::Unreadable(format!(
-            "{PLUGIN_NAME}: spool file '{}' decoded bound exceeds this platform's addressable size",
-            path.display()
-        ))
-    })?;
-    let text_reservation = ceiling.try_acquire(decoded_bound).ok_or_else(|| {
-        SpoolDecodeError::CeilingExhausted(format!(
-            "{PLUGIN_NAME}: spool replay deferred for '{}': {}",
-            path.display(),
-            PayloadMaterializationError::CeilingExhausted.reason()
-        ))
-    })?;
-
-    let decoded = if compressed {
-        decode_zstd_bounded(file, decoded_bound, path).map_err(SpoolDecodeError::Unreadable)?
-    } else {
-        read_spool_bytes_bounded(file, decoded_bound, path).map_err(SpoolDecodeError::Unreadable)?
-    };
-    let text = String::from_utf8(decoded).map_err(|error| {
-        SpoolDecodeError::Unreadable(format!(
-            "{PLUGIN_NAME}: spool file '{}' is not valid UTF-8 JSONEachRow: {error}",
-            path.display()
-        ))
-    })?;
-    // Charge only what the buffer really holds; `from_utf8` reuses the `Vec`
-    // allocation, so `capacity` is the true retained size.
-    text_reservation.shrink_to(text.capacity());
-
-    Ok(ReservedSpoolArtifact {
-        text,
-        _text_reservation: text_reservation,
-    })
-}
-
 /// Bytes of a zstd frame prefix that always contain the complete frame header.
 ///
 /// A zstd frame header is at most 18 bytes (4-byte magic + 14-byte header).
@@ -12214,40 +12405,38 @@ fn read_spool_bytes_bounded(
     Ok(decoded)
 }
 
-fn decode_zstd_bounded(reader: impl Read, limit: usize, path: &Path) -> Result<Vec<u8>, String> {
-    let decoder = zstd::stream::read::Decoder::new(reader).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to open spool file '{}' for decompression: {error}",
-            path.display()
-        )
-    })?;
-    read_spool_bytes_bounded(decoder, limit, path).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: spool file '{}' exceeded its decompression bound: {error}",
-            path.display()
-        )
-    })
-}
-
-/// Decode-only helper for external unit tests. The returned `String` outlives
-/// its ceiling reservation, which is exactly why production never uses this
-/// shape: [`decode_spool_artifact`] keeps the charge for the buffer's life.
-#[allow(dead_code)]
+/// Decode-only helper for external unit tests.
+///
+/// Reads the artifact through the same bounded [`StreamingSpoolReader`] replay
+/// uses — identical size, ratio, row, UTF-8, and JSON-object checks — and
+/// returns the validated rows joined by `\n`. The returned `String` outlives
+/// every ceiling reservation, which is why production never uses this shape.
 pub fn decode_spool_file_for_tests(path: &Path) -> Result<String, String> {
-    decode_spool_artifact(path, process_ceiling())
-        .map(ReservedSpoolArtifact::into_text)
-        .map_err(SpoolDecodeError::into_message)
+    let mut reader = StreamingSpoolReader::open(path, process_ceiling())
+        .map_err(SpoolDecodeError::into_message)?;
+    let mut text = String::new();
+    while let Some(batch) = reader
+        .next_batch()
+        .map_err(SpoolDecodeError::into_message)?
+    {
+        let body = batch.body_range(0, batch.row_count())?;
+        let rows = std::str::from_utf8(&body)
+            .map_err(|_| format!("{PLUGIN_NAME}: decoded spool rows are not UTF-8"))?;
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(rows);
+    }
+    Ok(text)
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn spool_artifact_byte_limit_for_tests() -> u64 {
     SPOOL_MAX_ARTIFACT_BYTES
 }
 
 /// Reserved capacity of the 413 split worklist.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn spool_split_worklist_max_entries_for_tests() -> usize {
     SPOOL_SPLIT_WORKLIST_MAX_ENTRIES
 }
@@ -12255,7 +12444,6 @@ pub fn spool_split_worklist_max_entries_for_tests() -> usize {
 /// `(row_bytes, rows_per_artifact, batch_bytes, isolation_attempts)` hard
 /// streaming replay limits for deterministic external regression tests.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn spool_streaming_limits_for_tests() -> (usize, usize, usize, usize) {
     (
         SPOOL_MAX_ROW_BYTES,
@@ -12271,7 +12459,6 @@ pub fn spool_streaming_limits_for_tests() -> (usize, usize, usize, usize) {
 /// the streaming decoder is constructed. The trailing bytes are intentionally
 /// not a complete frame body — header inspection happens first.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn encode_zstd_declaring_content_size_for_tests(declared_size: u64) -> Vec<u8> {
     // Magic (little-endian 0xFD2FB528) + Frame_Header_Descriptor with
     // FCS_Size=3 (8-byte content size) and Single_Segment=1 (no Window_Descriptor).
@@ -12284,7 +12471,6 @@ pub fn encode_zstd_declaring_content_size_for_tests(declared_size: u64) -> Vec<u
 /// tests. Returns the six defensive refusal diagnostics exercised by the
 /// extracted helpers that guard batch assembly and row decoding.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_streaming_spool_reader_defensive_paths_for_tests(
     ceiling: &'static RetainedByteCeiling,
 ) -> Result<[String; 6], String> {
@@ -12334,7 +12520,6 @@ pub fn probe_streaming_spool_reader_defensive_paths_for_tests(
 /// Returns the three refusal diagnostics for an empty range, an out-of-range
 /// start, and an inverted retained byte range.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_streaming_replay_batch_range_errors_for_tests(
     ceiling: &'static RetainedByteCeiling,
 ) -> Result<[String; 3], String> {
@@ -12393,7 +12578,6 @@ pub fn probe_streaming_replay_batch_range_errors_for_tests(
 /// fail-closed diagnostic. External tests use this to prove the two-pass reader
 /// cannot deliver a different same-shape artifact through a path swap.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_streaming_replay_path_swap_for_tests(
     path: &Path,
     replacement: &Path,
@@ -12423,7 +12607,6 @@ pub fn probe_streaming_replay_path_swap_for_tests(
 /// External tests only: proves the empty-publish refusal keeps the authoritative
 /// source claim intact rather than inventing an empty rejected artifact.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_empty_dead_letter_publish_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -12438,7 +12621,6 @@ pub fn probe_empty_dead_letter_publish_for_tests(
 /// the empty payload, so whatever survives this call is exactly what `open`'s
 /// authorization decided.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_empty_dead_letter_publish_with_identity_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -12468,7 +12650,6 @@ pub struct PinnedClaimIdentityForTests(PinnedClaimArtifact);
 /// A pathname that is missing or not a regular file yields the unpinned state,
 /// which authorizes no destructive step at all.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn pin_dead_letter_claim_identity_for_tests(path: &Path) -> PinnedClaimIdentityForTests {
     PinnedClaimIdentityForTests(PinnedClaimArtifact::pin_path(path))
 }
@@ -12477,7 +12658,6 @@ pub fn pin_dead_letter_claim_identity_for_tests(path: &Path) -> PinnedClaimIdent
 /// append/admission protocol. External concurrency tests use this to isolate
 /// the filesystem transaction from HTTP failure classification.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn publish_dead_letter_payload_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -12497,7 +12677,6 @@ pub fn publish_dead_letter_payload_for_tests(
 /// use it to prove that two managers sharing one namespace cannot both spend
 /// source-replacement capacity.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn publish_dead_letter_payload_for_claim_for_tests(
     spool: &SpoolManager,
     claim: &SpoolClaimHandle,
@@ -12527,7 +12706,6 @@ pub fn publish_dead_letter_payload_for_claim_for_tests(
 /// regression that collapses capacity checks into authorization alone cannot
 /// hide behind an earlier Unauthorized return.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_dead_letter_source_credit_bytes_for_tests(
     spool: &SpoolManager,
     claim_path: &Path,
@@ -12544,7 +12722,6 @@ pub fn probe_dead_letter_source_credit_bytes_for_tests(
 /// publish. Both explicit cleanup and the final replacing rename must refuse the
 /// substitute before the optional prior payload is planted.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn publish_dead_letter_payload_with_identity_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -12565,7 +12742,6 @@ pub fn publish_dead_letter_payload_with_identity_for_tests(
 /// Returns the published path and the usage snapshot taken after the prior was
 /// planted and accounted, immediately before publish replaces it.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn publish_dead_letter_payload_replacing_prior_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -12625,7 +12801,6 @@ fn single_row_replay_batch_for_tests(
 /// finalization boundary.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // external unit tests only
 pub enum DeadLetterHandoffStageForTests {
     /// After the writer opened its temp, before the first row is admitted or
     /// appended.
@@ -12641,7 +12816,6 @@ pub enum DeadLetterHandoffStageForTests {
 /// the initial claim rename, so the probe carries the same authorization
 /// capability production does.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_dead_letter_handoff_interference_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -12709,7 +12883,6 @@ fn publish_dead_letter_payload_inner_for_tests(
 /// Callers pass the payload bytes they already published so this probe does not
 /// re-stat or re-read the on-disk file solely to rebuild the metadata record.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn write_dead_letter_meta_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -12734,7 +12907,6 @@ pub fn write_dead_letter_meta_for_tests(
 /// substitution model: a claim pathname holding a different regular file must
 /// not authorize unlinking a completed `.rejected.meta` sibling.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn write_dead_letter_meta_with_identity_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -12780,7 +12952,6 @@ pub fn write_dead_letter_meta_with_identity_for_tests(
 
 /// Bytes one spool line-index / worklist entry occupies.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn spool_index_entry_bytes_for_tests() -> usize {
     SPOOL_INDEX_ENTRY_BYTES
 }
@@ -12796,7 +12967,6 @@ pub fn spool_index_entry_bytes_for_tests() -> usize {
 /// the pending set, a failed retry restores every pending delta, and the
 /// reservation is released exactly once when the recovery is dropped.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn probe_compact_recovery_retry_for_tests(
     ceiling: &'static RetainedByteCeiling,
     events: Vec<ChargeEvent>,
@@ -12848,7 +13018,6 @@ pub fn probe_compact_recovery_retry_for_tests(
 /// injects the process ceiling.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub struct SharedSpoolBatchCloneProbe {
     pub clone_bytes: usize,
     pub ceiling_used_baseline: usize,
@@ -12868,8 +13037,9 @@ pub struct SharedSpoolBatchCloneProbe {
 /// exceptional path that reserves before cloning. `clone_ceiling` is injected
 /// into the real delivery worker, allowing external tests to exercise both
 /// admission and refusal without perturbing the process-global ceiling.
+/// Installs a spool write hook, so it exists only with `test-support`.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn probe_shared_spool_batch_clone_for_tests(
     spool: Arc<SpoolManager>,
     events: Vec<ChargeEvent>,
@@ -12936,7 +13106,7 @@ pub async fn probe_shared_spool_batch_clone_for_tests(
     let _ = commit_tx.send(true);
 
     assert!(
-        delivery.try_enqueue(shared, "shared spool clone probe"),
+        delivery.try_enqueue(shared),
         "{PLUGIN_NAME}: shared spool clone probe failed to enqueue"
     );
 
@@ -13009,7 +13179,6 @@ impl CompactRecoveryProbe {
 /// Build a compact recovery backed by a real spool for deterministic external
 /// concurrency tests.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn compact_recovery_probe_for_tests(
     ceiling: &'static RetainedByteCeiling,
     events: Vec<ChargeEvent>,
@@ -13042,13 +13211,11 @@ pub fn compact_recovery_probe_for_tests(
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn spool_decompression_limit_for_tests(encoded_len: u64) -> u64 {
     spool_decompression_limit(encoded_len)
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn replay_spool_once_for_tests(
     spool: &SpoolManager,
     insert_url: &str,
@@ -13057,7 +13224,6 @@ pub async fn replay_spool_once_for_tests(
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn replay_spool_once_with_batch_size_for_tests(
     spool: &SpoolManager,
     insert_url: &str,
@@ -13070,15 +13236,39 @@ pub async fn replay_spool_once_with_batch_size_for_tests(
 /// refusal assertions stay exact while other tests in the same binary reserve
 /// against the process-global counter.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn replay_spool_once_with_ceiling_for_tests(
     spool: &SpoolManager,
     insert_url: &str,
     batch_size: usize,
     ceiling: &'static RetainedByteCeiling,
 ) -> Result<(), String> {
-    let flush_config = ClickHouseFlushConfig {
-        http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
+    let flush_config = replay_flush_config_for_tests(spool, insert_url, ceiling);
+    replay_spool_once(spool, &flush_config, batch_size.max(1)).await
+}
+
+/// Replay one tick exactly as the production replayer schedules it: on the
+/// blocking pool, cancellable by dropping the returned future.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn replay_spool_tick_off_worker_for_tests(
+    spool: Arc<SpoolManager>,
+    insert_url: &str,
+) -> Result<(), String> {
+    let flush_config = Arc::new(replay_flush_config_for_tests(
+        &spool,
+        insert_url,
+        process_ceiling(),
+    ));
+    replay_spool_tick_off_worker(spool, flush_config, default_batch_size()).await
+}
+
+fn replay_flush_config_for_tests(
+    spool: &SpoolManager,
+    insert_url: &str,
+    ceiling: &'static RetainedByteCeiling,
+) -> ClickHouseFlushConfig {
+    ClickHouseFlushConfig {
+        http: ClickHouseHttpClient::Dedicated(DedicatedPluginClient::fixed(reqwest::Client::new())),
         insert_url: insert_url.to_string(),
         redacted_insert_url: redacted_endpoint_url_str(insert_url),
         username: None,
@@ -13087,8 +13277,7 @@ pub async fn replay_spool_once_with_ceiling_for_tests(
         metrics: Arc::clone(&spool.metrics),
         ceiling,
         projection: spool.projection.clone(),
-    };
-    replay_spool_once(spool, &flush_config, batch_size.max(1)).await
+    }
 }
 
 /// Deterministic body-materialization probe for external unit tests.
@@ -13096,7 +13285,6 @@ pub async fn replay_spool_once_with_ceiling_for_tests(
 /// Returns `(reserved_bound, ceiling_used_while_body_held, ceiling_used_after_drop)`,
 /// or `Err` when the ceiling refused the body before it was serialized.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn probe_charge_body_materialization_for_tests(
     ceiling: &'static RetainedByteCeiling,
     batch: &[ChargeEvent],
@@ -13108,7 +13296,6 @@ pub fn probe_charge_body_materialization_for_tests(
 /// so a schema's reservation bound can be asserted to still precede — and cover
 /// — the projected serialization.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn probe_charge_body_materialization_with_projection_for_tests(
     ceiling: &'static RetainedByteCeiling,
     batch: &[ChargeEvent],
@@ -13116,7 +13303,7 @@ pub fn probe_charge_body_materialization_with_projection_for_tests(
 ) -> Result<(usize, usize, usize), String> {
     let metrics = Arc::new(SinkMetrics::default());
     let cfg = ClickHouseFlushConfig {
-        http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
+        http: ClickHouseHttpClient::Dedicated(DedicatedPluginClient::fixed(reqwest::Client::new())),
         insert_url: "http://127.0.0.1/".to_string(),
         redacted_insert_url: "http://127.0.0.1/redacted".to_string(),
         username: None,
@@ -13126,16 +13313,17 @@ pub fn probe_charge_body_materialization_with_projection_for_tests(
         ceiling,
         projection: projection.clone(),
     };
-    let bound = charge_body_byte_bound(batch, projection.as_deref())
+    // The same borrowed-event instantiation `send_batch` delivers through.
+    let events: Vec<&ChargeEvent> = batch.iter().collect();
+    let bound = charge_body_byte_bound(&events, projection.as_deref())
         .ok_or_else(|| format!("{PLUGIN_NAME}: bound overflowed"))?;
-    let body = materialize_charge_body(&cfg, batch)?;
+    let body = materialize_charge_body(&cfg, &events)?;
     let held = ceiling.used();
     drop(body);
     Ok((bound, held, ceiling.used()))
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn classify_clickhouse_http_status_for_tests(status: u16) -> &'static str {
     // Status-only helper for non-success paths. HTTP 200/204 durable success
     // additionally requires a complete empty acknowledgement body with no
@@ -13157,17 +13345,34 @@ pub fn classify_clickhouse_http_status_for_tests(status: u16) -> &'static str {
 /// `X-ClickHouse-Exception-Code` never appear in returned labels or messages
 /// beyond bounded reason classes.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn classify_clickhouse_acknowledgement_for_tests(
     status: u16,
     body: Option<&[u8]>,
     has_exception_code_header: bool,
 ) -> &'static str {
+    classify_clickhouse_acknowledgement_with_header_for_tests(
+        status,
+        body,
+        has_exception_code_header.then_some(""),
+    )
+}
+
+/// [`classify_clickhouse_acknowledgement_for_tests`] with an explicit
+/// `X-ClickHouse-Exception-Code` header value (`None` = header absent), so the
+/// transient/permanent exception-code split is covered for both carriers.
+#[doc(hidden)]
+pub fn classify_clickhouse_acknowledgement_with_header_for_tests(
+    status: u16,
+    body: Option<&[u8]>,
+    exception_code_header: Option<&str>,
+) -> &'static str {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let exception_header =
+        exception_code_header.map(|value| clickhouse_exception_from_header_value(value.as_bytes()));
     let ack = match body {
         Some(bytes) => ClickHouseAckRead::Complete {
             byte_len: bytes.len() as u64,
-            has_exception: body_has_clickhouse_exception(bytes),
+            exception: body_clickhouse_exception(bytes),
         },
         None => ClickHouseAckRead::Incomplete {
             kind: ClickHouseAckIncomplete::TransportFailure,
@@ -13175,7 +13380,7 @@ pub fn classify_clickhouse_acknowledgement_for_tests(
     };
     let metrics = Arc::new(SinkMetrics::default());
     let cfg = ClickHouseFlushConfig {
-        http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
+        http: ClickHouseHttpClient::Dedicated(DedicatedPluginClient::fixed(reqwest::Client::new())),
         insert_url: "http://127.0.0.1/".to_string(),
         redacted_insert_url: "http://127.0.0.1/redacted".to_string(),
         username: None,
@@ -13189,7 +13394,7 @@ pub fn classify_clickhouse_acknowledgement_for_tests(
         &cfg,
         status,
         ack,
-        has_exception_code_header,
+        exception_header,
         1,
         Duration::from_millis(1),
     )
@@ -13197,7 +13402,6 @@ pub fn classify_clickhouse_acknowledgement_for_tests(
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn clickhouse_insert_url_for_tests(config: &ApiChargebackSinkConfig) -> Result<String, String> {
     let base = Url::parse(&config.clickhouse.url)
         .map_err(|err| format!("invalid ClickHouse URL: {err}"))?;
@@ -13205,7 +13409,6 @@ pub fn clickhouse_insert_url_for_tests(config: &ApiChargebackSinkConfig) -> Resu
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn write_private_file_atomically_for_tests(
     tmp_path: &Path,
     final_path: &Path,
@@ -13217,8 +13420,8 @@ pub fn write_private_file_atomically_for_tests(
 }
 
 /// Exercise the durable-write contract with one step forced to fail.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn write_private_file_atomically_with_fault_for_tests(
     tmp_path: &Path,
     final_path: &Path,
@@ -13513,18 +13716,22 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
 
 fn start_spool_replayer(
     spool: Arc<SpoolManager>,
-    _summary: SinkSummary,
     flush_config: ClickHouseFlushConfig,
     batch_size: usize,
     replay_interval_secs: u64,
     commit_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     let batch_size = batch_size.max(1);
+    let flush_config = Arc::new(flush_config);
     tokio::spawn(async move {
         if !wait_until_committed(commit_rx).await {
             return;
         }
         let mut timer = tokio::time::interval(Duration::from_secs(replay_interval_secs));
+        // A tick that overran its interval (a large spool during a ClickHouse
+        // outage) waits a full interval before the next one instead of being
+        // followed by a burst of catch-up ticks.
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             timer.tick().await;
             // Prepare and refresh owned-usage gauges off the Tokio worker so a
@@ -13555,11 +13762,113 @@ fn start_spool_replayer(
                     continue;
                 }
             }
-            if let Err(error) = replay_spool_once(&spool, &flush_config, batch_size).await {
+            if let Err(error) = replay_spool_tick_off_worker(
+                Arc::clone(&spool),
+                Arc::clone(&flush_config),
+                batch_size,
+            )
+            .await
+            {
                 warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink spool replay failed");
             }
         }
     })
+}
+
+/// Run one [`replay_spool_once`] tick on Tokio's blocking pool.
+///
+/// A tick walks the spool tree, takes the cross-process namespace lock (before
+/// every delivery attempt, for claim renewal), decodes and validates whole
+/// artifacts before the first request, and fsyncs and renames dead-letter
+/// evidence — all synchronous file work that must not pin a runtime worker
+/// while unrelated tasks wait behind it (issue #7111). The tick is therefore
+/// driven by `Handle::block_on` on a blocking-pool thread; its ClickHouse POSTs
+/// stay asynchronous on the runtime's I/O and timer drivers.
+///
+/// Cancellation keeps its previous meaning. Dropping this future (a retiring
+/// generation aborts its replay task; runtime shutdown drops it) drops the
+/// cancellation sender, and the tick stops at its next await — the delivery
+/// POST — where dropping the replay future runs [`ReplayCancellationRelease`]
+/// and returns the in-flight claim to its durable replayable name.
+async fn replay_spool_tick_off_worker(
+    spool: Arc<SpoolManager>,
+    flush_config: Arc<ClickHouseFlushConfig>,
+    batch_size: usize,
+) -> Result<(), String> {
+    let handle = tokio::runtime::Handle::current();
+    let (cancel_tx, mut cancel_rx) = watch::channel(());
+    let tick = tokio::task::spawn_blocking(move || {
+        handle.block_on(async move {
+            tokio::select! {
+                biased;
+                // No value is ever sent: `changed` resolves only when the
+                // sender is dropped, i.e. when this tick was cancelled.
+                _ = cancel_rx.changed() => Err(format!(
+                    "{PLUGIN_NAME}: spool replay tick cancelled"
+                )),
+                result = replay_spool_once(&spool, &flush_config, batch_size) => result,
+            }
+        })
+    });
+    let outcome = tick.await;
+    drop(cancel_tx);
+    outcome.unwrap_or_else(|error| {
+        Err(format!(
+            "{PLUGIN_NAME}: spool replay worker did not complete: {error}"
+        ))
+    })
+}
+
+/// Returns an in-flight replay claim to the replayable namespace when replay is
+/// cancelled mid-delivery.
+///
+/// A plugin generation aborts its replay worker when it retires (an ordinary
+/// reload). Without this guard the aborted future would drop the claim handle —
+/// and with it the only pinned descriptor that can authorize a release — leaving
+/// a descriptor-free `.inflight` artifact that is deliberately never replayed or
+/// reclaimed automatically, so its charges would leave automatic delivery for
+/// good.
+///
+/// While armed, dropping the guard takes the namespace mutation lock and runs
+/// the same descriptor-bound release the retryable-delivery branch uses. A
+/// pathname that no longer resolves to the pinned artifact is refused exactly as
+/// it is there, so cancellation can never promote a substitute into the
+/// replayable namespace. The guard is disarmed as soon as the delivery future
+/// completes, so every non-cancelled outcome keeps its explicit disposition. The
+/// release is one bounded rename under the namespace lock, so running it
+/// synchronously on whichever thread drops the cancelled task is acceptable.
+struct ReplayCancellationRelease<'a> {
+    spool: &'a SpoolManager,
+    claim: &'a mut SpoolClaimHandle,
+    armed: bool,
+}
+
+impl<'a> ReplayCancellationRelease<'a> {
+    fn arm(spool: &'a SpoolManager, claim: &'a mut SpoolClaimHandle) -> Self {
+        Self {
+            spool,
+            claim,
+            armed: true,
+        }
+    }
+
+    fn claim_mut(&mut self) -> &mut SpoolClaimHandle {
+        &mut *self.claim
+    }
+
+    /// The delivery future completed; its caller owns the claim's disposition.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReplayCancellationRelease<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.spool.release_cancelled_claim(&*self.claim);
+    }
 }
 
 /// Replay one tick of this owner's durable spool files.
@@ -13737,7 +14046,25 @@ async fn replay_spool_once(
         if let Some(hook) = snapshot_spool_replay_hook_for_tests() {
             hook(SpoolReplayHookPoint::AfterMatchingReplayOpen, claim.path());
         }
-        match replay_spool_stream(spool, &mut claim, flush_config, &mut reader, batch_size).await {
+        // The streaming delivery below is the only await in this loop, so it is
+        // the only point at which a retiring generation's abort can cancel the
+        // replay. The guard keeps the claim's pinned descriptor authoritative
+        // across that cancellation and releases the claim back to its durable
+        // replayable name instead of stranding a descriptor-free `.inflight`.
+        let streamed = {
+            let mut cancellation = ReplayCancellationRelease::arm(spool, &mut claim);
+            let streamed = replay_spool_stream(
+                spool,
+                cancellation.claim_mut(),
+                flush_config,
+                &mut reader,
+                batch_size,
+            )
+            .await;
+            cancellation.disarm();
+            streamed
+        };
+        match streamed {
             Ok(completion) => {
                 if reader.row_count() != line_count {
                     drop(reader);
@@ -14372,7 +14699,11 @@ fn finalize_replayed_spool_file(
 /// The complete value is the typed accumulator key and is also copied into
 /// emitted `ChargeEvent`s. It must not be treated as first-writer-wins
 /// decoration on a coarser or delimiter-encoded identity.
-#[derive(Clone, Eq, Hash, PartialEq)]
+///
+/// `Hash` and map equality go through [`SnapshotKeyRef`], so the accumulator
+/// can look an identity up with a key borrowed from the request summary and
+/// build this owned key only when the identity is new (issue #7112).
+#[derive(Clone, Eq, PartialEq)]
 struct SnapshotMetadata {
     namespace: String,
     consumer_id: String,
@@ -14384,6 +14715,96 @@ struct SnapshotMetadata {
     http_status_code: Option<u16>,
     grpc_status: Option<u32>,
     protocol: String,
+}
+
+/// Borrowed form of a [`SnapshotMetadata`] identity: the same fields in the
+/// same order, borrowed from the request summary (already bounded).
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct SnapshotKeyRef<'a> {
+    namespace: &'a str,
+    consumer_id: &'a str,
+    consumer_name: Option<&'a str>,
+    proxy_id: &'a str,
+    proxy_name: &'a str,
+    route_id: Option<&'a str>,
+    status_code: u16,
+    http_status_code: Option<u16>,
+    grpc_status: Option<u32>,
+    protocol: &'a str,
+}
+
+impl SnapshotKeyRef<'_> {
+    fn to_metadata(self) -> SnapshotMetadata {
+        SnapshotMetadata {
+            namespace: self.namespace.to_owned(),
+            consumer_id: self.consumer_id.to_owned(),
+            consumer_name: self.consumer_name.map(str::to_owned),
+            proxy_id: self.proxy_id.to_owned(),
+            proxy_name: self.proxy_name.to_owned(),
+            route_id: self.route_id.map(str::to_owned),
+            status_code: self.status_code,
+            http_status_code: self.http_status_code,
+            grpc_status: self.grpc_status,
+            protocol: self.protocol.to_owned(),
+        }
+    }
+}
+
+/// The lookup view shared by owned and borrowed snapshot identities. The
+/// accumulator maps borrow their `SnapshotMetadata` keys as this trait object,
+/// and both forms hash and compare through [`SnapshotKeyView::key_ref`], so a
+/// borrowed probe finds exactly the entry the owned key was stored under.
+trait SnapshotKeyView {
+    fn key_ref(&self) -> SnapshotKeyRef<'_>;
+}
+
+impl SnapshotKeyView for SnapshotMetadata {
+    fn key_ref(&self) -> SnapshotKeyRef<'_> {
+        SnapshotKeyRef {
+            namespace: &self.namespace,
+            consumer_id: &self.consumer_id,
+            consumer_name: self.consumer_name.as_deref(),
+            proxy_id: &self.proxy_id,
+            proxy_name: &self.proxy_name,
+            route_id: self.route_id.as_deref(),
+            status_code: self.status_code,
+            http_status_code: self.http_status_code,
+            grpc_status: self.grpc_status,
+            protocol: &self.protocol,
+        }
+    }
+}
+
+impl SnapshotKeyView for SnapshotKeyRef<'_> {
+    fn key_ref(&self) -> SnapshotKeyRef<'_> {
+        *self
+    }
+}
+
+impl std::hash::Hash for SnapshotMetadata {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key_ref().hash(state);
+    }
+}
+
+impl std::hash::Hash for dyn SnapshotKeyView + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key_ref().hash(state);
+    }
+}
+
+impl PartialEq for dyn SnapshotKeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.key_ref() == other.key_ref()
+    }
+}
+
+impl Eq for dyn SnapshotKeyView + '_ {}
+
+impl<'a> Borrow<dyn SnapshotKeyView + 'a> for SnapshotMetadata {
+    fn borrow(&self) -> &(dyn SnapshotKeyView + 'a) {
+        self
+    }
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
@@ -14675,9 +15096,6 @@ impl SnapshotAccumulator {
         self.overflow_deliveries_in_flight.load(Ordering::Acquire)
     }
 
-    // External adversarial tests assert the hard byte ceiling is never crossed;
-    // the binary target compiles this module separately and cannot observe them.
-    #[allow(dead_code)]
     pub fn retained_bytes_for_tests(&self) -> usize {
         self.retained_bytes()
     }
@@ -14685,14 +15103,12 @@ impl SnapshotAccumulator {
     /// Bytes this accumulator currently charges to the process-wide ceiling.
     /// External tests assert it tracks the per-instance counter exactly, so N
     /// instances cannot multiply past the shared ceiling.
-    #[allow(dead_code)]
     pub fn process_retained_bytes_for_tests(&self) -> usize {
         self.process_retained.held()
     }
 
     /// Release every process-wide charge as `Drop` would, without consuming the
     /// accumulator. External tests use it to assert exact release.
-    #[allow(dead_code)]
     pub fn clear_for_compaction_for_tests(&self) {
         self.clear_for_compaction();
     }
@@ -14765,6 +15181,9 @@ impl SnapshotAccumulator {
         self.process_retained.release_all();
     }
 
+    /// `consumer` (here and in `record_stream` / `record_websocket`) is the
+    /// principal's already-bounded billing identity from
+    /// [`principal_billing_identity`]; it is used verbatim as `consumer_id`.
     fn record_http(
         &self,
         summary: &TransactionSummary,
@@ -14772,21 +15191,33 @@ impl SnapshotAccumulator {
         outcome: HttpBillingOutcome,
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
-        let proxy_id = summary.proxy_id.as_deref().unwrap_or("unknown");
-        let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
-        let meta = SnapshotMetadata {
-            namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-            consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
-            consumer_name: metadata_value(&summary.metadata, &["consumer_name"]),
-            proxy_id: bound_key_field(proxy_id, MAX_FIELD_LEN),
-            proxy_name: bound_key_field(proxy_name, MAX_FIELD_LEN),
-            route_id: metadata_value(&summary.metadata, &["route_id"]),
-            status_code: outcome.status_code,
-            http_status_code: Some(outcome.http_status_code),
-            grpc_status: outcome.grpc_status.map(normalize_snapshot_grpc_status),
-            protocol: infer_http_protocol(summary),
-        };
-        self.record(meta, charge)
+        let namespace = bounded_key_field(&summary.namespace, MAX_FIELD_LEN);
+        let consumer_name = metadata_value_cow(&summary.metadata, &["consumer_name"]);
+        let proxy_id = bounded_key_field(
+            summary.proxy_id.as_deref().unwrap_or("unknown"),
+            MAX_FIELD_LEN,
+        );
+        let proxy_name = bounded_key_field(
+            summary.proxy_name.as_deref().unwrap_or("unknown"),
+            MAX_FIELD_LEN,
+        );
+        let route_id = metadata_value_cow(&summary.metadata, &["route_id"]);
+        let protocol = infer_http_protocol_cow(summary);
+        self.record(
+            SnapshotKeyRef {
+                namespace: &namespace,
+                consumer_id: consumer,
+                consumer_name: consumer_name.as_deref(),
+                proxy_id: &proxy_id,
+                proxy_name: &proxy_name,
+                route_id: route_id.as_deref(),
+                status_code: outcome.status_code,
+                http_status_code: Some(outcome.http_status_code),
+                grpc_status: snapshot_http_outcome(outcome).grpc_status,
+                protocol: &protocol,
+            },
+            charge,
+        )
     }
 
     fn record_stream(
@@ -14795,22 +15226,30 @@ impl SnapshotAccumulator {
         consumer: &str,
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
-        let meta = SnapshotMetadata {
-            namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-            consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
-            consumer_name: metadata_value(&summary.metadata, &["consumer_name"]),
-            proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
-            proxy_name: bound_key_field(
-                summary.proxy_name.as_deref().unwrap_or("unknown"),
-                MAX_FIELD_LEN,
-            ),
-            route_id: metadata_value(&summary.metadata, &["route_id"]),
-            status_code: STREAM_STATUS_SENTINEL,
-            http_status_code: None,
-            grpc_status: None,
-            protocol: bound_key_field(&summary.protocol, MAX_FIELD_LEN),
-        };
-        self.record(meta, charge)
+        let namespace = bounded_key_field(&summary.namespace, MAX_FIELD_LEN);
+        let consumer_name = metadata_value_cow(&summary.metadata, &["consumer_name"]);
+        let proxy_id = bounded_key_field(&summary.proxy_id, MAX_FIELD_LEN);
+        let proxy_name = bounded_key_field(
+            summary.proxy_name.as_deref().unwrap_or("unknown"),
+            MAX_FIELD_LEN,
+        );
+        let route_id = metadata_value_cow(&summary.metadata, &["route_id"]);
+        let protocol = bounded_key_field(&summary.protocol, MAX_FIELD_LEN);
+        self.record(
+            SnapshotKeyRef {
+                namespace: &namespace,
+                consumer_id: consumer,
+                consumer_name: consumer_name.as_deref(),
+                proxy_id: &proxy_id,
+                proxy_name: &proxy_name,
+                route_id: route_id.as_deref(),
+                status_code: STREAM_STATUS_SENTINEL,
+                http_status_code: None,
+                grpc_status: None,
+                protocol: &protocol,
+            },
+            charge,
+        )
     }
 
     fn record_websocket(
@@ -14819,38 +15258,46 @@ impl SnapshotAccumulator {
         consumer: &str,
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
-        let meta = SnapshotMetadata {
-            namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-            consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
-            consumer_name: metadata_value(&summary.metadata, &["consumer_name"]),
-            proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
-            proxy_name: bound_key_field(
-                summary.proxy_name.as_deref().unwrap_or("unknown"),
-                MAX_FIELD_LEN,
-            ),
-            route_id: metadata_value(&summary.metadata, &["route_id"]),
-            status_code: STREAM_STATUS_SENTINEL,
-            http_status_code: None,
-            grpc_status: None,
-            protocol: "ws".to_string(),
-        };
-        self.record(meta, charge)
+        let namespace = bounded_key_field(&summary.namespace, MAX_FIELD_LEN);
+        let consumer_name = metadata_value_cow(&summary.metadata, &["consumer_name"]);
+        let proxy_id = bounded_key_field(&summary.proxy_id, MAX_FIELD_LEN);
+        let proxy_name = bounded_key_field(
+            summary.proxy_name.as_deref().unwrap_or("unknown"),
+            MAX_FIELD_LEN,
+        );
+        let route_id = metadata_value_cow(&summary.metadata, &["route_id"]);
+        self.record(
+            SnapshotKeyRef {
+                namespace: &namespace,
+                consumer_id: consumer,
+                consumer_name: consumer_name.as_deref(),
+                proxy_id: &proxy_id,
+                proxy_name: &proxy_name,
+                route_id: route_id.as_deref(),
+                status_code: STREAM_STATUS_SENTINEL,
+                http_status_code: None,
+                grpc_status: None,
+                protocol: "ws",
+            },
+            charge,
+        )
     }
 
-    fn record(&self, meta: SnapshotMetadata, charge: ChargeComputation) -> SnapshotRecordOutcome {
-        self.record_at(meta, charge, unix_timestamp_seconds())
+    fn record(&self, key: SnapshotKeyRef<'_>, charge: ChargeComputation) -> SnapshotRecordOutcome {
+        self.record_at(key, charge, unix_timestamp_seconds())
     }
 
     fn record_at(
         &self,
-        meta: SnapshotMetadata,
+        key: SnapshotKeyRef<'_>,
         charge: ChargeComputation,
         now: i64,
     ) -> SnapshotRecordOutcome {
-        let key = meta.clone();
-        // Fast path: refresh an already-published identity in place. No new
-        // admission is charged for a same-key refresh.
-        if let Some(entry) = self.entries.get(&key) {
+        // Fast path: refresh an already-published identity in place with a
+        // lookup borrowed from the request summary. No new admission is charged
+        // and no owned key is built for a same-key refresh; the owned
+        // `SnapshotMetadata` is materialized only on a miss.
+        if let Some(entry) = self.entries.get(&key as &dyn SnapshotKeyView) {
             entry.last_seen_at.store(now, Ordering::Relaxed);
             entry.revision.fetch_add(1, Ordering::Relaxed);
             if let Err(error) = entry.totals.try_add(charge) {
@@ -14860,6 +15307,7 @@ impl SnapshotAccumulator {
             return SnapshotRecordOutcome::Accumulated;
         }
 
+        let meta = key.to_metadata();
         let entry_bytes = snapshot_metadata_retained_bytes(&meta);
         // Reserve the identity slot and its retained bytes against the hard
         // ceilings *before* publishing the key. Because the reservation is
@@ -14871,6 +15319,7 @@ impl SnapshotAccumulator {
             return SnapshotRecordOutcome::OverflowImmediate;
         }
 
+        let key = meta.clone();
         let mut created = false;
         let refresh_result = {
             let entry = self.entries.entry(key.clone()).or_insert_with(|| {
@@ -14944,7 +15393,6 @@ impl SnapshotAccumulator {
         true
     }
 
-    #[allow(dead_code)]
     pub fn stage_overflow_event_for_tests(&self, event: ChargeEvent) -> bool {
         self.stage_overflow_event(event)
     }
@@ -14956,7 +15404,6 @@ impl SnapshotAccumulator {
     /// Tests set `ceiling.max()` to the staged charge before calling this. A
     /// correct take keeps the ceiling saturated, so the competing byte is
     /// refused and restoration cannot need a second admission.
-    #[allow(dead_code)]
     pub fn probe_taken_overflow_ownership_for_tests(
         &self,
         ceiling: &'static RetainedByteCeiling,
@@ -15052,9 +15499,6 @@ impl SnapshotAccumulator {
             .checked_add(identities.checked_mul(per_event_extra)?)
     }
 
-    // External integration tests exercise the public accumulator contract;
-    // the separately compiled binary cannot observe those call sites.
-    #[allow(dead_code)]
     pub fn compute_deltas(
         &self,
         config: &ApiChargebackSinkConfig,
@@ -15112,7 +15556,6 @@ impl SnapshotAccumulator {
     // Only the external `compute_deltas` test contract still commits a whole
     // `PreparedSnapshot`; production moves the projection apart and commits the
     // emitted totals directly.
-    #[allow(dead_code)]
     fn commit_prepared(&self, prepared: &PreparedSnapshot) {
         self.commit_emitted_totals(&prepared.emitted_totals);
     }
@@ -15155,7 +15598,6 @@ impl SnapshotAccumulator {
         }
     }
 
-    #[allow(dead_code)]
     pub fn cleanup_stale_for_tests(&self, stale_entry_ttl_secs: u64) -> usize {
         self.cleanup_stale(unix_timestamp_seconds(), stale_entry_ttl_secs)
     }
@@ -15223,7 +15665,6 @@ impl SnapshotAccumulator {
         removed
     }
 
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_for_test(
         &self,
@@ -15236,17 +15677,17 @@ impl SnapshotAccumulator {
         charge: ChargeComputation,
     ) {
         let _ = self.record_at(
-            SnapshotMetadata {
-                namespace: namespace.to_string(),
-                consumer_id: consumer.to_string(),
+            SnapshotKeyRef {
+                namespace,
+                consumer_id: consumer,
                 consumer_name: None,
-                proxy_id: proxy_id.to_string(),
-                proxy_name: proxy_name.to_string(),
+                proxy_id,
+                proxy_name,
                 route_id: None,
                 status_code,
                 http_status_code: (protocol == "http").then_some(status_code),
                 grpc_status: None,
-                protocol: protocol.to_string(),
+                protocol,
             },
             charge,
             unix_timestamp_seconds(),
@@ -15256,7 +15697,6 @@ impl SnapshotAccumulator {
     /// Record a charge and report whether it was accumulated (`true`) or spilled
     /// to durable overflow (`false`). Adversarial concurrency tests tally the
     /// two outcomes to prove no charge is double-counted or silently dropped.
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_accumulated_for_test(
         &self,
@@ -15270,17 +15710,17 @@ impl SnapshotAccumulator {
     ) -> bool {
         matches!(
             self.record_at(
-                SnapshotMetadata {
-                    namespace: namespace.to_string(),
-                    consumer_id: consumer.to_string(),
+                SnapshotKeyRef {
+                    namespace,
+                    consumer_id: consumer,
                     consumer_name: None,
-                    proxy_id: proxy_id.to_string(),
-                    proxy_name: proxy_name.to_string(),
+                    proxy_id,
+                    proxy_name,
                     route_id: None,
                     status_code,
                     http_status_code: (protocol == "http").then_some(status_code),
                     grpc_status: None,
-                    protocol: protocol.to_string(),
+                    protocol,
                 },
                 charge,
                 unix_timestamp_seconds(),
@@ -15291,7 +15731,6 @@ impl SnapshotAccumulator {
 
     /// Sum of accumulated `call_count` across every live identity. Equals the
     /// number of accumulated records in a test that seeds one call per record.
-    #[allow(dead_code)]
     pub fn total_call_count_for_tests(&self) -> u64 {
         self.entries
             .iter()
@@ -15300,14 +15739,17 @@ impl SnapshotAccumulator {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn record_http_for_test(
         &self,
         summary: &TransactionSummary,
         consumer: &str,
         charge: ChargeComputation,
     ) {
-        let _ = self.record_http(summary, consumer, http_billing_outcome(summary), charge);
+        let consumer_id = principal_billing_identity(
+            crate::plugins::utils::principal::Principal::Consumer(consumer),
+            MAX_FIELD_LEN,
+        );
+        let _ = self.record_http(summary, &consumer_id, http_billing_outcome(summary), charge);
     }
 
     /// Seed a single identity with an arbitrary `call_count` for boundary tests.
@@ -15634,7 +16076,7 @@ fn emit_periodic_snapshot(
 }
 
 async fn wait_for_snapshot_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
-    while !*shutdown_rx.borrow() {
+    while !*(*shutdown_rx).borrow() {
         if shutdown_rx.changed().await.is_err() {
             break;
         }
@@ -15746,9 +16188,12 @@ fn emit_final_snapshot_to_spool(
     true
 }
 
+/// `consumer_id` (here and in the stream/WebSocket builders) is the
+/// principal's already-bounded billing identity from
+/// [`principal_billing_identity`], moved into the event.
 fn event_from_http_summary(
     summary: &TransactionSummary,
-    consumer: &str,
+    consumer_id: String,
     outcome: HttpBillingOutcome,
     charge: ChargeComputation,
     config: &ApiChargebackSinkConfig,
@@ -15761,7 +16206,7 @@ fn event_from_http_summary(
         received_at: unix_timestamp_nanos(),
         node_id: bound_string(node_id, MAX_FIELD_LEN),
         namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-        consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
+        consumer_id,
         consumer_name: metadata_value(metadata, &["consumer_name"]),
         proxy_id: bound_key_field(
             summary.proxy_id.as_deref().unwrap_or("unknown"),
@@ -15786,14 +16231,7 @@ fn event_from_http_summary(
         currency: config.currency.clone(),
         pricing_version: config.pricing_version.clone(),
         request_id: if config.include_request_id {
-            metadata_value(
-                metadata,
-                &[
-                    super::REQUEST_ID_METADATA_KEY,
-                    "x-request-id",
-                    "correlation_id",
-                ],
-            )
+            metadata_value(metadata, &[super::REQUEST_ID_METADATA_KEY])
         } else {
             None
         },
@@ -15808,7 +16246,7 @@ fn event_from_http_summary(
 
 fn event_from_stream_summary(
     summary: &StreamTransactionSummary,
-    consumer: &str,
+    consumer_id: String,
     charge: ChargeComputation,
     config: &ApiChargebackSinkConfig,
     node_id: &str,
@@ -15820,7 +16258,7 @@ fn event_from_stream_summary(
         received_at: unix_timestamp_nanos(),
         node_id: bound_string(node_id, MAX_FIELD_LEN),
         namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-        consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
+        consumer_id,
         consumer_name: metadata_value(metadata, &["consumer_name"]),
         proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
         proxy_name: bound_key_field(
@@ -15842,14 +16280,7 @@ fn event_from_stream_summary(
         currency: config.currency.clone(),
         pricing_version: config.pricing_version.clone(),
         request_id: if config.include_request_id {
-            metadata_value(
-                metadata,
-                &[
-                    super::REQUEST_ID_METADATA_KEY,
-                    "x-request-id",
-                    "correlation_id",
-                ],
-            )
+            metadata_value(metadata, &[super::REQUEST_ID_METADATA_KEY])
         } else {
             None
         },
@@ -15864,7 +16295,7 @@ fn event_from_stream_summary(
 
 fn event_from_ws_summary(
     summary: &WsDisconnectContext,
-    consumer: &str,
+    consumer_id: String,
     charge: ChargeComputation,
     config: &ApiChargebackSinkConfig,
     node_id: &str,
@@ -15876,7 +16307,7 @@ fn event_from_ws_summary(
         received_at: unix_timestamp_nanos(),
         node_id: bound_string(node_id, MAX_FIELD_LEN),
         namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-        consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
+        consumer_id,
         consumer_name: metadata_value(metadata, &["consumer_name"]),
         proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
         proxy_name: bound_key_field(
@@ -15898,14 +16329,7 @@ fn event_from_ws_summary(
         currency: config.currency.clone(),
         pricing_version: config.pricing_version.clone(),
         request_id: if config.include_request_id {
-            metadata_value(
-                metadata,
-                &[
-                    super::REQUEST_ID_METADATA_KEY,
-                    "x-request-id",
-                    "correlation_id",
-                ],
-            )
+            metadata_value(metadata, &[super::REQUEST_ID_METADATA_KEY])
         } else {
             None
         },
@@ -15956,23 +16380,37 @@ fn event_from_snapshot(
 }
 
 fn infer_http_protocol(summary: &TransactionSummary) -> String {
+    infer_http_protocol_cow(summary).into_owned()
+}
+
+fn infer_http_protocol_cow(summary: &TransactionSummary) -> std::borrow::Cow<'_, str> {
     if is_websocket_handshake(summary) {
-        return "ws".to_string();
+        return std::borrow::Cow::Borrowed("ws");
     }
     if let Some(protocol) = summary
         .metadata
         .get("request_protocol")
         .or_else(|| summary.metadata.get("mesh.request_protocol"))
     {
-        return bound_key_field(protocol, MAX_FIELD_LEN);
+        return bounded_key_field(protocol, MAX_FIELD_LEN);
     }
-    "http".to_string()
+    std::borrow::Cow::Borrowed("http")
 }
 
-fn metadata_value(metadata: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
+fn metadata_value<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+    keys: &[&str],
+) -> Option<String> {
+    metadata_value_cow(metadata, keys).map(std::borrow::Cow::into_owned)
+}
+
+fn metadata_value_cow<'a, MS: std::hash::BuildHasher>(
+    metadata: &'a HashMap<String, String, MS>,
+    keys: &[&str],
+) -> Option<std::borrow::Cow<'a, str>> {
     keys.iter()
         .find_map(|key| metadata.get(*key))
-        .map(|value| bound_key_field(value, MAX_METADATA_FIELD_LEN))
+        .map(|value| bounded_key_field(value, MAX_METADATA_FIELD_LEN))
         .filter(|value| !value.is_empty())
 }
 
@@ -15986,6 +16424,18 @@ fn metadata_value(metadata: &HashMap<String, String>, keys: &[&str]) -> Option<S
 /// exhausted, the exact event is staged in the accumulator's bounded overflow
 /// instead; only when durable handoff *and* bounded staging both fail is a
 /// genuine cardinality loss recorded.
+/// Count a snapshot charge whose record hook ran after its generation closed
+/// snapshot admission. The generation's terminal delta has already been (or is
+/// being) finalized, so the charge is neither accumulated nor spooled; this
+/// fixed-cardinality counter is the only trace of it (issue #7112).
+fn record_late_snapshot_charge(lifecycle: &SnapshotLifecycle) {
+    lifecycle
+        .runtime
+        .metrics
+        .snapshot_late_charges_dropped_total
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 fn spool_snapshot_overflow_event(lifecycle: &SnapshotLifecycle, event: ChargeEvent) {
     let runtime = &lifecycle.runtime;
     let metrics = &runtime.metrics;
@@ -16244,16 +16694,71 @@ fn snapshot_event_extra_bytes(config: &ApiChargebackSinkConfig, node_id: &str) -
         .saturating_add(config.pricing_version.len())
 }
 
+/// Copies of one identity's strings the accumulator retains: the `entries`
+/// map key, the [`SnapshotEntry::meta`] copy, and the `last_emitted` key the
+/// first committed emission publishes.
+const SNAPSHOT_RETAINED_IDENTITY_COPIES: usize = 3;
+/// Hash-table control/bucket and allocator slack charged per identity across
+/// the `entries` and `last_emitted` maps.
+const SNAPSHOT_RETAINED_MAP_SLACK_BYTES: usize = 64;
+
+/// Retained bytes one snapshot identity is charged at admission.
+///
+/// Charges every copy that actually exists for the identity's lifetime rather
+/// than one: the inline `entries` key and [`SnapshotEntry`] (which itself
+/// carries a full [`SnapshotMetadata`]), the inline `last_emitted` key and
+/// [`LastEmitted`] baseline, each identity string once per retained copy, and
+/// fixed map slack. The baseline copy is charged up front so the first emission
+/// never grows retained state past the hard `max_retained_bytes` and process
+/// ceilings that admission already checked.
 fn snapshot_metadata_retained_bytes(meta: &SnapshotMetadata) -> usize {
-    let mut total = 128usize;
-    total = total.saturating_add(meta.namespace.len());
-    total = total.saturating_add(meta.consumer_id.len());
-    total = total.saturating_add(meta.consumer_name.as_ref().map(String::len).unwrap_or(0));
-    total = total.saturating_add(meta.proxy_id.len());
-    total = total.saturating_add(meta.proxy_name.len());
-    total = total.saturating_add(meta.route_id.as_ref().map(String::len).unwrap_or(0));
-    total = total.saturating_add(meta.protocol.len());
-    total
+    let mut field_bytes = 0usize;
+    field_bytes = field_bytes.saturating_add(meta.namespace.len());
+    field_bytes = field_bytes.saturating_add(meta.consumer_id.len());
+    field_bytes =
+        field_bytes.saturating_add(meta.consumer_name.as_ref().map(String::len).unwrap_or(0));
+    field_bytes = field_bytes.saturating_add(meta.proxy_id.len());
+    field_bytes = field_bytes.saturating_add(meta.proxy_name.len());
+    field_bytes = field_bytes.saturating_add(meta.route_id.as_ref().map(String::len).unwrap_or(0));
+    field_bytes = field_bytes.saturating_add(meta.protocol.len());
+    let fixed = std::mem::size_of::<SnapshotMetadata>()
+        .saturating_mul(2)
+        .saturating_add(std::mem::size_of::<SnapshotEntry>())
+        .saturating_add(std::mem::size_of::<LastEmitted>())
+        .saturating_add(SNAPSHOT_RETAINED_MAP_SLACK_BYTES);
+    fixed.saturating_add(field_bytes.saturating_mul(SNAPSHOT_RETAINED_IDENTITY_COPIES))
+}
+
+/// Retained bytes one snapshot identity is charged at admission, for external
+/// budget tests: `(charged, field_bytes)` for an identity built from the given
+/// string fields.
+#[doc(hidden)]
+pub fn snapshot_identity_retained_bytes_for_tests(
+    namespace: &str,
+    consumer: &str,
+    proxy_id: &str,
+    proxy_name: &str,
+    protocol: &str,
+) -> (usize, usize) {
+    let meta = SnapshotMetadata {
+        namespace: namespace.to_string(),
+        consumer_id: consumer.to_string(),
+        consumer_name: None,
+        proxy_id: proxy_id.to_string(),
+        proxy_name: proxy_name.to_string(),
+        route_id: None,
+        status_code: 200,
+        http_status_code: Some(200),
+        grpc_status: None,
+        protocol: protocol.to_string(),
+    };
+    let field_bytes = namespace
+        .len()
+        .saturating_add(consumer.len())
+        .saturating_add(proxy_id.len())
+        .saturating_add(proxy_name.len())
+        .saturating_add(protocol.len());
+    (snapshot_metadata_retained_bytes(&meta), field_bytes)
 }
 
 fn charge_event_retained_bytes(event: &ChargeEvent) -> usize {
@@ -16368,7 +16873,23 @@ fn bound_string(value: &str, max_len: usize) -> String {
 /// in practice this path is reached only by long operator-configured Consumer
 /// usernames, display names, or route identifiers.
 fn bound_key_field(value: &str, max_len: usize) -> String {
-    crate::plugins::chargeback::bounded_billing_identity(value, max_len).into_owned()
+    bounded_key_field(value, max_len).into_owned()
+}
+
+/// [`bound_key_field`] without the copy when the value is already in bounds.
+fn bounded_key_field(value: &str, max_len: usize) -> std::borrow::Cow<'_, str> {
+    crate::plugins::chargeback::bounded_billing_identity(value, max_len)
+}
+
+/// Snapshot-mode view of an HTTP billing outcome: a non-standard gRPC status
+/// collapses to [`GRPC_STATUS_OTHER_SENTINEL`]. Both the accumulated row and an
+/// overflow row spooled under cardinality pressure use it, so their
+/// `grpc_status` values agree.
+fn snapshot_http_outcome(outcome: HttpBillingOutcome) -> HttpBillingOutcome {
+    HttpBillingOutcome {
+        grpc_status: outcome.grpc_status.map(normalize_snapshot_grpc_status),
+        ..outcome
+    }
 }
 
 fn normalize_snapshot_grpc_status(status: u32) -> u32 {
@@ -16526,7 +17047,7 @@ mod snapshot_cleanup_race_tests {
 
         let accumulator = Arc::new(SnapshotAccumulator::new());
         let metadata = test_metadata();
-        accumulator.record_at(metadata.clone(), call_charge(1, 0.01), 100);
+        accumulator.record_at(metadata.key_ref(), call_charge(1, 0.01), 100);
         assert_eq!(
             accumulator
                 .compute_deltas(&config, "node-a", 100, "snap-1")
@@ -16551,7 +17072,7 @@ mod snapshot_cleanup_race_tests {
             thread::spawn(move || cleanup_accumulator.cleanup_stale(200, /* ttl */ 0));
 
         entered.wait();
-        accumulator.record_at(metadata, call_charge(2, 0.02), 201);
+        accumulator.record_at(metadata.key_ref(), call_charge(2, 0.02), 201);
         release.wait();
 
         assert_eq!(

@@ -50,8 +50,16 @@ REQUIRED_LATEST_RUN_SELF_TESTS = (
     "exact current run failure",
     "missing head_branch is not on main",
     "dispatched main run closes",
+    # A fork or pull-request run must never open or close the signal.
+    "fork run is not trusted",
+    "pull request run is not trusted",
 )
 PUBLISHER_QUEUE_MODE = "queue: max"
+
+_TOP_LEVEL_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+:")
+_JOB_KEY_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
+_COMMENT_RE = re.compile(r"#.*")
+_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}", re.IGNORECASE)
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,9 +83,9 @@ def job_blocks(workflow: str) -> dict[str, str]:
     current: str | None = None
     body: list[str] = []
     for line in lines[start + 1 :]:
-        if re.match(r"^[A-Za-z0-9_-]+:", line):
+        if _TOP_LEVEL_KEY_RE.match(line):
             break
-        match = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        match = _JOB_KEY_RE.match(line)
         if match:
             if current is not None:
                 blocks[current] = "".join(body)
@@ -136,7 +144,7 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         failures,
     )
     for name in REQUIRED_CHECK_NAMES:
-        live = re.sub(r"#.*", "", text)
+        live = _COMMENT_RE.sub("", text)
         require(
             name not in live,
             f"scaling workflow must not mention required check name {name}",
@@ -190,7 +198,7 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
     for match in EXTERNAL_ACTION.finditer(text):
         ref = match.group("ref")
         require(
-            bool(re.fullmatch(r"[0-9a-f]{40}", ref, flags=re.IGNORECASE)),
+            bool(_COMMIT_SHA_RE.fullmatch(ref)),
             f"mutable external action ref forbidden: {match.group('action')}@{ref}",
             failures,
         )
@@ -238,7 +246,7 @@ def validate_freshness_text(text: str, failures: list[str]) -> None:
         "freshness workflow must not reference the advisory token",
         failures,
     )
-    live = re.sub(r"#.*", "", text)
+    live = _COMMENT_RE.sub("", text)
     for name in REQUIRED_CHECK_NAMES:
         require(
             name not in live,
@@ -248,7 +256,7 @@ def validate_freshness_text(text: str, failures: list[str]) -> None:
     for match in EXTERNAL_ACTION.finditer(text):
         ref = match.group("ref")
         require(
-            bool(re.fullmatch(r"[0-9a-f]{40}", ref, flags=re.IGNORECASE)),
+            bool(_COMMIT_SHA_RE.fullmatch(ref)),
             f"mutable external action ref forbidden: {match.group('action')}@{ref}",
             failures,
         )
@@ -311,7 +319,7 @@ def validate_signal_text(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        "not numeric run-id comparison" in production or "not numeric run-id" in production,
+        "not numeric run-id" in production,
         "signal must not treat numeric run-id ordering as generation order",
         failures,
     )
@@ -356,9 +364,7 @@ def validate_helper_text(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        'NAMESPACE_FENCE_RETRY_MESSAGE: &str =\n    "Namespace mutation is temporarily unavailable; retry later"'
-        in text
-        or '"Namespace mutation is temporarily unavailable; retry later"' in text,
+        '"Namespace mutation is temporarily unavailable; retry later"' in text,
         "helper must pin the documented namespace-fence message",
         failures,
     )
@@ -397,7 +403,7 @@ def validate_harness_text(name: str, text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        ".post(format!(\"{}/batch\"" not in text and '.post(format!("{}/batch"' not in text,
+        '.post(format!("{}/batch"' not in text,
         f"{name} must not call POST /batch outside the shared helper",
         failures,
     )
@@ -450,13 +456,13 @@ def validate_repository_contract(failures: list[str]) -> None:
         load = LOAD_PATH.read_text(encoding="utf-8")
         validate_harness_text("load harness", load, failures)
         validate_load_consumer_separation(load, failures)
-    if CI_CD_PATH.is_file():
-        ci_cd = CI_CD_PATH.read_text(encoding="utf-8")
-        require(
-            "scaling-gate-freshness.yml" in ci_cd,
-            "docs/ci_cd.md must record the scaling-gate freshness workflow",
-            failures,
-        )
+    # A missing docs/ci_cd.md is a failure, not a silent skip (issue #7282).
+    ci_cd = CI_CD_PATH.read_text(encoding="utf-8") if CI_CD_PATH.is_file() else ""
+    require(
+        "scaling-gate-freshness.yml" in ci_cd,
+        "docs/ci_cd.md must record the scaling-gate freshness workflow",
+        failures,
+    )
 
 
 def self_test() -> int:

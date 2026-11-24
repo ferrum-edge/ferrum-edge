@@ -4,6 +4,8 @@ An admitted HTTP-family request keeps the absolute authorization deadline accept
 Activity, connection establishment, a retry, or a rewritten `grpc-timeout` header cannot extend it.
 The earliest authorization, client RPC, or applicable operator phase bound wins; its source is
 captured when the phase starts, so late observation cannot change the terminal's attribution.
+The streaming response and upload contract (including the gateway-owned response and upload
+pumps) is in [stream_authorization_lifetime.md](stream_authorization_lifetime.md).
 
 | Dispatch | Acquisition and readiness | Handoff and response headers | Buffered response |
 | --- | --- | --- | --- |
@@ -72,8 +74,25 @@ early `before_proxy` prebuffer, which also prepares HBONE and sidecar mesh-mTLS 
 retry and body-plugin collect, the native HTTP/3 backend collect, and the native gRPC buffered
 collect) is read through the same END_STREAM gate. hyper drops the service future on a client
 reset only while that future is pending, so a collect that read the last DATA and a masked reset in
-the same poll used to finish with the truncated body. It now fails as a client disconnect, and
-nothing is dispatched: a `499` on the HTTP paths, and gRPC `CANCELLED` on the native gRPC collect.
+the same poll fails as a client disconnect, and nothing is dispatched: a `499` on the HTTP paths, and gRPC `CANCELLED` on the native gRPC collect.
+
+When hyper drops the service future instead — the reset arrives while the handler is pending, or an
+HTTP/1.1 client closes its connection — no handler code runs at all. The request's
+`ClientAbortScope` (`src/proxy/client_abort_scope.rs`, issue #6768) owns the request context for the
+handler's lifetime (the WebSocket upgrade handler borrows it too), so the drop still settles the
+request's one terminal: a `499` client abort with the `client_disconnect` error class (gRPC:
+`CANCELLED`), through the plugin `log` chain when the route has plugins and the runtime terminal
+counters otherwise. It applies to every cancellation point before the response head: the upload,
+plugin phases, backend acquisition, the WebSocket upgrade handshake, and the wait for backend
+response headers. The scope settles in the same poll the handler returns in. It calls the drop a
+`499` client abort only on positive evidence of the client's cancellation: the HTTP/2 peer's reset
+or a lost transport, which the vendored hyper reports while it drops the stream (Hyper patch 006),
+or an HTTP/1.1 client EOF. A reset the gateway's own HTTP/2 stack sent for a protocol violation is a
+`400`; a connection the gateway closed itself (withdrawn trust, a sibling's authorization-lifetime
+close, shutdown teardown after the drain wait) or an unattributed HTTP/2 drop is a `444`. A request
+whose own terminal log was being delivered keeps that record (the log funnel finishes the sinks
+that had not started in detached delivery, never re-invoking one that had) and has its status
+counted once.
 
 When the dispatcher cancels a pump whose client has already reset, the pump looks past the DATA
 still buffered ahead of that reset, so the backend gets the client's `CANCEL` rather than the
@@ -89,31 +108,113 @@ masked `NO_ERROR` reset, or a dropped connection) as the client's own cancellati
 answers Trailers-Only `grpc-status: 1` (`CANCELLED`), runs the reject-path hooks, and logs the
 request under `rejection_phase` `client_disconnect_buffered_grpc_upload` with the
 `client_disconnect` error class. It releases a circuit-breaker probe and any backend admission
-taken for the body neutrally, and dials no backend. It used to answer `INTERNAL`, and on the
-retry path it handed the read failure to the dispatch pipeline as a gateway error.
+taken for the body neutrally, and dials no backend.
 
 An HTTP/3 frontend upload has its own form of the rule. A trailer section ends the request body
 but not the request stream, so a streamed HTTP/3 upload ends the backend upload only after the
 client's FIN, read with `recv_trailers`. A client that resets the stream after its trailers, with
 any code including `H3_NO_ERROR`, or loses its connection there, has cancelled the request. No
-streaming path completes it at the backend, and none charges it to backend health. Each path keeps
-the outcome it already gives a reset in the middle of the body:
+streaming path completes it at the backend, and none charges it to backend health. Each path
+records the same outcome as for a reset in the middle of the body.
+
+### Client-abort terminal convention
+
+A client-origin abort before response headers are committed is recorded the same way on every
+HTTP-family path (issue #6772). The cases are a request-stream reset with any code (`H3_NO_ERROR`
+included), `STOP_SENDING` on the response, or a connection the client closed (a close it sent, or a
+stateless reset). An idle-timeout expiry is not one: it fires locally even while the client is still
+reachable, for example while a completed upload waits on a slow backend, so it is the gateway-closed
+terminal. The paths are H1/H2 buffered intake, the native
+HTTP/3 backend, both HTTP/3 bridges, and native gRPC:
+
+| Signal | Recorded value |
+|---|---|
+| HTTP transaction log and request metrics | `499` (nginx's "client closed request") |
+| Native gRPC outcome | `CANCELLED` (1), logged under HTTP `200` with `grpc_status: 1` |
+| `error_class` | `client_disconnect` |
+| `client_disconnected` | `true` |
+| Circuit breaker, passive health, adaptive concurrency, HTTP/3 capability | not charged |
+
+`499` is a log and metrics value. The gateway does not send a `499` to a client that has gone. When
+the client is still reachable on the response direction, gRPC paths send `CANCELLED` trailers and
+plain HTTP paths reset the HTTP/3 response with `H3_REQUEST_CANCELLED`. Neither reports an upstream
+`502` or `UNAVAILABLE`.
+
+Only a proven client action selects this terminal (`ProvenClientAbort` in
+`src/proxy/client_abort.rs`). A failed read of the upload is classified positively by one shared
+classifier (`stream_util::classify_h3_request_read_error`) on buffered and streamed paths alike. A
+peer reset, or a connection the peer closed, is an abort. A frame error h3 closes with a
+protocol error code, or an undecodable or oversized trailer section, is malformed input. Anything
+else, including the gateway's own graceful `H3_NO_ERROR` close and Quinn's `LocallyClosed`, is the
+gateway's own close. A response-direction or connection watcher proves an abort only through a
+`STOP_SENDING` or a close the peer caused (`PeerConnectionSignal::closed_by_peer`). The watcher
+records its own typed result, so a later teardown cannot change it. On the HTTP/3 to gRPC bridge,
+the frontend terminal needs two pieces of evidence: the channel body handed the upload failure to
+hyper, and the returned error is the gateway's own HTTP/2 reset (neither received from the backend
+nor raised by h2 for a backend protocol violation). A backend reset that wins that race, a
+connection failure, and an I/O failure keep their status and their health charge.
+
+An HTTP/1.1 or HTTP/2 client upload streamed to a native HTTP/3 backend is classified by the H1/H2
+relayed-upload predicate (`upload_pump::client_upload_error_fault`), not by error text (issue
+#7187): a reset or `GOAWAY` the client sent, or a reset, aborted, or broken connection, is a client
+abort; any other read failure, and an HTTP/2 stream that ended without `END_STREAM`, is a malformed
+upload (`400`). An upload over the effective request-body limit is the typed `413` on every native
+HTTP/3 path.
+
+The `client_disconnect` class alone does not select the client-abort terminal, because that class
+also marks terminals the gateway chose while the client may still be connected. Each terminal keeps
+its own status:
+
+| Terminal | HTTP | gRPC |
+|---|---|---|
+| Client abort before response headers | `499` | `CANCELLED` |
+| Malformed upload (undecodable DATA or trailers, or a frame after the trailers) | `400` | `INVALID_ARGUMENT` |
+| Gateway closed the client's stream or connection | `503` | `UNAVAILABLE` |
+| Client RPC deadline or stalled client upload | `504` | `DEADLINE_EXCEEDED` |
+| Expired authorization lifetime | `401` | `UNAUTHENTICATED` |
+| Backend failure | `502` (`504` for a backend timeout) | `UNAVAILABLE` (`DEADLINE_EXCEEDED`) |
+
+The client-abort, malformed, and gateway-closed terminals are all neutral for backend health, and
+each request is recorded once. The streamed native HTTP/3 dispatch, the native HTTP/3 gRPC backend
+open and header wait, and the streaming HTTP/3 to gRPC bridge watch the client's response direction
+until the backend's response head arrives. On those paths, a client that cancels after a clean upload
+FIN while the backend withholds its head is a client abort, not a backend timeout. A settled backend
+result or a deadline wins a simultaneous cancel. The buffered native HTTP/3 retry loop does not watch
+yet. There, such a cancel stays unobserved until the backend answers or its own timeout fires, and it
+is never recorded as a client abort. A frontend-selected gRPC terminal write is bounded by the shared
+terminal-write grace, so a client that leaves its response direction open without flow-control
+credit cannot hold the request's accounting.
+
+After response headers are committed, the committed status stays. A later client abort only marks
+the transaction `client_disconnected` and incomplete. A gRPC status is committed with the trailers,
+so a native gRPC RPC whose client aborts its upload mid-response still ends `CANCELLED`, and the log
+records that status under the committed HTTP `200`, never a fallback `UNKNOWN`. On the HTTP/3 to gRPC
+bridge the relay has already reset the response when the backend body fails, so `CANCELLED` is
+recorded but cannot be written. A failed write of response headers the backend already produced
+keeps the backend's status, as nginx does.
+
+Per path, for a streamed upload:
 
 - Native HTTP/3 backend: the backend request stream is reset with `H3_REQUEST_CANCELLED`, never
-  finished. The client sees a `502` and request metrics count a `502`; the transaction log's error
-  class comes from the HTTP/3 error classifier (`ProtocolError` for a stream reset,
-  `ConnectionTimeout` for an idle timeout). Backend health, the circuit breaker, and the HTTP/3
-  capability are not charged.
+  finished. The client's response is reset with `H3_REQUEST_CANCELLED`, and no gateway `502` is
+  written. The request is logged and counted as `499` / `client_disconnect`. Backend health, the
+  circuit breaker, and the HTTP/3 capability are not charged.
 - Native HTTP/3 gRPC and the HTTP/3 to gRPC bridge: the backend stream is reset
   (`H3_REQUEST_CANCELLED`, or an HTTP/2 reset instead of `END_STREAM`). The RPC is answered
-  `UNAVAILABLE` with error class `ClientDisconnect`.
+  `CANCELLED` when the response direction is still open, and is recorded `client_disconnected` with
+  error class `ClientDisconnect` either way.
 - Plain HTTP/3 to HTTP bridge: the request body ends with an error. An HTTP/1.1 backend sees an
   aborted body and a closed connection, never the terminal chunk. An HTTP/2 backend sees its stream
-  reset. The request is recorded as a client disconnect with no response status.
+  reset. The client's response is reset with `H3_REQUEST_CANCELLED`, and the request is recorded as
+  `499` / `client_disconnect`.
 
-Before this change the native paths and the gRPC bridge answered this reset as malformed trailers
-(`400` / `INVALID_ARGUMENT`), so alerts keyed on `5xx` or gRPC `UNAVAILABLE` can see more of these
-requests. An undecodable trailer section, or a known frame after it, is still malformed.
+A malformed upload on these paths is `400` / `INVALID_ARGUMENT`, and a stream the gateway ended is
+`503` / `UNAVAILABLE`. Both are neutral for backend health. On the plain bridge both are logged
+without a write, and the response is reset because the stream has failed. The buffered plain and
+mesh bridges reset a departed plain-HTTP client's response too: they run the cancellation hooks and
+log `499`, but never write it.
+
+### Plain bridge backend body abort
 
 On the plain bridge the dispatch loop also aborts the backend body itself whenever it gives up on
 the request before a backend response: the client's STOP_SENDING on the response, a lost
@@ -130,10 +231,52 @@ apply the same end-of-stream read before dispatch (see [HTTP/3](http3.md)).
 The streaming body classifier, `classify_reqwest_error`, and the direct HTTP/1.1 pool's hyper error
 classifier never count this gateway-initiated reset as a backend failure (see
 [error classification](error_classification.md)). The sidecar mesh-mTLS, HBONE, and Unix-socket
-dispatchers do not inspect the cause of a `send_request` failure before response headers: apart
-from a canceled dispatch of a replayable body, it is `protocol_error`. If the gateway's reset
-surfaces there while the dispatch is still running, it is charged to that target's circuit breaker
-and passive health, as an explicit client `CANCEL` already is.
+dispatchers (issue #6776) first ask whether a `send_request` failure before response headers is
+the gateway's own request body ending the exchange. That proof is typed: hyper's HTTP/1.1 client
+(HBONE's inner client, the Unix-socket pool) fails the exchange with a user body error carrying the
+body's error, and its HTTP/2 client (sidecar mesh-mTLS, Unix h2c) fails the response wait with a
+stream reset h2 records as user-initiated. A reset or `GOAWAY` the backend sent, a backend close,
+and an I/O failure are not that proof. When it holds, the dispatcher names the cause from the
+upload's typed terminals, the same ones the direct-HTTP/2 early-response refusal reads (issue
+#6314):
+
+- The client's upload failed first: the gateway-owned pump's `SourceError` terminal, or, with no
+  pump, the size-limit adapter, which then reads only the client body. Where that body is read,
+  the typed error is reduced to a fault and nothing else is kept. Only typed proof the client
+  is gone counts as a departure: an HTTP/2 `RST_STREAM` or `GOAWAY` the client sent, or a reset,
+  aborted, or broken connection. An early EOF does not count: a client may half-close its write
+  side mid-upload and keep reading. Neither does an HTTP/2 stream that ended without `END_STREAM`
+  and without a reset the client sent, a body hyper's HTTP/1.1 decoder rejected, or a stream h2
+  reset because the client broke the protocol. Each of those is a malformed or incomplete upload.
+  - The client is proven gone: a client-closed request, `499` with `{"error":"Client disconnected"}`
+    (Trailers-Only `CANCELLED` for gRPC). The terminal transaction summary is marked
+    `client_disconnected`, which also feeds the client-disconnect counter, exactly once. That
+    mark comes from the dispatcher's proof, never from the `client_disconnect` class alone. The
+    client's transport cannot carry a response, so the `499` is what the logs and request
+    metrics record.
+  - The upload was malformed or incomplete, or no fault was recorded: a response is still
+    deliverable, so it is a bad request, `400` with `{"error":"Malformed request body"}`
+    (`INVALID_ARGUMENT` for gRPC), never a `499`, and not marked `client_disconnected`.
+  - Both carry the health-neutral `client_disconnect` error class: the circuit breaker, passive
+    health, least-latency samples, and adaptive concurrency are not charged, and
+    `connection_error` stays `false`, so neither is replayed as a connect failure.
+  - A gRPC refusal's status is recorded for the transaction summary and request metrics from its
+    Trailers-Only headers (`grpc_status` `1` or `3`), not synthesized as `UNKNOWN`.
+- The admitted stream's authorization lifetime ended the upload: the same health-neutral
+  authorization terminal as the response-header wait.
+- The pump's backend write watermark ended it: the same backend-charged `504`
+  (`read_write_timeout`, gRPC `DEADLINE_EXCEEDED`) as the watermark arm of the header wait.
+
+Any other cause keeps the previous classification. A failure that is not that proof, including a
+backend `CANCEL`, `NO_ERROR`, or `REFUSED_STREAM` reset, is still `protocol_error` and still
+charged to the target, and a canceled dispatch of a replayable body is still the pre-wire
+`connection_pool_error`. A replayable body has no client source to fail, so a gateway reset there
+names only the authorization or write-watermark cause. A route deadline cancels the whole attempt
+instead and is attributed by the route-deadline wrapper (`504`, charged only when the backend held
+the attempt). Once response headers have arrived the backend status is kept; a later upload
+failure is handled by the response-body classifiers above. A client that disappears after its
+upload completed ends no backend upload, so it relays no reset through these dispatchers: its
+request handler is dropped, or it runs to completion.
 
 ## Request-future stack boundaries
 

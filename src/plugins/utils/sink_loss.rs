@@ -36,14 +36,17 @@ pub const OTHER_PLUGIN: &str = "other";
 /// Sorted so the rendered exposition is stable across scrapes. Adding a sink
 /// means adding it here *and* to the `docs/prometheus_metrics.md` inventory
 /// note; the label set is asserted bounded by the unit tests.
-pub const SINK_PLUGINS: [&str; 10] = [
+pub const SINK_PLUGINS: [&str; 12] = [
     "ai_transcript_audit",
     "api_chargeback_sink",
     "http_logging",
     "kafka_logging",
     "loki_logging",
+    // Span records of the standalone tracing exporter.
+    "otel_tracing",
     OTHER_PLUGIN,
     "statsd_logging",
+    "stdout_logging",
     "tcp_logging",
     "udp_logging",
     "ws_logging",
@@ -178,15 +181,11 @@ pub fn record_accepted(plugin: &str, records: u64) {
 }
 
 /// Cumulative records lost by `plugin` for `reason` since process start.
-// Read by the external unit-test crate; the binary target compiles this module
-// separately and cannot observe those callers.
-#[allow(dead_code)]
 pub fn dropped_total(plugin: &str, reason: SinkLossReason) -> u64 {
     DROPPED[plugin_index(plugin)][reason.index()].load(Ordering::Relaxed)
 }
 
 /// Cumulative records lost by `plugin` across every reason.
-#[allow(dead_code)] // See `dropped_total`.
 pub fn dropped_total_all_reasons(plugin: &str) -> u64 {
     let index = plugin_index(plugin);
     SinkLossReason::ALL
@@ -196,7 +195,6 @@ pub fn dropped_total_all_reasons(plugin: &str) -> u64 {
 }
 
 /// Cumulative records admitted by `plugin` since process start.
-#[allow(dead_code)] // See `dropped_total`.
 pub fn accepted_total(plugin: &str) -> u64 {
     ACCEPTED[plugin_index(plugin)].load(Ordering::Relaxed)
 }
@@ -251,8 +249,8 @@ pub fn snapshot() -> SinkLossSnapshot {
 /// alert on `rate(...[5m]) > 0` does not depend on a sink having already lost
 /// a record for the series to exist.
 pub fn render_prometheus() -> String {
-    // 10 plugins * 7 series, each well under 128 bytes of exposition.
-    let mut output = String::with_capacity(8_192);
+    // 12 plugins * 7 series, each well under 128 bytes of exposition.
+    let mut output = String::with_capacity(12_288);
     output.push_str(
         "# HELP ferrum_plugin_log_sink_records_accepted_total Observability records admitted to a per-plugin logging sink's bounded queue. Process-cumulative; not reset by a plugin-cache reload.\n\
 # TYPE ferrum_plugin_log_sink_records_accepted_total counter\n",

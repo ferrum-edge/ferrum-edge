@@ -36,14 +36,16 @@ const API_KEY: &str = "quarantine-fail-closed-key-0123456789";
 /// Accepted by `KeyAuth::new`.
 const VALID_KEY_AUTH: &str = r#"{"key_location":"header:X-API-Key"}"#;
 
-/// Refused by `KeyAuth::new`: `key_auth` rejects unknown configuration fields
+/// Refused by `KeyAuth::new`: `key_auth` rejects unknown configuration keys
 /// (`src/plugins/key_auth.rs`), so this is a stored row no serving mode can
 /// construct.
 const MALFORMED_KEY_AUTH: &str = r#"{"key_location":"header:X-API-Key","typo":true}"#;
 
-/// Refused by the `stdout_logging` constructor, which is `OptionalFailOpen` —
-/// the one class of row a serving load is allowed to quarantine.
-const MALFORMED_STDOUT_LOGGING: &str = r#"{"filtr":{}}"#;
+/// Refused by the `transaction_debugger` constructor, which is
+/// `OptionalFailOpen` — the one class of row a serving load is allowed to
+/// quarantine. (`stdout_logging` is `KeepLastKnownGood`: the access log is
+/// never quarantined away.)
+const MALFORMED_OPTIONAL_PLUGIN: &str = r#"{"filtr":{}}"#;
 
 const PROXY_ID: &str = "quarantine-proxy";
 const LISTEN_PATH: &str = "/quarantine";
@@ -53,7 +55,7 @@ const CONSUMER_ID: &str = "quarantine-consumer";
 /// load, while other consumer changes apply incrementally (issue #6060).
 const FULL_RELOAD_CONSUMER_ID: &str = "quarantine-full-reload-trigger";
 const KEY_AUTH_PLUGIN_ID: &str = "quarantine-key-auth";
-const STDOUT_PLUGIN_ID: &str = "quarantine-stdout-logging";
+const OPTIONAL_PLUGIN_ID: &str = "quarantine-transaction-debugger";
 
 /// Upper bound on "the poll loop has observed the stored change". The poll
 /// interval is 1s; the slack covers loaded CI runners and the rejected-reload
@@ -146,7 +148,7 @@ async fn provision_full_reload_trigger_consumer(gateway: &TestGateway) {
 }
 
 /// Create the proxy, consumer + key credential, the attached `key_auth` row,
-/// and (optionally) a global `stdout_logging` row.
+/// and (optionally) a global `transaction_debugger` row.
 async fn provision_enforced_proxy(
     gateway: &TestGateway,
     backend_port: u16,
@@ -219,18 +221,18 @@ async fn provision_enforced_proxy(
             .post(gateway.admin_url("/plugins/config"))
             .header("Authorization", &auth)
             .json(&json!({
-                "id": STDOUT_PLUGIN_ID,
-                "plugin_name": "stdout_logging",
+                "id": OPTIONAL_PLUGIN_ID,
+                "plugin_name": "transaction_debugger",
                 "scope": "global",
                 "enabled": true,
                 "config": {},
             }))
             .send()
             .await
-            .expect("create stdout_logging plugin config");
+            .expect("create transaction_debugger plugin config");
         assert!(
             response.status().is_success(),
-            "create stdout_logging plugin config failed: {}",
+            "create transaction_debugger plugin config failed: {}",
             response.status()
         );
     }
@@ -438,8 +440,8 @@ async fn malformed_fail_closed_plugin_row_refuses_cold_start_without_backup() {
         output.contains("Config rejected: Plugin <redacted scalar>")
             && output.contains("plugin_config_id=<redacted scalar>")
             && output.contains("scope=Proxy")
-            && output.contains("key_auth: unknown configuration field(s): <redacted scalar>")
-            && output.contains("allowed fields are `key_location` and `hide_credentials`"),
+            && output
+                .contains("key_auth: `config`: unknown configuration key(s): <redacted scalar>"),
         "startup must retain the rejection and safe repair guidance; captured output was:\n{output}"
     );
     for withheld in [KEY_AUTH_PLUGIN_ID, PROXY_ID, API_KEY, "typo"] {
@@ -665,7 +667,9 @@ async fn hot_reload_preserves_fail_closed_plugin_and_quarantines_only_optional_r
 
     // ── In-band repair through the admin API ───────────────────────────────
     let response = reqwest::Client::new()
-        .put(gateway.admin_url(&format!("/plugins/config/{KEY_AUTH_PLUGIN_ID}")))
+        .put(gateway.admin_url(&format!(
+            "/plugins/config/{KEY_AUTH_PLUGIN_ID}?expected_proxy_ids="
+        )))
         .header("Authorization", gateway.auth_header())
         .json(&key_auth_plugin_body(VALID_KEY_AUTH))
         .send()
@@ -689,7 +693,7 @@ async fn hot_reload_preserves_fail_closed_plugin_and_quarantines_only_optional_r
     );
 
     // ── Contrast: an OptionalFailOpen row IS quarantined ───────────────────
-    store_plugin_config(&pool, STDOUT_PLUGIN_ID, MALFORMED_STDOUT_LOGGING).await;
+    store_plugin_config(&pool, OPTIONAL_PLUGIN_ID, MALFORMED_OPTIONAL_PLUGIN).await;
     seed_full_reload_change(&pool).await;
     wait_for_config_rejected(&gateway, true).await;
     pool.close().await;

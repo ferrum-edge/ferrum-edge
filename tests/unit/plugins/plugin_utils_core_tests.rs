@@ -8,29 +8,93 @@ use ferrum_edge::plugins::utils::claim_resolver::{
 use ferrum_edge::plugins::utils::json_escape::escape_json_string;
 use ferrum_edge::plugins::utils::jwks_store::JwksKeyStore;
 use ferrum_edge::plugins::utils::jwt_verifier::{
-    JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks,
+    CompiledJwtValidation, JwtVerifyParams, peek_unverified_issuer,
+    verify_jwt_with_compiled_validation, verify_jwt_with_jwks,
 };
 use ferrum_edge::plugins::utils::query::{
-    CanonicalQuery, QueryAmbiguity, canonical_query_for_policy, has_conflicting_duplicate_query_key,
+    CanonicalQuery, OrderedQuery, QueryAmbiguity, canonical_query_for_policy,
+    has_conflicting_duplicate_among, query_has_semicolon_credential_alias, query_name_matches,
+    query_name_matches_any, query_pair_names_any, semicolon_sub_pair_names,
+    semicolon_sub_pair_names_with_raw,
 };
 use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check};
 use ferrum_edge::plugins::utils::socket_host::parse_socket_host;
 use ferrum_edge::plugins::utils::sse::{
-    AnthropicEvent, MAX_ANTHROPIC_CONTENT_BLOCKS, MAX_GEMINI_CANDIDATES, SseEventName,
-    SseForwardedPrefix, SseReassembler, SseText, SseTextKind, UTF8_BOM,
-    classify_forwarded_sse_prefix, parse_sse_data_frames_checked, split_sse_line_terminator,
-    sse_event_end, sse_event_end_after, sse_line_end, sse_lines, sse_lines_inclusive,
-    strip_sse_boms,
+    AnthropicEvent, MAX_ANTHROPIC_CONTENT_BLOCKS, MAX_GEMINI_CANDIDATES,
+    MAX_OPENAI_STREAM_ACCUMULATORS, SseEventName, SseForwardedPrefix, SseReassembler, SseText,
+    SseTextKind, UTF8_BOM, classify_forwarded_sse_prefix, parse_sse_data_frames_checked,
+    split_sse_line_terminator, sse_event_end, sse_event_end_after, sse_line_end, sse_lines,
+    sse_lines_inclusive, strip_sse_boms,
 };
 use ferrum_edge::plugins::utils::token_extract::{
     TokenHeaderLocation, TokenLocation, TokenLocationExtract, extract_authorization_bearer,
-    extract_from_location,
+    extract_from_location, mark_present_query_credential_locations,
+    mark_provider_query_credential_locations, query_locations_have_semicolon_alias,
 };
 use ferrum_edge::startup::render_startup_error;
 use ferrum_edge::util::unknown_keys::reject_unknown_keys;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// The one gRPC method resolution `body_validator`, `ai_response_guard`, and
+/// `ai_transcript_audit` share: the private bound backend path wins, then
+/// non-empty `grpc_full_method` metadata (slash-prefixed), then the request
+/// path; every source reduces to its trailing `/Service/Method`.
+#[test]
+fn grpc_method_resolution_prefers_the_bound_path_and_canonicalizes_every_source() {
+    use ferrum_edge::plugins::RequestContext;
+    use ferrum_edge::plugins::utils::grpc_method::{
+        canonical_grpc_method, resolve_grpc_method_path,
+    };
+
+    let ctx = |path: &str, metadata: Option<&str>, bound: Option<&str>| {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), path.into());
+        if let Some(method) = metadata {
+            ctx.metadata
+                .insert("grpc_full_method".to_string(), method.to_string());
+        }
+        if let Some(bound) = bound {
+            ferrum_edge::_test_support::bind_authorized_backend_path_for_test(&mut ctx, bound);
+        }
+        ctx
+    };
+    for (path, metadata, bound, expected) in [
+        // Request path only, verbatim and prefixed.
+        ("/pkg.S/M", None, None, "/pkg.S/M"),
+        ("/api/pkg.S/M", None, None, "/pkg.S/M"),
+        // Metadata stands in before binding, with or without a leading slash.
+        ("/client/Path", Some("pkg.S/M"), None, "/pkg.S/M"),
+        ("/client/Path", Some("/pkg.S/M"), None, "/pkg.S/M"),
+        // Empty metadata names no method and falls through to the path.
+        ("/api/pkg.S/M", Some(""), None, "/pkg.S/M"),
+        // The bound path wins over metadata in both directions.
+        (
+            "/pkg.S/M",
+            Some("pkg.S/Other"),
+            Some("/pkg.S/M"),
+            "/pkg.S/M",
+        ),
+        (
+            "/pkg.S/M",
+            Some("pkg.S/M"),
+            Some("/pkg.S/Other"),
+            "/pkg.S/Other",
+        ),
+        // A backend base path in front of the method does not hide it.
+        ("/client", None, Some("/base/pkg.S/M"), "/pkg.S/M"),
+    ] {
+        let ctx = ctx(path, metadata, bound);
+        assert_eq!(
+            resolve_grpc_method_path(&ctx),
+            expected,
+            "path={path} metadata={metadata:?} bound={bound:?}"
+        );
+    }
+    assert_eq!(canonical_grpc_method("/a/pkg.S/M?x=1#f"), "/pkg.S/M");
+    assert_eq!(canonical_grpc_method("/pkg.S/M"), "/pkg.S/M");
+    assert_eq!(canonical_grpc_method("noslash"), "noslash");
+}
 
 #[test]
 fn unknown_key_diagnostics_keep_sorted_suggestions_when_rendered() {
@@ -214,34 +278,39 @@ fn json_escape_output_can_be_interpolated_into_json_string() {
     assert_eq!(parsed["message"], raw);
 }
 
+/// The WAF parameter-pollution predicate over `&`-separated pairs.
+fn conflicting_under_ampersand(query: &str) -> bool {
+    has_conflicting_duplicate_among(query.split('&'))
+}
+
 #[test]
 fn query_duplicate_check_detects_conflicting_duplicate_values() {
-    assert!(has_conflicting_duplicate_query_key("a=1&a=2"));
+    assert!(conflicting_under_ampersand("a=1&a=2"));
 }
 
 #[test]
 fn query_duplicate_check_allows_identical_duplicate_values() {
-    assert!(!has_conflicting_duplicate_query_key("a=1&a=1"));
+    assert!(!conflicting_under_ampersand("a=1&a=1"));
 }
 
 #[test]
 fn query_duplicate_check_detects_percent_encoded_key_collision() {
-    assert!(has_conflicting_duplicate_query_key("a%20b=1&a%20b=2"));
+    assert!(conflicting_under_ampersand("a%20b=1&a%20b=2"));
 }
 
 #[test]
 fn query_duplicate_check_detects_plus_and_percent_space_key_collision() {
-    assert!(has_conflicting_duplicate_query_key("a+b=1&a%20b=2"));
+    assert!(conflicting_under_ampersand("a+b=1&a%20b=2"));
 }
 
 #[test]
 fn query_duplicate_check_allows_percent_encoded_keys_with_same_value() {
-    assert!(!has_conflicting_duplicate_query_key("a%20b=1&a%20b=1"));
+    assert!(!conflicting_under_ampersand("a%20b=1&a%20b=1"));
 }
 
 #[test]
 fn query_duplicate_check_normalizes_plus_in_values() {
-    assert!(!has_conflicting_duplicate_query_key(
+    assert!(!conflicting_under_ampersand(
         "a=hello+world&a=hello%20world"
     ));
 }
@@ -249,39 +318,39 @@ fn query_duplicate_check_normalizes_plus_in_values() {
 #[test]
 fn query_duplicate_check_detects_encoded_plus_vs_raw_plus_value_conflict() {
     // `%2B` decodes to literal plus; raw `+` is form-urlencoded space.
-    assert!(has_conflicting_duplicate_query_key("a=%2B&a=+"));
+    assert!(conflicting_under_ampersand("a=%2B&a=+"));
 }
 
 #[test]
 fn query_duplicate_check_preserves_encoded_plus_as_literal_plus() {
-    assert!(!has_conflicting_duplicate_query_key("a=%2B&a=%2B"));
+    assert!(!conflicting_under_ampersand("a=%2B&a=%2B"));
 }
 
 #[test]
 fn query_duplicate_check_does_not_collapse_encoded_plus_and_raw_plus_keys() {
     // `a%2Bb` decodes to `a+b`; raw `a+b` is the distinct key `a b`.
-    assert!(!has_conflicting_duplicate_query_key("a%2Bb=1&a+b=2"));
+    assert!(!conflicting_under_ampersand("a%2Bb=1&a+b=2"));
 }
 
 #[test]
 fn query_duplicate_check_normalizes_raw_plus_and_percent_space_key_aliases() {
-    assert!(!has_conflicting_duplicate_query_key("a+b=1&a%20b=1"));
+    assert!(!conflicting_under_ampersand("a+b=1&a%20b=1"));
 }
 
 #[test]
 fn query_duplicate_check_detects_keys_without_equals() {
-    assert!(has_conflicting_duplicate_query_key("flag&flag=1"));
+    assert!(conflicting_under_ampersand("flag&flag=1"));
 }
 
 #[test]
 fn query_duplicate_check_allows_distinct_keys_without_equals() {
-    assert!(!has_conflicting_duplicate_query_key("flag&other"));
+    assert!(!conflicting_under_ampersand("flag&other"));
 }
 
 #[test]
 fn query_duplicate_check_ignores_empty_pairs() {
-    assert!(has_conflicting_duplicate_query_key("a=1&&a=2"));
-    assert!(!has_conflicting_duplicate_query_key("a=1&&a=1"));
+    assert!(conflicting_under_ampersand("a=1&&a=2"));
+    assert!(!conflicting_under_ampersand("a=1&&a=1"));
 }
 
 // --- CanonicalQuery: the shared representation every query-sensitive
@@ -419,6 +488,145 @@ fn canonical_query_ambiguity_reasons_are_stable_tokens() {
     assert_eq!(QueryAmbiguity::NonUtf8Name.reason(), "non_utf8_name");
     assert_eq!(QueryAmbiguity::NonUtf8Value.reason(), "non_utf8_value");
     assert_eq!(QueryAmbiguity::DuplicateName.reason(), "duplicate_name");
+    assert_eq!(
+        QueryAmbiguity::SemicolonSeparator.reason(),
+        "semicolon_separator"
+    );
+}
+
+#[test]
+fn canonical_query_flags_unencoded_semicolon_in_name_or_value() {
+    // Issue #6579: a backend that also splits on `;` (Rack < 3, Go < 1.17,
+    // Python < 3.9.2) sees `token=x` as its own parameter, while Ferrum sees
+    // one `a` whose value is `1;token=x`.
+    let query = CanonicalQuery::parse("a=1;token=x");
+    assert_eq!(query.ambiguities(), &[QueryAmbiguity::SemicolonSeparator]);
+    assert_eq!(query.len(), 1, "Ferrum still separates pairs only on '&'");
+    assert_eq!(
+        ambiguities("a;b=1"),
+        vec![QueryAmbiguity::SemicolonSeparator]
+    );
+    assert_eq!(
+        ambiguities("flag;other"),
+        vec![QueryAmbiguity::SemicolonSeparator]
+    );
+}
+
+#[test]
+fn canonical_query_flags_a_duplicate_smuggled_behind_a_semicolon() {
+    // To Ferrum `tenant` occurs once (`admin`); a `;`-splitting backend reads a
+    // second `tenant=victim` and, under last-value-wins, executes it. The
+    // duplicate-name pass cannot see it, so the semicolon class must.
+    assert_eq!(
+        ambiguities("tenant=admin&x=;tenant=victim"),
+        vec![QueryAmbiguity::SemicolonSeparator]
+    );
+}
+
+#[test]
+fn hpp_predicate_judges_the_semicolon_separator_convention() {
+    // Issue #6579: conflicting under `&`+`;`, not under `&` alone.
+    let ampersand_and_semicolon =
+        |query: &'static str| has_conflicting_duplicate_among(query.split(['&', ';']));
+    assert!(!conflicting_under_ampersand(
+        "tenant=admin&x=;tenant=victim"
+    ));
+    assert!(ampersand_and_semicolon("tenant=admin&x=;tenant=victim"));
+    assert!(ampersand_and_semicolon("a=1;a=2"));
+    // Identical values are still not a conflict, under either convention.
+    assert!(!conflicting_under_ampersand("a=1&x=;a=1"));
+    assert!(!ampersand_and_semicolon("a=1&x=;a=1"));
+    // `%3B` is a literal semicolon.
+    assert!(!ampersand_and_semicolon("a=1&x=%3Ba%3D2"));
+}
+
+#[test]
+fn credential_strip_drops_a_credential_smuggled_behind_a_semicolon() {
+    // Issue #6579: `carrier=;api_key=secret` is an `api_key` parameter to a
+    // `;`-splitting backend, so stripping must not forward it.
+    let mut ctx = ctx_for("api_key=secret&carrier=;api_key=secret&page=1");
+    ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+    let query = canonical_query_for_policy(&ctx);
+    assert!(query.is_unambiguous(), "{:?}", query.ambiguities());
+    assert_eq!(query.len(), 1);
+    assert_eq!(query.get("page"), Some("1"));
+
+    // The name-side and encoded spellings are matched too.
+    for raw in [
+        "x;api_key=secret&page=1",
+        "carrier=;api%5Fkey=secret&page=1",
+    ] {
+        let mut ctx = ctx_for(raw);
+        ctx.metadata.insert(
+            "auth.strip_query_param.api_key".to_string(),
+            "true".to_string(),
+        );
+        let query = canonical_query_for_policy(&ctx);
+        assert_eq!(query.len(), 1, "{raw}");
+        assert_eq!(query.get("page"), Some("1"), "{raw}");
+    }
+}
+
+#[test]
+fn semicolon_sub_pair_names_cover_form_decoding_and_keep_encoded_semicolons() {
+    let names = semicolon_sub_pair_names("carrier=;private+key=x;a%2Bb=1");
+    assert!(names.contains(&"private key".to_string()), "{names:?}");
+    assert!(names.contains(&"private+key".to_string()), "{names:?}");
+    // `%2B` is a literal plus under either decoding.
+    assert!(names.contains(&"a+b".to_string()), "{names:?}");
+    assert!(!names.contains(&"a b".to_string()), "{names:?}");
+    // `%3B` is content, not a separator.
+    assert!(semicolon_sub_pair_names("a=1%3Bapi_key%3Dx").is_empty());
+}
+
+#[test]
+fn credential_strip_matches_a_form_decoded_semicolon_name() {
+    // A JWKS `from_params: ["private key"]` credential consumed at
+    // `private%20key` must not survive as a hidden `;private+key=` copy that a
+    // form-decoding backend reads under the same name.
+    let mut ctx = ctx_for("private%20key=token&carrier=;private+key=token&page=1");
+    ctx.metadata.insert(
+        "auth.strip_query_param.private key".to_string(),
+        "true".to_string(),
+    );
+    let query = canonical_query_for_policy(&ctx);
+    assert_eq!(query.len(), 1, "{:?}", query.params());
+    assert_eq!(query.get("page"), Some("1"));
+}
+
+#[test]
+fn credential_strip_matches_an_ordinary_form_decoded_alias() {
+    // `private+key` is `private key` to a form-decoding backend; `%2B` stays a
+    // literal plus and is not the credential.
+    let mut ctx = ctx_for("private%20key=token&private+key=token&private%2Bkey=kept&page=1");
+    ctx.metadata.insert(
+        "auth.strip_query_param.private key".to_string(),
+        "true".to_string(),
+    );
+    let query = canonical_query_for_policy(&ctx);
+    assert_eq!(query.get("private key"), None);
+    assert_eq!(query.get("private+key"), Some("kept"));
+    assert_eq!(query.get("page"), Some("1"));
+}
+
+#[test]
+fn ordered_query_credential_removal_drops_a_semicolon_smuggled_credential() {
+    let names: HashSet<&str> = ["api_key"].into_iter().collect();
+    let mut query = OrderedQuery::parse("carrier=;api_key=secret&x;api_key=s2&keep=a;b&page=1");
+    assert!(query.remove_matching_names(&names));
+    assert_eq!(query.serialize(), "keep=a;b&page=1");
+}
+
+#[test]
+fn canonical_query_accepts_percent_encoded_semicolon() {
+    // `%3B` is a literal `;` to every decoder, so it is not a separator.
+    let query = CanonicalQuery::parse("a=1%3Btoken%3Dx&b=%3b");
+    assert!(query.is_unambiguous());
+    assert_eq!(query.get("a"), Some("1;token=x"));
+    assert_eq!(query.get("b"), Some(";"));
 }
 
 #[test]
@@ -552,7 +760,7 @@ fn jwt_verifier_peeks_issuer_without_verifying_signature() {
     let token = encode(
         &Header::default(),
         &json!({"iss": "https://issuer", "exp": 9_999_999_999u64}),
-        &EncodingKey::from_secret(b"secret"),
+        &EncodingKey::from_secret(b"secret").unwrap(),
     )
     .expect("test token should encode");
 
@@ -810,6 +1018,115 @@ async fn jwt_verifier_accepts_matching_kid_and_key() {
     assert_eq!(claims["sub"], "user");
 }
 
+/// `CompiledJwtValidation` is the per-provider precompiled form of the policy
+/// `verify_jwt_with_jwks` rebuilds on every call (jwks_auth-SOL-3). Both paths
+/// must reach the identical verdict and claims for every issuer, audience,
+/// shape, and `kid` case.
+#[tokio::test]
+async fn compiled_validation_matches_per_call_validation() {
+    let audiences = vec!["api".to_string(), "other-api".to_string()];
+    let params = JwtVerifyParams {
+        issuer: Some("https://issuer"),
+        audiences: &audiences,
+        require_exp: true,
+        leeway_secs: 0,
+        validate_nbf: true,
+    };
+    let compiled = CompiledJwtValidation::new(&params);
+    let store = two_key_store();
+    let now = chrono::Utc::now().timestamp();
+
+    let cases = [
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": "api"}),
+            "key-1",
+            true,
+        ),
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": ["x", "other-api"]}),
+            "key-1",
+            true,
+        ),
+        (json!({"sub": "u", "iss": "https://issuer"}), "key-1", false),
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": "nope"}),
+            "key-1",
+            false,
+        ),
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": 42}),
+            "key-1",
+            false,
+        ),
+        (
+            json!({"sub": "u", "iss": "https://other", "aud": "api"}),
+            "key-1",
+            false,
+        ),
+        (
+            json!({"sub": "u", "iss": ["https://issuer"], "aud": "api"}),
+            "key-1",
+            false,
+        ),
+        (json!({"sub": "u", "aud": "api"}), "key-1", false),
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": "api", "nbf": now + 600}),
+            "key-1",
+            false,
+        ),
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": "api"}),
+            "no-such-kid",
+            false,
+        ),
+    ];
+    for (claims, kid, accepted) in cases {
+        let token = super::jwks_auth_support::create_rs256_token_with_kid(
+            &claims,
+            include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+            kid,
+        );
+        let per_call = verify_jwt_with_jwks(&token, &store, &params).await;
+        let precompiled = verify_jwt_with_compiled_validation(&token, &store, &compiled);
+        assert_eq!(
+            per_call.is_some(),
+            accepted,
+            "per-call verdict for {claims}"
+        );
+        assert_eq!(
+            per_call, precompiled,
+            "compiled verdict must match for {claims}"
+        );
+    }
+
+    // A token signed by the other published key under `key-1` stays rejected.
+    let wrong_key = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({"sub": "u", "iss": "https://issuer", "aud": "api"}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private_other.pem"),
+        "key-1",
+    );
+    assert!(verify_jwt_with_compiled_validation(&wrong_key, &store, &compiled).is_none());
+}
+
+/// The compiled policy carries the configured `exp`/`nbf` leeway.
+#[test]
+fn compiled_validation_applies_configured_leeway() {
+    let now = chrono::Utc::now().timestamp();
+    let store = two_key_store();
+    let recently_expired = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({"sub": "u", "exp": now - 20}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        "key-1",
+    );
+    let strict = CompiledJwtValidation::new(&jwt_verify_params());
+    let lenient = CompiledJwtValidation::new(&JwtVerifyParams {
+        leeway_secs: 60,
+        ..jwt_verify_params()
+    });
+    assert!(verify_jwt_with_compiled_validation(&recently_expired, &store, &strict).is_none());
+    assert!(verify_jwt_with_compiled_validation(&recently_expired, &store, &lenient).is_some());
+}
+
 fn ctx_with_header(name: &str, value: &str) -> RequestContext {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
     ctx.headers.insert(name.to_string(), value.to_string());
@@ -896,12 +1213,317 @@ fn token_extract_non_materialized_custom_header_is_invalid_not_missing() {
     ));
 }
 
+// --- Semicolon-aliased query credentials (issue #6579, GHSA-c259-vchc-3vgr).
+
+#[test]
+fn semicolon_credential_alias_detects_sub_pair_spellings_only() {
+    for raw_query in [
+        "carrier=;access_token=t",
+        "carrier=1;access_token=t&keep=1",
+        // The `;` sits in the NAME, so Ferrum's name is `access_token;x`.
+        "access_token;x=1&carrier=1",
+        // Percent-encoded and form-decoded sub-pair names.
+        "carrier=;access%5Ftoken=t",
+        "access_token=t&carrier=;access_token=other",
+    ] {
+        assert!(
+            query_has_semicolon_credential_alias(Some(raw_query), "access_token"),
+            "{raw_query}"
+        );
+    }
+    assert!(query_has_semicolon_credential_alias(
+        Some("carrier=;private+key=t"),
+        "private key"
+    ));
+    for raw_query in [
+        "access_token=t",
+        // A `;` inside the credential's own value is that value, not an alias.
+        "access_token=t;x=1",
+        "access_token=t&carrier=a;b=c",
+        // `%3B` is content, never a separator.
+        "carrier=a%3Baccess_token%3Dt",
+    ] {
+        assert!(
+            !query_has_semicolon_credential_alias(Some(raw_query), "access_token"),
+            "{raw_query}"
+        );
+    }
+    assert!(!query_has_semicolon_credential_alias(None, "access_token"));
+}
+
+#[test]
+fn semicolon_credential_alias_matches_raw_and_decoded_names_without_changing_semantics() {
+    // Plain names compare by raw spelling only.
+    assert!(query_has_semicolon_credential_alias(
+        Some("carrier=;tenant_ticket=t"),
+        "tenant_ticket"
+    ));
+    // A configured name holding a literal escape matches its raw spelling...
+    assert!(query_has_semicolon_credential_alias(
+        Some("carrier=;workspace%2Dslot=t"),
+        "workspace%2Dslot"
+    ));
+    // ...and the decoded reading of an encoded sub-pair still matches.
+    assert!(query_has_semicolon_credential_alias(
+        Some("carrier=;workspace%2Dslot=t"),
+        "workspace-slot"
+    ));
+    // `%2B` is a literal plus under either decoding, never a space.
+    assert!(!query_has_semicolon_credential_alias(
+        Some("carrier=;private%2Bkey=t"),
+        "private key"
+    ));
+    assert!(query_has_semicolon_credential_alias(
+        Some("carrier=;private%2Bkey=t"),
+        "private+key"
+    ));
+}
+
+#[test]
+fn canonical_query_reports_raw_semicolon_sub_pair_spellings() {
+    let query = CanonicalQuery::parse("carrier=;workspace%2Dslot=t&page=1");
+    let carrier = query
+        .params()
+        .iter()
+        .find(|param| param.name == "carrier")
+        .expect("carrier pair");
+    assert!(
+        carrier
+            .semicolon_sub_names
+            .iter()
+            .any(|name| name == "workspace-slot"),
+        "{:?}",
+        carrier.semicolon_sub_names
+    );
+    assert!(
+        carrier
+            .semicolon_sub_names
+            .iter()
+            .any(|name| name == "workspace%2Dslot"),
+        "{:?}",
+        carrier.semicolon_sub_names
+    );
+}
+
+/// The single-pass collection reports exactly the decoded sub-pair names
+/// plus every raw spelling, as membership, and nothing else.
+#[test]
+fn semicolon_sub_pair_names_with_raw_is_decoded_names_plus_raw_spellings() {
+    for segment in [
+        "carrier=;workspace%2Dslot=t;private+key=x;a%2Bb=1;plain=2",
+        "access_token;x=1",
+        "carrier=a;b=c",
+        "carrier=;%E2%82%AC=t;%ZZ=bad",
+    ] {
+        let collected: HashSet<String> = semicolon_sub_pair_names_with_raw(segment)
+            .into_iter()
+            .collect();
+        let mut expected: HashSet<String> = semicolon_sub_pair_names(segment).into_iter().collect();
+        expected.extend(
+            segment
+                .split(';')
+                .map(|sub_pair| sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name))
+                .map(str::to_string),
+        );
+        assert_eq!(collected, expected, "{segment}");
+    }
+    assert!(semicolon_sub_pair_names_with_raw("a=1%3Bapi_key%3Dx").is_empty());
+    assert!(semicolon_sub_pair_names_with_raw("plain=1").is_empty());
+
+    // Linear in the number of sub-pairs: a long run of distinct plain names
+    // yields one entry each.
+    let segment: String = std::iter::once("carrier=".to_string())
+        .chain((0..2048).map(|idx| format!(";n{idx}=v")))
+        .collect();
+    assert_eq!(semicolon_sub_pair_names_with_raw(&segment).len(), 2049);
+}
+
+/// The one shared name-equivalence predicate: raw spelling, percent
+/// decoding, or (with a raw `+`) form decoding — the outbound strip's rule.
+#[test]
+fn shared_query_name_predicate_matches_raw_and_decoded_spellings() {
+    assert!(query_name_matches("workspace%2Dslot", "workspace%2Dslot"));
+    assert!(query_name_matches("workspace%2Dslot", "workspace-slot"));
+    assert!(query_name_matches("private+key", "private key"));
+    assert!(query_name_matches("private+key", "private+key"));
+    assert!(!query_name_matches("private%2Bkey", "private key"));
+    assert!(!query_name_matches("workspace-slot", "workspace%2Dslot"));
+
+    let marked: HashSet<&str> = ["workspace%2Dslot", "private key"].into_iter().collect();
+    assert!(query_name_matches_any("workspace%2Dslot", &marked));
+    assert!(query_name_matches_any("private+key", &marked));
+    assert!(!query_name_matches_any("workspace-slot", &marked));
+
+    // Pair-level: own name or any `;` sub-pair, exactly what the strip drops.
+    for pair in [
+        "workspace%2Dslot=v",
+        "private+key=v",
+        "carrier=;workspace%2Dslot=v",
+        "carrier=;private%20key=v",
+    ] {
+        assert!(query_pair_names_any(pair, &marked), "{pair}");
+    }
+    for pair in [
+        "workspace-slot=v",
+        "carrier=a;b=c",
+        "carrier=a%3Bprivate%20key%3Dv",
+    ] {
+        assert!(!query_pair_names_any(pair, &marked), "{pair}");
+    }
+    let mut ctx = ctx_for(
+        "workspace%2Dslot=a&carrier=;private+key=b&private%20key=c&workspace-slot=kept&page=1",
+    );
+    for name in ["workspace%2Dslot", "private key"] {
+        ctx.metadata
+            .insert(format!("auth.strip_query_param.{name}"), "true".to_string());
+    }
+    assert_eq!(
+        ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx),
+        "workspace-slot=kept&page=1"
+    );
+}
+
+/// The canonical view keeps a distinct raw top-level spelling for credential
+/// comparison only.
+#[test]
+fn canonical_query_keeps_a_distinct_raw_top_level_name_for_comparison() {
+    let query = CanonicalQuery::parse("workspace%2Dslot=1&plain=2&private+key=3");
+    let params = query.params();
+    assert_eq!(params[0].name, "workspace-slot");
+    assert_eq!(params[0].raw_name.as_deref(), Some("workspace%2Dslot"));
+    assert_eq!(params[1].raw_name, None);
+    // `+` survives RFC decoding, so the raw spelling equals the name and the
+    // form reading is carried separately.
+    assert_eq!(params[2].name, "private+key");
+    assert_eq!(params[2].form_name.as_deref(), Some("private key"));
+    assert_eq!(params[2].raw_name, None);
+}
+
+#[test]
+fn query_locations_alias_check_spans_every_configured_query_location() {
+    let locations = [
+        TokenLocation::Header(TokenHeaderLocation {
+            name: "authorization".to_string(),
+            prefix: None,
+        }),
+        TokenLocation::QueryParam("first".to_string()),
+        TokenLocation::QueryParam("second".to_string()),
+    ];
+    assert!(query_locations_have_semicolon_alias(
+        &materialized_ctx_for("carrier=;second=t"),
+        &locations
+    ));
+    assert!(!query_locations_have_semicolon_alias(
+        &materialized_ctx_for("first=t&carrier=a;b=c"),
+        &locations
+    ));
+    assert!(!query_locations_have_semicolon_alias(
+        &materialized_ctx_for("first=t"),
+        &locations
+    ));
+}
+
+fn materialized_ctx_for(raw_query: &str) -> RequestContext {
+    let mut ctx = ctx_for(raw_query);
+    ctx.materialize_query_params();
+    ctx
+}
+
+#[test]
+fn token_extract_semicolon_aliased_query_token_is_invalid_not_missing() {
+    let location = TokenLocation::QueryParam("access_token".to_string());
+    for raw_query in [
+        "carrier=;access_token=aliased-token",
+        // The ordinary occurrence must not mask a different aliased value.
+        "access_token=plain-token&carrier=;access_token=aliased-token",
+    ] {
+        let ctx = materialized_ctx_for(raw_query);
+        assert!(
+            matches!(
+                extract_from_location(&location, &ctx),
+                TokenLocationExtract::Credential(ExtractedCredential::InvalidFormat(body))
+                    if body == r#"{"error":"Ambiguous token query parameter"}"#
+            ),
+            "{raw_query}"
+        );
+    }
+
+    let ctx = materialized_ctx_for("access_token=plain-token&carrier=a;b=c");
+    assert!(matches!(
+        extract_from_location(&location, &ctx),
+        TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token))
+            if token == "plain-token"
+    ));
+}
+
+#[test]
+fn token_extract_marks_semicolon_aliased_query_token_for_redaction_and_strip() {
+    let locations = [TokenLocation::QueryParam("access_token".to_string())];
+
+    // Redaction-only marking never changes the forwarded query.
+    let mut ctx = materialized_ctx_for("carrier=;access_token=aliased-token&keep=1");
+    mark_present_query_credential_locations(&mut ctx, &locations);
+    assert_eq!(
+        ctx.metadata
+            .get("auth.query_credential_param.access_token")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("auth.strip_query_param.access_token")
+    );
+
+    // A provider that forwards the original token keeps the alias.
+    let mut ctx = materialized_ctx_for("carrier=;access_token=aliased-token&keep=1");
+    mark_provider_query_credential_locations(&mut ctx, &locations, true);
+    assert!(
+        ctx.metadata
+            .contains_key("auth.query_credential_param.access_token")
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("auth.strip_query_param.access_token")
+    );
+
+    // `forward_original_token: false` marks the alias for removal.
+    let mut ctx = materialized_ctx_for("carrier=;access_token=aliased-token&keep=1");
+    mark_provider_query_credential_locations(&mut ctx, &locations, false);
+    assert!(
+        ctx.metadata
+            .contains_key("auth.query_credential_param.access_token")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("auth.strip_query_param.access_token")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx),
+        "keep=1"
+    );
+
+    // An ordinary (non-aliased) token keeps its accept-time strip contract:
+    // discovery marks it for redaction only.
+    let mut ctx = materialized_ctx_for("access_token=plain-token&keep=1");
+    mark_provider_query_credential_locations(&mut ctx, &locations, false);
+    assert!(
+        ctx.metadata
+            .contains_key("auth.query_credential_param.access_token")
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("auth.strip_query_param.access_token")
+    );
+}
+
 // --- H1/H2/H3 parity.
 //
-// H1/H2 call `materialize_query_params` (percent-decoded) while H3 calls
-// `materialize_query_params_raw` (percent-escaped) unless a plugin opts in.
-// The canonical policy view must be identical either way, because it decodes
-// the forwarded query directly instead of reading that protocol-dependent map.
+// Every frontend calls `materialize_query_params` (percent-decoded), so the
+// shared map is identical on H1/H2/H3 (#6580). Security consumers still decide
+// on the canonical view, which decodes the forwarded query directly instead of
+// reading that lossy single-value map.
 
 fn ctx_for(raw_query: &str) -> RequestContext {
     let mut ctx = RequestContext::new(
@@ -914,54 +1536,53 @@ fn ctx_for(raw_query: &str) -> RequestContext {
 }
 
 #[test]
-fn canonical_policy_view_is_identical_across_h1_h2_and_h3_materialization() {
-    for raw_query in [
-        "resource=%2Fadmin",
-        "action=delete%20record",
-        "sign=a%2Bb",
-        "tenant=victim&tenant=admin",
-        "action=delete+record",
-        "flag&empty=",
-        "&a=1&&b=2&",
-        "name=%FF",
-        "name=%zz",
-    ] {
-        let mut h1 = ctx_for(raw_query);
-        h1.materialize_query_params();
-        let mut h3 = ctx_for(raw_query);
-        h3.materialize_query_params_raw();
+fn http3_materializes_decoded_query_params_unconditionally() {
+    // Issue #6580: native H3 used to call `materialize_query_params_raw()`
+    // unless a configured plugin set the decoded-query capability bit, so a
+    // custom plugin that never opted in saw `%2Fadmin` over HTTP/3 and
+    // `/admin` over HTTP/1.1 and HTTP/2. Guard the dispatch selection itself,
+    // not just the decoder: the H3 materialization must be the decoded one,
+    // must not depend on any capability, and the raw variant must not return.
+    let server = include_str!("../../../src/http3/server.rs");
+    let start = server
+        .find("// Materialize query params before authentication.")
+        .expect("native H3 query materialization marker");
+    let call = server[start..]
+        .find("ctx.materialize_query_params();")
+        .map(|offset| start + offset)
+        .expect("native H3 must materialize decoded query params");
+    let between = &server[start..call];
+    assert!(
+        !between.contains("capabilities.has(") && !between.contains("if "),
+        "native H3 query decoding must not be conditional"
+    );
+    assert!(!server.contains("materialize_query_params_raw"));
 
-        assert_eq!(
-            canonical_query_for_policy(&h1),
-            canonical_query_for_policy(&h3),
-            "query {raw_query} must yield one policy view on every frontend protocol"
-        );
-    }
+    let context = include_str!("../../../src/plugins/mod.rs");
+    assert!(
+        !context.contains("pub fn materialize_query_params_raw"),
+        "the raw H3 query materializer must stay removed"
+    );
+    let cache = include_str!("../../../src/plugin_cache.rs");
+    assert!(
+        !cache.contains("pub const NEEDS_DECODED_QUERY_PARAMS"),
+        "no capability may switch a frontend back to raw query params"
+    );
 }
 
 #[test]
-fn canonical_policy_view_ignores_a_divergent_materialized_map() {
-    // `%2Fadmin` is the advisory's cross-protocol case: H1/H2 put `/admin` in
-    // the shared map and H3 puts `%2Fadmin`. Neither reaches policy.
-    let mut h1 = ctx_for("resource=%2Fadmin");
-    h1.materialize_query_params();
+fn materialized_map_and_canonical_view_agree_on_a_percent_encoded_value() {
+    // `%2Fadmin` was the advisory's cross-protocol case: H3 used to put
+    // `%2Fadmin` in the shared map while H1/H2 put `/admin`.
+    let mut ctx = ctx_for("resource=%2Fadmin");
+    ctx.materialize_query_params();
     assert_eq!(
-        h1.query_params.get("resource").map(String::as_str),
+        ctx.query_params.get("resource").map(String::as_str),
         Some("/admin")
     );
-
-    let mut h3 = ctx_for("resource=%2Fadmin");
-    h3.materialize_query_params_raw();
-    assert_eq!(
-        h3.query_params.get("resource").map(String::as_str),
-        Some("%2Fadmin")
-    );
-
-    for ctx in [&h1, &h3] {
-        let query = canonical_query_for_policy(ctx);
-        assert!(query.is_unambiguous());
-        assert_eq!(query.get("resource"), Some("/admin"));
-    }
+    let query = canonical_query_for_policy(&ctx);
+    assert!(query.is_unambiguous());
+    assert_eq!(query.get("resource"), Some("/admin"));
 }
 
 #[test]
@@ -2358,5 +2979,229 @@ fn cached_header_sanitizer_ratelimit_match_is_bounded_and_keeps_existing_familie
         "my-ratelimit-remaining",
     ] {
         assert!(!is_sensitive_header(name), "{name} should be kept");
+    }
+}
+
+/// Issue #6624: the OpenAI-style families key by provider-supplied indexes
+/// too, so they fold past a live-accumulator ceiling exactly like the
+/// Anthropic/Gemini paths, keep every byte for inspection, and fail closed.
+#[test]
+fn openai_and_responses_stream_indexes_fold_and_flag() {
+    let overflow = 500;
+    let total = MAX_OPENAI_STREAM_ACCUMULATORS + overflow;
+    let frames: Vec<serde_json::Value> = vec![
+        // chat delta.content per choice
+        serde_json::json!({"choices": (0..total)
+            .map(|i| serde_json::json!({"index": i, "delta": {"content": "c"}}))
+            .collect::<Vec<_>>()}),
+        // legacy Completions text per choice
+        serde_json::json!({"choices": (0..total)
+            .map(|i| serde_json::json!({"index": i, "text": "t"}))
+            .collect::<Vec<_>>()}),
+    ];
+    let mut reassembler = SseReassembler::new();
+    for frame in &frames {
+        reassembler.push_frame(frame);
+    }
+    // Two-dimensional tool-call keys: the cap is on live keys, so choice x
+    // tool cannot multiply it.
+    for choice in 0..30 {
+        let calls: Vec<_> = (0..30)
+            .map(|tool| {
+                serde_json::json!({"index": tool, "function": {"name": "n", "arguments": "a"}})
+            })
+            .collect();
+        reassembler.push_frame(&serde_json::json!({
+            "choices": [{"index": choice, "delta": {"tool_calls": calls}}]
+        }));
+    }
+    for index in 0..total {
+        reassembler.push_frame(&serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": index,
+            "content_index": index,
+            "delta": "r"
+        }));
+        reassembler.push_frame(&serde_json::json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": index,
+            "delta": "f"
+        }));
+    }
+
+    assert!(
+        reassembler.provider_stream_uninspectable(),
+        "an index family past the ceiling fails closed"
+    );
+    assert_eq!(
+        reassembler.accumulator_count(),
+        5 * (MAX_OPENAI_STREAM_ACCUMULATORS + 1),
+        "each family holds at most the ceiling plus one shared overflow accumulator"
+    );
+    let texts = reassembler.texts();
+    assert_eq!(texts, reassembler.clone().into_texts());
+    let bytes_of = |kind: SseTextKind| -> usize {
+        texts
+            .iter()
+            .filter(|text| text.kind == kind)
+            .map(|text| text.text.len())
+            .sum()
+    };
+    // Every delta byte is still present for inspection, none dropped.
+    assert_eq!(bytes_of(SseTextKind::ChatContent), total);
+    assert_eq!(bytes_of(SseTextKind::CompletionText), total);
+    assert_eq!(bytes_of(SseTextKind::ChatToolName), 900);
+    assert_eq!(bytes_of(SseTextKind::ChatToolArguments), 900);
+    assert_eq!(bytes_of(SseTextKind::ResponsesText), total);
+    assert_eq!(bytes_of(SseTextKind::ResponsesArguments), total);
+}
+
+#[test]
+fn openai_stream_within_the_index_ceiling_stays_inspectable() {
+    let mut reassembler = SseReassembler::new();
+    reassembler.push_frame(
+        &serde_json::json!({"choices": (0..MAX_OPENAI_STREAM_ACCUMULATORS)
+        .map(|i| serde_json::json!({"index": i, "delta": {"content": "c"}}))
+        .collect::<Vec<_>>()}),
+    );
+    assert!(!reassembler.provider_stream_uninspectable());
+    assert_eq!(
+        reassembler.accumulator_count(),
+        MAX_OPENAI_STREAM_ACCUMULATORS
+    );
+    // Draining releases slots, so a later stream segment can reuse them.
+    reassembler.drain_assistant_prefix(usize::MAX);
+    assert_eq!(reassembler.accumulator_count(), 0);
+    reassembler.push_frame(&serde_json::json!({
+        "choices": [{"index": 999, "delta": {"content": "late"}}]
+    }));
+    assert!(!reassembler.provider_stream_uninspectable());
+}
+
+#[test]
+fn extended_reassembler_folds_legacy_function_calls_and_cohere_v2_events() {
+    let frames = [
+        json!({"choices": [{"index": 0, "delta": {"function_call": {"name": "no", "arguments": "{\"a\":"}}}]}),
+        json!({"choices": [{"index": 0, "delta": {"function_call": {"name": "te", "arguments": "1}"}}}]}),
+        json!({"type": "message-start", "delta": {"message": {"role": "assistant", "content": [], "tool_plan": "", "tool_calls": []}}}),
+        json!({"type": "content-start", "index": 0, "delta": {"message": {"content": {"type": "text", "text": ""}}}}),
+        json!({"type": "content-delta", "index": 0, "delta": {"message": {"content": {"text": "Hel"}}}}),
+        json!({"type": "content-delta", "index": 0, "delta": {"message": {"content": {"text": "lo."}}}}),
+        json!({"type": "tool-plan-delta", "delta": {"message": {"tool_plan": "I will look it up."}}}),
+        json!({"type": "tool-call-start", "index": 0, "delta": {"message": {"tool_calls": {"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": ""}}}}}),
+        json!({"type": "tool-call-delta", "index": 0, "delta": {"message": {"tool_calls": {"function": {"arguments": "{\"q\":1}"}}}}}),
+        json!({"type": "tool-call-end", "index": 0}),
+        json!({"type": "message-end", "delta": {"finish_reason": "COMPLETE"}}),
+    ];
+
+    // The default reassembler leaves both shapes to its callers
+    // (`ai_response_guard` keeps its own legacy function_call accumulators).
+    let mut default = SseReassembler::new();
+    for frame in &frames {
+        default.push_frame(frame);
+    }
+    assert!(default.into_texts().is_empty());
+
+    let mut extended = SseReassembler::with_extended_provider_shapes();
+    for frame in &frames {
+        extended.push_frame(frame);
+    }
+    assert!(!extended.provider_stream_uninspectable());
+    assert_eq!(extended.assistant_content(), "Hello.I will look it up.");
+    let texts = extended.into_texts();
+    let text_of = |kind: SseTextKind| -> Vec<(String, String)> {
+        texts
+            .iter()
+            .filter(|text| text.kind == kind)
+            .map(|text| (text.json_path.clone(), text.text.clone()))
+            .collect()
+    };
+    assert_eq!(
+        text_of(SseTextKind::ChatFunctionCallName),
+        vec![(
+            "$.choices[0].delta.function_call.name".to_string(),
+            "note".to_string()
+        )]
+    );
+    assert_eq!(
+        text_of(SseTextKind::ChatFunctionCallArguments),
+        vec![(
+            "$.choices[0].delta.function_call.arguments".to_string(),
+            "{\"a\":1}".to_string()
+        )]
+    );
+    assert_eq!(
+        text_of(SseTextKind::CohereText),
+        vec![(
+            "$.message.content[0].text".to_string(),
+            "Hello.".to_string()
+        )]
+    );
+    assert_eq!(
+        text_of(SseTextKind::CohereToolPlan),
+        vec![(
+            "$.message.tool_plan".to_string(),
+            "I will look it up.".to_string()
+        )]
+    );
+    assert_eq!(
+        text_of(SseTextKind::CohereToolName),
+        vec![(
+            "$.message.tool_calls[0].function.name".to_string(),
+            "lookup".to_string()
+        )]
+    );
+    assert_eq!(
+        text_of(SseTextKind::CohereToolArguments),
+        vec![(
+            "$.message.tool_calls[0].function.arguments".to_string(),
+            "{\"q\":1}".to_string()
+        )]
+    );
+}
+
+#[test]
+fn extended_reassembler_fails_closed_on_unmodelled_cohere_v2_content() {
+    for frame in [
+        // An unmodelled hyphenated event inside an identified Cohere v2 stream.
+        json!({"type": "content-shiny", "index": 0}),
+        // A non-text content part.
+        json!({"type": "content-delta", "index": 0, "delta": {"message": {"content": {"type": "thinking", "thinking": "hmm"}}}}),
+        // A non-string text fragment.
+        json!({"type": "content-delta", "index": 0, "delta": {"message": {"content": {"text": 7}}}}),
+    ] {
+        let mut reassembler = SseReassembler::with_extended_provider_shapes();
+        reassembler.push_frame(
+            &json!({"type": "message-start", "delta": {"message": {"role": "assistant"}}}),
+        );
+        reassembler.push_frame(&frame);
+        assert!(
+            reassembler.provider_stream_uninspectable(),
+            "{frame} must mark the stream uninspectable"
+        );
+    }
+}
+
+/// The one parsed-host check behind every credentialed cleartext exemption in
+/// `oauth2_introspection`, `jwks_auth`, `oidc_relying_party`, and
+/// `ai_transcript_audit` (#6659): loopback IP literals only, never a name.
+#[test]
+fn loopback_ip_literal_host_admits_addresses_never_names() {
+    use ferrum_edge::plugins::utils::socket_host::is_loopback_ip_literal_host;
+
+    for host in ["127.0.0.1", "127.42.0.9", "::1", "[::1]"] {
+        assert!(is_loopback_ip_literal_host(host), "{host}");
+    }
+    for host in [
+        "localhost",
+        "LOCALHOST",
+        "localhost.",
+        "api.localhost",
+        "127.0.0.1.example.com",
+        "10.0.0.1",
+        "[::2]",
+        "",
+    ] {
+        assert!(!is_loopback_ip_literal_host(host), "{host}");
     }
 }

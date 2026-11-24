@@ -201,7 +201,10 @@ async fn start_masque_gateway(config: String, extra_env: &[(&str, &str)]) -> (Te
             .env("FERRUM_POOL_WARMUP_ENABLED", "false")
             .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
             .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
-            .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key");
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+            // Uncached runtime snapshot: `assert_exactly_one_stream_udp_termination`
+            // reads fresh counters instead of waiting out the 1s default cache.
+            .env("FERRUM_METRICS_RUNTIME_CACHE_MS", "0");
         for (key, value) in extra_env {
             builder = builder.env(*key, *value);
         }
@@ -467,8 +470,15 @@ async fn functional_h3_connect_udp_is_not_governed_by_backend_circuit_breaker_st
 }
 
 #[ignore]
-#[tokio::test]
-async fn functional_h3_connect_udp_refuses_a_transport_constrained_target_in_a_mixed_upstream() {
+#[test]
+fn functional_h3_connect_udp_refuses_a_transport_constrained_target_in_a_mixed_upstream() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_connect_udp_refuses_a_transport_constrained_target_in_a_mixed_upstream_inner,
+    );
+}
+
+async fn functional_h3_connect_udp_refuses_a_transport_constrained_target_in_a_mixed_upstream_inner()
+ {
     // Both members of one upstream are live UDP echo sockets, so the only thing
     // separating them is the transport the operator configured. The direct
     // member proves the route works end to end; the HBONE-tagged member must
@@ -850,6 +860,27 @@ async fn functional_h3_connect_udp_closes_live_tunnels_on_route_withdrawal() {
         .await
         .expect("a withdrawn destination must tear the live tunnel down");
 
+    // Issue #7188: the client's still-open request direction is halted with
+    // `STOP_SENDING(H3_NO_ERROR)`, never the `STOP_SENDING(0)` a dropped
+    // receive half produces. The client sees the code on its next write.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let stopped = loop {
+        match tunnel.send_datagram(b"after withdrawal").await {
+            Err(error) => break error.to_string(),
+            Ok(()) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the gateway never halted the client's request direction"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    assert!(
+        stopped.contains("H3_NO_ERROR"),
+        "a clean tunnel end must halt the request direction with H3_NO_ERROR: {stopped}"
+    );
+
     // The replacement destination is now the admitted one.
     let new_url = tunnel_url(https_port, "127.0.0.1", replacement.port);
     let mut reopened = None;
@@ -1139,7 +1170,7 @@ fn mint_masque_token(ttl_secs: i64) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(AUTH_JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(AUTH_JWT_SECRET.as_bytes()).unwrap(),
     )
     .expect("encode MASQUE consumer JWT")
 }
@@ -1251,9 +1282,10 @@ async fn stream_udp_terminations(gateway: &TestGateway, class: &str) -> u64 {
 }
 
 /// Poll until the counter reaches `expected`, then prove it does not go past
-/// it. The runtime snapshot is cached (`FERRUM_METRICS_RUNTIME_CACHE_MS`), so a
-/// second read after the cache window is what shows the terminal accounting
-/// fired once for the tunnel rather than once per relayed datagram.
+/// it. `start_masque_gateway` disables the runtime snapshot cache
+/// (`FERRUM_METRICS_RUNTIME_CACHE_MS=0`), so the second, uncached read after a
+/// settle window is what shows the terminal accounting fired once for the
+/// tunnel rather than once per relayed datagram.
 async fn assert_exactly_one_stream_udp_termination(gateway: &TestGateway, class: &str) {
     let expected = 1u64;
     let deadline = std::time::Instant::now() + AUTH_TERMINATION_GRACE;
@@ -1269,7 +1301,7 @@ async fn assert_exactly_one_stream_udp_termination(gateway: &TestGateway, class:
         "expected exactly {expected} stream_udp {class} termination(s) on a freshly spawned \
          gateway; observed {observed}"
     );
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         stream_udp_terminations(gateway, class).await,
         expected,

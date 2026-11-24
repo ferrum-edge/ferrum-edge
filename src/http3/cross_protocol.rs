@@ -18,8 +18,8 @@
 //! - **Plain flavor — request body streamed via an mpsc bridge.**
 //!   `reqwest::Body::wrap_stream` requires a `'static + Send + Sync`
 //!   stream, which cannot directly hold a `&mut RequestStream` borrow.
-//!   The bridge uses a `tokio::sync::mpsc` channel: one task (inlined via
-//!   `tokio::join!`) reads `RequestStream::recv_data()` and pushes `Bytes`
+//!   The bridge uses a `tokio::sync::mpsc` channel: a reader future polled in
+//!   the dispatch `select!` loop reads `RequestStream::recv_data()` and pushes `Bytes`
 //!   chunks into the Sender; the `Receiver` is wrapped via
 //!   `stream::unfold` and handed to `Body::wrap_stream` (the Receiver
 //!   owns its own state and is `'static`). Backpressure is provided by
@@ -27,9 +27,9 @@
 //!   `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY`, default 32). When the H3
 //!   recv half is drained OR the backend cancels, both sides unwind
 //!   cleanly without a dangling task. If the caller pre-buffered the
-//!   body (plugin phase already collected it), the buffered bytes are
-//!   passed to reqwest directly via `Body::from(Vec<u8>)` — one
-//!   allocation, no bridge.
+//!   body (plugin phase already collected it), the buffered bytes ride the
+//!   gateway-owned buffered-upload write-watermark pump
+//!   (`install_buffered_upload_write_watermark`) instead of the bridge.
 //!
 //! - **gRPC flavor — duplex streaming when replay is unnecessary.**
 //!   With no retry, request/response body buffering, or pre-buffered body, the
@@ -42,7 +42,7 @@
 //!
 //! - **Size limits.** The Plain path enforces `max_request_body_size_bytes`
 //!   inline in the streaming reader (413 on overflow mid-stream — a shared
-//!   `AtomicBool` signals the post-join branch so the reqwest stream error
+//!   `AtomicBool` signals the dispatch loop so the reqwest stream error
 //!   isn't misclassified as 502). Streaming gRPC enforces
 //!   `max_grpc_recv_size_bytes` incrementally in `GrpcBody::Channel`; buffered
 //!   gRPC enforces the same ceiling in `drain_h3_body`.
@@ -106,7 +106,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -128,6 +128,7 @@ use crate::plugins::{
 use crate::proxy::LoadBalancerConnectionGuard;
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end;
+use crate::proxy::client_abort::ProvenClientAbort;
 use crate::proxy::grpc_proxy::{
     self, GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
     GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind, proxy_grpc_request_from_bytes,
@@ -148,7 +149,7 @@ use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
 
 use super::server::{H3RetainedUpload, publish_h3_retained_body};
-use super::stream_util::h3_request_read_error_is_client_abort;
+use super::stream_util::{H3RequestReadFailure, classify_h3_request_read_error};
 
 /// Outcome reported back to the H3 listener so it can update request
 /// counters, build the `TransactionSummary` for log plugins, and record
@@ -177,6 +178,11 @@ pub struct CrossProtocolOutcome {
     /// `log_rejected_request`; the H3 frontend must not emit a duplicate generic
     /// transaction summary for the same request.
     pub rejection_logged: bool,
+    /// The matched route rule's deadline (the earlier of its total and the
+    /// committed attempt's budget) cut the streamed response body. Logged as
+    /// `read_write_timeout`, settled health-neutrally; carried so response
+    /// stream termination hooks can settle plugin-side breakers the same way.
+    pub route_deadline_cut: bool,
 }
 
 /// Wake an H3 request pump if its owning bridge future is dropped before the
@@ -356,7 +362,7 @@ fn record_cross_protocol_header_write_disconnect(
         backend_outcome_status,
         false,
         Some(ErrorClass::ClientDisconnect),
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -406,7 +412,7 @@ where
         status,
         false,
         class,
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -432,6 +438,10 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_admission_elapsed.as_secs_f64() * 1000.0,
         rejection_logged: false,
+        // The response stream termination hooks must see the route cut, so a
+        // plugin-side breaker (`ai_federation`) settles it neutrally rather
+        // than as a provider `ReadWriteTimeout`.
+        route_deadline_cut: true,
     }
 }
 
@@ -536,6 +546,92 @@ struct PlainPeerGoneBeforeResponseHeadersCtx<'a> {
     bytes_sent: u64,
     current_url: &'a str,
     response_streamed: bool,
+    /// Who ended the request (issue #6772).
+    cause: PlainPeerGone,
+}
+
+/// Why a plain-bridge request ended before any backend response head (issue
+/// #6772), from positive evidence only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlainPeerGone {
+    /// The client reset its upload, sent `STOP_SENDING`, or closed its
+    /// connection.
+    ClientAbort(ProvenClientAbort),
+    /// The upload reader failed on an HTTP/3 framing violation.
+    Malformed,
+    /// The gateway ended the stream or connection itself, or the cause is not
+    /// observable.
+    GatewayClosed,
+}
+
+/// The plain bridge reader's record of why its read failed: one of these codes,
+/// stored once beside `reader_reset_flag`.
+const PLAIN_READER_OK: u8 = 0;
+const PLAIN_READER_CLIENT_ABORT: u8 = 1;
+const PLAIN_READER_MALFORMED: u8 = 2;
+const PLAIN_READER_GATEWAY_TERMINATED: u8 = 3;
+
+fn plain_reader_failure_code(error: &h3::error::StreamError) -> u8 {
+    match classify_h3_request_read_error(error) {
+        H3RequestReadFailure::ClientAbort => PLAIN_READER_CLIENT_ABORT,
+        H3RequestReadFailure::Malformed => PLAIN_READER_MALFORMED,
+        H3RequestReadFailure::GatewayTerminated => PLAIN_READER_GATEWAY_TERMINATED,
+    }
+}
+
+impl PlainPeerGone {
+    /// The cause when the response-cancellation or connection-close watcher
+    /// ended the wait. `stop_sending` is the watcher's own typed record of a
+    /// peer `STOP_SENDING`; otherwise a closed connection is the client's only
+    /// when the client closed it.
+    fn from_watcher(
+        stop_sending: bool,
+        peer: Option<&crate::plugins::PeerConnectionSignal>,
+    ) -> Self {
+        match ProvenClientAbort::from_response_cancellation(stop_sending, peer) {
+            Some(abort) => Self::ClientAbort(abort),
+            None => Self::GatewayClosed,
+        }
+    }
+
+    /// The cause for the streamed-upload arm: the reader's own classified read
+    /// failure when it recorded one, the watchers' evidence otherwise.
+    fn from_reader(
+        code: u8,
+        stop_sending: bool,
+        peer: Option<&crate::plugins::PeerConnectionSignal>,
+    ) -> Self {
+        match code {
+            PLAIN_READER_CLIENT_ABORT => {
+                Self::ClientAbort(ProvenClientAbort::latched_upload_abort())
+            }
+            PLAIN_READER_MALFORMED => Self::Malformed,
+            // A read on a connection the client closed can fail as an
+            // unclassified closed stream rather than as the connection error;
+            // the connection's own close reason still proves the abort.
+            PLAIN_READER_GATEWAY_TERMINATED => {
+                match ProvenClientAbort::from_peer_connection(peer) {
+                    Some(abort) => Self::ClientAbort(abort),
+                    None => Self::GatewayClosed,
+                }
+            }
+            _ => Self::from_watcher(stop_sending, peer),
+        }
+    }
+
+    /// End the response direction without writing to it: a departed client's
+    /// with `H3_REQUEST_CANCELLED`, anything else as an error.
+    fn reset_response<S>(self, stream: &mut RequestStream<S, Bytes>)
+    where
+        S: SendStream<Bytes>,
+    {
+        match self {
+            Self::ClientAbort(_) => stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED),
+            Self::Malformed | Self::GatewayClosed => {
+                crate::http3::stream_util::abort_response_stream(stream)
+            }
+        }
+    }
 }
 
 /// Arguments for the ONE pre-header backend-timeout terminal on the plain
@@ -594,7 +690,7 @@ where
         504,
         false,
         Some(ErrorClass::ReadWriteTimeout),
-        args.cb_probe.take_slot(),
+        args.cb_probe.settle(),
         false,
         args.backend_start.elapsed(),
     );
@@ -642,9 +738,31 @@ where
     Ok(outcome)
 }
 
+/// The plain bridge's terminal for a request that ended before any backend
+/// response head because its client stream ended (issue #6772).
+///
+/// A proven client abort (STOP_SENDING on the response, a connection the client
+/// closed, or a client reset seen by the upload reader) takes the shared
+/// pre-header client-abort terminal: `499` in the log and request metrics, the
+/// `ClientDisconnect` error class, `client_disconnected`, and nothing written to
+/// the departed client. A framing violation the reader saw is a `400`, and a
+/// stream the gateway ended itself is the gateway-closed `503`; neither is a
+/// client disconnect. Backend health and admission stay neutral every way: the
+/// backend did not end the exchange.
 fn plain_peer_gone_before_response_headers(
     ctx: PlainPeerGoneBeforeResponseHeadersCtx<'_>,
 ) -> CrossProtocolOutcome {
+    let client_abort = match ctx.cause {
+        PlainPeerGone::ClientAbort(abort) => Some(abort.pre_header_terminal()),
+        PlainPeerGone::Malformed | PlainPeerGone::GatewayClosed => None,
+    };
+    let status = match ctx.cause {
+        PlainPeerGone::ClientAbort(abort) => abort.pre_header_terminal().http_status,
+        PlainPeerGone::Malformed => StatusCode::BAD_REQUEST.as_u16(),
+        PlainPeerGone::GatewayClosed => {
+            crate::proxy::client_abort::GATEWAY_CLOSED_UPLOAD_TERMINAL.http_status
+        }
+    };
     record_cross_protocol_header_write_disconnect(
         ctx.state,
         ctx.proxy,
@@ -652,21 +770,32 @@ fn plain_peer_gone_before_response_headers(
         ctx.upstream_balancer,
         ctx.current_target,
         ctx.cb_target_key,
-        0,
-        0,
+        status,
+        status,
         ctx.cb_probe,
         ctx.backend_start,
         ctx.backend_admission_permits,
         ctx.backend_admission_elapsed,
     );
-    cross_protocol_header_write_disconnect_outcome(
-        0,
+    let mut outcome = cross_protocol_header_write_disconnect_outcome(
+        status,
         ctx.response_streamed,
         ctx.bytes_sent,
         ctx.backend_start,
         Some(strip_query_from_backend_url(ctx.current_url)),
         None,
-    )
+    );
+    match client_abort {
+        Some(terminal) => {
+            outcome.error_class = Some(terminal.error_class);
+            outcome.client_disconnected = terminal.client_disconnected;
+        }
+        None => {
+            outcome.client_disconnected = false;
+            outcome.body_error_class = None;
+        }
+    }
+    outcome
 }
 
 fn cross_protocol_header_write_disconnect_outcome(
@@ -695,6 +824,7 @@ fn cross_protocol_header_write_disconnect_outcome(
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
+        route_deadline_cut: false,
     }
 }
 
@@ -803,19 +933,24 @@ fn record_cross_protocol_retry_failure(
     cb_target_key: Option<&str>,
     response_status: u16,
     connection_error: bool,
-    is_half_open_probe: bool,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
 ) {
     // The failed attempt's connection ends now, not after the retry backoff.
     *lb_connection = None;
 
-    if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state.circuit_breaker_cache.get_or_create(
-            &proxy.namespace,
-            &proxy.id,
-            cb_target_key,
-            cb_config,
+    if let Some(cb) = cb_probe.current_breaker(
+        &state.circuit_breaker_cache,
+        &proxy.namespace,
+        &proxy.id,
+        cb_target_key,
+    ) {
+        cb.settle(
+            cb_probe.take_slot(),
+            crate::circuit_breaker::BreakerOutcome::Failure {
+                status_code: response_status,
+                connection_error,
+            },
         );
-        cb.record_failure(response_status, connection_error, is_half_open_probe);
     }
 }
 
@@ -993,7 +1128,7 @@ where
         cb_probe,
         flavor,
         prebuffered_body,
-        prebuffered_body_charge,
+        mut prebuffered_body_charge,
         request_body_prepared,
         raw_prebuffered_body_bytes,
         client_ip,
@@ -1035,14 +1170,34 @@ where
             // they do on the H1/H2 dispatch path. This bridge path has no
             // `:method` pseudo-header for the no-context hook to consult.
             let grpc_deadline_at = ctx.grpc_deadline_at();
-            let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            // Each replacement is charged before it is installed; an uncovered
+            // one is dropped with the body and its charge released inside the
+            // chain.
+            let transformed = crate::proxy::boxed_apply_request_body_plugins_with_context(
                 plugins,
                 Some(&mut *ctx),
                 grpc_deadline_at,
                 proxy_headers,
                 body,
+                prebuffered_body_charge.as_mut(),
             )
             .await;
+            let Ok(transformed) = transformed else {
+                // Nothing of the refused body may outlive the refusal's writes.
+                drop(prebuffered_body_charge.take());
+                cb_probe.release_neutral();
+                return boxed_write_bridge_upload_refusal(
+                    stream,
+                    flavor,
+                    plugins,
+                    ctx,
+                    BridgeUploadRefusal::BufferCapacity,
+                    response_committed_plugins,
+                    initial_response_header_policy_plugins.as_ref(),
+                    backend_start,
+                )
+                .await;
+            };
             // Run validators. Reject = emit a trailers-only native gRPC error,
             // a gRPC-Web trailer frame when that client representation was
             // retained, or a plain JSON error otherwise, then return early
@@ -1516,8 +1671,12 @@ impl PlainAttemptRecord {
         Self::failed(class)
     }
 
-    /// The plain bridge's one call to `RequestContext::record_backend_attempt`.
-    fn record(self, ctx: &RequestContext) {
+    /// The plain bridge's one call to `RequestContext::record_backend_attempt`,
+    /// after the dispatch provenance response-side plugins read
+    /// (`request_deduplication` releases its in-flight lease only on a proven
+    /// pre-wire failure), recorded for every attempt as proxy core records it.
+    fn record(self, ctx: &mut RequestContext) {
+        ctx.record_backend_dispatch_outcome(self.error_class, self.on_wire);
         ctx.record_backend_attempt(self.error_class, self.on_wire, self.status);
     }
 }
@@ -1587,16 +1746,13 @@ pub(crate) enum PlainAttemptEnd<T, D = std::convert::Infallible> {
 }
 
 impl<T: PlainSettledAttempt, D> PlainAttemptEnd<T, D> {
-    /// Record the attempt: end its `otel_tracing` CLIENT span and add it to
-    /// the request's diagnostic reference. A deadline or a disconnect is the
-    /// client's, except a gRPC-Web deadline that fired after the handoff and
-    /// was the route attempt budget (#5646), the backend's timeout, exactly as
-    /// the terminal records the attempt's outcome. Nothing is derived for a
-    /// request that records no attempts.
-    pub(crate) fn record(&self, ctx: &RequestContext) {
-        if !ctx.records_backend_attempts() {
-            return;
-        }
+    /// Record the attempt: its dispatch provenance, its `otel_tracing` CLIENT
+    /// span, and its diagnostic-reference entry. A deadline or a disconnect is
+    /// the client's, except a gRPC-Web deadline that fired after the handoff
+    /// and was the route attempt budget (#5646), the backend's timeout, exactly
+    /// as the terminal records the attempt's outcome. The record is derived
+    /// for every request: the provenance is request state, not a diagnostic.
+    pub(crate) fn record(&self, ctx: &mut RequestContext) {
         let record = match self {
             Self::Settled(settled) => settled.attempt_record(ctx),
             Self::HeaderTimeout | Self::WriteWatermark => {
@@ -2147,6 +2303,12 @@ where
             // The client never existed: a pre-wire connection failure, tokened
             // `connection_failure` after the hooks (see
             // `plain_pool_client_failure_headers`).
+            // Written inside the caller's `plain_local_bound` race, so the
+            // committed observers do not run here: a race firing mid-observer
+            // would drop it and write a second terminal. This attempt never
+            // existed and records no provenance, so `request_deduplication`
+            // keeps its lease (fail-closed), even when every earlier retry
+            // attempt was refused pre-wire.
             let mut outcome = write_plain_gateway_error_terminal(
                 stream,
                 plugins,
@@ -2154,6 +2316,7 @@ where
                 StatusCode::BAD_GATEWAY,
                 Bytes::from_static(crate::proxy::CONNECTION_POOL_CLIENT_ERROR_BODY.as_bytes()),
                 true,
+                false,
                 backend_start,
                 0,
             )
@@ -2221,7 +2384,7 @@ fn record_cross_protocol_client_acquire_failure(
         502,
         true,
         None,
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -2379,7 +2542,7 @@ where
             502,
             false,
             Some(ErrorClass::DispatchPolicyRejected),
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -2426,7 +2589,7 @@ where
             502,
             false,
             Some(ErrorClass::DispatchPolicyRejected),
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -2506,7 +2669,7 @@ where
                     502,
                     false,
                     Some(ErrorClass::DispatchPolicyRejected),
-                    cb_probe.take_slot(),
+                    cb_probe.settle(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -2600,7 +2763,7 @@ where
                     503,
                     false,
                     Some(ErrorClass::DispatchPolicyRejected),
-                    cb_probe.take_slot(),
+                    cb_probe.settle(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -2654,7 +2817,7 @@ fn record_plain_grpc_web_client_deadline(
         StatusCode::OK.as_u16(),
         false,
         Some(ErrorClass::ClientDisconnect),
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -2729,7 +2892,7 @@ fn record_plain_grpc_web_deadline_after_handoff(
         StatusCode::OK.as_u16(),
         false,
         class,
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -2857,7 +3020,7 @@ fn record_plain_grpc_web_client_deadline_after_backend_response(
         backend_status,
         backend_connection_error,
         backend_error_class,
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -3238,9 +3401,16 @@ where
         crate::http3::stream_util::abort_response_stream(stream);
         return (0, false);
     };
-    let bytes = translated.body.len() as u64;
+    // A `HEAD` response carries no body bytes (RFC 9110 §9.3.2), so none are
+    // delivered or accounted.
+    let omit_body = crate::http3::server::h3_request_is_head();
+    let bytes = if omit_body {
+        0
+    } else {
+        translated.body.len() as u64
+    };
     let write = async {
-        if !translated.body.is_empty() {
+        if !translated.body.is_empty() && !omit_body {
             stream.send_data(Bytes::from(translated.body)).await?;
         }
         stream.finish().await
@@ -3393,7 +3563,7 @@ async fn dispatch_plain<S>(
     request_authority: Option<&str>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
-    S: RecvStream + SendStream<Bytes> + SendStreamStopped,
+    S: RecvStream + SendStream<Bytes> + SendStreamStopped + Send,
 {
     // Effective client-facing ceilings for this request: each global knob
     // narrowed by any active route ceiling, `0` still meaning unlimited. The H3
@@ -3534,20 +3704,7 @@ where
     let (prebuffered_body, raw_prebuffered_body_bytes) = if prebuffered_body.is_none()
         && upstream_target.is_some_and(crate::proxy::target_requires_http_mesh_egress)
     {
-        let Some(upload) = H3RetainedUpload::admit(effective_max_request_body_size_bytes) else {
-            cb_probe.release_neutral();
-            return Box::pin(write_bridge_upload_refusal(
-                stream,
-                HttpFlavor::Plain,
-                plugins,
-                ctx,
-                BridgeUploadRefusal::BufferCapacity,
-                response_committed_plugins,
-                initial_response_header_policy_plugins,
-                backend_start,
-            ))
-            .await;
-        };
+        let upload = H3RetainedUpload::admit(effective_max_request_body_size_bytes);
         match super::server::collect_h3_request_body_under_authorization(
             drain_h3_body(stream, upload, &mut mesh_upload_charge),
             plain_local_bound,
@@ -3555,16 +3712,30 @@ where
         )
         .await
         {
-            Ok(Some(body)) => {
+            Ok(Ok(body)) => {
                 let len = body.len() as u64;
                 // No request body hook runs on this drain, so the client's
                 // bytes are the backend-visible body (#5819).
                 crate::plugins::grpc_web::record_request_grpc_message_count(ctx, &body);
                 (Some(body), len)
             }
-            Ok(None) => {
+            Ok(Err(crate::proxy::response_buffer_budget::RetainRejection::BudgetExhausted)) => {
                 cb_probe.release_neutral();
-                return Box::pin(write_bridge_upload_refusal(
+                return boxed_write_bridge_upload_refusal(
+                    stream,
+                    HttpFlavor::Plain,
+                    plugins,
+                    ctx,
+                    BridgeUploadRefusal::BufferCapacity,
+                    response_committed_plugins,
+                    initial_response_header_policy_plugins,
+                    backend_start,
+                )
+                .await;
+            }
+            Ok(Err(crate::proxy::response_buffer_budget::RetainRejection::TooLarge)) => {
+                cb_probe.release_neutral();
+                return boxed_write_bridge_upload_refusal(
                     stream,
                     HttpFlavor::Plain,
                     plugins,
@@ -3573,7 +3744,7 @@ where
                     response_committed_plugins,
                     initial_response_header_policy_plugins,
                     backend_start,
-                ))
+                )
                 .await;
             }
             // The winner was captured where BOTH instants were known, so a late
@@ -3608,9 +3779,12 @@ where
             }
             Err(super::server::H3RequestBodyReadError::Read(error)) => {
                 cb_probe.release_neutral();
-                if error.is_client_disconnect() {
+                if let Some(abort) =
+                    error.proven_client_abort_with_peer(ctx.peer_connection.as_ref())
+                {
                     return Box::pin(write_bridge_upload_client_disconnect(
                         stream,
+                        abort,
                         HttpFlavor::Plain,
                         plugins,
                         ctx,
@@ -3620,11 +3794,19 @@ where
                     ))
                     .await;
                 }
+                if error.failure() == H3RequestReadFailure::GatewayTerminated {
+                    return Ok(bridge_upload_gateway_closed_outcome(
+                        stream,
+                        ctx,
+                        false,
+                        backend_start,
+                    ));
+                }
                 return write_plain_gateway_error(
                     stream,
                     ctx,
                     StatusCode::BAD_REQUEST,
-                    r#"{"error":"Malformed request body"}"#,
+                    crate::proxy::client_abort::MALFORMED_UPLOAD_HTTP_BODY,
                     None,
                     backend_start,
                     0,
@@ -3655,11 +3837,26 @@ where
                 // Publish the body with its request-buffer charge (#6009):
                 // every attempt shares the one allocation, and the charge is
                 // released when this arm drops the last copy, once dispatch
-                // and every retry are done and before the response relay.
-                let buffered_body = publish_h3_retained_body(
+                // and every retry are done and before the response relay. A
+                // body a request-body plugin grew past what the budget can
+                // cover is refused rather than retained uncharged.
+                let Some(buffered_body) = publish_h3_retained_body(
                     buffered_body,
                     prebuffered_body_charge.or(mesh_upload_charge.take()),
-                );
+                ) else {
+                    cb_probe.release_neutral();
+                    return boxed_write_bridge_upload_refusal(
+                        stream,
+                        HttpFlavor::Plain,
+                        plugins,
+                        ctx,
+                        BridgeUploadRefusal::BufferCapacity,
+                        response_committed_plugins,
+                        initial_response_header_policy_plugins,
+                        backend_start,
+                    )
+                    .await;
+                };
                 let bytes_sent = raw_prebuffered_body_bytes;
                 let mut attempt = 0u32;
                 let final_backend_admission_permits: Option<BackendAdmissionPermitSet>;
@@ -3917,7 +4114,7 @@ where
                                     current_cb_target_key.as_deref(),
                                     attempt_result.status_code,
                                     attempt_result.connection_error,
-                                    cb_probe.take_slot(),
+                                    cb_probe,
                                 );
                                 // A gRPC-Web route attempt budget (#5646) ends with the failed
                                 // attempt, so backoff is bounded by the total deadline alone.
@@ -3975,25 +4172,45 @@ where
                                     )
                                     .await;
                                 }
-                                attempt += 1;
-                                if let CrossProtocolRetryTarget::Selected(
-                                    next_target,
+                                // Admit the next attempt after the backoff, through the breaker
+                                // of the target it will dial (issue #6799), as the H1/H2 retry
+                                // loops do. An OPEN breaker ends the retries: this attempt,
+                                // already recorded, is served below, and the retired guard keeps
+                                // the terminal record from settling it twice.
+                                let next_cb_target_key = match &retry_target {
+                                    CrossProtocolRetryTarget::Selected(
+                                        _,
+                                        next_cb_target_key,
+                                        _,
+                                    ) => Some(next_cb_target_key.as_str()),
+                                    _ => current_cb_target_key.as_deref(),
+                                };
+                                if crate::proxy::admit_retry_attempt(
+                                    state,
+                                    proxy,
                                     next_cb_target_key,
-                                    next_url,
-                                ) = retry_target
-                                {
-                                    current_target = Some(next_target);
-                                    current_cb_target_key = Some(next_cb_target_key);
-                                    current_url = next_url;
+                                    cb_probe,
+                                ) {
+                                    attempt += 1;
+                                    if let CrossProtocolRetryTarget::Selected(
+                                        next_target,
+                                        next_cb_target_key,
+                                        next_url,
+                                    ) = retry_target
+                                    {
+                                        current_target = Some(next_target);
+                                        current_cb_target_key = Some(next_cb_target_key);
+                                        current_url = next_url;
+                                    }
+                                    warn!(
+                                        proxy_id = %proxy.id,
+                                        attempt = attempt,
+                                        max_retries = retry_config.max_retries,
+                                        connection_error = attempt_result.connection_error,
+                                        "Retrying cross-protocol H3→HTTP mesh backend request"
+                                    );
+                                    continue;
                                 }
-                                warn!(
-                                    proxy_id = %proxy.id,
-                                    attempt = attempt,
-                                    max_retries = retry_config.max_retries,
-                                    connection_error = attempt_result.connection_error,
-                                    "Retrying cross-protocol H3→HTTP mesh backend request"
-                                );
-                                continue;
                             }
                         }
 
@@ -4038,7 +4255,7 @@ where
                                 mesh_status,
                                 mesh_connection_error,
                                 mesh_error_class,
-                                cb_probe.take_slot(),
+                                cb_probe.settle(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -4123,8 +4340,8 @@ where
                                     current_cb_target_key.as_deref(),
                                     401,
                                     false,
-                                    None,
-                                    cb_probe.take_slot(),
+                                    Some(ErrorClass::ClientDisconnect),
+                                    cb_probe.settle(),
                                     false,
                                     backend_start.elapsed(),
                                 );
@@ -4261,6 +4478,9 @@ where
                     );
                     let plain_upload_deadline = plain_write_bound.deadline();
                     let plain_peer_signal = ctx.peer_connection.as_ref();
+                    // Set by the response-cancellation watcher when a peer
+                    // `STOP_SENDING` ended the wait (issue #6772).
+                    let plain_stop_sending = AtomicBool::new(false);
                     let mut plain_attempt_builder = plain_request_builder.body(plain_upload_body);
                     // Every way this attempt can end, classified before anything
                     // acts on it, so it is recorded at ONE point below (issue
@@ -4278,7 +4498,10 @@ where
                         // the eventual response.
                         let header_bound = loop {
                             let stream_cancelled =
-                                crate::http3::stream_util::peer_response_cancelled(stream);
+                                crate::http3::stream_util::peer_response_cancelled(
+                                    crate::http3::stream_util::peer_response_stopped(stream),
+                                    &plain_stop_sending,
+                                );
                             let attempt = crate::plugins::await_deadline_first(
                                 plain_header_deadline_at,
                                 await_h3_backend_or_peer(
@@ -4315,17 +4538,60 @@ where
                             plain_attempt_builder = next;
                         };
                         drop(pending_slot);
+                        // The outer header timer or a backend failure observed
+                        // at/after a bound is owned by the EARLIER captured
+                        // bound, not by timer nesting (issue #6976).
+                        let late_owner = match &header_bound {
+                            Ok(Err(()))
+                            | Ok(Ok(H3BackendOrPeer::Ready(Err(_))))
+                            | Ok(Ok(H3BackendOrPeer::Deadline)) => {
+                                crate::proxy::elapsed_owning_bound(
+                                    plain_upload_deadline,
+                                    plain_header_deadline_at,
+                                    tokio::time::Instant::now(),
+                                )
+                            }
+                            _ => None,
+                        };
                         match header_bound {
                             Err(()) => PlainAttemptEnd::WriteWatermark,
+                            Ok(Err(()) | Ok(H3BackendOrPeer::Ready(Err(_))))
+                                if late_owner == Some(crate::proxy::OwningBound::Dispatch) =>
+                            {
+                                match plain_write_bound.expired_authorization() {
+                                    Some(termination) => {
+                                        PlainAttemptEnd::AuthorizationExpired(termination)
+                                    }
+                                    None => PlainAttemptEnd::GrpcWebDeadline { handed_off: true },
+                                }
+                            }
                             // The route attempt budget (#5646) ended this attempt
                             // before its response head: the ordinary backend
                             // timeout, charged to this backend and retryable.
-                            Ok(Err(())) if route.attempt_budget_expired(route_attempt_deadline) => {
+                            Ok(
+                                Err(())
+                                | Ok(H3BackendOrPeer::Ready(Err(_)))
+                                | Ok(H3BackendOrPeer::Deadline),
+                            ) if late_owner == Some(crate::proxy::OwningBound::ResponseHeader)
+                                && route.attempt_budget_owns(
+                                    route_attempt_deadline,
+                                    operator_header_deadline_at,
+                                ) =>
+                            {
                                 if let Some(pump) = plain_upload_pump.as_mut() {
                                     pump.cancel();
                                 }
                                 PlainAttemptEnd::Settled(Err(PlainAttemptFailure::AttemptBudget))
                             }
+                            Ok(
+                                Err(())
+                                | Ok(H3BackendOrPeer::Ready(Err(_)))
+                                | Ok(H3BackendOrPeer::Deadline),
+                            ) if late_owner == Some(crate::proxy::OwningBound::ResponseHeader) => {
+                                PlainAttemptEnd::HeaderTimeout
+                            }
+                            // The outer header timer fired, so `late_owner` is
+                            // always `Some` here; kept total for the compiler.
                             Ok(Err(())) => PlainAttemptEnd::HeaderTimeout,
                             // A buffered body is part of its attempt (#5738): collect
                             // it here when a failure during collection could be
@@ -4463,8 +4729,8 @@ where
                                 current_cb_target_key.as_deref(),
                                 401,
                                 false,
-                                None,
-                                cb_probe.take_slot(),
+                                Some(ErrorClass::ClientDisconnect),
+                                cb_probe.settle(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -4510,6 +4776,13 @@ where
                         PlainAttemptEnd::PeerGone => {
                             drop(attempt_end);
                             crate::http3::stream_util::halt_request_body(stream);
+                            // Only the watchers can end this wait; nothing is
+                            // written, the response direction is reset.
+                            let cause = PlainPeerGone::from_watcher(
+                                plain_stop_sending.load(Ordering::Acquire),
+                                ctx.peer_connection.as_ref(),
+                            );
+                            cause.reset_response(stream);
                             return Ok(plain_peer_gone_before_response_headers(
                                 PlainPeerGoneBeforeResponseHeadersCtx {
                                     state,
@@ -4525,6 +4798,7 @@ where
                                     bytes_sent,
                                     current_url: &current_url,
                                     response_streamed: false,
+                                    cause,
                                 },
                             ));
                         }
@@ -4583,7 +4857,7 @@ where
                                         current_cb_target_key.as_deref(),
                                         attempt_result.status_code,
                                         attempt_result.connection_error,
-                                        cb_probe.take_slot(),
+                                        cb_probe,
                                     );
                                     // A gRPC-Web route attempt budget (#5646) ends with the failed
                                     // attempt, so backoff is bounded by the total deadline alone.
@@ -4632,25 +4906,45 @@ where
                                         )
                                         .await;
                                     }
-                                    attempt += 1;
-                                    if let CrossProtocolRetryTarget::Selected(
-                                        next_target,
+                                    // Admit the next attempt after the backoff, through the breaker
+                                    // of the target it will dial (issue #6799), as the H1/H2 retry
+                                    // loops do. An OPEN breaker ends the retries: this attempt,
+                                    // already recorded, is served below, and the retired guard keeps
+                                    // the terminal record from settling it twice.
+                                    let next_cb_target_key = match &retry_target {
+                                        CrossProtocolRetryTarget::Selected(
+                                            _,
+                                            next_cb_target_key,
+                                            _,
+                                        ) => Some(next_cb_target_key.as_str()),
+                                        _ => current_cb_target_key.as_deref(),
+                                    };
+                                    if crate::proxy::admit_retry_attempt(
+                                        state,
+                                        proxy,
                                         next_cb_target_key,
-                                        next_url,
-                                    ) = retry_target
-                                    {
-                                        current_target = Some(next_target);
-                                        current_cb_target_key = Some(next_cb_target_key);
-                                        current_url = next_url;
+                                        cb_probe,
+                                    ) {
+                                        attempt += 1;
+                                        if let CrossProtocolRetryTarget::Selected(
+                                            next_target,
+                                            next_cb_target_key,
+                                            next_url,
+                                        ) = retry_target
+                                        {
+                                            current_target = Some(next_target);
+                                            current_cb_target_key = Some(next_cb_target_key);
+                                            current_url = next_url;
+                                        }
+                                        warn!(
+                                            proxy_id = %proxy.id,
+                                            attempt = attempt,
+                                            max_retries = retry_config.max_retries,
+                                            connection_error = false,
+                                            "Retrying cross-protocol H3→HTTP backend request"
+                                        );
+                                        continue;
                                     }
-                                    warn!(
-                                        proxy_id = %proxy.id,
-                                        attempt = attempt,
-                                        max_retries = retry_config.max_retries,
-                                        connection_error = false,
-                                        "Retrying cross-protocol H3→HTTP backend request"
-                                    );
-                                    continue;
                                 }
                             }
                             final_backend_admission_elapsed = backend_admission_start.elapsed();
@@ -4715,7 +5009,7 @@ where
                                         current_cb_target_key.as_deref(),
                                         attempt_result.status_code,
                                         attempt_result.connection_error,
-                                        cb_probe.take_slot(),
+                                        cb_probe,
                                     );
                                     // A gRPC-Web route attempt budget (#5646) ends with the failed
                                     // attempt, so backoff is bounded by the total deadline alone.
@@ -4764,25 +5058,45 @@ where
                                         )
                                         .await;
                                     }
-                                    attempt += 1;
-                                    if let CrossProtocolRetryTarget::Selected(
-                                        next_target,
+                                    // Admit the next attempt after the backoff, through the breaker
+                                    // of the target it will dial (issue #6799), as the H1/H2 retry
+                                    // loops do. An OPEN breaker ends the retries: this attempt,
+                                    // already recorded, is served below, and the retired guard keeps
+                                    // the terminal record from settling it twice.
+                                    let next_cb_target_key = match &retry_target {
+                                        CrossProtocolRetryTarget::Selected(
+                                            _,
+                                            next_cb_target_key,
+                                            _,
+                                        ) => Some(next_cb_target_key.as_str()),
+                                        _ => current_cb_target_key.as_deref(),
+                                    };
+                                    if crate::proxy::admit_retry_attempt(
+                                        state,
+                                        proxy,
                                         next_cb_target_key,
-                                        next_url,
-                                    ) = retry_target
-                                    {
-                                        current_target = Some(next_target);
-                                        current_cb_target_key = Some(next_cb_target_key);
-                                        current_url = next_url;
+                                        cb_probe,
+                                    ) {
+                                        attempt += 1;
+                                        if let CrossProtocolRetryTarget::Selected(
+                                            next_target,
+                                            next_cb_target_key,
+                                            next_url,
+                                        ) = retry_target
+                                        {
+                                            current_target = Some(next_target);
+                                            current_cb_target_key = Some(next_cb_target_key);
+                                            current_url = next_url;
+                                        }
+                                        warn!(
+                                            proxy_id = %proxy.id,
+                                            attempt = attempt,
+                                            max_retries = retry_config.max_retries,
+                                            connection_error = attempt_result.connection_error,
+                                            "Retrying cross-protocol H3→HTTP backend request"
+                                        );
+                                        continue;
                                     }
-                                    warn!(
-                                        proxy_id = %proxy.id,
-                                        attempt = attempt,
-                                        max_retries = retry_config.max_retries,
-                                        connection_error = attempt_result.connection_error,
-                                        "Retrying cross-protocol H3→HTTP backend request"
-                                    );
-                                    continue;
                                 }
                             }
 
@@ -4809,7 +5123,7 @@ where
                                 attempt_result.status_code,
                                 attempt_result.connection_error,
                                 attempt_result.error_class,
-                                cb_probe.take_slot(),
+                                cb_probe.settle(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -5008,8 +5322,8 @@ where
                                 current_cb_target_key.as_deref(),
                                 401,
                                 false,
-                                None,
-                                cb_probe.take_slot(),
+                                Some(ErrorClass::ClientDisconnect),
+                                cb_probe.settle(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -5085,7 +5399,10 @@ where
                 );
 
                 let max_req_bytes = effective_max_request_body_size_bytes;
-                let capacity = state.env_config.http3_request_body_channel_capacity;
+                // `mpsc::channel(0)` panics. The env parser clamps to >= 1, but
+                // `EnvConfig` is also built in code, so both H3 bridges guard
+                // the capacity the same way.
+                let capacity = state.env_config.http3_request_body_channel_capacity.max(1);
                 let (tx, rx) =
                     tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(capacity);
                 // `tx` is borrowed by `reader_future` below, so the receiver cannot
@@ -5158,8 +5475,20 @@ where
                 // Capture STOP_SENDING before the reader borrows the stream.
                 // The future is `'static` and does not hold `&mut` on either
                 // half, so the upload pump can keep polling recv_data.
-                let stream_cancelled = crate::http3::stream_util::peer_response_cancelled(stream);
+                // Set by the response-cancellation watcher when a peer
+                // `STOP_SENDING` ended the wait (issue #6772).
+                let response_stop_sending = AtomicBool::new(false);
+                let stream_cancelled = crate::http3::stream_util::peer_response_cancelled(
+                    crate::http3::stream_util::peer_response_stopped(stream),
+                    &response_stop_sending,
+                );
                 let reader_reset_flag = Arc::clone(&reader_peer_reset);
+                // Set by the reader beside `reader_reset_flag` with the
+                // classified cause of its failed read, so the terminal can tell
+                // a client abort (`499`) from malformed input (`400`) and the
+                // gateway's own close (`503`, issue #6772). A borrowed local:
+                // the reader runs on this task.
+                let reader_upload_failure = AtomicU8::new(PLAIN_READER_OK);
                 // gRPC request-message accounting for the streamed upload, read
                 // in its own framing: a pass-through gRPC-Web upload counts its
                 // decoded message frames, never its trailer frame or its
@@ -5290,13 +5619,19 @@ where
                                             }
                                             end = stream.recv_trailers() => end,
                                         };
+                                        if let Err(error) = &end {
+                                            reader_upload_failure.store(
+                                                plain_reader_failure_code(error),
+                                                Ordering::Release,
+                                            );
+                                        }
                                         if end.is_err() {
                                             reader_reset_flag.store(true, Ordering::Release);
                                         }
                                         finish_reader();
                                         return;
                                     }
-                                    Err(_e) => {
+                                    Err(error) => {
                                         // Request-stream reset/termination while
                                         // headers are still outstanding is
                                         // downstream cancellation, not a
@@ -5304,6 +5639,12 @@ where
                                         // makes the body stream end with an
                                         // error, so the backend upload is
                                         // aborted rather than cleanly ended.
+                                        // The cause is classified positively
+                                        // (issue #6772).
+                                        reader_upload_failure.store(
+                                            plain_reader_failure_code(&error),
+                                            Ordering::Release,
+                                        );
                                         reader_reset_flag.store(true, Ordering::Release);
                                         finish_reader();
                                         return;
@@ -5426,17 +5767,43 @@ where
                             // backend response. Attribution comes from the
                             // composition, not from arm order between two sleeps.
                             _ = &mut upload_deadline, if upload_deadline_active => {
-                                upload_auth_expired = plain_write_bound.expired_authorization();
-                                upload_deadline_after_handoff = true;
                                 drop(pending_slot.take());
                                 abort_backend_upload = true;
+                                // Both timers can be ready on a late wake: the
+                                // strictly earlier header bound keeps its own
+                                // terminal (issue #6976).
+                                if crate::proxy::elapsed_owning_bound(
+                                    upload_deadline_at,
+                                    header_wait_at,
+                                    tokio::time::Instant::now(),
+                                ) == Some(crate::proxy::OwningBound::ResponseHeader)
+                                {
+                                    header_wait_expired = true;
+                                    halt_reader_after_loop = true;
+                                    break None;
+                                }
+                                upload_auth_expired = plain_write_bound.expired_authorization();
+                                upload_deadline_after_handoff = true;
                                 break None;
                             }
                             _ = optional_sleep_elapsed(header_wait.as_mut()), if header_wait_active => {
-                                header_wait_expired = true;
                                 drop(pending_slot.take());
-                                halt_reader_after_loop = true;
                                 abort_backend_upload = true;
+                                // A strictly earlier elapsed write bound keeps its
+                                // own terminal, whichever timer fired first (issue
+                                // #6976).
+                                if crate::proxy::elapsed_owning_bound(
+                                    upload_deadline_at,
+                                    header_wait_at,
+                                    tokio::time::Instant::now(),
+                                ) == Some(crate::proxy::OwningBound::Dispatch)
+                                {
+                                    upload_auth_expired = plain_write_bound.expired_authorization();
+                                    upload_deadline_after_handoff = true;
+                                    break None;
+                                }
+                                header_wait_expired = true;
+                                halt_reader_after_loop = true;
                                 break None;
                             }
                             // STOP_SENDING on the response, or the connection
@@ -5456,6 +5823,11 @@ where
                                 break None;
                             }
                             result = &mut send_future => {
+                                // The instant `send()` was observed, before the
+                                // reader drain/halt below can await: a failure
+                                // ready before a bound stays the backend's
+                                // (issue #6976).
+                                let observed_at = tokio::time::Instant::now();
                                 send_done = true;
                                 drop(pending_slot.take());
                                 if !reader_done {
@@ -5472,8 +5844,14 @@ where
                                     if !reader_done {
                                         halt_notify.notify_one();
                                         let halt_deadline = Duration::from_millis(100);
-                                        let _ = tokio::time::timeout(halt_deadline, &mut reader_future)
-                                            .await;
+                                        // A completed reader must never be polled
+                                        // again by the post-loop halt.
+                                        if tokio::time::timeout(halt_deadline, &mut reader_future)
+                                            .await
+                                            .is_ok()
+                                        {
+                                            reader_done = true;
+                                        }
                                     }
                                 }
                                 // Biased select checks send_future before
@@ -5497,6 +5875,32 @@ where
                                 if result.is_err() && write_timed_out.load(Ordering::Acquire) {
                                     backend_write_watermark_expired = true;
                                     break None;
+                                }
+                                // A backend failure observed at/after a bound is
+                                // that bound, exactly as its timer arm settles it
+                                // (issue #6976). A SUCCESSFUL response still wins.
+                                // An oversized upload keeps its `413` (issue #6976).
+                                if result.is_err() && !oversized.load(Ordering::Relaxed) {
+                                    match crate::proxy::elapsed_owning_bound(
+                                        upload_deadline_at,
+                                        header_wait_at,
+                                        observed_at,
+                                    ) {
+                                        Some(crate::proxy::OwningBound::Dispatch) => {
+                                            upload_auth_expired =
+                                                plain_write_bound.expired_authorization();
+                                            upload_deadline_after_handoff = true;
+                                            abort_backend_upload = true;
+                                            break None;
+                                        }
+                                        // The reader was already halted above.
+                                        Some(crate::proxy::OwningBound::ResponseHeader) => {
+                                            header_wait_expired = true;
+                                            abort_backend_upload = true;
+                                            break None;
+                                        }
+                                        None => {}
+                                    }
                                 }
                                 break Some(result);
                             }
@@ -5636,8 +6040,8 @@ where
                             current_cb_target_key.as_deref(),
                             401,
                             false,
-                            None,
-                            cb_probe.take_slot(),
+                            Some(ErrorClass::ClientDisconnect),
+                            cb_probe.settle(),
                             false,
                             backend_start.elapsed(),
                         );
@@ -5694,6 +6098,14 @@ where
                     }
                     PlainAttemptEnd::PeerGone => {
                         drop(attempt_end);
+                        let cause = PlainPeerGone::from_reader(
+                            reader_upload_failure.load(Ordering::Acquire),
+                            response_stop_sending.load(Ordering::Acquire),
+                            ctx.peer_connection.as_ref(),
+                        );
+                        // Nothing is written either way: the response direction
+                        // is reset, never finished.
+                        cause.reset_response(stream);
                         return Ok(plain_peer_gone_before_response_headers(
                             PlainPeerGoneBeforeResponseHeadersCtx {
                                 state,
@@ -5709,6 +6121,7 @@ where
                                 bytes_sent,
                                 current_url: &current_url,
                                 response_streamed: true,
+                                cause,
                             },
                         ));
                     }
@@ -5775,8 +6188,8 @@ where
                             current_cb_target_key.as_deref(),
                             413,
                             false,
-                            None,
-                            cb_probe.take_slot(),
+                            Some(ErrorClass::RequestBodyTooLarge),
+                            cb_probe.settle(),
                             false,
                             backend_start.elapsed(),
                         );
@@ -5840,7 +6253,7 @@ where
                             attempt_result.status_code,
                             attempt_result.connection_error,
                             attempt_result.error_class,
-                            cb_probe.take_slot(),
+                            cb_probe.settle(),
                             false,
                             backend_start.elapsed(),
                         );
@@ -5965,7 +6378,7 @@ where
             } else {
                 None
             },
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -5995,6 +6408,7 @@ where
             StatusCode::BAD_GATEWAY,
             Bytes::from_static(br#"{"error":"Backend response body exceeds maximum size"}"#),
             false,
+            true,
             backend_start,
             bytes_sent,
         )
@@ -6068,7 +6482,7 @@ where
             status,
             terminal_connection_error,
             terminal_error_class,
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -6204,7 +6618,7 @@ where
                     reject_status,
                     false,
                     error_class,
-                    cb_probe.take_slot(),
+                    cb_probe.settle(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -6369,7 +6783,7 @@ where
             response_status,
             terminal_connection_error,
             terminal_error_class,
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -6462,7 +6876,13 @@ where
             outcome.error_class = terminal_error_class;
             return Ok(outcome);
         }
-        let bytes_streamed = response_body.len() as u64;
+        // A `HEAD` response delivers no body bytes, so none are accounted.
+        let omit_body = crate::http3::server::h3_request_is_head();
+        let bytes_streamed = if omit_body {
+            0
+        } else {
+            response_body.len() as u64
+        };
         // Read before the body moves into the write: a pass-through gRPC-Web
         // response carries its status in the backend's own trailer frame.
         let passthrough_grpc_status = if ctx.request_is_grpc_web() {
@@ -6475,7 +6895,7 @@ where
             None
         };
         let buffered_write = async {
-            if !response_body.is_empty() {
+            if !response_body.is_empty() && !omit_body {
                 stream.send_data(response_body).await?;
             }
             stream.finish().await
@@ -6523,6 +6943,7 @@ where
                         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                         rejection_logged: false,
+                        route_deadline_cut: false,
                     });
                 }
                 let (deadline_bytes, deadline_written) =
@@ -6542,6 +6963,7 @@ where
                     backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                     backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                     rejection_logged: false,
+                    route_deadline_cut: false,
                 });
             }
         };
@@ -6569,6 +6991,7 @@ where
             backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
             backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
             rejection_logged: false,
+            route_deadline_cut: false,
         });
     }
 
@@ -6597,7 +7020,7 @@ where
                 status,
                 terminal_connection_error,
                 terminal_error_class,
-                cb_probe.take_slot(),
+                cb_probe.settle(),
                 false,
                 backend_start.elapsed(),
             );
@@ -6891,6 +7314,7 @@ where
                     backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                     backend_ttfb_ms: backend_admission_elapsed.as_secs_f64() * 1000.0,
                     rejection_logged: false,
+                    route_deadline_cut: false,
                 });
             }
         };
@@ -6927,7 +7351,7 @@ where
         status,
         false,
         route_cut_class,
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -6960,6 +7384,7 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_admission_elapsed.as_secs_f64() * 1000.0,
         rejection_logged: false,
+        route_deadline_cut,
     })
 }
 
@@ -7089,6 +7514,15 @@ pub(crate) async fn run_plain_buffered_response_plugin_pipeline(
             }
         }
     }
+
+    // Every replacement and policy stage has run: a gateway-replaced `401`
+    // gets its challenge before committed observers and the wire (#6774).
+    crate::proxy::ensure_replaced_response_challenge(
+        plugins,
+        ctx,
+        *response_status,
+        response_headers,
+    );
 
     if !response_committed_plugins.is_empty() {
         crate::proxy::run_deadline_bounded_response_committed_hooks(
@@ -7314,10 +7748,12 @@ async fn handle_h3_grpc_streaming_response<S>(
     bytes_sent: u64,
     backend_target_url: &str,
     final_backend_resolved_ip: Option<String>,
-    // Set by the streaming-request pump when the H3 client resets its upload; used
-    // to classify a resulting response-body error as a CLIENT abort rather than a
-    // backend fault (codex P2). `None` on the buffered-request path (no pump).
-    frontend_upload_failed: Option<&Arc<AtomicBool>>,
+    // The streaming-request pump's upload evidence: a frontend failure the
+    // channel body relayed to hyper classifies a resulting response-body error as
+    // the frontend's terminal rather than a backend fault (codex P2), and a
+    // proven client abort records `CANCELLED` (issue #6772). `None` on the
+    // buffered-request path (no pump).
+    frontend_upload: Option<GrpcBridgeUploadSignals<'_>>,
     // Config-time response-trailer governance. Native gRPC terminal metadata on
     // this bridge crosses the response-header policy boundary exactly like a
     // plain streaming relay's trailer section (GHSA-r78v-rc86-6r86); only the
@@ -7360,7 +7796,7 @@ where
             200,
             false,
             Some(ErrorClass::RequestBodyTooLarge),
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -7502,7 +7938,7 @@ where
             outcome.response_status,
             false,
             None,
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -7713,11 +8149,14 @@ where
     // authorization exit inside it records through the REQUEST's shared latch
     // rather than the bare counter.
     let auth_latch = ctx.authorization_termination_latch();
+    // Typed evidence that the gateway's own reset ended the backend body (issue
+    // #6772); read with the relayed upload fault below.
+    let body_error_local_reset = AtomicBool::new(false);
     let (
         mut bytes_streamed,
         body_completed,
         client_disconnected,
-        body_error_class,
+        mut body_error_class,
         trailers,
         mut client_deadline_expired,
         mut auth_termination,
@@ -7737,6 +8176,7 @@ where
             // and never recomputed from relay activity.
             auth_deadline: auth_deadline_plan,
             auth_latch: &auth_latch,
+            body_error_local_reset: &body_error_local_reset,
         },
     )
     .await;
@@ -7844,66 +8284,85 @@ where
                 streaming.status,
                 text_mode,
             );
-        grpc_trailer_status = Some(pristine_trailer_status.unwrap_or(terminal_status));
-        let terminal_len = terminal_data.len() as u64;
-        let terminal_write = if gateway_terminal_selected {
-            crate::http3::stream_util::await_terminal_response_write_before_deadline(
-                terminal_write_bound.deadline(),
-                stream.send_data(terminal_data),
-            )
-            .await
+        // The generated terminal frame is client-visible DATA: charge it
+        // against the same effective ceiling as the translated message bytes,
+        // so an in-limit body cannot carry its trailer frame past the limit.
+        // The headers are committed, so the cut is a stream reset.
+        if crate::proxy::body::response_output_crosses_ceiling(
+            max_resp_bytes,
+            bytes_streamed,
+            terminal_data.len(),
+        ) {
+            warn!(
+                "Translated gRPC-Web terminal frame would exceed the {} byte response limit; \
+                 resetting the cross-protocol H3 stream",
+                max_resp_bytes
+            );
+            crate::http3::stream_util::abort_response_stream(stream);
+            body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
+            final_body_completed = false;
         } else {
-            crate::http3::stream_util::await_response_write_before_deadline(
-                terminal_write_bound.deadline(),
-                stream.send_data(terminal_data),
-            )
-            .await
-        };
-        let terminal_and_finish = match terminal_write {
-            Ok(()) if gateway_terminal_selected => {
-                bytes_streamed += terminal_len;
+            grpc_trailer_status = Some(pristine_trailer_status.unwrap_or(terminal_status));
+            let terminal_len = terminal_data.len() as u64;
+            let terminal_write = if gateway_terminal_selected {
                 crate::http3::stream_util::await_terminal_response_write_before_deadline(
                     terminal_write_bound.deadline(),
-                    stream.finish(),
+                    stream.send_data(terminal_data),
                 )
                 .await
-            }
-            Ok(()) => {
-                bytes_streamed += terminal_len;
+            } else {
                 crate::http3::stream_util::await_response_write_before_deadline(
                     terminal_write_bound.deadline(),
-                    stream.finish(),
+                    stream.send_data(terminal_data),
                 )
                 .await
-            }
-            Err(error) => Err(error),
-        };
-        if let Err(error) = terminal_and_finish {
-            if matches!(
-                error,
-                crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
-            ) {
-                // Attribute the composed terminal bound. Authorization wins a
-                // tie, matching every relay's biased select ordering, and the
-                // fixed-cardinality counter is recorded only when the relay
-                // itself did not already record one for this stream.
-                match terminal_write_bound.expired_authorization() {
-                    Some(termination) if auth_termination.is_none() => {
-                        ctx.record_authorization_termination_once(
-                            termination,
-                            terminal_auth_family,
-                        );
-                        auth_termination = Some(termination);
-                    }
-                    Some(_) => {}
-                    None => client_deadline_expired = true,
+            };
+            let terminal_and_finish = match terminal_write {
+                Ok(()) if gateway_terminal_selected => {
+                    bytes_streamed += terminal_len;
+                    crate::http3::stream_util::await_terminal_response_write_before_deadline(
+                        terminal_write_bound.deadline(),
+                        stream.finish(),
+                    )
+                    .await
                 }
-                crate::http3::stream_util::abort_response_stream(stream);
-            } else {
-                final_client_disconnected = true;
-                warn!("H3 gRPC-Web streaming terminal frame write failed");
+                Ok(()) => {
+                    bytes_streamed += terminal_len;
+                    crate::http3::stream_util::await_response_write_before_deadline(
+                        terminal_write_bound.deadline(),
+                        stream.finish(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = terminal_and_finish {
+                if matches!(
+                    error,
+                    crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
+                ) {
+                    // Attribute the composed terminal bound. Authorization wins a
+                    // tie, matching every relay's biased select ordering, and the
+                    // fixed-cardinality counter is recorded only when the relay
+                    // itself did not already record one for this stream.
+                    match terminal_write_bound.expired_authorization() {
+                        Some(termination) if auth_termination.is_none() => {
+                            ctx.record_authorization_termination_once(
+                                termination,
+                                terminal_auth_family,
+                            );
+                            auth_termination = Some(termination);
+                        }
+                        Some(_) => {}
+                        None => client_deadline_expired = true,
+                    }
+                    crate::http3::stream_util::abort_response_stream(stream);
+                } else {
+                    final_client_disconnected = true;
+                    warn!("H3 gRPC-Web streaming terminal frame write failed");
+                }
+                final_body_completed = false;
             }
-            final_body_completed = false;
         }
     } else if body_completed && let Some(mut trailers) = trailers {
         grpc_trailer_status = trailers.get("grpc-status").map(|value| {
@@ -8048,12 +8507,41 @@ where
         }
     }
 
-    // A client upload reset (recv-half error) makes the pump set
-    // `frontend_upload_failed`; the backend then sees an RST and the response body
-    // surfaces a hyper error here. That is a CLIENT abort, not a backend fault — so
-    // classify it as ClientDisconnect (neutral for backend health / adaptive
-    // concurrency) rather than the protocol/timeout class hyper reports (codex P2).
-    let frontend_aborted = frontend_upload_failed.is_some_and(|flag| flag.load(Ordering::Acquire));
+    // A client upload failure (recv-half error) the channel body relayed resets
+    // the backend stream, and the response body then surfaces a hyper error here.
+    // That is the frontend's terminal, not a backend fault — so classify it as
+    // ClientDisconnect (neutral for backend health / adaptive concurrency) rather
+    // than the protocol/timeout class hyper reports (codex P2).
+    // The relay latch counts only together with the typed local-reset
+    // evidence: a backend reset that beat hyper's own reset stays the
+    // backend's failure.
+    let relayed_upload_fault = if body_error_local_reset.load(Ordering::Relaxed) {
+        grpc_bridge_upload_fault_with_peer(
+            frontend_upload.map_or(
+                GRPC_BRIDGE_UPLOAD_OK,
+                GrpcBridgeUploadSignals::relayed_fault,
+            ),
+            ctx.peer_connection.as_ref(),
+        )
+    } else {
+        GRPC_BRIDGE_UPLOAD_OK
+    };
+    let frontend_aborted = relayed_upload_fault != GRPC_BRIDGE_UPLOAD_OK;
+    // Response headers are committed, so HTTP 200 stands; a PROVEN client abort
+    // that ended the response body records `CANCELLED` and `client_disconnected`
+    // (issue #6772). The relay already reset the response when the body failed,
+    // so no further terminal frame can be written. Gateway-selected terminals
+    // (an oversized upload, an authorization expiry, the client deadline) keep
+    // their own status.
+    let client_cancelled = relayed_upload_fault == GRPC_BRIDGE_UPLOAD_CLIENT_ABORT
+        && body_error_class.is_some()
+        && !final_body_completed
+        && !request_overflowed_late
+        && auth_termination.is_none()
+        && !client_deadline_expired;
+    if client_cancelled {
+        final_client_disconnected = true;
+    }
     let outcome_error_class = if request_overflowed_late {
         Some(ErrorClass::RequestBodyTooLarge)
     } else if client_deadline_expired || (frontend_aborted && body_error_class.is_some()) {
@@ -8083,7 +8571,7 @@ where
         outcome_status,
         false,
         outcome_error_class,
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -8105,6 +8593,10 @@ where
         grpc_proxy::grpc_status::UNAUTHENTICATED
     } else if client_deadline_expired {
         grpc_proxy::grpc_status::DEADLINE_EXCEEDED
+    } else if client_cancelled {
+        ProvenClientAbort::latched_upload_abort()
+            .pre_header_terminal()
+            .grpc_status
     } else {
         grpc_trailer_status
             .or(client_header_grpc_status)
@@ -8127,6 +8619,7 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms,
         rejection_logged: false,
+        route_deadline_cut: false,
     })
 }
 
@@ -8213,7 +8706,7 @@ async fn dispatch_grpc<S>(
     response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
-    S: RecvStream + SendStream<Bytes>,
+    S: RecvStream + SendStream<Bytes> + Send,
 {
     // Effective client-facing ceilings for this request: each global knob
     // narrowed by any active route ceiling, `0` still meaning unlimited. The H3
@@ -8308,20 +8801,7 @@ where
     let body = if let Some(buffered) = prebuffered_body {
         buffered
     } else {
-        let Some(upload) = H3RetainedUpload::admit(effective_max_grpc_recv_size_bytes) else {
-            cb_probe.release_neutral();
-            return Box::pin(write_bridge_upload_refusal(
-                stream,
-                HttpFlavor::Grpc,
-                plugins,
-                ctx,
-                BridgeUploadRefusal::BufferCapacity,
-                response_committed_plugins,
-                initial_response_header_policy_plugins,
-                backend_start,
-            ))
-            .await;
-        };
+        let upload = H3RetainedUpload::admit(effective_max_grpc_recv_size_bytes);
         match super::server::collect_h3_request_body_under_authorization(
             drain_h3_body(stream, upload, &mut bridge_upload_charge),
             upload_bound,
@@ -8329,12 +8809,26 @@ where
         )
         .await
         {
-            Ok(Some(b)) => b,
-            Ok(None) => {
+            Ok(Ok(b)) => b,
+            Ok(Err(crate::proxy::response_buffer_budget::RetainRejection::BudgetExhausted)) => {
+                cb_probe.release_neutral();
+                return boxed_write_bridge_upload_refusal(
+                    stream,
+                    HttpFlavor::Grpc,
+                    plugins,
+                    ctx,
+                    BridgeUploadRefusal::BufferCapacity,
+                    response_committed_plugins,
+                    initial_response_header_policy_plugins,
+                    backend_start,
+                )
+                .await;
+            }
+            Ok(Err(crate::proxy::response_buffer_budget::RetainRejection::TooLarge)) => {
                 // The reject writer emits HEADERS then STOP_SENDING; do not reverse
                 // that order with a pre-write halt (would duplicate STOP_SENDING).
                 cb_probe.release_neutral();
-                return Box::pin(write_bridge_upload_refusal(
+                return boxed_write_bridge_upload_refusal(
                     stream,
                     HttpFlavor::Grpc,
                     plugins,
@@ -8343,7 +8837,7 @@ where
                     response_committed_plugins,
                     initial_response_header_policy_plugins,
                     backend_start,
-                ))
+                )
                 .await;
             }
             Err(super::server::H3RequestBodyReadError::Read(e)) => {
@@ -8353,9 +8847,10 @@ where
                     "cross-protocol H3→gRPC: request body read failed"
                 );
                 cb_probe.release_neutral();
-                if e.is_client_disconnect() {
+                if let Some(abort) = e.proven_client_abort_with_peer(ctx.peer_connection.as_ref()) {
                     return Box::pin(write_bridge_upload_client_disconnect(
                         stream,
+                        abort,
                         HttpFlavor::Grpc,
                         plugins,
                         ctx,
@@ -8364,6 +8859,14 @@ where
                         backend_start,
                     ))
                     .await;
+                }
+                if e.failure() == H3RequestReadFailure::GatewayTerminated {
+                    return Ok(bridge_upload_gateway_closed_outcome(
+                        stream,
+                        ctx,
+                        true,
+                        backend_start,
+                    ));
                 }
                 return write_grpc_error_for_request(
                     stream,
@@ -8484,7 +8987,7 @@ where
     // reachable only when no body-transforming plugin is configured. `bytes_sent`
     // above stays the raw client-wire length.
     crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-        &ctx.metadata,
+        ctx,
         &ctx.grpc_request_messages_observed,
         &body,
     );
@@ -8521,7 +9024,22 @@ where
     );
     // Every attempt shares the one charged allocation; the charge is released
     // when the last copy drops, once dispatch and every retry are done (#6009).
-    let body_bytes = publish_h3_retained_body(body, bridge_upload_charge.take());
+    // A body a request-body plugin grew past what the budget can cover is
+    // refused rather than retained uncharged.
+    let Some(body_bytes) = publish_h3_retained_body(body, bridge_upload_charge.take()) else {
+        cb_probe.release_neutral();
+        return boxed_write_bridge_upload_refusal(
+            stream,
+            HttpFlavor::Grpc,
+            plugins,
+            ctx,
+            BridgeUploadRefusal::BufferCapacity,
+            response_committed_plugins,
+            initial_response_header_policy_plugins,
+            backend_start,
+        )
+        .await;
+    };
     let (initial_hmap, initial_body, retry_hmap, retry_body) = if grpc_has_retry {
         (
             hmap.clone(),
@@ -8584,11 +9102,10 @@ where
             hyper_method.clone(),
             initial_hmap,
             initial_body,
-            crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+            crate::plugins::grpc_web::staged_request_trailers(&ctx.grpc_web_request_trailers),
             grpc_dispatch_proxy,
             &current_url,
             &initial_grpc_transport,
-            &state.dns_cache,
             attempt_span.headers(&merge_proxy_headers),
             stream_grpc_response,
             effective_max_response_body_size_bytes,
@@ -8696,7 +9213,7 @@ where
                 current_cb_target_key.as_deref(),
                 502,
                 true,
-                cb_probe.take_slot(),
+                cb_probe,
             );
             // This attempt is settled and a retry replaces it (issue #5867),
             // with its TLS failure detail as the other gRPC paths note it
@@ -8706,11 +9223,9 @@ where
             {
                 crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
             }
-            ctx.record_backend_attempt(
-                retry_error_class,
-                grpc_proxy::grpc_dispatch_reached_wire(&result, retry_error_class),
-                None,
-            );
+            let retry_on_wire = grpc_proxy::grpc_dispatch_reached_wire(&result, retry_error_class);
+            ctx.record_backend_dispatch_outcome(retry_error_class, retry_on_wire);
+            ctx.record_backend_attempt(retry_error_class, retry_on_wire, None);
             last_attempt_recorded = true;
 
             // The failed attempt's route budget ends here: backoff is bounded
@@ -8732,6 +9247,11 @@ where
             }
             attempt += 1;
 
+            // Kept so a breaker refusal below can restore the target that
+            // produced the result being served.
+            let pre_rotation_target = current_target.clone();
+            let pre_rotation_cb_target_key = current_cb_target_key.clone();
+            let pre_rotation_url = current_url.clone();
             if let CrossProtocolRetryTarget::Selected(next_target, next_cb_target_key, next_url) =
                 retry_target
             {
@@ -8784,6 +9304,25 @@ where
                     .await;
                 }
             };
+
+            // Admit this attempt through the breaker of the target it will dial
+            // (issue #6799) after the backoff and the rotated target's transport
+            // screen, immediately before backend admission — the H1/H2 gRPC
+            // retry loop's order. An OPEN breaker ends the retries: the previous
+            // attempt, already recorded, is served against the target that
+            // produced it, and the retired guard keeps the terminal record from
+            // settling it twice.
+            if !crate::proxy::admit_retry_attempt(
+                state,
+                proxy,
+                current_cb_target_key.as_deref(),
+                cb_probe,
+            ) {
+                current_target = pre_rotation_target;
+                current_cb_target_key = pre_rotation_cb_target_key;
+                current_url = pre_rotation_url;
+                break;
+            }
 
             warn!(
                 proxy_id = %proxy.id,
@@ -8845,11 +9384,12 @@ where
                     hmap.clone(),
                     body_bytes.clone(),
                     // A retry replays the complete request, trailers included.
-                    crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+                    crate::plugins::grpc_web::staged_request_trailers(
+                        &ctx.grpc_web_request_trailers,
+                    ),
                     grpc_retry_dispatch_proxy,
                     &current_url,
                     &grpc_retry_transport,
-                    &state.dns_cache,
                     attempt_span.headers(&retry_merge_proxy_headers),
                     stream_grpc_response,
                     effective_max_response_body_size_bytes,
@@ -8863,21 +9403,22 @@ where
             crate::proxy::charge_grpc_route_attempt_budget_expiry(ctx, &mut result);
         }
     }
+    // The final attempt's dispatch provenance, as proxy core's gRPC path
+    // records it; re-recording an attempt the loop already recorded leaves the
+    // state unchanged.
+    let dispatch_error = result
+        .as_ref()
+        .err()
+        .map(crate::retry::classify_grpc_proxy_error);
+    let dispatch_on_wire = grpc_proxy::grpc_dispatch_reached_wire(&result, dispatch_error);
+    ctx.record_backend_dispatch_outcome(dispatch_error, dispatch_on_wire);
     if !last_attempt_recorded {
-        let dispatch_error = result
-            .as_ref()
-            .err()
-            .map(crate::retry::classify_grpc_proxy_error);
         if dispatch_error == Some(crate::retry::ErrorClass::TlsError)
             && let Err(error) = &result
         {
             crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
         }
-        ctx.record_backend_attempt(
-            dispatch_error,
-            grpc_proxy::grpc_dispatch_reached_wire(&result, dispatch_error),
-            None,
-        );
+        ctx.record_backend_attempt(dispatch_error, dispatch_on_wire, None);
     }
 
     let final_backend_resolved_ip =
@@ -9078,7 +9619,7 @@ where
                     outcome.response_status,
                     false,
                     None,
-                    cb_probe.take_slot(),
+                    cb_probe.settle(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -9612,7 +10153,8 @@ where
             let mut body_completed = true;
             let mut client_disconnected = false;
             let mut authorization_terminated = false;
-            if !response_body.is_empty() {
+            // A `HEAD` response carries no body bytes (RFC 9110 §9.3.2).
+            if !response_body.is_empty() && !crate::http3::server::h3_request_is_head() {
                 let body_len = response_body.len() as u64;
                 let body_write = if terminal_gateway_deadline {
                     crate::http3::stream_util::await_terminal_response_write_before_deadline(
@@ -9777,6 +10319,18 @@ where
                     body_completed = false;
                 }
             }
+            // A completed buffered gRPC response carries its backend outcome in the
+            // grpc-status trailer (HTTP 200), captured pre-hook as
+            // `grpc_backend_dispatch_status`, so an UNAVAILABLE/INTERNAL backend must
+            // count as a failure, not look healthy, for the breaker, passive health,
+            // least-latency AND the admission limiter — exactly as the streaming
+            // arm and the H1/H2 gRPC path record it (issue #7189). An incomplete
+            // stream stays a client disconnect, matching H1/H2.
+            let backend_outcome_status = if body_completed {
+                grpc_backend_dispatch_status
+            } else {
+                response_status
+            };
             if authorization_terminated {
                 cb_probe.release_neutral();
                 drop(backend_admission_permits.take());
@@ -9788,27 +10342,17 @@ where
                     upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
-                    response_status,
+                    backend_outcome_status,
                     false,
                     None,
-                    cb_probe.take_slot(),
+                    cb_probe.settle(),
                     false,
                     backend_start.elapsed(),
                 );
             }
-            // A completed buffered gRPC response carries its backend outcome in the
-            // grpc-status trailer (HTTP 200), captured pre-hook as
-            // `grpc_backend_dispatch_status`, so an UNAVAILABLE/INTERNAL backend must
-            // shrink, not look healthy. An incomplete stream stays a client
-            // disconnect (ignored), matching H1/H2.
-            let admission_status = if body_completed {
-                grpc_backend_dispatch_status
-            } else {
-                response_status
-            };
             record_cross_protocol_backend_admission_outcome(
                 &mut backend_admission_permits,
-                admission_status,
+                backend_outcome_status,
                 false,
                 if body_completed {
                     None
@@ -9836,6 +10380,7 @@ where
                 backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                 backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                 rejection_logged: false,
+                route_deadline_cut: false,
             })
         }
         Ok(GrpcResponseKind::Streaming(streaming)) => {
@@ -9898,9 +10443,10 @@ where
                     crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
                     crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
                 ),
-                grpc_proxy::GrpcProxyError::Internal(_) => {
-                    (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
-                }
+                grpc_proxy::GrpcProxyError::Internal(_) => (
+                    grpc_proxy::grpc_status::INTERNAL,
+                    grpc_proxy::GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE,
+                ),
                 grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
                     (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
                 }
@@ -9920,6 +10466,7 @@ where
             let connection_error =
                 !matches!(&err, grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_))
                     && !crate::retry::request_reached_wire(error_class);
+            let (health_status, health_class) = grpc_bridge_failure_health(&err, error_class);
             warn!(
                 proxy_id = %proxy.id,
                 error = %err,
@@ -9935,18 +10482,18 @@ where
                 upstream_balancer,
                 current_target.as_deref(),
                 current_cb_target_key.as_deref(),
-                502,
+                health_status,
                 connection_error,
-                Some(error_class),
-                cb_probe.take_slot(),
+                Some(health_class),
+                cb_probe.settle(),
                 false,
                 backend_start.elapsed(),
             );
             record_cross_protocol_backend_admission_outcome(
                 &mut backend_admission_permits,
-                502,
+                health_status,
                 connection_error,
-                Some(error_class),
+                Some(health_class),
                 backend_admission_start.elapsed(),
             );
             let mut outcome = write_grpc_error_for_request(
@@ -9965,6 +10512,26 @@ where
             outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
             Ok(outcome)
         }
+    }
+}
+
+/// Backend-health `(status, class)` for an H3→gRPC bridge dispatch failure.
+///
+/// `GrpcProxyError::Internal` is a gateway-side construction failure before
+/// any dial (backend TLS config, backend URL/authority could not be built), so
+/// it must not trip the breaker, ding passive health or shrink adaptive
+/// concurrency: it is recorded as a health-neutral, non-retryable
+/// `DispatchPolicyRejected` `500`, as the HTTP/1.1-HTTP/2 path (which settles
+/// it neutrally) and the native-HTTP/3 dispatch do (#6773). The transaction
+/// log keeps the granular class. Every other failure keeps `502` + its class.
+pub(crate) fn grpc_bridge_failure_health(
+    err: &grpc_proxy::GrpcProxyError,
+    error_class: ErrorClass,
+) -> (u16, ErrorClass) {
+    if matches!(err, grpc_proxy::GrpcProxyError::Internal(_)) {
+        (500, ErrorClass::DispatchPolicyRejected)
+    } else {
+        (502, error_class)
     }
 }
 
@@ -10035,6 +10602,89 @@ pub(crate) fn boxed_dispatch_grpc_streaming<'a>(
         )
         .await
     })
+}
+
+/// The H3→gRPC bridge pump's ONE published upload fault (issue #6772): a
+/// single atomic, so a reader can never pair one cause with another's failure.
+/// Each failed read is classified positively by
+/// `stream_util::classify_h3_request_read_error`.
+const GRPC_BRIDGE_UPLOAD_OK: u8 = 0;
+const GRPC_BRIDGE_UPLOAD_CLIENT_ABORT: u8 = 1;
+const GRPC_BRIDGE_UPLOAD_MALFORMED_TRAILERS: u8 = 2;
+const GRPC_BRIDGE_UPLOAD_MALFORMED_BODY: u8 = 3;
+const GRPC_BRIDGE_UPLOAD_GATEWAY_TERMINATED: u8 = 4;
+
+/// The bridge upload fault code for a failed read of the client's upload.
+/// `trailers` is whether the read was the trailer section's.
+fn grpc_bridge_upload_fault(error: &h3::error::StreamError, trailers: bool) -> u8 {
+    match classify_h3_request_read_error(error) {
+        H3RequestReadFailure::ClientAbort => GRPC_BRIDGE_UPLOAD_CLIENT_ABORT,
+        H3RequestReadFailure::Malformed if trailers => GRPC_BRIDGE_UPLOAD_MALFORMED_TRAILERS,
+        H3RequestReadFailure::Malformed => GRPC_BRIDGE_UPLOAD_MALFORMED_BODY,
+        H3RequestReadFailure::GatewayTerminated => GRPC_BRIDGE_UPLOAD_GATEWAY_TERMINATED,
+    }
+}
+
+/// Settle a published bridge upload fault against the client's connection: a
+/// gateway-terminated read on a connection the client closed is its abort,
+/// because such a read can fail as an unclassified closed stream rather than
+/// as the connection error (issue #6772). Every other code is unchanged.
+fn grpc_bridge_upload_fault_with_peer(
+    fault: u8,
+    peer: Option<&crate::plugins::PeerConnectionSignal>,
+) -> u8 {
+    if fault == GRPC_BRIDGE_UPLOAD_GATEWAY_TERMINATED
+        && ProvenClientAbort::from_peer_connection(peer).is_some()
+    {
+        GRPC_BRIDGE_UPLOAD_CLIENT_ABORT
+    } else {
+        fault
+    }
+}
+
+/// Whether a backend error chain ends in the gateway's OWN HTTP/2 stream reset
+/// (issue #6772): an `h2` reset that the backend did not send (`is_remote`) and
+/// that h2 did not raise for a backend protocol violation (`is_library`). That
+/// is the reset hyper issues when the channel body hands it the client's
+/// upload failure. Whichever side reset the stream first owns it: a backend
+/// reset that arrived first stays remote, so it, a connection failure, and an
+/// I/O failure all return `false` and stay backend failures. Typed only, and
+/// allocation-free.
+fn error_chain_is_local_h2_reset(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(node) = current {
+        if let Some(h2_err) = node.downcast_ref::<h2::Error>() {
+            return h2_err.is_reset() && !h2_err.is_remote() && !h2_err.is_library();
+        }
+        current = node.source();
+    }
+    false
+}
+
+/// The streaming bridge's frontend upload evidence, read together.
+#[derive(Clone, Copy)]
+struct GrpcBridgeUploadSignals<'a> {
+    /// The pump's published fault code.
+    fault: &'a AtomicU8,
+    /// Set by `GrpcBody::Channel` when it handed the pump's failure to hyper.
+    relayed: &'a AtomicBool,
+}
+
+impl GrpcBridgeUploadSignals<'_> {
+    /// The upload fault that ENDED the backend exchange, or
+    /// `GRPC_BRIDGE_UPLOAD_OK`. A fault counts only once the channel body
+    /// relayed it to hyper (which resets the backend stream): that acquire is
+    /// the publication flag, and the pump stored the fault before it sent the
+    /// failure, so the cause read after it is the one that was relayed. A
+    /// failure the body never relayed cannot have ended the exchange, so an
+    /// independently selected backend failure keeps its own classification.
+    fn relayed_fault(self) -> u8 {
+        if self.relayed.load(Ordering::Acquire) {
+            self.fault.load(Ordering::Acquire)
+        } else {
+            GRPC_BRIDGE_UPLOAD_OK
+        }
+    }
 }
 
 /// HTTP/3 → non-H3 gRPC backend with a STREAMING request body.
@@ -10214,13 +10864,18 @@ pub(crate) async fn dispatch_grpc_streaming(
     // merely read from H3 but still queued when cancellation wins never reached
     // the backend request and must not inflate TransactionSummary.bytes_sent.
     let request_bytes_forwarded = Arc::new(AtomicU64::new(0));
-    // Set by the pump when the H3 recv half errors (the client reset its upload).
-    // The resulting backend RST must be recorded as a CLIENT abort, not a backend
-    // fault (codex P2) — read in the dispatch Err arm below.
-    let frontend_upload_failed = Arc::new(AtomicBool::new(false));
-    let pump_frontend_failed = Arc::clone(&frontend_upload_failed);
-    let frontend_upload_malformed = Arc::new(AtomicBool::new(false));
-    let pump_frontend_malformed = Arc::clone(&frontend_upload_malformed);
+    // Set by the pump when the H3 recv half errors, with the classified cause
+    // (issue #6772), BEFORE it hands the failure to the channel body. The body
+    // sets `frontend_failure_relayed` when it passes that failure to hyper, so a
+    // resulting backend RST is recorded as the frontend's terminal, not a backend
+    // fault (codex P2) — read together in the dispatch Err arm below.
+    let frontend_upload_fault = Arc::new(AtomicU8::new(GRPC_BRIDGE_UPLOAD_OK));
+    let pump_frontend_fault = Arc::clone(&frontend_upload_fault);
+    let frontend_failure_relayed = Arc::new(AtomicBool::new(false));
+    let upload_signals = GrpcBridgeUploadSignals {
+        fault: &frontend_upload_fault,
+        relayed: &frontend_failure_relayed,
+    };
     // The pump sets this when response-side completion/cancellation stops it
     // before downstream request EOF. `GrpcBody::Channel` checks it before
     // queued DATA so the backend upload is reset, never cleanly truncated.
@@ -10237,6 +10892,9 @@ pub(crate) async fn dispatch_grpc_streaming(
         grpc_auth.as_ref().map(|(plan, _, _)| *plan),
     );
     let pump_auth = grpc_auth.clone();
+    // The route's configured credential header locations, stripped from the
+    // client's trailing metadata after the static late-boundary filter.
+    let pump_trailer_credential_header_names = ctx.request_trailer_credential_header_names();
     let pump = tokio::spawn(async move {
         let mut cancelled_before_eof = false;
         let upload = async {
@@ -10298,6 +10956,12 @@ pub(crate) async fn dispatch_grpc_streaming(
                                 match trailer_result {
                                     Ok(Some(mut trailers)) if !trailers.is_empty() => {
                                         sanitize_backend_request_trailers(&mut trailers);
+                                        crate::proxy::headers::strip_configured_credential_request_trailers(
+                                            &mut trailers,
+                                            crate::proxy::body::trailer_credential_names(
+                                                &pump_trailer_credential_header_names,
+                                            ),
+                                        );
                                         if !trailers.is_empty() {
                                             tokio::select! {
                                                 biased;
@@ -10312,10 +10976,10 @@ pub(crate) async fn dispatch_grpc_streaming(
                                     }
                                     Ok(_) => {}
                                     Err(e) => {
-                                        if !h3_request_read_error_is_client_abort(&e) {
-                                            pump_frontend_malformed.store(true, Ordering::Release);
-                                        }
-                                        pump_frontend_failed.store(true, Ordering::Release);
+                                        pump_frontend_fault.store(
+                                            grpc_bridge_upload_fault(&e, true),
+                                            Ordering::Release,
+                                        );
                                         tokio::select! {
                                             biased;
                                             _ = pump_shutdown_signal.notified() => {
@@ -10327,13 +10991,17 @@ pub(crate) async fn dispatch_grpc_streaming(
                                 }
                                 break;
                             }
-                            Err(_e) => {
+                            Err(e) => {
                                 // Frontend upload failure: flag it (so the dispatch Err
                                 // arm records a client abort, not a backend fault) and
                                 // best-effort signal the channel body to RST the backend
                                 // instead of sending a clean END_STREAM. The send stays
                                 // cancellable for the same reason as the data send above.
-                                pump_frontend_failed.store(true, Ordering::Release);
+                                // The cause is classified positively (issue #6772).
+                                pump_frontend_fault.store(
+                                    grpc_bridge_upload_fault(&e, false),
+                                    Ordering::Release,
+                                );
                                 tokio::select! {
                                     biased;
                                     _ = pump_shutdown_signal.notified() => {
@@ -10392,6 +11060,14 @@ pub(crate) async fn dispatch_grpc_streaming(
     let mut held_frontend_grpc_upload = None;
     // The single attempt's `otel_tracing` CLIENT span (issue #5867).
     let attempt_span = ctx.begin_backend_attempt_span(backend_url, &merge_proxy_headers);
+    // The client's response direction is watched until the response head
+    // (issue #6772): after a clean upload FIN the pump has nothing left to
+    // observe, so a `STOP_SENDING`, or a connection the client closed, while the
+    // backend withholds its head is seen here and recorded with its typed
+    // provenance, never left to surface as a backend timeout. A settled attempt
+    // (including every deadline inside it) keeps precedence.
+    let response_stopped = crate::http3::stream_util::peer_response_stopped(&send_half);
+    let mut response_cancel: Option<bool> = None;
     let mut result = {
         let attempt = grpc_proxy::proxy_grpc_request_streaming_channel(
             hyper_method,
@@ -10405,6 +11081,7 @@ pub(crate) async fn dispatch_grpc_streaming(
             Arc::clone(&body_size_exceeded),
             Arc::clone(&backend_upload_cancelled),
             Arc::clone(&request_bytes_forwarded),
+            Some(Arc::clone(&frontend_failure_relayed)),
             None,
             ctx.grpc_deadline_at(),
             &mut held_frontend_grpc_upload,
@@ -10412,7 +11089,20 @@ pub(crate) async fn dispatch_grpc_streaming(
             grpc_auth.as_ref(),
         );
         tokio::pin!(attempt);
-        attempt_span.scope(attempt).await
+        let scoped = attempt_span.scope(attempt);
+        tokio::pin!(scoped);
+        tokio::pin!(response_stopped);
+        tokio::select! {
+            biased;
+            result = &mut scoped => result,
+            peer_stop_sending = &mut response_stopped => {
+                response_cancel = Some(peer_stop_sending);
+                Err(grpc_proxy::GrpcProxyError::backend_unavailable(
+                    grpc_proxy::GrpcBackendUnavailableKind::DispatchCanceled,
+                    "client response direction ended before the response head".to_string(),
+                ))
+            }
+        }
     };
     // A stall the matched rule's per-attempt budget (`backendRequest`) cut is
     // the backend's, exactly as on the H1/H2 gRPC path (#5646).
@@ -10449,11 +11139,15 @@ pub(crate) async fn dispatch_grpc_streaming(
     {
         crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
     }
-    ctx.record_backend_attempt(
+    let dispatch_on_wire = grpc_proxy::grpc_dispatch_reached_wire(&result, dispatch_error);
+    // A client that gave up on the response while the attempt was in flight
+    // leaves it possibly executed: the synthesized cancel's connect-class label
+    // is not proof the request never reached the backend.
+    ctx.record_backend_dispatch_outcome(
         dispatch_error,
-        grpc_proxy::grpc_dispatch_reached_wire(&result, dispatch_error),
-        None,
+        dispatch_on_wire || response_cancel.is_some(),
     );
+    ctx.record_backend_attempt(dispatch_error, dispatch_on_wire, None);
 
     let final_backend_resolved_ip =
         resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await;
@@ -10481,7 +11175,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 bytes_sent,
                 backend_url,
                 final_backend_resolved_ip.clone(),
-                Some(&frontend_upload_failed),
+                Some(upload_signals),
                 response_trailer_governance,
             )
             .await
@@ -10500,7 +11194,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 500,
                 false,
                 Some(ErrorClass::ProtocolError),
-                cb_probe.take_slot(),
+                cb_probe.settle(),
                 false,
                 backend_start.elapsed(),
             );
@@ -10529,12 +11223,68 @@ pub(crate) async fn dispatch_grpc_streaming(
         }
         Err(err) => {
             let bytes_sent = request_bytes_forwarded.load(Ordering::Relaxed);
-            let malformed_upload = frontend_upload_malformed.load(Ordering::Acquire);
+            // Only an upload failure the channel body RELAYED to hyper ended this
+            // backend exchange (issue #6772); a backend failure that happened on
+            // its own keeps its own classification even if the client also went
+            // away. Deadline and authorization terminals keep their accounting.
+            let gateway_terminal = matches!(
+                &err,
+                grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_)
+                    | grpc_proxy::GrpcProxyError::BackendTimeout { .. }
+                    | grpc_proxy::GrpcProxyError::AuthorizationExpired { .. }
+            );
+            // The relay latch alone does not prove the relay ended the exchange:
+            // a backend reset can win before hyper's own reset, which h2 then
+            // drops. So a relayed upload fault counts only when the returned
+            // error is the gateway's own local reset as well.
+            let upload_fault = if let Some(peer_stop_sending) = response_cancel {
+                // The response-direction watcher above ended the dispatch.
+                if ProvenClientAbort::from_response_cancellation(
+                    peer_stop_sending,
+                    ctx.peer_connection.as_ref(),
+                )
+                .is_some()
+                {
+                    GRPC_BRIDGE_UPLOAD_CLIENT_ABORT
+                } else {
+                    GRPC_BRIDGE_UPLOAD_GATEWAY_TERMINATED
+                }
+            } else if gateway_terminal || !error_chain_is_local_h2_reset(&err) {
+                GRPC_BRIDGE_UPLOAD_OK
+            } else {
+                upload_signals.relayed_fault()
+            };
+            let upload_fault =
+                grpc_bridge_upload_fault_with_peer(upload_fault, ctx.peer_connection.as_ref());
+            let malformed_upload = matches!(
+                upload_fault,
+                GRPC_BRIDGE_UPLOAD_MALFORMED_TRAILERS | GRPC_BRIDGE_UPLOAD_MALFORMED_BODY
+            );
+            let gateway_closed = upload_fault == GRPC_BRIDGE_UPLOAD_GATEWAY_TERMINATED;
+            // A client that reset or lost its upload before any response header
+            // takes the shared client-abort terminal: `CANCELLED`, never the
+            // `UNAVAILABLE` its backend reset would map to.
+            let client_abort = if upload_fault == GRPC_BRIDGE_UPLOAD_CLIENT_ABORT {
+                Some(ProvenClientAbort::latched_upload_abort().pre_header_terminal())
+            } else {
+                None
+            };
+            let frontend_aborted = client_abort.is_some() || gateway_closed;
+            let upload_terminal_selected = upload_fault != GRPC_BRIDGE_UPLOAD_OK;
             let (grpc_status_code, grpc_message): (u32, &str) = if malformed_upload {
                 (
                     grpc_proxy::grpc_status::INVALID_ARGUMENT,
-                    "Malformed request trailers",
+                    if upload_fault == GRPC_BRIDGE_UPLOAD_MALFORMED_BODY {
+                        crate::proxy::client_abort::MALFORMED_UPLOAD_GRPC_MESSAGE
+                    } else {
+                        "Malformed request trailers"
+                    },
                 )
+            } else if let Some(terminal) = client_abort {
+                (terminal.grpc_status, terminal.grpc_message)
+            } else if gateway_closed {
+                let terminal = crate::proxy::client_abort::GATEWAY_CLOSED_UPLOAD_TERMINAL;
+                (terminal.grpc_status, terminal.grpc_message)
             } else {
                 match &err {
                     grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_) => (
@@ -10560,9 +11310,10 @@ pub(crate) async fn dispatch_grpc_streaming(
                         crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
                         crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
                     ),
-                    grpc_proxy::GrpcProxyError::Internal(_) => {
-                        (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
-                    }
+                    grpc_proxy::GrpcProxyError::Internal(_) => (
+                        grpc_proxy::grpc_status::INTERNAL,
+                        grpc_proxy::GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE,
+                    ),
                     grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
                     }
@@ -10577,9 +11328,10 @@ pub(crate) async fn dispatch_grpc_streaming(
             // concurrency (both neutralized by `client_side_no_backend_signal`):
             //   * `ResourceExhausted` — the gateway rejected an oversized client
             //     upload (the channel body tripped `max_grpc_recv_size_bytes`).
-            //   * a frontend upload abort — the H3 recv half errored, so the pump
-            //     set `frontend_upload_failed` and RST the backend; the resulting
-            //     `BackendUnavailable` is a consequence of the client reset.
+            //   * a frontend upload abort or gateway-closed stream — the H3 recv
+            //     half errored, the pump published the fault, and the channel
+            //     body relayed it and RST the backend; the resulting
+            //     `BackendUnavailable` is a consequence of that reset.
             //   * malformed request trailers — the H3 decoder refused the
             //     trailing block and the channel body RST the backend upload.
             // All three mirror the buffered H3 path, which releases the probe without
@@ -10587,8 +11339,6 @@ pub(crate) async fn dispatch_grpc_streaming(
             // wire-boundary derivation so a real backend failure still trains the
             // limiter.
             let request_overflow = matches!(&err, grpc_proxy::GrpcProxyError::ResourceExhausted(_));
-            let frontend_aborted =
-                !malformed_upload && frontend_upload_failed.load(Ordering::Acquire);
             let client_deadline =
                 matches!(&err, grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_));
             let error_class = if request_overflow {
@@ -10607,6 +11357,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 && !malformed_upload
                 && !frontend_aborted
                 && !crate::retry::request_reached_wire(error_class);
+            let (health_status, health_class) = grpc_bridge_failure_health(&err, error_class);
             warn!(
                 proxy_id = %proxy.id,
                 error = %err,
@@ -10615,6 +11366,21 @@ pub(crate) async fn dispatch_grpc_streaming(
                 connection_error,
                 "cross-protocol H3→gRPC streaming backend call failed"
             );
+            // A frontend terminal is recorded under its own status, never an
+            // upstream `502`; its `ClientDisconnect` class keeps it neutral.
+            // Every other failure keeps the shared bridge health mapping.
+            let (health_status, health_class) = if let Some(terminal) = client_abort {
+                (terminal.http_status, error_class)
+            } else if gateway_closed {
+                (
+                    crate::proxy::client_abort::GATEWAY_CLOSED_UPLOAD_TERMINAL.http_status,
+                    error_class,
+                )
+            } else if malformed_upload {
+                (StatusCode::BAD_REQUEST.as_u16(), error_class)
+            } else {
+                (health_status, health_class)
+            };
             record_backend_outcome_no_conn_end(
                 state,
                 proxy,
@@ -10622,20 +11388,27 @@ pub(crate) async fn dispatch_grpc_streaming(
                 upstream_balancer,
                 current_target.as_deref(),
                 current_cb_target_key.as_deref(),
-                502,
+                health_status,
                 connection_error,
-                Some(error_class),
-                cb_probe.take_slot(),
+                Some(health_class),
+                cb_probe.settle(),
                 false,
                 backend_start.elapsed(),
             );
             record_cross_protocol_backend_admission_outcome(
                 &mut backend_admission_permits,
-                502,
+                health_status,
                 connection_error,
-                Some(error_class),
+                Some(health_class),
                 backend_admission_start.elapsed(),
             );
+            if upload_terminal_selected {
+                crate::proxy::insert_grpc_error_metadata(
+                    &mut ctx.metadata,
+                    grpc_status_code,
+                    grpc_message,
+                );
+            }
             // Drop the held upload only after the Trailers-Only error is queued
             // on the H3 send half (#2057).
             let grpc_error_write = if let grpc_proxy::GrpcProxyError::AuthorizationExpired {
@@ -10653,20 +11426,51 @@ pub(crate) async fn dispatch_grpc_streaming(
                 )
                 .await
             } else {
-                write_grpc_error_send_with_policy(
+                let write = write_grpc_error_send_with_policy(
                     &mut send_half,
                     grpc_status_code,
                     grpc_message,
                     backend_start,
                     bytes_sent,
                     initial_response_header_policy_plugins,
-                )
-                .await
-                .map(|mut outcome| {
+                );
+                // A frontend-selected terminal (`CANCELLED`, `INVALID_ARGUMENT`,
+                // or the gateway-closed `UNAVAILABLE`) is best effort: a stream
+                // that is already gone cannot take it, and a client that keeps
+                // its response direction open without QUIC credit must not hold
+                // it, so the write takes the shared terminal-write grace. Either
+                // way the request reaches the transaction log once rather than
+                // surface as a request-task error.
+                let write = if upload_terminal_selected {
+                    crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("frontend terminal write did not complete"))
+                } else {
+                    write.await
+                };
+                let write = match write {
+                    Err(_) if upload_terminal_selected => {
+                        crate::http3::stream_util::abort_response_stream(&mut send_half);
+                        Ok(terminal_deadline_write_aborted_outcome(
+                            StatusCode::OK.as_u16(),
+                            0,
+                            backend_start,
+                            bytes_sent,
+                            client_abort.is_some(),
+                        ))
+                    }
+                    write => write,
+                };
+                write.map(|mut outcome| {
                     outcome.backend_target = Some(strip_query_from_backend_url(backend_url));
                     outcome.connection_error = connection_error;
                     outcome.error_class = Some(error_class);
                     outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                    if let Some(terminal) = client_abort {
+                        outcome.client_disconnected = terminal.client_disconnected;
+                    } else if gateway_closed {
+                        outcome.client_disconnected = false;
+                    }
                     outcome
                 })
             };
@@ -10804,7 +11608,7 @@ fn normalized_h3_grpc_deadline() -> crate::proxy::NormalizedRejectResponse {
 // ---------------------------------------------------------------------------
 // Streaming response writers — one per backend body type. Both implement
 // the same coalesce-min / coalesce-max / flush-interval window as the
-// native H3 pool write loop (server.rs:1339-1418), so operators see the
+// native H3 pool write loop in `server.rs`, so operators see the
 // same QUIC-level frame cadence across H3-pool and cross-protocol paths.
 // ---------------------------------------------------------------------------
 
@@ -11106,8 +11910,12 @@ fn inspected_emitted_response_limit_exceeded(
     next_len: usize,
     max_response_body_size_bytes: usize,
 ) -> bool {
-    max_response_body_size_bytes > 0
-        && bytes_streamed.saturating_add(next_len as u64) > max_response_body_size_bytes as u64
+    // The one shared output-side boundary every inspector driver uses.
+    crate::proxy::body::response_output_crosses_ceiling(
+        max_response_body_size_bytes,
+        bytes_streamed,
+        next_len,
+    )
 }
 
 /// Drive a response-stream [`ResponseStreamInspector`] over a reqwest backend
@@ -11478,6 +12286,11 @@ struct StreamHyperIncomingOpts<'a> {
     /// exit inside the relay records through it, so the idle arm, the
     /// blocked-write seam, and the terminal FIN cannot double count one stream.
     auth_latch: &'a crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    /// Set when the backend body failed with the gateway's OWN HTTP/2 reset
+    /// (see [`error_chain_is_local_h2_reset`]), the typed evidence that a
+    /// relayed client upload failure, not the backend, ended the body (issue
+    /// #6772).
+    body_error_local_reset: &'a AtomicBool,
 }
 
 /// Stream a hyper `Incoming` body into the H3 stream, separating trailer
@@ -11514,6 +12327,7 @@ where
         grpc_response_messages,
         auth_deadline,
         auth_latch,
+        body_error_local_reset,
     } = opts;
     let mut coalesce_buf = BytesMut::with_capacity(coalesce.max_bytes);
     let mut total_streamed: usize = 0;
@@ -11657,6 +12471,31 @@ where
             }
         }};
     }
+    // Output-side response ceiling. `total_streamed` bounds the backend's own
+    // DATA; translated gRPC-Web text mode base64-expands it, so the bytes the
+    // client receives are charged separately before every write. Untranslated
+    // output equals its input and can never trip this first. `true` means the
+    // stream was reset and the caller must leave the relay loop.
+    macro_rules! output_exceeds_ceiling {
+        ($len:expr) => {{
+            if crate::proxy::body::response_output_crosses_ceiling(
+                max_response_body_size_bytes,
+                bytes_offered,
+                $len,
+            ) {
+                warn!(
+                    "Translated response exceeded {} byte limit during cross-protocol H3 gRPC stream",
+                    max_response_body_size_bytes
+                );
+                coalesce_buf.clear();
+                crate::http3::stream_util::abort_response_stream(stream);
+                body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
+                true
+            } else {
+                false
+            }
+        }};
+    }
 
     'outer: loop {
         if just_received_backend_frame
@@ -11786,6 +12625,9 @@ where
                                 } else {
                                     data
                                 };
+                                if output_exceeds_ceiling!(out.len()) {
+                                    break 'outer;
+                                }
                                 let out_len = out.len() as u64;
                                 if !await_downstream_write!(stream.send_data(out), out_len) {
                                     break 'outer;
@@ -11810,6 +12652,9 @@ where
                                 } else {
                                     metric_data.clone()
                                 };
+                                if output_exceeds_ceiling!(out.len()) {
+                                    break 'outer;
+                                }
                                 let out_len = out.len() as u64;
                                 if !await_downstream_write!(stream.send_data(out), out_len) {
                                     break 'outer;
@@ -11831,6 +12676,9 @@ where
                     }
                     Some(Err(e)) => {
                         body_error_class = Some(classify_hyper_error(&e));
+                        if error_chain_is_local_h2_reset(&e) {
+                            body_error_local_reset.store(true, Ordering::Relaxed);
+                        }
                         coalesce_buf.clear();
                         crate::http3::stream_util::abort_response_stream(stream);
                         break 'outer;
@@ -11845,6 +12693,9 @@ where
                 } else {
                     metric_data.clone()
                 };
+                if output_exceeds_ceiling!(out.len()) {
+                    break 'outer;
+                }
                 let out_len = out.len() as u64;
                 if !await_downstream_write!(stream.send_data(out), out_len) {
                     break 'outer;
@@ -11873,6 +12724,9 @@ where
                 } else {
                     metric_data.clone()
                 };
+                if output_exceeds_ceiling!(out.len()) {
+                    break 'outer;
+                }
                 let out_len = out.len() as u64;
                 if !await_downstream_write!(stream.send_data(out), out_len) {
                     break 'outer;
@@ -11978,7 +12832,7 @@ pub(crate) fn collect_reqwest_response_headers(
         if connection_listed.iter().any(|n| n == k) {
             continue;
         }
-        if let Ok(val) = v.to_str() {
+        if let Some(val) = crate::proxy::backend_response_field_value_str(k, v) {
             // `get_mut(name)` borrows the key as &str — no String alloc on
             // the multi-value case. Only the insert branch allocates the
             // owned key. Matches the H1/H2 path's pattern (see CLAUDE.md).
@@ -12000,14 +12854,16 @@ pub(crate) fn collect_reqwest_response_headers(
 // H3 body drain + response writers
 // ---------------------------------------------------------------------------
 
-/// Drain the H3 stream body into an admitted, capped `Vec<u8>` (#6009).
-/// Returns `Ok(None)` when the retained ceiling is exceeded (caller emits
-/// 413); on success the shared request-buffer charge moves into `charge`.
+/// Drain the H3 stream body into a charged, capped `Vec<u8>` (#6009).
+/// Returns `Ok(Err(TooLarge))` when the retained ceiling is exceeded (caller
+/// emits 413) and `Ok(Err(BudgetExhausted))` when the shared request-buffer
+/// budget refuses a growth (caller emits 503); on success the charge moves into
+/// `charge`.
 async fn drain_h3_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     upload: H3RetainedUpload,
     charge: &mut Option<crate::proxy::response_buffer_budget::RequestBufferPermit>,
-) -> Result<Option<Vec<u8>>, super::server::H3UploadReadError>
+) -> super::server::H3RetainedUploadResult
 where
     S: RecvStream,
 {
@@ -12078,6 +12934,9 @@ where
     Ok(())
 }
 
+/// Write a fixed JSON error terminal for the one defensive arm that reaches
+/// it (a WebSocket flavor that should have been routed to
+/// `handle_h3_websocket`).
 async fn write_error<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
@@ -12088,25 +12947,16 @@ async fn write_error<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    write_error_with_header(stream, status, body, None, backend_start, bytes_sent).await
-}
-
-async fn write_error_with_header<S>(
-    stream: &mut RequestStream<S, Bytes>,
-    status: StatusCode,
-    body: &'static str,
-    extra_header: Option<(&'static str, &'static str)>,
-    backend_start: Instant,
-    bytes_sent: u64,
-) -> Result<CrossProtocolOutcome, anyhow::Error>
-where
-    S: RecvStream + SendStream<Bytes>,
-{
     let mut builder = Response::builder()
         .status(status)
         .header("content-type", "application/json");
-    if let Some((name, value)) = extra_header {
-        builder = builder.header(name, value);
+    // A `HEAD` response keeps its representation `Content-Length` and carries
+    // no body bytes (RFC 9110 §9.3.2).
+    let omit_body = crate::http3::server::h3_request_is_head() && !body.is_empty();
+    if omit_body
+        && !crate::plugins::utils::synthetic_response::status_forbids_response_body(status.as_u16())
+    {
+        builder = builder.header("content-length", body.len());
     }
     let resp = builder
         .body(())
@@ -12114,8 +12964,10 @@ where
     let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
     let bytes = Bytes::from_static(body.as_bytes());
-    let len = bytes.len() as u64;
-    let _ = stream.send_data(bytes).await;
+    let len = if omit_body { 0 } else { bytes.len() as u64 };
+    if !omit_body {
+        let _ = stream.send_data(bytes).await;
+    }
     let _ = stream.finish().await;
     crate::http3::stream_util::halt_request_body(stream);
     Ok(CrossProtocolOutcome {
@@ -12133,6 +12985,7 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
+        route_deadline_cut: false,
     })
 }
 
@@ -12213,6 +13066,32 @@ pub(crate) async fn run_cross_protocol_reject_committed_hooks(
     normalized: &mut crate::proxy::NormalizedRejectResponse,
     translated: &mut Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
 ) -> bool {
+    run_cross_protocol_reject_committed_hooks_with(
+        plugins,
+        ctx,
+        native_grpc,
+        charged_backend_deadline,
+        true,
+        normalized,
+        translated,
+    )
+    .await
+}
+
+/// [`run_cross_protocol_reject_committed_hooks`] with the deadline replacement
+/// selectable: `replace_on_deadline = false` still races each observer to the
+/// request's RPC / authorization deadline and detaches one still pending then,
+/// but keeps the response the caller already selected (the plain bridge's
+/// gateway error terminal is never swapped for a deadline terminal).
+async fn run_cross_protocol_reject_committed_hooks_with(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    native_grpc: bool,
+    charged_backend_deadline: bool,
+    replace_on_deadline: bool,
+    normalized: &mut crate::proxy::NormalizedRejectResponse,
+    translated: &mut Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
+) -> bool {
     for (index, plugin) in plugins.iter().enumerate() {
         if !plugin.requires_response_committed_hook() {
             continue;
@@ -12244,7 +13123,8 @@ pub(crate) async fn run_cross_protocol_reject_committed_hooks(
                 }
             };
 
-        let deadline_replaced = !terminal_gateway_deadline && !charged_backend_deadline;
+        let deadline_replaced =
+            replace_on_deadline && !terminal_gateway_deadline && !charged_backend_deadline;
         if deadline_replaced {
             ctx.mark_gateway_deadline_response_selected();
             let deadline = normalized_h3_grpc_deadline();
@@ -12313,10 +13193,23 @@ where
 /// authorization terminal on this bridge is, under the bounded post-deadline
 /// write grace, never through the unbounded gateway reject writer.
 ///
-/// The gateway-owned `X-Gateway-Error` token is written after the hooks, from
-/// the typed `connection_error` signal and the post-hook status, as HTTP/1.1
-/// and HTTP/2 write it: a hook can neither see, erase, replace, nor duplicate
-/// it (#5807).
+/// The gateway-owned `X-Gateway-Error` token is written after the `after_proxy`
+/// hooks, from the typed `connection_error` signal and the post-hook status,
+/// as HTTP/1.1 and HTTP/2 write it: an `after_proxy` hook can neither see,
+/// erase, replace, nor duplicate it (#5807).
+///
+/// With `run_committed_observers`, the terminal ends the request, so its
+/// `response_committed` observers run over the normalized client response,
+/// token included (a read-only view), as proxy core runs them over its
+/// gateway-built dispatch failure: `request_deduplication` releases a proven
+/// pre-wire failure's in-flight lease there. Each is awaited up to the request's
+/// RPC / authorization deadline, as on HTTP/1.1 and HTTP/2, so a Redis-backed
+/// release lands before the response is written; one still pending then is
+/// detached, never replaces the gateway's own terminal, and leaves that
+/// terminal to the bounded post-deadline write grace. A caller that
+/// writes this terminal inside a deadline race of its own passes `false`: a
+/// race that fires mid-observer would drop the observer and write a second
+/// terminal whose observers run again.
 #[allow(clippy::too_many_arguments)]
 async fn write_plain_gateway_error_terminal<S>(
     stream: &mut RequestStream<S, Bytes>,
@@ -12325,6 +13218,7 @@ async fn write_plain_gateway_error_terminal<S>(
     status: StatusCode,
     mut body: Bytes,
     connection_error: bool,
+    run_committed_observers: bool,
     backend_start: Instant,
     bytes_sent: u64,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
@@ -12365,14 +13259,44 @@ where
         connection_error,
         status.as_u16(),
     );
-    write_plain_gateway_reject(
+    let (mut normalized, mut translated) =
+        normalize_reject_for_client(ctx, status, body, &headers, false);
+    if run_committed_observers {
+        let observer_deadline = ctx.precommit_response_phase_bound().deadline();
+        run_cross_protocol_reject_committed_hooks_with(
+            plugins,
+            ctx,
+            false,
+            false,
+            false,
+            &mut normalized,
+            &mut translated,
+        )
+        .await;
+        // The RPC or authorization deadline passed while an observer was
+        // pending (it was detached, or dropped at an authorization expiry).
+        // The gateway's own terminal stands, as native H3 keeps it, and is
+        // written under the bounded post-deadline grace instead of the
+        // unbounded writer, so a client withholding flow-control credit cannot
+        // hold the request past that deadline.
+        if observer_deadline.is_some_and(|at| at <= tokio::time::Instant::now()) {
+            return write_normalized_plain_gateway_reject_after_deadline(
+                stream,
+                normalized,
+                translated,
+                backend_start,
+                bytes_sent,
+            )
+            .await;
+        }
+    }
+    write_normalized_plain_gateway_reject(
         stream,
-        ctx,
-        status,
-        body,
-        &headers,
+        normalized,
+        translated,
         backend_start,
         bytes_sent,
+        true,
     )
     .await
 }
@@ -12412,6 +13336,7 @@ where
         status,
         body,
         attempt_result.connection_error,
+        true,
         backend_start,
         bytes_sent,
     )
@@ -12462,6 +13387,86 @@ where
     S: RecvStream + SendStream<Bytes>,
 {
     let (normalized, translated) = normalize_reject_for_client(ctx, status, body, headers, false);
+    write_normalized_plain_gateway_reject(
+        stream,
+        normalized,
+        translated,
+        backend_start,
+        bytes_sent,
+        halt_recv,
+    )
+    .await
+}
+
+/// [`write_normalized_plain_gateway_reject`] after the request's RPC or
+/// authorization deadline: the write gets the shared post-deadline grace, a
+/// write that fails or outlives it resets the response, and the receive half
+/// is halted once the bounded write settles, as
+/// [`write_plain_authorization_expired_terminal`] writes its terminal.
+async fn write_normalized_plain_gateway_reject_after_deadline<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    normalized: crate::proxy::NormalizedRejectResponse,
+    translated: Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
+    backend_start: Instant,
+    bytes_sent: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let status = if translated.is_some() {
+        StatusCode::OK.as_u16()
+    } else {
+        normalized.http_status.as_u16()
+    };
+    let write = write_normalized_plain_gateway_reject(
+        stream,
+        normalized,
+        translated,
+        backend_start,
+        bytes_sent,
+        false,
+    );
+    let result =
+        match crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await {
+            Ok(outcome) => Ok(outcome),
+            Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                Ok(terminal_deadline_write_aborted_outcome(
+                    status,
+                    0,
+                    backend_start,
+                    bytes_sent,
+                    true,
+                ))
+            }
+            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                Ok(terminal_deadline_write_aborted_outcome(
+                    status,
+                    0,
+                    backend_start,
+                    bytes_sent,
+                    false,
+                ))
+            }
+        };
+    crate::http3::stream_util::halt_request_body(stream);
+    result
+}
+
+/// Write an already-normalized plain-bridge gateway reject: the gRPC-Web
+/// translation when the client speaks gRPC-Web, else the normalized response.
+async fn write_normalized_plain_gateway_reject<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    normalized: crate::proxy::NormalizedRejectResponse,
+    translated: Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
+    backend_start: Instant,
+    bytes_sent: u64,
+    halt_recv: bool,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
     if let Some(translated) = translated {
         return write_reject_with_headers_and_recv_halt(
             stream,
@@ -12512,7 +13517,9 @@ async fn write_plain_authorization_expired_terminal<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    let headers = HashMap::new();
+    // RFC 9110 §15.5.2 (issue #6774): the committing mechanism's scheme.
+    let mut headers = HashMap::with_capacity(1);
+    crate::proxy::insert_reauthentication_challenge(&mut headers, ctx);
     let write = write_plain_gateway_reject_with_recv_halt(
         stream,
         ctx,
@@ -12624,8 +13631,11 @@ where
         .map_err(|e| anyhow::anyhow!("Failed to build H3 reject response: {}", e))?;
     let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
-    let len = body.len() as u64;
-    if !body.is_empty() {
+    // A `HEAD` response keeps the `Content-Length` the framing above set and
+    // carries no body bytes (RFC 9110 §9.3.2), so none are accounted.
+    let omit_body = crate::http3::server::h3_request_is_head();
+    let len = if omit_body { 0 } else { body.len() as u64 };
+    if !body.is_empty() && !omit_body {
         let _ = stream.send_data(body).await;
     }
     let _ = stream.finish().await;
@@ -12647,13 +13657,11 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
+        route_deadline_cut: false,
     })
 }
 
-/// Handle a `PluginResult::Reject` from `on_final_request_body` by
-/// emitting the right wire format for the flavor: trailers-only gRPC for
-/// Grpc, HTTP + headers for Plain, 501 is never reached (WebSocket is
-/// rejected upstream).
+/// Byte and timing accounting carried into a final-body reject write.
 struct RejectWriteAccounting {
     backend_start: Instant,
     bytes_sent: u64,
@@ -12681,6 +13689,7 @@ fn terminal_deadline_write_aborted_outcome(
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
+        route_deadline_cut: false,
     }
 }
 
@@ -12765,6 +13774,42 @@ enum BridgeUploadRefusal {
     TooLarge,
 }
 
+/// [`write_bridge_upload_refusal`], constructed out of line and returned boxed
+/// so no bridge dispatcher carries the reject pipeline as a frame slot: each
+/// refusal arm then holds a pointer, not the concrete future. The thin `async
+/// move` trampoline is intentional, as in [`boxed_dispatch_plain`]: boxing
+/// the concrete refusal future at the call site still materializes it as a
+/// stack temporary in the caller's poll frame.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_write_bridge_upload_refusal<'a, S>(
+    stream: &'a mut RequestStream<S, Bytes>,
+    flavor: HttpFlavor,
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    refusal: BridgeUploadRefusal,
+    response_committed_plugins: &'a [Arc<dyn Plugin>],
+    initial_response_header_policy_plugins: &'a [Arc<dyn Plugin>],
+    backend_start: Instant,
+) -> BoxedPlainDispatchFuture<'a>
+where
+    S: RecvStream + SendStream<Bytes> + Send + 'a,
+{
+    Box::pin(async move {
+        write_bridge_upload_refusal(
+            stream,
+            flavor,
+            plugins,
+            ctx,
+            refusal,
+            response_committed_plugins,
+            initial_response_header_policy_plugins,
+            backend_start,
+        )
+        .await
+    })
+}
+
 /// Refuse the bridge's own request-body drain through the shared reject path
 /// (issue #6022): the reject-path `after_proxy` hooks, the committed-response
 /// observers, and the transaction log run as for the bridge's other terminal
@@ -12795,11 +13840,18 @@ where
         ),
         BridgeUploadRefusal::TooLarge => (
             StatusCode::PAYLOAD_TOO_LARGE,
-            r#"{"error":"Request body too large"}"#,
+            crate::util::body_limit::REQUEST_BODY_TOO_LARGE_BODY,
             grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
             "Request body exceeds maximum size",
         ),
     };
+    // A capacity refusal is the gateway-local capacity terminal: mark it so the
+    // reject pipeline's response policy (route response-size limits,
+    // rejection-replacement hooks) cannot replace the fixed `503` / capacity
+    // message, exactly as the request-decode capacity refusal does.
+    if matches!(refusal, BridgeUploadRefusal::BufferCapacity) {
+        ctx.mark_gateway_capacity_response_selected();
+    }
     let mut headers = HashMap::new();
     if matches!(flavor, HttpFlavor::Grpc) || crate::plugins::grpc_web::client_uses_grpc_web(ctx) {
         headers.insert("grpc-status".to_string(), grpc_status.to_string());
@@ -12850,6 +13902,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn write_bridge_upload_client_disconnect<S>(
     stream: &mut RequestStream<S, Bytes>,
+    abort: ProvenClientAbort,
     flavor: HttpFlavor,
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -12864,15 +13917,14 @@ where
         crate::plugins::RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
         "true".to_string(),
     );
+    // The shared pre-header client-abort terminal (issue #6772).
+    let terminal = abort.pre_header_terminal();
     let mut headers = HashMap::new();
     if matches!(flavor, HttpFlavor::Grpc) || crate::plugins::grpc_web::client_uses_grpc_web(ctx) {
-        headers.insert(
-            "grpc-status".to_string(),
-            grpc_proxy::grpc_status::CANCELLED.to_string(),
-        );
+        headers.insert("grpc-status".to_string(), terminal.grpc_status.to_string());
         headers.insert(
             "grpc-message".to_string(),
-            "Client disconnected".to_string(),
+            terminal.grpc_message.to_string(),
         );
     }
     let mut outcome = write_final_body_reject(
@@ -12881,8 +13933,8 @@ where
         plugins,
         ctx,
         PluginResult::Reject {
-            status_code: 499,
-            body: r#"{"error":"Client disconnected"}"#.to_string(),
+            status_code: terminal.http_status,
+            body: crate::proxy::client_abort::CLIENT_ABORT_HTTP_BODY.to_string(),
             headers,
         },
         response_committed_plugins,
@@ -12894,12 +13946,41 @@ where
         FinalRejectHooks::UploadClientDisconnect,
     )
     .await?;
-    outcome.client_disconnected = true;
-    outcome.error_class = Some(ErrorClass::ClientDisconnect);
-    outcome.body_error_class = Some(ErrorClass::ClientDisconnect);
+    outcome.client_disconnected = terminal.client_disconnected;
+    outcome.error_class = Some(terminal.error_class);
+    outcome.body_error_class = Some(terminal.error_class);
     outcome.body_completed = false;
     outcome.rejection_logged = true;
     Ok(outcome)
+}
+
+/// Settle a buffered bridge upload whose stream the GATEWAY ended (issue
+/// #6772): not a client abort and not malformed input. The stream is reset and
+/// nothing is written; the request is logged as the gateway-closed terminal
+/// (`503`, or `UNAVAILABLE` under HTTP `200` for gRPC) and is not a client
+/// disconnect.
+fn bridge_upload_gateway_closed_outcome<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    grpc: bool,
+    backend_start: Instant,
+) -> CrossProtocolOutcome
+where
+    S: SendStream<Bytes>,
+{
+    let terminal = crate::proxy::client_abort::GATEWAY_CLOSED_UPLOAD_TERMINAL;
+    crate::http3::stream_util::abort_response_stream(stream);
+    let status = if grpc {
+        crate::proxy::insert_grpc_error_metadata(
+            &mut ctx.metadata,
+            terminal.grpc_status,
+            terminal.grpc_message,
+        );
+        StatusCode::OK.as_u16()
+    } else {
+        terminal.http_status
+    };
+    terminal_deadline_write_aborted_outcome(status, 0, backend_start, 0, false)
 }
 
 /// How [`write_final_body_reject`] runs the reject-path hooks over its terminal.
@@ -12921,6 +14002,10 @@ enum FinalRejectHooks {
     ChargedAfterDecoratedHead,
 }
 
+/// Handle a `PluginResult::Reject` from `on_final_request_body` by
+/// emitting the right wire format for the flavor: trailers-only gRPC for
+/// Grpc, HTTP + headers for Plain, 501 is never reached (WebSocket is
+/// rejected upstream).
 #[allow(clippy::too_many_arguments)]
 async fn write_final_body_reject<S>(
     stream: &mut RequestStream<S, Bytes>,
@@ -13133,6 +14218,20 @@ where
             return result;
         }
         write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
+    } else if hooks == FinalRejectHooks::UploadClientDisconnect {
+        // Plain HTTP (issue #6772): `499` is log vocabulary, never written. The
+        // cleanup hooks and the cancellation log already ran above; the
+        // departed client's response is reset with `H3_REQUEST_CANCELLED` and
+        // the request direction halted, never answered.
+        stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+        crate::http3::stream_util::halt_request_body(stream);
+        Ok(terminal_deadline_write_aborted_outcome(
+            normalized.http_status.as_u16(),
+            0,
+            backend_start,
+            bytes_sent,
+            true,
+        ))
     } else if terminal_gateway_deadline {
         let write = write_reject_with_headers_and_recv_halt(
             stream,
@@ -13282,6 +14381,7 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
+        route_deadline_cut: false,
     })
 }
 
@@ -13453,21 +14553,6 @@ mod pool_client_fault {
     }
 }
 
-/// Extract a plugin reject body into a gRPC-safe header value for the H3
-/// test path. Reuses the shared H1/H2 JSON/body extraction logic, then
-/// strips bytes `HeaderValue::from_str` rejects on this response path.
-#[cfg(test)]
-fn reject_body_as_h3_grpc_message(body: &[u8], status: StatusCode) -> String {
-    crate::proxy::extract_grpc_reject_message(body)
-        .map(|message| sanitize_h3_grpc_message_for_header(&message))
-        .filter(|message| !message.is_empty())
-        .unwrap_or_else(|| {
-            sanitize_h3_grpc_message_for_header(
-                status.canonical_reason().unwrap_or("Request rejected"),
-            )
-        })
-}
-
 /// Keep H3 `grpc-message` header values builder-safe by normalizing CR/LF
 /// to spaces and dropping NUL bytes before trim. `HeaderValue::from_str`
 /// accepts UTF-8 here, so we do not strip non-ASCII.
@@ -13574,8 +14659,17 @@ where
         ) {
             crate::proxy::finalize_grpc_web_error_response_headers(&mut translated, policy, None);
             send_response_headers(stream, "POST", 200, &translated.headers).await?;
-            let body_len = translated.body.len() as u64;
-            stream.send_data(Bytes::from(translated.body)).await?;
+            // A `HEAD` response carries no body bytes (RFC 9110 §9.3.2), so
+            // none are accounted.
+            let omit_body = crate::http3::server::h3_request_is_head();
+            let body_len = if omit_body {
+                0
+            } else {
+                translated.body.len() as u64
+            };
+            if !omit_body {
+                stream.send_data(Bytes::from(translated.body)).await?;
+            }
             stream.finish().await?;
             Ok(CrossProtocolOutcome {
                 response_status: 200,
@@ -13592,6 +14686,7 @@ where
                 backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                 backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                 rejection_logged: false,
+                route_deadline_cut: false,
             })
         } else {
             write_grpc_error_send_with_policy(
@@ -13786,13 +14881,15 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
+        route_deadline_cut: false,
     })
 }
 
-/// Small helper duplicated from `proxy/mod.rs::parse_reqwest_method` to
-/// keep this module self-contained without promoting the original to
-/// `pub(crate)` (it's a hot-path leaf function that benefits from being
-/// inlined inside its home module).
+/// Local counterpart of `proxy/mod.rs::parse_reqwest_method` (returning
+/// `Option` rather than `Result`), kept here so this module stays
+/// self-contained without promoting the original to `pub(crate)` (it's a
+/// hot-path leaf function that benefits from being inlined inside its home
+/// module).
 fn parse_reqwest_method(method: &str) -> Option<reqwest::Method> {
     match method {
         "GET" => Some(reqwest::Method::GET),
@@ -13874,9 +14971,8 @@ mod tests {
         apply_h3_grpc_reject_metadata, build_h3_grpc_backend_headers, build_plain_request_builder,
         cross_protocol_header_write_disconnect_outcome, inspected_emitted_response_limit_exceeded,
         normalize_h3_grpc_reject, record_cross_protocol_client_acquire_failure,
-        record_cross_protocol_connection_start, reject_body_as_h3_grpc_message,
-        sanitize_h3_grpc_message_for_header, should_finish_h3_stream_without_trailers,
-        should_skip_cross_protocol_backend_header,
+        record_cross_protocol_connection_start, sanitize_h3_grpc_message_for_header,
+        should_finish_h3_stream_without_trailers, should_skip_cross_protocol_backend_header,
     };
     use crate::config::EnvConfig;
     use crate::config::types::{CircuitBreakerConfig, GatewayConfig, Proxy, UpstreamTarget};
@@ -14056,15 +15152,6 @@ mod tests {
     fn h3_grpc_message_sanitizer_strips_invalid_header_bytes() {
         assert_eq!(
             sanitize_h3_grpc_message_for_header("  bad\r\n\0message  "),
-            "bad  message"
-        );
-    }
-
-    #[test]
-    fn h3_grpc_reject_body_message_is_header_safe() {
-        let body = br#"{"message":"bad\r\n\u0000message"}"#;
-        assert_eq!(
-            reject_body_as_h3_grpc_message(body, StatusCode::BAD_REQUEST),
             "bad  message"
         );
     }
@@ -14261,250 +15348,6 @@ mod tests {
         );
     }
 
-    /// Regression test for the cross-protocol `select!` race: when the
-    /// backend resolves before the request-body reader finishes, the
-    /// reader must be notified (not dropped mid-stream). This mirrors
-    /// the `halt_notify` + drain + timeout loop in `dispatch_plain`.
-    #[tokio::test(flavor = "current_thread")]
-    async fn backend_early_response_notifies_reader_instead_of_dropping_it() {
-        use std::pin::pin;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
-        use tokio::sync::Notify;
-
-        let halt_notify = Arc::new(Notify::new());
-        let reader_halted = Arc::new(AtomicBool::new(false));
-
-        let reader_halt = Arc::clone(&halt_notify);
-        let reader_flag = Arc::clone(&reader_halted);
-        let reader_future = async move {
-            tokio::select! {
-                biased;
-                _ = reader_halt.notified() => {
-                    reader_flag.store(true, Ordering::Release);
-                }
-                () = std::future::pending::<()>() => {}
-            }
-        };
-
-        // Simulates `send_future` completing first (backend responded
-        // while the client was still uploading). Kept at 1 ms so the
-        // reader_future loses the race deterministically on the same
-        // runtime without needing `tokio::test(start_paused)`.
-        let send_future = async {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-            "ok"
-        };
-
-        let drain_ms = 5_u64;
-        let result: &str = {
-            let mut send_future = pin!(send_future);
-            let mut reader_future = pin!(reader_future);
-            let mut reader_done = false;
-            loop {
-                tokio::select! {
-                    result = &mut send_future => {
-                        if !reader_done {
-                            if drain_ms > 0 {
-                                let drain_deadline = Duration::from_millis(drain_ms);
-                                if let Ok(()) = tokio::time::timeout(
-                                    drain_deadline,
-                                    &mut reader_future,
-                                ).await {
-                                    reader_done = true;
-                                }
-                            }
-                            if !reader_done {
-                                halt_notify.notify_one();
-                                let halt_deadline = Duration::from_millis(100);
-                                let _ = tokio::time::timeout(
-                                    halt_deadline,
-                                    &mut reader_future,
-                                ).await;
-                            }
-                        }
-                        break result;
-                    }
-                    _ = &mut reader_future, if !reader_done => {
-                        reader_done = true;
-                    }
-                }
-            }
-        };
-
-        assert_eq!(result, "ok");
-        assert!(
-            reader_halted.load(Ordering::Acquire),
-            "reader must be notified and halted when backend wins the race"
-        );
-    }
-
-    /// Regression test for the backpressure-parked reader: even when
-    /// the reader is wedged inside an uncancellable region (modelling
-    /// `tx.send().await` blocking on a full mpsc channel after reqwest
-    /// stopped draining once the backend response arrived), the
-    /// bridge must still call `halt_request_body` after dropping the
-    /// reader future. Without the post-bridge halt the recv half
-    /// surfaces as RESET_STREAM(0x0) on the QUIC wire — the exact
-    /// failure mode this PR removes from the early-response paths.
-    ///
-    /// Real time (no `start_paused`), although the dev-dependency tokio
-    /// enables `test-util`. Drain + halt deadlines are kept short
-    /// (10 ms each) so the test runs in well under 100 ms while still
-    /// giving the reader_future a deterministic chance to stay wedged.
-    #[tokio::test(flavor = "current_thread")]
-    async fn parked_reader_still_halts_after_reader_future_dropped() {
-        use std::pin::pin;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
-
-        // 1 s sleep with no halt-observing branch — guaranteed to
-        // outlast the 10 + 10 ms drain + halt deadlines and not
-        // short-circuit on halt_notify. This is what a `tx.send()`
-        // parked on a full mpsc channel looks like to the bridge:
-        // an opaque, uncancellable await.
-        let reader_future = async move {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        };
-
-        let send_future = async {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-            Ok::<&'static str, &'static str>("ok")
-        };
-
-        let post_bridge_halted = Arc::new(AtomicBool::new(false));
-        let post_bridge_halted_clone = Arc::clone(&post_bridge_halted);
-        let halt_notify = Arc::new(tokio::sync::Notify::new());
-        let drain_ms = 10_u64;
-        let halt_deadline_ms = 10_u64;
-        let result = {
-            let mut send_future = pin!(send_future);
-            let mut reader_future = pin!(reader_future);
-            let mut reader_done = false;
-            let outcome = loop {
-                tokio::select! {
-                    result = &mut send_future => {
-                        if !reader_done {
-                            let backend_succeeded = result.is_ok();
-                            if backend_succeeded && drain_ms > 0 {
-                                let drain_deadline = Duration::from_millis(drain_ms);
-                                if let Ok(()) = tokio::time::timeout(
-                                    drain_deadline,
-                                    &mut reader_future,
-                                ).await {
-                                    reader_done = true;
-                                }
-                            }
-                            if !reader_done {
-                                halt_notify.notify_one();
-                                let halt_deadline = Duration::from_millis(halt_deadline_ms);
-                                let _ = tokio::time::timeout(
-                                    halt_deadline,
-                                    &mut reader_future,
-                                ).await;
-                            }
-                        }
-                        break result;
-                    }
-                    _ = &mut reader_future, if !reader_done => {
-                        reader_done = true;
-                    }
-                }
-            };
-            // Models the post-bridge `halt_request_body(stream)` call.
-            // Reachable only after the pinned reader_future is dropped
-            // — i.e. after stream's mutable borrow is released.
-            post_bridge_halted_clone.store(true, Ordering::Release);
-            outcome
-        };
-
-        assert_eq!(result, Ok("ok"));
-        assert!(
-            post_bridge_halted.load(Ordering::Acquire),
-            "halt_request_body must run after the reader future is dropped, \
-             even when the reader was wedged in an uncancellable region"
-        );
-    }
-
-    /// Regression test for the doc promise that error responses halt
-    /// immediately. When `send_future` returns Err, the bridge must
-    /// skip the FERRUM_H3_REQUEST_BODY_DRAIN_MS courtesy window and
-    /// notify halt right away — otherwise backend transport failures
-    /// pay up to the configured drain budget in extra latency before
-    /// the 502 is written. The witness flag captures whether the
-    /// drain branch ran; timing is intentionally not asserted because
-    /// the test runs on real time, where the comparison would be flaky.
-    #[tokio::test(flavor = "current_thread")]
-    async fn backend_error_skips_drain_window() {
-        use std::pin::pin;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
-        use tokio::sync::Notify;
-
-        let halt_notify = Arc::new(Notify::new());
-        let drain_was_applied = Arc::new(AtomicBool::new(false));
-
-        // Reader that responds to halt_notify promptly so the halt
-        // deadline can resolve cleanly inside the test.
-        let reader_halt = Arc::clone(&halt_notify);
-        let reader_future = async move {
-            reader_halt.notified().await;
-        };
-
-        // send_future immediately returns an Err — backend transport
-        // failure case (BAD_GATEWAY).
-        let send_future = async { Err::<&'static str, &'static str>("backend down") };
-
-        // Use a generous drain budget so we'd notice if it ran.
-        let drain_ms = 500_u64;
-        let drain_witness = Arc::clone(&drain_was_applied);
-        let result = {
-            let mut send_future = pin!(send_future);
-            let mut reader_future = pin!(reader_future);
-            let mut reader_done = false;
-            loop {
-                tokio::select! {
-                    result = &mut send_future => {
-                        if !reader_done {
-                            let backend_succeeded = result.is_ok();
-                            if backend_succeeded && drain_ms > 0 {
-                                drain_witness.store(true, Ordering::Release);
-                                let drain_deadline = Duration::from_millis(drain_ms);
-                                if let Ok(()) = tokio::time::timeout(
-                                    drain_deadline,
-                                    &mut reader_future,
-                                ).await {
-                                    reader_done = true;
-                                }
-                            }
-                            if !reader_done {
-                                halt_notify.notify_one();
-                                let halt_deadline = Duration::from_millis(50);
-                                let _ = tokio::time::timeout(
-                                    halt_deadline,
-                                    &mut reader_future,
-                                ).await;
-                            }
-                        }
-                        break result;
-                    }
-                    _ = &mut reader_future, if !reader_done => {
-                        reader_done = true;
-                    }
-                }
-            }
-        };
-
-        assert_eq!(result, Err("backend down"));
-        assert!(
-            !drain_was_applied.load(Ordering::Acquire),
-            "drain window must be skipped when backend returns Err"
-        );
-    }
-
     #[test]
     fn h3_grpc_reject_normalization_preserves_custom_headers_and_metadata() {
         let normalized = normalize_h3_grpc_reject(
@@ -14688,6 +15531,7 @@ mod tests {
         let dns_cache = DnsCache::new(DnsConfig::default());
         let config = GatewayConfig {
             quarantined_plugin_configs: Vec::new(),
+            quarantined_jwt_shared_secrets: Default::default(),
             version: "1".to_string(),
             proxies: vec![],
             consumers: vec![],
@@ -14750,11 +15594,11 @@ mod tests {
         cb.record_failure(500, false, false);
         assert_eq!(cb.state_name(), "open");
 
-        let (_, is_half_open_probe, admission_generation) = state
+        let (admitted, probe_ticket, _admission_generation) = state
             .circuit_breaker_cache
             .can_execute(&proxy.namespace, &proxy.id, target_key, &config)
             .expect("half-open probe should be admitted");
-        assert!(is_half_open_probe);
+        assert!(probe_ticket.is_probe());
         assert_eq!(cb.half_open_in_flight(), 1);
         assert!(
             state
@@ -14764,14 +15608,7 @@ mod tests {
             "single probe slot should be occupied before neutral release"
         );
 
-        crate::proxy::HalfOpenProbeGuard::new(
-            &state,
-            &proxy,
-            target_key,
-            is_half_open_probe,
-            admission_generation,
-        )
-        .release_neutral();
+        crate::proxy::HalfOpenProbeGuard::new(Some(&admitted), probe_ticket).release_neutral();
 
         assert_eq!(cb.half_open_in_flight(), 0);
         assert_eq!(cb.state_name(), "half_open");
@@ -15413,7 +16250,7 @@ mod tests {
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20hyper_method.clone(),\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20initial_hmap,\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20initial_body,\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20crate::plugins::grpc_web::staged_request_trailers(&ctx.grpc_web_request_trailers),\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20grpc_dispatch_proxy,"
             ),
             "initial gRPC dispatch must move the prepared headers/body and use the \
@@ -15910,11 +16747,14 @@ mod tests {
             let key_der = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
                 .expect("read private key");
 
-            let mut server_crypto =
-                rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                    .with_no_client_auth()
-                    .with_single_cert(vec![cert_der.clone()], key_der)
-                    .expect("server TLS config");
+            let mut server_crypto = rustls::ServerConfig::builder_with_provider(
+                std::sync::Arc::new(crate::fips::base_crypto_provider()),
+            )
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3 is supported")
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
             server_crypto.alpn_protocols = vec![b"h3".to_vec()];
             let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
                 .expect("QUIC server config");
@@ -15938,10 +16778,13 @@ mod tests {
 
             let mut roots = rustls::RootCertStore::empty();
             roots.add(cert_der).expect("trust the certificate");
-            let mut client_crypto =
-                rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                    .with_root_certificates(roots)
-                    .with_no_client_auth();
+            let mut client_crypto = rustls::ClientConfig::builder_with_provider(
+                std::sync::Arc::new(crate::fips::base_crypto_provider()),
+            )
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3 is supported")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
             client_crypto.alpn_protocols = vec![b"h3".to_vec()];
             let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
                 .expect("QUIC client config");
@@ -16164,6 +17007,140 @@ mod tests {
             assert!(
                 body.contains("grpc-status: 14"),
                 "the 502 is gRPC UNAVAILABLE in the trailer frame: {body:?}"
+            );
+        }
+
+        /// A `response_committed` observer that never finishes.
+        struct PendingCommittedObserver {
+            started_at: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+        }
+
+        #[async_trait]
+        impl Plugin for PendingCommittedObserver {
+            fn name(&self) -> &str {
+                "pending_committed_observer"
+            }
+
+            fn requires_response_committed_hook(&self) -> bool {
+                true
+            }
+
+            async fn on_response_committed(
+                &self,
+                _ctx: &mut RequestContext,
+                _response_status: u16,
+                _response_headers: &HashMap<String, String>,
+                _body: &[u8],
+            ) {
+                if let Ok(mut started_at) = self.started_at.lock() {
+                    started_at.get_or_insert_with(tokio::time::Instant::now);
+                }
+                std::future::pending::<()>().await;
+            }
+        }
+
+        /// The gateway error terminal races its committed observers to the
+        /// request's RPC deadline: one still pending then is detached, the
+        /// terminal does not wait on it, and the client receives the gateway's
+        /// own `502` unchanged rather than a deadline terminal.
+        #[tokio::test]
+        async fn pending_committed_observer_at_the_deadline_keeps_the_gateway_terminal() {
+            let started_at = Arc::new(std::sync::Mutex::new(None));
+            let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(PendingCommittedObserver {
+                started_at: Arc::clone(&started_at),
+            })];
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/operation".to_string(),
+            );
+            let mut exchange = h3_exchange("application/json").await;
+            // Armed after the loopback setup, so the observer is polled inline
+            // before the deadline rather than first in detached cleanup.
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+            ctx.grpc_deadline_at = Some(deadline);
+
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::http3::cross_protocol::write_plain_gateway_error_terminal(
+                    &mut exchange.server_stream,
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::BAD_GATEWAY,
+                    Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
+                    true,
+                    true,
+                    Instant::now(),
+                    0,
+                ),
+            )
+            .await
+            .expect("the terminal must not wait on a pending observer past the deadline")
+            .expect("the terminal is written");
+            let (response, body) = read_response(&mut exchange.client_stream).await;
+
+            let started_at = started_at
+                .lock()
+                .expect("observer start record")
+                .expect("the observer ran");
+            assert!(
+                started_at < deadline,
+                "the observer must be pending inline when the deadline passes"
+            );
+            assert!(
+                tokio::time::Instant::now() >= deadline,
+                "the terminal is written only once the observer's deadline passed"
+            );
+            assert_eq!(outcome.response_status, 502);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(gateway_tokens(&response), ["connection_failure"]);
+            assert_eq!(body, br#"{"error":"Backend unavailable"}"#);
+        }
+
+        /// Past the observers' deadline the gateway terminal is written under
+        /// the bounded post-deadline grace: a client that withholds stream
+        /// credit (here, never reading a terminal larger than its receive
+        /// window) cannot hold the request, and the response is reset.
+        #[tokio::test]
+        async fn terminal_after_the_observer_deadline_is_written_under_the_bounded_grace() {
+            let started_at = Arc::new(std::sync::Mutex::new(None));
+            let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(PendingCommittedObserver {
+                started_at: Arc::clone(&started_at),
+            })];
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/operation".to_string(),
+            );
+            let mut exchange = h3_exchange("application/json").await;
+            ctx.grpc_deadline_at = Some(tokio::time::Instant::now() + Duration::from_millis(100));
+            let oversized = Bytes::from(vec![b'x'; 16 * 1024 * 1024]);
+
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::http3::cross_protocol::write_plain_gateway_error_terminal(
+                    &mut exchange.server_stream,
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::BAD_GATEWAY,
+                    oversized,
+                    true,
+                    true,
+                    Instant::now(),
+                    0,
+                ),
+            )
+            .await
+            .expect("a client withholding credit must not hold the terminal past the grace")
+            .expect("the bounded write settles");
+
+            assert!(
+                started_at.lock().expect("observer start record").is_some(),
+                "the observer ran"
+            );
+            assert!(
+                !outcome.body_completed,
+                "the withheld terminal must be reset, not completed"
             );
         }
 

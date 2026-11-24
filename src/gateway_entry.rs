@@ -102,7 +102,8 @@ fn emit_bootstrap_error(message: &str, fields: &[(&str, String)]) {
 /// 4. Initialize structured JSON logging
 /// 5. Parse environment configuration (`EnvConfig::from_env()`)
 /// 6. Build the multi-threaded tokio runtime with configured worker/blocking threads
-/// 7. Dispatch to the appropriate operating mode (database, file, cp, dp, mesh, injector, migrate)
+/// 7. Dispatch to the appropriate operating mode (database, file, cp, dp, mesh, injector,
+///    node_agent, migrate)
 ///    — each mode then loads TLS certs (frontend, admin, DTLS, gRPC) and validates
 ///    per-proxy backend TLS paths before starting listeners
 /// 8. Wait for SIGINT/SIGTERM for graceful shutdown
@@ -116,7 +117,7 @@ unsafe fn run_gateway_cli() {
     // ── CLI parsing ─────────────────────────────────────────────────────
     // Parse before anything else so `--settings`/`--spec`/`--mode` env var
     // overrides are in place before `CONF_FILE_CACHE` OnceLock is triggered
-    // by `resolve_ferrum_var()` during logging init (line ~95 below).
+    // by `resolve_ferrum_var()` during logging init (`init_logging()`).
     let cli = cli::Cli::parse();
 
     // Handle early-exit subcommands that don't need the startup pipeline.
@@ -187,6 +188,10 @@ unsafe fn run_gateway_cli() {
     // module's power-on self-test, or the provider's algorithm classification
     // is missing, this errors out instead of installing a non-validated
     // provider.
+    //
+    // The same step fixes which implementation serves the TLS record layer on
+    // the ordinary build (`FERRUM_TLS_AEAD_BACKEND`, default `auto` = by CPU);
+    // see `fips::aead_backend`. It is logged once tracing exists.
     match fips::install_crypto_provider() {
         Ok(state) => {
             if state.is_enforcing() {
@@ -347,13 +352,18 @@ fn init_logging() -> Result<LoggingGuards, String> {
         let (fmt_reload_layer, fmt_handle) = reload::Layer::new(fmt_filter);
         let log_counter_level_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .json()
-            .with_writer(SeverityWriter {
-                stdout: stdout_writer.clone(),
-                stderr: stderr_writer.clone(),
-            })
-            .with_filter(fmt_reload_layer);
+        // The reloadable level filter stays outermost so it keeps the static
+        // max-level hint; credential-dumping records stay off whatever
+        // directive or RTDS reload is applied.
+        let fmt_layer = logging::filter_output_layer(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(SeverityWriter {
+                    stdout: stdout_writer.clone(),
+                    stderr: stderr_writer.clone(),
+                }),
+            fmt_reload_layer,
+        );
         let log_counter_filter = filter_fn(|metadata| {
             crate::runtime_metrics_tracing_layer::should_count_target(metadata.target())
         });
@@ -380,13 +390,18 @@ fn init_logging() -> Result<LoggingGuards, String> {
         let env_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
         let (reload_layer, fallback_handle) = reload::Layer::new(env_filter);
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .json()
-            .with_writer(SeverityWriter {
-                stdout: stdout_writer,
-                stderr: stderr_writer,
-            })
-            .with_filter(reload_layer);
+        // The reloadable level filter stays outermost so it keeps the static
+        // max-level hint; credential-dumping records stay off whatever
+        // directive or RTDS reload is applied.
+        let fmt_layer = logging::filter_output_layer(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(SeverityWriter {
+                    stdout: stdout_writer,
+                    stderr: stderr_writer,
+                }),
+            reload_layer,
+        );
         if tracing_subscriber::registry()
             .with(fmt_layer)
             .try_init()
@@ -645,6 +660,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                 return 1;
             }
         };
+        secrets::emit_deferred_startup_warnings();
         // Printed after logging init so any warning emitted by a later stage
         // still has a live subscriber, and before `execute_validate()` so the
         // report reads in resolution order: secrets, then settings, then spec.
@@ -678,7 +694,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
 
     // Same lowest-precedence mode selection as the `validate` branch above, and
     // for the same reasons. Scoped to `run` because that is the only serving
-    // entry point whose CLI overrides were applied in `main()`.
+    // entry point whose CLI overrides were applied in `run_gateway_cli()`.
     if matches!(&cli.command, Some(cli::Command::Run(_))) {
         cli::infer_file_mode();
     }
@@ -690,6 +706,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             return 1;
         }
     };
+    secrets::emit_deferred_startup_warnings();
 
     // Raise the soft FD cap to the hard cap before any subsystem opens
     // sockets. The call never asks for privileges we don't have (it caps at
@@ -871,6 +888,9 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             &format!("{:?}", env_config.mode),
         ))
     );
+    // Which implementation serves the TLS record layer, and why. Fixed at
+    // provider bootstrap; recorded here because tracing did not exist then.
+    fips::aead_backend::log_startup_selection();
     info!(
         "Proxy bind address: {}, Admin bind address: {}",
         sanitize_startup_scalar(secrets::report_env_field(
@@ -1031,7 +1051,9 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     let shutdown_predrain = std::time::Duration::from_secs(predrain_seconds);
     let gateway_exit_code: i32 = rt.block_on(async {
         // Shutdown signal
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let shutdown_tx = overload::ShutdownSender::new(std::time::Duration::from_secs(
+            env_config.shutdown_drain_seconds,
+        ));
         let shutdown_tx_signal = shutdown_tx.clone();
 
         // Signal observer (issue #4829). Deliberately keeps listening after
@@ -1044,8 +1066,10 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         tokio::spawn(async move {
             let mut first_signal_tx = Some(first_signal_tx);
             let mut observed: u32 = 0;
-            let mut on_signal = move |name: &'static str, count: u32| {
-                match overload::classify_shutdown_signal(count) {
+            let mut on_signal =
+                move |name: &'static str, count: u32| match overload::classify_shutdown_signal(
+                    count,
+                ) {
                     overload::ShutdownSignalAction::InitiateDrain => {
                         info!("{} received, initiating graceful shutdown...", name);
                         if let Some(tx) = first_signal_tx.take() {
@@ -1070,8 +1094,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                             name
                         );
                     }
-                }
-            };
+                };
 
             #[cfg(unix)]
             {
@@ -1139,21 +1162,9 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             // killing the pod mid-drain. With the default 0s window the accept
             // loops still close immediately, exactly as before.
             overload::announce_shutdown_drain();
-            if !shutdown_predrain.is_zero() {
-                info!(
-                    predrain_seconds = shutdown_predrain.as_secs(),
-                    "Pre-drain: reporting not-ready while listeners keep accepting"
-                );
-                // A repeated signal cuts the window short: an operator asking
-                // twice does not want to keep accepting new connections.
-                tokio::select! {
-                    _ = tokio::time::sleep(shutdown_predrain) => {}
-                    _ = overload::shutdown_escalation_token().cancelled() => {
-                        warn!("Pre-drain window cut short by a repeated shutdown signal");
-                    }
-                }
-            }
-            let _ = shutdown_tx_signal.send(true);
+            shutdown_tx_signal
+                .shutdown_after_predrain(shutdown_predrain, overload::shutdown_escalation_token())
+                .await;
         });
 
         // Process-wide SIGHUP disposition (issue #4548). Without a registered
@@ -1280,6 +1291,7 @@ fn run_ambient_udp_preflight(args: &cli::AmbientUdpPreflightArgs) -> i32 {
             return 1;
         }
     };
+    secrets::emit_deferred_startup_warnings();
     log_resolved_secret_sources(&resolved);
 
     // An enforce request that arrives only through ferrum.conf or an external
@@ -1293,6 +1305,26 @@ fn run_ambient_udp_preflight(args: &cli::AmbientUdpPreflightArgs) -> i32 {
         Err(error) => {
             error!(
                 "FIPS verification failed: {}",
+                render_startup_error(anyhow::anyhow!(error), &[])
+            );
+            return 1;
+        }
+    }
+
+    // The TLS record-layer backend is fixed in that same bootstrap step, so a
+    // request that arrives only through ferrum.conf or an external secret, and
+    // differs from what bootstrap selected, gets the same explicit refusal
+    // here as it does from `EnvConfig` on `run` and `validate`, rather than
+    // being ignored by this one-shot.
+    let aead_raw = config::conf_file::resolve_ferrum_var(fips::aead_backend::TLS_AEAD_BACKEND_ENV)
+        .unwrap_or_else(|| "auto".to_string());
+    match fips::aead_backend::AeadBackendRequest::parse(&aead_raw)
+        .and_then(fips::aead_backend::verify_resolved_request)
+    {
+        Ok(()) => {}
+        Err(error) => {
+            error!(
+                "TLS record-layer backend verification failed: {}",
                 render_startup_error(anyhow::anyhow!(error), &[])
             );
             return 1;

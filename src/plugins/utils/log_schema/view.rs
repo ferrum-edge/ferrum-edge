@@ -12,10 +12,12 @@ use serde::Serializer;
 use serde::ser::{Serialize, SerializeMap};
 
 use super::{
-    CollisionMode, DerivedKind, FieldSpec, HTTP_FIELDS, MetadataPolicy, STREAM_FIELDS,
+    CollisionMode, DerivedKind, FieldSpec, HTTP_FIELDS, MetadataPolicy, NativeText, STREAM_FIELDS,
     SummarySchema, TimestampFormat,
 };
-use crate::plugins::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
+use crate::plugins::utils::metadata_redaction::{
+    REDACTED_PLACEHOLDER, is_internal_only_metadata_key, metadata_value_is_redacted,
+};
 use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 
 /// Output keys already claimed by the schema's own fields, consulted by
@@ -97,6 +99,28 @@ pub trait SchemaSerializable {
     where
         S: SerializeMap;
 
+    /// String view of a transformable native field (`schema.transforms`).
+    ///
+    /// Return [`NativeText::Text`] for every field in
+    /// [`super::transform::TRANSFORMABLE_FIELDS`] this entry kind carries with
+    /// a value, and [`NativeText::Absent`] when it carries the field without
+    /// one. The default, [`NativeText::NotTransformable`], makes the projection
+    /// DROP a transformed field rather than emit it untransformed, so an entry
+    /// kind that forgets to expose a field fails closed. Only the
+    /// transaction-summary family admits `transforms` at compile time.
+    fn native_text(&self, _source: &str) -> NativeText<'_> {
+        NativeText::NotTransformable
+    }
+
+    /// Raw (unredacted) metadata value for `key`, used by `flatten` +
+    /// `on_collision: overwrite` to substitute the metadata value in place of
+    /// the colliding field so the record carries each key exactly once. The
+    /// caller applies redaction and internal-key omission. Entry kinds without
+    /// a metadata map keep the default `None`.
+    fn metadata_value(&self, _key: &str) -> Option<&str> {
+        None
+    }
+
     /// Emit metadata according to `policy`. Sensitive keys must be
     /// redacted; pass `emitted` so flatten can avoid colliding with
     /// already-emitted top-level keys.
@@ -142,6 +166,20 @@ impl<'a, T: SchemaSerializable> Serialize for SchemaView<'a, T> {
             emitted.per_record.reserve(schema.fields.len());
         }
 
+        // `flatten` + `on_collision: overwrite`: a metadata entry whose
+        // promoted key collides with one of the schema's own fields replaces
+        // that field's value IN PLACE, so the record carries the key exactly
+        // once (a duplicate JSON key would make the line's meaning depend on
+        // the downstream parser). `flatten_metadata` then skips every reserved
+        // key, which is exactly the set substituted here.
+        let overwrite_prefix: Option<Option<&'a str>> = match &schema.metadata {
+            MetadataPolicy::Flatten {
+                prefix,
+                on_collision: CollisionMode::Overwrite,
+            } => Some(prefix.as_deref()),
+            _ => None,
+        };
+
         for spec in &schema.fields {
             match spec {
                 FieldSpec::Native {
@@ -152,14 +190,44 @@ impl<'a, T: SchemaSerializable> Serialize for SchemaView<'a, T> {
                     // compilation; flatten reservation below keys off
                     // `owns_native`, which subsumes it.
                     extension: _,
+                    transform,
                 } => {
                     let ts_format = if *is_timestamp {
                         schema.timestamp_format
                     } else {
                         TimestampFormat::Rfc3339
                     };
-                    self.summary
-                        .serialize_native(source, out_key, ts_format, &mut map)?;
+                    // A key reserves (and is therefore substitutable) for this
+                    // entry when the schema is not capability-scoped, or when
+                    // the concrete entry kind owns the field — see below.
+                    let replacement = match overwrite_prefix {
+                        Some(prefix)
+                            if !schema.capability_scoped || self.summary.owns_native(source) =>
+                        {
+                            flatten_overwrite_value(self.summary, prefix, out_key)
+                        }
+                        _ => None,
+                    };
+                    if let Some(value) = replacement {
+                        map.serialize_entry(out_key.as_str(), value)?;
+                    } else if let Some(transform) = transform {
+                        match self.summary.native_text(source) {
+                            NativeText::Text(text) => {
+                                transform.serialize_entry(out_key, text, &mut map)?;
+                            }
+                            // No value to transform: native serialization
+                            // keeps its exact null-or-skip behavior.
+                            NativeText::Absent => {
+                                self.summary
+                                    .serialize_native(source, out_key, ts_format, &mut map)?;
+                            }
+                            // Fail closed: never emit a transformed field raw.
+                            NativeText::NotTransformable => {}
+                        }
+                    } else {
+                        self.summary
+                            .serialize_native(source, out_key, ts_format, &mut map)?;
+                    }
                     // Reserve the output key for flatten-collision detection.
                     //
                     // A BASE schema (`capability_scoped == false`) is only ever
@@ -194,12 +262,28 @@ impl<'a, T: SchemaSerializable> Serialize for SchemaView<'a, T> {
                 FieldSpec::Static { out_key, value } => {
                     // Static keys are unconditional and already compiled into
                     // `SummarySchema::flatten_reserved`.
-                    map.serialize_entry(out_key, value)?;
+                    match overwrite_prefix
+                        .and_then(|prefix| flatten_overwrite_value(self.summary, prefix, out_key))
+                    {
+                        Some(replacement) => map.serialize_entry(out_key, replacement)?,
+                        None => map.serialize_entry(out_key, value)?,
+                    }
                 }
                 FieldSpec::Derived { out_key, kind } => {
-                    let emitted_now = self.summary.serialize_derived(*kind, out_key, &mut map)?;
-                    if track_emitted && emitted_now {
-                        emitted.reserve(out_key);
+                    match overwrite_prefix
+                        .and_then(|prefix| flatten_overwrite_value(self.summary, prefix, out_key))
+                    {
+                        Some(replacement) => {
+                            map.serialize_entry(out_key, replacement)?;
+                            emitted.reserve(out_key);
+                        }
+                        None => {
+                            let emitted_now =
+                                self.summary.serialize_derived(*kind, out_key, &mut map)?;
+                            if track_emitted && emitted_now {
+                                emitted.reserve(out_key);
+                            }
+                        }
                     }
                 }
             }
@@ -273,15 +357,40 @@ pub(crate) fn status_class(code: u16) -> &'static str {
     }
 }
 
-fn flatten_key(key: &str, prefix: Option<&str>) -> String {
+/// The redacted metadata value that `flatten` + `on_collision: overwrite`
+/// substitutes for the schema field emitted under `out_key`, if the record's
+/// metadata carries the key that promotes onto it.
+fn flatten_overwrite_value<'v, T: SchemaSerializable>(
+    summary: &'v T,
+    prefix: Option<&str>,
+    out_key: &str,
+) -> Option<&'v str> {
+    let key = match prefix {
+        Some(prefix) => out_key.strip_prefix(prefix)?,
+        None => out_key,
+    };
+    if is_internal_only_metadata_key(key) {
+        return None;
+    }
+    let value = summary.metadata_value(key)?;
+    Some(if metadata_value_is_redacted(key) {
+        REDACTED_PLACEHOLDER
+    } else {
+        value
+    })
+}
+
+/// The flattened output key; borrows `key` when there is no prefix, so an
+/// unprefixed flatten allocates nothing per metadata entry.
+fn flatten_key<'k>(key: &'k str, prefix: Option<&str>) -> std::borrow::Cow<'k, str> {
     match prefix {
         Some(p) => {
             let mut out = String::with_capacity(p.len() + key.len());
             out.push_str(p);
             out.push_str(key);
-            out
+            std::borrow::Cow::Owned(out)
         }
-        None => key.to_string(),
+        None => std::borrow::Cow::Borrowed(key),
     }
 }
 
@@ -292,6 +401,22 @@ fn flatten_key(key: &str, prefix: Option<&str>) -> String {
 impl SchemaSerializable for TransactionSummary {
     fn owns_native(&self, source: &str) -> bool {
         HTTP_FIELDS.iter().any(|f| f.name == source)
+    }
+
+    fn native_text(&self, source: &str) -> NativeText<'_> {
+        match source {
+            "client_ip" => NativeText::Text(&self.client_ip),
+            "consumer_username" => NativeText::from_option(self.consumer_username.as_deref()),
+            "request_path" => NativeText::Text(&self.request_path),
+            "request_user_agent" => NativeText::from_option(self.request_user_agent.as_deref()),
+            "backend_target" => NativeText::from_option(self.backend_target.as_deref()),
+            "backend_resolved_ip" => NativeText::from_option(self.backend_resolved_ip.as_deref()),
+            _ => NativeText::NotTransformable,
+        }
+    }
+
+    fn metadata_value(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
     }
 
     fn serialize_native<S>(
@@ -384,6 +509,7 @@ impl SchemaSerializable for TransactionSummary {
                     Ok(())
                 }
             }
+            "response_delivery" => map.serialize_entry(out_key, &self.response_delivery),
             "bytes_sent" => {
                 if self.bytes_sent != 0 {
                     map.serialize_entry(out_key, &self.bytes_sent)
@@ -494,6 +620,21 @@ impl SchemaSerializable for TransactionSummary {
 impl SchemaSerializable for StreamTransactionSummary {
     fn owns_native(&self, source: &str) -> bool {
         STREAM_FIELDS.iter().any(|f| f.name == source)
+    }
+
+    fn native_text(&self, source: &str) -> NativeText<'_> {
+        match source {
+            "client_ip" => NativeText::Text(&self.client_ip),
+            "consumer_username" => NativeText::from_option(self.consumer_username.as_deref()),
+            "backend_target" => NativeText::Text(&self.backend_target),
+            "backend_resolved_ip" => NativeText::from_option(self.backend_resolved_ip.as_deref()),
+            "sni_hostname" => NativeText::from_option(self.sni_hostname.as_deref()),
+            _ => NativeText::NotTransformable,
+        }
+    }
+
+    fn metadata_value(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
     }
 
     fn serialize_native<S>(
@@ -626,18 +767,19 @@ impl SchemaSerializable for StreamTransactionSummary {
 
 /// Wrapper that serializes a metadata HashMap with redaction. Used when
 /// metadata is emitted as a nested object.
-pub(crate) struct MetadataNested<'a>(pub(crate) &'a std::collections::HashMap<String, String>);
+pub(crate) struct MetadataNested<'a, MS = std::collections::hash_map::RandomState>(
+    pub(crate) &'a std::collections::HashMap<String, String, MS>,
+);
 
-impl<'a> Serialize for MetadataNested<'a> {
+impl<MS: std::hash::BuildHasher> Serialize for MetadataNested<'_, MS> {
     fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
         crate::plugins::utils::metadata_redaction::serialize_redacted_metadata(self.0, ser)
     }
 }
 
-fn flatten_metadata<S>(
-    metadata: &std::collections::HashMap<String, String>,
+fn flatten_metadata<MS: std::hash::BuildHasher, S>(
+    metadata: &std::collections::HashMap<String, String, MS>,
     prefix: Option<&str>,
-    on_collision: CollisionMode,
     emitted: &EmittedKeys<'_>,
     map: &mut S,
 ) -> Result<(), S::Error>
@@ -649,20 +791,17 @@ where
     // metadata map's already-unique keys and two metadata entries cannot
     // produce the same output key.
     for (key, value) in metadata {
-        if crate::plugins::utils::metadata_redaction::is_internal_only_metadata_key(key) {
+        if is_internal_only_metadata_key(key) {
             continue;
         }
         let out_key = flatten_key(key, prefix);
+        // A reserved key is never emitted a second time. Under `skip` the
+        // schema's own field keeps it; under `overwrite` `SchemaView` already
+        // wrote this metadata value in that field's place.
         if emitted.contains(&out_key) {
-            match on_collision {
-                CollisionMode::Skip => continue,
-                CollisionMode::Overwrite => {
-                    // JSON semantics: duplicate key emission — most parsers
-                    // take the last value. Documented behavior.
-                }
-            }
+            continue;
         }
-        if is_sensitive_metadata_key(key) {
+        if metadata_value_is_redacted(key) {
             map.serialize_entry(&out_key, REDACTED_PLACEHOLDER)?;
         } else {
             map.serialize_entry(&out_key, value)?;
@@ -676,8 +815,8 @@ where
 /// The nested form is emitted by `serialize_native`; this helper owns the
 /// omit / flatten behavior shared by the built-in summary types and
 /// WebSocket disconnect entries.
-pub(crate) fn serialize_schema_metadata<S>(
-    metadata: &std::collections::HashMap<String, String>,
+pub(crate) fn serialize_schema_metadata<MS: std::hash::BuildHasher, S>(
+    metadata: &std::collections::HashMap<String, String, MS>,
     policy: &MetadataPolicy,
     emitted: &EmittedKeys<'_>,
     map: &mut S,
@@ -689,8 +828,8 @@ where
         MetadataPolicy::Nested | MetadataPolicy::Omit => Ok(()),
         MetadataPolicy::Flatten {
             prefix,
-            on_collision,
-        } => flatten_metadata(metadata, prefix.as_deref(), *on_collision, emitted, map),
+            on_collision: _,
+        } => flatten_metadata(metadata, prefix.as_deref(), emitted, map),
     }
 }
 
@@ -705,7 +844,6 @@ mod tests {
         Direction, DisconnectCause, StreamTransactionSummary, TransactionSummary,
     };
     use serde_json::{Value, json};
-    use std::collections::HashMap;
 
     fn http_summary() -> TransactionSummary {
         TransactionSummary {
@@ -713,6 +851,7 @@ mod tests {
             timestamp_received: "2026-05-11T12:00:00Z".into(),
             client_ip: "10.0.0.1".into(),
             consumer_username: Some("alice".into()),
+            principal_origin: Some(crate::plugins::utils::principal::PrincipalOrigin::Consumer),
             http_method: "GET".into(),
             request_path: "/api/v1/things".into(),
             proxy_id: Some("p1".into()),
@@ -723,7 +862,7 @@ mod tests {
             bytes_received: 1024,
             grpc_request_messages: 0,
             grpc_response_messages: 0,
-            metadata: HashMap::from([
+            metadata: crate::plugins::MetadataMap::from_iter([
                 ("trace_id".to_string(), "abc-123".to_string()),
                 ("authorization".to_string(), "Bearer secret".to_string()),
             ]),
@@ -740,6 +879,7 @@ mod tests {
             proxy_name: Some("postgres-front".into()),
             client_ip: "10.0.0.2".into(),
             consumer_username: None,
+            principal_origin: None,
             auth_method: None,
             backend_target: "10.5.0.10:5432".into(),
             backend_resolved_ip: None,
@@ -755,7 +895,10 @@ mod tests {
             timestamp_connected: "2026-05-11T12:00:00Z".into(),
             timestamp_disconnected: "2026-05-11T12:01:40Z".into(),
             sni_hostname: None,
-            metadata: HashMap::from([("session_id".to_string(), "xyz".to_string())]),
+            metadata: crate::plugins::MetadataMap::from_iter([(
+                "session_id".to_string(),
+                "xyz".to_string(),
+            )]),
         }
     }
 
@@ -814,10 +957,9 @@ mod tests {
                 "metadata": { "mode": "flatten", "on_collision": "skip" }
             }),
         );
-        assert_eq!(
-            v.get("event").and_then(Value::as_str),
-            Some("from-metadata")
-        );
+        // The key survives; its value is redacted because `event` is not an
+        // allowlisted metadata name (fail closed, issue #6619).
+        assert_eq!(v.get("event").and_then(Value::as_str), Some("[REDACTED]"));
         assert_eq!(v.get("direction").and_then(Value::as_str), Some("up"));
         assert_eq!(v.get("io_side").and_then(Value::as_str), Some("read"));
     }
@@ -861,9 +1003,10 @@ mod tests {
             }),
         );
         // Stream-only native the HTTP entry does not own → metadata survives.
+        // (Its value is redacted: `protocol` is not an allowlisted name.)
         assert_eq!(
             v.get("protocol").and_then(Value::as_str),
-            Some("from-metadata")
+            Some("[REDACTED]")
         );
         // Owned + emitted native → native value wins, metadata dropped.
         assert_eq!(v.get("namespace").and_then(Value::as_str), Some("ferrum"));

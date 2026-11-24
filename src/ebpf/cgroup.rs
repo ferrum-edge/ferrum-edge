@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! cgroup v2 path resolution for Kubernetes pods.
 //!
 //! Kubernetes uses two cgroup drivers — `systemd` and `cgroupfs` — each
@@ -24,9 +23,10 @@ static RELAY_POD_CGROUP_PATH_MEMO: OnceLock<Mutex<Option<(String, String, PathBu
 /// `kubepods.slice` / `kubepods` layouts. On the kubeadm/kind systemd layout
 /// (`kubelet.slice/kubelet-kubepods.slice/...`, pinned by
 /// `resolve_pod_cgroup_path_finds_kubelet_slice_systemd_pod`) every call falls
-/// through to `discover_pod_cgroup_paths`, a breadth-first walk bounded at
-/// `POD_CGROUP_DISCOVERY_MAX_DIRS` directories that does not early-exit on a
-/// match. The NodeWaypoint relay reconcile runs every
+/// through to `discover_pod_cgroup_path`, a breadth-first walk bounded at
+/// `POD_CGROUP_DISCOVERY_MAX_DIRS` directories (it stops at the first match,
+/// but still reads every directory ahead of the pod). The NodeWaypoint relay
+/// reconcile runs every
 /// `UDP_CAPTURE_READINESS_POLL` (250 ms), so calling the uncached resolver
 /// there costs thousands of directory reads per second, forever, on a
 /// steady-state node.
@@ -96,9 +96,7 @@ pub fn resolve_pod_cgroup_path(cgroup_root: &str, pod_uid: &str) -> Option<PathB
         return Some(path);
     }
 
-    discover_pod_cgroup_paths(cgroup_root, pod_uid, &sanitized_uid)
-        .into_iter()
-        .find(|path| path.exists())
+    discover_pod_cgroup_path(cgroup_root, pod_uid, &sanitized_uid)
 }
 
 fn systemd_pod_cgroup_paths(cgroup_root: &str, sanitized_uid: &str) -> [PathBuf; 3] {
@@ -126,15 +124,19 @@ fn cgroupfs_pod_cgroup_paths(cgroup_root: &str, pod_uid: &str) -> [PathBuf; 3] {
 const POD_CGROUP_DISCOVERY_MAX_DEPTH: usize = 8;
 const POD_CGROUP_DISCOVERY_MAX_DIRS: usize = 4096;
 
-fn discover_pod_cgroup_paths(
+/// Breadth-first search for the pod's cgroup directory under `cgroup_root`.
+///
+/// Returns the first (shallowest, then directory-order) existing match, which
+/// is the only one [`resolve_pod_cgroup_path`] ever used, so the walk stops
+/// there instead of reading the rest of the tree on every enrollment.
+fn discover_pod_cgroup_path(
     cgroup_root: &str,
     pod_uid: &str,
     sanitized_uid: &str,
-) -> Vec<PathBuf> {
+) -> Option<PathBuf> {
     let root = Path::new(cgroup_root);
     let raw_cgroupfs = format!("pod{pod_uid}");
     let systemd_suffix = format!("pod{sanitized_uid}.slice");
-    let mut matches = Vec::new();
     let mut queue = VecDeque::new();
     queue.push_back((root.to_path_buf(), 0usize));
     let mut scanned = 0usize;
@@ -153,7 +155,11 @@ fn discover_pod_cgroup_paths(
             .and_then(|name| name.to_str())
             .is_some_and(|name| name == raw_cgroupfs || name.ends_with(&systemd_suffix));
         if name_matches {
-            matches.push(dir.clone());
+            // Re-checked like the fast paths: the directory can vanish
+            // between the parent's `read_dir` and here.
+            if dir.exists() {
+                return Some(dir);
+            }
             continue;
         }
         if depth >= POD_CGROUP_DISCOVERY_MAX_DEPTH {
@@ -171,17 +177,7 @@ fn discover_pod_cgroup_paths(
         }
     }
 
-    matches
-}
-
-/// Build the expected cgroup path for a given QoS class (for testing/validation).
-pub fn cgroup_path_for_qos(cgroup_root: &str, pod_uid: &str, qos_class: &str) -> PathBuf {
-    match qos_class {
-        "Guaranteed" => Path::new(cgroup_root).join(format!("kubepods/pod{pod_uid}")),
-        "Burstable" => Path::new(cgroup_root).join(format!("kubepods/burstable/pod{pod_uid}")),
-        "BestEffort" => Path::new(cgroup_root).join(format!("kubepods/besteffort/pod{pod_uid}")),
-        _ => Path::new(cgroup_root).join(format!("kubepods/pod{pod_uid}")),
-    }
+    None
 }
 
 /// Bounds for [`collect_cgroup_tree`]. Kubernetes pod cgroups nest only a
@@ -613,43 +609,75 @@ pub fn collect_cgroup_tree(_pod_cgroup_path: &Path) -> CgroupTreeWalk {
     CgroupTreeWalk::complete(Vec::new())
 }
 
+/// Cgroup paths whose program detach FAILED. A failed cgroup detach consumes
+/// aya's link, so there is no handle to retry with; the attachment is only
+/// proven gone once the kernel releases it together with the cgroup itself.
+/// Retained so a `detach_pod` retry keeps failing (instead of succeeding
+/// vacuously on a missing entry) until each recorded cgroup no longer exists.
+///
+/// Pure bookkeeping (no aya types), kept outside the Linux-only loader so its
+/// transitions are unit-tested on every host; only the live loader
+/// (`AyaEbpfBackend::detach_pod`) uses it outside tests.
+#[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct UnconfirmedCgroupDetaches {
+    paths: Vec<String>,
+}
+
+#[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+impl UnconfirmedCgroupDetaches {
+    /// Record a cgroup whose program detach failed. Idempotent per path.
+    pub(crate) fn record(&mut self, cgroup_path: String) {
+        if !self.paths.contains(&cgroup_path) {
+            self.paths.push(cgroup_path);
+        }
+    }
+
+    /// Forget every recorded cgroup that `cgroup_may_exist` reports gone, and
+    /// return one error per cgroup that may still carry the attachment.
+    pub(crate) fn recheck(
+        &mut self,
+        mut cgroup_may_exist: impl FnMut(&str) -> bool,
+    ) -> Vec<String> {
+        self.paths.retain(|path| cgroup_may_exist(path));
+        self.paths
+            .iter()
+            .map(|path| {
+                format!(
+                    "cgroup program on '{path}': an earlier detach failed and the cgroup \
+                     still exists"
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+}
+
+/// Whether a cgroup path still exists. Anything other than a definite
+/// `NotFound` (for example a permission error) is treated as present, so an
+/// unconfirmed detach is never reported as complete on doubt.
+#[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+pub(crate) fn cgroup_path_may_exist(cgroup_path: &str) -> bool {
+    !matches!(
+        std::fs::symlink_metadata(cgroup_path),
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+#[cfg(test)]
+#[path = "../../tests/unit/gateway_core/ebpf_cgroup_detach_tests.rs"]
+mod cgroup_detach_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn cgroup_path_for_qos_guaranteed() {
-        let path = cgroup_path_for_qos("/sys/fs/cgroup", "abc-123", "Guaranteed");
-        assert_eq!(path, PathBuf::from("/sys/fs/cgroup/kubepods/podabc-123"));
-    }
-
-    #[test]
-    fn cgroup_path_for_qos_burstable() {
-        let path = cgroup_path_for_qos("/sys/fs/cgroup", "abc-123", "Burstable");
-        assert_eq!(
-            path,
-            PathBuf::from("/sys/fs/cgroup/kubepods/burstable/podabc-123")
-        );
-    }
-
-    #[test]
-    fn cgroup_path_for_qos_besteffort() {
-        let path = cgroup_path_for_qos("/sys/fs/cgroup", "abc-123", "BestEffort");
-        assert_eq!(
-            path,
-            PathBuf::from("/sys/fs/cgroup/kubepods/besteffort/podabc-123")
-        );
-    }
-
-    #[test]
     fn resolve_pod_cgroup_path_nonexistent() {
         assert!(resolve_pod_cgroup_path("/nonexistent/cgroup", "abc-123").is_none());
-    }
-
-    #[test]
-    fn systemd_path_sanitizes_dashes_to_underscores() {
-        let sanitized = "abc-def-123".replace('-', "_");
-        assert_eq!(sanitized, "abc_def_123");
     }
 
     #[test]
@@ -677,6 +705,28 @@ mod tests {
         assert_eq!(
             resolve_pod_cgroup_path(dir.path().to_str().unwrap(), "abc-def"),
             Some(path)
+        );
+    }
+
+    #[test]
+    fn pod_cgroup_discovery_stops_at_the_shallowest_match() {
+        // A shallower match wins and nothing below it is needed: the walk
+        // returns it instead of collecting every match in the tree.
+        let dir = tempfile::tempdir().unwrap();
+        let shallow = dir.path().join("kubelet.slice/podabc-def");
+        let deeper = dir
+            .path()
+            .join("kubelet.slice/kubelet-kubepods.slice/x.slice/kubelet-kubepods-podabc_def.slice");
+        std::fs::create_dir_all(&shallow).unwrap();
+        std::fs::create_dir_all(&deeper).unwrap();
+
+        assert_eq!(
+            discover_pod_cgroup_path(dir.path().to_str().unwrap(), "abc-def", "abc_def"),
+            Some(shallow)
+        );
+        assert_eq!(
+            discover_pod_cgroup_path(dir.path().to_str().unwrap(), "zzz", "zzz"),
+            None
         );
     }
 

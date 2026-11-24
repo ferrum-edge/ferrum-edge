@@ -537,7 +537,7 @@ async fn a_configured_authority_refuses_in_process_rotation() {
         .jwt_authority()
         .expect("configured signing material yields a JWT authority");
     assert!(
-        !authority.allows_in_process_rotation(),
+        !authority.uses_ephemeral_key(),
         "configured material must be externally rotated"
     );
 

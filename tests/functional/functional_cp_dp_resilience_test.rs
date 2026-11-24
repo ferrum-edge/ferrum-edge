@@ -111,7 +111,6 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -327,7 +326,7 @@ fn generate_admin_token() -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(ADMIN_JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(ADMIN_JWT_SECRET.as_bytes()).unwrap(),
     )
     .expect("encode admin JWT")
 }

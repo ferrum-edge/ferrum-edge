@@ -69,7 +69,7 @@ fn make_token() -> String {
         "exp": (now + chrono::Duration::seconds(3600i64)).timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
-    let key = EncodingKey::from_secret(JWT_SECRET.as_bytes());
+    let key = EncodingKey::from_secret(JWT_SECRET.as_bytes()).unwrap();
     encode(&Header::new(jsonwebtoken::Algorithm::HS256), &claims, &key).unwrap()
 }
 
@@ -1348,6 +1348,109 @@ async fn get_with_matching_if_none_match_returns_304() {
     );
 }
 
+/// Every admin response carries `X-Content-Type-Options: nosniff`,
+/// `Cache-Control: no-store` and `X-Frame-Options: DENY` (issue #7074).
+fn assert_admin_security_headers(label: &str, headers: &reqwest::header::HeaderMap) {
+    for (name, expected) in [
+        ("x-content-type-options", "nosniff"),
+        ("cache-control", "no-store"),
+        ("x-frame-options", "DENY"),
+    ] {
+        let values: Vec<&str> = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        assert_eq!(values, vec![expected], "{label}: {name}");
+    }
+}
+
+/// The raw API-spec GET (200 and 304) and DELETE (204) used to be built by
+/// hand and omitted `X-Frame-Options` (and `nosniff` on 304/204). Pin all
+/// three security headers on each, exactly once (issue #7074).
+#[tokio::test]
+async fn api_spec_get_304_and_delete_carry_admin_security_headers() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let (post_status, post_body) = client
+        .post_json("/api-specs", &minimal_json_spec(&proxy_id))
+        .await;
+    assert_eq!(post_status, reqwest::StatusCode::CREATED);
+    let spec_id = post_body["id"].as_str().unwrap().to_string();
+    let path = format!("/api-specs/{spec_id}");
+
+    let (status, _, headers) = client.get_raw(&path, None, None).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_admin_security_headers("raw spec GET 200", &headers);
+    let etag = headers
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .expect("ETag header must be present")
+        .to_string();
+
+    let (status, _, headers) = client.get_raw(&path, None, Some(&etag)).await;
+    assert_eq!(status, reqwest::StatusCode::NOT_MODIFIED);
+    assert_admin_security_headers("raw spec GET 304", &headers);
+
+    let resp = client
+        .client
+        .delete(client.url(&path))
+        .header("authorization", format!("Bearer {}", client.token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_admin_security_headers("spec DELETE 204", resp.headers());
+}
+
+/// Characterization of the admin security-header policy on responses outside
+/// the JSON helpers (issue #7074): the policy is uniform, so the `/metrics`
+/// `401`, Prometheus text, `/charges/sink/status`, the unauthenticated `/live`
+/// probe and an unknown-route `404` all carry the three headers exactly once.
+#[tokio::test]
+async fn admin_security_headers_cover_metrics_charges_and_unrouted_responses() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let cases: [(&str, &str, bool, reqwest::StatusCode); 5] = [
+        (
+            "metrics 401",
+            "/metrics",
+            false,
+            reqwest::StatusCode::UNAUTHORIZED,
+        ),
+        ("metrics 200", "/metrics", true, reqwest::StatusCode::OK),
+        (
+            "charges sink status",
+            "/charges/sink/status",
+            true,
+            reqwest::StatusCode::OK,
+        ),
+        ("live", "/live", false, reqwest::StatusCode::OK),
+        (
+            "unknown route",
+            "/no-such-admin-route",
+            true,
+            reqwest::StatusCode::NOT_FOUND,
+        ),
+    ];
+    for (label, path, authenticated, expected_status) in cases {
+        let mut request = client.client.get(client.url(path));
+        if authenticated {
+            request = request.header("authorization", format!("Bearer {}", client.token));
+        }
+        let resp = request.send().await.unwrap();
+        assert_eq!(resp.status(), expected_status, "{label}");
+        assert_admin_security_headers(label, resp.headers());
+    }
+}
+
 // ============================================================================
 // GET /api-specs/by-proxy/{proxy_id}
 // ============================================================================
@@ -1814,6 +1917,100 @@ async fn post_with_failing_plugin_config_returns_422_via_real_validator() {
         "bad-rl",
         "plugin failure id must match the submitted plugin id"
     );
+}
+
+fn public_egress_policy(allow_cidrs: &str) -> ferrum_edge::config::BackendEgressPolicy {
+    ferrum_edge::config::BackendEgressPolicy::from_env(
+        ferrum_edge::config::BackendAllowIps::Public,
+        allow_cidrs,
+        "",
+        true,
+    )
+    .expect("valid backend egress policy")
+}
+
+fn load_testing_spec(proxy_id: &str, gateway_port: u16) -> Value {
+    json_spec_with_plugin(
+        proxy_id,
+        "backend.internal",
+        &uid("load-testing"),
+        "load_testing",
+        json!({
+            "key": "spec-load-key-0123456789abcdef!!",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": gateway_port
+        }),
+    )
+}
+
+/// An admin for a database-mode node that serves traffic under `policy`.
+async fn serving_admin(
+    dir: &TempDir,
+    policy: ferrum_edge::config::BackendEgressPolicy,
+) -> (AdminClient, tokio::sync::watch::Sender<bool>) {
+    use ferrum_edge::config::{EnvConfig, OperatingMode};
+
+    let env_config = EnvConfig {
+        mode: OperatingMode::Database,
+        proxy_http_port: 18082,
+        backend_allow_ips: policy.clone(),
+        ..Default::default()
+    };
+    let dns_cache = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
+    let (proxy_state, _health_checks) = ferrum_edge::proxy::ProxyState::new(
+        ferrum_edge::config::types::GatewayConfig::default(),
+        dns_cache,
+        env_config,
+        None,
+        None,
+    )
+    .expect("proxy state");
+    let mut state = make_admin_state(make_store(dir).await, 25);
+    state.proxy_state = Some(proxy_state);
+    state.backend_allow_ips = policy;
+    let (base, shutdown) = start_admin(state).await;
+    (AdminClient::new(base), shutdown)
+}
+
+// API-spec admission uses the same plugin validation client as direct admin
+// plugin writes: a serving database-mode node screens `load_testing`'s
+// loopback dial against its backend egress policy, while a control plane (no
+// `ProxyState`) checks shape only because that policy belongs to its DPs.
+#[tokio::test]
+async fn api_spec_load_testing_loopback_dial_follows_the_admin_serving_posture() {
+    let dir = TempDir::new().unwrap();
+
+    // Under `public`, even the node's own listener port is refused: which
+    // process owns 127.0.0.1:<port> cannot be proven at admission.
+    let (client, _shutdown) = serving_admin(&dir, public_egress_policy("")).await;
+    let listener_spec = load_testing_spec(&uid("proxy"), 18082);
+    let (status, body) = client.post_json("/api-specs", &listener_spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {body}"
+    );
+    assert!(
+        body.to_string().contains("backend egress policy"),
+        "body: {body}"
+    );
+
+    // Control: an explicit loopback allow CIDR admits the same spec.
+    let allow_loopback = public_egress_policy("127.0.0.1/32");
+    let (client, _shutdown) = serving_admin(&dir, allow_loopback).await;
+    let listener_spec = load_testing_spec(&uid("proxy"), 18082);
+    let (status, body) = client.post_json("/api-specs", &listener_spec).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "body: {body}");
+
+    // A control-plane-style admin has no local `ProxyState`.
+    let mut control_plane = make_admin_state(make_store(&dir).await, 25);
+    control_plane.backend_allow_ips = public_egress_policy("");
+    let (base, _shutdown) = start_admin(control_plane).await;
+    let client = AdminClient::new(base);
+    let dp_listener_spec = load_testing_spec(&uid("proxy"), 18082);
+    let (status, body) = client.post_json("/api-specs", &dp_listener_spec).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "body: {body}");
 }
 
 #[tokio::test]
@@ -2810,6 +3007,146 @@ async fn direct_proxy_delete_rejects_foreign_upstream_then_allows_hand_owned_gra
         .unwrap()
         .expect("hand-owned upstream must survive proxy deletion");
     assert!(preserved_upstream.api_spec_id.is_none());
+}
+
+/// A plaintext TCP listener whose API-spec bundle attaches `spiffe_identity`
+/// (PR #6871 review SOL-2 / spiffe_identity-MUSE-2).
+fn plaintext_tcp_spec_with_spiffe_identity(
+    proxy_id: &str,
+    listen_port: u16,
+    plugin_id: Option<&str>,
+) -> Value {
+    let mut spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Plaintext TCP SPIFFE", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_scheme": "tcp",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9000,
+            "listen_port": listen_port
+        }
+    });
+    if let Some(plugin_id) = plugin_id {
+        spec["x-ferrum-plugins"] = json!([{
+            "id": plugin_id,
+            "plugin_name": "spiffe_identity",
+            "config": {}
+        }]);
+    }
+    spec
+}
+
+fn assert_spiffe_stream_refusal(status: reqwest::StatusCode, body: &Value) {
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "scoped spiffe_identity on a plaintext stream listener was admitted: {body}"
+    );
+    assert!(
+        body["failures"].as_array().is_some_and(|failures| {
+            failures.iter().any(|failure| {
+                failure["resource_type"] == "plugin_composition"
+                    && failure["errors"]
+                        .to_string()
+                        .contains("cannot use `spiffe_identity` PluginConfig")
+            })
+        }),
+        "422 response omitted the stream SPIFFE compatibility failure: {body}"
+    );
+}
+
+#[tokio::test]
+async fn post_rejects_spiffe_identity_on_plaintext_stream_listener() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let bound = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
+    let listen_port = bound.local_addr().unwrap().port();
+    drop(bound);
+
+    let proxy_id = uid("spec-tcp-spiffe");
+    let plugin_id = uid("spec-tcp-spiffe-plugin");
+    let spec = plaintext_tcp_spec_with_spiffe_identity(&proxy_id, listen_port, Some(&plugin_id));
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+
+    assert_spiffe_stream_refusal(status, &body);
+    assert!(
+        store
+            .get_proxy("ferrum", &proxy_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused spec must persist no proxy"
+    );
+    assert!(
+        store
+            .get_plugin_config("ferrum", &plugin_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused spec must persist no plugin config"
+    );
+}
+
+#[tokio::test]
+async fn put_rejects_adding_spiffe_identity_to_plaintext_stream_listener() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let bound = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
+    let listen_port = bound.local_addr().unwrap().port();
+    drop(bound);
+
+    let proxy_id = uid("spec-tcp-spiffe-put");
+    let (post_status, post_body) = client
+        .post_json(
+            "/api-specs",
+            &plaintext_tcp_spec_with_spiffe_identity(&proxy_id, listen_port, None),
+        )
+        .await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "plaintext TCP API-spec setup failed: {post_body}"
+    );
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("POST response must include spec id")
+        .to_string();
+
+    let plugin_id = uid("spec-tcp-spiffe-put-plugin");
+    let replacement =
+        plaintext_tcp_spec_with_spiffe_identity(&proxy_id, listen_port, Some(&plugin_id));
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &replacement)
+        .await;
+
+    assert_spiffe_stream_refusal(put_status, &put_body);
+    let proxy = store
+        .get_proxy("ferrum", &proxy_id)
+        .await
+        .unwrap()
+        .expect("the refused replacement must keep the stored proxy");
+    assert!(
+        proxy.plugins.is_empty(),
+        "the refused replacement must not attach the plugin: {:?}",
+        proxy.plugins
+    );
+    assert!(
+        store
+            .get_plugin_config("ferrum", &plugin_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -7252,20 +7589,20 @@ async fn external_ref_put_failure_and_delete_preserve_last_good_snapshot_lifecyc
         allowed_origins: vec!["https://schemas.example.com:443".to_string()],
         ..Default::default()
     });
-    let mut loader = ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default();
-    loader.fixtures.insert(
+    let mut loader = ferrum_edge::admin::api_specs::MapExternalDocumentLoader::default();
+    loader.docs.insert(
         FIRST_URI.to_string(),
         br#"{"type":"object","required":["first"],"properties":{"first":{"type":"string"}}}"#
             .to_vec(),
     );
-    loader.fixtures.insert(
+    loader.docs.insert(
         SECOND_URI.to_string(),
         br#"{"type":"object","required":["second"],"properties":{"second":{"type":"integer"}}}"#
             .to_vec(),
     );
     // The fixture is deterministic and performs no I/O, but its nested file
     // reference is outside the effective policy and must fail closed.
-    loader.fixtures.insert(
+    loader.docs.insert(
         REJECTED_URI.to_string(),
         br#"{"$ref":"file:///outside-policy.json"}"#.to_vec(),
     );
@@ -7415,4 +7752,71 @@ async fn external_ref_put_failure_and_delete_preserve_last_good_snapshot_lifecyc
     );
     let (get_status, _) = client.get_json(&format!("/api-specs/{spec_id}")).await;
     assert_eq!(get_status, reqwest::StatusCode::NOT_FOUND);
+}
+
+/// Issue #6539: a disabled `kafka_logging` entry skips plugin construction,
+/// but a native librdkafka `producer_config` key is still refused on POST and
+/// PUT with 422 (the hosted suite never sets `FERRUM_KAFKA_ALLOW_NATIVE_CONFIG`), and
+/// nothing is persisted.
+#[tokio::test]
+async fn disabled_kafka_spec_plugin_with_native_producer_key_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let kafka = |producer_config: Value| {
+        json!({
+            "id": "kafka-native-spec",
+            "plugin_name": "kafka_logging",
+            "enabled": false,
+            "config": {
+                "broker_list": "localhost:9092",
+                "topic": "logs",
+                "producer_config": producer_config
+            }
+        })
+    };
+    let mut spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Disabled Kafka native key", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [kafka(json!({"plugin.library.paths": "/opt/attacker/payload"}))]
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body.to_string()
+            .contains("FERRUM_KAFKA_ALLOW_NATIVE_CONFIG"),
+        "{body}"
+    );
+    assert!(
+        !body.to_string().contains("/opt/attacker/payload"),
+        "{body}"
+    );
+
+    // A tuning-only disabled entry is admitted; replacing it with a native key
+    // through PUT is refused the same way.
+    spec["x-ferrum-plugins"][0] = kafka(json!({"linger.ms": "5"}));
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    let spec_id = body["id"].as_str().expect("created spec id").to_string();
+
+    spec["x-ferrum-plugins"][0] = kafka(json!({"Topic.offset.store.path": "/tmp/offsets"}));
+    let (status, body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec)
+        .await;
+    assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body.to_string()
+            .contains("FERRUM_KAFKA_ALLOW_NATIVE_CONFIG"),
+        "{body}"
+    );
 }

@@ -53,17 +53,41 @@ paths:
 
 - New config fields go in `src/config/types.rs` with `#[serde(default)]` when optional.
 - Env-driven fields also update `src/config/env_config.rs`, `docs/configuration.md`, and `ferrum.conf`.
-- SQL storage changes are folded into `src/config/migrations/v001_initial_schema.rs` during build-out, with parsing in `db_loader.rs`.
+- SQL storage changes are folded into the V001 baseline in `src/config/migrations/sql_dialect.rs` (`v001_initial_schema.rs` only delegates to it) during build-out, with parsing in `db_loader.rs`.
 - MongoDB persists through serde BSON unless a queried field needs an index in
   `src/config/mongo_index_plan.rs` (consumed by `MongoStore::run_migrations()`,
   migrate dry-run, and migrate status).
 - Add unit tests under `tests/unit/config/` and update `openapi.yaml` when admin-exposed.
 - During build-out, required-field changes update the current schema, config examples, and validation directly. Document the breaking change; do not add legacy transforms, startup schema repairs/backfills, or compatibility tracking tables. Recreate development databases after a baseline change.
 - Check parent structs for `#[serde(deny_unknown_fields)]` before adding fields.
+- Deliberate exception to the no-legacy-shims policy (issue #7218): the
+  security read paths keep tolerating pre-contract stored Consumer credential
+  shapes — a single-object (non-array) `jwt` / `hmac_auth` / `mtls_auth` value,
+  and extra fields on the `SINGLE_FIELD_CREDENTIAL_TYPES` entries. That covers
+  `jwt_credential_secret_values` (JWT secret ownership counts a stored secret
+  whatever its shape), the credential redaction projection
+  (`redact_consumer_credentials*`), `preserve_response_hidden_consumer_credentials`,
+  and `canonicalize_consumer_credentials_for_backup`. They are security
+  fail-closed reads: the JWT ownership check counts a secret whatever its
+  stored shape (defence in depth against two consumers sharing a JWT secret),
+  and the redaction, response-hidden preservation and backup paths keep
+  treating an old row's secret as a secret instead of losing or mis-projecting
+  it. Removing them would make such a row's secret invisible to those checks
+  rather than refuse it. Admission still accepts only the current shapes. Keep
+  them; do not add new legacy-shape writers.
+- `allowed_ws_origins` `*` / non-origin entries are refused by Admin API
+  writes, restore, and file-mode load/reload (`file_loader`, fatal like any
+  invalid local config); database, CP and DP loads keep #5454's grandfathering
+  and only warn (`Proxy::warn_legacy_allowed_ws_origins`), so a stored row
+  never takes a running gateway down (issue #7218).
 
 ## Database Backends
 
 - Supported stores are PostgreSQL, MySQL, SQLite through sqlx, and MongoDB.
+- MongoDB 4.4.2 is the server floor (the `mongodb` 3.9 driver's wire version 9,
+  plus the `hello` command Ferrum sends directly).
+  Do not add MongoDB queries that need a newer server without updating the
+  supported-version table in `docs/mongodb.md` and the CI 4.4 fixture.
 - SQLite must keep `PRAGMA journal_mode=WAL`, `busy_timeout=5000`, and `foreign_keys=ON` through `after_connect`.
 - `DatabaseBackend` in `src/config/db_backend.rs` is the shared trait. `DatabaseStore` and `MongoStore` both implement it. Admin and modes use `Arc<dyn DatabaseBackend>`.
 - SQL wraps multi-step CRUD in `sqlx::Transaction`.
@@ -83,11 +107,19 @@ paths:
   a write-topology pin (SQL reconnect `RwLock` read / Mongo distinct
   `admin_write_topology` `RwLock` read) retained for the full persistence
   lifetime so a reconnect cannot redirect an already-admitted write; Mongo
-  admission continues to pin only `connection_generation` (publication
-  `try_write`s Admin topology then generation, both fail-fast; failover marks
-  before publish and primary marks after publish, both under those guards).
+  admission continues to pin only `connection_generation` (an uncertain
+  mutation never keeps that pin: it becomes an explicit per-namespace
+  `AdmissionFence` checked under the pin, surfaced on authenticated `/health`
+  and `ferrum_database_mtls_dns_admission_fences_retained`, cleared only by a
+  probe of the ORIGINAL bundle proving the owner-qualified lock absent; publication
+  `try_write`s Admin topology then generation, both fail-fast, and publishes the
+  connection and its topology in one store under those guards; issue #7061).
   Managed TLS/ACME handlers use the non-topology write gate only (read-only +
-  database-unavailable) and must not pin or inherit sticky DB failover policy.
+  database-unavailable) and must not inherit sticky DB failover policy. The
+  one exception to "no pin" is the managed TLS/ACME delete's cross-namespace
+  reference fence (issue #7394): it reads and leases the config store, so it
+  takes `acquire_write_topology_permit` (not `admit_write`) before its leases
+  and holds it until the TLS-store delete concludes.
   Observe-only `/health` uses the synchronous policy check;
   `admin_writes_enabled` reports config-database mutation admission.
 - Runtime config polling is authoritative and primary-consistent: startup full loads, incremental change-log reads, relationship reads, cursor advancement, and accepted association state must not use SQL read replicas or MongoDB secondary read preferences.
@@ -113,6 +145,13 @@ paths:
 - MongoDB supports only `disable`, `require`, and `verify-full`.
 - SQLite accepts only `disable` and rejects cert paths and other TLS modes.
 - Keep `docs/database_tls.md`, `docs/configuration.md`, and env parsing synchronized.
+- Deliberate exception to the no-legacy-shims policy: `validate_db_tls_config`
+  refuses startup when any retired DB TLS variable (`FERRUM_DB_TLS_ENABLED`,
+  `FERRUM_DB_TLS_INSECURE`, `FERRUM_DB_SSL_MODE`, `FERRUM_DB_SSL_ROOT_CERT`,
+  `FERRUM_DB_SSL_CLIENT_CERT`, `FERRUM_DB_SSL_CLIENT_KEY`) is set. It accepts
+  nothing old; it fails closed so a stale TLS setting cannot be silently
+  ignored and leave the config-database connection without the TLS the
+  operator asked for (issue #7218). Keep it.
 
 ## File Mode And Validation
 
@@ -131,7 +170,7 @@ paths:
   distribution so CP admission and serving-DP correlation ownership cannot diverge.
 - CP/DP auth is HS256 JWT in `authorization` metadata. The channel carries that JWT plus the full gateway config, so the transport is secure-by-default: `EnvConfig::validate_cp_dp_grpc_transport_security()` refuses a non-loopback plaintext CP bind and a non-loopback `http://` DP URL unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true`. Loopback (`127.0.0.1`/`::1`/`localhost`) plaintext is always allowed; permitted plaintext still logs a high-severity warning on CP and DP. mTLS (`FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH`) is the only DP auth factor beyond the bearer JWT — warn when CP TLS is configured without it.
 - `FERRUM_DP_GRPC_TLS_NO_VERIFY=true` is rejected at startup: tonic's `ClientTlsConfig` exposes no public verifier-skip hook, so the flag never disabled verification (CRL is likewise not applied to the tonic-managed CP/DP client). Pin the CP CA via `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` for self-signed test certs. Do not re-add a no-verify path by hand-rolling a tonic connector.
-- A rejected CP/DP trust-bundle reload retains the ENTIRE last accepted verifier, but only for `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS` (default 900, monotonic, reset only by an accepted reload including a semantically unchanged one). The first refusal marks trust reload degraded on authenticated `/health` (`cp_dp_trust`) and in the `ferrum_cp_dp_trust_*` families; at the bound readiness fails and `bind_to_store` refuses new ConfigSync/MeshSubscribe/SotW-ADS/Delta-ADS admissions while the shared lease ends established streams with `trust_stale`. An unexpectedly dead reload worker fails readiness immediately; a stalled worker (no completed attempt inside three poll intervals, floored at 60s) is immediately degraded and `ferrum_cp_dp_trust_reload_worker_stalled=1` but does not fail readiness inside the bound; a clean shutdown never counts as a failure. `0` is unbounded and requires `FERRUM_CP_DP_TRUST_ALLOW_UNBOUNDED_STALE=true`; a bound below three poll intervals fails startup. Unauthenticated `/health`/`/status` uses the lock-free coarse verdict (no closed-reason-map allocation). Published Prometheus state is fixed-cardinality and carries no path, `kid`, namespace, token, key material, or generation identifier. Authenticated `/health`/`/status` additionally publish `active_generation`, a replica-stable HMAC-SHA-256 of the private configuration fingerprint under fleet-shared `FERRUM_ADMIN_JWT_SECRET` with domain `ferrum-cp-dp-trust-status-id-v1\0` (64 lowercase hex). Never an unkeyed digest. The identifier is incomparable across replicas that do not share the HMAC key, never appears in logs, Prometheus, or errors, and does not reveal the HMAC key. The internal configuration fingerprint stays private to the reload worker as a change detector. `attempts_total` counts attempts started (a wedged in-flight read is visible; acceptances+rejections may trail by one).
+- A rejected CP/DP trust-bundle reload retains the ENTIRE last accepted verifier, but only for `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS` (default 900, monotonic, reset only by an accepted reload including a semantically unchanged one). The first refusal marks trust reload degraded on authenticated `/health` (`cp_dp_trust`) and in the `ferrum_cp_dp_trust_*` families; at the bound readiness fails and `bind_to_store` refuses new ConfigSync/MeshSubscribe/SotW-ADS/Delta-ADS admissions while the shared lease ends established streams with `trust_stale`. An unexpectedly dead reload worker fails readiness immediately; a stalled worker (no completed attempt inside three poll intervals, floored at 60s) is immediately degraded and `ferrum_cp_dp_trust_reload_worker_stalled=1` but does not fail readiness inside the bound; a clean shutdown never counts as a failure. `0` is unbounded and requires `FERRUM_CP_DP_TRUST_ALLOW_UNBOUNDED_STALE=true`; a bound below three poll intervals fails startup. Unauthenticated `/health`/`/status` uses the lock-free coarse verdict (no closed-reason-map allocation). Published Prometheus state is fixed-cardinality and carries no path, `kid`, namespace, token, key material, or generation identifier. `/health`/`/status` authenticated by a fleet-wide primary-key admin JWT (never a `FERRUM_ADMIN_JWT_VIEWER_SECRET` token, metrics bearer, or CIDR source, which get `null`) additionally publish `active_generation`, a replica-stable HMAC-SHA-256 of the private configuration fingerprint under fleet-shared `FERRUM_ADMIN_JWT_SECRET` with domain `ferrum-cp-dp-trust-status-id-v1\0` (64 lowercase hex). Never an unkeyed digest. The identifier is incomparable across replicas that do not share the HMAC key, never appears in logs, Prometheus, or errors, and does not reveal the HMAC key. The internal configuration fingerprint stays private to the reload worker as a change detector. `attempts_total` counts attempts started (a wedged in-flight read is visible; acceptances+rejections may trail by one).
 - `CpGrpcServer::builder(...).build()` is the only constructor (default channel capacity 128); production threads `channel_capacity(env_config.cp_broadcast_channel_capacity)` and the other operator knobs through it. `build()` returns only the server: reach a namespace's sender through `broadcasts().sender_for(ns)`. `MeshGrpcServer` likewise has only `builder()`.
 - DP reconnects priority-ordered CP URLs with exponential backoff from 1s to 30s and plus/minus 25% jitter. Backoff follows the failure sequence across CP switches; a clean close that delivered no config message counts as a failure. A transport/RPC failure after the attempt already accepted config resets backoff to the initial delay (healthy progress) while still failing over. Intentional disconnect may reset without treating the attempt as a failure.
 - ConfigSync Subscribe streams use HTTP/2/TCP keepalive plus application heartbeats that are always on: the CP emits heartbeat frames on every Subscribe stream and the DP always arms the `CONFIGSYNC_MAX_SILENCE_SECS` watchdog, so DPs reconnect after bounded silence rather than hanging on idle `message().await`. There is no capability negotiation (CP and DP run the same build; proto fields `SubscribeRequest` 5 and `ConfigUpdate` 8 are `reserved`). A heartbeat is admissible only after the subscription's FULL_SNAPSHOT base is applied (`heartbeat_frame_admissible`). `ConfigSyncStreamTimings` is a per-invocation stack argument, production default `production()`; do not add a global/env override.

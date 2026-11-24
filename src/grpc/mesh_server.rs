@@ -125,8 +125,9 @@ pub struct MeshGrpcServer {
     sidecar_enforced: bool,
     /// Mirror of `EnvConfig.mesh_sidecar_enforced_dry_run`.
     sidecar_enforced_dry_run: bool,
-    /// Mirror of `EnvConfig.mesh_sidecar_identity_narrowing`. Only takes
-    /// effect when `sidecar_enforced` is also true.
+    /// Mirror of `EnvConfig.mesh_sidecar_identity_narrowing` (default `true`,
+    /// like the env var). Only takes effect when `sidecar_enforced` is also
+    /// true.
     sidecar_identity_narrowing: bool,
     /// Cluster DNS suffix used when synthesizing MeshService FQDN aliases for
     /// Sidecar egress matching.
@@ -184,7 +185,7 @@ impl MeshGrpcServerBuilder {
             require_ns_claim: false,
             sidecar_enforced: false,
             sidecar_enforced_dry_run: false,
-            sidecar_identity_narrowing: false,
+            sidecar_identity_narrowing: true,
             cluster_domain: crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
             cluster_audience: None,
         }
@@ -310,23 +311,8 @@ impl MeshGrpcServer {
         MeshGrpcServerBuilder::new(config, jwt_secret)
     }
 
-    #[allow(dead_code)]
-    pub fn with_cluster_domain(mut self, cluster_domain: String) -> Self {
-        self.cluster_domain = cluster_domain;
-        self
-    }
-
     pub fn into_service(self) -> MeshConfigSyncServer<Self> {
         MeshConfigSyncServer::new(self)
-    }
-
-    /// Shared admission controller, for asserting stream/node occupancy.
-    ///
-    /// Reachable only from the external `tests/` crate, so the bin target sees
-    /// it as dead — same as the constructors above.
-    #[allow(dead_code)]
-    pub fn admission(&self) -> CpGrpcAdmissionController {
-        self.admission.clone()
     }
 
     fn check_namespace(
@@ -681,12 +667,16 @@ impl MeshConfigSync for MeshGrpcServer {
                         "Refused MeshSubscribe: JWT audience does not match subscription purpose"
                     );
                 }
+                let audit_reason = match audience_reason {
+                    Some(reason) => reason.as_metric_label(),
+                    None => super::cp_server::tenant_authentication_rejection_reason(&status),
+                };
                 CpGrpcServer::audit_tenant_subscription(
                     "MeshConfigSync.MeshSubscribe",
                     &req.node_id,
                     &req.namespace,
                     "failure",
-                    status.message(),
+                    audit_reason,
                 );
                 return Err(status);
             }
@@ -701,7 +691,7 @@ impl MeshConfigSync for MeshGrpcServer {
                 &inner.node_id,
                 &inner.namespace,
                 "failure",
-                status.message(),
+                super::cp_server::tenant_rejection_reason::NAMESPACE_NOT_AUTHORIZED,
             );
             return Err(status);
         }
@@ -719,7 +709,7 @@ impl MeshConfigSync for MeshGrpcServer {
                 &identity.subject,
                 &inner.namespace,
                 "failure",
-                "node_id does not match authenticated subject",
+                super::cp_server::tenant_rejection_reason::NODE_ID_MISMATCH,
             );
             return Err(Status::permission_denied(
                 "MeshSubscribe node_id must match the authenticated JWT subject",
@@ -742,7 +732,7 @@ impl MeshConfigSync for MeshGrpcServer {
                     "",
                     &inner.namespace,
                     "failure",
-                    status.message(),
+                    rejection.metric_reason(),
                 );
                 return Err(status);
             }
@@ -790,7 +780,8 @@ impl MeshConfigSync for MeshGrpcServer {
         .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing);
         let slice_request = slice_request
             .with_ambient_udp_source_scoping(inner.ambient_udp_source_scoping)
-            .with_node_waypoint_capture_scoping(inner.node_waypoint_capture_scoping);
+            .with_node_waypoint_capture_scoping(inner.node_waypoint_capture_scoping)
+            .with_sidecar_http_routes(inner.sidecar_http_routes);
         // Register the receiver before loading the initial snapshot so a
         // concurrent CP broadcast is either captured by this stream or already
         // reflected in the loaded snapshot.

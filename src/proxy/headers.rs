@@ -46,8 +46,6 @@ macro_rules! define_header_name_set {
 }
 
 define_header_name_set! {
-    // Public inventory is consumed by library tests, not the binary target.
-    #[allow(dead_code)]
     /// Closed set of lowercase names stripped by
     /// [`is_backend_request_strip_header`]. Secondary-request builders call that
     /// predicate directly; this const is the shared inventory for docs/tests.
@@ -71,8 +69,9 @@ define_header_name_set! {
     ///   by the compression plugin to track the pre-compression encoding;
     ///   never forward to the backend.
     ///
-    /// - **`x-grpc-web-mode`:** internal grpc_web plugin marker used only between
-    ///   request header and body plugin phases; never forward to the backend.
+    /// - **`x-grpc-web-mode`:** reserved grpc_web name. The plugin keeps its
+    ///   mode in request metadata and never emits it; a client copy is never
+    ///   forwarded to the backend.
     ///
     /// - **`expect`:** the gateway has already satisfied the expectation. Hyper's
     ///   HTTP/1 *server* writes the interim `100 Continue` itself when the
@@ -101,6 +100,62 @@ define_header_name_set! {
         "x-ferrum-original-content-encoding",
         "x-grpc-web-mode",
     ]
+}
+
+define_header_name_set! {
+    // Public inventory is consumed by library tests, not the binary target.
+    #[allow(dead_code)]
+    /// Closed set of lowercase names stripped from a backend WebSocket
+    /// handshake on top of [`BACKEND_REQUEST_STRIP_HEADER_NAMES`] and the
+    /// consumer-assertion namespace. Both WebSocket frontends (H1/H2 and H3)
+    /// apply it through [`is_websocket_backend_request_strip_header`].
+    pub const WEBSOCKET_HANDSHAKE_STRIP_HEADER_NAMES;
+    /// Returns `true` for the WebSocket-handshake-only names a backend
+    /// WebSocket handshake must not carry:
+    ///
+    /// - **`host`:** the backend WebSocket client sets its own from the backend
+    ///   URL.
+    /// - **`proxy-authenticate`:** hop-by-hop.
+    /// - **`sec-websocket-key` / `-version` / `-accept`:** the client side of
+    ///   the gateway's backend handshake synthesises its own (RFC 6455 §4.1).
+    /// - **`sec-websocket-extensions`:** the gateway's WebSocket bridge
+    ///   (tungstenite) cannot encode or decode permessage-deflate, so the
+    ///   client's extension OFFER must not reach the backend: a deflate-capable
+    ///   backend would accept it, set rsv1 on data frames, and the bridge would
+    ///   tear the session down with a protocol error. A
+    ///   `websocket_permessage_deflate: passthrough` proxy re-adds only the
+    ///   permessage-deflate elements (issue #5769).
+    /// - **`x-geo-country`:** reserved gateway assertion header.
+    ///
+    /// `name` is expected to be lowercase.
+    pub fn is_websocket_handshake_strip_header;
+    [
+        "host",
+        "proxy-authenticate",
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-accept",
+        "sec-websocket-extensions",
+        "x-geo-country",
+    ]
+}
+
+/// Returns `true` for headers that must NOT be forwarded on a backend WebSocket
+/// handshake request: the canonical backend request strip set
+/// ([`is_backend_request_strip_header`]), the WebSocket handshake set
+/// ([`is_websocket_handshake_strip_header`]) and the consumer-assertion
+/// namespace ([`is_consumer_assertion_header`]).
+///
+/// Frontend-specific arms stay with each collector: H1/H2 also drops
+/// `Connection`-nominated names; H3 also drops pseudo-headers and replaces a
+/// client `early-data` with its own 0-RTT value.
+///
+/// `name` is expected to be lowercase.
+#[inline]
+pub fn is_websocket_backend_request_strip_header(name: &str) -> bool {
+    is_backend_request_strip_header(name)
+        || is_websocket_handshake_strip_header(name)
+        || is_consumer_assertion_header(name)
 }
 
 /// Returns `true` for the gateway-owned consumer assertion namespace
@@ -178,6 +233,81 @@ fn fold_field_name_byte(byte: u8) -> u8 {
     }
 }
 
+/// Returns `true` for a request header name a plugin-owned gateway assertion
+/// (`claim_headers`, `output_claim_headers`, OPA `decision_request_headers`,
+/// mesh `outputClaimToHeaders`) may never use as its destination.
+///
+/// The rule: an owned assertion destination must be an application-specific
+/// header that nothing but its owner ever writes. The final gateway-assertion
+/// pass (`proxy::enforce_route_owned_request_assertions`) removes every copy an
+/// owner did not install, but some request fields are written again AFTER it,
+/// by the gateway or by a client library: reqwest adds `Accept: */*`,
+/// `User-Agent` and `Proxy-Authorization`, hyper and the request builders add
+/// `Host` and framing (`Content-Length`, `Transfer-Encoding`, `TE`),
+/// tungstenite synthesizes the WebSocket handshake (`Connection`, `Upgrade`,
+/// `Sec-WebSocket-*`), the gateway writes per-attempt `traceparent`, the
+/// remaining `grpc-timeout`, `early-data` and forwarding headers, and it
+/// re-injects its own assertions on the WebSocket handshake. On such a name
+/// an absent claim would not stay absent on the wire, or the owner's final
+/// pass would strip a value the transport needs. So every standard HTTP
+/// request field (and every family a client, proxy or browser may
+/// synthesize or interpret) is refused, not just the names known to be
+/// written today. Names are folded the way CGI-style backends read them
+/// (ASCII case-insensitive, `_` read as `-`). Configuration-time only.
+pub fn is_reserved_assertion_destination(name: &str) -> bool {
+    let folded = name.to_ascii_lowercase().replace('_', "-");
+    is_gateway_assertion_header(&folded)
+        || is_path_param_assertion_header(&folded)
+        || folded.starts_with("accept-")
+        || folded.starts_with("access-control-")
+        || folded.starts_with("content-")
+        || folded.starts_with("grpc-")
+        || folded.starts_with("if-")
+        || folded.starts_with("proxy-")
+        || folded.starts_with("sec-")
+        || folded.starts_with("x-b3-")
+        || folded.starts_with("x-ferrum-")
+        || folded.starts_with("x-forwarded-")
+        || matches!(
+            folded.as_str(),
+            "a-im"
+                | "accept"
+                | "authorization"
+                | "b3"
+                | "baggage"
+                | "cache-control"
+                | "cdn-loop"
+                | "connection"
+                | "cookie"
+                | "date"
+                | "dnt"
+                | "early-data"
+                | "expect"
+                | "forwarded"
+                | "from"
+                | "host"
+                | "http2-settings"
+                | "keep-alive"
+                | "max-forwards"
+                | "origin"
+                | "pragma"
+                | "prefer"
+                | "priority"
+                | "range"
+                | "referer"
+                | "te"
+                | "traceparent"
+                | "tracestate"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+                | "upgrade-insecure-requests"
+                | "user-agent"
+                | "via"
+                | "x-real-ip"
+        )
+}
+
 /// Returns `true` for every backend-visible gateway assertion: the
 /// [`is_consumer_assertion_header`] namespace plus the private GeoIP result
 /// (`x-geo-country`). ASCII case-insensitive with `_` equivalent to `-`
@@ -192,8 +322,6 @@ pub fn is_gateway_assertion_header(name: &str) -> bool {
 }
 
 define_header_name_set! {
-    // Public inventory is consumed by library tests, not the binary target.
-    #[allow(dead_code)]
     /// Closed set of lowercase proxy-owned forwarding identity headers stripped
     /// before Ferrum regenerates them on primary dispatch (and before secondary
     /// request builders copy the materialised map).
@@ -339,6 +467,8 @@ pub fn filter_secondary_request_headers(
     peer_trusted: bool,
     extra_exclude: &[&str],
 ) -> Vec<(String, String)> {
+    let canonical = canonical_request_header_map(headers);
+    let headers = canonical.as_ref();
     let connection_listed = parse_connection_listed_from_str_map(headers);
     headers
         .iter()
@@ -618,14 +748,22 @@ pub fn confine_connection_nominated_request_headers(
 pub fn parse_connection_listed_from_str_map(
     headers: &std::collections::HashMap<String, String>,
 ) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
     // The materialised request map folds repeated non-cookie headers with
     // `, ` (see the request handler). Walk every case variant defensively
     // so a plugin-added `Connection` does not bypass listed-header stripping.
-    for value in headers.iter().filter_map(|(name, value)| {
+    parse_connection_listed_from_str_values(headers.iter().filter_map(|(name, value)| {
         name.eq_ignore_ascii_case("connection")
             .then_some(value.as_str())
-    }) {
+    }))
+}
+
+/// [`parse_connection_listed_from_str_map`] over already-selected
+/// `Connection` field values.
+pub fn parse_connection_listed_from_str_values<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for value in values {
         for token in value.split(',') {
             let trimmed = token.trim();
             if trimmed.is_empty() {
@@ -719,13 +857,22 @@ pub fn strip_backend_request_headers_for_grpc(headers: &mut http::HeaderMap) {
 /// call parameters. `Forwarded` is rejected unconditionally because this late
 /// boundary has no route-level `add_forwarded_header` context and failing
 /// closed prevents protocol-path-dependent identity shape.
+///
+/// Gateway assertions are matched with [`is_gateway_assertion_header`], the
+/// SAME folded predicate the initial header block uses, so the underscore
+/// spellings a CGI-style backend folds onto the gateway's own value
+/// (`x_geo_country`, `x_geo-country`, `x-geo_country`, `x_consumer_username`)
+/// cannot ride a trailer block past the scrub the header path applies.
 #[inline]
 pub(crate) fn is_forbidden_backend_request_trailer_name(name: &str) -> bool {
     is_backend_request_strip_header(name)
         || is_proxy_owned_forwarding_header(name, true)
         || name.starts_with("grpc-")
-        || is_consumer_assertion_header(name)
-        || name.starts_with("x-ferrum-")
+        || is_gateway_assertion_header(name)
+        // Folded like the other gateway-owned prefixes: a CGI-style backend
+        // reads `x_ferrum_peer_spiffe_id` as the gateway's
+        // `x-ferrum-peer-spiffe-id` (`spiffe_identity` `forward_identity`).
+        || has_backend_folded_prefix(name, b"x-ferrum-")
         || is_path_param_assertion_header(name)
         // `via` and `early-data` are deliberately asymmetric with the header
         // boundary, and that asymmetry is the point:
@@ -757,7 +904,6 @@ pub(crate) fn is_forbidden_backend_request_trailer_name(name: &str) -> bool {
                 | "authorization"
                 | "cookie"
                 | "x-api-key"
-                | "x-geo-country"
         )
 }
 
@@ -769,6 +915,50 @@ pub(crate) fn sanitize_backend_request_trailers(trailers: &mut http::HeaderMap) 
     let strip: Vec<http::HeaderName> = trailers
         .keys()
         .filter(|name| is_forbidden_backend_request_trailer_name(name.as_str()))
+        .cloned()
+        .collect();
+    for name in strip {
+        trailers.remove(name);
+    }
+}
+
+/// Remove request trailers that restate one of the route's configured
+/// credential header locations (a `key_auth` `header:<name>`, a custom
+/// `jwt_auth` / `jwks_auth` / `oauth2_introspection` token header, ...) or one
+/// of the route's owned gateway-assertion headers (a `jwks_auth` /
+/// `oauth2_introspection` / `oidc_relying_party` `claim_headers` or
+/// `output_claim_headers` destination).
+///
+/// [`sanitize_backend_request_trailers`] knows only the fixed credential names
+/// (`authorization`, `cookie`, `x-api-key`) and fixed gateway assertions. These
+/// names are per-route configuration, so every late request-trailer boundary
+/// applies this right after the static filter with the route's precomputed
+/// list (`RequestContext::request_trailer_credential_header_names`, built once
+/// with the plugin cache). Removal is unconditional, whatever any trigger
+/// decided: trailers are never a legitimate credential location or claim
+/// assertion, and `hide_credentials: false` governs only the initial header
+/// block the plugin authenticated.
+///
+/// Names match the way a CGI-style backend reads them (ASCII case-insensitive,
+/// `_` read as `-`, [`field_names_equivalent_for_backends`]), so a client
+/// `x_user_email` trailer cannot fold onto a gateway-owned `x-user-email`.
+/// Nothing allocates unless a trailer matches, and nothing runs at all when
+/// the trailer block or the route list is empty.
+#[inline]
+pub(crate) fn strip_configured_credential_request_trailers(
+    trailers: &mut http::HeaderMap,
+    credential_header_names: &[String],
+) {
+    if trailers.is_empty() || credential_header_names.is_empty() {
+        return;
+    }
+    let strip: Vec<http::HeaderName> = trailers
+        .keys()
+        .filter(|trailer| {
+            credential_header_names
+                .iter()
+                .any(|name| field_names_equivalent_for_backends(trailer.as_str(), name))
+        })
         .cloned()
         .collect();
     for name in strip {
@@ -909,6 +1099,11 @@ pub fn merge_proxy_headers_preserving_repeated(
     headers: &mut http::HeaderMap,
     proxy_headers: &std::collections::HashMap<String, String>,
 ) {
+    // Direct replay/dispatch callers can supply a plugin-written map without
+    // passing through the dispatch-ladder refresh. Borrow the common case;
+    // copy only a map that actually contains competing case variants.
+    let canonical = canonical_request_header_map(proxy_headers);
+    let proxy_headers = canonical.as_ref();
     // Drop client-supplied reserved assertion headers from the raw base BEFORE
     // the merge, so a verified gateway value carried in `proxy_headers`
     // (post-auth) is layered back on and preserved.
@@ -948,6 +1143,120 @@ pub fn merge_proxy_headers_preserving_repeated(
             headers.insert(name, val);
         }
     }
+}
+
+/// Fold plugin-written case variants of a request field into one lowercase key.
+///
+/// List fields (including extension fields) join in byte-wise key order using
+/// the same separator as wire-header materialization: `, `, or `; ` for Cookie.
+/// Known singleton fields prefer the exact lowercase key, otherwise the
+/// byte-wise smallest key. This rule is shared by authorization and egress;
+/// neither may select a value by `HashMap` iteration order.
+///
+/// Maps without duplicate variants are left untouched and allocate nothing,
+/// including maps containing a single operator-cased spelling. Wire-derived
+/// maps have only lowercase names, so detection is linear in their name bytes.
+pub fn canonicalize_request_header_map(headers: &mut std::collections::HashMap<String, String>) {
+    if !request_header_map_has_case_duplicates(headers) {
+        return;
+    }
+    let mixed_names: Vec<String> = headers
+        .keys()
+        .filter(|name| name.bytes().any(|byte| byte.is_ascii_uppercase()))
+        .cloned()
+        .collect();
+    for name in mixed_names {
+        // An earlier spelling in this group may already have folded it.
+        if !headers.contains_key(&name) {
+            continue;
+        }
+        let mut variants: Vec<_> = headers
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(&name))
+            .collect();
+        if variants.len() < 2 {
+            continue;
+        }
+        variants.sort_unstable_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+        let lower = name.to_ascii_lowercase();
+        let value = if is_singleton_request_header(&lower) {
+            // `variants` has at least two entries. Use an iterator instead of
+            // indexing so no request-path panic depends on that invariant.
+            let Some(value) = headers
+                .get(&lower)
+                .map(String::as_str)
+                .or_else(|| variants.first().map(|(_, value)| value.as_str()))
+            else {
+                continue;
+            };
+            value.to_owned()
+        } else {
+            let separator = crate::plugins::repeated_request_header_separator(&lower);
+            let mut value = String::new();
+            for (index, (_, part)) in variants.into_iter().enumerate() {
+                if index != 0 {
+                    value.push_str(separator);
+                }
+                value.push_str(part);
+            }
+            value
+        };
+        headers.retain(|key, _| !key.eq_ignore_ascii_case(&lower));
+        headers.insert(lower, value);
+    }
+}
+
+fn request_header_map_has_case_duplicates(
+    headers: &std::collections::HashMap<String, String>,
+) -> bool {
+    headers.keys().any(|name| {
+        name.bytes().any(|byte| byte.is_ascii_uppercase())
+            && headers
+                .keys()
+                .any(|other| other != name && other.eq_ignore_ascii_case(name))
+    })
+}
+
+fn canonical_request_header_map(
+    headers: &std::collections::HashMap<String, String>,
+) -> std::borrow::Cow<'_, std::collections::HashMap<String, String>> {
+    if request_header_map_has_case_duplicates(headers) {
+        let mut canonical = headers.clone();
+        canonicalize_request_header_map(&mut canonical);
+        std::borrow::Cow::Owned(canonical)
+    } else {
+        std::borrow::Cow::Borrowed(headers)
+    }
+}
+
+fn is_singleton_request_header(lower: &str) -> bool {
+    matches!(
+        lower,
+        "authorization"
+            | "proxy-authorization"
+            | "host"
+            | "content-length"
+            | "content-type"
+            | "content-location"
+            | "content-range"
+            | "content-disposition"
+            | "date"
+            | "from"
+            | "if-modified-since"
+            | "if-unmodified-since"
+            | "if-range"
+            | "max-forwards"
+            | "origin"
+            | "range"
+            | "referer"
+            | "user-agent"
+            | "grpc-timeout"
+            | "grpc-encoding"
+            | "traceparent"
+            | "idempotency-key"
+            | "sec-websocket-key"
+            | "sec-websocket-version"
+    )
 }
 
 /// Returns `true` for headers that must NOT cross the backend-response trust
@@ -1494,7 +1803,7 @@ fn canonical_content_length_matches(value: &str, expected: u64) -> bool {
 /// that says "omitted" paired with a framing repair that says "body allowed"
 /// preserves exactly the plugin-authored length this boundary exists to remove.
 #[inline]
-fn status_forbids_response_body(status: u16) -> bool {
+pub(crate) fn status_forbids_response_body(status: u16) -> bool {
     crate::plugins::utils::synthetic_response::status_forbids_response_body(status)
 }
 
@@ -1605,7 +1914,7 @@ fn canonicalize_preserved_content_length(headers: &mut std::collections::HashMap
 /// on paths that replace or retranslate the body (native H3 gRPC streaming,
 /// gRPC-Web translation, stream inspectors, deadline replacement) use this only
 /// to drop a length that internal accounting must not read either — the
-/// gateway's own `content_length_header_value` captures happen *after* those
+/// gateway's own `preserved_response_content_length` captures happen *after* those
 /// omissions, and a stale backend length there would misclassify a truncated or
 /// retranslated body. It remains mandatory before
 /// [`ClientResponseFraming::Head`], which still preserves a valid value.
@@ -1629,10 +1938,9 @@ pub fn remove_content_length_header(headers: &mut std::collections::HashMap<Stri
 /// trimmed value is a `1*DIGIT` decimal that fits `u64`, and `None` for any
 /// status that forbids a message body.
 ///
-/// It is deliberately NOT [`content_length_header_value`], which returns the
-/// first `parse()`-able variant: that accepts a signed `+42` and silently picks
-/// one of several conflicting duplicates, neither of which may inform gateway
-/// truncation decisions.
+/// It deliberately does not return the first `parse()`-able variant: that would
+/// accept a signed `+42` and silently pick one of several conflicting
+/// duplicates, neither of which may inform gateway truncation decisions.
 pub fn preserved_response_content_length(
     headers: &std::collections::HashMap<String, String>,
     status: u16,
@@ -1658,6 +1966,29 @@ pub fn preserved_response_content_length(
         found = trimmed.parse::<u64>().ok();
     }
     found
+}
+
+/// `http::HeaderMap` counterpart to [`preserved_response_content_length`] for
+/// the deferred streaming response-header lane. Applies the exact same
+/// single-header, `is_wire_valid_content_length` predicate so comma-folded
+/// values (`"42, 42"`), signed values, or duplicates return `None` identically.
+pub(crate) fn preserved_response_content_length_from_header_map(
+    headers: &http::HeaderMap,
+    status: u16,
+) -> Option<u64> {
+    if status_forbids_response_body(status) {
+        return None;
+    }
+    let mut iter = headers.get_all(http::header::CONTENT_LENGTH).iter();
+    let first = iter.next()?;
+    if iter.next().is_some() {
+        return None;
+    }
+    let trimmed = first.to_str().ok()?.trim();
+    if !is_wire_valid_content_length(trimmed) {
+        return None;
+    }
+    trimmed.parse::<u64>().ok()
 }
 
 fn set_content_length_header(headers: &mut std::collections::HashMap<String, String>, len: u64) {
@@ -1867,7 +2198,6 @@ impl GatewayOwnedResponseHeaders {
     /// [`Self::insert`] at the point of each builder write; this name-driven
     /// form exists so external tests can reach the real name-to-variant mapping
     /// through [`crate::_test_support`] rather than restating it.
-    #[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
     pub(crate) fn from_names(names: &[String]) -> Self {
         let mut owned = Self::default();
         for name in names {
@@ -2238,6 +2568,111 @@ pub fn apply_sanitized_response_headers(
 ) -> http::response::Builder {
     sanitize_client_response_headers_for_wire(headers, framing);
     apply_response_headers(builder, headers)
+}
+
+/// Whether a backend `http::HeaderMap` can bypass the `HashMap<String, String>`
+/// round-trip on the streaming response-header passthrough path with 1:1 wire
+/// parity: every header name occurs once (or is `set-cookie`) and every value
+/// is visible ASCII/HTAB that `HeaderValue::from_str` accepts unchanged.
+#[inline]
+pub(crate) fn response_headers_passthrough_eligible(headers: &http::HeaderMap) -> bool {
+    if headers.contains_key(http::header::CONNECTION) {
+        // Any Connection nomination beyond `keep-alive` / `close` can strip
+        // fields (`content-length`, `content-type`, custom headers) during
+        // collection before the rest of the response pipeline inspects them;
+        // materialize so header lookups stay 1:1 with the standard path.
+        for value in headers.get_all(http::header::CONNECTION) {
+            let Ok(text) = value.to_str() else {
+                return false;
+            };
+            for token in text.split(',') {
+                let trimmed = token.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.eq_ignore_ascii_case("keep-alive")
+                    && !trimmed.eq_ignore_ascii_case("close")
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    let unique_or_set_cookie = headers.len() == headers.keys_len()
+        || headers.keys().all(|name| {
+            name == http::header::SET_COOKIE || headers.get_all(name).iter().nth(1).is_none()
+        });
+    unique_or_set_cookie
+        && headers.values().all(|value| {
+            value
+                .as_bytes()
+                .iter()
+                .all(|&b| b == b'\t' || (0x20..0x7f).contains(&b))
+        })
+}
+
+/// In-place `http::HeaderMap` counterpart to
+/// `strip_gateway_owned_diagnostic_response_headers` +
+/// `sanitize_client_response_headers_for_wire` for the streaming
+/// response-header passthrough path.
+///
+/// `http::HeaderMap` already normalizes header names to lowercase ASCII, so
+/// removing each closed-set name is O(1) with zero heap allocations on the
+/// common path.
+pub(crate) fn sanitize_client_response_header_map_for_wire(
+    headers: &mut http::HeaderMap,
+    framing: ClientResponseFraming,
+) {
+    if headers.contains_key(http::header::CONNECTION) {
+        let listed = parse_connection_listed_headers(headers);
+        for name in listed {
+            headers.remove(name);
+        }
+    }
+    const STATIC_STRIP_NAMES: [http::HeaderName; 11] = [
+        http::header::CONNECTION,
+        http::HeaderName::from_static("keep-alive"),
+        http::header::PROXY_AUTHENTICATE,
+        http::HeaderName::from_static("proxy-connection"),
+        http::header::TE,
+        http::header::TRAILER,
+        http::header::TRANSFER_ENCODING,
+        http::header::UPGRADE,
+        http::HeaderName::from_static("x-gateway-error"),
+        http::HeaderName::from_static("x-gateway-upstream-status"),
+        http::HeaderName::from_static("x-ferrum-diagnostic-ref"),
+    ];
+    for name in &STATIC_STRIP_NAMES {
+        headers.remove(name);
+    }
+    if headers
+        .keys()
+        .any(|name| is_internal_response_control_header(name.as_str()))
+    {
+        let internal: Vec<http::HeaderName> = headers
+            .keys()
+            .filter(|name| is_internal_response_control_header(name.as_str()))
+            .cloned()
+            .collect();
+        for name in internal {
+            headers.remove(name);
+        }
+    }
+    match framing {
+        ClientResponseFraming::ExactBody { status, len } => {
+            if status_forbids_response_body(status) {
+                headers.remove(http::header::CONTENT_LENGTH);
+            } else if let Ok(val) = http::HeaderValue::from_str(&len.to_string()) {
+                headers.insert(http::header::CONTENT_LENGTH, val);
+            }
+        }
+        ClientResponseFraming::Head { status } => {
+            if status_forbids_response_body(status) {
+                headers.remove(http::header::CONTENT_LENGTH);
+            }
+        }
+        ClientResponseFraming::Streaming | ClientResponseFraming::TrailersOnly => {
+            headers.remove(http::header::CONTENT_LENGTH);
+        }
+    }
 }
 
 /// Append a cookie to the proxy's newline-separated multi-value representation.
@@ -3350,7 +3785,7 @@ mod tests {
     fn intentional_content_length_omit_before_streaming_sanitize_drops_mixed_case() {
         // Paths that must omit length (H3 gRPC streaming, gRPC-Web translation,
         // inspectors, deadline replacement) strip first so the gateway's own
-        // `content_length_header_value` capture cannot read a stale backend
+        // `preserved_response_content_length` capture cannot read a stale backend
         // length; Streaming sanitization then drops any remaining variant.
         let mut headers = std::collections::HashMap::from([
             ("Content-Length".to_string(), "999".to_string()),

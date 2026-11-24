@@ -16,7 +16,7 @@ use ferrum_edge::secrets::credential_file::{
     HARD_MAX_CREDENTIAL_FILE_MAX_BYTES, read_bounded_credential_bytes, read_credential_file,
     read_credential_file_detached, validate_credential_file_max_bytes,
 };
-use ferrum_edge::secrets::file::{read_secret, read_secret_detached};
+use ferrum_edge::secrets::file::read_secret_detached;
 
 const LIMIT: usize = 64;
 
@@ -331,6 +331,16 @@ fn limit_validation_rejects_zero_and_above_hard_max() {
         validate_credential_file_max_bytes(DEFAULT_CREDENTIAL_FILE_MAX_BYTES).unwrap(),
         DEFAULT_CREDENTIAL_FILE_MAX_BYTES
     );
+}
+
+/// Drive the production `_FILE` reader ([`read_secret_detached`]) to completion
+/// from a synchronous test.
+fn read_secret(path: &str, key: &str) -> Result<String, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(read_secret_detached(path, key))
 }
 
 #[test]

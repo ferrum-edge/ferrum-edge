@@ -6,10 +6,12 @@
 pub mod ai_model_glob;
 pub mod ai_pii;
 pub mod ai_providers;
+pub mod ai_translation;
 pub mod ai_usage_stream;
 pub mod ambient_cloud_credentials;
 pub mod auth_attempt;
 pub mod auth_flow;
+pub mod aws_refreshing_credentials;
 pub mod aws_sigv4;
 pub mod batching_logger;
 pub mod body_transform;
@@ -21,8 +23,10 @@ pub mod claim_header_fanout;
 pub mod claim_resolver;
 pub mod content_encoding;
 pub mod dpop;
+pub mod fast_id;
 pub mod fault_delay;
 pub mod fault_roll;
+pub mod grpc_method;
 pub mod header_extract;
 pub mod http_client;
 pub mod introspection_cache;
@@ -35,9 +39,11 @@ pub mod log_sampling;
 pub mod log_schema;
 pub mod mcp_jsonrpc;
 pub mod metadata_redaction;
+pub mod oauth_client_auth;
 pub mod openai_error;
 pub mod plugin_secret_env;
 pub mod policy_digest;
+pub mod principal;
 pub mod query;
 pub mod rate_limit;
 pub mod redis_rate_limiter;
@@ -50,11 +56,12 @@ pub mod scope_role_check;
 pub mod session_cookie;
 pub mod sink_loss;
 pub mod size_limit;
+pub mod socket_endpoint;
 pub mod socket_host;
 pub mod sse;
+pub mod structured_fields;
 pub mod summary_log_budget;
 pub mod synthetic_response;
-pub mod tcp_endpoint;
 pub mod token_extract;
 pub mod transformer_gate;
 pub mod udp_endpoint;
@@ -80,12 +87,9 @@ pub use summary_log_budget::{
     JSON_ARRAY_FRAMING_BYTES, QueuedSummaryPayload, admit_http_summary, admit_stream_summary,
     assemble_json_array, assemble_ndjson, json_array_len,
 };
-// Re-exported for external unit tests; unused inside the binary target.
+// Re-exported for external unit tests.
 #[allow(unused_imports)]
-pub use log_helpers::{
-    HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT,
-    handle_http_batch_response,
-};
+pub use log_helpers::{HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT};
+pub use socket_endpoint::resolve_socket_endpoint;
 pub use socket_host::{parse_socket_host, socket_addr_lookup_input};
-pub use tcp_endpoint::resolve_tcp_endpoint;
-pub use udp_endpoint::{UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, resolve_udp_endpoint};
+pub use udp_endpoint::{UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket};

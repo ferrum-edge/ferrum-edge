@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 
 use ferrum_edge::modes::mesh::metric_tag_cel::{
-    MAX_METRIC_TAG_CEL_EXPR_LEN, MetricTagCelAttr, MetricTagCelContext, MetricTagCelExpr,
-    evaluate_metric_tag_cel, parse_metric_tag_cel_expression, sanitize_metric_tag_value,
+    MAX_METRIC_TAG_CEL_EXPR_LEN, MetricTagCelAttr, MetricTagCelExpr,
+    parse_metric_tag_cel_expression, sanitize_metric_tag_value,
     validate_metric_tag_cel_for_families,
 };
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
@@ -97,7 +97,9 @@ async fn cel_tag_override_evaluates_on_live_request_count_path() {
         http_method: "GET".into(),
         request_path: "/checkout".into(),
         response_status_code: 200,
-        metadata: mesh_identity_metadata(ctx.metadata),
+        metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+            .into_iter()
+            .collect(),
         ..TransactionSummary::default()
     };
     registry.record(&summary);
@@ -144,7 +146,9 @@ async fn cel_reads_original_attribution_not_prior_label_mutations() {
     let summary = TransactionSummary {
         http_method: "GET".into(),
         response_status_code: 200,
-        metadata: mesh_identity_metadata(ctx.metadata),
+        metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+            .into_iter()
+            .collect(),
         ..TransactionSummary::default()
     };
     registry.record(&summary);
@@ -204,7 +208,9 @@ async fn cel_cannot_read_a_label_removed_earlier_in_the_override_plan() {
     let summary = TransactionSummary {
         http_method: "GET".into(),
         response_status_code: 200,
-        metadata: mesh_identity_metadata(ctx.metadata),
+        metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+            .into_iter()
+            .collect(),
         ..TransactionSummary::default()
     };
     registry.record(&summary);
@@ -267,7 +273,9 @@ async fn missing_cel_attribute_emits_empty_label_not_invented_data() {
     let summary = TransactionSummary {
         http_method: "GET".into(),
         response_status_code: 200,
-        metadata: mesh_identity_metadata(ctx.metadata),
+        metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+            .into_iter()
+            .collect(),
         ..TransactionSummary::default()
     };
     registry.record(&summary);
@@ -278,6 +286,64 @@ async fn missing_cel_attribute_emits_empty_label_not_invented_data() {
         .expect("mesh request counter")
         .to_string();
     assert!(counter.contains(r#"source_workload="""#), "{counter}");
+}
+
+fn render_request_count_with_metadata(metadata: HashMap<String, String>) -> String {
+    let registry = MetricsRegistry::new();
+    let summary = TransactionSummary {
+        http_method: "GET".into(),
+        response_status_code: 200,
+        metadata: mesh_identity_metadata(metadata).into_iter().collect(),
+        ..TransactionSummary::default()
+    };
+    registry.record(&summary);
+    registry
+        .render_uncached()
+        .lines()
+        .find(|line| line.starts_with("ferrum_mesh_requests_total{"))
+        .expect("mesh request counter")
+        .to_string()
+}
+
+/// The `has(attr) ? attr : "literal"` form and label sanitization are pinned on
+/// the live emission path (the reload-time compact plan), not on a separate
+/// evaluator production never runs.
+#[tokio::test]
+async fn cel_ternary_fallback_and_sanitization_on_live_request_count_path() {
+    let workload_metrics = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": "REQUEST_COUNT",
+                "name": "source_workload",
+                "operation": {
+                    "type": "set_expr",
+                    "cel": r#"has(request.host) ? request.host : "unknown""#
+                }
+            }]
+        }
+    }))
+    .expect("cel override");
+    let mut ctx = RequestContext::new("10.0.0.2".into(), "GET".into(), "/".into());
+    let mut headers = HashMap::new();
+    workload_metrics.before_proxy(&mut ctx, &mut headers).await;
+    let mut metadata: HashMap<String, String> = ctx.metadata.into_iter().collect();
+    metadata.remove("mesh.metrics.cel.request_host");
+    assert!(
+        metadata.contains_key("mesh.metrics.request_count.tag_overrides"),
+        "the override plan must be stamped for the live path"
+    );
+
+    // Missing attribute selects the literal else-branch.
+    let counter = render_request_count_with_metadata(metadata.clone());
+    assert!(
+        counter.contains(r#"source_workload="unknown""#),
+        "{counter}"
+    );
+
+    // Present attribute selects the then-branch, sanitized for Prometheus.
+    metadata.insert("mesh.metrics.cel.request_host".into(), "a\nb\"c".into());
+    let counter = render_request_count_with_metadata(metadata);
+    assert!(counter.contains(r#"source_workload="a_b_c""#), "{counter}");
 }
 
 #[test]
@@ -327,7 +393,7 @@ fn rejects_unsupported_malformed_and_costly_cel() {
 }
 
 #[test]
-fn compiled_cel_forms_evaluate_with_missing_attribute_semantics() {
+fn compiled_cel_forms_parse_to_their_bounded_shapes() {
     let host = parse_metric_tag_cel_expression("request.host").expect("request.host");
     assert_eq!(
         host,
@@ -347,29 +413,6 @@ fn compiled_cel_forms_evaluate_with_missing_attribute_semantics() {
         parse_metric_tag_cel_expression(r#"has(request.host) ? request.host : "unknown""#)
             .expect("bounded ternary");
     assert!(matches!(fallback, MetricTagCelExpr::HasThenElse { .. }));
-
-    let ctx = MetricTagCelContext {
-        source_workload: "frontend",
-        source_namespace: "default",
-        source_principal: "spiffe://cluster.local/ns/default/sa/frontend",
-        source_app: "frontend",
-        source_service: "frontend",
-        destination_workload: "backend",
-        destination_namespace: "default",
-        destination_principal: "spiffe://cluster.local/ns/default/sa/backend",
-        destination_app: "backend",
-        destination_service: "backend",
-        request_protocol: "http",
-        response_flags: "-",
-        connection_security_policy: "mutual_tls",
-        request_method: Some("GET"),
-        request_host: None,
-        response_code: Some(200),
-        destination_port: Some(8080),
-    };
-    assert_eq!(evaluate_metric_tag_cel(&host, ctx), "");
-    assert_eq!(evaluate_metric_tag_cel(&port, ctx), "8080");
-    assert_eq!(evaluate_metric_tag_cel(&fallback, ctx), "unknown");
     assert_eq!(sanitize_metric_tag_value("a\nb\"c"), "a_b_c");
 }
 
@@ -449,7 +492,9 @@ async fn tag_override_reload_update_and_delete_change_emitted_labels() {
         let summary = TransactionSummary {
             http_method: "GET".into(),
             response_status_code: 200,
-            metadata: mesh_identity_metadata(ctx.metadata),
+            metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+                .into_iter()
+                .collect(),
             ..TransactionSummary::default()
         };
         registry.record(&summary);
@@ -504,7 +549,9 @@ async fn mesh_series_budget_caps_cel_cardinality_and_keeps_admitted_keys_updatin
         let summary = TransactionSummary {
             http_method: "GET".into(),
             response_status_code: 200,
-            metadata: mesh_identity_metadata(ctx.metadata),
+            metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+                .into_iter()
+                .collect(),
             ..TransactionSummary::default()
         };
         registry.record(&summary);
@@ -590,7 +637,7 @@ fn mesh_series_budget_admission_is_exact_under_concurrent_distinct_keys() {
             let summary = TransactionSummary {
                 http_method: "GET".into(),
                 response_status_code: 200,
-                metadata,
+                metadata: metadata.into_iter().collect(),
                 ..TransactionSummary::default()
             };
             barrier.wait();
@@ -635,7 +682,9 @@ async fn mesh_series_budget_releases_capacity_on_stale_eviction() {
         registry.record(&TransactionSummary {
             http_method: "GET".into(),
             response_status_code: 200,
-            metadata: mesh_identity_metadata(ctx.metadata),
+            metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+                .into_iter()
+                .collect(),
             ..TransactionSummary::default()
         });
     }
@@ -654,7 +703,9 @@ async fn mesh_series_budget_releases_capacity_on_stale_eviction() {
     registry.record(&TransactionSummary {
         http_method: "GET".into(),
         response_status_code: 200,
-        metadata: mesh_identity_metadata(ctx.metadata),
+        metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+            .into_iter()
+            .collect(),
         ..TransactionSummary::default()
     });
     assert_eq!(registry.mesh_series_live_for_test("REQUEST_COUNT"), Some(1));
@@ -805,7 +856,7 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
         std::sync::Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
     );
     stream.destination_port = Some(15001);
-    stream.metadata = Some(HashMap::from([
+    stream.metadata = Some(ferrum_edge::plugins::MetadataMap::from_iter([
         ("mesh.metrics.cel.request_host".into(), "leak".into()),
         ("mesh.metrics.cel.request_method".into(), "GET".into()),
         ("mesh.metrics.cel.destination_port".into(), "1".into()),
@@ -891,7 +942,9 @@ async fn multiple_effective_instances_union_surviving_family_cel_inputs() {
     registry.record(&TransactionSummary {
         http_method: "POST".into(),
         response_status_code: 200,
-        metadata: mesh_identity_metadata(ctx.metadata),
+        metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+            .into_iter()
+            .collect(),
         ..TransactionSummary::default()
     });
     let output = registry.render_uncached();
@@ -950,7 +1003,9 @@ async fn later_same_family_plan_replaces_cel_input_requirements() {
     registry.record(&TransactionSummary {
         http_method: "GET".into(),
         response_status_code: 200,
-        metadata: mesh_identity_metadata(ctx.metadata),
+        metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+            .into_iter()
+            .collect(),
         ..TransactionSummary::default()
     });
     let output = registry.render_uncached();
@@ -998,7 +1053,7 @@ async fn multiple_stream_instances_preserve_surviving_destination_port_need() {
     );
     stream.destination_port = Some(15001);
     stream.connection_destination_port = Some(9080);
-    stream.metadata = Some(HashMap::from([(
+    stream.metadata = Some(ferrum_edge::plugins::MetadataMap::from_iter([(
         "mesh.metrics.prometheus_metrics_observed".into(),
         "1".into(),
     )]));

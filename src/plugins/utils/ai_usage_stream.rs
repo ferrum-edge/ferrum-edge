@@ -38,7 +38,9 @@
 use base64::Engine;
 use serde_json::Value;
 
-use super::ai_providers::{AiProvider, AiTokenUsage, detect_sse_provider, extract_response_usage};
+use super::ai_providers::{
+    AiProvider, AiTokenUsage, UsageCategories, detect_sse_provider, extract_response_usage,
+};
 use super::sse::{sse_line_end, strip_sse_boms};
 
 /// Media type AWS Bedrock uses for `InvokeModelWithResponseStream` and
@@ -48,7 +50,9 @@ pub const AWS_EVENT_STREAM_MEDIA_TYPE: &str = "application/vnd.amazon.eventstrea
 /// Largest single SSE line retained while waiting for its line terminator. A
 /// longer line is discarded and the parser resynchronizes at the next line
 /// terminator, so a provider (or an attacker-controlled upstream) cannot turn
-/// one unterminated line into unbounded gateway memory.
+/// one unterminated line into unbounded gateway memory. A discarded `data`
+/// line abandons its whole event, exactly like an event whose joined `data`
+/// fields exceed this cap.
 pub const MAX_SSE_EVENT_BYTES: usize = 64 * 1024;
 
 /// Largest AWS event-stream message retained whole. Larger messages are skipped
@@ -64,6 +68,21 @@ const EVENT_STREAM_PRELUDE_LEN: usize = 12;
 const EVENT_STREAM_MESSAGE_CRC_LEN: usize = 4;
 /// Smallest structurally valid event-stream message (prelude + message CRC).
 const EVENT_STREAM_MIN_MESSAGE_LEN: usize = EVENT_STREAM_PRELUDE_LEN + EVENT_STREAM_MESSAGE_CRC_LEN;
+
+/// Longest provider-reported model name a usage observer retains or
+/// publishes. The model string is backend-controlled and flows into every
+/// transaction-log sink, so an oversized (or control-character-bearing) value
+/// is dropped rather than copied: real model identifiers are far shorter.
+pub const MAX_USAGE_MODEL_BYTES: usize = 256;
+
+/// Whether a provider-reported model name may be retained and published:
+/// non-empty, at most [`MAX_USAGE_MODEL_BYTES`] bytes, and free of control
+/// characters.
+pub fn is_publishable_model_name(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= MAX_USAGE_MODEL_BYTES
+        && !model.chars().any(char::is_control)
+}
 
 /// Big-endian `u32` from the first four bytes of `bytes` (which must be at
 /// least four long — every caller slices an already-validated prelude).
@@ -88,17 +107,26 @@ pub fn is_aws_event_stream_content_type(content_type: &str) -> bool {
 
 /// Accumulated provider usage counters.
 ///
-/// Fixed size (three `Option<u64>` plus a flag) regardless of how many events
-/// the stream carried. Later explicit values replace earlier ones; an absent
-/// field never erases a previously observed one, because supported providers
-/// report cumulative counters and split them across events (Anthropic reports
-/// input tokens on `message_start` and output tokens on `message_delta`).
+/// Bounded size (three `Option<u64>`, a flag, the provider family of the
+/// first observed usage, and at most one [`MAX_USAGE_MODEL_BYTES`] model name)
+/// regardless of how many events the stream carried. Later explicit values
+/// replace earlier ones; an absent field never erases a previously observed
+/// one, because supported providers report cumulative counters and split them
+/// across events (Anthropic reports input tokens on `message_start` and output
+/// tokens on `message_delta`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageAccumulator {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
     observed: bool,
+    /// Raw provider categories seen so far, merged field by field, so an event
+    /// that restates only some categories cannot erase the others.
+    categories: UsageCategories,
+    /// Provider family of the first usage report that was observed.
+    provider: Option<AiProvider>,
+    /// First publishable provider-reported model name.
+    model: Option<String>,
 }
 
 impl UsageAccumulator {
@@ -106,6 +134,55 @@ impl UsageAccumulator {
     /// the caller must apply its unmetered policy, not charge zero.
     pub fn observed(&self) -> bool {
         self.observed
+    }
+
+    /// The accumulated counters, observed provider, and model in the shared
+    /// [`AiTokenUsage`] shape, for observers that publish individual counters
+    /// rather than resolve one `count_mode`.
+    pub fn token_usage(&self) -> AiTokenUsage {
+        AiTokenUsage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+            model: self.model.clone(),
+            provider: self.provider,
+            categories: UsageCategories::default(),
+        }
+    }
+
+    /// Mark a usage report as observed, remembering the first reporter's
+    /// provider family.
+    fn note_observed(&mut self, provider: Option<AiProvider>) {
+        self.observed = true;
+        if self.provider.is_none() {
+            self.provider = provider;
+        }
+    }
+
+    /// Retain the first publishable model name an event carries. The carrier
+    /// follows the same event shapes the usage arms below unwrap.
+    fn capture_model(&mut self, json: &Value) {
+        if self.model.is_some() {
+            return;
+        }
+        let carrier = match json.get("type").and_then(Value::as_str) {
+            Some("response.completed" | "response.incomplete") => json.get("response"),
+            Some("message_start") => json.get("message"),
+            _ => Some(json),
+        };
+        let Some(carrier) = carrier else {
+            return;
+        };
+        let Some(model) = carrier
+            .get("model")
+            .or_else(|| carrier.get("modelVersion"))
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        if is_publishable_model_name(model) {
+            self.model = Some(model.to_string());
+        }
     }
 
     /// These counters in the shared [`AiTokenUsage`] shape.
@@ -122,6 +199,7 @@ impl UsageAccumulator {
             total_tokens: self.total_tokens,
             model: None,
             provider: None,
+            categories: UsageCategories::default(),
         }
     }
 
@@ -139,6 +217,26 @@ impl UsageAccumulator {
     }
 
     fn record(&mut self, usage: &AiTokenUsage) {
+        let has_categories = usage.categories != UsageCategories::default();
+        let folded = self.categories.absorb(usage.clone());
+        if has_categories {
+            // The merged categories hold the whole cumulative history, so
+            // their fold IS the current usage: assign it directly, `None`
+            // included. A malformed, overflowing or inconsistent update then
+            // clears a stale count instead of leaving it complete.
+            let (prompt_invalid, completion_invalid) = self.categories.invalid_sides();
+            let reported = folded.prompt_tokens.is_some()
+                || folded.completion_tokens.is_some()
+                || folded.total_tokens.is_some();
+            if reported || prompt_invalid || completion_invalid {
+                self.prompt_tokens = folded.prompt_tokens;
+                self.completion_tokens = folded.completion_tokens;
+                self.total_tokens = folded.total_tokens;
+                self.note_observed(usage.provider);
+            }
+            return;
+        }
+        let usage = &folded;
         if usage.prompt_tokens.is_none()
             && usage.completion_tokens.is_none()
             && usage.total_tokens.is_none()
@@ -161,7 +259,7 @@ impl UsageAccumulator {
                 _ => self.total_tokens,
             };
         }
-        self.observed = true;
+        self.note_observed(usage.provider);
     }
 
     /// Apply one dispatched SSE event's assembled `data` payload.
@@ -214,22 +312,28 @@ impl UsageAccumulator {
     /// and an explicitly configured `provider` must not suppress the
     /// authoritative terminal signal of the format the backend actually sent.
     pub fn apply_event_json(&mut self, json: &Value, configured: Option<AiProvider>) {
+        self.capture_model(json);
         // OpenAI Responses streaming (`response.*` events). The authoritative
-        // counters ride the TERMINAL `response.completed` event and live under
-        // `response.usage`, not root `usage`, so without this arm a completed
-        // Responses stream reported no usage at all and the budget kept the
-        // pre-request estimate (`GHSA-pqjf-4jcj-34rp`). Every other
-        // `response.*` event — `response.created`, `response.in_progress`,
-        // `response.incomplete`, `response.failed`, the per-item deltas — is a
-        // progress snapshot, never a usage authority, so the whole family
-        // returns here rather than falling through to the generic arms below.
+        // counters ride the TERMINAL event and live under `response.usage`, not
+        // root `usage`, so without this arm a completed Responses stream
+        // reported no usage at all and the budget kept the pre-request estimate
+        // (`GHSA-pqjf-4jcj-34rp`). Two events are terminal and usage-bearing:
+        // `response.completed` and `response.incomplete` — the latter is a
+        // finished response that stopped early (for example at
+        // `max_output_tokens`) and still bills the tokens it reports
+        // (`ai_rate_limiter-SOL-4`). Every other `response.*` event —
+        // `response.created`, `response.in_progress`, `response.failed`, the
+        // per-item deltas — is a progress snapshot, never a usage authority, so
+        // the whole family returns here rather than falling through to the
+        // generic arms below. A terminal whose usage is absent or malformed
+        // records nothing usable and stays resolved by the unmetered policy.
         // Mirrors the sibling `ai_token_metrics` terminal-event handling, and
         // matches no supported provider's own event names (Anthropic uses
         // `message_*`/`content_block_*`, Cohere v2 `message-*`).
         if let Some(kind) = json.get("type").and_then(Value::as_str)
             && kind.starts_with("response.")
         {
-            if kind == "response.completed"
+            if matches!(kind, "response.completed" | "response.incomplete")
                 && let Some(response) = json.get("response")
             {
                 let provider = detect_sse_provider(response)
@@ -256,37 +360,42 @@ impl UsageAccumulator {
             // policy, which would otherwise release the reservation).
             let provider = detect_sse_provider(json)
                 .or(configured)
+                .or_else(|| self.categories.family_provider())
                 .unwrap_or(AiProvider::OpenAi);
+            self.record(&extract_response_usage(json, provider));
+        }
+        // A present, non-null `usage` that is not an object is a malformed
+        // report, not an omission: route it to invalidation under the
+        // detected, configured, or previously identified provider so a stale
+        // complete count cannot survive it.
+        else if json
+            .get("usage")
+            .is_some_and(|usage| !usage.is_null() && !usage.is_object())
+            && let Some(provider) = detect_sse_provider(json)
+                .or(configured)
+                .or_else(|| self.categories.family_provider())
+        {
             self.record(&extract_response_usage(json, provider));
         }
 
         match json.get("type").and_then(Value::as_str) {
-            // Anthropic streams input tokens once, up front.
+            // Anthropic streams its input (with prompt-cache writes and reads
+            // reported beside `input_tokens`) up front, and cumulative output —
+            // sometimes restating cumulative input categories — on the terminal
+            // delta. Categories merge field by field in `record`.
             Some("message_start") => {
-                if let Some(prompt) = json
-                    .get("message")
-                    .and_then(|message| message.get("usage"))
-                    .and_then(|usage| usage.get("input_tokens"))
-                    .and_then(Value::as_u64)
-                {
-                    self.record(&AiTokenUsage {
-                        prompt_tokens: Some(prompt),
-                        ..Default::default()
-                    });
+                // Only the input side is authoritative here: `output_tokens`
+                // on `message_start` is an initial placeholder (commonly 1),
+                // and the cumulative output arrives on `message_delta`.
+                // Recording it would make an interrupted stream look complete
+                // at almost no output and release the reservation.
+                if let Some(message) = json.get("message") {
+                    let carrier = super::ai_providers::anthropic_message_start_usage(message);
+                    self.record(&extract_response_usage(&carrier, AiProvider::Anthropic));
                 }
             }
-            // ... and the cumulative output tokens on the terminal delta.
             Some("message_delta") => {
-                if let Some(completion) = json
-                    .get("usage")
-                    .and_then(|usage| usage.get("output_tokens"))
-                    .and_then(Value::as_u64)
-                {
-                    self.record(&AiTokenUsage {
-                        completion_tokens: Some(completion),
-                        ..Default::default()
-                    });
-                }
+                self.record(&extract_response_usage(json, AiProvider::Anthropic));
             }
             // Cohere v2 nests counts under `delta.usage.tokens.*`.
             Some("message-end") => {
@@ -312,58 +421,118 @@ impl UsageAccumulator {
         }
 
         // Bedrock `InvokeModelWithResponseStream` terminal chunk metrics.
-        if json.get("amazon-bedrock-invocationMetrics").is_some() {
-            self.record(&extract_response_usage(json, AiProvider::Bedrock));
+        // Read independently of any native `usage` in the same event, which
+        // the arms above already recorded.
+        if let Some(metrics) = super::ai_providers::extract_bedrock_invocation_metrics(json) {
+            self.record(&metrics);
         }
     }
 }
 
-/// Bounded assembly buffer for one SSE event's `data` fields.
+/// Bounded assembly state for one SSE event's `data` fields.
 ///
 /// Retention is capped by [`MAX_SSE_EVENT_BYTES`] across the WHOLE event, not
 /// just per line: without that, a provider could split unbounded bytes over
 /// many short, individually-legal `data` fields and grow this buffer without
-/// limit. An event that exceeds the cap is abandoned and the parser resumes at
-/// the next dispatch, exactly as an oversized single line already does — a
-/// usage event is never 64 KiB, so no real charge is lost.
+/// limit. An event whose `data` exceeds the cap, whether across fields or in
+/// one oversized `data` line, is abandoned and the parser resumes at the next
+/// dispatch. Dropping only the oversized field would dispatch the event's
+/// other fields as if they were the whole payload, which is not what a
+/// conforming parser reassembles. A usage event is never 64 KiB, so no real
+/// charge is lost.
 #[derive(Debug, Default)]
-struct SseEventBuffer {
-    data: String,
-    /// A `data` field was seen for this event. An explicitly empty one still
-    /// counts, so `data:\ndata:{...}` keeps its leading newline.
-    has_data: bool,
-    /// The cap was exceeded; drop the remainder of this event.
-    overflowed: bool,
+enum SseEventBuffer {
+    /// No `data` field since the last dispatch.
+    #[default]
+    Empty,
+    /// At least one `data` field, joined with `\n`. An explicitly empty field
+    /// still counts, so `data:\ndata:{...}` keeps its leading newline.
+    Assembling(String),
+    /// The cap was exceeded; the rest of this event is discarded and its
+    /// dispatch yields nothing.
+    Abandoned,
+}
+
+/// Input to [`SseEventBuffer::step`].
+#[derive(Debug, Clone, Copy)]
+enum SseEventStep<'a> {
+    /// A complete `data` field value under the line cap.
+    Data(&'a str),
+    /// A `data` line exceeded the line cap and was dropped unparsed.
+    OversizedData,
+    /// A blank line, or end of stream.
+    Dispatch,
 }
 
 impl SseEventBuffer {
-    fn push_data(&mut self, value: &str) {
-        if self.overflowed {
-            return;
-        }
-        let separator = usize::from(self.has_data);
-        if self.data.len() + separator + value.len() > MAX_SSE_EVENT_BYTES {
-            self.overflowed = true;
-            self.data = String::new();
-            self.has_data = true;
-            return;
-        }
-        if self.has_data {
-            self.data.push('\n');
-        }
-        self.data.push_str(value);
-        self.has_data = true;
+    /// The single transition function. Returns the payload to hand to the
+    /// accumulator, which only a `Dispatch` out of `Assembling` produces.
+    fn step(&mut self, step: SseEventStep<'_>) -> Option<String> {
+        let (next, dispatched) = match (std::mem::take(self), step) {
+            (Self::Empty, SseEventStep::Data(value)) => {
+                if value.len() > MAX_SSE_EVENT_BYTES {
+                    (Self::Abandoned, None)
+                } else {
+                    (Self::Assembling(value.to_owned()), None)
+                }
+            }
+            (Self::Assembling(mut data), SseEventStep::Data(value)) => {
+                if data.len() + 1 + value.len() > MAX_SSE_EVENT_BYTES {
+                    (Self::Abandoned, None)
+                } else {
+                    data.push('\n');
+                    data.push_str(value);
+                    (Self::Assembling(data), None)
+                }
+            }
+            (Self::Empty | Self::Assembling(_) | Self::Abandoned, SseEventStep::OversizedData)
+            | (Self::Abandoned, SseEventStep::Data(_)) => (Self::Abandoned, None),
+            (Self::Assembling(data), SseEventStep::Dispatch) => (Self::Empty, Some(data)),
+            (Self::Empty | Self::Abandoned, SseEventStep::Dispatch) => (Self::Empty, None),
+        };
+        *self = next;
+        dispatched
     }
 
-    /// Reset and return the dispatched payload, or `None` when this event
-    /// carried no usable `data` (no field at all, or an abandoned oversized
-    /// one).
-    fn take(&mut self) -> Option<String> {
-        let overflowed = std::mem::take(&mut self.overflowed);
-        let has_data = std::mem::take(&mut self.has_data);
-        let data = std::mem::take(&mut self.data);
-        (has_data && !overflowed).then_some(data)
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Assembling(data) => data.len(),
+            Self::Empty | Self::Abandoned => 0,
+        }
     }
+}
+
+/// Whether a line made of `head` followed by `tail` is an SSE `data` field.
+///
+/// The check uses only the field name, read across both slices by logical
+/// index, so an oversized line is classified without being joined, copied, or
+/// retained. When `at_stream_start` is set, every leading U+FEFF is skipped
+/// first. That is the shared policy [`strip_sse_boms`] applies to the first
+/// line, so a BOM-prefixed first `data` field is still recognized when a BOM
+/// or the name is split between the slices.
+fn sse_line_is_data_field(head: &[u8], tail: &[u8], at_stream_start: bool) -> bool {
+    const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+    const DATA_FIELD: &[u8] = b"data:";
+    let byte_at = |index: usize| -> Option<u8> {
+        match index.checked_sub(head.len()) {
+            None => head.get(index).copied(),
+            Some(tail_index) => tail.get(tail_index).copied(),
+        }
+    };
+    let starts_with_at = |offset: usize, prefix: &[u8]| {
+        prefix
+            .iter()
+            .enumerate()
+            .all(|(index, &byte)| byte_at(offset.saturating_add(index)) == Some(byte))
+    };
+    let mut offset = 0usize;
+    if at_stream_start {
+        // Each skip consumes three present bytes, so this ends within the line.
+        while starts_with_at(offset, UTF8_BOM) {
+            offset = offset.saturating_add(UTF8_BOM.len());
+        }
+    }
+    starts_with_at(offset, DATA_FIELD)
 }
 
 /// Wire framing an [`UsageStreamExtractor`] should decode.
@@ -429,9 +598,8 @@ impl UsageStreamExtractor {
 
     /// Bytes currently retained by the parser. Test/diagnostic accessor for the
     /// bounded-retention guarantee.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn retained_bytes(&self) -> usize {
-        self.carry.len() + self.event.data.len()
+        self.carry.len() + self.event.retained_bytes()
     }
 
     /// Feed the next chunk of decoded response body bytes.
@@ -496,6 +664,8 @@ impl UsageStreamExtractor {
             // would allocate their combined size, bypassing the bounded-parser
             // guarantee even though neither survives after this iteration.
             if self.carry.len().saturating_add(line.len()) > MAX_SSE_EVENT_BYTES {
+                let is_data_field = sse_line_is_data_field(&self.carry, line, self.at_stream_start);
+                self.discard_oversized_line(is_data_field);
                 self.carry.clear();
                 continue;
             }
@@ -514,12 +684,27 @@ impl UsageStreamExtractor {
         }
         if self.carry.len().saturating_add(rest.len()) > MAX_SSE_EVENT_BYTES {
             // Drop the oversized line entirely and resynchronize; a usage event
-            // is never 64 KiB, so this cannot silently lose a real charge.
+            // is never 64 KiB, so this cannot silently lose a real charge. An
+            // oversized `data` line abandons its whole event.
+            let is_data_field = sse_line_is_data_field(&self.carry, rest, self.at_stream_start);
+            self.discard_oversized_line(is_data_field);
             self.carry = Vec::new();
             self.resyncing = true;
             return;
         }
         self.carry.extend_from_slice(rest);
+    }
+
+    /// Discard one line that exceeded the line cap without parsing it.
+    ///
+    /// A `data` field abandons its whole event. The line still consumes the
+    /// stream start, so leading-BOM stripping never moves on to the line after
+    /// it.
+    fn discard_oversized_line(&mut self, is_data_field: bool) {
+        self.at_stream_start = false;
+        if is_data_field {
+            self.event.step(SseEventStep::OversizedData);
+        }
     }
 
     /// Feed one complete SSE line into event assembly.
@@ -562,12 +747,12 @@ impl UsageStreamExtractor {
         if field != "data" {
             return;
         }
-        self.event.push_data(value);
+        self.event.step(SseEventStep::Data(value));
     }
 
     /// Hand the assembled event payload to the accumulator and reset.
     fn dispatch_sse_event(&mut self) {
-        let Some(data) = self.event.take() else {
+        let Some(data) = self.event.step(SseEventStep::Dispatch) else {
             return;
         };
         self.usage.apply_sse_data(&data, self.configured_provider);

@@ -161,9 +161,10 @@ Severity targets and the private disclosure process are in
 security advisories.
 
 Advisories in the dependency tree are handled separately and continuously: a
-blocking `cargo deny` gate runs on every pull request and a weekly re-check runs
+blocking `cargo deny` gate runs when CI selects the full dependency-audit lane
+for dependency or supply-chain governance changes, and a weekly re-check runs
 against the current advisory database, including the vendored, patched upstream
-crates. See [dependency-policy.md](dependency-policy.md).
+crates. See [dependency-policy.md](dependency-policy.md#1-blocking-dependency-gate-denytoml--ci).
 
 ## Upgrading
 

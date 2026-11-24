@@ -106,6 +106,7 @@ fn empty_proxy_metrics_serializes_mode_skeletons_for_cp_and_node_agent() {
             value["tcp_connection_throttle"]["replica_limit_behavior"],
             "configured_limit_per_replica"
         );
+        assert_eq!(value["tcp_connection_throttle"]["active_connections"], 0);
     }
 }
 
@@ -125,6 +126,30 @@ fn build_admin_metrics_cp_without_proxy_state_reports_db_availability() {
 
     let offline = build_admin_metrics("cp", Some(false), None, None);
     assert_eq!(offline.gateway.config_source_status, "offline");
+}
+
+/// Issue #7215: CP has no proxy state, yet `docs/admin_metrics.md` says its
+/// payload carries `database_polling`. Build it through the runtime builder,
+/// not the fixture, so the no-proxy-state branch is what is exercised.
+#[test]
+fn build_admin_metrics_cp_without_proxy_state_keeps_database_polling() {
+    let polling = contract_fixtures()
+        .into_iter()
+        .find(|fixture| fixture.gateway.mode == "cp")
+        .and_then(|fixture| fixture.database_polling)
+        .expect("cp fixture carries a database_polling sample");
+
+    let cp = build_admin_metrics("cp", Some(true), None, Some(polling.clone()));
+    assert_eq!(cp.database_polling.as_ref(), Some(&polling));
+    let value = serde_json::to_value(&cp).expect("serialize");
+    assert!(value.get("database_polling").is_some());
+
+    // Modes without a DB-backed config source never report it, even if a
+    // snapshot is passed in.
+    for mode in ["file", "dp", "mesh", "node_agent"] {
+        let built = build_admin_metrics(mode, None, None, Some(polling.clone()));
+        assert!(built.database_polling.is_none(), "{mode}");
+    }
 }
 
 #[test]

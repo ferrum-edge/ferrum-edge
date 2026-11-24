@@ -48,6 +48,3 @@ controlPlane:
 
 injector:
   enabled: false
-
-ca:
-  enabled: false

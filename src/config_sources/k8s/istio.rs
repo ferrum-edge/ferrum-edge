@@ -25,13 +25,13 @@ use crate::modes::mesh::metric_tag_cel::{
 
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions,
-    MeshRouteDispatchDestination, MeshRouteDispatchPolicy, RouteBackend, RouteProxySpec,
-    SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
-    is_vs_authority_header, mesh_route_dispatch_can_emit_rule,
+    MeshRouteDispatchDestination, MeshRouteDispatchPolicy, ProxyUpsert, RouteBackend,
+    RouteProxySpec, SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
+    invalid_resource, is_vs_authority_header, mesh_route_dispatch_can_emit_rule,
     mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_from_rules,
-    mesh_route_dispatch_rules_for_proxy, optional_port_field, optional_target_weight_field,
-    parse_istio_duration_ms, port_from_u64, proxy_for_route, request_termination_plugin_for_proxy,
-    resolve_workload_entry_service_attachment, resource_id,
+    mesh_route_dispatch_rules_for_proxy, namespaced_resource_key, optional_port_field,
+    optional_target_weight_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
+    request_termination_plugin_for_proxy, resolve_workload_entry_service_attachment, resource_id,
     route_backends_require_node_waypoint_authz, route_local_fault_delay_for_rule,
     route_local_fault_value_for_rule, route_request_transformer_plugin_for_proxy,
     route_response_transformer_plugin_for_proxy, sidecar_selector_from_istio, string_array,
@@ -86,14 +86,73 @@ pub(super) fn translate(
         }
         "VirtualService" => {
             let (proxies, upstreams, plugins) = virtual_service_routes(object, acc)?;
+            // Resolved before anything is upserted so an invalid `exportTo`
+            // refuses the VirtualService atomically.
+            let mesh_http_export_to = virtual_service_mesh_http_route_export_to(object)?;
+            claim_virtual_service_ids(acc, object, &proxies, &upstreams)?;
             for upstream in upstreams {
                 acc.upsert_upstream(upstream);
             }
+            // Proxy-scoped plugins follow their proxy (GHSA-qw5p-g8jx-pmv8).
+            // Plugin ids are derived from the proxy id, so pushing the plugins
+            // of a proxy `upsert_proxy` refused would publish two plugin
+            // configs with one `(namespace, id)`, and the publish-time
+            // duplicate check would then reject every later Kubernetes
+            // reconcile cluster-wide. A replaced proxy's previous plugins are
+            // withdrawn for the same reason before this VirtualService's
+            // plugins are added. (A second VirtualService deriving an owned id
+            // never gets here: `claim_virtual_service_ids` refuses it.)
+            let mut accepted_proxy_keys: Vec<(String, String)> = Vec::new();
+            let mut refused_proxy_keys: Vec<(String, String)> = Vec::new();
             for proxy in proxies {
-                acc.upsert_proxy(proxy, SourceKind::Istio);
+                let key = (proxy.namespace.clone(), proxy.id.clone());
+                match acc.upsert_proxy(proxy, SourceKind::Istio) {
+                    ProxyUpsert::Inserted => accepted_proxy_keys.push(key),
+                    ProxyUpsert::Replaced => {
+                        acc.config.plugin_configs.retain(|plugin| {
+                            !(plugin.namespace == key.0
+                                && plugin.proxy_id.as_deref() == Some(key.1.as_str()))
+                        });
+                        accepted_proxy_keys.push(key);
+                    }
+                    ProxyUpsert::Ignored => refused_proxy_keys.push(key),
+                }
             }
             for plugin in plugins {
-                acc.config.plugin_configs.push(plugin);
+                let follows_refused_proxy = plugin.proxy_id.as_deref().is_some_and(|proxy_id| {
+                    let is_key = |(namespace, id): &(String, String)| {
+                        *namespace == plugin.namespace && id == proxy_id
+                    };
+                    refused_proxy_keys.iter().any(is_key) && !accepted_proxy_keys.iter().any(is_key)
+                });
+                if !follows_refused_proxy {
+                    acc.config.plugin_configs.push(plugin);
+                }
+            }
+            // Issue #7233: record which of the accepted HTTP route proxies
+            // apply to mesh data planes, and to which namespaces, so the slice
+            // builder can carry them to a NodeWaypoint.
+            if let Some(export_to) = mesh_http_export_to {
+                let proxy_ids: Vec<String> = accepted_proxy_keys
+                    .into_iter()
+                    .filter(|(namespace, id)| {
+                        *namespace == object.metadata.namespace
+                            && crate::modes::mesh::config::is_virtual_service_http_route_proxy_id(
+                                id,
+                            )
+                    })
+                    .map(|(_, id)| id)
+                    .collect();
+                if !proxy_ids.is_empty() {
+                    acc.mesh.virtual_service_http_routes.push(
+                        crate::modes::mesh::config::MeshVirtualServiceHttpRoutes {
+                            name: object.metadata.name.clone(),
+                            namespace: object.metadata.namespace.clone(),
+                            export_to,
+                            proxy_ids,
+                        },
+                    );
+                }
             }
             Ok(true)
         }
@@ -109,7 +168,7 @@ pub(super) fn translate(
             Ok(true)
         }
         "Sidecar" => {
-            let sidecar = sidecar(acc, object)?;
+            let sidecar = sidecar(object)?;
             acc.mesh.sidecars.push(sidecar);
             Ok(true)
         }
@@ -126,6 +185,58 @@ pub(super) fn translate(
         }
         _ => Ok(false),
     }
+}
+
+/// Bind every route proxy and route upstream id `virtual_service` derived to
+/// that object (GHSA-qw5p-g8jx-pmv8).
+///
+/// `resource_id` folds `.` into `-` and joins name and route suffix with `-`,
+/// so two VirtualServices in one namespace can derive one id (`my.app` /
+/// `my-app`, or `a` `http[1]` match 0 / `a-1` `http[0]`). The object
+/// translated first (snapshot order) keeps the id; a later one is refused as a
+/// whole with `invalid_resource`, so it reports `FerrumAccepted=False` instead
+/// of having its route silently shadowed, or its upstream overwrite the
+/// owner's backends, while reporting accepted. The error is returned before
+/// anything is upserted, and the reconciler retranslates without the refused
+/// object, so the refusal is atomic.
+fn claim_virtual_service_ids(
+    acc: &mut K8sAccumulator,
+    virtual_service: &K8sObject,
+    proxies: &[Proxy],
+    upstreams: &[crate::config::types::Upstream],
+) -> Result<(), K8sTranslateError> {
+    for proxy in proxies {
+        let Some(key) = namespaced_resource_key(&proxy.namespace, &proxy.id) else {
+            continue;
+        };
+        if let Some(owner) = acc.claim_istio_virtual_service_proxy(&key, virtual_service) {
+            return Err(invalid_resource(
+                virtual_service,
+                format!(
+                    "VirtualService route proxy id {:?} is already derived by VirtualService \
+                     {:?} in the same namespace; rename one of the two VirtualServices",
+                    proxy.id, owner.name
+                ),
+            ));
+        }
+    }
+    for upstream in upstreams {
+        let Some(key) = namespaced_resource_key(&upstream.namespace, &upstream.id) else {
+            continue;
+        };
+        if let Some(owner) = acc.claim_istio_virtual_service_upstream(&key, virtual_service) {
+            return Err(invalid_resource(
+                virtual_service,
+                format!(
+                    "VirtualService route upstream id {:?} is already derived by \
+                     VirtualService {:?} in the same namespace; rename one of the two \
+                     VirtualServices",
+                    upstream.id, owner.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn authorization_policy(
@@ -685,6 +796,15 @@ fn allow_nothing_rule() -> MeshRule {
     }
 }
 
+/// A DENY rule with no source, operation, or condition: it matches every
+/// request and connection, like Istio's `rules: [{}]`.
+fn deny_everything_rule() -> MeshRule {
+    MeshRule {
+        action: PolicyAction::Deny,
+        ..MeshRule::default()
+    }
+}
+
 fn mesh_rules(
     object: &K8sObject,
     rule: &Value,
@@ -1115,7 +1235,9 @@ fn peer_authentication(
     object: &K8sObject,
 ) -> Result<PeerAuthentication, K8sTranslateError> {
     let mtls = object.spec.get("mtls").unwrap_or(&Value::Null);
-    let effective_mtls_mode = mtls_mode(string_field(mtls, "mode").unwrap_or("PERMISSIVE"))
+    // An omitted `mtls` block or `mtls.mode` decodes to Istio `UNSET`, which
+    // inherits from the next-higher tier; it is NOT a concrete `PERMISSIVE`.
+    let effective_mtls_mode = mtls_mode(string_field(mtls, "mode").unwrap_or("UNSET"))
         .map_err(|message| invalid_resource(object, format!("mtls.mode {message}")))?;
     let mut port_overrides = HashMap::new();
     for (port, value) in object
@@ -1127,7 +1249,7 @@ fn peer_authentication(
     {
         let port = port_from_string(object, port, "portLevelMtls")?;
         let mode =
-            mtls_mode(string_field(value, "mode").unwrap_or("PERMISSIVE")).map_err(|message| {
+            mtls_mode(string_field(value, "mode").unwrap_or("UNSET")).map_err(|message| {
                 invalid_resource(object, format!("portLevelMtls[\"{port}\"].mode {message}"))
             })?;
         port_overrides.insert(port, mode);
@@ -1135,18 +1257,11 @@ fn peer_authentication(
 
     let selector = object.spec.get("selector");
     let scope = istio_policy_scope(options, object, selector);
-    let selector = match &scope {
-        PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
-        PolicyScope::MeshWide | PolicyScope::Namespace { .. } | PolicyScope::TargetRefs { .. } => {
-            None
-        }
-    };
 
     Ok(PeerAuthentication {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
-        scope: Some(scope),
-        selector,
+        scope,
         mtls_mode: effective_mtls_mode,
         port_overrides,
     })
@@ -1176,25 +1291,97 @@ fn peer_authentication(
 ///     Classification is delegated to the shared, fail-closed
 ///     [`classify_sidecar_outbound_traffic_policy`] so the status writer's
 ///     `deferred_fields` report can never disagree with what is enforced.
-fn sidecar(
-    _acc: &mut K8sAccumulator,
-    object: &K8sObject,
-) -> Result<MeshSidecar, K8sTranslateError> {
-    let workload_selector = match object.spec.get("workloadSelector") {
-        Some(selector_value) => {
-            let labels = sidecar_selector_from_istio(Some(selector_value));
-            if labels.is_empty() {
-                None
-            } else {
-                Some(WorkloadSelector {
-                    labels,
-                    namespace: Some(object.metadata.namespace.clone()),
-                })
-            }
-        }
-        None => None,
-    };
+fn sidecar(object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
+    let workload_selector = sidecar_workload_selector(object);
+    let (egress_inherits_defaults, egress) = sidecar_egress(object)?;
+    let (ingress_declared, ingress) = sidecar_ingress(object)?;
 
+    // `spec.outboundTrafficPolicy` (issue #3262). A present-but-unrepresentable
+    // block resolves to REGISTRY_ONLY rather than rejecting the resource — see
+    // `classify_sidecar_outbound_traffic_policy` for why dropping the Sidecar
+    // would WIDEN egress instead of failing closed.
+    let outbound_policy = classify_sidecar_outbound_traffic_policy(&object.spec);
+    if let Some(reason) = outbound_policy.deferred {
+        report_sidecar_outbound_policy_degradation(
+            &object.metadata.namespace,
+            &object.metadata.name,
+            reason,
+        );
+    }
+
+    Ok(MeshSidecar {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        workload_selector,
+        egress_inherits_defaults,
+        egress,
+        ingress_declared,
+        ingress,
+        outbound_traffic_policy: outbound_policy.policy,
+    })
+}
+
+/// Fail-closed stand-in for a Sidecar that translation refused
+/// (GHSA-2r85-85hh-23mw).
+///
+/// Dropping a refused Sidecar WIDENS the workloads it selects: their egress
+/// scope and `REGISTRY_ONLY` registry fall back to the namespace or mesh
+/// default, and a declared `ingress[]` falls back to the default inbound
+/// listeners. So the resource keeps its place in Sidecar selection (same name,
+/// namespace and `workloadSelector`) and every block that could not be
+/// translated takes its most restrictive form:
+///
+/// * a declared `egress` that does not translate becomes an explicit empty
+///   `egress: []` (block all) with `outboundTrafficPolicy` `REGISTRY_ONLY`;
+/// * a declared `ingress` that does not translate becomes an explicit empty
+///   `ingress: []`, which replaces the default inbound listeners with none.
+///
+/// A block that does translate, or that was omitted, is published exactly as
+/// an accepted Sidecar would publish it. The skip map still carries the
+/// translation error, so status keeps reporting the resource as rejected.
+pub(crate) fn refused_sidecar(object: &K8sObject) -> MeshSidecar {
+    let workload_selector = sidecar_workload_selector(object);
+    let (egress_inherits_defaults, egress, outbound_traffic_policy) = match sidecar_egress(object) {
+        Ok((inherits, egress)) => (
+            inherits,
+            egress,
+            classify_sidecar_outbound_traffic_policy(&object.spec).policy,
+        ),
+        Err(_) => (
+            false,
+            Vec::new(),
+            Some(crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly),
+        ),
+    };
+    let (ingress_declared, ingress) =
+        sidecar_ingress(object).unwrap_or_else(|_| (true, Vec::new()));
+    MeshSidecar {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        workload_selector,
+        egress_inherits_defaults,
+        egress,
+        ingress_declared,
+        ingress,
+        outbound_traffic_policy,
+    }
+}
+
+fn sidecar_workload_selector(object: &K8sObject) -> Option<WorkloadSelector> {
+    let selector_value = object.spec.get("workloadSelector")?;
+    let labels = sidecar_selector_from_istio(Some(selector_value));
+    if labels.is_empty() {
+        None
+    } else {
+        Some(WorkloadSelector {
+            labels,
+            namespace: Some(object.metadata.namespace.clone()),
+        })
+    }
+}
+
+/// Translate `spec.egress[]`, returning `(egress_inherits_defaults, egress)`.
+fn sidecar_egress(object: &K8sObject) -> Result<(bool, Vec<MeshSidecarEgress>), K8sTranslateError> {
     let mut egress = Vec::new();
     let mut egress_inherits_defaults = false;
     match object.spec.get("egress") {
@@ -1250,7 +1437,13 @@ fn sidecar(
             }
         }
     }
+    Ok((egress_inherits_defaults, egress))
+}
 
+/// Translate `spec.ingress[]`, returning `(ingress_declared, ingress)`.
+fn sidecar_ingress(
+    object: &K8sObject,
+) -> Result<(bool, Vec<MeshSidecarIngress>), K8sTranslateError> {
     // `spec.ingress[]` — custom inbound listeners. Each entry MUST declare a
     // `port.number`; `defaultEndpoint` and everything else are optional. We
     // translate the entry shape here (parse + validate the required fields) and
@@ -1322,30 +1515,7 @@ fn sidecar(
             });
         }
     }
-
-    // `spec.outboundTrafficPolicy` (issue #3262). A present-but-unrepresentable
-    // block resolves to REGISTRY_ONLY rather than rejecting the resource — see
-    // `classify_sidecar_outbound_traffic_policy` for why dropping the Sidecar
-    // would WIDEN egress instead of failing closed.
-    let outbound_policy = classify_sidecar_outbound_traffic_policy(&object.spec);
-    if let Some(reason) = outbound_policy.deferred {
-        report_sidecar_outbound_policy_degradation(
-            &object.metadata.namespace,
-            &object.metadata.name,
-            reason,
-        );
-    }
-
-    Ok(MeshSidecar {
-        name: object.metadata.name.clone(),
-        namespace: object.metadata.namespace.clone(),
-        workload_selector,
-        egress_inherits_defaults,
-        egress,
-        ingress_declared,
-        ingress,
-        outbound_traffic_policy: outbound_policy.policy,
-    })
+    Ok((ingress_declared, ingress))
 }
 
 fn request_authentication(
@@ -1365,11 +1535,122 @@ fn request_authentication(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(MeshRequestAuthentication {
+        refused: false,
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
         scope,
         jwt_rules,
     })
+}
+
+/// Fail-closed stand-in for a RequestAuthentication that translation refused
+/// (issue #6656).
+///
+/// A refused resource used to be dropped from the published configuration,
+/// which removes JWT validation, token stripping and gateway-owned claim
+/// headers from every workload it selects: a forged or invalid token, or a
+/// client-supplied claim header, then reached the backend. Ferrum cannot
+/// enforce the resource faithfully, so it is published with no JWT rules and
+/// `refused: true`; the data plane refuses every HTTP request to the selected
+/// workloads until the resource is fixed.
+///
+/// The scope is the resource's own selector scope. A `targetRef(s)` attachment
+/// is not supported for RequestAuthentication, so its target cannot be
+/// resolved; the refusal then covers the namespace (mesh-wide in the Istio
+/// root namespace), the narrowest scope that still contains the target.
+pub(crate) fn refused_request_authentication(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> MeshRequestAuthentication {
+    MeshRequestAuthentication {
+        refused: true,
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        scope: refused_policy_scope(options, object),
+        jwt_rules: Vec::new(),
+    }
+}
+
+/// Scope a refused security resource's fail-closed marker.
+///
+/// The resource's own `selector` scope when it declares no `targetRef(s)`.
+/// A refused resource's attachment cannot be trusted to resolve (it may be the
+/// reason it was refused), so a `targetRef(s)` resource covers its namespace,
+/// or the mesh in the Istio root namespace: the narrowest scope that still
+/// contains every target it could name. A selector that does not parse also
+/// falls back to that scope.
+fn refused_policy_scope(options: &K8sTranslationOptions, object: &K8sObject) -> PolicyScope {
+    let selector = if has_istio_target_refs(&object.spec) {
+        None
+    } else {
+        object.spec.get("selector")
+    };
+    istio_policy_scope(options, object, selector)
+}
+
+/// Fail-closed stand-in for an AuthorizationPolicy that translation refused
+/// (GHSA-2r85-85hh-23mw).
+///
+/// A refused policy used to be dropped from the published configuration, which
+/// removes enforcement from every workload it selects: a refused DENY stops
+/// denying, a refused CUSTOM stops delegating to its external authorizer, and a
+/// refused ALLOW that was a workload's only ALLOW removes the implicit-deny
+/// floor, so every caller is allowed. Ferrum cannot enforce the resource
+/// faithfully, so it is published under its own name and scope
+/// ([`refused_policy_scope`]) with one rule that never grants more than the
+/// resource did:
+///
+/// * `ALLOW` (or an omitted action): Istio's allow-nothing rule. It keeps the
+///   implicit-deny floor and grants nothing, so the workload accepts only what
+///   its other ALLOW policies grant.
+/// * `DENY`, `CUSTOM`, or an action Ferrum cannot read: a DENY rule with no
+///   conditions, which denies every request and connection to the scope. For
+///   CUSTOM this matches the runtime rule that a delegation which cannot be
+///   executed denies.
+/// * `AUDIT` changes no decision, so it publishes nothing (`None`).
+///
+/// The skip map still carries the translation error, so status keeps reporting
+/// the resource as rejected.
+pub(crate) fn refused_authorization_policy(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> Option<MeshPolicy> {
+    let rule = match object.spec.get("action") {
+        None => allow_nothing_rule(),
+        Some(action) => match action.as_str() {
+            Some("ALLOW") => allow_nothing_rule(),
+            Some("AUDIT") => return None,
+            _ => deny_everything_rule(),
+        },
+    };
+    Some(MeshPolicy {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        scope: refused_policy_scope(options, object),
+        rules: vec![rule],
+    })
+}
+
+/// Fail-closed stand-in for a PeerAuthentication that translation refused
+/// (GHSA-2r85-85hh-23mw).
+///
+/// Dropping a refused PeerAuthentication lets the workloads it selects fall
+/// back to the next tier's mode (or Ferrum's `PERMISSIVE` default), so a
+/// refused workload-level `STRICT` would admit plaintext. The resource is
+/// published under its own name and selector scope at `STRICT` with no port
+/// overrides. Within one tier the most restrictive mode wins, so the marker
+/// can only tighten inbound mTLS for the workloads it selects.
+pub(crate) fn refused_peer_authentication(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> PeerAuthentication {
+    PeerAuthentication {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        scope: istio_policy_scope(options, object, object.spec.get("selector")),
+        mtls_mode: MtlsMode::Strict,
+        port_overrides: HashMap::new(),
+    }
 }
 
 fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K8sTranslateError> {
@@ -1382,14 +1663,37 @@ fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K
         })?
         .to_string();
 
+    if issuer.trim().is_empty() {
+        return Err(invalid_resource(
+            object,
+            "RequestAuthentication jwtRules[].issuer must not be empty",
+        ));
+    }
+
     let audiences = optional_string_array(
         object,
         rule,
         "audiences",
         "RequestAuthentication jwtRules[].audiences",
     )?;
-    let jwks_uri = string_field(rule, "jwksUri").map(ToOwned::to_owned);
-    let jwks = string_field(rule, "jwks").map(ToOwned::to_owned);
+    // Ferrum has no OIDC discovery, so a rule needs `jwksUri` or inline
+    // `jwks`. Native mesh admission (`validate_mesh_fields`) requires one too;
+    // refusing here makes an issuer-only rule a fail-closed refusal (issue
+    // #6656) instead of a published rule that vetoes the whole reload and
+    // keeps the previous configuration in force.
+    let jwks_uri = string_field(rule, "jwksUri")
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let jwks = string_field(rule, "jwks")
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    if jwks_uri.is_none() && jwks.is_none() {
+        return Err(invalid_resource(
+            object,
+            "RequestAuthentication jwtRules[] needs jwksUri or jwks; Ferrum does not discover \
+             keys from the issuer",
+        ));
+    }
 
     let from_headers = jwt_from_headers(object, rule)?;
 
@@ -1497,7 +1801,12 @@ fn jwt_output_claim_to_headers(
         let (header, claim) =
             crate::modes::mesh::config::validate_mesh_jwt_claim_header(header, claim)
                 .map_err(|error| invalid_resource(object, format!("{path}: {error}")))?;
-        if out.iter().any(|existing| existing.header == header) {
+        // Backend-equivalent spellings (`X_Tenant_Id` / `x-tenant-id`) are one
+        // destination, matching the injected `jwks_auth` admission. A refused
+        // RequestAuthentication fails closed (issue #6656).
+        if out.iter().any(|existing| {
+            crate::proxy::headers::field_names_equivalent_for_backends(&existing.header, &header)
+        }) {
             return Err(invalid_resource(
                 object,
                 format!(
@@ -1820,9 +2129,10 @@ fn translate_traffic_policy(
 ) -> Result<MeshTrafficPolicy, K8sTranslateError> {
     let tcp = value.get("connectionPool").and_then(|cp| cp.get("tcp"));
 
-    let connect_timeout_ms = tcp
-        .and_then(|tcp| string_field(tcp, "connectTimeout"))
-        .and_then(parse_istio_duration_ms);
+    let connect_timeout_ms = match tcp.and_then(|tcp| tcp.get("connectTimeout")) {
+        Some(raw) => Some(parse_tcp_connect_timeout_ms(object, raw)?),
+        None => None,
+    };
 
     let max_connections = tcp
         .map(|tcp| translate_tcp_max_connections(object, tcp))
@@ -2142,7 +2452,6 @@ fn translate_connection_pool_http(
     };
 
     let overlay = MeshConnectionPoolHttp {
-        max_requests_per_connection: None,
         idle_timeout_ms,
         http2_max_requests,
         max_concurrent_streams,
@@ -2291,6 +2600,34 @@ fn parse_http_idle_timeout_ms(object: &K8sObject, raw: &str) -> Result<u64, K8sT
 /// other than 0 are rejected because the proxy field is whole-second
 /// granular. Values above `MAX_TCP_IDLE_TIMEOUT` (24h) are rejected so the
 /// K8s surface stays consistent with the admin admit-path validator.
+/// `connectionPool.tcp.connectTimeout` lands on the proxy's
+/// `backend_connect_timeout_ms` (or a per-port override of it), which config
+/// validation bounds to `1..=MAX_TIMEOUT_MS`. Refuse anything outside that
+/// range here, like the sibling durations, rather than silently dropping an
+/// unparseable value (which kept the default timeout while reporting the
+/// resource Accepted) or emitting a value the data plane refuses.
+fn parse_tcp_connect_timeout_ms(object: &K8sObject, raw: &Value) -> Result<u64, K8sTranslateError> {
+    let ms = raw
+        .as_str()
+        .and_then(parse_istio_duration_ms)
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                "trafficPolicy.connectionPool.tcp.connectTimeout is not a valid Istio duration",
+            )
+        })?;
+    if ms == 0 || ms > MAX_TIMEOUT_MS {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.connectionPool.tcp.connectTimeout must be between 1ms and \
+                 {MAX_TIMEOUT_MS}ms"
+            ),
+        ));
+    }
+    Ok(ms)
+}
+
 fn parse_tcp_idle_timeout_seconds(object: &K8sObject, raw: &str) -> Result<u64, K8sTranslateError> {
     let ms = parse_istio_duration_ms(raw).ok_or_else(|| {
         invalid_resource(
@@ -2760,7 +3097,7 @@ fn translate_client_tls_settings(
         MtlsMode::Disable | MtlsMode::Simple => {}
         // PeerAuthentication-side modes can't be set via DR.tls.mode in Istio;
         // translation above only emits the four client-side modes.
-        MtlsMode::Strict | MtlsMode::Permissive => {
+        MtlsMode::Strict | MtlsMode::Permissive | MtlsMode::Unset => {
             return Err(invalid_resource(
                 object,
                 format!("trafficPolicy.tls.mode {mode_raw:?} is not a client-side TLS mode"),
@@ -3044,10 +3381,12 @@ fn translate_subset(
 /// Translate an Istio PeerAuthentication `mtls.mode` string into [`MtlsMode`].
 ///
 /// Istio defines exactly four values: `UNSET`, `DISABLE`, `PERMISSIVE`, and
-/// `STRICT`. `UNSET` means "inherit from the next-higher tier"; Ferrum models
-/// that inheritance through `resolve_effective_mtls_mode` precedence, so an
-/// explicit `UNSET` contributes the same default posture as `PERMISSIVE` here
-/// (unchanged from prior behaviour).
+/// `STRICT`. `UNSET` (also what an omitted mode decodes to) means "inherit from
+/// the next-higher tier", so it maps to [`MtlsMode::Unset`] rather than a
+/// concrete mode: `resolve_effective_mtls_mode` walks workload port override ->
+/// workload mode -> namespace -> mesh-wide -> the `PERMISSIVE` default. Mapping
+/// it to `PERMISSIVE` here would let a lower-tier policy that only sets
+/// `portLevelMtls` (or an empty `mtls` block) override an inherited `STRICT`.
 ///
 /// A genuinely unknown value (e.g. a typo like `STICT`) is **rejected** rather
 /// than silently treated as `PERMISSIVE`. Otherwise a malformed
@@ -3057,7 +3396,8 @@ fn translate_subset(
 fn mtls_mode(value: &str) -> Result<MtlsMode, String> {
     match value {
         "STRICT" => Ok(MtlsMode::Strict),
-        "PERMISSIVE" | "UNSET" => Ok(MtlsMode::Permissive),
+        "PERMISSIVE" => Ok(MtlsMode::Permissive),
+        "UNSET" => Ok(MtlsMode::Unset),
         "DISABLE" => Ok(MtlsMode::Disable),
         other => Err(format!(
             "unsupported value {other:?} (expected one of UNSET, DISABLE, PERMISSIVE, STRICT)"
@@ -3107,7 +3447,18 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
         .flatten()
     {
         let Some(address) = string_field(endpoint, "address") else {
-            continue;
+            // Istio allows an address-less endpoint only when `network` names
+            // the network whose gateway reaches it. Ferrum does not
+            // materialize those (reported in `deferred_fields` through
+            // `service_entry_endpoint_is_network_gateway_only`); without a
+            // `network` the endpoint is malformed.
+            if service_entry_endpoint_is_network_gateway_only(endpoint) {
+                continue;
+            }
+            return Err(invalid_resource(
+                object,
+                "ServiceEntry endpoints[].address is required unless endpoints[].network is set",
+            ));
         };
         let mut ports = HashMap::new();
         for (name, port) in endpoint
@@ -3116,12 +3467,16 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
             .into_iter()
             .flat_map(|ports| ports.iter())
         {
-            if let Some(raw_port) = port.as_u64() {
-                ports.insert(
-                    name.clone(),
-                    port_from_u64(object, raw_port, "endpoints[].ports")?,
-                );
-            }
+            let Some(raw_port) = port.as_u64() else {
+                return Err(invalid_resource(
+                    object,
+                    "ServiceEntry endpoints[].ports values must be integer port numbers",
+                ));
+            };
+            ports.insert(
+                name.clone(),
+                port_from_u64(object, raw_port, "endpoints[].ports")?,
+            );
         }
         endpoints.push(MeshEndpoint {
             address: address.to_string(),
@@ -3136,10 +3491,21 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
         namespace: object.metadata.namespace.clone(),
         hosts,
         endpoints,
-        resolution: service_entry_resolution(&object.spec),
+        resolution: service_entry_resolution(&object.spec).ok_or_else(|| {
+            invalid_resource(
+                object,
+                "ServiceEntry spec.resolution must be NONE, STATIC, DNS, or DNS_ROUND_ROBIN",
+            )
+        })?,
         location: match string_field(&object.spec, "location").unwrap_or("MESH_EXTERNAL") {
+            "MESH_EXTERNAL" => ServiceEntryLocation::MeshExternal,
             "MESH_INTERNAL" => ServiceEntryLocation::MeshInternal,
-            _ => ServiceEntryLocation::MeshExternal,
+            _ => {
+                return Err(invalid_resource(
+                    object,
+                    "ServiceEntry spec.location must be MESH_EXTERNAL or MESH_INTERNAL",
+                ));
+            }
         },
         ports: service_ports(object)?,
         export_to,
@@ -3480,6 +3846,23 @@ fn validate_vs_header_block(
                         ),
                     ));
                 }
+                // Gateway-owned request assertions: `mesh_route_dispatch`
+                // refuses these `request_transform` destinations at
+                // construction, so refuse this VirtualService here instead of
+                // emitting a plugin config that fails later.
+                if direction == "request"
+                    && (crate::proxy::headers::is_path_param_assertion_header(&normalized)
+                        || crate::proxy::headers::is_consumer_assertion_header(&normalized))
+                {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "VirtualService {field} cannot write gateway-owned request header \
+                             {normalized:?}: the `x-path-param-*` route-capture and \
+                             `x-consumer-*` consumer assertion namespaces are gateway-owned"
+                        ),
+                    ));
+                }
                 let value = value.as_str().ok_or_else(|| {
                     invalid_resource(
                         object,
@@ -3548,10 +3931,6 @@ fn validate_vs_header_name(
         })
 }
 
-fn route_has_uncollapsible_local_policy(route_plugins: &[PluginConfig]) -> bool {
-    !route_plugins.is_empty()
-}
-
 #[allow(clippy::too_many_arguments)]
 fn materialize_route_candidate(
     proxies: &mut Vec<Proxy>,
@@ -3571,7 +3950,7 @@ fn materialize_route_candidate(
         route_plugins.push(request_termination_plugin_for_proxy(
             &proxy.id,
             namespace,
-            "unsupported Istio VirtualService match predicate",
+            super::VIRTUAL_SERVICE_UNSUPPORTED_MATCH_TERMINATION_MESSAGE,
         ));
     }
 
@@ -3651,7 +4030,7 @@ fn parse_l4_match_arm(
     m: &Value,
     kind: &str,
     vs_gateways: &[String],
-) -> Result<Option<crate::proxy::stream_match::StreamMatchArm>, K8sTranslateError> {
+) -> Result<crate::proxy::stream_match::StreamMatchArm, K8sTranslateError> {
     use crate::proxy::stream_match::{
         MAX_STREAM_MATCH_GATEWAY_LENGTH, MAX_STREAM_MATCH_GATEWAYS, MAX_STREAM_MATCH_LABELS,
         StreamMatchArm, canonicalize_gateway_name, valid_kubernetes_label_key,
@@ -3799,7 +4178,7 @@ fn parse_l4_match_arm(
         vs_gateways.to_vec()
     };
 
-    Ok(Some(arm))
+    Ok(arm)
 }
 
 fn parse_l4_cidr_list(
@@ -3861,16 +4240,6 @@ fn parse_l4_cidr_list(
         out.push(raw.to_string());
     }
     Ok(out)
-}
-
-fn attach_l4_stream_match(
-    proxy: &mut Proxy,
-    arm: Option<crate::proxy::stream_match::StreamMatchArm>,
-) {
-    if let Some(arm) = arm {
-        proxy.stream_match =
-            Some(crate::proxy::stream_match::StreamMatchCriteria { arms: vec![arm] });
-    }
 }
 
 /// Resolve L4 (`tcp[]`/`tls[]`) route destinations into Ferrum backends.
@@ -4180,7 +4549,7 @@ fn l4_route_backend_binding(
 /// — that list is the only withdrawal mechanism for translator-generated
 /// upstreams, so a prefix missing from it makes every compose append another
 /// copy instead of replacing it.
-const L4_UPSTREAM_ID_PREFIX: &str = "istio-vs-l4-upstream-";
+const L4_UPSTREAM_ID_PREFIX: &str = crate::proxy::stream_match::ISTIO_VS_L4_UPSTREAM_ID_PREFIX;
 
 /// Hex characters of the identity digest every generated L4 upstream id
 /// carries. 64 bits is far past birthday relevance for the per-cluster
@@ -4556,10 +4925,12 @@ pub const MAX_L4_CANDIDATE_PROXIES: usize = 64;
 /// remaining independently tunable from [`MAX_L4_CANDIDATE_PROXIES`].
 pub const MAX_PROJECTED_L4_PROXIES: usize = 1024;
 
+/// Project each L4 candidate (a stream proxy and the one match arm it was
+/// built from) into every namespace the VirtualService is visible to.
 fn project_l4_proxy_visibility(
     object: &K8sObject,
     acc: &K8sAccumulator,
-    proxies: Vec<Proxy>,
+    proxies: Vec<(Proxy, crate::proxy::stream_match::StreamMatchArm)>,
     upstream_templates: Vec<crate::config::types::Upstream>,
 ) -> Result<(Vec<Proxy>, Vec<crate::config::types::Upstream>), K8sTranslateError> {
     let (mut export_namespaces, public) = l4_export_namespaces(object, acc)?;
@@ -4570,9 +4941,7 @@ fn project_l4_proxy_visibility(
         // `known_namespaces` yet.
         for gateway in proxies
             .iter()
-            .filter_map(|proxy| proxy.stream_match.as_ref())
-            .flat_map(|criteria| criteria.arms.iter())
-            .flat_map(|arm| arm.gateways.iter())
+            .flat_map(|(_, arm)| arm.gateways.iter())
             .filter(|gateway| gateway.as_str() != crate::proxy::stream_match::MESH_GATEWAY_TOKEN)
         {
             if let Some((namespace, _)) = gateway.split_once('/') {
@@ -4612,12 +4981,11 @@ fn project_l4_proxy_visibility(
     let mut projected = Vec::with_capacity(projected_proxy_count);
     let mut projected_upstreams = Vec::new();
     let mut emitted_upstream_keys = HashSet::new();
-    for proxy in proxies {
-        let Some(criteria) = proxy.stream_match.as_ref() else {
-            continue;
-        };
+    for (proxy, arm) in proxies {
         for namespace in &export_namespaces {
-            let mut criteria = criteria.clone();
+            let mut criteria = crate::proxy::stream_match::StreamMatchCriteria {
+                arms: vec![arm.clone()],
+            };
             let mut projected_arms = Vec::with_capacity(criteria.arms.len().saturating_mul(2));
             for arm in criteria.arms.drain(..) {
                 if arm
@@ -4774,8 +5142,7 @@ fn virtual_service_l4_proxies(
                     backend_read_timeout_ms: None,
                 });
                 proxy.passthrough = true;
-                attach_l4_stream_match(&mut proxy, stream_arm);
-                proxies.push(proxy);
+                proxies.push((proxy, stream_arm));
             }
         }
     }
@@ -4804,7 +5171,7 @@ fn virtual_service_l4_proxies(
                          set match.port explicitly to select the listen port",
                     )
                 })?;
-                let mut proxy = super::proxy_for_route(super::RouteProxySpec {
+                let proxy = super::proxy_for_route(super::RouteProxySpec {
                     id: virtual_service_l4_proxy_id("tcp", namespace, vs_name, bi, 0),
                     namespace: namespace.clone(),
                     hosts: Vec::new(),
@@ -4826,8 +5193,7 @@ fn virtual_service_l4_proxies(
                     "tcp",
                     &vs_gateways,
                 )?;
-                attach_l4_stream_match(&mut proxy, arm);
-                proxies.push(proxy);
+                proxies.push((proxy, arm));
             } else {
                 for (mi, m) in match_entries.into_iter().enumerate() {
                     let stream_arm = parse_l4_match_arm(object, m, "tcp", &vs_gateways)?;
@@ -4848,7 +5214,7 @@ fn virtual_service_l4_proxies(
                                 )
                             })?,
                         };
-                    let mut proxy = super::proxy_for_route(super::RouteProxySpec {
+                    let proxy = super::proxy_for_route(super::RouteProxySpec {
                         id: virtual_service_l4_proxy_id("tcp", namespace, vs_name, bi, mi),
                         namespace: namespace.clone(),
                         hosts: Vec::new(),
@@ -4863,14 +5229,71 @@ fn virtual_service_l4_proxies(
                         retry: None,
                         backend_read_timeout_ms: None,
                     });
-                    attach_l4_stream_match(&mut proxy, stream_arm);
-                    proxies.push(proxy);
+                    proxies.push((proxy, stream_arm));
                 }
             }
         }
     }
 
     project_l4_proxy_visibility(object, acc, proxies, upstream_templates)
+}
+
+/// The mesh `exportTo` of a VirtualService: the validated, normalized
+/// `spec.exportTo`, or Istio's public `["*"]` when it is omitted (the mesh
+/// model's EMPTY list is namespace-local). Shared by the CORS policy and the
+/// HTTP route binding so both carry the same visibility.
+///
+/// `optional_string_array` (not the lossy `string_array`): a non-array
+/// `exportTo`, or a non-string entry, would otherwise be dropped and the
+/// resource would default to the PUBLIC `["*"]` — a fail-open on the one field
+/// that bounds its blast radius.
+fn virtual_service_mesh_export_to(object: &K8sObject) -> Result<Vec<String>, K8sTranslateError> {
+    let declared = optional_string_array(
+        object,
+        &object.spec,
+        "exportTo",
+        "VirtualService spec.exportTo",
+    )?;
+    let mut errors = Vec::new();
+    validate_mesh_export_to("VirtualService spec", &declared, &mut errors);
+    if let Some(first) = errors.first() {
+        return Err(invalid_resource(object, first.clone()));
+    }
+    if declared.is_empty() {
+        Ok(vec!["*".to_string()])
+    } else {
+        let mut entries = declared;
+        crate::modes::mesh::config::normalize_mesh_export_to(&mut entries);
+        Ok(entries)
+    }
+}
+
+/// The mesh export list of a VirtualService whose HTTP routes apply to mesh
+/// data planes, or `None` when `spec.gateways` does not bind the mesh (issue
+/// #7233). Only an OMITTED `gateways` defaults to `mesh`, as in Istio; the
+/// value is read with the strict L4 parser, so a non-array, an empty array, or
+/// a non-string entry never collapses to that default and binds nothing (the
+/// gateway routes still translate).
+fn virtual_service_mesh_http_route_export_to(
+    object: &K8sObject,
+) -> Result<Option<Vec<String>>, K8sTranslateError> {
+    if !virtual_service_binds_mesh(object) {
+        return Ok(None);
+    }
+    virtual_service_mesh_export_to(object).map(Some)
+}
+
+/// Whether a VirtualService's `spec.gateways` binds the mesh: omitted, or a
+/// strictly parsed list naming `mesh` (issue #7233). Shared with the Istio
+/// status writer, which reports where a mesh-bound VirtualService's `http[]`
+/// routes are applied (issue #7390), so the binding the translator writes and
+/// the status it reports cannot diverge.
+pub(crate) fn virtual_service_binds_mesh(object: &K8sObject) -> bool {
+    parse_l4_virtual_service_gateways(object).is_ok_and(|gateways| {
+        gateways
+            .iter()
+            .any(|gateway| gateway == crate::proxy::stream_match::MESH_GATEWAY_TOKEN)
+    })
 }
 
 fn virtual_service_routes(
@@ -4954,26 +5377,7 @@ fn virtual_service_routes(
         // a non-string entry, would otherwise be silently dropped and the
         // policy would default to Istio's PUBLIC `["*"]` — a fail-open on the
         // one field that bounds the policy's blast radius.
-        let export_to = {
-            let declared = optional_string_array(
-                object,
-                &object.spec,
-                "exportTo",
-                "VirtualService spec.exportTo",
-            )?;
-            let mut errors = Vec::new();
-            validate_mesh_export_to("VirtualService spec", &declared, &mut errors);
-            if let Some(first) = errors.first() {
-                return Err(invalid_resource(object, first.clone()));
-            }
-            if declared.is_empty() {
-                vec!["*".to_string()]
-            } else {
-                let mut entries = declared;
-                crate::modes::mesh::config::normalize_mesh_export_to(&mut entries);
-                entries
-            }
-        };
+        let export_to = virtual_service_mesh_export_to(object)?;
         for host in &hosts {
             acc.mesh
                 .virtual_service_cors_policies
@@ -5001,7 +5405,7 @@ fn virtual_service_routes(
         // dispatch rule (or, for mirror, attached as a proxy-scoped plugin).
         // Extracted before the backend check because a `redirect` route is
         // valid with NO backend — Istio forbids `route` + `redirect` together.
-        let route_rewrite_value = route_rewrite_value(http);
+        let route_rewrite_value = route_rewrite_value(object, http)?;
         let route_redirect_value = route_redirect_value(object, http)?;
 
         let backends = route_backends(object, http, acc, index)?;
@@ -5055,8 +5459,8 @@ fn virtual_service_routes(
                 )
             };
 
-        let retry = route_retry_config(http);
-        let timeout_ms = route_timeout_ms(http);
+        let retry = route_retry_config(object, http)?;
+        let timeout_ms = route_timeout_ms(object, http)?;
 
         let match_count = route_candidates.len();
         for (match_index, (listen_path, force_terminate_current)) in
@@ -5079,7 +5483,7 @@ fn virtual_service_routes(
             // Istio `http[].mirror`: attach a proxy-scoped `request_mirror`
             // plugin. Mirror is a per-route action; making it a route-local
             // plugin means a route that must be collapsed with siblings fails
-            // closed (via `route_has_uncollapsible_local_policy`) rather than
+            // closed (a non-empty `route_plugins` blocks collapse) rather than
             // silently mirroring the siblings' traffic too. This reuses the
             // battle-tested `request_mirror` plugin instead of duplicating its
             // fire-and-forget task plumbing on the dispatch hot path.
@@ -5094,8 +5498,8 @@ fn virtual_service_routes(
             // A matcher outside those bounds is left unprojected (warned +
             // reported as a deferred field) rather than silently approximated
             // or widened. Like mirror this is a route-local plugin, so a route
-            // that must collapse with siblings fails closed via
-            // `route_has_uncollapsible_local_policy` — route-local CORS never
+            // that must collapse with siblings fails closed (a non-empty
+            // `route_plugins` blocks collapse) — route-local CORS never
             // leaks onto a sibling route.
             if let Some(cors_plugin) = route_cors_plugin(object, http, &proxy_id) {
                 route_plugins.push(cors_plugin);
@@ -5105,9 +5509,9 @@ fn virtual_service_routes(
             // emitted dispatch rule rather than spinning up a separate
             // proxy-scoped `fault_injection` plugin. The per-rule
             // representation collapses cleanly with sibling routes — the
-            // historical fail-closed escape hatch
-            // (`route_has_uncollapsible_local_policy` returning true on a
-            // fault-carrying merged route) is no longer needed for fault.
+            // historical fail-closed escape hatch (a route-local plugin
+            // blocking collapse of a fault-carrying merged route) is no
+            // longer needed for fault.
             if let Some(delay) = http
                 .get("fault")
                 .and_then(route_local_fault_delay_for_rule)
@@ -5183,7 +5587,6 @@ fn virtual_service_routes(
                     rewrite: route_rewrite_value.as_ref(),
                     redirect: route_redirect_value.as_ref(),
                 },
-                false,
             );
 
             let mut proxy = proxy_for_route(RouteProxySpec {
@@ -5230,7 +5633,9 @@ fn virtual_service_routes(
                 || consumes_pending_scoped
                 || (is_uri_less_catch_all
                     && (has_later_any_path || pending_uri_less_route.is_some()));
-            if route_has_uncollapsible_local_policy(&route_plugins)
+            // Any route-local plugin (mirror, CORS) is policy that cannot be
+            // collapsed with sibling routes without leaking onto them.
+            if !route_plugins.is_empty()
                 && (consumes_pending_uri_less
                     || overlaps_pending_scoped
                     || (guarded_route && collapse_required))
@@ -5481,17 +5886,21 @@ fn route_backends(
         .collect();
     let preserve_single_destination = routes.len() == 1;
     let mut skipped_zero = 0usize;
-    let mut active_route_without_backend = false;
     for route in routes {
         let weight = route_weight(object, route)?;
+        // `HTTPRouteDestination.destination` is required in Istio. Refuse a
+        // missing one even on a zero-weight leg, like the L4 path, instead of
+        // silently dropping that share of the split.
+        let Some(destination) = route.get("destination") else {
+            return Err(invalid_resource(
+                object,
+                "VirtualService http[].route[] requires a destination",
+            ));
+        };
         if weight == 0 && !preserve_single_destination {
             skipped_zero += 1;
             continue;
         }
-        let Some(destination) = route.get("destination") else {
-            active_route_without_backend = true;
-            continue;
-        };
         let Some(host) = string_field(destination, "host") else {
             return Err(invalid_resource(
                 object,
@@ -5522,7 +5931,7 @@ fn route_backends(
         });
     }
     if skipped_zero > 0 {
-        if backends.is_empty() && !active_route_without_backend {
+        if backends.is_empty() {
             acc.warnings.push(format!(
                 "VirtualService {:?} HTTP route {} has only zero-weight split destinations; no \
                  proxy was materialized",
@@ -5648,6 +6057,99 @@ fn route_weight(object: &K8sObject, route: &Value) -> Result<u32, K8sTranslateEr
     optional_target_weight_field(object, route, "VirtualService route.weight", 0)
 }
 
+/// `HTTPRetry.retryOn` policies Istio's validation admits that Ferrum does not
+/// enforce. They are reported in `deferred_fields` rather than refused, because
+/// the resource is valid Istio; the enforced retry policy is built from the
+/// remaining tokens.
+const UNENFORCED_RETRY_ON_POLICIES: &[&str] = &[
+    "retriable-4xx",
+    "retriable-headers",
+    "envoy-ratelimited",
+    "reset-before-request",
+    "http3-post-connect-failure",
+    "cancelled",
+    "deadline-exceeded",
+    "internal",
+    "resource-exhausted",
+    "unavailable",
+];
+
+/// `HTTPRetry` fields Ferrum parses past without enforcing, with the
+/// `deferred_fields` text the Istio status writer reports for each.
+const UNENFORCED_RETRY_FIELDS: &[(&str, &str)] = &[
+    (
+        "perTryTimeout",
+        "http[].retries.perTryTimeout (not enforced; the route-level timeout bounds the \
+         backend read)",
+    ),
+    (
+        "retryRemoteLocalities",
+        "http[].retries.retryRemoteLocalities (not enforced)",
+    ),
+];
+
+/// How Ferrum treats one `retryOn` token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryOnToken {
+    /// Enforced by the emitted [`RetryConfig`].
+    Enforced,
+    /// Valid Istio policy Ferrum does not enforce (see
+    /// [`UNENFORCED_RETRY_ON_POLICIES`]).
+    Unenforced,
+    /// Neither an Istio retry policy nor an HTTP status code; Istio's own
+    /// validation refuses it.
+    Invalid,
+}
+
+fn classify_retry_on_token(token: &str) -> RetryOnToken {
+    match token {
+        "5xx"
+        | "gateway-error"
+        | "connect-failure"
+        | "reset"
+        | "refused-stream"
+        | "retriable-status-codes" => RetryOnToken::Enforced,
+        _ if UNENFORCED_RETRY_ON_POLICIES.contains(&token) => RetryOnToken::Unenforced,
+        _ if token.bytes().all(|byte| byte.is_ascii_digit())
+            && token
+                .parse::<u16>()
+                .is_ok_and(|code| (100..=599).contains(&code)) =>
+        {
+            RetryOnToken::Enforced
+        }
+        _ => RetryOnToken::Invalid,
+    }
+}
+
+fn retry_on_tokens(retries: &Value) -> impl Iterator<Item = &str> {
+    string_field(retries, "retryOn")
+        .into_iter()
+        .flat_map(|retry_on| retry_on.split(','))
+        .map(str::trim)
+}
+
+/// `deferred_fields` entries for one VirtualService `http[].retries` block:
+/// Istio-valid retry settings the translator accepts but does not enforce.
+/// Shared with `istio_status` so the report cannot diverge from translation.
+pub(crate) fn virtual_service_retry_deferred_fields(retries: &Value) -> Vec<&'static str> {
+    let mut deferred = Vec::new();
+    if retry_on_tokens(retries)
+        .any(|token| classify_retry_on_token(token) == RetryOnToken::Unenforced)
+    {
+        deferred.push(
+            "http[].retries.retryOn policies Ferrum does not enforce (retriable-4xx, \
+             retriable-headers, envoy-ratelimited, reset-before-request, \
+             http3-post-connect-failure, gRPC status policies)",
+        );
+    }
+    for (field, description) in UNENFORCED_RETRY_FIELDS {
+        if retries.get(*field).is_some_and(|value| !value.is_null()) {
+            deferred.push(*description);
+        }
+    }
+    deferred
+}
+
 /// Extract Istio VirtualService `http[].retries` into a Ferrum [`RetryConfig`].
 ///
 /// Maps:
@@ -5656,12 +6158,30 @@ fn route_weight(object: &K8sObject, route: &Value) -> Result<u32, K8sTranslateEr
 ///     or bare numeric codes) and `retry_on_connect_failure` (from `connect-failure`,
 ///     `reset`, `refused-stream`)
 ///
+/// A `retryOn` token that is neither an Istio retry policy nor an HTTP status
+/// code (`100..=599`) refuses the resource, as Istio's validation does; Istio
+/// policies Ferrum does not enforce are reported via
+/// [`virtual_service_retry_deferred_fields`].
+///
 /// Returns `None` when no `retries` block is present or when `attempts` is zero.
-fn route_retry_config(http: &Value) -> Option<RetryConfig> {
-    let retries = http.get("retries")?;
+fn route_retry_config(
+    object: &K8sObject,
+    http: &Value,
+) -> Result<Option<RetryConfig>, K8sTranslateError> {
+    let Some(retries) = http.get("retries") else {
+        return Ok(None);
+    };
+    if retry_on_tokens(retries).any(|token| classify_retry_on_token(token) == RetryOnToken::Invalid)
+    {
+        return Err(invalid_resource(
+            object,
+            "VirtualService http[].retries.retryOn contains a value that is neither an Istio \
+             retry policy nor an HTTP status code (100-599)",
+        ));
+    }
     let attempts = retries.get("attempts").and_then(Value::as_u64).unwrap_or(0);
     if attempts == 0 {
-        return None;
+        return Ok(None);
     }
 
     let mut retry = RetryConfig {
@@ -5669,11 +6189,11 @@ fn route_retry_config(http: &Value) -> Option<RetryConfig> {
         ..RetryConfig::default()
     };
 
-    if let Some(retry_on) = string_field(retries, "retryOn") {
+    if string_field(retries, "retryOn").is_some() {
         let mut status_codes = Vec::new();
         let mut connect_failure = false;
 
-        for token in retry_on.split(',').map(str::trim) {
+        for token in retry_on_tokens(retries) {
             match token {
                 "5xx" => {
                     status_codes.extend(500..=599);
@@ -5703,7 +6223,7 @@ fn route_retry_config(http: &Value) -> Option<RetryConfig> {
         retry.retry_on_connect_failure = connect_failure;
     }
 
-    Some(retry)
+    Ok(Some(retry))
 }
 
 fn retriable_status_codes(retries: &Value) -> impl Iterator<Item = u16> + '_ {
@@ -5717,9 +6237,24 @@ fn retriable_status_codes(retries: &Value) -> impl Iterator<Item = u16> + '_ {
         .map(|code| code as u16)
 }
 
-fn route_timeout_ms(http: &Value) -> Option<u64> {
-    let raw = string_field(http, "timeout")?;
-    parse_istio_duration_ms(raw).map(|ms| ms.min(MAX_TIMEOUT_MS))
+/// `http[].timeout`, clamped to `MAX_TIMEOUT_MS`. An absent timeout leaves the
+/// route timeout disabled (Istio's default); a present value that is not a
+/// valid Istio duration is refused, because treating it as absent would turn a
+/// typo into a disabled route timeout while reporting the resource Accepted.
+fn route_timeout_ms(object: &K8sObject, http: &Value) -> Result<Option<u64>, K8sTranslateError> {
+    let Some(raw) = http.get("timeout").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let ms = raw
+        .as_str()
+        .and_then(parse_istio_duration_ms)
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                "VirtualService http[].timeout is not a valid Istio duration",
+            )
+        })?;
+    Ok(Some(ms.min(MAX_TIMEOUT_MS)))
 }
 
 /// Project an Istio `VirtualService.http[].rewrite` block into the per-rule
@@ -5733,7 +6268,10 @@ fn route_timeout_ms(http: &Value) -> Option<u64> {
 /// `mesh_route_dispatch_rules_for_proxy` from each match entry's URI prefix —
 /// it is NOT derived here. Returns `None` when neither field is present so a
 /// `rewrite: {}` block does not emit an inert action.
-fn route_rewrite_value(http: &Value) -> Option<Value> {
+fn route_rewrite_value(
+    object: &K8sObject,
+    http: &Value,
+) -> Result<Option<Value>, K8sTranslateError> {
     let rewrite = http.get("rewrite").and_then(Value::as_object);
     let mut out = serde_json::Map::new();
     if let Some(uri) = rewrite
@@ -5751,15 +6289,28 @@ fn route_rewrite_value(http: &Value) -> Option<Value> {
     if let Some(authority) = authority
         && !authority.is_empty()
     {
+        // The dispatch plugin writes this verbatim into the forwarded `Host`
+        // and refuses a non-`host[:port]` operand at construction; refusing it
+        // here keeps the failure scoped to this VirtualService.
+        if let Some(reason) =
+            crate::plugins::mesh_route_dispatch::route_authority_operand_error(authority)
+        {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService http[].rewrite.authority (or headers.request.set host) must be `host` or `host:port`: {reason}"
+                ),
+            ));
+        }
         out.insert(
             "authority".to_string(),
             Value::String(authority.to_string()),
         );
     }
     if out.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(Value::Object(out))
+    Ok(Some(Value::Object(out)))
 }
 
 fn route_request_header_authority(http: &Value) -> Option<&str> {
@@ -5813,11 +6364,32 @@ fn route_redirect_value(
     if let Some(uri) = redirect.get("uri").and_then(Value::as_str)
         && !uri.is_empty()
     {
+        // Same admission the dispatch plugin applies at construction: a
+        // relative, fragment-bearing, or non-canonical URI would compose a
+        // corrupted `Location`, so refuse it as this resource's failure.
+        if let Some(reason) =
+            crate::plugins::mesh_route_dispatch::redirect_uri_operand_error(uri, false)
+        {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService http[].redirect.uri {reason}"),
+            ));
+        }
         out.insert("uri".to_string(), Value::String(uri.to_string()));
     }
     if let Some(authority) = redirect.get("authority").and_then(Value::as_str)
         && !authority.is_empty()
     {
+        if let Some(reason) =
+            crate::plugins::mesh_route_dispatch::route_authority_operand_error(authority)
+        {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService http[].redirect.authority must be `host` or `host:port`: {reason}"
+                ),
+            ));
+        }
         out.insert(
             "authority".to_string(),
             Value::String(authority.to_string()),
@@ -5895,13 +6467,27 @@ fn route_redirect_value(
 /// `mirrorPercent`). Returns `None` when no `mirror` destination is present.
 /// Returns `Err` when the mirror destination is malformed (missing host, or a
 /// `port.name` that does not resolve) so the bug is surfaced rather than the
-/// mirror silently dropped.
+/// mirror silently dropped. A well-formed non-zero mirror to anything but a
+/// loopback IP literal returns `None` and is reported in `deferred_fields`
+/// ([`virtual_service_route_mirror_is_deferred`]).
 fn route_mirror_plugin(
     object: &K8sObject,
     http: &Value,
     acc: &K8sAccumulator,
     proxy_id: &str,
 ) -> Result<Option<PluginConfig>, K8sTranslateError> {
+    if virtual_service_route_mirrors_are_deferred(http) {
+        // `http[].mirrors` is never projected; the status writer reports it in
+        // `deferred_fields` (`virtual_service_route_mirrors_are_deferred`).
+        crate::warn_sampled!(
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", object.metadata.namespace.to_string()),
+                &[]
+            ),
+            name = %sanitize_startup_cause(format!("{:?}", object.metadata.name.to_string()), &[]),
+            "VirtualService http[].mirrors is not translated; no mirror traffic is sent for it"
+        );
+    }
     let Some(mirror) = http.get("mirror") else {
         return Ok(None);
     };
@@ -5913,23 +6499,30 @@ fn route_mirror_plugin(
     };
     let port = resolve_destination_port(object, mirror, host, acc)?.unwrap_or(80);
 
-    // `mirrorPercentage.value` is a float 0-100; the legacy `mirrorPercent` is
-    // an integer. Default (neither present) is 100% per Istio.
-    let percentage = if let Some(value) = http
-        .get("mirrorPercentage")
-        .and_then(|m| m.get("value"))
-        .and_then(Value::as_f64)
-    {
-        value.clamp(0.0, 100.0)
-    } else if let Some(percent) = http.get("mirrorPercent").and_then(Value::as_u64) {
-        percent.min(100) as f64
-    } else {
-        100.0
-    };
+    let percentage = route_mirror_percentage(http);
 
     // A 0% mirror is a no-op; skip emitting the plugin entirely so the proxy
     // does not carry an inert instance (and the route can still collapse).
     if percentage == 0.0 {
+        return Ok(None);
+    }
+
+    // GHSA-gcwp-xp94-4pcv: never opt in to cleartext silently. The mirror is
+    // a best-effort side effect, so it is omitted (and reported in
+    // `deferred_fields`) while the rest of the VirtualService translates.
+    if virtual_service_route_mirror_is_deferred(http) {
+        crate::warn_sampled!(
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", object.metadata.namespace.to_string()),
+                &[]
+            ),
+            name = %sanitize_startup_cause(format!("{:?}", object.metadata.name.to_string()), &[]),
+            "VirtualService http[].mirror is not translated for a destination other than a \
+             loopback IP literal: Ferrum would send the mirror request directly over cleartext \
+             HTTP, outside the mesh's mTLS, and a VirtualService cannot express the \
+             request_mirror allow_plaintext opt-in; the route is translated without the mirror. \
+             Configure a request_mirror plugin with mirror_protocol https instead."
+        );
         return Ok(None);
     }
 
@@ -5953,6 +6546,52 @@ fn route_mirror_plugin(
         created_at: now,
         updated_at: now,
     }))
+}
+
+/// `mirrorPercentage.value` is a float 0-100; the legacy `mirrorPercent` is an
+/// integer. Default (neither present) is 100% per Istio.
+fn route_mirror_percentage(http: &Value) -> f64 {
+    if let Some(value) = http
+        .get("mirrorPercentage")
+        .and_then(|m| m.get("value"))
+        .and_then(Value::as_f64)
+    {
+        value.clamp(0.0, 100.0)
+    } else if let Some(percent) = http.get("mirrorPercent").and_then(Value::as_u64) {
+        percent.min(100) as f64
+    } else {
+        100.0
+    }
+}
+
+/// Whether an `http[]` route's `mirror` is valid Istio that Ferrum does not
+/// project (GHSA-gcwp-xp94-4pcv). Istio carries a mirror over the sidecar's
+/// mesh mTLS; Ferrum's `request_mirror` dials the destination directly from
+/// the proxy process with the plugin HTTP client (the proxy UID is excluded
+/// from capture), so the shadow request, which replays the request body,
+/// would travel in cleartext. Cleartext is admitted without an explicit
+/// `allow_plaintext` opt-in only to a loopback IP literal, and a
+/// VirtualService cannot express that opt-in, so a non-zero mirror to any
+/// other destination is omitted rather than silently opted in. Shared by the
+/// translator and the status writer's `deferred_fields` so the two never
+/// disagree. A mirror without a host is malformed, not deferred.
+pub(crate) fn virtual_service_route_mirror_is_deferred(http: &Value) -> bool {
+    let Some(host) = http
+        .get("mirror")
+        .and_then(|mirror| string_field(mirror, "host"))
+    else {
+        return false;
+    };
+    route_mirror_percentage(http) != 0.0
+        && !crate::plugins::utils::socket_host::is_loopback_ip_literal_host(host.trim())
+}
+
+/// Whether an `http[]` route carries Istio's `mirrors[]` list, which Ferrum
+/// never projects (only the single `mirror` is translated).
+pub(crate) fn virtual_service_route_mirrors_are_deferred(http: &Value) -> bool {
+    http.get("mirrors")
+        .and_then(Value::as_array)
+        .is_some_and(|mirrors| !mirrors.is_empty())
 }
 
 fn parse_istio_duration_secs(raw: &str) -> Option<u64> {
@@ -6143,9 +6782,11 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
         cors.get("allowCredentials"),
         None | Some(Value::Null) | Some(Value::Bool(_))
     );
-    // Exact `*`, opaque exact `null`, AND effectively universal prefix/regex
-    // matchers share one
-    // breadth classifier with plugin construction (issue #4269). Credentialed
+    // Exact `*`, opaque exact `null`, effectively universal prefixes and
+    // probe-universal regexes are screened here (issue #4269). A credentialed
+    // regex that only fails the host-pinning proof is projected on purpose:
+    // fail-closed `cors` construction rejects the update, so the route never
+    // loses CORS ownership. Credentialed
     // exact `*` stays deferred because projecting it would drop credentials;
     // credentialed opaque/universal matcher is refused at construction, so it
     // must be deferred here rather than failing plugin construction later.
@@ -6167,7 +6808,8 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
 /// would be accepted by `CorsPlugin` construction: the plugin rejects padded
 /// or empty values, invalid HTTP methods, and invalid
 /// header names (shared `plugins::cors::{validate_method,validate_header_name}`
-/// admission — do not fork). `cors_string_array` emits the collected strings
+/// admission — do not fork), plus the shared per-list entry bound
+/// (`plugins::cors::validate_token_list_count`). `cors_string_array` emits the collected strings
 /// verbatim, so a bad token would otherwise fail plugin construction AFTER
 /// translation instead of deferring the policy here. An absent list is
 /// projected as explicit empty so Istio omission is preserved.
@@ -6176,12 +6818,13 @@ fn cors_string_arrays_plugin_valid(cors: &Value) -> bool {
         match cors.get(key) {
             None => true,
             Some(Value::Array(_)) => cors_string_array(cors, key).is_some_and(|values| {
-                values.iter().all(|value| {
-                    let trimmed = value.trim();
-                    !trimmed.is_empty()
-                        && trimmed.len() == value.len()
-                        && validate(key, value).is_ok()
-                })
+                crate::plugins::cors::validate_token_list_count(key, values.len()).is_ok()
+                    && values.iter().all(|value| {
+                        let trimmed = value.trim();
+                        !trimmed.is_empty()
+                            && trimmed.len() == value.len()
+                            && validate(key, value).is_ok()
+                    })
             }),
             _ => false,
         }
@@ -6199,16 +6842,6 @@ fn cors_string_arrays_plugin_valid(cors: &Value) -> bool {
         )
 }
 
-/// Build a proxy-scoped `cors` plugin for an Istio `VirtualService.http[].corsPolicy`.
-/// Returns `None` when there is no `corsPolicy`, or when the policy is not
-/// faithfully representable (a malformed/unknown origin matcher, an
-/// un-compilable `regex`, or an unparseable `maxAge`) — in that case it is left
-/// unprojected (warned, and reported as a deferred field by the status writer)
-/// rather than failing the whole VirtualService or silently approximating.
-/// `allowOrigins[]` `exact`/`prefix`/`regex` `StringMatch` and the legacy
-/// `allowOrigin` exact list are all projected. This reuses the existing `cors`
-/// plugin instead of duplicating preflight/header logic, mirroring the
-/// `request_mirror` approach for `http[].mirror`.
 /// Whether ONE `match[]` block applies to sidecars. Istio's
 /// `HTTPMatchRequest.gateways` OVERRIDES the top-level `spec.gateways` list:
 /// a match carrying `gateways` applies to sidecars iff it names the reserved
@@ -6316,18 +6949,16 @@ fn mesh_cors_policy_from_value(cors: &Value) -> Option<MeshCorsPolicy> {
     let mut allowed_origins = Vec::new();
     for origin in cors_allowed_origins(cors)? {
         let matcher = match &origin {
-            // Kept for the native allow-all string form; the translator itself
-            // now emits every exact as a `{"exact": ...}` matcher object.
-            Value::String(exact) => MeshCorsOriginMatch::Exact(exact.clone()),
             Value::Object(map) => {
                 if let Some(exact) = map.get("exact").and_then(Value::as_str) {
                     MeshCorsOriginMatch::Exact(exact.to_string())
                 } else if let Some(prefix) = map.get("prefix").and_then(Value::as_str) {
                     MeshCorsOriginMatch::Prefix(prefix.to_string())
                 } else {
-                    // `cors_allowed_origins` only emits the supported shapes;
-                    // anything else is a translatability bug upstream — stay
-                    // fail-closed rather than approximate.
+                    // `cors_allowed_origins` only emits these matcher objects
+                    // (every exact as `{"exact": ...}`); anything else is a
+                    // translatability bug upstream — stay fail-closed rather
+                    // than approximate.
                     let regex = map.get("regex").and_then(Value::as_str)?;
                     MeshCorsOriginMatch::Regex(regex.to_string())
                 }
@@ -6360,6 +6991,16 @@ fn mesh_cors_policy_from_value(cors: &Value) -> Option<MeshCorsPolicy> {
     })
 }
 
+/// Build a proxy-scoped `cors` plugin for an Istio `VirtualService.http[].corsPolicy`.
+/// Returns `None` when there is no `corsPolicy`, or when the policy is not
+/// faithfully representable (a malformed/unknown origin matcher, an
+/// un-compilable `regex`, or an unparseable `maxAge`) — in that case it is left
+/// unprojected (warned, and reported as a deferred field by the status writer)
+/// rather than failing the whole VirtualService or silently approximating.
+/// `allowOrigins[]` `exact`/`prefix`/`regex` `StringMatch` and the legacy
+/// `allowOrigin` exact list are all projected. This reuses the existing `cors`
+/// plugin instead of duplicating preflight/header logic, mirroring the
+/// `request_mirror` approach for `http[].mirror`.
 fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option<PluginConfig> {
     let cors = http.get("corsPolicy")?;
     // `cors_policy_translatable` is the single shared gate; the actual origin
@@ -6722,7 +7363,10 @@ fn service_ports(object: &K8sObject) -> Result<Vec<ServicePort>, K8sTranslateErr
         .flatten()
         .try_for_each(|port| {
             let Some(raw_port) = port.get("number").and_then(Value::as_u64) else {
-                return Ok(());
+                return Err(invalid_resource(
+                    object,
+                    "ServiceEntry ports[].number is required and must be an integer",
+                ));
             };
             // Istio ServiceEntry `targetPort` is a numeric container port.
             let target_port = port
@@ -6770,10 +7414,10 @@ fn workload_ports(object: &K8sObject) -> Result<Vec<WorkloadPort>, K8sTranslateE
 /// port), so `protocol: UDP` mirrors the K8s Service L4 mapping
 /// (`core::workload_port_protocol`) to `AppProtocol::Udp` rather than the
 /// `Unknown` (HTTP-family) catch-all — otherwise a UDP ServiceEntry would still
-/// be classified HTTP-family and routed into HTTP/stream materialization. UDP is
-/// inert in this F3 §3.3 stage (no UDP capture/egress yet); the classification
-/// just keeps it partitioned out of the other lanes. Unrecognized tokens (e.g.
-/// `sctp`) stay `Unknown`.
+/// be classified HTTP-family and routed into HTTP/stream materialization. UDP
+/// takes the datagram lanes (in-mesh UDP capture/egress and the external-UDP
+/// egress allowlist, issue #3263). Unrecognized tokens (e.g. `sctp`) stay
+/// `Unknown`.
 fn app_protocol(value: Option<&str>) -> AppProtocol {
     match value.unwrap_or_default().to_ascii_lowercase().as_str() {
         "http" => AppProtocol::Http,
@@ -6800,11 +7444,11 @@ fn app_protocol(value: Option<&str>) -> AppProtocol {
 ///
 /// Routes the raw token through the SAME [`app_protocol`] classifier the
 /// ServiceEntry translator uses to populate `ServicePort.protocol`, then checks
-/// for [`AppProtocol::Udp`] — so the Istio status writer's UDP-deferral
-/// detection can never diverge from what the translator classifies (and thus
-/// from what the EgressGateway materializer skips as inert in F3 §3.3 stage 1,
-/// which keys off `AppProtocol::Udp`). Used by `istio_status::service_entry_status`
-/// to surface the deferred UDP egress lane in `deferred_fields`. Shared (like
+/// for [`AppProtocol::Udp`] — so the Istio status writer's UDP egress note
+/// can never diverge from what the translator classifies (and thus from the
+/// external-UDP egress materializers, which key off `AppProtocol::Udp`). Used
+/// by `istio_status::service_entry_status` to surface the conditions external
+/// UDP egress needs in `deferred_fields`. Shared (like
 /// [`cors_policy_translatable`] / [`sidecar_ingress_protocol_is_http_family`]) so
 /// the predicate lives in one place and translation/materialization and the
 /// status report stay in lock-step.
@@ -6815,16 +7459,27 @@ pub(crate) fn service_entry_port_protocol_is_udp(protocol: Option<&str>) -> bool
 }
 
 /// Parse an Istio `ServiceEntry` `spec.resolution` string, defaulting to `NONE`
-/// exactly as Istio does. Shared by the ServiceEntry translator and by
-/// [`service_entry_spec_has_unresolvable_stream_wildcard_host`] so the raw-spec
-/// predicate can never classify a resolution differently from the translation
-/// that feeds materialization.
-fn service_entry_resolution(spec: &Value) -> Resolution {
+/// exactly as Istio does. `DNS_ROUND_ROBIN` resolves through DNS like `DNS`
+/// (Ferrum has one DNS resolution mode); any other value is `None` and the
+/// translator refuses the resource. Shared by the ServiceEntry translator and
+/// by [`service_entry_spec_has_unresolvable_stream_wildcard_host`] so the
+/// raw-spec predicate can never classify a resolution differently from the
+/// translation that feeds materialization.
+fn service_entry_resolution(spec: &Value) -> Option<Resolution> {
     match string_field(spec, "resolution").unwrap_or("NONE") {
-        "DNS" => Resolution::Dns,
-        "STATIC" => Resolution::Static,
-        _ => Resolution::None,
+        "DNS" | "DNS_ROUND_ROBIN" => Some(Resolution::Dns),
+        "STATIC" => Some(Resolution::Static),
+        "NONE" => Some(Resolution::None),
+        _ => None,
     }
+}
+
+/// Whether a `ServiceEntry` `endpoints[]` entry has no `address` but names a
+/// `network`: Istio reaches such an endpoint through that network's gateway,
+/// which Ferrum does not model, so the translator skips it and the Istio
+/// status writer reports it in `deferred_fields`.
+pub(crate) fn service_entry_endpoint_is_network_gateway_only(endpoint: &Value) -> bool {
+    string_field(endpoint, "address").is_none() && string_field(endpoint, "network").is_some()
 }
 
 /// Whether an Istio `ServiceEntry` `spec.ports[].protocol` string names a
@@ -6873,7 +7528,11 @@ pub(crate) fn service_entry_spec_has_unresolvable_stream_wildcard_host(spec: &Va
     if !has_stream_port {
         return false;
     }
-    let resolution = service_entry_resolution(spec);
+    let Some(resolution) = service_entry_resolution(spec) else {
+        // An unknown resolution refuses the whole resource; nothing is
+        // materialized, so there is no inert stream host to report.
+        return false;
+    };
     let endpoint_count = spec
         .get("endpoints")
         .and_then(Value::as_array)
@@ -7014,11 +7673,11 @@ pub(crate) struct SidecarOutboundPolicy {
 ///     `mode: null` handling below): the operator declared no egress proxy, so
 ///     the declared `mode` is honored.
 ///
-/// The resource is never REJECTED over this field. A rejected Sidecar is dropped
-/// from the translation entirely (`translate_k8s_objects_collecting_skips` skips
-/// it and retries), which would also drop its `egress` narrowing and thereby
-/// WIDEN both the workload's slice service view and the `REGISTRY_ONLY` registry
-/// derived from it — the opposite of failing closed.
+/// The resource is never REJECTED over this field. A rejected Sidecar used to
+/// be dropped from the translation, which widened egress; it is now published
+/// as a fail-closed marker ([`refused_sidecar`], GHSA-2r85-85hh-23mw). Even so,
+/// `REGISTRY_ONLY` is already this field's exact fail-closed reading, so the
+/// resource stays accepted and reports the degradation in `deferred_fields`.
 pub(crate) fn classify_sidecar_outbound_traffic_policy(spec: &Value) -> SidecarOutboundPolicy {
     use crate::modes::mesh::config::OutboundTrafficPolicy;
 
@@ -7108,6 +7767,29 @@ fn report_sidecar_outbound_policy_degradation(namespace: &str, name: &str, reaso
     }
 }
 
+/// `deferred_fields` entries for an Istio `Telemetry` spec.
+///
+/// Ferrum has one metrics pipeline and one access-log pipeline per workload,
+/// so [`telemetry`] translates only the first `metrics[]` and
+/// `accessLogging[]` entry (every `tracing[]` entry is merged). Later entries
+/// (typically per-provider overrides) are accepted but not enforced; shared
+/// with `istio_status` so the report names exactly what the translator skips.
+pub(crate) fn telemetry_deferred_fields(spec: &Value) -> Vec<&'static str> {
+    let entries = |section: &str| {
+        spec.get(section)
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    let mut deferred = Vec::new();
+    if entries("metrics") > 1 {
+        deferred.push("metrics[1..] (only the first metrics entry is translated)");
+    }
+    if entries("accessLogging") > 1 {
+        deferred.push("accessLogging[1..] (only the first accessLogging entry is translated)");
+    }
+    deferred
+}
+
 fn telemetry(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -7132,6 +7814,7 @@ fn telemetry(
                 custom_tags: HashMap::new(),
                 custom_header_tags: HashMap::new(),
                 custom_env_tags: HashMap::new(),
+                safe_tag_sources: Vec::new(),
                 providers: Vec::new(),
             };
             let mut emits_server = false;
@@ -8650,6 +9333,72 @@ mod tests {
     }
 
     #[test]
+    fn service_entry_refuses_malformed_fields_instead_of_dropping_them() {
+        let translate = |patch: Value| {
+            let mut spec = serde_json::json!({
+                "hosts": ["api.example.com"],
+                "resolution": "STATIC",
+                "ports": [{"number": 443, "name": "https", "protocol": "TLS"}],
+                "endpoints": [{"address": "203.0.113.10", "ports": {"https": 8443}}]
+            });
+            for (key, value) in patch.as_object().expect("patch object") {
+                spec[key] = value.clone();
+            }
+            translate_k8s_objects(&[object("ServiceEntry", spec)], options())
+        };
+
+        for (patch, expected) in [
+            (
+                serde_json::json!({"location": "MESH_ELSEWHERE"}),
+                "spec.location must be",
+            ),
+            (
+                serde_json::json!({"resolution": "LOGICAL_DNS"}),
+                "spec.resolution must be",
+            ),
+            (
+                serde_json::json!({"ports": [{"name": "https", "protocol": "TLS"}]}),
+                "ports[].number is required",
+            ),
+            (
+                serde_json::json!({"ports": [{"number": "443", "name": "https"}]}),
+                "ports[].number is required",
+            ),
+            (
+                serde_json::json!({"endpoints": [{"ports": {"https": 8443}}]}),
+                "endpoints[].address is required",
+            ),
+            (
+                serde_json::json!({"endpoints": [{"address": "203.0.113.10", "ports": {"https": "8443"}}]}),
+                "endpoints[].ports values must be integer",
+            ),
+        ] {
+            let error = translate(patch.clone())
+                .expect_err("malformed ServiceEntry field must refuse the resource");
+            assert!(
+                error.to_string().contains(expected),
+                "patch {patch}: unexpected error {error}"
+            );
+        }
+
+        // Istio-valid values that used to be silently remapped still translate.
+        let result = translate(serde_json::json!({
+            "resolution": "DNS_ROUND_ROBIN",
+            "location": "MESH_INTERNAL",
+            "endpoints": [
+                {"address": "203.0.113.10"},
+                {"network": "remote-network", "ports": {"https": 8443}}
+            ]
+        }))
+        .expect("Istio-valid ServiceEntry translates");
+        let mesh = result.config.mesh.expect("mesh config");
+        let entry = &mesh.service_entries[0];
+        assert_eq!(entry.resolution, Resolution::Dns);
+        assert_eq!(entry.location, ServiceEntryLocation::MeshInternal);
+        assert_eq!(entry.endpoints.len(), 1, "network-only endpoint is skipped");
+    }
+
+    #[test]
     fn service_entry_udp_port_classifies_as_udp_app_protocol() {
         // An Istio ServiceEntry port with `protocol: UDP` must classify as the
         // distinct `AppProtocol::Udp` (mirroring the K8s Service L4 mapping), NOT
@@ -9391,7 +10140,7 @@ mod tests {
             let mesh = result.config.mesh.expect("mesh config");
             assert!(matches!(
                 mesh.peer_authentications[0].scope,
-                Some(PolicyScope::MeshWide)
+                PolicyScope::MeshWide
             ));
         }
     }
@@ -9422,13 +10171,9 @@ mod tests {
             assert!(
                 matches!(
                     &peer_auth.scope,
-                    Some(PolicyScope::Namespace { namespace }) if namespace == "default"
+                    PolicyScope::Namespace { namespace } if namespace == "default"
                 ),
-                "{case} selector must use namespace scope"
-            );
-            assert!(
-                peer_auth.selector.is_none(),
-                "{case} selector must not become a workload selector"
+                "{case} selector must use namespace scope, not a workload selector"
             );
             assert_eq!(
                 crate::modes::mesh::slice::resolve_effective_mtls_mode(
@@ -11042,57 +11787,6 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_environment_custom_tag_does_not_resolve_controller_host_env() {
-        // Structural proof only: the translator carries `defaultValue` plus a
-        // typed `custom_env_tags` lookup and never reads process environment.
-        // Do not mutate the process environment — Rust 2024 forbids unsynchronized
-        // `set_var` under the parallel test harness, and host env is not the DP.
-        let result = translate_k8s_objects(
-            &[object(
-                "Telemetry",
-                serde_json::json!({
-                    "tracing": [{
-                        "customTags": {
-                            "env_tag": {
-                                "environment": {
-                                    "name": "FERRUM_TEST_TELEMETRY_ENV_TAG",
-                                    "defaultValue": "fallback-value"
-                                }
-                            }
-                        }
-                    }]
-                }),
-            )],
-            options(),
-        )
-        .expect("translation succeeds");
-
-        let mesh = result.config.mesh.expect("mesh config");
-        let tracing = mesh.telemetry_resources[0]
-            .config
-            .tracing
-            .as_ref()
-            .expect("tracing config");
-
-        assert_eq!(
-            tracing.custom_tags.get("env_tag").map(String::as_str),
-            Some("fallback-value"),
-            "controller must not read host env as the data plane"
-        );
-        assert_eq!(
-            tracing.custom_env_tags.get("env_tag").map(String::as_str),
-            Some("FERRUM_TEST_TELEMETRY_ENV_TAG")
-        );
-        assert!(
-            tracing
-                .custom_tags
-                .values()
-                .all(|value| value != "live-env-value"),
-            "translated literals must stay at defaultValue, never a host env read"
-        );
-    }
-
-    #[test]
     fn telemetry_environment_custom_tag_rejects_missing_name() {
         let err = translate_k8s_objects(
             &[object(
@@ -11184,7 +11878,7 @@ mod tests {
                 serde_json::json!({
                     "tracing": [{
                         "customTags": {
-                            "credential": {
+                            "env_tag": {
                                 "environment": {
                                     "name": "FERRUM_ADMIN_JWT_SECRET"
                                 }
@@ -11409,7 +12103,7 @@ mod tests {
             filter.expression,
             Some(AccessLogFilterExpr::Or {
                 left: Box::new(AccessLogFilterExpr::StatusCodeMin { value: 500 }),
-                right: Box::new(AccessLogFilterExpr::MinLatencyMs { value: 1001 }),
+                right: Box::new(AccessLogFilterExpr::LatencyAboveMs { value: 1000 }),
             })
         );
         assert_eq!(filter.status_code_min, None);
@@ -11424,7 +12118,7 @@ mod tests {
             filter.expression,
             Some(AccessLogFilterExpr::Or {
                 left: Box::new(AccessLogFilterExpr::StatusCodeMin { value: 500 }),
-                right: Box::new(AccessLogFilterExpr::MinLatencyMs { value: 1001 }),
+                right: Box::new(AccessLogFilterExpr::LatencyAboveMs { value: 1000 }),
             })
         );
     }
@@ -11580,7 +12274,13 @@ mod tests {
             .expect("filter parses")
             .expect("filter is present");
 
-        assert_eq!(filter.min_latency_ms, Some(101));
+        // Latency is fractional milliseconds, so `> 100` is a strict bound,
+        // not `>= 101` (issue #7245): it stays an expression tree.
+        assert_eq!(filter.min_latency_ms, None);
+        assert_eq!(
+            filter.expression,
+            Some(AccessLogFilterExpr::LatencyAboveMs { value: 100 })
+        );
     }
 
     #[test]
@@ -13088,7 +13788,7 @@ extensionProviders:
                     "http": [{
                         "match": [{"uri": {"prefix": "/v1"}}],
                         "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
-                        "mirror": {"host": "shadow.default.svc.cluster.local", "port": {"number": 9090}},
+                        "mirror": {"host": "127.0.0.1", "port": {"number": 9090}},
                         "mirrorPercentage": {"value": 25.0}
                     }]
                 }),
@@ -13103,12 +13803,11 @@ extensionProviders:
             .iter()
             .find(|p| p.plugin_name == "request_mirror")
             .expect("request_mirror plugin emitted for http[].mirror");
-        assert_eq!(
-            mirror.config["mirror_host"].as_str(),
-            Some("shadow.default.svc.cluster.local")
-        );
+        assert_eq!(mirror.config["mirror_host"].as_str(), Some("127.0.0.1"));
         assert_eq!(mirror.config["mirror_port"].as_u64(), Some(9090));
         assert_eq!(mirror.config["percentage"].as_f64(), Some(25.0));
+        // No cleartext opt-in is ever written by translation.
+        assert!(mirror.config.get("allow_plaintext").is_none());
         // The mirror plugin is proxy-scoped to the route's proxy.
         assert_eq!(
             mirror.proxy_id.as_deref(),
@@ -13145,6 +13844,57 @@ extensionProviders:
                 .any(|p| p.plugin_name == "request_mirror"),
             "0% mirror must not emit an inert plugin"
         );
+    }
+
+    /// GHSA-gcwp-xp94-4pcv: the mirror request would leave the proxy process
+    /// over cleartext HTTP (it does not ride mesh mTLS) and a VirtualService
+    /// cannot express the plaintext opt-in, so a mirror to a Service host is
+    /// omitted. The rest of the VirtualService still translates.
+    #[test]
+    fn virtual_service_mirror_to_service_host_is_omitted_not_refused() {
+        for host in [
+            "shadow.default.svc.cluster.local",
+            "shadow",
+            "10.0.0.7",
+            "localhost",
+        ] {
+            let route = serde_json::json!({
+                "match": [{"uri": {"prefix": "/v1"}}],
+                "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                "mirror": {"host": host, "port": {"number": 9090}}
+            });
+            assert!(virtual_service_route_mirror_is_deferred(&route), "{host}");
+            let result = translate_k8s_objects(
+                &[object(
+                    "VirtualService",
+                    serde_json::json!({
+                        "hosts": ["api.example.com"],
+                        "http": [route]
+                    }),
+                )],
+                options(),
+            )
+            .unwrap_or_else(|error| panic!("{host}: the VirtualService must translate: {error}"));
+            assert!(
+                !result
+                    .config
+                    .plugin_configs
+                    .iter()
+                    .any(|plugin| plugin.plugin_name == "request_mirror"),
+                "{host}: no cleartext mirror may be emitted"
+            );
+            assert!(
+                !result.config.proxies.is_empty(),
+                "{host}: the primary route must still be translated"
+            );
+        }
+        let loopback = serde_json::json!({"mirror": {"host": "127.0.0.1"}});
+        assert!(!virtual_service_route_mirror_is_deferred(&loopback));
+        let zero = serde_json::json!({
+            "mirror": {"host": "shadow"},
+            "mirrorPercentage": {"value": 0.0}
+        });
+        assert!(!virtual_service_route_mirror_is_deferred(&zero));
     }
 
     #[test]
@@ -14423,7 +15173,38 @@ extensionProviders:
     }
 
     #[test]
-    fn virtual_service_retries_numeric_code_out_of_range_filtered() {
+    fn virtual_service_retries_refuse_invalid_retry_on_tokens() {
+        // Istio's validation refuses a retryOn token that is neither a retry
+        // policy nor an HTTP status code; dropping it would report Accepted
+        // while retrying on less than the operator asked for.
+        for retry_on in ["503,9999", "42", "5xx,5XX", "5xx,", "connect_failure"] {
+            let err = translate_k8s_objects(
+                &[object(
+                    "VirtualService",
+                    serde_json::json!({
+                        "hosts": ["api.example.com"],
+                        "http": [{
+                            "match": [{"uri": {"prefix": "/v1"}}],
+                            "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                            "retries": {
+                                "attempts": 1,
+                                "retryOn": retry_on
+                            }
+                        }]
+                    }),
+                )],
+                options(),
+            )
+            .expect_err("invalid retryOn token must refuse the VirtualService");
+            assert!(
+                err.to_string().contains("http[].retries.retryOn"),
+                "unexpected error for {retry_on:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_service_retries_keep_enforced_tokens_beside_unenforced_policies() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -14434,20 +15215,58 @@ extensionProviders:
                         "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
                         "retries": {
                             "attempts": 1,
-                            "retryOn": "503,9999,42,418"
+                            "retryOn": "503,418,retriable-4xx,unavailable",
+                            "perTryTimeout": "2s"
                         }
                     }]
                 }),
             )],
             options(),
         )
-        .expect("translation succeeds");
+        .expect("Istio-valid retry policies translate");
 
         let retry = result.config.proxies[0].retry.as_ref().expect("retry");
-        assert!(retry.retryable_status_codes.contains(&503));
-        assert!(retry.retryable_status_codes.contains(&418));
-        assert!(!retry.retryable_status_codes.contains(&9999));
-        assert!(!retry.retryable_status_codes.contains(&42));
+        assert_eq!(retry.retryable_status_codes, vec![418, 503]);
+        assert_eq!(
+            virtual_service_retry_deferred_fields(&serde_json::json!({
+                "retryOn": "503,retriable-4xx",
+                "perTryTimeout": "2s",
+                "retryRemoteLocalities": true
+            }))
+            .len(),
+            3
+        );
+        assert!(
+            virtual_service_retry_deferred_fields(&serde_json::json!({
+                "attempts": 2,
+                "retryOn": "5xx,connect-failure"
+            }))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn virtual_service_http_route_without_destination_is_refused() {
+        for routes in [
+            serde_json::json!([{"weight": 100}]),
+            serde_json::json!([
+                {"destination": {"host": "api.default.svc.cluster.local"}, "weight": 100},
+                {"weight": 0}
+            ]),
+        ] {
+            let err = translate_k8s_objects(
+                &[object(
+                    "VirtualService",
+                    serde_json::json!({
+                        "hosts": ["api.example.com"],
+                        "http": [{"route": routes}]
+                    }),
+                )],
+                options(),
+            )
+            .expect_err("a route[] entry without destination must refuse the VirtualService");
+            assert!(err.to_string().contains("route[] requires a destination"));
+        }
     }
 
     #[test]
@@ -15233,11 +16052,12 @@ extensionProviders:
 
     #[test]
     fn virtual_service_regex_uri_with_ignored_predicates_fails_closed() {
-        // Unsupported non-URI match shapes (regex method/header/queryParam)
-        // cannot be enforced by mesh_route_dispatch. A match entry with URI
-        // plus only unsupported predicate types must not materialize a naked
-        // URI proxy, because that would forward every regex-URI request
-        // without the method/header/query gates.
+        // Unsupported non-URI match shapes cannot be enforced by
+        // mesh_route_dispatch. A match entry with URI plus an unsupported
+        // predicate (`sourceLabels`; regex method/header/queryParam values
+        // are first-class now) must not materialize a naked URI proxy,
+        // because that would forward every regex-URI request without the
+        // gates.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -15248,7 +16068,8 @@ extensionProviders:
                             "uri": {"regex": "/v[0-9]+/api"},
                             "method": {"regex": "GET|POST"},
                             "headers": {"x-canary": {"regex": "v[0-9]+"}},
-                            "queryParams": {"variant": {"regex": "beta|stable"}}
+                            "queryParams": {"variant": {"regex": "beta|stable"}},
+                            "sourceLabels": {"app": "billing"}
                         }],
                         "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
                     }]
@@ -18010,6 +18831,17 @@ extensionProviders:
     }
 
     #[test]
+    fn istio_duration_secs_max_is_the_largest_projected_value() {
+        // `u64::MAX` milliseconds is the parser's saturation point; mesh slice
+        // decode bounds a carried CORS `max_age` by this value.
+        assert_eq!(
+            parse_istio_duration_secs("18446744073709551615ms"),
+            Some(crate::config_sources::k8s::ISTIO_DURATION_SECS_MAX)
+        );
+        assert_eq!(parse_istio_duration_secs("1e30ms"), None);
+    }
+
+    #[test]
     fn parse_istio_duration_ms_formats() {
         assert_eq!(parse_istio_duration_ms("5s"), Some(5000));
         assert_eq!(parse_istio_duration_ms("1.5s"), Some(1500));
@@ -18976,6 +19808,7 @@ extensionProviders:
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         };
         let slice = MeshSlice::from_gateway_config(&gateway_config, request);
         // Both should match — namespace-default applies to any workload, and
@@ -20639,10 +21472,6 @@ extensionProviders:
         let dr = &mesh.destination_rules[0];
         let tp = dr.traffic_policy.as_ref().expect("traffic policy");
         let http = tp.connection_pool_http.as_ref().expect("http overlay");
-        assert!(
-            http.max_requests_per_connection.is_none(),
-            "maxRequestsPerConnection is validated but deferred, not projected"
-        );
         assert_eq!(http.idle_timeout_ms, Some(300_000));
         assert_eq!(http.http2_max_requests, Some(1000));
         assert!(
@@ -20684,7 +21513,6 @@ extensionProviders:
             .as_ref()
             .unwrap();
         assert_eq!(http.http2_max_requests, Some(500));
-        assert!(http.max_requests_per_connection.is_none());
         assert!(http.idle_timeout_ms.is_none());
     }
 
@@ -20721,10 +21549,6 @@ extensionProviders:
             .connection_pool_http
             .as_ref()
             .expect("port http overlay");
-        assert!(
-            http.max_requests_per_connection.is_none(),
-            "maxRequestsPerConnection is deferred at port level too"
-        );
         assert_eq!(http.idle_timeout_ms, Some(60_000));
         assert_eq!(http.http2_max_requests, Some(200));
         assert!(
@@ -21069,7 +21893,6 @@ extensionProviders:
         );
         assert_eq!(http.http1_max_pending_requests, Some(1024));
         // Unset fields stay None.
-        assert!(http.max_requests_per_connection.is_none());
         assert!(http.idle_timeout_ms.is_none());
     }
 
@@ -21989,7 +22812,7 @@ extensionProviders:
     fn sidecar_ingress_unrecognized_protocol_is_deferred() {
         // A TYPO like `HTPS` must NOT be routed as HTTP or guessed as TCP. The
         // ingress-specific classifier maps it to `Unknown` so resolution defers
-        // it (`NonHttpProtocol`) instead of exposing a mistyped listener.
+        // it (`UnmodeledProtocol`) instead of exposing a mistyped listener.
         let result = translate_k8s_objects(
             &[object(
                 "Sidecar",
@@ -22011,7 +22834,7 @@ extensionProviders:
         assert!(
             matches!(
                 entry.resolve(),
-                Err(crate::modes::mesh::config::IngressListenerUnsupported::NonHttpProtocol)
+                Err(crate::modes::mesh::config::IngressListenerUnsupported::UnmodeledProtocol)
             ),
             "a mistyped protocol must defer, not route"
         );

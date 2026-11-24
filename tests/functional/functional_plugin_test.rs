@@ -624,8 +624,7 @@ async fn test_plugin_ip_restriction() {
             "proxy_id": "proxy-ip-deny",
             "enabled": true,
             "config": {
-                "allow": ["10.0.0.0/8"],
-                "mode": "allow_first"
+                "allow": ["10.0.0.0/8"]
             }
         })],
     )
@@ -646,8 +645,7 @@ async fn test_plugin_ip_restriction() {
             "proxy_id": "proxy-ip-allow",
             "enabled": true,
             "config": {
-                "allow": ["127.0.0.1"],
-                "mode": "allow_first"
+                "allow": ["127.0.0.1"]
             }
         })],
     )
@@ -668,8 +666,7 @@ async fn test_plugin_ip_restriction() {
             "proxy_id": "proxy-ip-deny-explicit",
             "enabled": true,
             "config": {
-                "deny": ["127.0.0.1"],
-                "mode": "deny_first"
+                "deny": ["127.0.0.1"]
             }
         })],
     )
@@ -1972,6 +1969,25 @@ async fn test_plugin_bot_detection() {
         resp.text().await.expect("bot rejection body"),
         r#"{"error":"Forbidden"}"#
     );
+
+    // A present User-Agent carrying a non-UTF-8 obs-text byte is omitted from
+    // the materialized header map. The plugin reads the raw wire block and
+    // fails closed instead of treating it as a missing (allowed) header.
+    let resp = client
+        .get(format!("{}/botdetect/test", harness.proxy_base_url))
+        .header(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_bytes(b"Mozilla/5.0 (x\xFF)")
+                .expect("obs-text header value"),
+        )
+        .send()
+        .await
+        .expect("Request failed");
+    assert_eq!(
+        resp.status().as_u16(),
+        451,
+        "a non-UTF-8 User-Agent must not take the missing-header allow path"
+    );
 }
 
 // ============================================================================
@@ -2219,6 +2235,9 @@ mod waf_wide_charset {
                     "proxy_id": "wide", "enabled": true,
                     "config": {
                         "include_default_rules": false,
+                        // Excluded media must stay releasable below; the
+                        // unlisted-type refusal is covered by its own tests.
+                        "on_unlisted_response_content_type": "allow",
                         "response_inspection": true, "response_body_inspection": true,
                         "custom_rules": [
                             {

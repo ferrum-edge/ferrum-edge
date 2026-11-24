@@ -66,7 +66,7 @@ fn generate_test_token(config: &TestConfig) -> String {
         "jti": uuid::Uuid::new_v4().to_string()
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes()).unwrap();
     encode(&header, &claims, &key).unwrap()
 }
 
@@ -82,7 +82,7 @@ fn generate_expired_test_token(config: &TestConfig) -> String {
         "jti": uuid::Uuid::new_v4().to_string()
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes()).unwrap();
     encode(&header, &claims, &key).unwrap()
 }
 
@@ -129,7 +129,6 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -238,6 +237,7 @@ fn create_test_upstream(id: &str, name: &str) -> Upstream {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -1642,6 +1642,8 @@ async fn test_charges_requires_admin_jwt() {
         .unwrap();
     assert_eq!(invalid.status(), reqwest::StatusCode::UNAUTHORIZED);
 
+    let invalid_body: Value = invalid.json().await.unwrap();
+
     let expired_token = generate_expired_test_token(&tc);
     let expired = client
         .get(format!("{}/charges", base_url))
@@ -1650,6 +1652,46 @@ async fn test_charges_requires_admin_jwt() {
         .await
         .unwrap();
     assert_eq!(expired.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let expired_body: Value = expired.json().await.unwrap();
+
+    let wrong_secret = generate_test_token(&TestConfig {
+        jwt_secret: "a-different-secret-key-for-admin-api".to_string(),
+        ..TestConfig::default()
+    });
+    let bad_signature = client
+        .get(format!("{}/charges", base_url))
+        .header("authorization", format!("Bearer {}", wrong_secret))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_signature.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let bad_signature_body: Value = bad_signature.json().await.unwrap();
+
+    let wrong_issuer = generate_test_token(&TestConfig {
+        jwt_issuer: "some-other-issuer".to_string(),
+        ..TestConfig::default()
+    });
+    let bad_issuer = client
+        .get(format!("{}/charges", base_url))
+        .header("authorization", format!("Bearer {}", wrong_issuer))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_issuer.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let bad_issuer_body: Value = bad_issuer.json().await.unwrap();
+
+    // Every verification failure returns one static body, so an
+    // unauthenticated caller cannot tell expiry from a bad signature,
+    // issuer, or malformed token.
+    let expected = json!({"error": "Token verification failed"});
+    for body in [
+        &invalid_body,
+        &expired_body,
+        &bad_signature_body,
+        &bad_issuer_body,
+    ] {
+        assert_eq!(body, &expected);
+    }
 }
 
 #[tokio::test]
@@ -2307,7 +2349,7 @@ async fn transaction_log_schema_admin_rejects_unknown_closed_object_keys() {
         (
             "unknown-outer",
             json!({"schemas": {"audit": {}}, "strict": true}),
-            "unknown config key \"strict\" at `config`",
+            "`config`: unknown configuration key(s): \"config.strict\"",
         ),
         (
             "unknown-derived",
@@ -2389,12 +2431,22 @@ async fn transaction_log_schema_crud_validates_the_prospective_database_graph() 
 
     let mut renamed = schema.clone();
     renamed["config"] = json!({"schemas": {"renamed": {}}});
-    let (status, body) =
-        admin_put(&base_url, "/plugins/config/schema-owner", &token, &renamed).await;
+    let (status, body) = admin_put(
+        &base_url,
+        "/plugins/config/schema-owner?expected_proxy_ids=",
+        &token,
+        &renamed,
+    )
+    .await;
     assert_eq!(status, 400, "dangling rename was admitted: {body:?}");
     assert!(body.to_string().contains(r#"unknown schema \"audit\""#));
 
-    let (status, body) = admin_delete(&base_url, "/plugins/config/schema-owner", &token).await;
+    let (status, body) = admin_delete(
+        &base_url,
+        "/plugins/config/schema-owner?expected_proxy_ids=",
+        &token,
+    )
+    .await;
     assert_eq!(status, 400, "dangling delete was admitted: {body:?}");
     assert!(body.to_string().contains(r#"unknown schema \"audit\""#));
 }
@@ -2817,7 +2869,7 @@ async fn prometheus_plugin_crud_rejects_a_second_enabled_registry_owner() {
 
     let (status, body) = admin_put(
         &base_url,
-        "/plugins/config/prometheus-owner",
+        "/plugins/config/prometheus-owner?expected_proxy_ids=",
         &token,
         &first,
     )
@@ -2844,7 +2896,7 @@ async fn prometheus_plugin_crud_rejects_a_second_enabled_registry_owner() {
     enabled["enabled"] = json!(true);
     let (status, body) = admin_put(
         &base_url,
-        "/plugins/config/prometheus-disabled",
+        "/plugins/config/prometheus-disabled?expected_proxy_ids=",
         &token,
         &enabled,
     )
@@ -2974,7 +3026,10 @@ async fn test_admin_create_rejects_unknown_jwt_auth_policy_keys() {
             body["error"]
                 .as_str()
                 .expect("admin error string")
-                .contains(&format!("jwt_auth: unknown config key {unknown_key:?}")),
+                .contains(&format!(
+                    "jwt_auth: `config`: unknown configuration key(s): {:?}",
+                    format!("config.{unknown_key}")
+                )),
             "unexpected admin validation response: {body}"
         );
     }
@@ -3331,7 +3386,7 @@ async fn test_admin_create_rejects_malformed_correlation_id_configs() {
         (
             "correlation-unknown-key",
             json!({"echo_downsteam": false}),
-            "correlation_id: unknown config field(s): \"echo_downsteam\"",
+            "correlation_id: `config`: unknown configuration key(s): \"config.echo_downsteam\"",
         ),
         (
             "correlation-managed-header",
@@ -3526,7 +3581,8 @@ async fn test_admin_create_rejects_unknown_ai_prompt_compressor_policy_keys() {
         let error = body["error"].as_str().expect("admin error string");
         assert!(
             error.contains(&format!(
-                "ai_prompt_compressor: unknown config field(s): {unknown_key:?}"
+                "ai_prompt_compressor: `config`: unknown configuration key(s): {:?}",
+                format!("config.{unknown_key}")
             )),
             "unexpected admin validation response: {body}"
         );
@@ -3631,7 +3687,9 @@ async fn test_admin_create_rejects_unknown_adaptive_concurrency_policy_keys() {
         body["error"]
             .as_str()
             .expect("admin error string")
-            .contains("adaptive_concurrency: unknown config key \"max_limt\""),
+            .contains(
+                "adaptive_concurrency: `config`: unknown configuration key(s): \"config.max_limt\""
+            ),
         "unexpected admin validation response: {body}"
     );
 }
@@ -4322,6 +4380,17 @@ async fn restore_rejects_disabled_plugin_config_with_unknown_name_before_delete(
         status, 400,
         "batch must refuse the unknown disabled plugin: {body:?}"
     );
+    // Issue #7216: the unknown name is reported once, not a second time by
+    // the definition check as an "invalid config".
+    let errors = body["validation_errors"].to_string();
+    assert!(
+        errors.contains("unknown plugin name 'does_not_exist'"),
+        "{body:?}"
+    );
+    assert!(
+        !errors.contains("invalid config: Unknown plugin name"),
+        "unknown plugin name reported twice: {body:?}"
+    );
 
     // A disabled config-graph participant keeps its policy screening on both
     // paths: the definition is admitted or refused identically.
@@ -4445,7 +4514,7 @@ async fn plugin_delete_rejects_revealing_global_body_transformer_beside_hmac() {
 
     let (status, body) = admin_delete(
         &base_url,
-        "/plugins/config/delete-shadow-scoped-transformer",
+        "/plugins/config/delete-shadow-scoped-transformer?expected_proxy_ids=delete-shadow-proxy",
         &token,
     )
     .await;
@@ -4991,6 +5060,257 @@ async fn test_restore_rolls_back_prior_config_after_mid_import_failure() {
     );
 }
 
+/// Current owner of the namespace's durable mTLS DNS restore fence, if any.
+async fn mtls_dns_restore_owner(pool: &sqlx::AnyPool, namespace: &str) -> Option<String> {
+    let owner: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT restore_owner FROM mtls_dns_admission_locks WHERE namespace = ?",
+    )
+    .bind(namespace)
+    .fetch_optional(pool)
+    .await
+    .expect("Failed to inspect the mTLS DNS admission fence");
+    owner.flatten()
+}
+
+/// Let any guard-drop cleanup task spawned by the finished request run, so a
+/// retained fence is not observed only because its release is still pending.
+async fn settle_guard_drop_cleanup() {
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+}
+
+async fn restore_fence_test_server(
+    db_name: &str,
+) -> (
+    tempfile::TempDir,
+    sqlx::AnyPool,
+    String,
+    String,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(db_name);
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    let pool = db.pool();
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "proxies": [{
+            "id": "restore-keep",
+            "listen_path": "/keep",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "Seed failed: {:?}", body);
+    (temp_dir, pool, base_url, token, shutdown)
+}
+
+fn restore_fence_failing_import_payload() -> Value {
+    json!({
+        "consumers": [{
+            "id": "restore-partial-consumer",
+            "username": "partial-user",
+            "credentials": {}
+        }],
+        "proxies": [{
+            "id": "restore-fail",
+            "listen_path": "/new",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    })
+}
+
+/// Issue #7032: clear, then an import with errors, then a compensating
+/// rollback that fails. The production finalizer must keep the durable fence
+/// (on the guard explicitly and on its Drop) instead of admitting writes over
+/// the half-restored namespace.
+#[tokio::test]
+async fn mtls_dns_restore_failed_rollback_retains_fence() {
+    let (_temp_dir, pool, base_url, token, _shutdown) =
+        restore_fence_test_server("test_restore_failed_rollback_fence.db").await;
+
+    // The import fails on `restore-fail`; the compensating replay then fails
+    // on the snapshot proxy `restore-keep`.
+    sqlx::query(
+        "CREATE TRIGGER fail_restore_import BEFORE INSERT ON proxies \
+         WHEN NEW.id = 'restore-fail' \
+         BEGIN SELECT RAISE(FAIL, 'injected restore persistence failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to install import fault-injection trigger");
+    sqlx::query(
+        "CREATE TRIGGER fail_restore_rollback BEFORE INSERT ON proxies \
+         WHEN NEW.id = 'restore-keep' \
+         BEGIN SELECT RAISE(FAIL, 'injected rollback persistence failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to install rollback fault-injection trigger");
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &restore_fence_failing_import_payload(),
+    )
+    .await;
+    assert_eq!(status, 500, "Failed restore response: {:?}", body);
+    assert_eq!(
+        body["rollback"].as_str(),
+        Some("incomplete"),
+        "the injected replay failure must make rollback incomplete: {body:?}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("namespace admission guard was retained"),
+        "the response must report the retained fence: {body:?}"
+    );
+
+    settle_guard_drop_cleanup().await;
+    assert!(
+        mtls_dns_restore_owner(&pool, "ferrum").await.is_some(),
+        "a failed rollback must leave the half-restored namespace fenced"
+    );
+}
+
+/// The restore phase drives the finalizer's release: a completed rollback and
+/// a successful restore both clear the durable fence.
+#[tokio::test]
+async fn mtls_dns_restore_completed_rollback_and_success_release_fence() {
+    let (_temp_dir, pool, base_url, token, _shutdown) =
+        restore_fence_test_server("test_restore_completed_rollback_fence.db").await;
+
+    sqlx::query(
+        "CREATE TRIGGER fail_restore_import BEFORE INSERT ON proxies \
+         WHEN NEW.id = 'restore-fail' \
+         BEGIN SELECT RAISE(FAIL, 'injected restore persistence failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to install import fault-injection trigger");
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &restore_fence_failing_import_payload(),
+    )
+    .await;
+    assert_eq!(status, 500, "Failed restore response: {:?}", body);
+    assert_eq!(body["rollback"].as_str(), Some("completed"), "{body:?}");
+    settle_guard_drop_cleanup().await;
+    assert!(
+        mtls_dns_restore_owner(&pool, "ferrum").await.is_none(),
+        "a completed rollback must release the fence"
+    );
+
+    let restore_payload = json!({
+        "proxies": [{
+            "id": "restore-new",
+            "listen_path": "/new",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+    assert_eq!(status, 200, "Restore response: {:?}", body);
+    settle_guard_drop_cleanup().await;
+    assert!(
+        mtls_dns_restore_owner(&pool, "ferrum").await.is_none(),
+        "a successful restore must release the fence"
+    );
+}
+
+/// Issue #7062: lost-lease recovery keeps the restore's original guard across
+/// the namespace lease reacquisition. When that reacquisition is abandoned
+/// (cancelled while another writer holds the lease, or failed), the dropped
+/// guard leaves the half-restored namespace fenced, and a guarded write is
+/// refused until the fence is cleared. Before the fix the recovery released
+/// the old owner first, so nothing held the fence in that window.
+#[tokio::test]
+async fn mtls_dns_restore_abandoned_lost_lease_recovery_keeps_guarded_writes_refused() {
+    for (after_import, db_name) in [
+        (false, "test_restore_lost_clear_recovery_fence.db"),
+        (true, "test_restore_lost_import_recovery_fence.db"),
+    ] {
+        let (temp_dir, pool, base_url, token, _shutdown) = restore_fence_test_server(db_name).await;
+        let db_url = format!(
+            "sqlite:{}?mode=rwc",
+            temp_dir.path().join(db_name).to_string_lossy()
+        );
+        let recovery_db =
+            DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+                .await
+                .expect("Failed to connect the recovery store");
+        let recovery_db: Arc<dyn ferrum_edge::config::db_backend::DatabaseBackend> =
+            Arc::new(recovery_db);
+
+        let abandoned_owner =
+            ferrum_edge::_test_support::admin_abandon_restore_lost_lease_recovery_for_test(
+                recovery_db,
+                "ferrum",
+                after_import,
+            )
+            .await
+            .expect("model the abandoned recovery");
+        settle_guard_drop_cleanup().await;
+        assert_eq!(
+            mtls_dns_restore_owner(&pool, "ferrum").await.as_deref(),
+            Some(abandoned_owner.as_str()),
+            "after_import={after_import}: the abandoned recovery must keep the original owner's fence"
+        );
+
+        let write = json!({
+            "id": "write-after-abandoned-restore",
+            "listen_path": "/after",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        });
+        let (status, body) = admin_post(&base_url, "/proxies", &token, &write).await;
+        assert_eq!(
+            status, 503,
+            "after_import={after_import}: a guarded write over the half-restored namespace must be refused: {body:?}"
+        );
+
+        // Control: the refusal is the fence's. Once an operator clears it, the
+        // same write is admitted.
+        sqlx::query(
+            "UPDATE mtls_dns_admission_locks SET restore_owner = NULL, updated_at = ? \
+             WHERE namespace = ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind("ferrum")
+        .execute(&pool)
+        .await
+        .expect("Failed to clear the mTLS DNS admission fence");
+        let (status, body) = admin_post(&base_url, "/proxies", &token, &write).await;
+        assert_eq!(
+            status, 201,
+            "after_import={after_import}: the write must succeed once the fence is cleared: {body:?}"
+        );
+    }
+}
+
 /// Rollback must faithfully replay the raw pre-restore snapshot even when it
 /// contains a legacy/out-of-band mTLS DNS ambiguity. Normal admission rejects
 /// this state, but applying that new validation to the compensating replay
@@ -5439,7 +5759,10 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
             tags: vec![],
             server_urls: vec![],
             operation_count: 0,
-            resource_hash: String::new(),
+            resource_hash: ferrum_edge::config::store_policy::store_canonical_resource_hash(
+                &bundle,
+            )
+            .expect("bundle resource hash"),
             external_ref_snapshot: None,
             external_ref_digest: None,
             created_at: chrono::Utc::now(),
@@ -5486,7 +5809,10 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
             tags: vec![],
             server_urls: vec![],
             operation_count: 0,
-            resource_hash: String::new(),
+            resource_hash: ferrum_edge::config::store_policy::store_canonical_resource_hash(
+                &bundle,
+            )
+            .expect("bundle resource hash"),
             external_ref_snapshot: None,
             external_ref_digest: None,
             created_at: chrono::Utc::now(),
@@ -7577,7 +7903,7 @@ async fn test_consumer_delete_referenced_by_access_control_returns_409() {
     let consumer = json!({
         "id": "acl-cs",
         "username": "acluser",
-        "credentials": {"keyauth": [{"key": "acl-key-1"}]}
+        "credentials": {"keyauth": [{"key": "acl-key-1-0123456789"}]}
     });
     let (status, body) = admin_post(&base_url, "/consumers", &token, &consumer).await;
     assert_eq!(status, 201, "Create consumer failed: {:?}", body);
@@ -7637,7 +7963,13 @@ async fn test_consumer_delete_referenced_by_access_control_returns_409() {
         "enabled": true,
         "config": {"disallowed_consumers": ["acluser"]}
     });
-    let (status, body) = admin_put(&base_url, "/plugins/config/acl-pc", &token, &deny_only).await;
+    let (status, body) = admin_put(
+        &base_url,
+        "/plugins/config/acl-pc?expected_proxy_ids=",
+        &token,
+        &deny_only,
+    )
+    .await;
     assert_eq!(
         status, 200,
         "Updating access_control to a deny-list must succeed: {:?}",
@@ -7660,6 +7992,131 @@ async fn test_consumer_delete_referenced_by_access_control_returns_409() {
         "successful delete must not rewrite the operator's plugin config: {:?}",
         plugin_body
     );
+}
+
+/// A rename detaches every byte-for-byte `access_control` entry naming the old
+/// username, so `PUT /consumers/{id}` that changes the username is refused with
+/// `409` while one does — on the deny side as well as the allow side, because a
+/// renamed principal would otherwise silently escape its revocation.
+#[tokio::test]
+async fn test_consumer_rename_referenced_by_access_control_returns_409() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let consumer = json!({
+        "id": "acl-rename-cs",
+        "username": "mallory"
+    });
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &consumer).await;
+    assert_eq!(status, 201, "Create consumer failed: {:?}", body);
+
+    let proxy = json!({
+        "id": "acl-rename-px",
+        "listen_path": "/acl-rename",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    let deny_only = json!({
+        "id": "acl-rename-pc",
+        "plugin_name": "access_control",
+        "scope": "proxy",
+        "proxy_id": "acl-rename-px",
+        "enabled": true,
+        "config": {"disallowed_consumers": ["mallory"]}
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &deny_only).await;
+    assert_eq!(status, 201, "Create plugin failed: {:?}", body);
+
+    let renamed = json!({
+        "id": "acl-rename-cs",
+        "username": "m.reyes"
+    });
+    let (status, body) = admin_put(&base_url, "/consumers/acl-rename-cs", &token, &renamed).await;
+    assert_eq!(
+        status, 409,
+        "a rename must be refused while disallowed_consumers names the old username: {:?}",
+        body
+    );
+    assert_eq!(
+        body["error"].as_str().unwrap_or(""),
+        "Consumer is referenced by one or more access_control plugin_configs and cannot be renamed",
+        "409 body must use the documented error string: {:?}",
+        body
+    );
+    let (status, consumer_body, _) = admin_get(&base_url, "/consumers/acl-rename-cs", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        consumer_body["username"], "mallory",
+        "a refused rename must leave the consumer unchanged: {:?}",
+        consumer_body
+    );
+
+    // An update that keeps the username is unaffected by the guard.
+    let regrouped = json!({
+        "id": "acl-rename-cs",
+        "username": "mallory",
+        "acl_groups": ["contractors"]
+    });
+    let (status, body) = admin_put(&base_url, "/consumers/acl-rename-cs", &token, &regrouped).await;
+    assert_eq!(status, 200, "a non-rename update must succeed: {:?}", body);
+
+    // The allow side pins the username too.
+    let allow_only = json!({
+        "id": "acl-rename-pc",
+        "plugin_name": "access_control",
+        "scope": "proxy",
+        "proxy_id": "acl-rename-px",
+        "enabled": true,
+        "config": {"allowed_consumers": ["mallory"]}
+    });
+    let (status, body) = admin_put(
+        &base_url,
+        "/plugins/config/acl-rename-pc?expected_proxy_ids=",
+        &token,
+        &allow_only,
+    )
+    .await;
+    assert_eq!(status, 200, "Updating access_control failed: {:?}", body);
+    let (status, body) = admin_put(&base_url, "/consumers/acl-rename-cs", &token, &renamed).await;
+    assert_eq!(
+        status, 409,
+        "a rename must be refused while allowed_consumers names the old username: {:?}",
+        body
+    );
+
+    // Once the policy names the new username, the rename succeeds.
+    let retargeted = json!({
+        "id": "acl-rename-pc",
+        "plugin_name": "access_control",
+        "scope": "proxy",
+        "proxy_id": "acl-rename-px",
+        "enabled": true,
+        "config": {"allowed_consumers": ["m.reyes"]}
+    });
+    let (status, body) = admin_put(
+        &base_url,
+        "/plugins/config/acl-rename-pc?expected_proxy_ids=",
+        &token,
+        &retargeted,
+    )
+    .await;
+    assert_eq!(status, 200, "Updating access_control failed: {:?}", body);
+    let (status, body) = admin_put(&base_url, "/consumers/acl-rename-cs", &token, &renamed).await;
+    assert_eq!(
+        status, 200,
+        "a rename of an unreferenced username must succeed: {:?}",
+        body
+    );
+    let (status, consumer_body, _) = admin_get(&base_url, "/consumers/acl-rename-cs", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(consumer_body["username"], "m.reyes");
 }
 
 #[tokio::test]
@@ -8054,6 +8511,27 @@ async fn test_upstream_update_rejects_removing_referenced_subset() {
     assert!(
         error.contains("cannot remove subset 'canary'") && error.contains("subset-p1"),
         "Error should identify the referenced subset and proxy: {:?}",
+        body
+    );
+
+    // An update that keeps every stored subset cannot strand a reference and
+    // skips the proxy scan (issue #7209); it must still succeed.
+    let kept = json!({
+        "id": "subset-u1",
+        "name": "subset-upstream",
+        "targets": [
+            {"host": "10.0.0.1", "port": 8080, "weight": 50, "tags": {"version": "stable"}},
+            {"host": "10.0.0.2", "port": 8080, "weight": 100, "tags": {"version": "canary"}}
+        ],
+        "subsets": [
+            {"name": "stable", "labels": {"version": "stable"}},
+            {"name": "canary", "labels": {"version": "canary"}}
+        ]
+    });
+    let (status, body) = admin_put(&base_url, "/upstreams/subset-u1", &token, &kept).await;
+    assert_eq!(
+        status, 200,
+        "keeping every subset must not be refused: {:?}",
         body
     );
 }
@@ -9175,6 +9653,186 @@ async fn batch_rejects_stream_port_conflict_with_persisted_proxy() {
     );
 }
 
+/// Issue #7214: `POST /batch` refuses a stream listener on a reserved gateway
+/// port, as `POST /proxies` does, instead of persisting it for the listener
+/// reconcile to fail on.
+#[tokio::test]
+async fn batch_rejects_stream_proxy_on_reserved_gateway_port() {
+    let tc = TestConfig::default();
+    let (mut state, _dir) = create_db_admin_state(&tc).await;
+    state.reserved_ports = std::collections::HashSet::from([9000u16]);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let stream_proxy = json!({
+        "id": "batch-reserved-port",
+        "backend_scheme": "tcp",
+        "backend_host": "reserved.internal",
+        "backend_port": 5432,
+        "listen_port": 9000
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &stream_proxy).await;
+    assert_eq!(status, 409, "single write must refuse it: {body:?}");
+
+    let batch = json!({"proxies": [stream_proxy]});
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(status, 400, "batch persisted a reserved port: {body:?}");
+    assert!(
+        body["validation_errors"]
+            .to_string()
+            .contains("listen_port 9000 conflicts with a gateway reserved port"),
+        "expected the reserved-port diagnostic: {body:?}"
+    );
+    let (status, _, _) = admin_get(&base_url, "/proxies/batch-reserved-port", &token).await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+}
+
+/// Issue #7214: `POST /batch` runs the same OS bind probe as `POST /proxies`
+/// for a new stream port, so a port another process already holds is refused.
+#[tokio::test]
+async fn batch_rejects_stream_proxy_on_unbindable_port() {
+    let tc = TestConfig::default();
+    let (mut state, _dir) = create_db_admin_state(&tc).await;
+    // Held for the whole test so the probe on the same interface fails.
+    let held = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
+    let occupied_port = held.local_addr().unwrap().port();
+    state.stream_proxy_bind_address = "127.0.0.1".to_string();
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let batch = json!({
+        "proxies": [{
+            "id": "batch-occupied-port",
+            "backend_scheme": "tcp",
+            "backend_host": "occupied.internal",
+            "backend_port": 5432,
+            "listen_port": occupied_port
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(status, 400, "batch persisted an unbindable port: {body:?}");
+    assert!(
+        body["validation_errors"]
+            .to_string()
+            .contains("is not available on the host"),
+        "expected the bind-probe diagnostic: {body:?}"
+    );
+    let (status, _, _) = admin_get(&base_url, "/proxies/batch-occupied-port", &token).await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    drop(held);
+}
+
+/// Issue #7214: `POST /batch` runs the single-write API-spec ownership and
+/// `openapi_validator` admission checks: a batch proxy cannot attach a
+/// spec-owned upstream, and an `openapi_validator` row needs a persisted proxy
+/// with an attached API spec (a batch-created proxy never carries one).
+#[tokio::test]
+async fn batch_runs_api_spec_ownership_and_openapi_validator_checks() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let spec = json!({
+        "openapi": "3.0.3", "info": {"title": "Owned", "version": "1"},
+        "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
+        "x-ferrum-proxy": {"id": "spec-proxy", "listen_path": "/spec-proxy",
+            "backend_host": "backend.example.com", "backend_port": 8080},
+        "x-ferrum-upstream": {"id": "owned-upstream", "name": "owned-upstream",
+            "targets": [{"host": "backend.example.com", "port": 8080}]}
+    });
+    let (status, body) = admin_post(&base_url, "/api-specs", &token, &spec).await;
+    assert_eq!(status, 201, "spec import failed: {body:?}");
+    let hand_proxy = json!({
+        "id": "hand-proxy",
+        "listen_path": "/hand-proxy",
+        "backend_host": "backend.example.com",
+        "backend_port": 8080
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &hand_proxy).await;
+    assert_eq!(status, 201, "hand proxy create failed: {body:?}");
+
+    // A hand-managed proxy cannot attach a spec-owned upstream, as with
+    // `POST /proxies`.
+    let attach = json!({
+        "id": "batch-attach",
+        "listen_path": "/batch-attach",
+        "backend_scheme": "http",
+        "upstream_id": "owned-upstream"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &attach).await;
+    assert_eq!(status, 400, "single write must refuse it: {body:?}");
+    let (status, body) =
+        admin_post(&base_url, "/batch", &token, &json!({"proxies": [attach]})).await;
+    assert_eq!(
+        status, 400,
+        "batch attached a spec-owned upstream: {body:?}"
+    );
+    assert!(
+        body["validation_errors"].to_string().contains(
+            "Proxy 'batch-attach' references upstream_id 'owned-upstream' that is owned by api_spec"
+        ),
+        "expected the ownership diagnostic: {body:?}"
+    );
+    let (status, _, _) = admin_get(&base_url, "/proxies/batch-attach", &token).await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+
+    let validator = |id: &str, proxy_id: &str| {
+        json!({
+            "id": id,
+            "plugin_name": "openapi_validator",
+            "scope": "proxy",
+            "proxy_id": proxy_id,
+            "enabled": true,
+            "config": {}
+        })
+    };
+
+    // Persisted target without an attached API spec.
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({"plugin_configs": [validator("validator-hand", "hand-proxy")]}),
+    )
+    .await;
+    assert_eq!(status, 400, "batch admitted openapi_validator: {body:?}");
+    assert!(
+        body["validation_errors"].to_string().contains(
+            "PluginConfig 'validator-hand': openapi_validator requires a proxy with an attached api_spec"
+        ),
+        "expected the precondition diagnostic: {body:?}"
+    );
+
+    // Target created by the same batch.
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({
+            "proxies": [{
+                "id": "batch-new",
+                "listen_path": "/batch-new",
+                "backend_host": "backend.example.com",
+                "backend_port": 8080
+            }],
+            "plugin_configs": [validator("validator-new", "batch-new")]
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "batch admitted openapi_validator: {body:?}");
+    assert!(
+        body["validation_errors"]
+            .to_string()
+            .contains("proxy 'batch-new' is created by this batch and cannot carry one"),
+        "expected the batch-created-target diagnostic: {body:?}"
+    );
+    let (status, _, _) = admin_get(&base_url, "/proxies/batch-new", &token).await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+}
+
 /// A batch that joins an existing, valid shared-SNI listener group must be
 /// admitted: the port-bucket candidate is re-projected (`resolve_upstream_tls`)
 /// and limited to the ports the batch touches, so neither a half-projected
@@ -10183,7 +10841,7 @@ fn generate_test_token_with_role(config: &TestConfig, role: &str) -> String {
         "jti": uuid::Uuid::new_v4().to_string()
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes()).unwrap();
     encode(&header, &claims, &key).unwrap()
 }
 
@@ -10455,7 +11113,7 @@ async fn plugin_config_put_without_enabled_is_rejected_and_row_stays_disabled() 
 
     let (status, body) = admin_put(
         &base_url,
-        "/plugins/config/put-presence-pc",
+        "/plugins/config/put-presence-pc?expected_proxy_ids=",
         &token,
         &json!({
             "plugin_name": "key_auth",

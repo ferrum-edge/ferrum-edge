@@ -3,19 +3,22 @@
 //! **CA trust chain resolution** (all 8 backend protocol paths follow this):
 //! 1. Proxy-specific CA (`backend_tls_server_ca_cert_path`) → sole trust anchor
 //! 2. Global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`) → sole trust anchor
-//! 3. Neither set → webpki/system roots (secure default)
+//! 3. Neither set → bundled webpki roots (secure default)
 //! 4. Explicit opt-out → `backend_tls_verify_server_cert: false` skips verification
 //!
 //! **CA exclusivity**: When a custom CA is configured, it is the **sole** trust
-//! anchor — webpki/system roots are NOT added. This prevents internal backends
+//! anchor — the bundled webpki roots are NOT added. This prevents internal backends
 //! from being MITMed via any public CA.
 //!
 //! **TLS policy**: Optional hardening via `FERRUM_TLS_CIPHER_SUITES`,
-//! `FERRUM_TLS_MIN_VERSION`, and `FERRUM_TLS_KEY_EXCHANGE_GROUPS`
-//! (`FERRUM_TLS_CURVES` alias). Applied to both inbound listeners and
-//! outbound backend connections.
+//! `FERRUM_TLS_MIN_VERSION`, and `FERRUM_TLS_KEY_EXCHANGE_GROUPS`. Applied to
+//! both inbound listeners and outbound backend connections.
 
 pub mod acme;
+#[cfg(test)]
+mod acme_final_publication_tests;
+#[cfg(test)]
+mod acme_renewal_resume_tests;
 pub mod backend;
 pub mod client_trust;
 pub mod crl_policy;
@@ -26,10 +29,6 @@ pub mod inventory_cache;
 // Renewal-lease coordination is consumed by the `acme`-feature renewal
 // scheduler and by external tests; the default (no-`acme`) build compiles it
 // unused, so suppress dead-code warnings for the whole module.
-#[cfg(test)]
-mod acme_final_publication_tests;
-#[cfg(test)]
-mod acme_renewal_resume_tests;
 #[allow(dead_code)]
 pub mod lease;
 pub mod managed;
@@ -44,13 +43,11 @@ pub mod shared_store;
 #[cfg(test)]
 mod shared_store_tests;
 pub mod source;
+#[allow(dead_code)]
+pub mod spiffe;
 #[cfg(test)]
 mod store_atomicity_tests;
 pub(crate) mod store_dir;
-// `spiffe` exposes Phase A scaffolding for Phase C — every public item is
-// dead from the binary's perspective until a later phase wires it in.
-#[allow(dead_code)]
-pub mod spiffe;
 
 pub use client_trust::{
     ClientTrustAdmission, ClientTrustMaterial, ClientTrustScope, ClientTrustSession,
@@ -759,7 +756,7 @@ impl TlsPolicy {
         info!(
             "TLS policy: version_count={} (`FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_MAX_VERSION`), \
              cipher_suite_count={} (`FERRUM_TLS_CIPHER_SUITES`), \
-             group_count={} (`FERRUM_TLS_CURVES`); \
+             group_count={} (`FERRUM_TLS_KEY_EXCHANGE_GROUPS`); \
              `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` value withheld",
             versions.len(),
             cipher_suites.len(),
@@ -988,14 +985,14 @@ fn parse_kx_groups(
             "secp384r1" | "p-384" | "p384" => rustls::NamedGroup::secp384r1,
             unknown => {
                 return Err(anyhow::anyhow!(
-                    "`FERRUM_TLS_CURVES`: Unknown curve/group {:?}. Supported: `X25519`, `secp256r1` (`P-256`), `secp384r1` (`P-384`)",
+                    "`FERRUM_TLS_KEY_EXCHANGE_GROUPS`: Unknown curve/group {:?}. Supported: `X25519`, `secp256r1` (`P-256`), `secp384r1` (`P-384`)",
                     unknown
                 ));
             }
         };
         let group = lookup_kx_group(provider, group_name).ok_or_else(|| {
             anyhow::anyhow!(
-                "`FERRUM_TLS_CURVES`: Curve/group {:?} is not implemented by the crypto provider in this build. See \
+                "`FERRUM_TLS_KEY_EXCHANGE_GROUPS`: Curve/group {:?} is not implemented by the crypto provider in this build. See \
                  `docs/fips.md` for the groups available in a FIPS build.",
                 name
             )
@@ -1004,7 +1001,7 @@ fn parse_kx_groups(
     }
     if groups.is_empty() {
         return Err(anyhow::anyhow!(
-            "`FERRUM_TLS_CURVES`: No curves/groups specified"
+            "`FERRUM_TLS_KEY_EXCHANGE_GROUPS`: No curves/groups specified"
         ));
     }
     Ok(groups)
@@ -1112,9 +1109,7 @@ pub fn load_frontend_tls_candidate_from_paths(
 ///
 /// Existing path strings are parsed as [`CertSource::Path`]. Inline PEM is
 /// accepted without writing temporary files, and `file://` URIs share the same
-/// file loader. Other typed URI schemes parse successfully but are rejected here
-/// until their provider loaders are wired in later phases.
-#[allow(dead_code)]
+/// file loader.
 #[allow(clippy::too_many_arguments)]
 pub fn load_tls_config_with_client_auth_from_sources(
     cert_source: &CertSource,
@@ -1139,10 +1134,6 @@ pub fn load_tls_config_with_client_auth_from_sources(
     )
 }
 
-// Retained as the source-typed projection of the frontend loader. Live callers
-// go through `load_frontend_tls_candidate`, so the bin target sees this only
-// from `tests/`.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
     cert_source: &CertSource,
@@ -1191,6 +1182,11 @@ pub struct AcceptedClientTrust {
     /// Semantic client-CA / CRL identity of exactly the material `verifier` was
     /// built from.
     pub material: client_trust::ClientTrustMaterial,
+    /// Whether `verifier` enforces a nonempty CRL set. A second family that
+    /// adopts the verifier (the HTTP/3 endpoint) must then disable session
+    /// resumption too, so every handshake reaches the CRL expiry check
+    /// (issue #6538). Always `false` when `verifier` is `None`.
+    pub crls_enforced: bool,
 }
 
 impl std::fmt::Debug for AcceptedClientTrust {
@@ -1435,8 +1431,10 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
                 client_auth_roots.len()
             );
 
-            let mut verifier_builder =
-                rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
+            let mut verifier_builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(client_auth_roots),
+                tls_policy.crypto_provider.clone(),
+            );
             verifier_builder = crl_policy::apply_client_crl_policy(verifier_builder, crls);
             if !crls.is_empty() {
                 info!(
@@ -1474,6 +1472,7 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
         *out = Some(AcceptedClientTrust {
             verifier: client_cert_verifier.clone(),
             material,
+            crls_enforced: client_auth_enforced && !crls.is_empty(),
         });
     }
 
@@ -1545,21 +1544,24 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
     // always set 0 here. Proxy-specific call sites apply early_data_max_size
     // via Arc::get_mut() after this returns — see modes/*.rs.
     config.max_early_data_size = 0;
-    if client_auth_enforced && handshake_scope.is_some() {
-        // TLS 1.3 session tickets and the stateful cache do not re-run client
-        // certificate verification. After a CRL or client-CA withdrawal the
-        // next handshake must meet the accepted verifier, not a ticket issued
-        // under the withdrawn generation.
-        //
-        // Gated on `handshake_scope` — i.e. on this listener participating in
-        // client-trust binding at all, which callers set only under
-        // `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`. Without live reload no
-        // generation can ever advance, there is no withdrawn generation a
-        // ticket could outlive, and disabling resumption would be a pure
-        // handshake-cost regression on every static mTLS listener. Keep the
-        // "cost when disabled is zero" contract this feature documents.
-        config.send_tls13_tickets = 0;
-        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    // Resumed TLS 1.2/1.3 handshakes do not re-run client-certificate
+    // verification, so resumption is disabled whenever a later handshake must
+    // reach the verifier:
+    //
+    // - the verifier enforces a nonempty CRL set (issue #6538). Its
+    //   `nextUpdate` check runs only on a full handshake, so without this a
+    //   client admitted before a CRL expired could keep resuming afterwards,
+    //   including on a static listener without live reload.
+    // - the listener is bound to a client-trust scope (`handshake_scope` is set
+    //   only under `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`), so an accepted
+    //   client-CA or CRL withdrawal can land mid-life and the next handshake
+    //   must meet the accepted verifier, not a session from the withdrawn
+    //   generation.
+    //
+    // A static mTLS listener without CRLs keeps normal resumption: nothing it
+    // enforces can change or expire while the process runs.
+    if client_auth_enforced && (handshake_scope.is_some() || !crls.is_empty()) {
+        disable_server_session_resumption(&mut config);
     }
 
     Ok(Arc::new(config))
@@ -1946,8 +1948,9 @@ pub fn svid_rotating_mesh_server_identity(
     }))
 }
 
-/// The process-default rustls crypto provider (startup installs ring before
-/// any TLS work), with a ring fallback for test contexts that skip install.
+/// The process-default rustls crypto provider (startup installs the
+/// build-selected provider before any TLS work), with the same build-selected
+/// base provider as the fallback for test contexts that skip install.
 fn default_crypto_provider() -> Arc<CryptoProvider> {
     CryptoProvider::get_default()
         .cloned()
@@ -1967,12 +1970,19 @@ pub fn load_mesh_server_identity(
     key_path: &str,
     cert_expiry_warning_days: u64,
 ) -> Result<Arc<MeshServerIdentity>, anyhow::Error> {
-    check_cert_expiry(cert_path, "mesh server TLS cert", cert_expiry_warning_days)?;
-
+    // Load the certificate once and check expiry on the bytes that will be
+    // served: a second read could fetch a provider source twice and check one
+    // rotation generation while storing another.
     let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
     let key_source = CertSource::parse(key_path, MaterialKind::Key);
     let cert_material = load_material_blocking(&cert_source, MaterialKind::Cert)
         .map_err(|error| material_load_error("mesh server TLS cert", error))?;
+    check_cert_expiry_from_pem_bytes(
+        cert_material.bytes.expose_secret(),
+        "mesh server TLS cert",
+        &cert_material.display_source_id,
+        cert_expiry_warning_days,
+    )?;
     let key_material = load_material_blocking(&key_source, MaterialKind::Key)
         .map_err(|error| material_load_error("mesh server TLS private key", error))?;
 
@@ -2058,6 +2068,7 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
         .with_protocol_versions(&tls_policy.protocol_versions)
         .map_err(|e| anyhow::anyhow!("Failed to set TLS protocol versions: {}", e))?;
 
+    let mut spiffe_verifier_installed = false;
     let mut config = match client_auth {
         MeshClientAuth::Required | MeshClientAuth::Optional => {
             // When a SPIFFE verifier is supplied (gateway SVID bundle is
@@ -2071,6 +2082,7 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
             // operator-CA path below; the `crls` arg here applies only to that
             // operator-CA fallback for deployments without gateway SVID material.
             if let Some(verifier) = spiffe_client_verifier {
+                spiffe_verifier_installed = true;
                 info!(
                     mesh_client_auth = ?client_auth,
                     "Mesh TLS configuration loaded with SPIFFE trust-domain-validating \
@@ -2097,7 +2109,10 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
                 )?;
 
                 let mut verifier_builder =
-                    rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
+                    rustls::server::WebPkiClientVerifier::builder_with_provider(
+                        Arc::new(client_auth_roots),
+                        tls_policy.crypto_provider.clone(),
+                    );
 
                 if client_auth == MeshClientAuth::Optional {
                     verifier_builder = verifier_builder.allow_unauthenticated();
@@ -2150,6 +2165,19 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
         rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size);
     config.max_early_data_size = 0;
 
+    // Resumption skips the client-certificate verifier (issue #6538). Disable
+    // it whenever a later handshake must reach that verifier:
+    // - the SPIFFE verifier reads the enforced CRL records and the peer trust
+    //   bundles live on every handshake (issue #5574), so a published
+    //   revocation or trust withdrawal must apply to the peer's next
+    //   handshake, not only to its next full one;
+    // - the operator-CA verifier enforces a nonempty CRL set, whose
+    //   `nextUpdate` check runs only on a full handshake.
+    let operator_ca_crls_enforced = client_auth != MeshClientAuth::None && !crls.is_empty();
+    if spiffe_verifier_installed || operator_ca_crls_enforced {
+        disable_server_session_resumption(&mut config);
+    }
+
     Ok(Arc::new(config))
 }
 
@@ -2194,14 +2222,101 @@ pub fn enable_early_data(_config: &mut Arc<ServerConfig>, tls_policy: &TlsPolicy
     }
 }
 
-/// Enable TLS session resumption on an outbound `ClientConfig` using the shared
-/// `FERRUM_TLS_SESSION_CACHE_SIZE` knob; falls back to 4096 when no policy is set.
+/// Configure outbound resumption for the CRLs actually enforced by the verifier.
+///
+/// Resumed TLS 1.2/1.3 handshakes skip certificate reverification, so a ticket
+/// could outlive a CRL's `nextUpdate`. Disable resumption for a nonempty enforced
+/// set; each new connection must reach the verifier's expiration check. This
+/// also costs full handshakes for uncovered issuers sharing the config, whose
+/// chains are unknown until the handshake. Established connections are intact.
+///
+/// Pass an empty slice when verification is disabled. Without enforced CRLs,
+/// retain `FERRUM_TLS_SESSION_CACHE_SIZE` (4096 when no policy is set).
 pub fn apply_client_session_resumption(
     config: &mut rustls::ClientConfig,
     tls_policy: Option<&TlsPolicy>,
+    enforced_crls: &[CertificateRevocationListDer<'static>],
 ) {
+    if !enforced_crls.is_empty() {
+        apply_crl_enforced_client_resumption(config, enforced_crls);
+        return;
+    }
     let cache_size = tls_policy.map(|p| p.session_cache_size).unwrap_or(4096);
     config.resumption = rustls::client::Resumption::in_memory_sessions(cache_size);
+}
+
+/// Disable outbound resumption when the verifier enforces a nonempty CRL set.
+///
+/// The one resumption policy every cached CRL-enforcing `ClientConfig` shares
+/// (backend builder, health probes, rustls logging sinks, LDAP, SMTP). With no
+/// enforced CRLs, the config's existing resumption setting is left untouched.
+/// Pass an empty slice when verification is disabled.
+pub fn apply_crl_enforced_client_resumption(
+    config: &mut rustls::ClientConfig,
+    enforced_crls: &[CertificateRevocationListDer<'static>],
+) {
+    if !enforced_crls.is_empty() {
+        config.resumption = rustls::client::Resumption::disabled();
+    }
+}
+
+/// A ticketer that never issues a ticket and never decrypts one.
+///
+/// rustls keeps its own equivalent private. Setting `send_tls13_tickets` to 0
+/// alone does not stop TLS 1.2 (RFC 5077) tickets: a TLS 1.2 client that
+/// offers the SessionTicket extension still receives one from an enabled
+/// ticketer and can resume with it.
+#[derive(Debug)]
+struct NoSessionTickets;
+
+impl rustls::server::ProducesTickets for NoSessionTickets {
+    fn enabled(&self) -> bool {
+        false
+    }
+
+    fn lifetime(&self) -> u32 {
+        0
+    }
+
+    fn encrypt(&self, _plain: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn decrypt(&self, _cipher: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// Disable every inbound session-resumption mechanism on `config`.
+///
+/// A resumed TLS 1.2 or TLS 1.3 handshake restores the client certificate
+/// chain from the session and never calls the client-certificate verifier.
+/// This turns off all three ways a client could skip it: TLS 1.3 tickets
+/// (stateless or stateful), TLS 1.2 RFC 5077 tickets, and the TLS 1.2
+/// session-ID cache. Established connections are unaffected.
+pub fn disable_server_session_resumption(config: &mut ServerConfig) {
+    config.send_tls13_tickets = 0;
+    config.ticketer = Arc::new(NoSessionTickets);
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+}
+
+/// Inbound twin of [`apply_crl_enforced_client_resumption`] (issue #6538).
+///
+/// When the installed client-certificate verifier enforces a nonempty CRL
+/// set, every new connection must reach the verifier, whose
+/// `enforce_revocation_expiration()` check refuses a chain once its
+/// authoritative CRL passes `nextUpdate`. A resumed session skips that check,
+/// so a client admitted before `nextUpdate` could otherwise keep reconnecting
+/// afterwards. This holds whether or not frontend live reload is enabled.
+/// Pass an empty slice when no verifier is installed or no CRL is enforced;
+/// the config's existing resumption settings are then left untouched.
+pub fn apply_crl_enforced_server_resumption(
+    config: &mut ServerConfig,
+    enforced_crls: &[CertificateRevocationListDer<'static>],
+) {
+    if !enforced_crls.is_empty() {
+        disable_server_session_resumption(config);
+    }
 }
 
 /// Validate that the backend TLS policy can be converted into a QUIC-capable
@@ -2244,8 +2359,16 @@ pub fn validate_backend_tls_policy_for_quic(policy: &TlsPolicy) -> Result<(), an
 /// This ensures outbound connections enforce the same TLS settings (cipher suites,
 /// min/max protocol versions, key exchange groups) as inbound listeners.
 ///
-/// Falls back to `ClientConfig::builder()` (using the installed global default
-/// `CryptoProvider`) when no `TlsPolicy` is available — e.g., in unit tests.
+/// With no `TlsPolicy` this is rustls's `ClientConfig` builder with the provider
+/// named explicitly: the seam's provider and rustls's safe default protocol
+/// versions. Ferrum-owned clients that take the build defaults (log sinks,
+/// health probes) call it that way instead of the provider-less builder, which
+/// reads rustls's process-default provider and, when none is installed, the one
+/// its crate features name. The ordinary build links both of rustls's
+/// providers (see `fips::aead_backend`), so that fallback is ambiguous there
+/// and the provider-less call panics. Naming the provider keeps these
+/// constructors independent of process-global state; it is the same provider
+/// bootstrap installs as the process default.
 pub fn backend_client_config_builder(
     tls_policy: Option<&TlsPolicy>,
 ) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, anyhow::Error> {
@@ -2322,9 +2445,16 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        crate::fips::base_crypto_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        // rustls asks on every ClientHello. The base provider is fixed at
+        // compile time, so resolve its schemes once instead of building a
+        // provider (and its suite and group `Vec`s) per handshake.
+        static SCHEMES: std::sync::LazyLock<Vec<rustls::SignatureScheme>> =
+            std::sync::LazyLock::new(|| {
+                crate::fips::base_crypto_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            });
+        SCHEMES.clone()
     }
 }
 
@@ -2334,10 +2464,6 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 /// When `crls` is non-empty, CRL revocation checking is enabled with the shared
 /// policy in [`crl_policy`], the same one used by H1/H2 frontend mTLS, the mesh
 /// operator-CA path, backend server verification, SPIFFE, and DTLS.
-// Verifier-only projection. Production callers need the paired trust identity
-// and use `build_client_cert_verifier_candidate`, so the bin target sees this
-// only from `tests/`.
-#[allow(dead_code)]
 pub fn build_client_cert_verifier(
     ca_bundle_path: &str,
     crls: &[CertificateRevocationListDer<'static>],
@@ -2357,6 +2483,8 @@ pub struct ClientCertVerifierCandidate {
     pub verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
     /// Semantic identity of the same anchors and CRLs.
     pub material: client_trust::ClientTrustMaterial,
+    /// Whether the verifier enforces a nonempty CRL set (issue #6538).
+    pub crls_enforced: bool,
 }
 
 /// [`build_client_cert_verifier`] that also returns the trust identity of the
@@ -2381,8 +2509,10 @@ pub fn build_client_cert_verifier_candidate(
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    let mut verifier_builder =
-        rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
+    let mut verifier_builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(client_auth_roots),
+        Arc::new(crate::fips::base_crypto_provider()),
+    );
     verifier_builder = crl_policy::apply_client_crl_policy(verifier_builder, crls);
     if !crls.is_empty() {
         info!(
@@ -2394,7 +2524,11 @@ pub fn build_client_cert_verifier_candidate(
     let verifier = verifier_builder
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build client certificate verifier: {}", e))?;
-    Ok(ClientCertVerifierCandidate { verifier, material })
+    Ok(ClientCertVerifierCandidate {
+        verifier,
+        material,
+        crls_enforced: !crls.is_empty(),
+    })
 }
 
 /// Check X.509 certificate expiration for a PEM certificate file.
@@ -2635,15 +2769,6 @@ mod tests {
         assert!(identity.is_svid_rotating());
     }
 
-    fn new_test_client_config() -> rustls::ClientConfig {
-        let provider = Arc::new(crate::fips::base_crypto_provider());
-        rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .expect("default protocol versions")
-            .with_root_certificates(rustls::RootCertStore::empty())
-            .with_no_client_auth()
-    }
-
     fn new_test_server_config() -> rustls::ServerConfig {
         let key_pair =
             rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
@@ -2665,25 +2790,6 @@ mod tests {
             .with_no_client_auth()
             .with_single_cert(certs, private_key)
             .expect("server cert")
-    }
-
-    #[test]
-    fn apply_client_session_resumption_compiles_and_runs() {
-        let mut config = new_test_client_config();
-        apply_client_session_resumption(&mut config, None);
-    }
-
-    #[test]
-    fn apply_client_session_resumption_with_policy() {
-        let policy = TlsPolicy {
-            protocol_versions: vec![&rustls::version::TLS13],
-            crypto_provider: Arc::new(crate::fips::base_crypto_provider()),
-            prefer_server_cipher_order: false,
-            session_cache_size: 123,
-            early_data_max_size: 0,
-        };
-        let mut config = new_test_client_config();
-        apply_client_session_resumption(&mut config, Some(&policy));
     }
 
     #[tokio::test]

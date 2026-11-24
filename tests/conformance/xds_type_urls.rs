@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, HashMap};
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, MtlsMode,
-    PeerAuthentication, RuntimeValue, ServicePort, Workload, WorkloadPort, WorkloadRef,
-    WorkloadSelector,
+    PeerAuthentication, PolicyScope, RuntimeValue, ServicePort, Workload, WorkloadPort,
+    WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::xds::{
@@ -76,11 +76,12 @@ fn slice_with_one_service() -> MeshSlice {
     let peer_auth = PeerAuthentication {
         name: "strict".to_string(),
         namespace: "default".to_string(),
-        scope: None,
-        selector: Some(WorkloadSelector {
-            labels: HashMap::from([("app".to_string(), "echo".to_string())]),
-            namespace: None,
-        }),
+        scope: PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "echo".to_string())]),
+                namespace: Some("default".to_string()),
+            },
+        },
         mtls_mode: MtlsMode::Strict,
         port_overrides: HashMap::new(),
     };

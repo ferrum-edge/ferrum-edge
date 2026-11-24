@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::Duration;
+use tracing::warn;
 
 use super::utils::log_schema::{SchemaCapabilities, SummarySchema, resolve_schema};
 #[cfg(test)]
@@ -34,10 +35,10 @@ use super::utils::summary_log_budget::serialize_under_byte_budget;
 use super::utils::{
     BatchConfig, BatchConfigDefaults, ByteBudget, DeferredBatchingLogger, PluginHttpClient,
     QueuedSummaryPayload, admit_byte_limits, admit_http_summary, admit_stream_summary,
-    assemble_ndjson, build_batch_config, parse_socket_host, resolve_tcp_endpoint,
+    assemble_ndjson, build_batch_config, parse_socket_host, resolve_socket_endpoint,
     validate_batch_config,
 };
-use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCache;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -175,6 +176,7 @@ impl TcpLogging {
                 http_client.tls_no_verify(),
                 http_client.tls_ca_bundle_path(),
                 http_client.tls_crls(),
+                Some(&http_client),
             )?;
             let server_name_str = tls_server_name_override
                 .as_deref()
@@ -280,8 +282,16 @@ impl Plugin for TcpLogging {
         "tcp_logging"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::TCP_LOGGING
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::LOG
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -313,6 +323,17 @@ impl Plugin for TcpLogging {
             summary,
             self.schema.as_deref(),
         );
+    }
+
+    /// WebSocket session end, emitted as the shared session-end record every
+    /// log sink writes (`WsDisconnectContext::session_end_summary`, issue
+    /// #7144) through the same admission path as `log`.
+    fn requires_ws_disconnect_hooks(&self) -> bool {
+        true
+    }
+
+    async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
+        self.log(&ctx.session_end_summary()).await;
     }
 
     async fn log(&self, summary: &TransactionSummary) {
@@ -365,7 +386,7 @@ async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
     let port = cfg.port;
     let establish = async {
         let socket_addr =
-            resolve_tcp_endpoint(&cfg.host, cfg.port, cfg.dns_cache.as_ref(), "tcp_logging")
+            resolve_socket_endpoint(&cfg.host, cfg.port, cfg.dns_cache.as_ref(), "tcp_logging")
                 .await?;
         let addr_log = format!("{host_log} ({socket_addr})");
         let stream = TcpStream::connect(socket_addr)
@@ -394,6 +415,14 @@ async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
     }
 }
 
+/// A rustls `ClientConfig` builder with the provider named explicitly, so the
+/// sink does not depend on a process-default provider having been installed.
+fn tls_client_config_builder()
+-> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, String> {
+    crate::tls::backend_client_config_builder(None)
+        .map_err(|_| "TCP logging: failed to build TLS client configuration".to_string())
+}
+
 /// Build the TLS connector for the TCP log sink.
 ///
 /// Performs the synchronous CA-bundle read + PEM parse and the verifier build
@@ -401,10 +430,11 @@ async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
 /// blocks a tokio worker thread re-reading the filesystem on reconnect
 /// (finding #74). The result is an `Arc<ClientConfig>`-backed connector that is
 /// cheap to clone per reconnect.
-fn build_tls_connector(
+pub(crate) fn build_tls_connector(
     tls_no_verify: bool,
     tls_ca_bundle_path: Option<&str>,
     tls_crls: &[CertificateRevocationListDer<'static>],
+    live_source: Option<&PluginHttpClient>,
 ) -> Result<tokio_rustls::TlsConnector, String> {
     // Materialize a declared custom bundle even when verification is disabled.
     // An explicit but malformed source is still a configuration error.
@@ -429,9 +459,13 @@ fn build_tls_connector(
         .transpose()?;
 
     let tls_config = if tls_no_verify {
-        rustls::ClientConfig::builder()
+        // The shared verifier advertises the active crypto provider's
+        // signature schemes (the FIPS provider on a FIPS build), never a
+        // hard-coded list.
+        warn!("TCP logging TLS certificate verification DISABLED (FERRUM_TLS_NO_VERIFY)");
+        tls_client_config_builder()?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
             .with_no_client_auth()
     } else {
         let root_store = if let Some(root_store) = custom_root_store {
@@ -442,67 +476,40 @@ fn build_tls_connector(
 
         // Apply gateway CRL list (`FERRUM_TLS_CRL_FILE_PATH`) so that revoked
         // log-sink certificates are rejected, matching the proxy backend / DTLS
-        // / frontend mTLS surfaces. The shared `tls::crl_policy` (applied inside
-        // `build_server_verifier_with_crls`) decides the posture.
-        let verifier = crate::tls::build_server_verifier_with_crls(root_store, tls_crls)
-            .map_err(|_| "TCP logging: failed to build TLS verifier".to_string())?;
-        rustls::ClientConfig::builder()
-            .with_webpki_verifier(verifier)
-            .with_no_client_auth()
+        // / frontend mTLS surfaces. With a live source the verifier follows
+        // CRL generations after a backend TLS reload (#6651); otherwise the
+        // shared `tls::crl_policy` (applied inside
+        // `build_server_verifier_with_crls`) decides the posture over the
+        // snapshot list.
+        match live_source {
+            Some(client) => {
+                let verifier = client
+                    .crl_server_verifier(root_store)
+                    .map_err(|_| "TCP logging: failed to build TLS verifier".to_string())?;
+                let mut config = tls_client_config_builder()?
+                    .dangerous()
+                    .with_custom_certificate_verifier(verifier)
+                    .with_no_client_auth();
+                if client.enforces_gateway_crls() {
+                    config.resumption = rustls::client::Resumption::disabled();
+                }
+                config
+            }
+            None => {
+                let verifier = crate::tls::build_server_verifier_with_crls(root_store, tls_crls)
+                    .map_err(|_| "TCP logging: failed to build TLS verifier".to_string())?;
+                let mut config = tls_client_config_builder()?
+                    .with_webpki_verifier(verifier)
+                    .with_no_client_auth();
+                // The connector is reused across reconnects; resumption would skip the
+                // CRL expiration check on a resumed handshake.
+                crate::tls::apply_crl_enforced_client_resumption(&mut config, tls_crls);
+                config
+            }
+        }
     };
 
     Ok(tokio_rustls::TlsConnector::from(Arc::new(tls_config)))
-}
-
-/// No-op TLS certificate verifier for `tls_no_verify` mode.
-#[derive(Debug)]
-struct NoVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for NoVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::ED448,
-        ]
-    }
 }
 
 async fn send_batch(
@@ -686,9 +693,15 @@ mod tests {
             "private key should be present",
         );
         let server_config = must(
-            rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(cert_chain, key),
+            must(
+                rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+                    crate::fips::base_crypto_provider(),
+                ))
+                .with_safe_default_protocol_versions(),
+                "select TLS protocol versions",
+            )
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key),
             "build TLS server config",
         );
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
@@ -779,7 +792,7 @@ mod tests {
         // Reach into `connect_tcp` directly so the handshake error surfaces
         // synchronously rather than being swallowed by the batching task.
         let tls_connector = must(
-            build_tls_connector(false, Some(path_str(&ca_path)), &crl_list),
+            build_tls_connector(false, Some(path_str(&ca_path)), &crl_list, None),
             "build TLS connector",
         );
         let cfg = TcpFlushConfig {
@@ -825,7 +838,7 @@ mod tests {
         let port = spawn_tls_server(&leaf_pem, &leaf_key_pem).await;
 
         let tls_connector = must(
-            build_tls_connector(false, Some(path_str(&ca_path)), &[]),
+            build_tls_connector(false, Some(path_str(&ca_path)), &[], None),
             "build TLS connector",
         );
         let cfg = TcpFlushConfig {
@@ -845,6 +858,86 @@ mod tests {
             result.is_ok(),
             "Empty CRL must allow the unrevoked cert to connect, got: {:?}",
             result.err()
+        );
+    }
+
+    /// A CRL refresh published after the connector was built reaches the
+    /// sink's verifier: the same connector first accepts the leaf, then
+    /// rejects it once the shared list revokes it (#6651 item 4).
+    #[tokio::test]
+    async fn test_tcp_logging_follows_live_crl_generation() {
+        ensure_crypto_provider();
+
+        let (ca_issuer, ca_pem) = generate_ca();
+        let (leaf_pem, leaf_key_pem, leaf_serial) =
+            generate_signed_leaf(&ca_issuer, &["localhost", "127.0.0.1"]);
+
+        let td = must(tempfile::tempdir(), "create tempdir");
+        let ca_path = td.path().join("ca.pem");
+        must(std::fs::write(&ca_path, &ca_pem), "write CA PEM");
+
+        let parse_crls = |pem: &str| -> crate::tls::CrlList {
+            Arc::new(
+                rustls::pki_types::CertificateRevocationListDer::pem_slice_iter(pem.as_bytes())
+                    .filter_map(|c| c.ok())
+                    .collect(),
+            )
+        };
+        // A non-revoking CRL from the same CA: selects the CRL posture (and
+        // its live verifier) without revoking the leaf yet.
+        let initial_crls = parse_crls(&generate_crl_pem(&ca_issuer, &[]));
+        assert_eq!(initial_crls.len(), 1);
+        let shared = crate::tls::shared_crl_list(initial_crls.clone());
+
+        let http_client = PluginHttpClient::new(
+            &crate::config::PoolConfig::default(),
+            crate::dns::DnsCache::new(crate::dns::DnsConfig::default()),
+            1000,
+            0,
+            100,
+            false,
+            Some(path_str(&ca_path)),
+            initial_crls,
+            "ferrum",
+            crate::config::BackendEgressPolicy::unrestricted(),
+            std::sync::Arc::new(Vec::new()),
+            0,
+        )
+        .with_live_crls(shared.clone());
+
+        let port = spawn_tls_server(&leaf_pem, &leaf_key_pem).await;
+        let tls_connector = must(
+            build_tls_connector(false, Some(path_str(&ca_path)), &[], Some(&http_client)),
+            "build TLS connector",
+        );
+        let cfg = TcpFlushConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            tls: Some(TcpTlsRuntime {
+                connector: tls_connector,
+                server_name: ServerName::try_from("localhost".to_string())
+                    .expect("localhost is a valid server name"),
+            }),
+            connect_timeout: Duration::from_secs(2),
+            write_timeout: Duration::from_secs(2),
+            dns_cache: None,
+        };
+        assert!(
+            connect_tcp(&cfg).await.is_ok(),
+            "leaf must connect before the CRL refresh revokes it"
+        );
+
+        shared.store(parse_crls(&generate_crl_pem(
+            &ca_issuer,
+            std::slice::from_ref(&leaf_serial),
+        )));
+        let err = match connect_tcp(&cfg).await {
+            Ok(_) => panic!("TLS handshake must fail after the live CRL revokes the leaf"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("TLS handshake failed") || err.contains("revoked"),
+            "Expected revocation/handshake error, got: {err}"
         );
     }
 
@@ -870,7 +963,7 @@ mod tests {
         });
 
         let tls_connector = must(
-            build_tls_connector(true, None, &[]),
+            build_tls_connector(true, None, &[], None),
             "build no-verify connector",
         );
         let cfg = TcpFlushConfig {

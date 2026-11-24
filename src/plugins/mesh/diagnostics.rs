@@ -27,8 +27,10 @@ impl Schema {
         match self {
             Self::Slice => SLICE,
             Self::Policy => "name namespace scope rules",
-            Self::Route => "rules reject_unmatched",
-            Self::Registry => "registry reject_status outbound_listen_ports namespace",
+            Self::Route => "rules reject_unmatched weighted_splits",
+            Self::Registry => {
+                "registry reject_status outbound_listen_ports namespace wildcard_match"
+            }
             Self::Direction => "server client",
             Self::Provider => "kind config",
             Self::Fields(fields) => fields,
@@ -38,10 +40,13 @@ impl Schema {
 
     fn child(self, field: &str) -> Self {
         match (self, field) {
-            (Self::Slice, "mesh_policies") => Self::Policy,
+            (Self::Slice, "mesh_policies" | "node_waypoint_capture_mesh_policies") => Self::Policy,
             (Self::Slice, "revision") => Self::Fields("authority sequence"),
             (Self::Slice, "service_waypoint_bound_services") => Self::Fields("namespace name"),
             (Self::Slice, "node_waypoint_assertors") => Self::Fields("spiffe_id asserts"),
+            (Self::Slice, "destination_rule_host_exclusions") => {
+                Self::Fields("namespace name rule_host host")
+            }
             (Self::Slice, "extension_configs") => Self::Fields("name namespace type_url value"),
             (
                 Self::Slice,
@@ -95,7 +100,7 @@ impl Schema {
             (Self::Fields(JWT_RULE), "output_claim_to_headers") => Self::Fields("header claim"),
             (Self::Fields(TELEMETRY), "config") => Self::Fields("tracing metrics access_logging"),
             (Self::Fields("tracing metrics access_logging"), "tracing") => Self::Fields(TRACING),
-            (Self::Fields(TRACING), "providers" | "provider") => Self::Provider,
+            (Self::Fields(TRACING), "providers") => Self::Provider,
             (Self::Fields("tracing metrics access_logging"), "metrics") => {
                 Self::Fields("tag_overrides disabled_metrics")
             }
@@ -147,7 +152,7 @@ impl Schema {
                 Self::Fields("time_seconds interval_seconds probes")
             }
             (Self::Fields(TRAFFIC_POLICY), "connection_pool_http") => Self::Fields(
-                "max_requests_per_connection idle_timeout_ms http2_max_requests max_concurrent_streams h2_upgrade_policy max_retries http1_max_pending_requests",
+                "idle_timeout_ms http2_max_requests max_concurrent_streams h2_upgrade_policy max_retries http1_max_pending_requests",
             ),
             (Self::Fields(TRAFFIC_POLICY), "load_balancer") => {
                 Self::Fields("simple consistent_hash")
@@ -167,7 +172,7 @@ impl Schema {
                 "spiffe_id_pattern namespace_pattern trust_domain trust_domain_pattern",
             ),
             (Self::Fields(POLICY_RULE), "to") => Self::Fields(
-                "methods paths hosts ports not_methods not_paths not_hosts not_ports not_port_patterns",
+                "methods paths hosts headers ports port_patterns not_methods not_paths not_hosts not_ports not_port_patterns",
             ),
             (Self::Fields(POLICY_RULE), "when") => Self::Fields("key values not_values"),
             (Self::Fields(POLICY_RULE), "source_negation") => Self::Fields(
@@ -184,15 +189,14 @@ impl Schema {
             }
             (Self::Fields(SERVICE), "workloads") => Self::Fields("spiffe_id"),
             (Self::Route, "rules") => Self::Fields(ROUTE_RULE),
-            (Self::Fields(ROUTE_RULE), "match") => Self::Fields(
-                "methods headers query_params source_namespace authority uri ignore_uri_case",
-            ),
-            (
-                Self::Fields(
-                    "methods headers query_params source_namespace authority uri ignore_uri_case",
-                ),
-                "methods" | "authority" | "uri",
-            ) => Self::Fields("exact prefix regex"),
+            (Self::Route, "weighted_splits") => Self::Fields("upstream_id legs"),
+            (Self::Fields("upstream_id legs"), "legs") => {
+                Self::Fields("upstream_id weight originate_tls")
+            }
+            (Self::Fields(ROUTE_RULE), "match") => Self::Fields(ROUTE_MATCH),
+            (Self::Fields(ROUTE_MATCH), "methods" | "authority" | "uri") => {
+                Self::Fields("exact prefix regex")
+            }
             (Self::Fields(ROUTE_RULE), "destination") => Self::Fields(DESTINATION),
             (Self::Fields(DESTINATION), "backend_tls") => Self::Fields(
                 "client_cert_path client_key_path server_ca_cert_path verify_server_cert sni san_allow_list",
@@ -223,24 +227,29 @@ impl Schema {
 
 const SLICE: &str = "node_id namespace istio_root_namespace workload_spiffe_id waypoint_name \
     waypoint_gateway_class service_waypoint_bound_services labels labels_ambiguous \
-    virtual_service_l4_proxies virtual_service_l4_upstreams version revision workloads \
-    ambient_udp_source_workloads node_waypoint_assertors node_waypoint_capture_destinations \
-    node_waypoint_capture_peer_authentications services local_inbound_services \
+    virtual_service_l4_proxies virtual_service_l4_upstreams http_routes version revision \
+    workloads ambient_udp_source_workloads node_waypoint_assertors \
+    node_waypoint_capture_destinations \
+    node_waypoint_capture_peer_authentications node_waypoint_capture_mesh_policies \
+    node_waypoint_capture_mesh_policies_resolved services local_inbound_services \
     local_inbound_workloads local_ingress_listeners sidecar_ingress_declared \
     declared_ingress_http_ports mesh_policies ext_authz_providers peer_authentications \
     service_entries request_authentications telemetry_resources destination_rules \
-    virtual_service_cors_policies proxy_configs trust_bundles multi_cluster \
-    outbound_traffic_policy sidecar_outbound_traffic_policy sidecar_egress_scope \
-    extension_configs runtime_overlay";
+    destination_rule_host_exclusions virtual_service_cors_policies proxy_configs trust_bundles multi_cluster \
+    outbound_traffic_policy sidecar_outbound_traffic_policy sidecar_egress_scope extension_configs \
+    runtime_overlay";
 const WORKLOAD: &str = "spiffe_id selector service_name service_namespace addresses ports \
     trust_domain namespace network cluster weight locality service_account pod_uid \
     node_waypoint";
-const SERVICE: &str = "name namespace ports workloads protocol_overrides cluster_ips uid";
+const SERVICE: &str = "name namespace ports workloads protocol_overrides cluster_ips uid \
+    allow_path_parameters";
 const POLICY_RULE: &str = "from to when request_principals not_request_principals \
     source_negation never_matches action";
-const ROUTE_RULE: &str = "match destination timeout_ms timeout_disabled request_timeout_ms \
+const ROUTE_RULE: &str = "name match destination timeout_ms timeout_disabled request_timeout_ms \
     attempt_timeout_ms retry retry_disabled request_transform response_transform fault rewrite \
     redirect";
+const ROUTE_MATCH: &str = "methods headers without_headers query_params source_namespace \
+    authority uri ignore_uri_case port";
 const DESTINATION: &str = "upstream_id backend_host backend_port backend_tls \
     requires_node_waypoint_authz";
 const RETRY: &str = "max_retries retryable_status_codes retryable_methods backoff \
@@ -250,12 +259,12 @@ const EXT_AUTHZ: &str = "name service port tls path_prefix timeout_ms fail_open 
     include_request_body_in_check headers_to_upstream_on_allow headers_to_downstream_on_deny \
     headers_to_downstream_on_allow";
 const PEER_AUTH: &str = "name namespace scope selector mtls_mode port_overrides";
-const REQUEST_AUTH: &str = "name namespace scope jwt_rules";
+const REQUEST_AUTH: &str = "name namespace scope jwt_rules refused";
 const JWT_RULE: &str = "issuer audiences jwks_uri jwks from_headers from_params \
     forward_original_token output_claim_to_headers";
 const TELEMETRY: &str = "name namespace scope config";
 const TRACING: &str = "mode sampling_percentage disable_span_reporting disableSpanReporting custom_tags \
-    custom_header_tags custom_env_tags providers provider";
+    custom_header_tags custom_env_tags safe_tag_sources providers";
 const CEL: &str = "op value name attribute then_expr else_expr";
 const ACCESS_FILTER: &str = "status_code_min status_code_max min_latency_ms errors_only expression";
 const PROXY_CONFIG: &str = "name namespace scope concurrency image environment tracing_sampling";

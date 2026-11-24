@@ -1,4 +1,5 @@
-//! Database mode — single-instance gateway backed by PostgreSQL, MySQL, or SQLite.
+//! Database mode — single-instance gateway backed by PostgreSQL, MySQL, SQLite,
+//! or MongoDB.
 //!
 //! Lifecycle:
 //! 1. Connect to the primary DB (with failover URL retry)
@@ -48,12 +49,12 @@ use crate::startup::{sanitize_startup_scalar, wait_for_start_signals};
 use crate::tls;
 
 async fn shutdown_database_runtime_tasks(
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     proxy_state: &ProxyState,
     listener_handles: Vec<(String, ListenerJoinHandle)>,
     mut background_handles: Vec<JoinHandle<()>>,
 ) -> Result<(), anyhow::Error> {
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     let listener_result = if listener_handles.is_empty() {
         Ok(())
     } else {
@@ -1042,7 +1043,7 @@ fn truncate_for_log(value: &str, max_chars: usize) -> String {
 
 pub async fn run(
     env_config: EnvConfig,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<(), anyhow::Error> {
     // Open the observability delivery lifecycle for this serving cycle before
     // any plugin activation registers a queue worker. Re-running this mode in
@@ -1078,6 +1079,10 @@ pub async fn run(
     // URL was unreachable — polling will retry and flip this back to normal
     // operation once the database recovers.
     let mut bootstrap_from_backup = false;
+
+    // SQL admin-read replica to dial in the background once the store is
+    // shared (see below); `None` when unset, suppressed, or MongoDB.
+    let mut startup_replica_url: Option<String> = None;
 
     // Build the database backend — SQL (sqlx) or MongoDB depending on FERRUM_DB_TYPE
     let db: Box<dyn DatabaseBackend> = match db_type {
@@ -1194,20 +1199,17 @@ pub async fn run(
             retention_policy.log_if_enabled();
             store.set_audit_retention_policy(retention_policy);
 
-            // Connect read replica for admin-only read offload. Runtime
-            // config polling remains primary-consistent.
+            // Record the read replica for admin-only read offload. Runtime
+            // config polling remains primary-consistent. The replica is dialed
+            // in the background below: it is never authoritative, so it must
+            // not delay migrations or the initial primary load, and admin reads
+            // use primary until its pool is published.
             if let Some(ref replica_url) = effective_replica_url {
-                match store.connect_read_replica(replica_url).await {
-                    Ok(()) if store.read_replica_suppressed() => {
-                        info!("Read replica configured but suppressed until primary failback")
-                    }
-                    Ok(()) => info!("Read replica connected for admin reads"),
-                    Err(_error) => {
-                        warn!(
-                            "Read replica connection failed for {}; admin reads will use primary until reconnect succeeds",
-                            sanitize_startup_scalar(replica_url)
-                        );
-                    }
+                store.set_read_replica_url(replica_url);
+                if store.read_replica_suppressed() {
+                    info!("Read replica configured but suppressed until primary failback");
+                } else {
+                    startup_replica_url = Some(replica_url.clone());
                 }
             }
             Box::new(store)
@@ -1215,6 +1217,18 @@ pub async fn run(
     };
     // Convert to Arc for sharing across tasks
     let db: Arc<dyn DatabaseBackend> = Arc::from(db);
+    // Single-flight guard shared with every poll generation, so the first
+    // tick cannot double-dial while the startup replica connect is in flight.
+    let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
+    if let Some(replica_url) = startup_replica_url {
+        crate::modes::spawn_admin_read_replica_reconnect(
+            db.clone(),
+            replica_url,
+            replica_reconnect_in_flight.clone(),
+            "startup",
+            None,
+        );
+    }
     let db_tls_reload_handle = crate::modes::db_tls_reload::start_db_tls_reload_task(
         env_config.clone(),
         db.clone(),
@@ -1545,6 +1559,7 @@ pub async fn run(
         Some(tls_policy.clone()),
         Some(shutdown_tx.subscribe()),
     )?;
+    proxy_state.overload.attach_shutdown(&shutdown_tx);
     // ProxyState construction is the initial live-config publication boundary.
     // Hot reloads install and record trust inside the request-epoch swap, but a
     // process restarted with an already-persisted bundle has no later delta to
@@ -1689,7 +1704,7 @@ pub async fn run(
     ) {
         Ok(Some(candidate)) => {
             let mut config = candidate.config;
-            info!("Loading TLS configuration with client certificate verification...");
+            info!("Loading TLS configuration...");
             // Enable 0-RTT on the proxy frontend only (not admin).
             tls::enable_early_data(&mut config, &tls_policy);
             // Enable kTLS session-secret extraction on the proxy frontend
@@ -2103,6 +2118,15 @@ pub async fn run(
     // for a later mutation to lazily spawn the worker. A process that receives
     // no new mutations still has to drain the backlog it inherited.
     crate::admin::audit::start_delivery(env_config.admin_audit_enabled, db.clone());
+    // Age retention must also reach namespaces that stop receiving audit
+    // events; insert-path pruning alone never revisits them.
+    if let Some(handle) = crate::admin::audit::start_retention_sweep(
+        env_config.audit_retention_days,
+        db.clone(),
+        shutdown_tx.subscribe(),
+    ) {
+        background_handles.push(handle);
+    }
 
     let initial_runtime_cursor = initial_change_cursor
         .unwrap_or_else(|| LiveApplyCursor::new(db.config_topology_epoch(), 0));
@@ -2155,7 +2179,6 @@ pub async fn run(
             crate::admin::api_specs::DefaultExternalDocumentLoader {
                 egress: env_config.backend_allow_ips.clone(),
                 dns_cache: None,
-                fixtures: std::collections::HashMap::new(),
             },
         ),
         runtime_config_apply: Some(runtime_config_apply.clone()),
@@ -2327,7 +2350,7 @@ pub async fn run(
             .stream_listener_manager
             .wait_until_started(Duration::from_secs(10))
             .await?;
-        proxy_state.set_h3_websocket_listener_started(h3_listener_started);
+        proxy_state.set_h3_listener_started(h3_listener_started);
         Ok(())
     }
     .await;
@@ -2474,6 +2497,7 @@ pub async fn run(
             let poll_namespace = poll_namespace.clone();
             let db_hostname = db_hostname.clone();
             let replica_hostname = replica_hostname.clone();
+            let replica_reconnect_in_flight = replica_reconnect_in_flight.clone();
             let poll_generation = poll_generation.clone();
             let poll_shutdown_tx = poll_shutdown_tx.clone();
             let poll_wake_signal = poll_wake_signal.clone();
@@ -2493,6 +2517,7 @@ pub async fn run(
                 let poll_namespace = poll_namespace.clone();
                 let db_hostname = db_hostname.clone();
                 let replica_hostname = replica_hostname.clone();
+                let replica_reconnect_in_flight = replica_reconnect_in_flight.clone();
                 let poll_wake_signal = poll_wake_signal.clone();
                 let runtime_config_apply_poll = runtime_config_apply_poll.clone();
                 let generation = poll_generation.fetch_add(1, Ordering::AcqRel);
@@ -2507,12 +2532,11 @@ pub async fn run(
                     let mut last_db_ips: Option<Vec<IpAddr>> = None;
                     let last_replica_ips: crate::modes::AdminReadReplicaDnsWatermark =
                         Arc::new(tokio::sync::Mutex::new(None));
-                    let mut force_full_reload = false;
+                    let mut force_full_reload: Option<crate::modes::FullReloadReason> = None;
                     // Active rejected-delta retry deadline. A change-stream
                     // wake-up must never run before it, or a stream of
                     // committed-but-invalid changes could defeat the backoff.
                     let mut earliest_wake: Option<tokio::time::Instant> = None;
-                    let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
                     let mut rejected_delta_tracker = RejectedDeltaTracker::new(
                         rejected_delta_initial_backoff,
                         rejected_delta_max_backoff,
@@ -2584,7 +2608,8 @@ pub async fn run(
                                         plugin_migration_reconcile_state_poll
                                             .store(PLUGIN_MIGRATIONS_NEED_RECONCILE, Ordering::Release);
                                         last_db_ips = Some(ips);
-                                        force_full_reload = true;
+                                        force_full_reload =
+                                            Some(crate::modes::FullReloadReason::DnsReconnect);
                                     }
                                     Err(error) => {
                                         log_database_dns_reconnect_failure(hostname, &error);
@@ -2610,7 +2635,7 @@ pub async fn run(
                         // projected single-document read per tick, and it runs
                         // before the reload decision so the repair happens in
                         // this tick rather than the next.
-                        if !force_full_reload {
+                        if force_full_reload.is_none() {
                             let running_config = proxy_state_poll.current_config();
                             let drifted = detect_gateway_trust_drift(
                                 db_poll.as_ref(),
@@ -2619,11 +2644,12 @@ pub async fn run(
                             )
                             .await;
                             if !drifted.is_empty() {
-                                force_full_reload = true;
+                                force_full_reload =
+                                    Some(crate::modes::FullReloadReason::GatewayTrustDrift);
                             }
                         }
 
-                        if force_full_reload {
+                        if let Some(full_reload_reason) = force_full_reload {
                             match load_full_config_with_sequence(&db_poll, &poll_namespace).await {
                                 Ok((new_config, cursor)) => {
                                     match try_publish_full_reload_after_gate(
@@ -2632,8 +2658,8 @@ pub async fn run(
                                         &db_available_poll,
                                         &proxy_state_poll,
                                         new_config,
-                                        "full reload after DB DNS reconnect",
-                                        "after DB DNS reconnect",
+                                        full_reload_reason.reload_context(),
+                                        full_reload_reason.trigger(),
                                         auto_apply_plugin_migrations_poll,
                                         &plugin_migration_reconcile_state_poll,
                                         &mut last_change_cursor,
@@ -2649,9 +2675,12 @@ pub async fn run(
                                             continue;
                                         }
                                         Some(true) => {
-                                            force_full_reload = false;
+                                            force_full_reload = None;
                                             rejected_delta_tracker.record_accepted();
-                                            debug!("Full config reload complete after DB DNS reconnect");
+                                            debug!(
+                                                reason = full_reload_reason.as_label(),
+                                                "Full config reload complete"
+                                            );
                                         }
                                         Some(false) => {}
                                     }
@@ -2665,14 +2694,15 @@ pub async fn run(
                                             auto_apply_plugin_migrations_poll,
                                             &plugin_migration_reconcile_state_poll,
                                             &e,
-                                            "full reload after DB DNS reconnect",
+                                            full_reload_reason.reload_context(),
                                         )
                                         .await;
                                         database_delta_poll_metrics_for_poll
                                             .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
                                     } else {
                                         error!(
-                                            "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying"
+                                            reason = full_reload_reason.as_label(),
+                                            "Authoritative primary full config reload failed; keeping existing config and retrying"
                                         );
                                         database_delta_poll_metrics_for_poll
                                             .record_config_source_unavailable(
@@ -3265,7 +3295,7 @@ pub async fn run(
     } else {
         let shutdown_tx_on_failure = shutdown_tx.clone();
         await_fallible_listener_handles(handles, move || {
-            let _ = shutdown_tx_on_failure.send(true);
+            shutdown_tx_on_failure.shutdown();
         })
         .await
     };
@@ -3286,6 +3316,9 @@ pub async fn run(
         crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))
             .await;
     }
+    // Shutdown now closes whatever is still pending, while observability
+    // delivery is open, so those requests settle their terminals (issue #6768).
+    crate::overload::end_shutdown_drain_wait(&proxy_state.overload).await;
     // Release backend transport pools that hold kernel objects (issue #3731).
     proxy_state.drain_transport_pools_for_shutdown().await;
 
@@ -3721,7 +3754,7 @@ async fn mark_db_available_after_successful_poll_load(
         Ordering::Acquire,
     ) {
         Ok(_) => {
-            match crate::modes::handle_recovery_plugin_migrations(
+            match crate::modes::handle_startup_plugin_migrations(
                 db,
                 auto_apply_plugin_migrations,
                 "database-recovery",
@@ -3908,6 +3941,12 @@ pub(super) mod tests {
     #[test]
     fn normal_startup_seeds_poll_cursor_from_initial_full_load() {
         let source = include_str!("database.rs");
+        // Only production code: `include_str!` also embeds this test module,
+        // whose needle literals would otherwise always match.
+        let test_module = source
+            .find("\n#[cfg(test)]\npub(super) mod tests")
+            .expect("test module marker");
+        let source = &source[..test_module];
         assert!(
             source.contains("let (config, initial_change_cursor) ="),
             "database startup must retain the initial topology-bound full-load cursor"
@@ -3926,12 +3965,21 @@ pub(super) mod tests {
         // migrations, the poll-loop availability helper must invoke the same
         // warn/auto-apply policy once deferred core migrations succeed.
         let source = include_str!("database.rs");
+        // Only production code: `include_str!` also embeds this test module,
+        // whose needle literals would otherwise always match.
+        let test_module = source
+            .find("\n#[cfg(test)]\npub(super) mod tests")
+            .expect("test module marker");
+        let source = &source[..test_module];
         let helper_start = source
             .find("async fn mark_db_available_after_successful_poll_load(")
             .expect("availability helper must exist");
-        let helper = &source[helper_start..];
+        let helper_end = source[helper_start..]
+            .find("\n/// A validation-rejected full snapshot")
+            .map_or(source.len(), |offset| helper_start + offset);
+        let helper = &source[helper_start..helper_end];
         assert!(
-            helper.contains("handle_recovery_plugin_migrations"),
+            helper.contains("handle_startup_plugin_migrations("),
             "recovery path must reconcile custom-plugin migrations"
         );
         assert!(
@@ -4438,6 +4486,12 @@ pub(super) mod tests {
     #[test]
     fn startup_backup_seeds_config_rejection_before_first_poll() {
         let source = include_str!("database.rs");
+        // Only production code: `include_str!` also embeds this test module,
+        // whose needle literals would otherwise always match.
+        let test_module = source
+            .find("\n#[cfg(test)]\npub(super) mod tests")
+            .expect("test module marker");
+        let source = &source[..test_module];
         assert!(
             source
                 .contains("crate::config::validation_pipeline::is_config_validation_rejection(&e)"),

@@ -60,20 +60,6 @@ pub enum CniCommand {
     Unsupported,
 }
 
-impl CniCommand {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Add => "ADD",
-            Self::Del => "DEL",
-            Self::Check => "CHECK",
-            Self::Status => "STATUS",
-            Self::Gc => "GC",
-            Self::Version => "VERSION",
-            Self::Unsupported => "UNSUPPORTED",
-        }
-    }
-}
-
 impl FromStr for CniCommand {
     type Err = ();
 
@@ -116,7 +102,7 @@ pub fn cni_version_supports_gc(version: &str) -> bool {
 /// so the rest of the CNI binary works on a normalized in-memory shape
 /// instead of poking `std::env` repeatedly. `cni_args` is the raw
 /// semicolon-separated form (e.g. `K8S_POD_NAMESPACE=foo;K8S_POD_NAME=bar`)
-/// — see [`parse_cni_args`] for the parsed map.
+/// — see [`ingest_cni_args`] for the strict parsed map.
 ///
 /// STATUS, GC, and VERSION do not carry attachment parameters; those
 /// commands leave `container_id` empty and optional fields unset.
@@ -127,7 +113,6 @@ pub struct CniInvocation {
     pub netns: Option<String>,
     pub ifname: Option<String>,
     pub args: Option<String>,
-    pub path: Option<String>,
 }
 
 impl CniInvocation {
@@ -138,17 +123,12 @@ impl CniInvocation {
             .map_err(|_| CniError::missing_env("CNI_COMMAND"))
     }
 
-    /// Read the CNI invocation from `std::env`.
+    /// Read the CNI invocation for `command` from `std::env`.
     ///
     /// Empty `CNI_NETNS` is normalized to `None`; the spec allows DEL to
     /// pass an empty netns when the sandbox is already gone, and treating
     /// `""` and unset identically here saves the node-agent server from
     /// having to do the same dance.
-    pub fn from_env() -> Result<Self, CniError> {
-        let command = Self::command_from_env()?;
-        Self::from_env_for_command(command)
-    }
-
     pub fn from_env_for_command(command: CniCommand) -> Result<Self, CniError> {
         match command {
             CniCommand::Version => Ok(Self {
@@ -157,7 +137,6 @@ impl CniInvocation {
                 netns: None,
                 ifname: None,
                 args: None,
-                path: env::var("CNI_PATH").ok().filter(|v| !v.trim().is_empty()),
             }),
             CniCommand::Status => {
                 // SPEC §2 STATUS: only CNI_COMMAND is required. CNI_PATH is
@@ -168,14 +147,13 @@ impl CniInvocation {
                     netns: None,
                     ifname: None,
                     args: None,
-                    path: env::var("CNI_PATH").ok().filter(|v| !v.trim().is_empty()),
                 })
             }
             CniCommand::Gc => {
                 // SPEC §2 GC: only CNI_COMMAND + CNI_PATH are required; there
-                // are no attachment parameters.
-                let path = env::var("CNI_PATH").map_err(|_| CniError::missing_env("CNI_PATH"))?;
-                if path.trim().is_empty() {
+                // are no attachment parameters. Ferrum never execs a delegate
+                // plugin, so the search path is checked for presence only.
+                if !env::var("CNI_PATH").is_ok_and(|path| !path.trim().is_empty()) {
                     return Err(CniError::missing_env("CNI_PATH"));
                 }
                 Ok(Self {
@@ -184,7 +162,6 @@ impl CniInvocation {
                     netns: None,
                     ifname: None,
                     args: None,
-                    path: Some(path),
                 })
             }
             CniCommand::Unsupported => Ok(Self {
@@ -193,7 +170,6 @@ impl CniInvocation {
                 netns: None,
                 ifname: None,
                 args: None,
-                path: None,
             }),
             CniCommand::Add | CniCommand::Del | CniCommand::Check => {
                 let container_id = env::var("CNI_CONTAINERID")
@@ -218,38 +194,16 @@ impl CniInvocation {
                     return Err(CniError::missing_env("CNI_IFNAME"));
                 }
                 let args = env::var("CNI_ARGS").ok().filter(|v| !v.trim().is_empty());
-                let path = env::var("CNI_PATH").ok().filter(|v| !v.trim().is_empty());
                 Ok(Self {
                     command,
                     container_id,
                     netns,
                     ifname,
                     args,
-                    path,
                 })
             }
         }
     }
-}
-
-/// Parse `CNI_ARGS` into a key/value map.
-///
-/// The wire format is `K=V;K=V;...`. Tokens with no `=` are skipped (the
-/// spec is loose about that); empty values are kept (kubelet sometimes
-/// passes `IgnoreUnknown=1;K8S_POD_NAME=`). Keys are normalized to
-/// uppercase so `K8S_POD_NAMESPACE` and `k8s_pod_namespace` collapse to
-/// the same entry — kubelets in the wild are inconsistent.
-pub fn parse_cni_args(raw: &str) -> HashMap<String, String> {
-    raw.split(';')
-        .filter_map(|kv| {
-            let (k, v) = kv.split_once('=')?;
-            let key = k.trim().to_ascii_uppercase();
-            if key.is_empty() {
-                return None;
-            }
-            Some((key, v.trim().to_string()))
-        })
-        .collect()
 }
 
 /// Strict, bounded CNI_ARGS ingestion for the executable boundary.
@@ -320,7 +274,9 @@ fn is_safe_cni_arg_key(key: &str) -> bool {
 /// Extracted Kubernetes pod identity from CNI_ARGS.
 ///
 /// kubelet always supplies `K8S_POD_NAMESPACE`, `K8S_POD_NAME`,
-/// `K8S_POD_UID`, and `K8S_POD_INFRA_CONTAINER_ID` per CNI conventions.
+/// `K8S_POD_UID`, and `K8S_POD_INFRA_CONTAINER_ID` per CNI conventions; the
+/// infra container id is not read (the CNI container id already names the
+/// sandbox).
 /// `K8S_POD_UID` was added later than the others and is occasionally
 /// missing on older CRIs; the wire surface to the node-agent treats it as
 /// optional so older clusters still get a working ADD/DEL round-trip.
@@ -329,7 +285,6 @@ pub struct K8sPodIdentity {
     pub namespace: String,
     pub name: String,
     pub pod_uid: Option<String>,
-    pub infra_container_id: Option<String>,
 }
 
 impl K8sPodIdentity {
@@ -343,15 +298,10 @@ impl K8sPodIdentity {
             return None;
         }
         let pod_uid = args.get("K8S_POD_UID").cloned().filter(|v| !v.is_empty());
-        let infra_container_id = args
-            .get("K8S_POD_INFRA_CONTAINER_ID")
-            .cloned()
-            .filter(|v| !v.is_empty());
         Some(Self {
             namespace,
             name,
             pod_uid,
-            infra_container_id,
         })
     }
 }
@@ -565,6 +515,64 @@ pub struct FerrumCniOptions {
     pub socket_path: Option<String>,
 }
 
+/// Pod addresses from a chained `prevResult` (CNI result `ips[]`), for the
+/// node-agent to enroll the pod at ADD before `status.podIP` exists
+/// (GHSA-7x6j-vmqm-xx2v).
+///
+/// An address counts when its `interface` index names an interface that has a
+/// `sandbox` (the container side), or when it names no interface at all; an
+/// address explicitly on a host-side interface is skipped. Malformed entries
+/// are skipped, never guessed. The result is deduplicated and bounded by
+/// [`crate::cni::rpc::MAX_CNI_POD_IPS`]; a missing or pre-0.3 (`ip4`/`ip6`)
+/// `prevResult` yields none.
+pub fn prev_result_pod_ips(prev_result: Option<&serde_json::Value>) -> Vec<std::net::IpAddr> {
+    let Some(result) = prev_result.and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    let interfaces = result
+        .get("interfaces")
+        .and_then(serde_json::Value::as_array);
+    let Some(ips) = result.get("ips").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<std::net::IpAddr> = Vec::new();
+    for entry in ips {
+        if out.len() >= crate::cni::rpc::MAX_CNI_POD_IPS {
+            break;
+        }
+        let Some(entry) = entry.as_object() else {
+            continue;
+        };
+        if let Some(index) = entry.get("interface") {
+            let Some(index) = index.as_u64().and_then(|i| usize::try_from(i).ok()) else {
+                continue;
+            };
+            let in_sandbox = interfaces
+                .and_then(|interfaces| interfaces.get(index))
+                .and_then(|interface| interface.get("sandbox"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|sandbox| !sandbox.is_empty());
+            if !in_sandbox {
+                continue;
+            }
+        }
+        let Some(address) = entry.get("address").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let host = address.split_once('/').map_or(address, |(host, _)| host);
+        let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+            continue;
+        }
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
 /// CNI result returned on stdout for ADD/CHECK.
 ///
 /// Ferrum is a chained "meta-plugin" that does NOT allocate IPs or
@@ -606,13 +614,18 @@ pub struct CniErrorResult {
     pub cni_version: String,
     pub code: u32,
     pub msg: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub details: Option<String>,
 }
 
-/// Closed set of CNI errors the binary returns. Codes 1-99 are reserved
-/// for plugin-specific errors per the spec; 1-7 are the common
-/// values we map onto, and 50/51 are the CNI 1.1 STATUS availability codes.
+/// Closed set of CNI errors the binary returns. The CNI spec reserves codes
+/// 0-99 for the well-known errors it defines (1-7, 11 "try again later", and
+/// the CNI 1.1 STATUS availability codes 50/51) and leaves 100 and above for
+/// plugin-specific errors, so a node-agent rejection uses
+/// [`CNI_ERROR_CODE_REJECTED`].
+/// Plugin-specific CNI error code for a node-agent rejection: the first code
+/// the spec leaves to plugins (codes below 100 are reserved for the spec's own
+/// well-known errors).
+pub const CNI_ERROR_CODE_REJECTED: u32 = 100;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CniError {
     #[error("required environment variable {0} is missing or invalid")]
@@ -630,13 +643,6 @@ pub enum CniError {
     /// CNI 1.1 STATUS code 50: plugin cannot service ADD requests.
     #[error("CNI plugin is not available: {0}")]
     NotAvailable(String),
-    /// CNI 1.1 STATUS code 51: unavailable and existing attachments may be
-    /// degraded. Reserved for cases where Ferrum knows capture/connectivity
-    /// for already-enrolled pods may also be limited.
-    #[error(
-        "CNI plugin is not available and existing containers may have limited connectivity: {0}"
-    )]
-    NotAvailableDegraded(String),
 }
 
 impl CniError {
@@ -651,9 +657,8 @@ impl CniError {
             Self::BadConfig(_) => 7,
             Self::UnsupportedVersion => 1,
             Self::IpcFailed(_) => 11,
-            Self::Rejected(_) => 12,
+            Self::Rejected(_) => CNI_ERROR_CODE_REJECTED,
             Self::NotAvailable(_) => 50,
-            Self::NotAvailableDegraded(_) => 51,
         }
     }
 }
@@ -665,7 +670,6 @@ pub fn build_error_result(cni_version: &str, err: &CniError) -> CniErrorResult {
         cni_version: cni_version.to_string(),
         code: err.code(),
         msg: err.to_string(),
-        details: None,
     }
 }
 
@@ -704,27 +708,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_cni_args_decodes_kv_pairs() {
-        let args = parse_cni_args(
-            "IgnoreUnknown=1;K8S_POD_NAMESPACE=demo;K8S_POD_NAME=alpha;K8S_POD_UID=abc-123",
-        );
-        assert_eq!(args.get("IGNOREUNKNOWN").map(String::as_str), Some("1"));
-        assert_eq!(
-            args.get("K8S_POD_NAMESPACE").map(String::as_str),
-            Some("demo")
-        );
-        assert_eq!(args.get("K8S_POD_NAME").map(String::as_str), Some("alpha"));
-        assert_eq!(args.get("K8S_POD_UID").map(String::as_str), Some("abc-123"));
-    }
-
-    #[test]
-    fn parse_cni_args_ignores_malformed_tokens() {
-        let args = parse_cni_args("=value;onlykey;=;K8S_POD_NAME=ok");
-        assert_eq!(args.len(), 1, "only valid k=v pair should remain");
-        assert_eq!(args.get("K8S_POD_NAME").map(String::as_str), Some("ok"));
-    }
-
-    #[test]
     fn k8s_identity_requires_namespace_and_name() {
         let mut args = HashMap::new();
         assert!(K8sPodIdentity::from_args(&args).is_none());
@@ -735,7 +718,6 @@ mod tests {
         assert_eq!(id.namespace, "demo");
         assert_eq!(id.name, "alpha");
         assert!(id.pod_uid.is_none());
-        assert!(id.infra_container_id.is_none());
 
         args.insert("K8S_POD_UID".to_string(), "uid-1".to_string());
         args.insert(
@@ -744,7 +726,6 @@ mod tests {
         );
         let id = K8sPodIdentity::from_args(&args).expect("identity should parse with extras");
         assert_eq!(id.pod_uid.as_deref(), Some("uid-1"));
-        assert_eq!(id.infra_container_id.as_deref(), Some("infra-1"));
     }
 
     #[test]
@@ -878,9 +859,9 @@ mod tests {
         assert_eq!(CniError::BadConfig("x".to_string()).code(), 7);
         assert_eq!(CniError::UnsupportedVersion.code(), 1);
         assert_eq!(CniError::IpcFailed("x".to_string()).code(), 11);
-        assert_eq!(CniError::Rejected("x".to_string()).code(), 12);
+        // Plugin-specific: the spec reserves every code below 100.
+        assert_eq!(CniError::Rejected("x".to_string()).code(), 100);
         assert_eq!(CniError::NotAvailable("x".to_string()).code(), 50);
-        assert_eq!(CniError::NotAvailableDegraded("x".to_string()).code(), 51);
     }
 
     #[test]

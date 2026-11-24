@@ -19,6 +19,9 @@ use crate::modes::mesh::metric_tag_cel::{
 };
 use crate::plugins::StreamConnectionContext;
 use crate::plugins::TransactionSummary;
+use crate::plugins::mesh::telemetry_facts::{
+    MeshLabel, MeshLabelShadow, UNKNOWN_LABEL, static_label, unknown_label,
+};
 use crate::plugins::prometheus_metrics::{HistogramBuckets, escape_label_value};
 use crate::tls::backend::{BackendTlsRefusalSurface, backend_tls_refusal_count};
 
@@ -55,6 +58,13 @@ static MESH_CONFIG_UPDATE_REJECTIONS: LazyLock<DashMap<MeshConfigUpdateRejectKey
     LazyLock::new(DashMap::new);
 static MESH_CONFIG_REVISION_REJECTIONS: LazyLock<DashMap<&'static str, AtomicU64>> =
     LazyLock::new(DashMap::new);
+/// `ferrum_mesh_tracing_spans_dropped_total{provider,reason}`, indexed by
+/// `provider.index() * MeshTracingSpanDropReason::ALL.len() + reason.index()`.
+/// Both labels are closed enums, so the series set is fixed at compile time.
+static MESH_TRACING_SPANS_DROPPED: [AtomicU64; MESH_TRACING_SPAN_DROP_SERIES] =
+    [const { AtomicU64::new(0) }; MESH_TRACING_SPAN_DROP_SERIES];
+const MESH_TRACING_SPAN_DROP_SERIES: usize =
+    MeshTracingProvider::ALL.len() * MeshTracingSpanDropReason::ALL.len();
 static MESH_CONFIG_STREAM_ATTEMPTS: LazyLock<DashMap<MeshConfigStreamAttemptKey, AtomicU64>> =
     LazyLock::new(DashMap::new);
 static MESH_CONFIG_REVISION_ADOPTIONS: AtomicU64 = AtomicU64::new(0);
@@ -88,8 +98,6 @@ static XDS_ACTIVE_NODE_IDS: AtomicU64 = AtomicU64::new(0);
 /// absent everywhere else.
 static XDS_ADMISSION_OBSERVED: AtomicU64 = AtomicU64::new(0);
 static MESH_INBOUND_PLAINTEXT_ALLOWED: AtomicU64 = AtomicU64::new(0);
-static XDS_WARMING_PARTIAL_APPLIES: LazyLock<DashMap<Arc<str>, AtomicU64>> =
-    LazyLock::new(DashMap::new);
 static XDS_FIRST_SLICE_NACKS: LazyLock<DashMap<XdsFirstSliceNackKey, AtomicU64>> =
     LazyLock::new(DashMap::new);
 /// `1` once a Workload API listener has stood up in this process. Gates the
@@ -124,8 +132,16 @@ pub struct MeshRequestKey {
     pub destination_app: Arc<str>,
     pub destination_service: Arc<str>,
     pub request_protocol: Arc<str>,
+    /// Numeric HTTP status. A response-code label override whose value is the
+    /// canonical decimal spelling of a status is stored here too (with no
+    /// override), so equal rendered labels are always equal registry keys.
     pub response_code: u16,
     response_code_override: Option<Arc<str>>,
+    /// Istio `grpc_response_status`: the finalized numeric gRPC status (`0`
+    /// to `16`, out-of-range or malformed statuses as UNKNOWN `2`) for gRPC
+    /// requests, and the empty value for every other request. The value set
+    /// is fixed, so the label adds no unbounded cardinality.
+    pub grpc_response_status: Arc<str>,
     pub response_flags: Arc<str>,
     pub connection_security_policy: Arc<str>,
     /// Bitset of labels removed by a Telemetry metric tag override. The
@@ -134,12 +150,64 @@ pub struct MeshRequestKey {
     removed_labels: u16,
 }
 
+/// Fixed `grpc_response_status` label values: index `n` (0..=16) is the
+/// numeric gRPC status `n`; index 17 is the empty value carried by requests
+/// with no gRPC status.
+static GRPC_RESPONSE_STATUS_LABELS: LazyLock<[Arc<str>; 18]> = LazyLock::new(|| {
+    std::array::from_fn(|index| {
+        if index <= GRPC_STATUS_MAX_CODE {
+            Arc::from(index.to_string())
+        } else {
+            Arc::from("")
+        }
+    })
+});
+const GRPC_STATUS_MAX_CODE: usize = 16;
+const GRPC_STATUS_UNKNOWN_CODE: usize = 2;
+const GRPC_STATUS_ABSENT_LABEL_INDEX: usize = 17;
+
+/// The bounded `grpc_response_status` label for a finalized gRPC status.
+/// `None` (not a gRPC request, or a status the gateway could not read) is the
+/// empty value. A status outside the defined 0–16 range — including the
+/// malformed-status sentinel — is UNKNOWN (`2`), the value a gRPC client
+/// reports for it, so hostile trailers cannot mint new label values.
+fn grpc_response_status_label(status: Option<u32>) -> Arc<str> {
+    let index = match status {
+        None => GRPC_STATUS_ABSENT_LABEL_INDEX,
+        Some(code) => usize::try_from(code)
+            .ok()
+            .filter(|code| *code <= GRPC_STATUS_MAX_CODE)
+            .unwrap_or(GRPC_STATUS_UNKNOWN_CODE),
+    };
+    GRPC_RESPONSE_STATUS_LABELS
+        .get(index)
+        .map(Arc::clone)
+        .unwrap_or_else(|| Arc::from(""))
+}
+
+/// The status a response-code label value is the canonical decimal spelling
+/// of (`"200"`, but not `"0200"`, `"+200"`, or `"200 "`), so storing it as
+/// the numeric code renders exactly the same label.
+fn canonical_response_code(value: &str) -> Option<u16> {
+    let bytes = value.as_bytes();
+    let canonical = !bytes.is_empty()
+        && bytes.iter().all(u8::is_ascii_digit)
+        && (bytes.len() == 1 || bytes.first() != Some(&b'0'));
+    if !canonical {
+        return None;
+    }
+    value.parse::<u16>().ok()
+}
+
 pub(crate) const MESH_METRICS_DISABLED_METADATA: &str = "mesh.metrics.disabled";
 /// Stamped by the single enabled process-global `prometheus_metrics` plugin
-/// when its request/stream hook actually observed this transaction.
+/// when its stream hook actually observed this connection. (HTTP-family
+/// requests carry the same fact as the typed
+/// [`crate::plugins::RequestContext::prometheus_metrics_observed`] bit, so the
+/// per-request hook allocates nothing.)
 ///
-/// Workload-metrics producers and body scanners require this marker before
-/// updating the global registry. Mesh mode auto-injects `workload_metrics`, but
+/// Stream lifecycle producers require this marker before updating the global
+/// registry. Mesh mode auto-injects `workload_metrics`, but
 /// it deliberately does not auto-inject a Prometheus exporter; without this
 /// gate, the opened half of a TCP lifecycle and gRPC body scanners would still
 /// run in deployments where `/metrics` was otherwise plugin-gated silent.
@@ -535,9 +603,13 @@ pub(crate) enum MeshMetricLabel {
     ResponseFlags = 11,
     ConnectionSecurityPolicy = 12,
     ResponseCode = 13,
+    GrpcResponseStatus = 14,
 }
 
 impl MeshMetricLabel {
+    /// The highest label index; every label's bit fits the `u16` removal set.
+    const LAST: Self = Self::GrpcResponseStatus;
+
     pub(crate) fn from_config_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "mesh.source.workload" | "source_workload" => Some(Self::SourceWorkload),
@@ -566,6 +638,7 @@ impl MeshMetricLabel {
                 Some(Self::ConnectionSecurityPolicy)
             }
             "mesh.response_code" | "response_code" => Some(Self::ResponseCode),
+            "mesh.grpc_response_status" | "grpc_response_status" => Some(Self::GrpcResponseStatus),
             _ => None,
         }
     }
@@ -590,6 +663,7 @@ impl MeshMetricLabel {
             11 => Some(Self::ResponseFlags),
             12 => Some(Self::ConnectionSecurityPolicy),
             13 => Some(Self::ResponseCode),
+            14 => Some(Self::GrpcResponseStatus),
             _ => None,
         }
     }
@@ -968,11 +1042,156 @@ pub fn increment_mesh_config_update_rejection(consumer: &'static str, reason: &'
         .fetch_add(1, Ordering::Relaxed);
 }
 
+/// Tracing backend a mesh span exporter delivers to. The `provider` label of
+/// `ferrum_mesh_tracing_spans_dropped_total`; never an endpoint or host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshTracingProvider {
+    OpenTelemetry,
+    Zipkin,
+    Datadog,
+    Lightstep,
+    /// An exporter outside the built-in provider set.
+    Other,
+}
+
+impl MeshTracingProvider {
+    pub const ALL: [Self; 5] = [
+        Self::OpenTelemetry,
+        Self::Zipkin,
+        Self::Datadog,
+        Self::Lightstep,
+        Self::Other,
+    ];
+
+    /// Map a trace exporter's provider name (`OTLP`, `Zipkin`, `Datadog`,
+    /// `Lightstep`) onto the closed label set.
+    pub fn from_exporter_name(name: &str) -> Self {
+        match name {
+            "OTLP" => Self::OpenTelemetry,
+            "Zipkin" => Self::Zipkin,
+            "Datadog" => Self::Datadog,
+            "Lightstep" => Self::Lightstep,
+            _ => Self::Other,
+        }
+    }
+
+    pub const fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::OpenTelemetry => "opentelemetry",
+            Self::Zipkin => "zipkin",
+            Self::Datadog => "datadog",
+            Self::Lightstep => "lightstep",
+            Self::Other => "other",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::OpenTelemetry => 0,
+            Self::Zipkin => 1,
+            Self::Datadog => 2,
+            Self::Lightstep => 3,
+            Self::Other => 4,
+        }
+    }
+}
+
+/// Why a mesh span exporter refused a finished span. The `reason` label of
+/// `ferrum_mesh_tracing_spans_dropped_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshTracingSpanDropReason {
+    /// The exporter's bounded span queue (`buffer_capacity`) was full.
+    QueueFull,
+    /// The exporter's queued-byte budget (`buffer_max_bytes`) was exhausted.
+    ByteBudget,
+    /// The process-wide observability retained-byte ceiling was exhausted.
+    ProcessCeiling,
+    /// The exporter was closing for reload or shutdown.
+    ShuttingDown,
+    /// The exporter could not accept spans at all (no flush worker, for
+    /// example outside a Tokio runtime).
+    Unavailable,
+    /// An enqueued batch was discarded at delivery: a non-retryable
+    /// collector response, exhausted retries, or no HTTP client.
+    ExportFailed,
+}
+
+impl MeshTracingSpanDropReason {
+    pub const ALL: [Self; 6] = [
+        Self::QueueFull,
+        Self::ByteBudget,
+        Self::ProcessCeiling,
+        Self::ShuttingDown,
+        Self::Unavailable,
+        Self::ExportFailed,
+    ];
+
+    pub const fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::QueueFull => "queue_full",
+            Self::ByteBudget => "byte_budget",
+            Self::ProcessCeiling => "process_ceiling",
+            Self::ShuttingDown => "shutting_down",
+            Self::Unavailable => "unavailable",
+            Self::ExportFailed => "export_failed",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::QueueFull => 0,
+            Self::ByteBudget => 1,
+            Self::ProcessCeiling => 2,
+            Self::ShuttingDown => 3,
+            Self::Unavailable => 4,
+            Self::ExportFailed => 5,
+        }
+    }
+}
+
+fn mesh_tracing_span_drop_slot(
+    provider: MeshTracingProvider,
+    reason: MeshTracingSpanDropReason,
+) -> Option<&'static AtomicU64> {
+    MESH_TRACING_SPANS_DROPPED
+        .get(provider.index() * MeshTracingSpanDropReason::ALL.len() + reason.index())
+}
+
+/// Count one span a mesh tracing exporter dropped. Lock-free: a fixed atomic
+/// slot per `(provider, reason)` pair, so a collector outage that drops spans
+/// at line rate costs one relaxed increment each.
+pub fn increment_mesh_tracing_span_dropped(
+    provider: MeshTracingProvider,
+    reason: MeshTracingSpanDropReason,
+) {
+    add_mesh_tracing_spans_dropped(provider, reason, 1);
+}
+
+/// Count `spans` dropped at once (a whole discarded export batch).
+pub fn add_mesh_tracing_spans_dropped(
+    provider: MeshTracingProvider,
+    reason: MeshTracingSpanDropReason,
+    spans: u64,
+) {
+    if let Some(slot) = mesh_tracing_span_drop_slot(provider, reason) {
+        slot.fetch_add(spans, Ordering::Relaxed);
+    }
+}
+
+/// Current `ferrum_mesh_tracing_spans_dropped_total` value for one series.
+pub fn mesh_tracing_spans_dropped_count(
+    provider: MeshTracingProvider,
+    reason: MeshTracingSpanDropReason,
+) -> u64 {
+    mesh_tracing_span_drop_slot(provider, reason).map_or(0, |slot| slot.load(Ordering::Relaxed))
+}
+
 /// Count a mesh freshness admission or apply-token rejection. A missing apply
 /// token refuses commit publication while retaining the last committed state.
 ///
 /// `reason` is a compile-time constant
-/// (`MeshRevisionRejectReason::as_metric_label` or `missing_apply_token`), so
+/// (`MeshRevisionRejectReason::as_metric_label` or
+/// `revision::MISSING_APPLY_TOKEN_REJECTION_LABEL`), so
 /// cardinality is fixed and no control-plane-supplied authority or sequence can
 /// reach `/metrics`. Local-slice detail rides the JWT-authenticated
 /// `GET /mesh/config-drift` `revision` block; local and remote-discovery gates
@@ -1164,7 +1383,6 @@ mod xds_admission_gauge_delta_tests {
 }
 
 /// Current value of `ferrum_xds_stream_admission_rejections_total{reason}`.
-#[allow(dead_code)] // External integration tests consume the library copy; the binary target does not.
 pub fn xds_stream_admission_rejection_count(reason: &'static str) -> u64 {
     XDS_STREAM_ADMISSION_REJECTIONS
         .get(reason)
@@ -1173,7 +1391,6 @@ pub fn xds_stream_admission_rejection_count(reason: &'static str) -> u64 {
 }
 
 /// Current value of the label-free ADS stream rejection aggregate counter.
-#[allow(dead_code)] // External integration tests consume the library copy; the binary target does not.
 pub fn xds_streams_rejected_total() -> u64 {
     XDS_STREAMS_REJECTED.load(Ordering::Relaxed)
 }
@@ -1208,20 +1425,6 @@ pub fn increment_xds_first_slice_nack(namespace: impl AsRef<str>, type_url: impl
     };
     XDS_FIRST_SLICE_NACKS
         .entry(key)
-        .or_insert_with(|| AtomicU64::new(0))
-        .fetch_add(1, Ordering::Relaxed);
-}
-
-/// Count any defensive mesh-slice apply that is explicitly marked as version
-/// skewed. Normal xDS apply now requires coherent required-type versions before
-/// installing a slice, so this counter should remain zero unless a future caller
-/// deliberately opts into applying a skewed warmed slice. Keyed by `namespace` only
-/// (matching `ferrum_xds_first_slice_nacks_total`) — low, operator-bounded
-/// cardinality; the per-type version strings live behind JWT on
-/// `/mesh/config-drift` because they embed config timestamps + content digests.
-pub fn increment_xds_warming_partial_apply(namespace: impl AsRef<str>) {
-    XDS_WARMING_PARTIAL_APPLIES
-        .entry(Arc::from(namespace.as_ref()))
         .or_insert_with(|| AtomicU64::new(0))
         .fetch_add(1, Ordering::Relaxed);
 }
@@ -1312,7 +1515,6 @@ pub fn increment_workload_api_rpc_rejected() {
 /// Render process-static mesh families without a gateway namespace label.
 /// Retained for diagnostics/tests that consume these helpers outside the
 /// configured Prometheus plugin.
-#[allow(dead_code)]
 pub fn render_mesh_observability_metrics(output: &mut String) {
     render_mesh_observability_metrics_with_gateway_namespace(output, "");
 }
@@ -1472,6 +1674,34 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
         }
     }
 
+    // Mesh tracing span drops. Both labels are closed enums, so no endpoint,
+    // host, or exporter error text can become a label; only series that have
+    // dropped at least one span are rendered.
+    if MESH_TRACING_SPANS_DROPPED
+        .iter()
+        .any(|slot| slot.load(Ordering::Relaxed) > 0)
+    {
+        output.push_str(
+            "# HELP ferrum_mesh_tracing_spans_dropped_total Finished mesh telemetry spans a workload_metrics exporter dropped, refused at enqueue or discarded at delivery, by provider and reason.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_tracing_spans_dropped_total counter\n");
+        for provider in MeshTracingProvider::ALL {
+            for reason in MeshTracingSpanDropReason::ALL {
+                let count = mesh_tracing_spans_dropped_count(provider, reason);
+                if count == 0 {
+                    continue;
+                }
+                output.push_str(&format!(
+                    "ferrum_mesh_tracing_spans_dropped_total{{provider=\"{}\",reason=\"{}\"{}}} {}\n",
+                    provider.as_metric_label(),
+                    reason.as_metric_label(),
+                    gateway_ns_label,
+                    count
+                ));
+            }
+        }
+    }
+
     if !MESH_CONFIG_REVISION_REJECTIONS.is_empty() {
         output.push_str(
             "# HELP ferrum_mesh_config_revision_rejections_total Mesh config revision admission or apply-token rejections, by reason.\n",
@@ -1546,25 +1776,36 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
     }
 
     if !MESH_FEDERATION_LAST_SUCCESS.is_empty() {
+        // One snapshot feeds both families, so each is emitted as one group
+        // (HELP, TYPE, then all of its samples) from the same key set.
+        let samples: Vec<(String, u64)> = MESH_FEDERATION_LAST_SUCCESS
+            .iter()
+            .map(|entry| {
+                (
+                    escape_label_value(entry.key()),
+                    entry.value().load(Ordering::Relaxed),
+                )
+            })
+            .collect();
         output.push_str(
             "# HELP ferrum_mesh_federation_last_success_timestamp_seconds Unix timestamp of last successful SPIFFE federation poll.\n",
         );
         output.push_str("# TYPE ferrum_mesh_federation_last_success_timestamp_seconds gauge\n");
-        output.push_str(
-            "# HELP ferrum_mesh_federation_bundle_age_seconds Age of the cached federated trust bundle, in seconds.\n",
-        );
-        output.push_str("# TYPE ferrum_mesh_federation_bundle_age_seconds gauge\n");
-        for entry in MESH_FEDERATION_LAST_SUCCESS.iter() {
-            let last = entry.value().load(Ordering::Relaxed);
-            let trust_domain = escape_label_value(entry.key());
+        for (trust_domain, last) in &samples {
             output.push_str(&format!(
                 "ferrum_mesh_federation_last_success_timestamp_seconds{{trust_domain=\"{}\"{}}} {}\n",
                 trust_domain, gateway_ns_label, last
             ));
+        }
+        output.push_str(
+            "# HELP ferrum_mesh_federation_bundle_age_seconds Age of the cached federated trust bundle, in seconds.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_federation_bundle_age_seconds gauge\n");
+        for (trust_domain, last) in &samples {
             // Age clamps to 0 when the cached "last" timestamp is somehow in the
             // future (clock skew on a restart). Saturating subtraction keeps the
             // gauge non-negative for a Prometheus `gauge` type.
-            let age = now.saturating_sub(last);
+            let age = now.saturating_sub(*last);
             output.push_str(&format!(
                 "ferrum_mesh_federation_bundle_age_seconds{{trust_domain=\"{}\"{}}} {}\n",
                 trust_domain, gateway_ns_label, age
@@ -1605,24 +1846,35 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
     }
 
     if !MESH_REMOTE_DISCOVERY_LAST_SUCCESS.is_empty() {
+        // One snapshot feeds both families, so each is emitted as one group
+        // (HELP, TYPE, then all of its samples) from the same key set.
+        let samples: Vec<(String, String, u64)> = MESH_REMOTE_DISCOVERY_LAST_SUCCESS
+            .iter()
+            .map(|entry| {
+                (
+                    escape_label_value(&entry.key().cluster),
+                    escape_label_value(&entry.key().trust_domain),
+                    entry.value().load(Ordering::Relaxed),
+                )
+            })
+            .collect();
         output.push_str(
             "# HELP ferrum_mesh_remote_discovery_last_success_timestamp_seconds Unix timestamp of last successful remote-cluster endpoint discovery poll.\n",
         );
         output
             .push_str("# TYPE ferrum_mesh_remote_discovery_last_success_timestamp_seconds gauge\n");
-        output.push_str(
-            "# HELP ferrum_mesh_remote_discovery_endpoint_age_seconds Age of the cached remote-cluster endpoints, in seconds.\n",
-        );
-        output.push_str("# TYPE ferrum_mesh_remote_discovery_endpoint_age_seconds gauge\n");
-        for entry in MESH_REMOTE_DISCOVERY_LAST_SUCCESS.iter() {
-            let last = entry.value().load(Ordering::Relaxed);
-            let cluster = escape_label_value(&entry.key().cluster);
-            let trust_domain = escape_label_value(&entry.key().trust_domain);
+        for (cluster, trust_domain, last) in &samples {
             output.push_str(&format!(
                 "ferrum_mesh_remote_discovery_last_success_timestamp_seconds{{cluster=\"{}\",trust_domain=\"{}\"{}}} {}\n",
                 cluster, trust_domain, gateway_ns_label, last
             ));
-            let age = now.saturating_sub(last);
+        }
+        output.push_str(
+            "# HELP ferrum_mesh_remote_discovery_endpoint_age_seconds Age of the cached remote-cluster endpoints, in seconds.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_remote_discovery_endpoint_age_seconds gauge\n");
+        for (cluster, trust_domain, last) in &samples {
+            let age = now.saturating_sub(*last);
             output.push_str(&format!(
                 "ferrum_mesh_remote_discovery_endpoint_age_seconds{{cluster=\"{}\",trust_domain=\"{}\"{}}} {}\n",
                 cluster, trust_domain, gateway_ns_label, age
@@ -1720,21 +1972,6 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
             XDS_ACTIVE_NODE_IDS.load(Ordering::Relaxed),
             gateway_ns_label,
         );
-    }
-
-    if !XDS_WARMING_PARTIAL_APPLIES.is_empty() {
-        output.push_str(
-            "# HELP ferrum_xds_warming_partial_applies_total Mesh slices applied while marked as xDS required-version skewed. Normal coherent xDS apply should not increment this.\n",
-        );
-        output.push_str("# TYPE ferrum_xds_warming_partial_applies_total counter\n");
-        for entry in XDS_WARMING_PARTIAL_APPLIES.iter() {
-            output.push_str(&format!(
-                "ferrum_xds_warming_partial_applies_total{{namespace=\"{}\"{}}} {}\n",
-                escape_label_value(entry.key()),
-                gateway_ns_label,
-                entry.value().load(Ordering::Relaxed)
-            ));
-        }
     }
 
     if !XDS_FIRST_SLICE_NACKS.is_empty() {
@@ -1918,8 +2155,6 @@ fn mesh_cert_expiry_series_is_stale(expires_at: u64, last_observed_at: u64, now:
     now >= stale_after
 }
 
-/// Build a `MeshRequestKey` from a transaction summary.
-///
 /// Hard cap on the number of distinct interned mesh-label values.
 ///
 /// The legitimate mesh label space (workload / namespace / principal / app /
@@ -1973,7 +2208,9 @@ fn intern_label(value: &str) -> Arc<str> {
 
 /// True when metadata carries mesh identity/routing keys rather than only the
 /// reserved internal `mesh.metrics.*` coordination namespace.
-fn metadata_has_mesh_identity_keys(metadata: &HashMap<String, String>) -> bool {
+fn metadata_has_mesh_identity_keys<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> bool {
     metadata.keys().any(|key| {
         key.starts_with("mesh.")
             && !crate::plugins::utils::metadata_redaction::is_mesh_metrics_internal_metadata_key(
@@ -2052,10 +2289,111 @@ pub fn mesh_request_key(summary: &TransactionSummary) -> Option<MeshRequestKey> 
         request_protocol,
         response_code: summary.response_status_code,
         response_code_override: None,
+        grpc_response_status: grpc_response_status_label(summary.grpc_status()),
         response_flags,
         connection_security_policy,
         removed_labels: 0,
     })
+}
+
+/// [`mesh_request_key`] for a request whose context carries the typed mesh
+/// label projection (issue #6793).
+///
+/// The labels come from the request's [`MeshLabelShadow`] as shared
+/// `Arc<str>` values: no per-label metadata parse and no intern-table lookup.
+/// The shadow is authoritative when the request's plugin view deferred the
+/// string projection, because then nothing else can have written the label
+/// keys. On an eager request it is used only after
+/// [`MeshLabelShadow::metric_key_labels_match`] proves the summary metadata
+/// still holds exactly its values; a label another plugin rewrote, added or
+/// removed sends the summary through the string parser, which reports it
+/// exactly as before. Protocol, response flags and security policy are always
+/// read from the summary metadata, which every request still carries.
+pub fn mesh_request_key_for_request(
+    summary: &TransactionSummary,
+    ctx: &crate::plugins::RequestContext,
+) -> Option<MeshRequestKey> {
+    let Some(shadow) = ctx.mesh_label_shadow() else {
+        return mesh_request_key(summary);
+    };
+    // Same gate as the parser: a summary carrying no mesh key emits no mesh
+    // metric, whichever projection would build it. Every stamp writes
+    // non-label `mesh.*` keys, so a deferred request still passes it.
+    if !metadata_has_mesh_identity_keys(&summary.metadata) {
+        return None;
+    }
+    if !ctx.mesh_label_projection_deferred() && !shadow.metric_key_labels_match(&summary.metadata) {
+        return mesh_request_key(summary);
+    }
+    Some(mesh_request_key_from_shadow(summary, shadow))
+}
+
+/// Build the key [`mesh_request_key`] would parse from metadata holding
+/// `shadow`'s label projection, applying the parser's own defaults to every
+/// absent label.
+fn mesh_request_key_from_shadow(
+    summary: &TransactionSummary,
+    shadow: &MeshLabelShadow,
+) -> MeshRequestKey {
+    let label_or =
+        |label: MeshLabel, default: &Arc<str>| Arc::clone(shadow.get_arc(label).unwrap_or(default));
+    let unknown = unknown_label();
+    let source_workload = label_or(MeshLabel::SourceWorkload, unknown);
+    let destination_workload = match shadow.get_arc(MeshLabel::DestinationWorkload) {
+        Some(workload) => Arc::clone(workload),
+        None => shared_label(
+            summary
+                .proxy_name
+                .as_deref()
+                .or(summary.proxy_id.as_deref())
+                .unwrap_or(UNKNOWN_LABEL),
+        ),
+    };
+    MeshRequestKey {
+        source_namespace: label_or(MeshLabel::SourceNamespace, unknown),
+        source_principal: label_or(MeshLabel::SourcePrincipal, unknown),
+        source_app: label_or(MeshLabel::SourceApp, &source_workload),
+        source_service: label_or(MeshLabel::SourceService, &source_workload),
+        source_workload,
+        destination_namespace: label_or(MeshLabel::DestinationNamespace, unknown),
+        destination_principal: label_or(MeshLabel::DestinationPrincipal, unknown),
+        destination_app: label_or(MeshLabel::DestinationApp, &destination_workload),
+        destination_service: label_or(MeshLabel::DestinationService, &destination_workload),
+        destination_workload,
+        request_protocol: shared_label(
+            ["mesh.request_protocol", "request_protocol"]
+                .iter()
+                .find_map(|key| summary.metadata.get(*key).map(String::as_str))
+                .unwrap_or("http"),
+        ),
+        response_code: summary.response_status_code,
+        response_code_override: None,
+        grpc_response_status: grpc_response_status_label(summary.grpc_status()),
+        response_flags: shared_label(
+            summary
+                .metadata
+                .get("mesh.response_flags")
+                .map(String::as_str)
+                .unwrap_or_else(|| inferred_response_flags(summary)),
+        ),
+        connection_security_policy: shared_label(
+            summary
+                .metadata
+                .get("mesh.connection_security_policy")
+                .map(String::as_str)
+                .unwrap_or("none"),
+        ),
+        removed_labels: 0,
+    }
+}
+
+/// A shared label value: the static `Arc` for a value the gateway itself
+/// stamps, otherwise the interned one.
+fn shared_label(value: &str) -> Arc<str> {
+    match static_label(value) {
+        Some(label) => Arc::clone(label),
+        None => intern_label(value),
+    }
 }
 
 pub(crate) fn mesh_metric_disabled(summary: &TransactionSummary, family: MeshMetricFamily) -> bool {
@@ -2066,13 +2404,25 @@ pub(crate) fn mesh_metric_disabled(summary: &TransactionSummary, family: MeshMet
 /// `workload_metrics` to a finalized mesh key. The compact plan is parsed in
 /// place without JSON parsing, CEL text reparsing, or a lock on the request-log
 /// path. Expression opcodes evaluate against the metric-phase attribute context.
+#[cfg(test)]
 pub(crate) fn mesh_request_key_for_family(
     summary: &TransactionSummary,
     base: &MeshRequestKey,
     family: MeshMetricFamily,
 ) -> MeshRequestKey {
+    mesh_request_key_for_family_cow(summary, base, family).into_owned()
+}
+
+/// Borrowing variant of [`mesh_request_key_for_family`]: returns `Cow::Borrowed`
+/// when no per-family metric tag override applies (the common path), avoiding
+/// 14 `Arc<str>` atomic clones per family on warm series hits.
+pub(crate) fn mesh_request_key_for_family_cow<'a>(
+    summary: &TransactionSummary,
+    base: &'a MeshRequestKey,
+    family: MeshMetricFamily,
+) -> std::borrow::Cow<'a, MeshRequestKey> {
     let Some(plan) = summary.metadata.get(family.override_metadata_key()) else {
-        return base.clone();
+        return std::borrow::Cow::Borrowed(base);
     };
     let mut key = base.clone();
     let extras = MetricTagCelExtras {
@@ -2084,7 +2434,7 @@ pub(crate) fn mesh_request_key_for_family(
     };
     apply_metric_override_plan(&mut key, base, plan, extras);
     normalize_removed_labels(&mut key);
-    key
+    std::borrow::Cow::Owned(key)
 }
 
 /// Collapse every removed label onto one shared sentinel value so the derived
@@ -2098,7 +2448,7 @@ fn normalize_removed_labels(key: &mut MeshRequestKey) {
         return;
     }
     static REMOVED_LABEL_SENTINEL: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from(""));
-    for index in 0u8..=MeshMetricLabel::ResponseCode.index() {
+    for index in 0u8..=MeshMetricLabel::LAST.index() {
         if key.removed_labels & (1u16 << index) == 0 {
             continue;
         }
@@ -2484,6 +2834,7 @@ fn metric_label_value(key: &MeshRequestKey, label: MeshMetricLabel) -> Arc<str> 
             .response_code_override
             .as_ref()
             .map_or_else(|| intern_label(&key.response_code.to_string()), Arc::clone),
+        MeshMetricLabel::GrpcResponseStatus => Arc::clone(&key.grpc_response_status),
     }
 }
 
@@ -2502,14 +2853,29 @@ fn set_metric_label_value(key: &mut MeshRequestKey, label: MeshMetricLabel, valu
         MeshMetricLabel::RequestProtocol => key.request_protocol = value,
         MeshMetricLabel::ResponseFlags => key.response_flags = value,
         MeshMetricLabel::ConnectionSecurityPolicy => key.connection_security_policy = value,
-        MeshMetricLabel::ResponseCode => {
-            key.response_code = 0;
-            key.response_code_override = Some(value);
-        }
+        // A value that renders exactly like a numeric status (an override
+        // `set` to `"200"`, or `string(response.code)`) is stored as that
+        // status, so it shares the registry key of the same response recorded
+        // without an override instead of splitting one rendered series in two.
+        MeshMetricLabel::ResponseCode => match canonical_response_code(&value) {
+            Some(code) => {
+                key.response_code = code;
+                key.response_code_override = None;
+            }
+            None => {
+                key.response_code = 0;
+                key.response_code_override = Some(value);
+            }
+        },
+        MeshMetricLabel::GrpcResponseStatus => key.grpc_response_status = value,
     }
 }
 
-fn metadata_arc(metadata: &HashMap<String, String>, key: &str, default: &str) -> Arc<str> {
+fn metadata_arc<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+    key: &str,
+    default: &str,
+) -> Arc<str> {
     intern_label(metadata.get(key).map(String::as_str).unwrap_or(default))
 }
 
@@ -2526,7 +2892,11 @@ fn trust_bundle_fingerprint(roots_der: &[Vec<u8>]) -> u64 {
     hash
 }
 
-fn metadata_arc_any(metadata: &HashMap<String, String>, keys: &[&str], default: &str) -> Arc<str> {
+fn metadata_arc_any<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+    keys: &[&str],
+    default: &str,
+) -> Arc<str> {
     intern_label(
         keys.iter()
             .find_map(|key| metadata.get(*key).map(String::as_str))
@@ -2534,8 +2904,8 @@ fn metadata_arc_any(metadata: &HashMap<String, String>, keys: &[&str], default: 
     )
 }
 
-fn metadata_arc_or_clone(
-    metadata: &HashMap<String, String>,
+fn metadata_arc_or_clone<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     key: &str,
     default: &Arc<str>,
 ) -> Arc<str> {
@@ -2579,15 +2949,18 @@ pub fn render_mesh_histogram_named(
 ) {
     let base_labels = mesh_label_base_fragment(key);
     let le_separator = if base_labels.is_empty() { "" } else { "," };
-    for (i, boundary) in histogram.boundaries.iter().enumerate() {
-        let count = histogram.counts[i].load(Ordering::Relaxed);
+    let mut finite_total = 0u64;
+    for (boundary, count) in histogram.cumulative_buckets() {
+        finite_total = count;
         let _ = writeln!(
             output,
             "{metric_name}_bucket{{{}{le_separator}le=\"{}\"{}}} {}",
             base_labels, boundary, gateway_ns_label, count
         );
     }
-    let total_count = histogram.count.load(Ordering::Relaxed);
+    // Never below the last finite cumulative bucket, so a scrape racing an
+    // observation cannot expose a non-monotonic bucket series.
+    let total_count = histogram.count.load(Ordering::Relaxed).max(finite_total);
     let _ = writeln!(
         output,
         "{metric_name}_bucket{{{}{le_separator}le=\"+Inf\"{}}} {}",
@@ -2613,11 +2986,17 @@ pub fn render_mesh_histogram_named(
     );
 }
 
+/// Labels TCP families never render (Istio parity): the HTTP `response_code`
+/// and the gRPC `grpc_response_status`.
+const TCP_FAMILY_REMOVED_LABELS: u16 = (1u16 << MeshMetricLabel::ResponseCode.index())
+    | (1u16 << MeshMetricLabel::GrpcResponseStatus.index());
+
 /// Build a mesh identity key from stream metadata (TCP/UDP connect or disconnect).
 ///
-/// TCP families omit `response_code` from the rendered label set (Istio parity).
-pub fn mesh_stream_key_from_metadata(
-    metadata: &HashMap<String, String>,
+/// TCP families omit `response_code` and `grpc_response_status` from the
+/// rendered label set (Istio parity).
+pub fn mesh_stream_key_from_metadata<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     proxy_id: &str,
     proxy_name: Option<&str>,
 ) -> Option<MeshRequestKey> {
@@ -2660,16 +3039,17 @@ pub fn mesh_stream_key_from_metadata(
         request_protocol,
         response_code: 0,
         response_code_override: None,
+        grpc_response_status: grpc_response_status_label(None),
         response_flags,
         connection_security_policy,
-        removed_labels: 1u16 << MeshMetricLabel::ResponseCode.index(),
+        removed_labels: TCP_FAMILY_REMOVED_LABELS,
     };
     normalize_removed_labels(&mut key);
     Some(key)
 }
 
-pub(crate) fn mesh_metric_disabled_metadata(
-    metadata: &HashMap<String, String>,
+pub(crate) fn mesh_metric_disabled_metadata<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     family: MeshMetricFamily,
 ) -> bool {
     metadata
@@ -2681,13 +3061,13 @@ pub(crate) fn mesh_metric_disabled_metadata(
         })
 }
 
-pub(crate) fn mesh_request_key_for_family_from_metadata(
-    metadata: &HashMap<String, String>,
-    base: &MeshRequestKey,
+pub(crate) fn mesh_request_key_for_family_from_metadata_cow<'a, MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+    base: &'a MeshRequestKey,
     family: MeshMetricFamily,
-) -> MeshRequestKey {
+) -> std::borrow::Cow<'a, MeshRequestKey> {
     let Some(plan) = metadata.get(family.override_metadata_key()) else {
-        return base.clone();
+        return std::borrow::Cow::Borrowed(base);
     };
     let mut key = base.clone();
     let extras = MetricTagCelExtras {
@@ -2697,14 +3077,15 @@ pub(crate) fn mesh_request_key_for_family_from_metadata(
         destination_port: metadata_destination_port(metadata),
     };
     apply_metric_override_plan(&mut key, base, plan, extras);
-    // TCP families never carry an HTTP response-code dimension. Preserve that
-    // fixed schema even when an ALL_METRICS plan contains a response-code
-    // UPSERT/rename intended for the HTTP/gRPC families.
+    // TCP families never carry an HTTP response-code or gRPC-status
+    // dimension. Preserve that fixed schema even when an ALL_METRICS plan
+    // contains a response-code / gRPC-status UPSERT or rename intended for the
+    // HTTP/gRPC families.
     if family.is_tcp() {
-        key.removed_labels |= 1u16 << MeshMetricLabel::ResponseCode.index();
+        key.removed_labels |= TCP_FAMILY_REMOVED_LABELS;
     }
     normalize_removed_labels(&mut key);
-    key
+    std::borrow::Cow::Owned(key)
 }
 
 /// True when both metric plugins actually observed a mesh TCP connection.
@@ -2715,7 +3096,9 @@ pub(crate) fn mesh_request_key_for_family_from_metadata(
 /// incomplete/default labels and keeps mesh mode silent when its auto-injected
 /// `workload_metrics` plugin has no configured Prometheus exporter. The request
 /// protocol still defaults to `tcp` exactly as the key builder does.
-pub fn metadata_is_mesh_tcp_stream(metadata: &HashMap<String, String>) -> bool {
+pub fn metadata_is_mesh_tcp_stream<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> bool {
     metadata.contains_key(MESH_PROMETHEUS_METRICS_OBSERVED_METADATA)
         && metadata.contains_key(MESH_WORKLOAD_METRICS_OBSERVED_METADATA)
         && metadata
@@ -2725,7 +3108,9 @@ pub fn metadata_is_mesh_tcp_stream(metadata: &HashMap<String, String>) -> bool {
 }
 
 /// True when `TCP_OPENED_CONNECTIONS` was already finalized for this stream.
-pub fn mesh_tcp_opened_finalized(metadata: &HashMap<String, String>) -> bool {
+pub fn mesh_tcp_opened_finalized<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> bool {
     metadata.contains_key(MESH_TCP_OPENED_FINALIZED_METADATA)
 }
 
@@ -2762,11 +3147,17 @@ pub fn is_mesh_grpc_protocol(protocol: &str) -> bool {
 
 /// True when the Prometheus hook observed a gRPC (or gRPC-Web) transaction that
 /// should populate authoritative length-prefixed message counters.
-pub fn metadata_observes_grpc_messages(metadata: &HashMap<String, String>) -> bool {
-    metadata.contains_key(MESH_PROMETHEUS_METRICS_OBSERVED_METADATA)
-        && metadata
+///
+/// Observation is the typed
+/// [`crate::plugins::RequestContext::prometheus_metrics_observed`]
+/// bit the request hook sets (no per-request metadata marker); the protocol
+/// still comes from routing metadata.
+pub fn request_observes_grpc_messages(ctx: &crate::plugins::RequestContext) -> bool {
+    ctx.prometheus_metrics_observed()
+        && ctx
+            .metadata
             .get("request_protocol")
-            .or_else(|| metadata.get("mesh.request_protocol"))
+            .or_else(|| ctx.metadata.get("mesh.request_protocol"))
             .is_some_and(|protocol| is_mesh_grpc_protocol(protocol))
 }
 
@@ -2799,11 +3190,11 @@ pub fn record_complete_grpc_message_count(counter: &AtomicU64, body: &[u8]) {
 /// Both directions therefore describe the native gRPC representation exchanged
 /// with the backend, and `fetch_max` keeps retried/replayed buffers idempotent.
 pub fn record_native_grpc_message_count(
-    metadata: &HashMap<String, String>,
+    ctx: &crate::plugins::RequestContext,
     counter: &AtomicU64,
     body: &[u8],
 ) {
-    if metadata_observes_grpc_messages(metadata) {
+    if request_observes_grpc_messages(ctx) {
         record_complete_grpc_message_count(counter, body);
     }
 }
@@ -2914,6 +3305,13 @@ fn mesh_label_base_fragment(key: &MeshRequestKey) -> String {
     write_optional_mesh_label(
         &mut labels,
         key,
+        MeshMetricLabel::GrpcResponseStatus,
+        "grpc_response_status",
+        &key.grpc_response_status,
+    );
+    write_optional_mesh_label(
+        &mut labels,
+        key,
         MeshMetricLabel::ResponseFlags,
         "response_flags",
         &key.response_flags,
@@ -2942,23 +3340,6 @@ fn write_optional_mesh_label(
         labels.push(',');
     }
     let _ = write!(labels, "{}=\"{}\"", name, escape_label_value(value));
-}
-
-/// Current value of the aggregate ADS stream rejection counter. Test-only
-/// accessor so the cap can be asserted without scraping the full metrics text.
-#[cfg(test)]
-pub fn xds_streams_rejected_count() -> u64 {
-    XDS_STREAMS_REJECTED.load(Ordering::Relaxed)
-}
-
-/// Current value of the warming partial-apply counter for a `namespace`.
-/// Test-only accessor.
-#[cfg(test)]
-pub fn xds_warming_partial_apply_count(namespace: &str) -> u64 {
-    XDS_WARMING_PARTIAL_APPLIES
-        .get(namespace)
-        .map(|entry| entry.load(Ordering::Relaxed))
-        .unwrap_or(0)
 }
 
 /// Current value of the first-slice NACK counter for a `(namespace, type_url)`
@@ -2994,6 +3375,7 @@ mod tests {
             request_protocol: Arc::from("http"),
             response_code: 200,
             response_code_override: None,
+            grpc_response_status: Arc::from(""),
             response_flags: Arc::from("-"),
             connection_security_policy: Arc::from("mutual_tls"),
             removed_labels: 0,
@@ -3003,7 +3385,7 @@ mod tests {
     #[test]
     fn metric_override_plan_applies_after_base_attribution_in_order() {
         let summary = TransactionSummary {
-            metadata: HashMap::from([(
+            metadata: crate::plugins::MetadataMap::from_iter([(
                 MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
                 // Copy the source workload into destination workload, then set
                 // the source to a new value. The order is observable.
@@ -3026,7 +3408,7 @@ mod tests {
     #[test]
     fn removed_and_renamed_labels_do_not_split_series_identity() {
         let summary = TransactionSummary {
-            metadata: HashMap::from([(
+            metadata: crate::plugins::MetadataMap::from_iter([(
                 MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
                 // Remove source_principal, rename source_workload into
                 // source_app (removing source_workload).
@@ -3070,7 +3452,7 @@ mod tests {
         // `é` is UTF-8 C3 A9. Reading the lead byte then slicing at index 1
         // would panic on a char-boundary check; defensive parsing must return.
         let summary = TransactionSummary {
-            metadata: HashMap::from([(
+            metadata: crate::plugins::MetadataMap::from_iter([(
                 MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
                 "m0;é".to_string(),
             )]),
@@ -3087,7 +3469,7 @@ mod tests {
         // Length is UTF-8 bytes so the body slice is well-formed as a str, but
         // opcode consumption must not panic mid-character.
         let summary = TransactionSummary {
-            metadata: HashMap::from([(
+            metadata: crate::plugins::MetadataMap::from_iter([(
                 MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
                 "m0;x0,2:é;".to_string(),
             )]),
@@ -3127,7 +3509,7 @@ mod tests {
     #[test]
     fn metric_disable_marker_is_family_specific() {
         let summary = TransactionSummary {
-            metadata: HashMap::from([(
+            metadata: crate::plugins::MetadataMap::from_iter([(
                 MESH_METRICS_DISABLED_METADATA.to_string(),
                 "request_duration".to_string(),
             )]),
@@ -3207,18 +3589,15 @@ mod tests {
         let namespace = format!("ns-{suffix}");
         let type_url = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
 
-        let before = xds_streams_rejected_count();
+        let before = xds_streams_rejected_total();
         increment_xds_stream_rejected();
         increment_xds_stream_rejected();
         increment_xds_first_slice_nack(&namespace, type_url);
-        increment_xds_warming_partial_apply(&namespace);
 
-        assert_eq!(xds_streams_rejected_count() - before, 2);
+        assert_eq!(xds_streams_rejected_total() - before, 2);
         assert_eq!(xds_first_slice_nack_count(&namespace, type_url), 1);
-        // Unique namespace → this test is the only writer for that series.
-        assert_eq!(xds_warming_partial_apply_count(&namespace), 1);
 
-        let total = xds_streams_rejected_count();
+        let total = xds_streams_rejected_total();
         let mut output = String::new();
         render_mesh_observability_metrics(&mut output);
 
@@ -3240,15 +3619,11 @@ mod tests {
             )),
             "first-slice NACK counter series missing: {output}"
         );
+        // Removed in #7027: the coherent-version gate means no slice is ever
+        // applied under version skew, so the family could never increment.
         assert!(
-            output.contains("# TYPE ferrum_xds_warming_partial_applies_total counter"),
-            "warming partial-apply counter TYPE line missing: {output}"
-        );
-        assert!(
-            output.contains(&format!(
-                "ferrum_xds_warming_partial_applies_total{{namespace=\"{namespace}\"}} 1"
-            )),
-            "warming partial-apply counter series missing: {output}"
+            !output.contains("ferrum_xds_warming_partial_applies_total"),
+            "retired warming partial-apply family must not be rendered: {output}"
         );
     }
 

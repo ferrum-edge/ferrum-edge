@@ -15,29 +15,81 @@
 //!
 //! An optional `filter` (status-code range, minimum latency, errors-only)
 //! gates which transactions are logged; it runs before schema application.
-//! This is also the sink mesh mode injects to honor a Telemetry CRD's
-//! `accessLogging` configuration.
+//! An optional `sampling` block then keeps a deterministic fraction of the
+//! matching records. This is also the sink mesh mode injects to honor a
+//! Telemetry CRD's `accessLogging` configuration.
+//!
+//! Every record's sink outcome (accepted, saturated, oversized, closed, or a
+//! serialization failure) is published under the `stdout_logging` label of the
+//! per-plugin `ferrum_plugin_log_sink_records_*` families, so access-record
+//! loss is attributable separately from runtime tracing records that share the
+//! process stdout queue.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use crossbeam_utils::CachePadded;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tracing::warn;
 
+use crate::logging::non_blocking::EnqueueResult;
 use crate::modes::mesh::access_log_filter::AccessLogFilterExpr;
 use crate::modes::mesh::access_log_filter::{
-    AccessLogFilterContext, StreamAccessLogFilterContext, evaluate_access_log_filter_expr,
-    evaluate_access_log_filter_expr_for_stream, validate_access_log_filter_expr,
+    AccessLogFilterContext, MAX_ACCESS_LOG_FILTER_STATUS_CODE, StreamAccessLogFilterContext,
+    evaluate_access_log_filter_expr, evaluate_access_log_filter_expr_for_stream,
+    validate_access_log_filter_expr,
 };
 
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
+use super::utils::sink_loss::{SinkLossReason, SinkLossSlot};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
+
+/// Re-exported from [`crate::plugins`], where the shared session-end
+/// projection ([`WsDisconnectContext::session_end_summary`]) lives.
+pub use super::WS_SESSION_END_TIMESTAMP_METADATA_KEY;
+
+/// Sampling resolution: `sampling.rate` resolves to whole records per million
+/// candidates, so the smallest accepted rate is `0.000001`.
+const SAMPLE_PERIOD: u64 = 1_000_000;
 
 pub struct StdoutLogging {
     /// When set, only log transactions matching all filter predicates.
     filter: Option<Filter>,
+    /// When set, keep only a deterministic fraction of the matching records.
+    sampler: Option<Sampler>,
     schema: Option<Arc<SummarySchema>>,
+    /// Pre-resolved `stdout_logging` slot of the per-plugin sink-loss counters.
+    loss_slot: SinkLossSlot,
+}
+
+/// Deterministic, evenly spaced record sampler.
+///
+/// Admits exactly `threshold` of every [`SAMPLE_PERIOD`] consecutive
+/// candidates (a Bresenham walk over one shared sequence), so a configured
+/// rate is honored exactly rather than in expectation, with one relaxed
+/// `fetch_add` and no CAS loop per candidate.
+struct Sampler {
+    /// Candidates admitted per [`SAMPLE_PERIOD`], in `1..SAMPLE_PERIOD`.
+    threshold: u64,
+    /// Terminal failures bypass sampling (and do not advance the sequence).
+    always_log_errors: bool,
+    /// Padded so the per-record increment does not false-share with the
+    /// immutable filter state read on the same path.
+    sequence: CachePadded<AtomicU64>,
+}
+
+impl Sampler {
+    fn admits(&self, is_failure: impl FnOnce() -> bool) -> bool {
+        if self.always_log_errors && is_failure() {
+            return true;
+        }
+        let position = self.sequence.fetch_add(1, Ordering::Relaxed) % SAMPLE_PERIOD;
+        // `position < SAMPLE_PERIOD` and `threshold < SAMPLE_PERIOD`, so the
+        // products stay far below `u64::MAX`.
+        (position + 1) * self.threshold / SAMPLE_PERIOD > position * self.threshold / SAMPLE_PERIOD
+    }
 }
 
 struct Filter {
@@ -59,16 +111,17 @@ impl StdoutLogging {
             return Err("stdout_logging: config must be an object".to_string());
         }
         if let Some(config) = config.as_object() {
-            reject_unknown_keys(
+            crate::util::unknown_keys::reject_unknown_keys(
                 config,
                 "stdout_logging",
-                &["filter", "schema", "schema_ref"],
+                &["filter", "sampling", "schema", "schema_ref"],
+                "stdout_logging: `stdout_logging`: ",
             )?;
         }
         let filter = match config.get("filter") {
             Some(Value::Null) | None => None,
             Some(Value::Object(filter_config)) => {
-                reject_unknown_keys(
+                crate::util::unknown_keys::reject_unknown_keys(
                     filter_config,
                     "stdout_logging.filter",
                     &[
@@ -78,9 +131,10 @@ impl StdoutLogging {
                         "errors_only",
                         "expression",
                     ],
+                    "stdout_logging: `stdout_logging.filter`: ",
                 )?;
-                let status_code_min = parse_optional_u16(filter_config, "status_code_min")?;
-                let status_code_max = parse_optional_u16(filter_config, "status_code_max")?;
+                let status_code_min = parse_optional_status_code(filter_config, "status_code_min")?;
+                let status_code_max = parse_optional_status_code(filter_config, "status_code_max")?;
                 if let (Some(min), Some(max)) = (status_code_min, status_code_max)
                     && min > max
                 {
@@ -140,8 +194,18 @@ impl StdoutLogging {
             }
             Some(_) => return Err("stdout_logging: `filter` must be an object".to_string()),
         };
+        let sampler = match config.get("sampling") {
+            Some(Value::Null) | None => None,
+            Some(Value::Object(sampling)) => parse_sampling(sampling)?,
+            Some(_) => return Err("stdout_logging: `sampling` must be an object".to_string()),
+        };
         let schema = resolve_schema(config, "stdout_logging", SchemaCapabilities::BASE)?;
-        Ok(Self { filter, schema })
+        Ok(Self {
+            filter,
+            sampler,
+            schema,
+            loss_slot: SinkLossSlot::for_plugin("stdout_logging"),
+        })
     }
 
     /// Project a WebSocket disconnect into the HTTP access-log schema.
@@ -149,13 +213,53 @@ impl StdoutLogging {
     /// Hidden test helper so external unit tests can assert handshake
     /// method/status/original-path without going through stdout.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests; dead in the binary target
     pub fn project_ws_disconnect(ctx: &WsDisconnectContext) -> TransactionSummary {
-        transaction_summary_from_ws_disconnect(ctx)
+        ctx.session_end_summary()
     }
 
-    /// Apply the configured HTTP-family predicates to a finalized summary.
+    /// Apply the configured HTTP-family predicates, then sampling, to a
+    /// finalized summary.
+    ///
+    /// Sampling advances only for records the filter admits, so a rate applies
+    /// to the filtered stream; with `sampling.always_log_errors` a terminal
+    /// failure is always kept.
     pub fn should_log_transaction(&self, summary: &TransactionSummary) -> bool {
+        if !self.filter_matches_transaction(summary) {
+            return false;
+        }
+        match &self.sampler {
+            Some(sampler) => sampler.admits(|| summary.is_terminal_failure()),
+            None => true,
+        }
+    }
+
+    /// Apply the configured stream-family predicates, then sampling, to a
+    /// finalized summary.
+    pub fn should_log_stream_transaction(&self, summary: &StreamTransactionSummary) -> bool {
+        if !self.filter_matches_stream_transaction(summary) {
+            return false;
+        }
+        match &self.sampler {
+            Some(sampler) => sampler
+                .admits(|| summary.error_class.is_some() || summary.connection_error.is_some()),
+            None => true,
+        }
+    }
+
+    /// Account one sink admission outcome on the `stdout_logging` series of
+    /// the per-plugin sink-loss counters.
+    pub fn record_enqueue_outcome(&self, outcome: EnqueueResult) {
+        match outcome {
+            EnqueueResult::Queued => self.loss_slot.record_accepted(1),
+            EnqueueResult::Saturated => self.loss_slot.record_dropped(SinkLossReason::QueueFull, 1),
+            EnqueueResult::RecordTooLarge => self
+                .loss_slot
+                .record_dropped(SinkLossReason::RecordTooLarge, 1),
+            EnqueueResult::Closed => self.loss_slot.record_dropped(SinkLossReason::Shutdown, 1),
+        }
+    }
+
+    fn filter_matches_transaction(&self, summary: &TransactionSummary) -> bool {
         let Some(filter) = &self.filter else {
             return true;
         };
@@ -172,8 +276,7 @@ impl StdoutLogging {
         Self::flat_filter_matches_transaction(&filter.flat, summary)
     }
 
-    /// Apply the configured stream-family predicates to a finalized summary.
-    pub fn should_log_stream_transaction(&self, summary: &StreamTransactionSummary) -> bool {
+    fn filter_matches_stream_transaction(&self, summary: &StreamTransactionSummary) -> bool {
         let Some(filter) = &self.filter else {
             return true;
         };
@@ -205,10 +308,7 @@ impl StdoutLogging {
         {
             return false;
         }
-        if filter.errors_only && !summary.is_terminal_failure() {
-            return false;
-        }
-        true
+        !filter.errors_only || summary.is_terminal_failure()
     }
 
     fn flat_filter_matches_stream(filter: &FlatFilter, summary: &StreamTransactionSummary) -> bool {
@@ -220,65 +320,8 @@ impl StdoutLogging {
         {
             return false;
         }
-        if filter.errors_only && summary.error_class.is_none() && summary.connection_error.is_none()
-        {
-            return false;
-        }
-        true
+        !filter.errors_only || summary.error_class.is_some() || summary.connection_error.is_some()
     }
-}
-
-/// Project a WebSocket session-end into the HTTP-family access-log schema.
-///
-/// Handshake `log()` already emitted the upgrade row (usually without
-/// `error_class`). In-session faults live on `WsDisconnectContext`; this
-/// conversion lets operators grep the same `error_class` key. Method, path,
-/// and status are the values captured at upgrade admission (`GET`/`101` for
-/// HTTP/1.1, `CONNECT`/`200` for RFC 8441/9220 Extended CONNECT) so a
-/// rewritten backend target cannot corrupt those fields. BASE schema only —
-/// this is not the `websocket_disconnect` capability family.
-fn transaction_summary_from_ws_disconnect(ctx: &WsDisconnectContext) -> TransactionSummary {
-    TransactionSummary {
-        namespace: ctx.namespace.clone(),
-        timestamp_received: ctx.timestamp_connected.clone(),
-        client_ip: ctx.client_ip.clone(),
-        consumer_username: ctx.consumer_username.clone(),
-        auth_method: ctx.auth_method,
-        http_method: ctx.http_method.clone(),
-        request_path: ctx.request_path.clone(),
-        proxy_id: Some(ctx.proxy_id.clone()),
-        proxy_name: ctx.proxy_name.clone(),
-        backend_target: Some(ctx.backend_target.clone()),
-        response_status_code: ctx.handshake_status_code,
-        latency_total_ms: ctx.duration_ms,
-        latency_gateway_processing_ms: ctx.duration_ms,
-        bytes_sent: ctx.bytes_client_to_backend,
-        bytes_received: ctx.bytes_backend_to_client,
-        error_class: ctx.error_class,
-        metadata: ctx.metadata.clone(),
-        proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
-        ..TransactionSummary::default()
-    }
-}
-
-fn reject_unknown_keys(
-    config: &Map<String, Value>,
-    path: &str,
-    allowed: &[&str],
-) -> Result<(), String> {
-    let mut unknown: Vec<String> = config
-        .keys()
-        .filter(|key| !allowed.contains(&key.as_str()))
-        .map(|key| format!("{path}.{key}"))
-        .collect();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort_unstable();
-    Err(format!(
-        "stdout_logging: unknown configuration key(s) at `{path}`: {:?}",
-        unknown.join(", ")
-    ))
 }
 
 /// `errors_only` is a serde unit-like node (`{"op":"errors_only"}`). Internally
@@ -290,21 +333,12 @@ fn reject_unknown_errors_only_fields(value: &Value, path: &str) -> Result<(), St
         return Ok(());
     };
     match obj.get("op").and_then(Value::as_str) {
-        Some("errors_only") => {
-            let mut unknown: Vec<String> = obj
-                .keys()
-                .filter(|key| key.as_str() != "op")
-                .map(|key| format!("{path}.{key}"))
-                .collect();
-            if unknown.is_empty() {
-                return Ok(());
-            }
-            unknown.sort_unstable();
-            Err(format!(
-                "stdout_logging: unknown configuration key(s) at `{path}`: {:?}",
-                unknown.join(", ")
-            ))
-        }
+        Some("errors_only") => crate::util::unknown_keys::reject_unknown_keys(
+            obj,
+            path,
+            &["op"],
+            &format!("stdout_logging: `{path}`: "),
+        ),
         Some("and") | Some("or") => {
             if let Some(left) = obj.get("left") {
                 reject_unknown_errors_only_fields(left, &format!("{path}.left"))?;
@@ -343,14 +377,14 @@ fn expression_decode_diagnostic(value: &Value, path: &str) -> Option<String> {
             }
             &["op", "left", "right"]
         }
-        "status_code_min" | "status_code_max" | "min_latency_ms" => {
+        "status_code_min" | "status_code_max" | "min_latency_ms" | "latency_above_ms" => {
             let Some(value) = object.get("value") else {
                 return failure(path, "missing field `value`");
             };
-            let max = if operation == "min_latency_ms" {
+            let max = if matches!(operation, "min_latency_ms" | "latency_above_ms") {
                 u64::MAX
             } else {
-                u64::from(u16::MAX)
+                u64::from(MAX_ACCESS_LOG_FILTER_STATUS_CODE)
             };
             if value.as_u64().is_none_or(|value| value > max) {
                 return failure(
@@ -364,7 +398,7 @@ fn expression_decode_diagnostic(value: &Value, path: &str) -> Option<String> {
         _ => {
             return failure(
                 &format!("{path}.op"),
-                "unknown operation; expected `and`, `or`, `status_code_min`, `status_code_max`, `min_latency_ms` or `errors_only`",
+                "unknown operation; expected `and`, `or`, `status_code_min`, `status_code_max`, `min_latency_ms`, `latency_above_ms` or `errors_only`",
             );
         }
     };
@@ -374,7 +408,10 @@ fn expression_decode_diagnostic(value: &Value, path: &str) -> Option<String> {
     None
 }
 
-fn parse_optional_u16(config: &Map<String, Value>, key: &str) -> Result<Option<u16>, String> {
+fn parse_optional_status_code(
+    config: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<u16>, String> {
     let Some(value) = config.get(key) else {
         return Ok(None);
     };
@@ -382,8 +419,55 @@ fn parse_optional_u16(config: &Map<String, Value>, key: &str) -> Result<Option<u
         return Err(format!("stdout_logging: `filter.{key}` must be an integer"));
     };
     u16::try_from(raw)
+        .ok()
+        .filter(|code| *code <= MAX_ACCESS_LOG_FILTER_STATUS_CODE)
         .map(Some)
-        .map_err(|_| format!("stdout_logging: `filter.{key}` must be between 0 and 65535"))
+        .ok_or_else(|| {
+            format!(
+                "stdout_logging: `filter.{key}` must be between 0 and \
+                 {MAX_ACCESS_LOG_FILTER_STATUS_CODE}"
+            )
+        })
+}
+
+/// Parse `sampling`. A rate of `1` keeps every record and needs no sampler.
+fn parse_sampling(sampling: &Map<String, Value>) -> Result<Option<Sampler>, String> {
+    crate::util::unknown_keys::reject_unknown_keys(
+        sampling,
+        "stdout_logging.sampling",
+        &["rate", "always_log_errors"],
+        "stdout_logging: `stdout_logging.sampling`: ",
+    )?;
+    let Some(rate) = sampling.get("rate") else {
+        return Err("stdout_logging: `sampling.rate` is required".to_string());
+    };
+    let Some(rate) = rate.as_f64().filter(|rate| rate.is_finite()) else {
+        return Err("stdout_logging: `sampling.rate` must be a number".to_string());
+    };
+    if rate <= 0.0 || rate > 1.0 {
+        return Err(
+            "stdout_logging: `sampling.rate` must be greater than 0 and at most 1".to_string(),
+        );
+    }
+    // In `0..=SAMPLE_PERIOD` because `rate` is in `(0, 1]`.
+    let threshold = (rate * SAMPLE_PERIOD as f64).round() as u64;
+    if threshold == 0 {
+        return Err("stdout_logging: `sampling.rate` must be at least 0.000001".to_string());
+    }
+    let always_log_errors = match sampling.get("always_log_errors") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            "stdout_logging: `sampling.always_log_errors` must be a boolean".to_string()
+        })?,
+    };
+    if threshold >= SAMPLE_PERIOD {
+        return Ok(None);
+    }
+    Ok(Some(Sampler {
+        threshold,
+        always_log_errors,
+        sequence: CachePadded::new(AtomicU64::new(0)),
+    }))
 }
 
 fn parse_optional_u64(config: &Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
@@ -406,17 +490,30 @@ fn parse_optional_bool(config: &Map<String, Value>, key: &str) -> Result<Option<
         .ok_or_else(|| format!("stdout_logging: `filter.{key}` must be a boolean"))
 }
 
-/// Serialize and enqueue one access-log line after capacity reservation.
-fn write_access_log_line<T: Serialize + ?Sized>(value: &T) -> Result<(), serde_json::Error> {
-    if let Some(writer) = crate::logging::access_log_writer() {
-        // Saturation and oversize outcomes are accounted by the sink and
-        // intentionally do not log into either potentially degraded sink.
-        let _ = writer.try_write_json(value)?;
+impl StdoutLogging {
+    /// Serialize and enqueue one access-log line after capacity reservation.
+    fn write_access_log_line<T: Serialize + ?Sized>(
+        &self,
+        value: &T,
+    ) -> Result<(), serde_json::Error> {
+        if let Some(writer) = crate::logging::access_log_writer() {
+            // The process sink accounts these outcomes for the shared queue
+            // too; this attributes them to access records. Neither path logs
+            // into a potentially degraded sink.
+            match writer.try_write_json(value) {
+                Ok(outcome) => self.record_enqueue_outcome(outcome),
+                Err(error) => {
+                    self.loss_slot.record_dropped(SinkLossReason::SinkError, 1);
+                    return Err(error);
+                }
+            }
+        }
+        // The gateway treats process-sink initialization failure as fatal. A
+        // missing writer therefore only occurs in library/unit contexts; never
+        // add a synchronous stdout fallback here because plugin hooks are hot
+        // paths.
+        Ok(())
     }
-    // The gateway treats process-sink initialization failure as fatal. A
-    // missing writer therefore only occurs in library/unit contexts; never
-    // add a synchronous stdout fallback here because plugin hooks are hot paths.
-    Ok(())
 }
 
 #[async_trait]
@@ -425,8 +522,16 @@ impl Plugin for StdoutLogging {
         "stdout_logging"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::STDOUT_LOGGING
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::LOG
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -451,8 +556,8 @@ impl Plugin for StdoutLogging {
             return;
         }
         let result = match self.schema.as_ref().filter(|s| s.applies_to_http()) {
-            Some(schema) => write_access_log_line(&SchemaView { summary, schema }),
-            None => write_access_log_line(summary),
+            Some(schema) => self.write_access_log_line(&SchemaView { summary, schema }),
+            None => self.write_access_log_line(summary),
         };
         if let Err(error) = result {
             warn!("stdout_logging: failed to serialize transaction summary: {error}");
@@ -464,8 +569,8 @@ impl Plugin for StdoutLogging {
             return;
         }
         let result = match self.schema.as_ref().filter(|s| s.applies_to_stream()) {
-            Some(schema) => write_access_log_line(&SchemaView { summary, schema }),
-            None => write_access_log_line(summary),
+            Some(schema) => self.write_access_log_line(&SchemaView { summary, schema }),
+            None => self.write_access_log_line(summary),
         };
         if let Err(error) = result {
             warn!("stdout_logging: failed to serialize stream summary: {error}");
@@ -477,14 +582,12 @@ impl Plugin for StdoutLogging {
     }
 
     async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
-        let summary = transaction_summary_from_ws_disconnect(ctx);
-        self.log(&summary).await;
+        self.log(&ctx.session_end_summary()).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use serde_json::json;
 
@@ -513,6 +616,7 @@ mod tests {
             proxy_name: None,
             client_ip: "127.0.0.1".to_string(),
             consumer_username: None,
+            principal_origin: None,
             auth_method: None,
             backend_target: "127.0.0.1:8080".to_string(),
             backend_resolved_ip: None,
@@ -528,7 +632,7 @@ mod tests {
             timestamp_connected: "2026-05-10T00:00:00Z".to_string(),
             timestamp_disconnected: "2026-05-10T00:00:01Z".to_string(),
             sni_hostname: None,
-            metadata: HashMap::new(),
+            metadata: crate::plugins::MetadataMap::default(),
         }
     }
 
@@ -600,7 +704,7 @@ mod tests {
             Ok(_) => panic!("status code above u16 range must be rejected"),
             Err(e) => e,
         };
-        assert!(err.contains("between 0 and 65535"), "got: {err}");
+        assert!(err.contains("between 0 and 999"), "got: {err}");
     }
 
     #[test]
@@ -621,7 +725,7 @@ mod tests {
             ),
             (
                 json!({ "filter": { "status_code_max": 70000 } }),
-                "`filter.status_code_max` must be between 0 and 65535",
+                "`filter.status_code_max` must be between 0 and 999",
             ),
             (
                 json!({ "filter": { "min_latency_ms": "250" } }),
@@ -762,18 +866,20 @@ mod tests {
             io_side: None,
             error_class,
             consumer_username: None,
+            principal_origin: None,
             auth_method: None,
             connection_id: 7,
-            metadata: HashMap::new(),
+            metadata: crate::plugins::MetadataMap::default(),
         }
     }
 
     #[test]
     fn ws_disconnect_summary_carries_error_class_and_path() {
-        let summary = transaction_summary_from_ws_disconnect(&ws_disconnect(
+        let summary = ws_disconnect(
             Some(ErrorClass::ProtocolError),
             "ws://backend.local:9000/chat",
-        ));
+        )
+        .session_end_summary();
         assert_eq!(summary.response_status_code, 101);
         assert_eq!(summary.http_method, "GET");
         assert_eq!(summary.request_path, "/chat");
@@ -792,12 +898,9 @@ mod tests {
             "filter": { "errors_only": true }
         }))
         .expect("plugin config");
-        let failed = transaction_summary_from_ws_disconnect(&ws_disconnect(
-            Some(ErrorClass::ConnectionReset),
-            "http://127.0.0.1:9/",
-        ));
-        let clean =
-            transaction_summary_from_ws_disconnect(&ws_disconnect(None, "http://127.0.0.1:9/"));
+        let failed = ws_disconnect(Some(ErrorClass::ConnectionReset), "http://127.0.0.1:9/")
+            .session_end_summary();
+        let clean = ws_disconnect(None, "http://127.0.0.1:9/").session_end_summary();
         assert!(plugin.should_log_transaction(&failed));
         assert!(!plugin.should_log_transaction(&clean));
     }

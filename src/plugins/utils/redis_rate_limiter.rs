@@ -112,8 +112,10 @@
 //! ([`redis_trailing_window_count`]). The trailing `K + 2` of those counters
 //! span `window + (1 + f) * (window / K)` of wall clock, where `f` is how far
 //! into its own sub-bucket the request arrived, so the sum covers the exact
-//! trailing window in full and over-counts by at most two sub-buckets of older
-//! history. (The forward counter is empty except under reordering or clock
+//! trailing window in full. Measured from that selection instant it
+//! over-counts by at most two sub-buckets of older history; the bound, measured
+//! from the instant the server executes the decision, is THREE (see below).
+//! (The forward counter is empty except under reordering or clock
 //! skew; see [`REDIS_WINDOW_SUB_BUCKET_KEYS`].)
 //!
 //! The `K + 1`-th old counter is structural, not padding: a retained charge's
@@ -165,7 +167,7 @@
 //! drop-in for the sub-bucket ladder; their residual boundary-burst exposure is
 //! documented rather than silently shared with the quota path.
 //!
-//! Neither scheme needs Lua: both are native `GET`/`INCR`/`INCRBY`/`EXPIRE`
+//! Neither scheme needs Lua: both are native `GETRANGE`/`INCR`/`INCRBY`/`EXPIRE`
 //! commands pipelined into one transaction.
 //!
 //! HTTP, GraphQL, and gRPC-method quotas add **charge-then-compensate**
@@ -256,7 +258,7 @@
 //! **Bucket mis-settlement has a bounded rebuild, and it is not a retry
 //! budget.** Bucket selection precedes connection acquisition, so a charge is
 //! always slightly stale when it lands. One sub-bucket of that is covered by
-//! the forward `GET`. Past that the transaction's own `TIME` reply settles it
+//! the forward read. Past that the transaction's own `TIME` reply settles it
 //! ([`sub_bucket_charge_is_settled`]): if the server executed `EXEC` at
 //! `b + 2` or later, a peer may have charged a bucket this ladder neither read
 //! nor charged; if it executed BEFORE `b`, this charge was placed in the future
@@ -725,7 +727,7 @@ impl RedisServerClock {
 /// The offset a reply teaches is `server_time − local_time_at_reply`, so a
 /// reply held for `d` teaches an offset `d` too small, and the NEXT selection
 /// lands `d` earlier than the server's clock. While `d` is under one sub-bucket
-/// the ladder's forward `GET` and the two-sided settlement band already cover
+/// the ladder's forward read and the two-sided settlement band already cover
 /// that placement. Past it they do not, and adopting the sample would let one
 /// delayed reply — an `EXEC` whose response was held while the rest of the
 /// process moved on — walk the base backwards. Keeping the previous offset is
@@ -1052,7 +1054,14 @@ impl RedisConfig {
         })?;
 
         Ok(Some(RedisConfig {
-            url: url.to_string(),
+            // Stored with a lowercase scheme. `validate_redis_url` admits any
+            // letter case (URL schemes are case-insensitive and `Url::scheme()`
+            // normalizes them), but every later consumer — the `redis_tls`
+            // upgrade, SNI preservation, and the CA-bundle / skip-verify TLS
+            // policy — reads this string, so `REDIS://` must not silently skip
+            // the TLS upgrade and `REDISS://` must not lose SNI or the
+            // configured TLS verification policy.
+            url: normalize_redis_url_scheme(url),
             tls,
             key_prefix,
             pool_size,
@@ -1065,11 +1074,17 @@ impl RedisConfig {
 
     /// Build the effective Redis URL, upgrading to TLS scheme if needed.
     fn effective_url(&self) -> String {
-        if self.tls && self.url.starts_with("redis://") {
-            self.url.replacen("redis://", "rediss://", 1)
-        } else {
-            self.url.clone()
+        // Case-insensitive: `from_plugin_config` already lowercases the scheme,
+        // and this keeps a directly constructed config on the same contract.
+        if self.tls
+            && let Some(rest) = strip_redis_scheme_prefix(&self.url, "redis://")
+        {
+            let mut url = String::with_capacity(self.url.len() + 1);
+            url.push_str("rediss://");
+            url.push_str(rest);
+            return url;
         }
+        self.url.clone()
     }
 
     /// Extract the hostname from the Redis URL for DNS pre-warming.
@@ -1130,7 +1145,7 @@ impl RedisConfig {
 
         // Don't replace hostname for TLS — SNI needs the original hostname (see
         // the ACCEPTED LIMITATION note above on the residual rebinding gap).
-        if url.starts_with("rediss://") {
+        if redis_url_scheme_is_tls(&url) {
             return url;
         }
 
@@ -1197,6 +1212,35 @@ pub(crate) fn redact_url_userinfo(raw_url: &str) -> String {
         ));
     }
     parsed.to_string()
+}
+
+/// `raw_url` without its `prefix` scheme, compared ASCII case-insensitively.
+fn strip_redis_scheme_prefix<'a>(raw_url: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = raw_url.get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    raw_url.get(prefix.len()..)
+}
+
+/// Whether a Redis URL uses the TLS scheme, in any letter case.
+fn redis_url_scheme_is_tls(raw_url: &str) -> bool {
+    strip_redis_scheme_prefix(raw_url, "rediss://").is_some()
+}
+
+/// Lowercase the scheme of an admitted `redis_url`, leaving the rest
+/// byte-for-byte unchanged (userinfo, host, and path keep their spelling).
+fn normalize_redis_url_scheme(raw_url: &str) -> String {
+    match raw_url.split_once("://") {
+        Some((scheme, rest)) => {
+            let mut url = String::with_capacity(raw_url.len());
+            url.push_str(&scheme.to_ascii_lowercase());
+            url.push_str("://");
+            url.push_str(rest);
+            url
+        }
+        None => raw_url.to_string(),
+    }
 }
 
 fn validate_redis_url(raw_url: &str) -> Result<(), String> {
@@ -1329,7 +1373,7 @@ fn open_screened_redis_client(
 ) -> Result<redis::Client, redis::RedisError> {
     use redis::IntoConnectionInfo;
 
-    let is_tls = url.starts_with("rediss://");
+    let is_tls = redis_url_scheme_is_tls(url);
     let without_fragment = url.split_once('#').map(|(base, _)| base).unwrap_or(url);
     let conn_info_url = if is_tls && tls_no_verify {
         format!("{without_fragment}#insecure")
@@ -1646,6 +1690,15 @@ fn push_slot_tag_component(key: &mut String, value: &str) {
 /// returning an unscreened address. Shared by the hot-path connect (`resolve_url`)
 /// AND the background recovery checker so neither can hand an unscreened host to
 /// the Redis crate's own resolver.
+///
+/// `dns_cache: None` skips the hostname screen. Only clients built from a
+/// `PluginHttpClient` without a gateway DNS cache take that branch: config
+/// validation (which constructs plugins but never dials Redis) and tests.
+/// Every serving runtime builds its plugin clients with the shared cache.
+/// Literal-IP endpoints are additionally screened at config admission
+/// (`screen_redis_endpoint_egress`). The remaining `rediss://` hostname
+/// rebinding window is the accepted limitation documented on
+/// `RedisConfig::url_with_resolved_ip`.
 async fn screen_redis_endpoint(
     config: &RedisConfig,
     dns_cache: Option<&DnsCache>,
@@ -2184,7 +2237,6 @@ fn pause_shared_replay_apply_for_test() {
 /// unit tests use this to deterministically reproduce the previously dangerous
 /// transition/global-publish reordering.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn arm_shared_replay_apply_pause_for_test() {
     REPLAY_HEALTH_APPLY_PAUSE_ENTERED.store(0, Ordering::Release);
     REPLAY_HEALTH_APPLY_PAUSE_ARMED.store(true, Ordering::Release);
@@ -2192,14 +2244,12 @@ pub fn arm_shared_replay_apply_pause_for_test() {
 
 /// Disarm the apply-pause gate so a paused transition can proceed.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn disarm_shared_replay_apply_pause_for_test() {
     REPLAY_HEALTH_APPLY_PAUSE_ARMED.store(false, Ordering::Release);
 }
 
 /// Number of transitions currently (or previously) paused at the tear point.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn shared_replay_apply_pause_entered_for_test() -> usize {
     REPLAY_HEALTH_APPLY_PAUSE_ENTERED.load(Ordering::Acquire)
 }
@@ -2207,7 +2257,6 @@ pub fn shared_replay_apply_pause_entered_for_test() -> usize {
 /// Whether the shared-replay transition lock is currently held. External tests
 /// use this to prove a transition spans the tear point under the lock.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn shared_replay_transition_lock_held_for_test() -> bool {
     SHARED_REPLAY_TRANSITION_LOCK.try_lock().is_err()
 }
@@ -2637,7 +2686,7 @@ impl ConnectionPool {
 }
 
 /// Outcome of a size-bounded Redis fetch ([`RedisRateLimitClient::get_bytes_bounded`]).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum BoundedRedisValue {
     /// Key is absent.
     Missing,
@@ -2676,6 +2725,79 @@ pub fn redis_getrange_end_index(max_bytes: usize) -> Result<isize, RedisGetrange
         return Err(RedisGetrangeEndIndexError::ZeroCap);
     }
     isize::try_from(max_bytes).map_err(|_| RedisGetrangeEndIndexError::Overflow)
+}
+
+/// Inclusive `GETRANGE` end for reading an `i64` counter: at most 21 bytes
+/// transfer, one more than the widest `i64` (`-9223372036854775808`, 20
+/// bytes), so a truncated 21-byte reply is distinguishable from a complete
+/// extreme value. A plain `GET` would allocate whatever a writer with access
+/// to the key prefix parked under a counter key (issue #6653).
+const COUNTER_GETRANGE_END: isize = 20;
+const COUNTER_MAX_BYTES: usize = 20;
+
+/// Parse bytes read with `GETRANGE key 0 20` as a counter.
+///
+/// The outer `None` is malformed — a truncated (21-byte), non-UTF-8, or
+/// non-integer reply — and callers must fail the command rather than read it
+/// as a count. The inner `None` is a missing counter: `GETRANGE` on an absent
+/// key answers an empty bulk string, never nil.
+fn parse_bounded_counter_bytes(bytes: &[u8]) -> Option<Option<i64>> {
+    if bytes.is_empty() {
+        return Some(None);
+    }
+    if bytes.len() > COUNTER_MAX_BYTES {
+        return None;
+    }
+    std::str::from_utf8(bytes)
+        .ok()?
+        .parse::<i64>()
+        .ok()
+        .map(Some)
+}
+
+/// Decode one transaction element as a bounded counter: an `INCR` integer
+/// reply or a `GETRANGE` bulk string. Outer `None` is malformed.
+fn decode_bounded_counter(value: redis::Value) -> Option<Option<i64>> {
+    match value {
+        redis::Value::Nil => Some(None),
+        redis::Value::Int(count) => Some(Some(count)),
+        redis::Value::BulkString(bytes) => parse_bounded_counter_bytes(&bytes),
+        _ => None,
+    }
+}
+
+/// Whether a reply is the exact `+OK` acknowledgement `WATCH` / `MULTI` return.
+fn is_ok_acknowledgement(reply: &redis::Value) -> bool {
+    match reply {
+        redis::Value::Okay => true,
+        redis::Value::SimpleString(text) => text == "OK",
+        _ => false,
+    }
+}
+
+/// `GETRANGE` bound for comparing a stored value against `expected` without
+/// downloading the stored value: read `0..=end` (at most `expected.len() + 1`
+/// bytes) next to `EXISTS` and `STRLEN`, and match only when the key exists,
+/// its true length equals `expected.len()`, and the prefix equals `expected`.
+struct BoundedCompare {
+    end: isize,
+    max_prefix: usize,
+}
+
+impl BoundedCompare {
+    fn for_expected(expected: &[u8]) -> Result<Self, ()> {
+        // An empty operand still reads one byte: a missing key is not an empty
+        // string, and a one-byte value must not match it.
+        let end = if expected.is_empty() {
+            0
+        } else {
+            redis_getrange_end_index(expected.len()).map_err(|_| ())?
+        };
+        Ok(Self {
+            end,
+            max_prefix: expected.len().checked_add(1).ok_or(())?,
+        })
+    }
 }
 
 /// A Redis-backed limiter/store client shared across plugin instances.
@@ -2962,7 +3084,6 @@ pub struct SharedReplayRegistrationSample {
 
 impl SharedReplayRegistrationSample {
     /// Whether this sample observed a reachable backend.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn available(self) -> bool {
         self.available
     }
@@ -3159,7 +3280,7 @@ impl RedisWindowCharges {
 
 /// Per-window trailing-window counts returned by one
 /// [`RedisRateLimitClient::charge_rate_limit_windows`]: for each configured
-/// window, the FULL sum of the sub-bucket this request charged, the `K`
+/// window, the FULL sum of the sub-bucket this request charged, the `K + 1`
 /// sub-buckets before it, and the one after it.
 ///
 /// The fold happens here rather than at the caller so the decision surface is
@@ -3539,7 +3660,6 @@ impl RedisRateLimitClient {
     /// The probe itself needs a live server, so this is how coverage proves a
     /// consumer asked for the prerequisite — the exact distinction between a
     /// deployment that must grant `+time` and one that must not be forced to.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn requires_server_clock_for_test(&self) -> bool {
         self.requires_server_clock()
     }
@@ -3550,7 +3670,6 @@ impl RedisRateLimitClient {
     /// The screen itself needs a live server, so this is how coverage proves a
     /// consumer asked for the prerequisite at construction — the exact
     /// distinction `GHSA-26gf-943w-w5x8` turned on.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn requires_no_eviction_screen_for_test(&self) -> bool {
         self.requires_no_eviction()
     }
@@ -3564,7 +3683,6 @@ impl RedisRateLimitClient {
     /// a cache/counter client reports "usable" without publishing a verdict —
     /// otherwise this helper would prove something the production path does
     /// not do.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn apply_memory_policy_screen_for_test(&self, screen: MemoryPolicyScreen) -> bool {
         if !self.requires_no_eviction() {
             return true;
@@ -3686,7 +3804,6 @@ impl RedisRateLimitClient {
     /// Mark Redis unavailable (test support). Arming the recovery checker is
     /// part of [`Self::mark_unavailable`] itself, so this exercises the same
     /// transition production error paths take.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn mark_unavailable_for_test(&self) {
         self.mark_unavailable();
     }
@@ -3694,7 +3811,6 @@ impl RedisRateLimitClient {
     /// Prove an unsupported Cluster topology the way a racing task would
     /// (test support), so concurrency coverage can land the rejection at an
     /// exact point in another operation's lifecycle.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn mark_topology_unsupported_for_test(&self) {
         self.mark_topology_unsupported("test-injected cluster topology proof");
     }
@@ -3703,7 +3819,6 @@ impl RedisRateLimitClient {
     /// (test support), so admission coverage can land a recovery at a chosen
     /// point without a live server. Returns `false` when the topology is
     /// terminal and nothing was written.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn publish_reachable_for_test(&self) -> bool {
         self.availability.publish_reachable()
     }
@@ -3716,7 +3831,6 @@ impl RedisRateLimitClient {
     /// Attaching does not move the packed health word; only a later
     /// [`Self::publish_shared_replay_registration_sample_for_test`] or a
     /// transition notify publishes counts.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn capture_shared_replay_registration_sample_for_test(
         &self,
     ) -> SharedReplayRegistrationSample {
@@ -3731,7 +3845,6 @@ impl RedisRateLimitClient {
     /// A sample whose epoch is older than a notification that already landed
     /// is rejected, which is the proof that the packed health word cannot stay
     /// permanently stale after the last registration/availability race settles.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn publish_shared_replay_registration_sample_for_test(
         &self,
         sample: SharedReplayRegistrationSample,
@@ -3744,7 +3857,6 @@ impl RedisRateLimitClient {
 
     /// What a failover health observer reads from this client's shared
     /// availability signal — the same `Arc` the observer holds (test support).
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn observer_sees_available_for_test(&self) -> bool {
         self.availability_signal().is_available()
     }
@@ -3753,19 +3865,16 @@ impl RedisRateLimitClient {
     ///
     /// True only when verification is on and a configured bundle loaded. False
     /// when no CA path was set or when `tls_no_verify` skipped the load.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn uses_exclusive_ca_bundle_for_test(&self) -> bool {
         self.tls_ca_bundle_pem.is_some()
     }
 
     /// Whether the background recovery checker has been started (test support).
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn health_checker_started_for_test(&self) -> bool {
         self.health_checker_started.load(Ordering::Relaxed)
     }
 
     /// Abort handle for the background recovery checker, when started (tests).
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn health_checker_abort_for_test(&self) -> Option<AbortHandle> {
         self.health_checker_abort
             .lock()
@@ -3774,13 +3883,11 @@ impl RedisRateLimitClient {
     }
 
     /// Configured pool cardinality (`redis_pool_size`).
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn pool_size_for_test(&self) -> usize {
         self.pool.len()
     }
 
     /// Number of pool slots that currently hold an established connection.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn cached_pool_cardinality_for_test(&self) -> usize {
         self.pool
             .slots
@@ -3790,13 +3897,11 @@ impl RedisRateLimitClient {
     }
 
     /// Round-robin slot indexes that the next `count` hot-path selections would use.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn select_slot_indexes_for_test(&self, count: usize) -> Vec<usize> {
         (0..count).map(|_| self.select_slot_index()).collect()
     }
 
     /// Lazily establish every pool slot. Returns how many slots connected.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub async fn warm_pool_for_test(&self) -> usize {
         let mut established = 0usize;
         for idx in 0..self.pool.len() {
@@ -3808,13 +3913,11 @@ impl RedisRateLimitClient {
     }
 
     /// Clear every cached pool slot (same path as reconnect clearing).
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn clear_pool_for_test(&self) {
         self.clear_connection();
     }
 
     /// Establish (or reuse) one round-robin pooled connection for tests.
-    #[allow(dead_code)] // public support used by the external integration-test target
     pub async fn connect_cached_for_test(&self) -> bool {
         self.get_connection().await.is_some()
     }
@@ -3826,13 +3929,11 @@ impl RedisRateLimitClient {
     /// `ConnectionManager`. The pooled helper's return type is the compile-time
     /// pin; reintroducing a transparently reconnecting manager fails either this
     /// string check or the `slot.connection.store(..)` assignment.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn cached_pool_connection_type_name_for_test() -> &'static str {
         std::any::type_name::<redis::aio::MultiplexedConnection>()
     }
 
     /// Establish a dedicated non-reconnecting multiplexed connection for tests.
-    #[allow(dead_code)] // public support used by the external integration-test target
     pub async fn connect_dedicated_for_test(&self) -> bool {
         self.get_dedicated_connection().await.is_some()
     }
@@ -3844,7 +3945,6 @@ impl RedisRateLimitClient {
     /// `ConnectionManager`. The production helper's return type is the
     /// compile-time pin; changing it to a reconnecting manager fails either
     /// this string check or the assignment in `get_dedicated_connection`.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn dedicated_watch_connection_type_name_for_test() -> &'static str {
         std::any::type_name::<redis::aio::MultiplexedConnection>()
     }
@@ -3855,7 +3955,6 @@ impl RedisRateLimitClient {
     /// (inner `AsyncConnectionConfig` + defensive outer connect bound, then a
     /// `PING` bounded by the same `connect_timeout`). DNS screening still
     /// happens first and remains outside the connection timeout.
-    #[allow(dead_code)] // public support used by the external integration-test target
     pub async fn health_check_connect_for_test(&self) -> bool {
         let url = match self.resolve_url().await {
             RedisEndpoint::Url(url) => url,
@@ -3882,7 +3981,6 @@ impl RedisRateLimitClient {
     }
 
     /// Connection-timeout duration installed into redis-rs configs (tests).
-    #[allow(dead_code)] // public support used by the external integration-test target
     pub fn connection_timeout_for_test(&self) -> Duration {
         self.connect_timeout()
     }
@@ -5024,7 +5122,9 @@ impl RedisRateLimitClient {
     ///
     /// Used where one admission decision covers several units of work — the
     /// WebSocket frame limiter charges every physical fragment of a reassembled
-    /// message in a single round trip rather than one round trip per fragment.
+    /// message in a single round trip rather than one round trip per fragment,
+    /// and the `ai_rate_limiter` reservation charges its token estimate and
+    /// reads the previous window in the same round trip.
     /// `amount` must be positive; the caller owns the bound on how large it can
     /// grow.
     #[allow(clippy::result_unit_err)]
@@ -5038,10 +5138,12 @@ impl RedisRateLimitClient {
         let amount = amount.max(1);
         let mut conn = self.get_connection().await.ok_or(())?;
 
-        let result: Result<(Option<i64>, i64), redis::RedisError> = redis::pipe()
+        let result: Result<(Vec<u8>, i64), redis::RedisError> = redis::pipe()
             .atomic()
-            .cmd("GET")
+            .cmd("GETRANGE")
             .arg(previous_key)
+            .arg(0)
+            .arg(COUNTER_GETRANGE_END)
             .cmd("INCRBY")
             .arg(current_key)
             .arg(amount)
@@ -5053,14 +5155,26 @@ impl RedisRateLimitClient {
             .await;
 
         match result {
-            Ok((previous_count, current_count)) => {
+            Ok((previous_bytes, current_count)) => {
+                let Some(previous_count) = parse_bounded_counter_bytes(&previous_bytes) else {
+                    // A counter this code cannot read is NOT a zero: it would
+                    // under-count and over-admit. The INCRBY already landed,
+                    // so mark the endpoint unusable like the charge path.
+                    self.mark_unavailable();
+                    warn!(
+                        redis_url = %self.config.redacted_url(),
+                        operation = "GETRANGE+INCRBY+EXPIRE",
+                        "Redis sliding-window transaction returned an unreadable counter"
+                    );
+                    return Err(());
+                };
                 self.note_command_success()?;
                 Ok((previous_count.unwrap_or(0), current_count))
             }
             Err(e) => {
                 warn!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "GET+INCRBY+EXPIRE",
+                    operation = "GETRANGE+INCRBY+EXPIRE",
                     error = %e,
                     "Redis sliding-window transaction failed"
                 );
@@ -5237,23 +5351,40 @@ impl RedisRateLimitClient {
     pub async fn get_two_counters(&self, key1: &str, key2: &str) -> Result<(i64, i64), ()> {
         let mut conn = self.get_connection().await.ok_or(())?;
 
-        let result: Result<(Option<i64>, Option<i64>), redis::RedisError> = redis::pipe()
-            .cmd("GET")
+        let result: Result<(Vec<u8>, Vec<u8>), redis::RedisError> = redis::pipe()
+            .cmd("GETRANGE")
             .arg(key1)
-            .cmd("GET")
+            .arg(0)
+            .arg(COUNTER_GETRANGE_END)
+            .cmd("GETRANGE")
             .arg(key2)
+            .arg(0)
+            .arg(COUNTER_GETRANGE_END)
             .query_async(&mut conn)
             .await;
 
         match result {
-            Ok((v1, v2)) => {
+            Ok((bytes1, bytes2)) => {
+                let parsed = parse_bounded_counter_bytes(&bytes1)
+                    .and_then(|v1| parse_bounded_counter_bytes(&bytes2).map(|v2| (v1, v2)));
+                let Some((v1, v2)) = parsed else {
+                    // A counter this code cannot read is NOT a zero: it would
+                    // under-count and over-admit, so fail the command.
+                    self.mark_unavailable();
+                    warn!(
+                        redis_url = %self.config.redacted_url(),
+                        operation = "GETRANGE+GETRANGE",
+                        "Redis pipeline returned an unreadable counter"
+                    );
+                    return Err(());
+                };
                 self.note_command_success()?;
                 Ok((v1.unwrap_or(0), v2.unwrap_or(0)))
             }
             Err(e) => {
                 warn!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "GET+GET",
+                    operation = "GETRANGE+GETRANGE",
                     error = %e,
                     "Redis pipeline failed"
                 );
@@ -5263,12 +5394,18 @@ impl RedisRateLimitClient {
         }
     }
 
-    /// Get a raw byte value from Redis.
+    /// Unbounded `GET` of a raw byte value. **Test support only.**
     ///
-    /// Used by plugins that need arbitrary key-value storage (e.g., request
-    /// deduplication, AI semantic cache) rather than rate limiting counters.
-    #[allow(clippy::result_unit_err)]
-    pub async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, ()> {
+    /// A plain `GET` allocates the whole stored value whatever its size, so a
+    /// single oversized value under a consumed key would force an unbounded
+    /// allocation in the gateway (issue #6622). Production reads use
+    /// [`Self::get_bytes_bounded`]; the compare primitives below bound their
+    /// reads the same way. This stays only so connection-screening tests can
+    /// drive one ordinary command through a scripted fake server, and a source
+    /// guard in `redis_rate_limiter_tests` keeps it out of production code.
+    #[doc(hidden)]
+    #[allow(clippy::result_unit_err, dead_code)]
+    pub async fn get_bytes_unbounded_for_test(&self, key: &str) -> Result<Option<Vec<u8>>, ()> {
         let mut conn = self.get_connection().await.ok_or(())?;
 
         let result: Result<Option<Vec<u8>>, redis::RedisError> =
@@ -5461,7 +5598,10 @@ impl RedisRateLimitClient {
     /// Set a raw byte value only if the key does not already exist, with a TTL.
     ///
     /// Returns `Ok(true)` when the caller acquired the key, `Ok(false)` when an
-    /// existing key prevented the write, and `Err(())` when Redis is unavailable.
+    /// existing key prevented the write, and `Err(())` when Redis is unavailable
+    /// or the reply is neither exactly `OK` nor nil. Any other string proves
+    /// nothing about whether the key was stored, so it fails closed exactly like
+    /// [`Self::set_bytes_nx_with_expire_bounded`].
     #[allow(clippy::result_unit_err)]
     pub async fn set_bytes_nx_with_expire(
         &self,
@@ -5481,10 +5621,23 @@ impl RedisRateLimitClient {
             .await;
 
         match result {
-            Ok(value) => {
-                self.note_command_success()?;
-                Ok(value.is_some())
-            }
+            Ok(value) => match classify_replay_set_nx_reply(value.as_deref()) {
+                Ok(acquired) => {
+                    self.note_command_success()?;
+                    Ok(acquired)
+                }
+                Err(ReplaySetNxReplyError::InvalidClaimReply) => {
+                    // Never render the server-controlled reply.
+                    warn!(
+                        redis_url = %self.config.redacted_url(),
+                        operation = "SET NX EX",
+                        classification = "malformed_response",
+                        "Redis SET NX returned a reply other than OK or nil"
+                    );
+                    self.mark_unavailable();
+                    Err(())
+                }
+            },
             Err(e) => {
                 warn!(
                     redis_url = %self.config.redacted_url(),
@@ -5616,30 +5769,64 @@ impl RedisRateLimitClient {
     /// command nor silently dropped by a transparent reconnect. `MULTI` is sent
     /// on its own and the `DEL` must be acknowledged `QUEUED` before `EXEC`
     /// (`exec_watched_write`), so an ACL that denies `MULTI` cannot let
-    /// the delete run outside the transaction. Any I/O failure at `WATCH`,
-    /// `GET`, `UNWATCH`, `MULTI`, `DEL`, or `EXEC` fails closed as `Err(())`.
+    /// the delete run outside the transaction. The compare never downloads the
+    /// stored value: `EXISTS`, `STRLEN` and `GETRANGE` transfer at most
+    /// `expected.len() + 1` bytes, so an oversized value under the key cannot
+    /// force an unbounded allocation (issue #6622). Any I/O failure at `WATCH`,
+    /// the compare, `UNWATCH`, `MULTI`, `DEL`, or `EXEC` fails closed as
+    /// `Err(())`.
     #[allow(clippy::result_unit_err)]
     pub async fn delete_if_value_matches(&self, key: &str, expected: &[u8]) -> Result<bool, ()> {
+        // Derive the bounded read before dialing so an unrepresentable bound
+        // fails closed without sending a command.
+        let compare = BoundedCompare::for_expected(expected)?;
         // Owned for the duration of the transaction; never cloned or shared.
         let mut conn = self.get_dedicated_connection().await.ok_or(())?;
 
-        let watch_result: Result<(), redis::RedisError> =
+        let watch_result: Result<redis::Value, redis::RedisError> =
             redis::cmd("WATCH").arg(key).query_async(&mut conn).await;
-        if let Err(e) = watch_result {
-            warn!(
-                redis_url = %self.config.redacted_url(),
-                operation = "WATCH",
-                error = %e,
-                "Redis command failed"
-            );
-            self.note_command_failure(&e);
-            return Err(());
+        match watch_result {
+            Ok(reply) => self.require_ok_acknowledgement(&reply, "WATCH")?,
+            Err(e) => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "WATCH",
+                    error = %e,
+                    "Redis command failed"
+                );
+                self.note_command_failure(&e);
+                return Err(());
+            }
         }
 
-        let current: Result<Option<Vec<u8>>, redis::RedisError> =
-            redis::cmd("GET").arg(key).query_async(&mut conn).await;
+        // Bounded compare: transfer at most `expected.len() + 1` bytes however
+        // large the stored value is (issue #6622). Rewrites between these reads
+        // only cause a mismatch or abort the watched EXEC.
+        let current: Result<(i64, usize, Vec<u8>), redis::RedisError> = redis::pipe()
+            .cmd("EXISTS")
+            .arg(key)
+            .cmd("STRLEN")
+            .arg(key)
+            .cmd("GETRANGE")
+            .arg(key)
+            .arg(0)
+            .arg(compare.end)
+            .query_async(&mut conn)
+            .await;
         match current {
-            Ok(Some(current)) if current == expected => {}
+            Ok((_, _, prefix)) if prefix.len() > compare.max_prefix => {
+                // A nonconforming reply is protocol uncertainty, never a match.
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "compare EXISTS+STRLEN+GETRANGE",
+                    classification = "malformed_response",
+                    "Redis bounded compare returned more bytes than requested"
+                );
+                self.mark_unavailable();
+                return Err(());
+            }
+            Ok((exists, length, prefix))
+                if exists == 1 && length == expected.len() && prefix == expected => {}
             Ok(_) => {
                 let unwatch: Result<(), redis::RedisError> =
                     redis::cmd("UNWATCH").query_async(&mut conn).await;
@@ -5659,7 +5846,7 @@ impl RedisRateLimitClient {
             Err(e) => {
                 warn!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "compare-delete GET",
+                    operation = "compare-delete EXISTS+STRLEN+GETRANGE",
                     error = %e,
                     "Redis command failed"
                 );
@@ -5699,6 +5886,53 @@ impl RedisRateLimitClient {
         }
     }
 
+    /// Require the exact `+OK` acknowledgement `WATCH` and `MULTI` return.
+    ///
+    /// Decoding into `()` accepts any non-error reply, including nil or another
+    /// status. A server that answered that way has not provably installed the
+    /// watch or opened the transaction, and a write sent afterwards could run
+    /// unfenced. Anything but `OK` is protocol uncertainty: fail closed and mark
+    /// the client unavailable before the write is sent. The reply is never
+    /// rendered.
+    fn require_ok_acknowledgement(
+        &self,
+        reply: &redis::Value,
+        operation: &'static str,
+    ) -> Result<(), ()> {
+        if is_ok_acknowledgement(reply) {
+            return Ok(());
+        }
+        warn!(
+            redis_url = %self.config.redacted_url(),
+            operation,
+            classification = "malformed_response",
+            "Redis did not acknowledge with OK; failing closed before the write"
+        );
+        self.mark_unavailable();
+        Err(())
+    }
+
+    /// [`Self::require_ok_acknowledgement`] for the optional quarantine path,
+    /// whose diagnostics are sampled and endpoint-free like its other
+    /// failures. A malformed acknowledgement is still protocol uncertainty, so
+    /// the client is marked unavailable.
+    fn require_quarantine_ok_acknowledgement(
+        &self,
+        reply: &redis::Value,
+        operation: &'static str,
+    ) -> Result<(), ()> {
+        if is_ok_acknowledgement(reply) {
+            return Ok(());
+        }
+        warn_sampled!(
+            operation,
+            classification = "malformed_response",
+            "Redis quarantine comparison failed"
+        );
+        self.mark_unavailable();
+        Err(())
+    }
+
     /// Run one write as an explicit `MULTI` → `QUEUED` → `EXEC` transaction on
     /// a dedicated connection that already holds a `WATCH`.
     ///
@@ -5717,17 +5951,21 @@ impl RedisRateLimitClient {
         write: &redis::Cmd,
         operation: &'static str,
     ) -> Result<Option<T>, ()> {
-        let multi: Result<(), redis::RedisError> = redis::cmd("MULTI").query_async(conn).await;
-        if let Err(e) = multi {
-            warn!(
-                redis_url = %self.config.redacted_url(),
-                operation,
-                phase = "MULTI",
-                error = %e,
-                "Redis command failed"
-            );
-            self.note_command_failure(&e);
-            return Err(());
+        let multi: Result<redis::Value, redis::RedisError> =
+            redis::cmd("MULTI").query_async(conn).await;
+        match multi {
+            Ok(reply) => self.require_ok_acknowledgement(&reply, "MULTI")?,
+            Err(e) => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation,
+                    phase = "MULTI",
+                    error = %e,
+                    "Redis command failed"
+                );
+                self.note_command_failure(&e);
+                return Err(());
+            }
         }
         let queued: Result<String, redis::RedisError> = write.query_async(conn).await;
         match queued {
@@ -5807,11 +6045,14 @@ impl RedisRateLimitClient {
         let max_prefix = expected.len().checked_add(1).ok_or(())?;
         let mut conn = self.get_quarantine_connection().await.ok_or(())?;
 
-        let watch: Result<(), redis::RedisError> =
+        let watch: Result<redis::Value, redis::RedisError> =
             redis::cmd("WATCH").arg(key).query_async(&mut conn).await;
-        if let Err(e) = watch {
-            self.note_quarantine_command_failure(&e, "WATCH");
-            return Err(());
+        match watch {
+            Ok(reply) => self.require_quarantine_ok_acknowledgement(&reply, "WATCH")?,
+            Err(e) => {
+                self.note_quarantine_command_failure(&e, "WATCH");
+                return Err(());
+            }
         }
 
         // Rewrites during these reads can only cause a mismatch or abort EXEC.
@@ -5852,10 +6093,14 @@ impl RedisRateLimitClient {
 
         // Never pipeline MULTI with DEL: if the ACL denies MULTI, a pipelined
         // DEL could execute outside a transaction and erase a replacement.
-        let multi: Result<(), redis::RedisError> = redis::cmd("MULTI").query_async(&mut conn).await;
-        if let Err(e) = multi {
-            self.note_quarantine_command_failure(&e, "MULTI");
-            return Err(());
+        let multi: Result<redis::Value, redis::RedisError> =
+            redis::cmd("MULTI").query_async(&mut conn).await;
+        match multi {
+            Ok(reply) => self.require_quarantine_ok_acknowledgement(&reply, "MULTI")?,
+            Err(e) => {
+                self.note_quarantine_command_failure(&e, "MULTI");
+                return Err(());
+            }
         }
         let queued: Result<String, redis::RedisError> =
             redis::cmd("DEL").arg(key).query_async(&mut conn).await;
@@ -5932,22 +6177,22 @@ impl RedisRateLimitClient {
 
     /// Charge one request against EVERY configured rate-limit window in a
     /// single atomic `MULTI`/`EXEC`, returning each window's trailing-window
-    /// count (the charged sub-bucket, the `K` sub-buckets before it, and the one
-    /// after it, summed in full).
+    /// count (the charged sub-bucket, the `K + 1` sub-buckets before it, and the
+    /// one after it, summed in full).
     ///
     /// One round trip on the ordinary pooled multiplexed slots: no `WATCH`, no
     /// dedicated per-request connection, no optimistic-retry budget, and no
     /// server-side scripting — every command is plain RESP any Redis-compatible
-    /// server accepts. Per window the transaction issues `GET` on each of the
-    /// [`REDIS_WINDOW_TRAILING_SUB_BUCKETS`] older sub-buckets and on the one
-    /// after the charged bucket, then `INCR` and `EXPIRE` on the sub-bucket this
+    /// server accepts. Per window the transaction issues a bounded `GETRANGE` on
+    /// each of the [`REDIS_WINDOW_TRAILING_SUB_BUCKETS`] older sub-buckets and on
+    /// the one after the charged bucket, then `INCR` and `EXPIRE` on the sub-bucket this
     /// request lands in — twenty commands over nineteen keys — so the admission
     /// decision the caller derives is tied to its own mutation and can never be
     /// a stale read that two gateways both act on.
     ///
-    /// The forward `GET` is what makes the pair of decisions independent of the
+    /// The forward read is what makes the pair of decisions independent of the
     /// order two concurrent transactions reach the server in, and the extra old
-    /// `GET` is what keeps a peer's retained charge inside this ladder when its
+    /// `GETRANGE` is what keeps a peer's retained charge inside this ladder when its
     /// key is one bucket older than the bucket it executed in; see
     /// [`REDIS_WINDOW_SUB_BUCKET_KEYS`]. Neither covers a stall longer than one
     /// whole sub-bucket, nor a charge placed in the future — that is the
@@ -6018,7 +6263,7 @@ impl RedisRateLimitClient {
         if !self.requires_server_clock() {
             warn_sampled!(
                 redis_url = %self.config.redacted_url(),
-                operation = "GET+INCR+EXPIRE+TIME",
+                operation = "GETRANGE+INCR+EXPIRE+TIME",
                 "Redis rate-limit charge attempted on a client that did not declare the \
                  server-clock requirement"
             );
@@ -6030,7 +6275,7 @@ impl RedisRateLimitClient {
         if windows.len() > MAX_REDIS_ADMISSION_WINDOWS {
             warn_sampled!(
                 redis_url = %self.config.redacted_url(),
-                operation = "GET+INCR+EXPIRE",
+                operation = "GETRANGE+INCR+EXPIRE",
                 windows = windows.len(),
                 max_windows = MAX_REDIS_ADMISSION_WINDOWS,
                 "Redis rate-limit charge exceeds the supported window count"
@@ -6056,9 +6301,17 @@ impl RedisRateLimitClient {
             // read-only; only the bucket this request lands in is mutated and
             // retained.
             for key in window.trailing_keys() {
-                pipeline.cmd("GET").arg(key);
+                pipeline
+                    .cmd("GETRANGE")
+                    .arg(key)
+                    .arg(0)
+                    .arg(COUNTER_GETRANGE_END);
             }
-            pipeline.cmd("GET").arg(window.next_key());
+            pipeline
+                .cmd("GETRANGE")
+                .arg(window.next_key())
+                .arg(0)
+                .arg(COUNTER_GETRANGE_END);
             pipeline
                 .cmd("INCR")
                 .arg(window.charged_key())
@@ -6073,9 +6326,10 @@ impl RedisRateLimitClient {
         // connection that could not answer `TIME` was never published.
         pipeline.cmd("TIME");
 
-        // `GET` answers a bulk string or nil, `INCR` an integer, and `TIME` a
-        // two-element array, so the reply is decoded one element at a time
-        // rather than through a single scalar type. `Vec<redis::Value>` IS
+        // `GETRANGE` answers a bulk string (empty for a missing key), `INCR`
+        // an integer, and `TIME` a two-element array, so the reply is decoded
+        // one element at a time rather than through a single scalar type.
+        // `Vec<redis::Value>` IS
         // redis-rs's own decode allocation, and it is consumed element by
         // element below — redis-rs decodes a `Value` by value, so borrowing
         // would add one clone per counter on the admission hot path.
@@ -6097,7 +6351,7 @@ impl RedisRateLimitClient {
                 for _ in 0..windows.len() {
                     for slot in ladder.iter_mut() {
                         let decoded = match values.next() {
-                            Some(value) => redis::from_redis_value::<Option<i64>>(value).ok(),
+                            Some(value) => decode_bounded_counter(value),
                             None => None,
                         };
                         let Some(count) = decoded else {
@@ -6108,7 +6362,7 @@ impl RedisRateLimitClient {
                             self.mark_unavailable();
                             warn_sampled!(
                                 redis_url = %self.config.redacted_url(),
-                                operation = "GET+INCR+EXPIRE",
+                                operation = "GETRANGE+INCR+EXPIRE",
                                 "Redis rate-limit charge returned an unreadable sub-bucket \
                                  counter"
                             );
@@ -6127,7 +6381,7 @@ impl RedisRateLimitClient {
                     self.mark_unavailable();
                     warn_sampled!(
                         redis_url = %self.config.redacted_url(),
-                        operation = "GET+INCR+EXPIRE+TIME",
+                        operation = "GETRANGE+INCR+EXPIRE+TIME",
                         "Redis rate-limit charge returned an unreadable server clock"
                     );
                     return Err(());
@@ -6163,7 +6417,7 @@ impl RedisRateLimitClient {
                 self.mark_unavailable();
                 warn_sampled!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "GET+INCR+EXPIRE",
+                    operation = "GETRANGE+INCR+EXPIRE",
                     fields = reply.len(),
                     "Redis rate-limit charge returned an unexpected reply shape"
                 );
@@ -6180,7 +6434,7 @@ impl RedisRateLimitClient {
                 // revocation seen at connect time gets.
                 warn!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "GET+INCR+EXPIRE",
+                    operation = "GETRANGE+INCR+EXPIRE",
                     error = %e,
                     "Redis rate-limit charge transaction failed"
                 );
@@ -6346,7 +6600,6 @@ impl RedisRateLimitClient {
     /// Test support only: coverage that asserts a counter after a refusal waits
     /// for this to reach zero instead of racing the detached task. Admission
     /// never reads it.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn pending_compensations_for_test(&self) -> usize {
         self.pending_compensations.load(Ordering::Acquire)
     }
@@ -6375,9 +6628,11 @@ impl RedisRateLimitClient {
     ///
     /// `MULTI` is sent on its own and the `SET` must be acknowledged `QUEUED`
     /// before `EXEC` (`exec_watched_write`), so an ACL that denies
-    /// `MULTI` cannot let the write run outside the transaction. Any I/O
-    /// failure at `WATCH`, `GET`, `UNWATCH`, `MULTI`, `SET`, or `EXEC` fails
-    /// closed; a partial transaction is never retried on a fresh connection.
+    /// `MULTI` cannot let the write run outside the transaction. The compare is
+    /// the same bounded `EXISTS`/`STRLEN`/`GETRANGE` read as
+    /// [`Self::delete_if_value_matches`]. Any I/O failure at `WATCH`, the
+    /// compare, `UNWATCH`, `MULTI`, `SET`, or `EXEC` fails closed; a partial
+    /// transaction is never retried on a fresh connection.
     #[allow(clippy::result_unit_err)]
     pub async fn set_bytes_with_expire_if_value_matches(
         &self,
@@ -6386,26 +6641,56 @@ impl RedisRateLimitClient {
         value: &[u8],
         ttl_seconds: u64,
     ) -> Result<bool, ()> {
+        // Derive the bounded read before dialing so an unrepresentable bound
+        // fails closed without sending a command.
+        let compare = BoundedCompare::for_expected(expected)?;
         // Owned for the duration of the transaction; never cloned or shared.
         let mut conn = self.get_dedicated_connection().await.ok_or(())?;
 
-        let watch_result: Result<(), redis::RedisError> =
+        let watch_result: Result<redis::Value, redis::RedisError> =
             redis::cmd("WATCH").arg(key).query_async(&mut conn).await;
-        if let Err(e) = watch_result {
-            warn!(
-                redis_url = %self.config.redacted_url(),
-                operation = "WATCH",
-                error = %e,
-                "Redis command failed"
-            );
-            self.note_command_failure(&e);
-            return Err(());
+        match watch_result {
+            Ok(reply) => self.require_ok_acknowledgement(&reply, "WATCH")?,
+            Err(e) => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "WATCH",
+                    error = %e,
+                    "Redis command failed"
+                );
+                self.note_command_failure(&e);
+                return Err(());
+            }
         }
 
-        let current: Result<Option<Vec<u8>>, redis::RedisError> =
-            redis::cmd("GET").arg(key).query_async(&mut conn).await;
+        // Bounded compare: transfer at most `expected.len() + 1` bytes however
+        // large the stored value is (issue #6622). Rewrites between these reads
+        // only cause a mismatch or abort the watched EXEC.
+        let current: Result<(i64, usize, Vec<u8>), redis::RedisError> = redis::pipe()
+            .cmd("EXISTS")
+            .arg(key)
+            .cmd("STRLEN")
+            .arg(key)
+            .cmd("GETRANGE")
+            .arg(key)
+            .arg(0)
+            .arg(compare.end)
+            .query_async(&mut conn)
+            .await;
         match current {
-            Ok(Some(current)) if current == expected => {}
+            Ok((_, _, prefix)) if prefix.len() > compare.max_prefix => {
+                // A nonconforming reply is protocol uncertainty, never a match.
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "compare EXISTS+STRLEN+GETRANGE",
+                    classification = "malformed_response",
+                    "Redis bounded compare returned more bytes than requested"
+                );
+                self.mark_unavailable();
+                return Err(());
+            }
+            Ok((exists, length, prefix))
+                if exists == 1 && length == expected.len() && prefix == expected => {}
             Ok(_) => {
                 let unwatch: Result<(), redis::RedisError> =
                     redis::cmd("UNWATCH").query_async(&mut conn).await;
@@ -6425,7 +6710,7 @@ impl RedisRateLimitClient {
             Err(e) => {
                 warn!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "compare-and-set GET",
+                    operation = "compare-and-set EXISTS+STRLEN+GETRANGE",
                     error = %e,
                     "Redis command failed"
                 );
@@ -6459,9 +6744,24 @@ impl RedisRateLimitClient {
             .await;
 
         match result {
-            Ok(Some(_)) => {
+            Ok(Some((reply,))) if reply == "OK" => {
                 self.note_command_success()?;
                 Ok(true)
+            }
+            Ok(Some(_)) => {
+                // Only an exact `OK` proves the completion was stored. Any
+                // other string is protocol uncertainty: reporting it as a
+                // publication would let the caller treat an unwritten
+                // completion as authoritative.
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "compare-and-set",
+                    phase = "EXEC",
+                    classification = "malformed_response",
+                    "Redis transaction SET returned a reply other than OK"
+                );
+                self.mark_unavailable();
+                Err(())
             }
             Ok(None) => {
                 self.note_command_success()?;
@@ -6573,6 +6873,12 @@ impl RedisRateLimitClient {
     ///
     /// For keys that participate in a multi-key atomic operation use
     /// [`Self::make_slot_key`] instead so they share a hash slot.
+    ///
+    /// Components are joined with `:` WITHOUT escaping, so the layout is only
+    /// injective when no component can carry a caller-controlled `:`. Every
+    /// caller passes fixed literals, lowercase hex digests, or a versioned
+    /// digest such as `v6:<hex>`. Never pass raw request input here: hash it
+    /// first, or use [`Self::make_slot_key`], which escapes its tag components.
     pub fn make_key(&self, components: &[&str]) -> String {
         let mut key = self.config.key_prefix.clone();
         for component in components {
@@ -6619,21 +6925,12 @@ impl RedisRateLimitClient {
         Self::window_progress(window_seconds).index
     }
 
-    /// Sub-bucket a request charges right now, from ONE wall-clock sample.
-    ///
-    /// One sample per window is what keeps the whole ladder internally
-    /// consistent: a boundary straddle can shift which sub-bucket is charged,
-    /// but it can never pair a charged bucket from one instant with older
-    /// buckets read from another.
-    pub fn sub_bucket(window_seconds: u64) -> RedisSubBucket {
-        Self::sub_bucket_at(redis_epoch_now(), window_seconds)
-    }
-
     /// Deterministic sub-bucket for a captured epoch offset.
     ///
     /// `index = floor(epoch_nanos / (window_nanos / REDIS_WINDOW_SUB_BUCKETS))`.
-    /// Every gateway sharing one Redis derives the same ladder because they
-    /// share the system epoch clock, exactly as the whole-window index did.
+    /// The ladder is a pure function of the instant passed in: request-quota
+    /// admission passes the Redis-server-corrected instant
+    /// (`RedisServerClock`), never a raw local sample.
     pub fn sub_bucket_at(now: Duration, window_seconds: u64) -> RedisSubBucket {
         let window_seconds = window_seconds.max(1);
         let sub_bucket_nanos = redis_sub_bucket_nanos(window_seconds);

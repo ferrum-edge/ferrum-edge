@@ -31,8 +31,9 @@
 //! JSON `400` written directly to the socket only for the connection's first
 //! head, before any response bytes. Later malformed heads stay with Hyper so
 //! earlier responses are preserved. A well-formed head takes the same in-place
-//! observe path and the same vectored writes as on `main`. Other Hyper parse
-//! failures the scanner cannot name stay Hyper's empty-bodied `400`.
+//! observe path and the same vectored writes as an unguarded connection. Other
+//! Hyper parse failures the scanner cannot name stay Hyper's empty-bodied
+//! `400`.
 //!
 //! The envelope carries the same shape as a handler-layer protocol reject
 //! (`Content-Type: application/json`, a fixed `{"error":"..."}` body,
@@ -784,14 +785,20 @@ impl H1StreamScanner {
                     match step {
                         HeadStep::Continue => None,
                         HeadStep::Complete(outcome) => {
-                            if matches!(outcome.framing, BodyFraming::Invalid)
-                                && signals.parse_reject_hint.load(Ordering::Relaxed)
-                                    & !PARSE_HINT_PRIOR_HEAD
-                                    == PARSE_HINT_CONFLICTING_CONTENT_LENGTH
-                            {
-                                // Hyper rejects this head before dispatch. Stop
-                                // here without poisoning earlier queued heads
-                                // or publishing a decision for the rejected one.
+                            if matches!(outcome.framing, BodyFraming::Invalid) {
+                                // A conflicting, non-numeric or overflowing
+                                // `Content-Length`: the scanner cannot frame
+                                // this head's body, so it stops here without
+                                // poisoning earlier queued heads (issue #7179).
+                                // No decision is published for this head, so
+                                // it is refused either way: Hyper rejects it at
+                                // parse, or, for a value Hyper accepts and the
+                                // scanner does not (`5, 5`), its decision read
+                                // finds none and fails closed with
+                                // `ObserverFailed`. Decided from the scanner's
+                                // own outcome, never the shared parse-reject
+                                // hint, which `poll_read` clears at the end of
+                                // every read.
                                 self.state = H1State::Disabled;
                                 signals.disable_observation();
                                 return true;
@@ -1798,6 +1805,26 @@ mod tests {
                 "parse-reject envelope must not carry X-Gateway-Error: {head_text}"
             );
         }
+
+        // The parse-layer bodies are the same messages the handler-layer
+        // `check_protocol_headers` returns for the same request shapes.
+        let uri: hyper::Uri = "/".parse().expect("uri");
+        let mut duplicate_cl = hyper::HeaderMap::new();
+        duplicate_cl.append(hyper::header::CONTENT_LENGTH, "5".parse().expect("value"));
+        duplicate_cl.append(hyper::header::CONTENT_LENGTH, "6".parse().expect("value"));
+        assert_eq!(
+            crate::proxy::check_protocol_headers(&duplicate_cl, hyper::Version::HTTP_11, &uri),
+            Some(JSON_CONFLICTING_CONTENT_LENGTH)
+        );
+        let mut http10_chunked = hyper::HeaderMap::new();
+        http10_chunked.insert(
+            hyper::header::TRANSFER_ENCODING,
+            "chunked".parse().expect("value"),
+        );
+        assert_eq!(
+            crate::proxy::check_protocol_headers(&http10_chunked, hyper::Version::HTTP_10, &uri),
+            Some(JSON_HTTP10_TRANSFER_ENCODING)
+        );
     }
 
     /// Minimal duplex used to drive `H1FramingGuardIo` directly: `reads` are
@@ -1929,6 +1956,80 @@ mod tests {
                 assert_eq!(signals.take_parse_rejects(), 0);
             }
         }
+    }
+
+    /// Issue #7179: a head with a conflicting, non-numeric or overflowing
+    /// `Content-Length` queued behind a valid one must not poison the valid
+    /// head however the reads split it, in particular between its
+    /// `Content-Length` line and the blank line that ends it (the hint a
+    /// conflicting line publishes is cleared at the end of the read, before
+    /// the head completes).
+    #[test]
+    fn invalid_content_length_split_inside_its_head_preserves_prior_heads() {
+        let valid = b"GET /PROOF HTTP/1.1\r\nHost: x\r\n\r\n";
+        let non_numeric: &[u8] = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n";
+        let overflowing: &[u8] =
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999999999999999999\r\n\r\n";
+        for malformed in [CONFLICTING_CL_HEAD, non_numeric, overflowing] {
+            for split in 1..malformed.len() {
+                let first = [valid.as_slice(), &malformed[..split]].concat();
+                let reads = [first.as_slice(), &malformed[split..]];
+                let (mut guard, signals) =
+                    H1FramingGuardIo::new(MockIo::new(&reads), TEST_MAX_HEAD_BYTES, None);
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                let mut storage = [0u8; 4096];
+                for chunk in reads {
+                    let mut buf = ReadBuf::new(&mut storage);
+                    assert!(matches!(
+                        Pin::new(&mut guard).poll_read(&mut cx, &mut buf),
+                        Poll::Ready(Ok(()))
+                    ));
+                    assert_eq!(
+                        buf.filled(),
+                        chunk,
+                        "split {split}: every byte reaches Hyper"
+                    );
+                }
+                assert_eq!(
+                    signals.next_conflict(),
+                    H1FramingResult::Clear,
+                    "split {split}: the valid head ahead of the malformed one is served"
+                );
+                assert!(
+                    !signals.unknown.load(Ordering::Acquire),
+                    "split {split}: the malformed head must not mark observation unknown"
+                );
+                assert!(guard.inner.written.is_empty(), "split {split}");
+                assert_eq!(signals.take_parse_rejects(), 0, "split {split}");
+            }
+        }
+    }
+
+    /// A `Content-Length` list Hyper accepts (`5, 5`) but the scanner cannot
+    /// frame takes the same non-poisoning exit, yet the head itself is still
+    /// refused: no decision is published for it, so its read fails closed.
+    #[test]
+    fn content_length_the_scanner_cannot_frame_fails_closed_for_its_own_head() {
+        let valid = b"GET /PROOF HTTP/1.1\r\nHost: x\r\n\r\n";
+        let listed: &[u8] = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5, 5\r\n\r\nhello";
+        let combined = [valid.as_slice(), listed].concat();
+        let reads = [combined.as_slice()];
+        let (mut guard, signals) =
+            H1FramingGuardIo::new(MockIo::new(&reads), TEST_MAX_HEAD_BYTES, None);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut storage = [0u8; 4096];
+        let mut buf = ReadBuf::new(&mut storage);
+        assert!(matches!(
+            Pin::new(&mut guard).poll_read(&mut cx, &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(buf.filled(), combined.as_slice());
+        assert_eq!(signals.next_conflict(), H1FramingResult::Clear);
+        assert_eq!(
+            signals.next_conflict(),
+            H1FramingResult::ObserverFailed,
+            "an unframed head must never be dispatched as clear"
+        );
     }
 
     #[test]

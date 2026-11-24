@@ -10,7 +10,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde_json::json;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::common::{TestGateway, spawn_http_counting_mutations};
@@ -85,6 +85,70 @@ async fn opa_policy_denial_applies_to_http_websocket_upgrade_and_grpc() {
     backend.abort();
 }
 
+/// opa-SOL-2: an HTTP/1.1 GET with no body framing takes the no-collection
+/// fast path, and OPA must still see the same `body: ""` a collected
+/// `Content-Length: 0` upload (and native HTTP/3) produces, so a policy that
+/// requires an empty body decides identically on every frontend.
+#[ignore]
+#[tokio::test]
+async fn opa_include_body_sees_an_empty_string_for_a_proven_empty_get() {
+    let opa = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(DECISION_PATH))
+        .and(body_partial_json(json!({"input": {"body": ""}})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": true})))
+        .with_priority(1)
+        .mount(&opa)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(DECISION_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": false})))
+        .with_priority(2)
+        .mount(&opa)
+        .await;
+
+    let (mut backend, _mutations) = spawn_http_counting_mutations()
+        .await
+        .expect("start counting backend");
+    let config = opa_config(
+        backend.port,
+        &opa.uri(),
+        json!({"include_body": true, "max_body_bytes": 4096}),
+    );
+    let mut gateway = TestGateway::builder()
+        .mode_file(config)
+        .log_level("warn")
+        .spawn()
+        .await
+        .expect("start OPA include_body gateway");
+    let client = reqwest::Client::new();
+
+    let bodiless_get = client
+        .get(gateway.proxy_url("/x"))
+        .send()
+        .await
+        .expect("bodiless GET completes");
+    assert_eq!(bodiless_get.status(), StatusCode::OK);
+
+    let empty_post = client
+        .post(gateway.proxy_url("/x"))
+        .body("")
+        .send()
+        .await
+        .expect("empty POST completes");
+    assert_eq!(empty_post.status(), StatusCode::OK);
+
+    let requests = opa.received_requests().await.expect("recorded OPA calls");
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        let payload: serde_json::Value = request.body_json().expect("OPA input is JSON");
+        assert_eq!(payload["input"]["body"], json!(""), "{payload}");
+    }
+
+    gateway.shutdown();
+    backend.abort();
+}
+
 async fn send_grpc_request(
     gateway_addr: &str,
     path: &str,
@@ -131,6 +195,19 @@ async fn send_grpc_request(
 }
 
 fn opa_deny_config(backend_port: u16, opa_host: &str) -> String {
+    opa_config(backend_port, opa_host, json!({}))
+}
+
+fn opa_config(backend_port: u16, opa_host: &str, extra: serde_json::Value) -> String {
+    let mut plugin_config = json!({
+        "opa_host": opa_host,
+        "policy_path": "ferrum/authz/allow"
+    });
+    if let (Some(target), Some(extra)) = (plugin_config.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            target.insert(key.clone(), value.clone());
+        }
+    }
     let config = json!({
         "version": "1",
         "proxies": [{
@@ -149,10 +226,7 @@ fn opa_deny_config(backend_port: u16, opa_host: &str) -> String {
             "scope": "proxy",
             "proxy_id": "opa-protocol-coverage",
             "enabled": true,
-            "config": {
-                "opa_host": opa_host,
-                "policy_path": "ferrum/authz/allow"
-            }
+            "config": plugin_config
         }]
     });
     serde_yaml::to_string(&config).expect("serialize OPA protocol-coverage config")

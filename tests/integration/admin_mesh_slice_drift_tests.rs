@@ -50,7 +50,7 @@ fn admin_token() -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(ADMIN_JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(ADMIN_JWT_SECRET.as_bytes()).unwrap(),
     )
     .expect("admin jwt")
 }
@@ -213,6 +213,7 @@ async fn slice_drift_admin_auth_and_ack_nack_convergence() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     };
     assert!(
         client
@@ -232,6 +233,7 @@ async fn slice_drift_admin_auth_and_ack_nack_convergence() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     };
     let mut stream = client
         .mesh_subscribe(tonic::Request::new(subscribe.clone()))
@@ -430,7 +432,7 @@ async fn status_report_skips_session_mismatches_across_permitted_namespaces() {
             "ns": ["alpha", "beta"],
             "aud": MESH_LOCAL_SUBSCRIBE_AUDIENCE,
         }),
-        &EncodingKey::from_secret(GRPC_JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(GRPC_JWT_SECRET.as_bytes()).unwrap(),
     )
     .expect("multi-namespace mesh JWT");
     let auth_header = format!("Bearer {token}");
@@ -458,6 +460,7 @@ async fn status_report_skips_session_mismatches_across_permitted_namespaces() {
             ambient_udp_source_scoping: false,
             remote_discovery: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }))
         .await
         .unwrap()
@@ -474,6 +477,7 @@ async fn status_report_skips_session_mismatches_across_permitted_namespaces() {
             ambient_udp_source_scoping: false,
             remote_discovery: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }))
         .await
         .unwrap()
@@ -531,6 +535,7 @@ async fn drift_registry_refusal_still_delivers_mesh_config_untracked() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     };
     let mut stream = client
         .mesh_subscribe(tonic::Request::new(subscribe))

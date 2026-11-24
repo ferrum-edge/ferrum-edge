@@ -12,7 +12,7 @@
 //!   `Duration`, then calls the inner `poll_read`. If the inner returns
 //!   `Poll::Pending`, the next poll will delay again — so the delay is
 //!   applied once per *scheduler pass*, not once per byte. Good enough
-//!   for the per-chunk semantics the test catalog models.
+//!   for the per-chunk semantics these tests model.
 //! - `poll_write` likewise delays once per pass. After the inner write
 //!   returns, the wrapper resets the timer so subsequent writes are
 //!   also delayed.

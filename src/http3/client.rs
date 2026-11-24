@@ -30,6 +30,7 @@ use tracing::debug;
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::pool::{GenericPool, PoolCreateCaller, PoolManager};
+use crate::proxy::client_abort::ProvenClientAbort;
 use crate::proxy::headers::{
     is_backend_request_strip_header, is_backend_response_strip_header,
     parse_connection_listed_headers, sanitize_backend_request_trailers,
@@ -43,6 +44,13 @@ use crate::tls::backend::{
 /// Construct a bounded per-request exchange without a heap allocation.
 /// Connection setup keeps its separate boxed boundaries; exchanges retain
 /// their original task, stream ownership, and cancellation guards.
+///
+/// The exchange is returned by value, so the caller copies its whole state
+/// out of a temporary. The HTTP/1.1 and HTTP/2 dispatch path builds the same
+/// kind of child in place (`construct_proxy_future_in` in `proxy/mod.rs`);
+/// this factory has not been converted because the HTTP/3 exchange has not
+/// been profiled. `bounded_inline_children_are_constructed_in_their_final_slot`
+/// names it as the one remaining by-value factory.
 #[inline(never)]
 fn construct_h3_future<F: std::future::Future>(construct: impl FnOnce() -> F) -> F {
     construct()
@@ -697,14 +705,12 @@ where
 
 /// The bounded slices a buffered native-H3 request body is written in, in
 /// order. Reached through `crate::_test_support`.
-#[allow(dead_code)]
 pub(crate) fn h3_buffered_body_chunks_for_test(body: bytes::Bytes) -> Vec<bytes::Bytes> {
     H3BufferedBodyChunks::new(body).collect()
 }
 
 /// The slice size each buffered native-H3 write is bounded at. Reached through
 /// `crate::_test_support`.
-#[allow(dead_code)]
 pub(crate) const fn h3_buffered_send_chunk_bytes() -> usize {
     H3_BUFFERED_SEND_CHUNK_BYTES
 }
@@ -718,7 +724,6 @@ pub(crate) const fn h3_buffered_send_chunk_bytes() -> usize {
 /// `per_chunk_delay_ms` is how long each simulated write takes, and a body whose
 /// TOTAL write time far exceeds `backend_write_timeout_ms` still completes as
 /// long as no single write does.
-#[allow(dead_code)]
 pub(crate) async fn drive_h3_buffered_body_send_for_test(
     body: bytes::Bytes,
     backend_write_timeout_ms: u64,
@@ -764,7 +769,7 @@ pub(crate) fn collect_h3_response_headers(source: &http::HeaderMap) -> HashMap<S
         if connection_listed.iter().any(|n| n == name) {
             continue;
         }
-        if let Ok(value_str) = value.to_str() {
+        if let Some(value_str) = crate::proxy::backend_response_field_value_str(name, value) {
             let sep = if name == http::header::SET_COOKIE {
                 "\n"
             } else {
@@ -811,9 +816,8 @@ pub(crate) fn is_h3_graceful_close(e: &h3::error::StreamError) -> bool {
 /// Map an h3 [`StreamError`](h3::error::StreamError) returned by
 /// `recv_response()` into the corresponding [`H3PoolError`] variant.
 ///
-/// Centralises the four identical `.map_err` closures across the pool's
-/// inner request helpers (`do_request`, `do_request_streaming`,
-/// `do_request_streaming_body`, `do_request_streaming_incoming_body`) so
+/// Centralises the mapping for the pool's response-head readers
+/// (`recv_h3_response_with_timeout` and `recv_h3_backend_response_head`) so
 /// the graceful-close detection cannot drift between sites on future
 /// edits.
 ///
@@ -909,8 +913,9 @@ type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes
 /// It deliberately does NOT carry the destination's
 /// `connectionPool.tcp.maxConnections` slot. The pooled value is only a handle:
 /// the physical QUIC connection and its UDP socket are owned by the spawned h3
-/// driver task, which outlives every handle (`h3`'s client `poll_close` resolves
-/// on connection close/error, not on `SendRequest` drop). Parking the slot here
+/// driver task. Active request streams retain a sender: dropping the last
+/// `SendRequest` closes the h3 session even when a request stream still exists.
+/// Parking the slot here
 /// would release it as soon as the cached value and any in-flight clones dropped
 /// — on a force-drain / eviction that happens while the old connection is still
 /// open, so a replacement could be admitted past the cap. The slot therefore
@@ -948,9 +953,50 @@ impl H3PooledConnection {
     }
 }
 
-/// Type alias for the h3 client request stream (bidirectional).
+/// An opened backend stream owns the session sender until the stream is dropped.
+/// Pool eviction retires the sender for new dispatch, while this private clone
+/// preserves established traffic. The physical connection limit stays owned by
+/// the driver, so an evicted connection remains charged while it is still open.
+pub struct H3BackendStream<S> {
+    stream: S,
+    session: H3SendRequest,
+}
+
+impl<S> H3BackendStream<S> {
+    fn new(stream: S, session: H3SendRequest) -> Self {
+        Self { stream, session }
+    }
+}
+
+impl<S> std::ops::Deref for H3BackendStream<S> {
+    type Target = S;
+
+    fn deref(&self) -> &Self::Target {
+        &self.stream
+    }
+}
+
+impl<S> std::ops::DerefMut for H3BackendStream<S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.stream
+    }
+}
+
+/// Guarded native h3 client request stream (bidirectional).
 pub type H3RequestStream =
-    h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
+    H3BackendStream<h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>>;
+
+impl H3RequestStream {
+    /// Both independently driven directions retain the established session.
+    pub fn split(self) -> (H3BackendSendStream, H3BackendRecvStream) {
+        let Self { stream, session } = self;
+        let (send, recv) = stream.split();
+        (
+            H3BackendStream::new(send, session.clone()),
+            H3BackendStream::new(recv, session),
+        )
+    }
+}
 
 /// Quinn finishes a send stream on drop. Until the entire upload is finished,
 /// every error or cancelled future must instead reset it, including cancellation
@@ -1008,8 +1054,9 @@ fn h3_backend_connect_timeout(proxy: &Proxy, host: &str, port: u16, phase: &str)
 /// Set to `true` as soon as `send_request().await` succeeds (the QUIC
 /// stream is opened and request headers are committed) — regardless of
 /// whether `send_data` / `finish` / `recv_response` succeeds afterwards.
-/// The pool's internal retry chain promotes the flag forward so a later
-/// failed-connect attempt cannot mask the earlier wire commitment.
+/// A post-wire failure is returned immediately rather than retried on another
+/// connection inside the pool, so a later failed-connect attempt can never
+/// mask an earlier wire commitment.
 ///
 /// Also carries `graceful_close`, set when the underlying error is a
 /// graceful remote close (`H3_NO_ERROR` `ApplicationClose` or
@@ -1028,23 +1075,161 @@ fn h3_backend_connect_timeout(proxy: &Proxy, host: &str, port: u16, phase: &str)
 ///   backend closed gracefully before a usable response could be parsed.
 ///   Post-wire by construction; suppresses `mark_h3_unsupported` at
 ///   gateway dispatch sites.
-/// - [`H3PoolError::promote_on_wire_if`] — conditionally promote a stored
-///   error to `request_on_wire=true` (no-op when the condition is false).
-///   Used by the pool's internal retry chain to surface the "any attempt
-///   committed" semantics: each fresh-connect setup `?` exit threads
-///   `any_request_on_wire` through this method so a previous post-wire
-///   attempt's commitment is preserved across the final error.
 /// - [`H3PoolError::route_deadline`] — a matched route rule's deadline, not
 ///   the backend transport, ended the attempt (#5646).
+///
+/// The wire state is stored as one `H3AttemptHandoff`, from which both
+/// `request_on_wire` and the H3 `connection_error` are derived.
 #[derive(Debug)]
 pub struct H3PoolError {
     inner: anyhow::Error,
-    request_on_wire: bool,
+    handoff: H3AttemptHandoff,
     graceful_close: bool,
     read_timeout: bool,
     route_deadline: Option<crate::proxy::RouteDeadlineExpiry>,
     authorization_expiry: Option<crate::proxy::auth_lifetime::StreamAuthTermination>,
     client_deadline_expired: bool,
+    client_request_fault: Option<H3ClientRequestFault>,
+}
+
+/// How far one failed native-H3 backend attempt got toward the backend.
+///
+/// Proxy core keeps two bits on `BackendResponse`: `connection_error` and
+/// `request_on_wire`. The H3 outcomes derive both from this one value, so an H3
+/// outcome cannot claim the backend may have executed a request that was never
+/// dialed, and cannot count an attempt the gateway never started as a
+/// connection failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum H3AttemptHandoff {
+    /// The gateway ended the attempt before polling it, because a route
+    /// deadline was already spent. Nothing was dialed, no request byte left
+    /// the gateway, and it is not a connection failure. This matches proxy
+    /// core's `route_deadline_expiry_response` with `handed_to_backend == false`.
+    NotDialed,
+    /// The request never reached the backend's application layer. DNS, TLS,
+    /// connect, session setup, or `send_request` failed, or the gateway refused
+    /// the target. The attempt is accounted as a connection failure.
+    PreWire,
+    /// The request was committed to the backend on an attempt this outcome
+    /// covers, so the backend may have executed it.
+    OnWire,
+}
+
+impl H3AttemptHandoff {
+    /// The handoff for a plain wire flag: `true` is [`Self::OnWire`], `false`
+    /// is [`Self::PreWire`].
+    pub(crate) const fn from_request_on_wire(request_on_wire: bool) -> Self {
+        if request_on_wire {
+            Self::OnWire
+        } else {
+            Self::PreWire
+        }
+    }
+
+    /// Whether the backend may have executed the request.
+    pub(crate) const fn request_on_wire(self) -> bool {
+        matches!(self, Self::OnWire)
+    }
+
+    /// Whether the outcome is a connect-phase (pre-wire) connection failure.
+    /// The H3 `BackendResponse::connection_error` before any class-based
+    /// neutralization. It is false for an attempt the gateway never started.
+    pub(crate) const fn connection_error(self) -> bool {
+        matches!(self, Self::PreWire)
+    }
+}
+
+/// Why reading the CLIENT's HTTP/3 request upload failed while the native-H3
+/// streaming dispatch was forwarding it (issue #6772).
+///
+/// Typed so the gateway terminal is keyed on the observed cause rather than on
+/// the error text: only [`Self::Abort`] carries the
+/// [`ProvenClientAbort`](crate::proxy::client_abort::ProvenClientAbort) that
+/// reaches the `499` / `CANCELLED` client-abort terminal. None of the variants
+/// is a backend fault, so all of them are neutral for backend health.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum H3ClientRequestFault {
+    /// The client reset its request stream, or closed its connection.
+    Abort(ProvenClientAbort),
+    /// A request DATA read failed on a framing violation (`400`).
+    MalformedBody,
+    /// The trailer section could not be decoded, or a frame followed it (`400`).
+    MalformedTrailers,
+    /// The gateway ended the client's request stream or connection itself, or
+    /// the cause is not observable: the gateway-closed `503` / `UNAVAILABLE`
+    /// terminal, never a client abort.
+    GatewayTerminated,
+    /// The client's upload exceeded the effective request-body limit: `413`
+    /// (gRPC `RESOURCE_EXHAUSTED`), typed so no consumer keys the refusal on
+    /// the error text (issue #7187).
+    BodyTooLarge,
+}
+
+/// The typed [`H3PoolError`] for a client upload that exceeded the effective
+/// request-body limit (issue #7187). The text is the operator-stable wording;
+/// consumers read [`H3ClientRequestFault::BodyTooLarge`], never the text.
+pub(crate) fn h3_request_body_too_large_error() -> H3PoolError {
+    H3PoolError::client_request(
+        H3ClientRequestFault::BodyTooLarge,
+        anyhow::anyhow!("Request body exceeds maximum size"),
+    )
+}
+
+/// The typed [`H3PoolError`] for a failed read of an HTTP/1.1 or HTTP/2
+/// client's upload while it is forwarded to a native-H3 backend (issue #7187).
+///
+/// Classified by the one H1/H2 upload-fault predicate the relayed-upload paths
+/// use (`upload_pump::client_upload_error_fault`): only typed proof the client
+/// went away (a reset or `GOAWAY` it sent, or a reset, aborted, or broken
+/// connection) is a client abort (`499`); anything else is a malformed or
+/// incomplete upload (`400`), never a client-closed request.
+fn h1h2_client_upload_read_error(error: &hyper::Error) -> H3PoolError {
+    match crate::proxy::upload_pump::client_upload_error_fault(error) {
+        crate::proxy::upload_pump::ClientUploadFault::Disconnected => H3PoolError::client_request(
+            H3ClientRequestFault::Abort(ProvenClientAbort::latched_upload_abort()),
+            anyhow::anyhow!("Client disconnected while sending request body: {}", error),
+        ),
+        crate::proxy::upload_pump::ClientUploadFault::Malformed => H3PoolError::client_request(
+            H3ClientRequestFault::MalformedBody,
+            anyhow::anyhow!("malformed client request body: {}", error),
+        ),
+    }
+}
+
+/// The typed [`H3PoolError`] for a failed read of the client's own upload.
+///
+/// The cause is classified positively by
+/// [`crate::http3::stream_util::classify_h3_request_read_error`], the predicate
+/// the buffered drains use too (issue #6772). `malformed` names the malformed
+/// variant for the read that failed (DATA or the trailer section).
+fn h3_client_upload_read_error(
+    error: &h3::error::StreamError,
+    malformed: H3ClientRequestFault,
+) -> H3PoolError {
+    use crate::http3::stream_util::H3RequestReadFailure;
+    match crate::http3::stream_util::classify_h3_request_read_error(error) {
+        H3RequestReadFailure::ClientAbort => H3PoolError::client_request(
+            H3ClientRequestFault::Abort(ProvenClientAbort::latched_upload_abort()),
+            anyhow::anyhow!("client disconnected while sending request body: {}", error),
+        ),
+        H3RequestReadFailure::Malformed => {
+            if malformed == H3ClientRequestFault::MalformedTrailers {
+                H3PoolError::client_request(
+                    malformed,
+                    anyhow::anyhow!("malformed client request trailers: {}", error),
+                )
+            } else {
+                H3PoolError::client_request(
+                    malformed,
+                    anyhow::anyhow!("malformed client request body: {}", error),
+                )
+            }
+        }
+        H3RequestReadFailure::GatewayTerminated => H3PoolError::client_request(
+            H3ClientRequestFault::GatewayTerminated,
+            anyhow::anyhow!("client request stream closed by the gateway: {}", error),
+        ),
+    }
 }
 
 impl H3PoolError {
@@ -1055,12 +1240,13 @@ impl H3PoolError {
     pub fn pre_wire(error: impl Into<anyhow::Error>) -> Self {
         Self {
             inner: error.into(),
-            request_on_wire: false,
+            handoff: H3AttemptHandoff::PreWire,
             graceful_close: false,
             read_timeout: false,
             route_deadline: None,
             authorization_expiry: None,
             client_deadline_expired: false,
+            client_request_fault: None,
         }
     }
 
@@ -1071,12 +1257,13 @@ impl H3PoolError {
     pub fn post_wire(error: impl Into<anyhow::Error>) -> Self {
         Self {
             inner: error.into(),
-            request_on_wire: true,
+            handoff: H3AttemptHandoff::OnWire,
             graceful_close: false,
             read_timeout: false,
             route_deadline: None,
             authorization_expiry: None,
             client_deadline_expired: false,
+            client_request_fault: None,
         }
     }
 
@@ -1094,12 +1281,13 @@ impl H3PoolError {
     pub fn graceful_close(error: impl Into<anyhow::Error>) -> Self {
         Self {
             inner: error.into(),
-            request_on_wire: true,
+            handoff: H3AttemptHandoff::OnWire,
             graceful_close: true,
             read_timeout: false,
             route_deadline: None,
             authorization_expiry: None,
             client_deadline_expired: false,
+            client_request_fault: None,
         }
     }
 
@@ -1121,12 +1309,13 @@ impl H3PoolError {
     pub fn read_timeout(error: impl Into<anyhow::Error>) -> Self {
         Self {
             inner: error.into(),
-            request_on_wire: true,
+            handoff: H3AttemptHandoff::OnWire,
             graceful_close: false,
             read_timeout: true,
             route_deadline: None,
             authorization_expiry: None,
             client_deadline_expired: false,
+            client_request_fault: None,
         }
     }
 
@@ -1145,13 +1334,16 @@ impl H3PoolError {
     /// `timeouts.backendRequest`).
     ///
     /// It carries the typed read-timeout signal, so every native dispatch
-    /// failure arm answers it with a `504` and records it as a post-wire
-    /// timeout rather than a connection failure, exactly like proxy core's
-    /// route deadline terminal (`connection_error: false`). Its class and
-    /// client-visible body come from the expiry instead of the transport:
-    /// see `classify_h3_error` and `h3_backend_failure_status_body`. A route
-    /// deadline never proves the backend lost QUIC, so it never downgrades
-    /// the cached H3 capability.
+    /// failure arm answers it with a `504` and never records it as a
+    /// connection failure, exactly like proxy core's route deadline terminal
+    /// (`connection_error: false`). Its handoff comes from the expiry
+    /// (`route_deadline::expiry_handoff`). A total deadline spent before the
+    /// attempt started is `NotDialed`, so it is not on the wire either. Every
+    /// other expiry ended an attempt the backend held, so it is `OnWire`. Its
+    /// class and client-visible body also come from the expiry instead of the
+    /// transport: see `classify_h3_error` and `h3_backend_failure_status_body`.
+    /// A route deadline never proves the backend lost QUIC, so it never
+    /// downgrades the cached H3 capability.
     pub(crate) fn route_deadline(expiry: crate::proxy::RouteDeadlineExpiry) -> Self {
         let inner = if expiry == crate::proxy::RouteDeadlineExpiry::AttemptBudget {
             anyhow::anyhow!("route attempt budget exceeded before the backend response head")
@@ -1160,12 +1352,13 @@ impl H3PoolError {
         };
         Self {
             inner,
-            request_on_wire: true,
+            handoff: crate::http3::route_deadline::expiry_handoff(expiry),
             graceful_close: false,
             read_timeout: true,
             route_deadline: Some(expiry),
             authorization_expiry: None,
             client_deadline_expired: false,
+            client_request_fault: None,
         }
     }
 
@@ -1183,6 +1376,64 @@ impl H3PoolError {
         self.client_deadline_expired
     }
 
+    /// A post-wire failure reading the client's own request upload (issue
+    /// #6772). The backend stream is already open, so it is post-wire like any
+    /// other mid-upload failure; the typed fault decides the gateway terminal.
+    pub(crate) fn client_request(
+        fault: H3ClientRequestFault,
+        error: impl Into<anyhow::Error>,
+    ) -> Self {
+        let mut error = Self::post_wire(error);
+        error.client_request_fault = Some(fault);
+        error
+    }
+
+    /// [`Self::client_request`] for a client fault observed while the dispatch
+    /// may not have handed the request to the backend yet: `request_on_wire`
+    /// is whether the backend stream had opened.
+    pub(crate) fn client_request_at_handoff(
+        fault: H3ClientRequestFault,
+        error: impl Into<anyhow::Error>,
+        request_on_wire: bool,
+    ) -> Self {
+        let mut error = Self::client_request(fault, error);
+        error.handoff = H3AttemptHandoff::from_request_on_wire(request_on_wire);
+        error
+    }
+
+    /// The client-upload fault that ended this request, when one did.
+    pub(crate) fn client_request_fault(&self) -> Option<H3ClientRequestFault> {
+        self.client_request_fault
+    }
+
+    /// Settle a gateway-terminated upload read against the client's
+    /// connection (issue #6772): when the client closed that connection, the
+    /// fault is its abort. A read on a connection the client closed can fail
+    /// as an unclassified closed stream rather than as the connection error,
+    /// so the connection's own close reason is the proof. Every other error,
+    /// and a connection the gateway closed or that timed out, is unchanged.
+    pub(crate) fn with_peer_closed_upload(
+        mut self,
+        peer: Option<&crate::plugins::PeerConnectionSignal>,
+    ) -> Self {
+        if self.client_request_fault == Some(H3ClientRequestFault::GatewayTerminated)
+            && let Some(abort) = ProvenClientAbort::from_peer_connection(peer)
+        {
+            self.client_request_fault = Some(H3ClientRequestFault::Abort(abort));
+        }
+        self
+    }
+
+    /// The proven client abort that ended this request, when one did. Only
+    /// this, never the error class or text, selects the `499` / `CANCELLED`
+    /// client-abort terminal.
+    pub(crate) fn proven_client_abort(&self) -> Option<ProvenClientAbort> {
+        match self.client_request_fault {
+            Some(H3ClientRequestFault::Abort(abort)) => Some(abort),
+            _ => None,
+        }
+    }
+
     pub(crate) fn authorization_expiry(
         &self,
     ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
@@ -1195,10 +1446,33 @@ impl H3PoolError {
     }
 
     /// Returns `true` if the request was committed to the wire on any
-    /// attempt covered by this error. Drives `BackendResponse::connection_error`
-    /// at the gateway: `connection_error = !request_on_wire`.
+    /// attempt covered by this error, so the backend may have executed it.
     pub fn request_on_wire(&self) -> bool {
-        self.request_on_wire
+        self.handoff.request_on_wire()
+    }
+
+    /// Whether this error is a connect-phase connection failure: the H3
+    /// `BackendResponse::connection_error` before class-based neutralization.
+    /// Equal to `!request_on_wire()` except for an attempt the gateway never
+    /// started (a route deadline spent before dispatch), which is neither.
+    pub(crate) fn connection_error(&self) -> bool {
+        self.handoff.connection_error()
+    }
+
+    /// How far the failed attempt got toward the backend.
+    pub(crate) fn handoff(&self) -> H3AttemptHandoff {
+        self.handoff
+    }
+
+    /// Whether the failure is a gateway-side internal fault — the backend TLS
+    /// client configuration could not be built
+    /// ([`crate::connection_pool::BackendTlsConfigUnavailable`]) — rather than
+    /// anything the backend did. Native gRPC maps it to `INTERNAL` and keeps
+    /// it neutral for backend health (#6773).
+    pub fn is_gateway_internal(&self) -> bool {
+        self.inner
+            .chain()
+            .any(|cause| cause.is::<crate::connection_pool::BackendTlsConfigUnavailable>())
     }
 
     /// Returns `true` if this error originates from a graceful remote
@@ -1221,39 +1495,6 @@ impl H3PoolError {
     /// timeouts do not trigger `mark_h3_unsupported`.
     pub fn is_read_timeout(&self) -> bool {
         self.read_timeout
-    }
-
-    /// Conditionally promote the sticky `request_on_wire` flag.
-    ///
-    /// - When `condition` is `true`, the flag is set to `true` (no-op if
-    ///   already `true`).
-    /// - When `condition` is `false`, this is a NO-OP — the existing flag
-    ///   is preserved, never demoted from `true` back to `false`.
-    ///
-    /// A `false` value just means "no earlier attempt committed the body" — it
-    /// must NOT clobber a `true` flag that an earlier
-    /// `H3PoolError::post_wire(...)` constructor set. `graceful_close` is
-    /// preserved verbatim — promotion only affects the body-on-wire signal.
-    ///
-    /// The pool's `request*` methods no longer thread this flag across internal
-    /// attempts. A POST-WIRE failure is returned immediately (it must never be
-    /// replayed on another connection), so the cached/fallback/fresh chain is
-    /// only driven by PRE-WIRE failures and the fresh-connect setup errors are
-    /// genuinely pre-wire. This method is retained as a utility for combining a
-    /// prior on-wire observation with a later pre-wire error.
-    #[allow(dead_code)] // Retained public utility for combining a prior on-wire observation with a later pre-wire error.
-    pub fn promote_on_wire_if(mut self, condition: bool) -> Self {
-        if condition {
-            self.request_on_wire = true;
-        }
-        self
-    }
-
-    /// Consume and return the underlying error, dropping the body-on-wire
-    /// signal. Used by callers that have already extracted the signal.
-    #[allow(dead_code)] // Public escape hatch for callers that need owned anyhow::Error.
-    pub fn into_error(self) -> anyhow::Error {
-        self.inner
     }
 }
 
@@ -1593,11 +1834,18 @@ where
     let dispatch = auth.compose(protocol_at);
     let bound = crate::proxy::compose_backend_handoff_bound(None, dispatch);
     match crate::proxy::await_backend_dispatch_bound(bound, work).await {
-        Ok(result) => result,
-        Err(_) if dispatch.authorization_wins || dispatch.at == auth.client_deadline_at => {
+        // The bound is checked before every poll, but a poll that began in time
+        // can still complete with a failure after it. That failure settles as
+        // the bound, exactly as the expiry arm below (issue #6976); an error
+        // the work already typed as a lifetime expiry keeps its own terminal.
+        Ok(Err(error)) if error.lifetime_expired() || bound.elapsed().is_none() => Err(error),
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) | Err(_)
+            if dispatch.authorization_wins || dispatch.at == auth.client_deadline_at =>
+        {
             Err(h3_authorization_error(dispatch, auth, handed_to_backend))
         }
-        Err(_) => Err(H3PoolError::read_timeout(anyhow::anyhow!(
+        Ok(Err(_)) | Err(_) => Err(H3PoolError::read_timeout(anyhow::anyhow!(
             "recv_response read timeout"
         ))),
     }
@@ -1628,11 +1876,17 @@ where
             .map_err(|error| H3PoolError::post_wire(anyhow::anyhow!("{op} failed: {error}")))
     };
     match crate::proxy::await_backend_dispatch_bound(bound, work).await {
-        Ok(result) => result,
-        Err(_) if dispatch.authorization_wins || dispatch.at == auth.client_deadline_at => {
+        // A write poll that began in time can still fail after the bound; that
+        // failure settles as the bound, exactly as the expiry arms below (issue
+        // #6976).
+        Ok(Err(error)) if bound.elapsed().is_none() => Err(error),
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) | Err(_)
+            if dispatch.authorization_wins || dispatch.at == auth.client_deadline_at =>
+        {
             Err(h3_authorization_error(dispatch, auth, true))
         }
-        Err(_) => Err(H3PoolError::write_timeout(anyhow::anyhow!(
+        Ok(Err(_)) | Err(_) => Err(H3PoolError::write_timeout(anyhow::anyhow!(
             "backend request body write timeout after {timeout_ms}ms"
         ))),
     }
@@ -1789,10 +2043,11 @@ pub struct H3StreamingResponse {
 
 /// Send half of a `split()` native-H3 backend request stream.
 pub type H3BackendSendStream =
-    h3::client::RequestStream<h3_quinn::SendStream<bytes::Bytes>, bytes::Bytes>;
+    H3BackendStream<h3::client::RequestStream<h3_quinn::SendStream<bytes::Bytes>, bytes::Bytes>>;
 
 /// Receive half of a `split()` native-H3 backend request stream.
-pub type H3BackendRecvStream = h3::client::RequestStream<h3_quinn::RecvStream, bytes::Bytes>;
+pub type H3BackendRecvStream =
+    H3BackendStream<h3::client::RequestStream<h3_quinn::RecvStream, bytes::Bytes>>;
 
 /// A native-H3 backend request stream whose HEADERS are on the wire but whose
 /// request body has NOT been written yet, already split into independently
@@ -1939,11 +2194,12 @@ impl PoolManager for Http3PoolManager {
     }
 
     // HTTP/3 request paths establish new connections through
-    // `GenericPool::create_or_get_existing_owned()` because QUIC setup needs
-    // per-call TLS and H3 config objects that are not part of the manager.
+    // `GenericPool::create_or_get_existing_owned_sampled_as()` because QUIC
+    // setup needs per-call TLS and H3 config objects that are not part of the
+    // manager.
     async fn create(&self, _key: &str, _proxy: &Proxy) -> Result<Self::Connection> {
         Err(anyhow::anyhow!(
-            "Http3ConnectionPool uses GenericPool::create_or_get_existing_owned for creation"
+            "Http3ConnectionPool uses GenericPool::create_or_get_existing_owned_sampled_as for creation"
         ))
     }
 
@@ -1974,9 +2230,7 @@ impl Http3PoolManager {
     fn svid_generation_for_proxy(&self, proxy: &Proxy) -> Option<u64> {
         let effective_client_cert_path = proxy
             .resolved_tls
-            .client_cert_path
-            .as_deref()
-            .or(self.global_backend_client_cert_path.as_deref());
+            .effective_client_cert_path(self.global_backend_client_cert_path.as_deref());
         backend_svid_generation_for_client_cert(
             effective_client_cert_path,
             self.workload_svid_cert_path.as_deref(),
@@ -1986,7 +2240,6 @@ impl Http3PoolManager {
 }
 
 impl Http3ConnectionPool {
-    #[allow(dead_code)] // Used by tests and standalone H3 callers without shared SVID rotation state.
     pub fn new(env_config: Arc<crate::config::EnvConfig>, dns_cache: crate::dns::DnsCache) -> Self {
         Self::new_with_svid_generation(env_config, dns_cache, Arc::new(AtomicU64::new(0)))
     }
@@ -2070,6 +2323,21 @@ impl Http3ConnectionPool {
         self.pool.clear();
     }
 
+    /// This pool's drain epoch (see [`GenericPool::drain_epoch`]).
+    ///
+    /// A checkout reads two dial inputs before it reaches the pool's create
+    /// path: the SVID generation its pool key carries, and the backend TLS
+    /// configuration its create closure holds. It therefore samples the epoch
+    /// FIRST, before either read, and hands the sample to the create. A drain
+    /// retires both inputs before it bumps the epoch (the generation counter
+    /// has advanced, the TLS configuration cache is cleared), so an input
+    /// read after the sample is either current, or the drain's bump comes
+    /// after the sample and the connection is not published. One shared
+    /// atomic load per checkout, warm or cold.
+    pub(crate) fn drain_epoch(&self) -> u64 {
+        self.pool.drain_epoch()
+    }
+
     fn current_svid_generation(&self) -> u64 {
         self.backend_svid_generation.load(Ordering::Acquire)
     }
@@ -2077,9 +2345,7 @@ impl Http3ConnectionPool {
     fn svid_generation_for_proxy(&self, proxy: &Proxy) -> Option<u64> {
         let effective_client_cert_path = proxy
             .resolved_tls
-            .client_cert_path
-            .as_deref()
-            .or(self.env_config.backend_tls_client_cert_path.as_deref());
+            .effective_client_cert_path(self.env_config.backend_tls_client_cert_path.as_deref());
         backend_svid_generation_for_client_cert(
             effective_client_cert_path,
             self.env_config.gateway_svid_cert_path.as_deref(),
@@ -2089,7 +2355,6 @@ impl Http3ConnectionPool {
 
     /// Pool key — includes TLS-differentiating fields (CA, mTLS, verify).
     /// Uses `|` as delimiter to avoid ambiguity with `:` in IPv6 addresses.
-    #[allow(dead_code)] // Public test/helper surface; runtime paths use generation-aware methods.
     pub fn pool_key(proxy: &Proxy, index: usize) -> String {
         let mut key = String::with_capacity(128);
         Self::write_pool_key(&mut key, proxy, index);
@@ -2111,7 +2376,6 @@ impl Http3ConnectionPool {
         );
     }
 
-    #[allow(dead_code)] // Paired with pool_key_for_target() for external tests/helpers.
     fn write_pool_key_with_host(
         buf: &mut String,
         host: &str,
@@ -2176,7 +2440,6 @@ impl Http3ConnectionPool {
     /// a capability probed through one proxy's resolver / cert material
     /// could be served by a pooled QUIC connection originated by a
     /// different proxy.
-    #[allow(dead_code)] // Public test/helper surface; runtime paths use generation-aware methods.
     pub fn pool_key_for_target(proxy: &Proxy, host: &str, port: u16, index: usize) -> String {
         let mut key = String::with_capacity(128);
         Self::write_pool_key_with_host(&mut key, host, port, proxy, index);
@@ -2270,22 +2533,34 @@ impl Http3ConnectionPool {
 
     /// Use one typed failure adapter for both H3 creation paths so the pool
     /// publishes transport facts before notifying any coalesced waiter.
+    ///
+    /// `drain_epoch` is the [`Self::drain_epoch`] sample the checkout took
+    /// before it read the SVID generation in `key` and the TLS configuration
+    /// `create` dials with.
     async fn create_or_get_sender<F>(
         &self,
         key: String,
+        drain_epoch: u64,
         connect_at: Option<&OnceLock<tokio::time::Instant>>,
         create: F,
     ) -> Result<H3PooledConnection, anyhow::Error>
     where
         F: std::future::Future<Output = Result<H3PooledConnection, anyhow::Error>>,
     {
-        self.create_or_get_sender_as(key, connect_at, PoolCreateCaller::Request, create)
-            .await
+        self.create_or_get_sender_as(
+            key,
+            drain_epoch,
+            connect_at,
+            PoolCreateCaller::Request,
+            create,
+        )
+        .await
     }
 
     async fn create_or_get_sender_as<F>(
         &self,
         key: String,
+        drain_epoch: u64,
         connect_at: Option<&OnceLock<tokio::time::Instant>>,
         caller: PoolCreateCaller,
         create: F,
@@ -2294,7 +2569,7 @@ impl Http3ConnectionPool {
         F: std::future::Future<Output = Result<H3PooledConnection, anyhow::Error>>,
     {
         self.pool
-            .create_or_get_existing_owned_as(key, caller, |_| async move {
+            .create_or_get_existing_owned_sampled_as(key, drain_epoch, caller, |_| async move {
                 create
                     .await
                     .map_err(|error| H3ConnectionCreateError::capture(error, connect_at))
@@ -2339,7 +2614,11 @@ impl Http3ConnectionPool {
     where
         F: std::future::Future<Output = anyhow::Error>,
     {
-        let create = self.create_or_get_sender(key, Some(connect_at), async { Err(failure.await) });
+        // No generation or TLS read precedes this create.
+        let drain_epoch = self.drain_epoch();
+        let create = self.create_or_get_sender(key, drain_epoch, Some(connect_at), async {
+            Err(failure.await)
+        });
         await_h3_connection_checkout(
             H3Authorization::new(client_at, plan),
             connect_at,
@@ -2365,12 +2644,18 @@ impl Http3ConnectionPool {
     async fn create_or_get_proxy_sender(
         &self,
         key: String,
+        drain_epoch: u64,
         proxy: &Proxy,
         tls_config: Arc<rustls::ClientConfig>,
         h3_config: super::config::Http3ServerConfig,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         self.create_or_get_proxy_sender_with_connect_deadline(
-            key, proxy, tls_config, h3_config, None,
+            key,
+            drain_epoch,
+            proxy,
+            tls_config,
+            h3_config,
+            None,
         )
         .await
     }
@@ -2381,21 +2666,28 @@ impl Http3ConnectionPool {
     async fn create_or_get_probe_sender(
         &self,
         key: String,
+        drain_epoch: u64,
         proxy: &Proxy,
         tls_config: Arc<rustls::ClientConfig>,
         h3_config: super::config::Http3ServerConfig,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         let create = async {
-            boxed_h3_future(|| self.create_connection(proxy, &tls_config, Some(&h3_config), None))
-                .await
+            boxed_h3_future(|| self.create_connection(proxy, &tls_config, &h3_config, None)).await
         };
-        self.create_or_get_sender_as(key, None, PoolCreateCaller::CapabilityProbe, create)
-            .await
+        self.create_or_get_sender_as(
+            key,
+            drain_epoch,
+            None,
+            PoolCreateCaller::CapabilityProbe,
+            create,
+        )
+        .await
     }
 
     async fn create_or_get_proxy_sender_with_connect_deadline(
         &self,
         key: String,
+        drain_epoch: u64,
         proxy: &Proxy,
         tls_config: Arc<rustls::ClientConfig>,
         h3_config: super::config::Http3ServerConfig,
@@ -2404,12 +2696,11 @@ impl Http3ConnectionPool {
         // H3 is the one pool that needs extra creation context beyond the
         // `Proxy`, so it uses the shared shell's explicit creation closure.
         let create = async {
-            boxed_h3_future(|| {
-                self.create_connection(proxy, &tls_config, Some(&h3_config), connect_at)
-            })
-            .await
+            boxed_h3_future(|| self.create_connection(proxy, &tls_config, &h3_config, connect_at))
+                .await
         };
-        self.create_or_get_sender(key, connect_at, create).await
+        self.create_or_get_sender(key, drain_epoch, connect_at, create)
+            .await
     }
 
     /// `policy_port` is the DestinationRule policy port for this dispatch; see
@@ -2419,13 +2710,20 @@ impl Http3ConnectionPool {
     async fn create_or_get_target_sender(
         &self,
         key: String,
+        drain_epoch: u64,
         proxy: &Proxy,
         target: H3ConnectionTarget<'_>,
         tls_config: Arc<rustls::ClientConfig>,
         h3_config: super::config::Http3ServerConfig,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         self.create_or_get_target_sender_with_connect_deadline(
-            key, proxy, target, tls_config, h3_config, None,
+            key,
+            drain_epoch,
+            proxy,
+            target,
+            tls_config,
+            h3_config,
+            None,
         )
         .await
     }
@@ -2434,6 +2732,7 @@ impl Http3ConnectionPool {
     async fn create_or_get_target_sender_with_connect_deadline(
         &self,
         key: String,
+        drain_epoch: u64,
         proxy: &Proxy,
         target: H3ConnectionTarget<'_>,
         tls_config: Arc<rustls::ClientConfig>,
@@ -2448,13 +2747,14 @@ impl Http3ConnectionPool {
                     target.port,
                     target.policy_port,
                     &tls_config,
-                    Some(&h3_config),
+                    &h3_config,
                     connect_at,
                 )
             })
             .await
         };
-        self.create_or_get_sender(key, connect_at, create).await
+        self.create_or_get_sender(key, drain_epoch, connect_at, create)
+            .await
     }
 
     /// Recover from a create the destination's `maxConnections` ceiling refused
@@ -2515,10 +2815,15 @@ impl Http3ConnectionPool {
     /// the capability probe and must succeed; additional shards are best-effort
     /// so one slow parallel connection does not mark an H3-capable backend
     /// unsupported.
+    ///
+    /// The caller read `tls_config` before this call, so it also supplies
+    /// `drain_epoch`: the pool's drain epoch as it sampled it before that
+    /// read. The SVID generation is read below, after the sample.
     pub async fn warmup_connection(
         &self,
         proxy: &Proxy,
         tls_config: &Arc<rustls::ClientConfig>,
+        drain_epoch: u64,
     ) -> Result<(), anyhow::Error> {
         let conns_per_backend =
             Self::warmup_shard_indices(proxy, self.connections_per_backend).len();
@@ -2529,6 +2834,7 @@ impl Http3ConnectionPool {
             let _ = self
                 .create_or_get_probe_sender(
                     primary_key,
+                    drain_epoch,
                     proxy,
                     tls_config.clone(),
                     h3_config.clone(),
@@ -2551,7 +2857,7 @@ impl Http3ConnectionPool {
                     }
 
                     if let Err(err) = self
-                        .create_or_get_probe_sender(key, proxy, tls_config, h3_config)
+                        .create_or_get_probe_sender(key, drain_epoch, proxy, tls_config, h3_config)
                         .await
                     {
                         debug!(
@@ -2569,7 +2875,6 @@ impl Http3ConnectionPool {
     ///
     /// Round-robins across `connections_per_backend` connections to distribute
     /// QUIC frame processing across multiple driver tasks.
-    /// Send an HTTP/3 request, reusing a cached QUIC connection if available.
     ///
     /// The `tls_config_fn` closure is only called on cache miss (when a new
     /// QUIC connection must be established), avoiding the overhead of cloning
@@ -2607,6 +2912,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
 
         // Snapshot the SVID generation once at the top of the request so all
@@ -2739,7 +3046,7 @@ impl Http3ConnectionPool {
         // multiplexing. Only a cap refusal takes that path — see
         // `reuse_shard_after_max_connections`.
         let pooled = match self
-            .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
+            .create_or_get_proxy_sender(key, drain_epoch, proxy, tls_config, h3_config)
             .await
         {
             Ok(pooled) => pooled,
@@ -2800,6 +3107,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         // Snapshot the SVID generation once; see `request()` for rationale —
         // pinning across the cache probe + retry-shard fan-out prevents a
@@ -2891,6 +3200,7 @@ impl Http3ConnectionPool {
         let pooled = match self
             .create_or_get_target_sender(
                 key,
+                drain_epoch,
                 proxy,
                 H3ConnectionTarget {
                     host: target_host,
@@ -2944,7 +3254,7 @@ impl Http3ConnectionPool {
         &self,
         proxy: &Proxy,
         tls_config: &Arc<rustls::ClientConfig>,
-        h3_config: Option<&super::config::Http3ServerConfig>,
+        h3_config: &super::config::Http3ServerConfig,
         connect_at: Option<&OnceLock<tokio::time::Instant>>,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         let quic_client_config = QuicClientConfig::try_from(tls_config.clone()).map_err(|e| {
@@ -2954,14 +3264,11 @@ impl Http3ConnectionPool {
             )
         })?;
 
-        let default_cfg = super::config::Http3ServerConfig::default();
-        let cfg = h3_config.unwrap_or(&default_cfg);
-
         // Backend-plane QUIC transport tuning (issues #4755 and #4756): the
         // documented backend flow-control windows and the configured
         // `FERRUM_HTTP3_IDLE_TIMEOUT`, never the hardened frontend listener's
         // untrusted-client budgets and never quinn's 30 s idle default.
-        let transport_config = crate::http3::config::build_backend_transport_config(cfg)?;
+        let transport_config = crate::http3::config::build_backend_transport_config(h3_config)?;
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
@@ -3110,7 +3417,7 @@ impl Http3ConnectionPool {
         port: u16,
         policy_port: u16,
         tls_config: &Arc<rustls::ClientConfig>,
-        h3_config: Option<&super::config::Http3ServerConfig>,
+        h3_config: &super::config::Http3ServerConfig,
         connect_at: Option<&OnceLock<tokio::time::Instant>>,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         let quic_client_config = QuicClientConfig::try_from(tls_config.clone()).map_err(|e| {
@@ -3120,14 +3427,11 @@ impl Http3ConnectionPool {
             )
         })?;
 
-        let default_cfg = super::config::Http3ServerConfig::default();
-        let cfg = h3_config.unwrap_or(&default_cfg);
-
         // Backend-plane QUIC transport tuning (issues #4755 and #4756): the
         // documented backend flow-control windows and the configured
         // `FERRUM_HTTP3_IDLE_TIMEOUT`, never the hardened frontend listener's
         // untrusted-client budgets and never quinn's 30 s idle default.
-        let transport_config = crate::http3::config::build_backend_transport_config(cfg)?;
+        let transport_config = crate::http3::config::build_backend_transport_config(h3_config)?;
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
@@ -3289,7 +3593,6 @@ impl Http3ConnectionPool {
             .parse()
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
 
-        let _host = uri.host().unwrap_or(&proxy.backend_host);
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
         let req_method: http::Method = method.parse().map_err(|_| {
@@ -3315,6 +3618,7 @@ impl Http3ConnectionPool {
         let mut stream = send_request
             .send_request(req)
             .await
+            .map(|stream| H3BackendStream::new(stream, send_request.clone()))
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))?;
 
         let mut upload = H3UploadResetGuard::new(&mut stream);
@@ -3413,7 +3717,6 @@ impl Http3ConnectionPool {
             .parse()
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
 
-        let _host = uri.host().unwrap_or(&proxy.backend_host);
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
         let req_method: http::Method = method.parse().map_err(|_| {
@@ -3436,6 +3739,7 @@ impl Http3ConnectionPool {
             send_request
                 .send_request(req)
                 .await
+                .map(|stream| H3BackendStream::new(stream, send_request.clone()))
                 .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))
         })
         .await?;
@@ -3520,13 +3824,16 @@ impl Http3ConnectionPool {
         // timeout (a stalled client — neutral for backend health) from a header-wait
         // timeout (a slow backend — a real read-timeout fault).
         upload_complete: Arc<AtomicBool>,
+        // The route's configured credential header locations, removed from the
+        // client's request trailers after the static late-boundary filter
+        // (`RequestContext::request_trailer_credential_header_names`).
+        trailer_credential_header_names: &[String],
         auth: H3Authorization<'_>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let uri: http::Uri = backend_url
             .parse()
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
 
-        let _host = uri.host().unwrap_or(&proxy.backend_host);
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
         let req_method: http::Method = method.parse().map_err(|_| {
@@ -3539,6 +3846,7 @@ impl Http3ConnectionPool {
             send_request
                 .send_request(req)
                 .await
+                .map(|stream| H3BackendStream::new(stream, send_request.clone()))
                 .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))
         })
         .await?;
@@ -3559,13 +3867,16 @@ impl Http3ConnectionPool {
                 Ok(frontend_stream.recv_data().await)
             })
             .await?;
+            // Only a read failure the client caused (a reset or a lost
+            // connection) is a client abort; anything else is input the gateway
+            // refused (issue #6772), exactly as the buffered drains decide.
             let chunk_opt = match recv_res {
                 Ok(c) => c,
                 Err(e) => {
-                    return Err(H3PoolError::post_wire(anyhow::anyhow!(
-                        "client disconnected while sending request body: {}",
-                        e
-                    )));
+                    return Err(h3_client_upload_read_error(
+                        &e,
+                        H3ClientRequestFault::MalformedBody,
+                    ));
                 }
             };
             let Some(mut chunk) = chunk_opt else { break };
@@ -3573,9 +3884,7 @@ impl Http3ConnectionPool {
             if max_request_body_size > 0 {
                 total_sent += len;
                 if total_sent > max_request_body_size {
-                    return Err(H3PoolError::post_wire(anyhow::anyhow!(
-                        "Request body exceeds maximum size"
-                    )));
+                    return Err(h3_request_body_too_large_error());
                 }
             }
             if len == 0 {
@@ -3625,6 +3934,10 @@ impl Http3ConnectionPool {
                 // forwarding. HTTP/3 header names are always lowercase, so exact
                 // lowercase comparisons suffice.
                 sanitize_backend_request_trailers(&mut trailers);
+                crate::proxy::headers::strip_configured_credential_request_trailers(
+                    &mut trailers,
+                    trailer_credential_header_names,
+                );
                 // Only forward a still-non-empty block; an all-reserved trailer set
                 // collapses to nothing and must not emit an empty trailer frame.
                 if !trailers.is_empty() {
@@ -3638,17 +3951,11 @@ impl Http3ConnectionPool {
                 }
             }
             Ok(_) => {}
-            Err(e) if crate::http3::stream_util::h3_request_read_error_is_client_abort(&e) => {
-                return Err(H3PoolError::post_wire(anyhow::anyhow!(
-                    "client disconnected while sending request body: {}",
-                    e
-                )));
-            }
             Err(e) => {
-                return Err(H3PoolError::post_wire(anyhow::anyhow!(
-                    "malformed client request trailers: {}",
-                    e
-                )));
+                return Err(h3_client_upload_read_error(
+                    &e,
+                    H3ClientRequestFault::MalformedTrailers,
+                ));
             }
         }
         await_h3_write_under_authorization(
@@ -3691,7 +3998,6 @@ impl Http3ConnectionPool {
     #[allow(clippy::too_many_arguments)]
     async fn do_open_bidi_backend_stream(
         send_request: &mut H3SendRequest,
-        proxy: &Proxy,
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
@@ -3702,7 +4008,6 @@ impl Http3ConnectionPool {
             .parse()
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
 
-        let _host = uri.host().unwrap_or(&proxy.backend_host);
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
         let req_method: http::Method = method.parse().map_err(|_| {
@@ -3719,6 +4024,7 @@ impl Http3ConnectionPool {
             send_request
                 .send_request(req)
                 .await
+                .map(|stream| H3BackendStream::new(stream, send_request.clone()))
                 .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))
         })
         .await?;
@@ -3745,6 +4051,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = self.pool_key_with_current_generation(proxy, start);
 
@@ -3752,7 +4060,6 @@ impl Http3ConnectionPool {
             let mut sr = pooled.send_request;
             match Self::do_open_bidi_backend_stream(
                 &mut sr,
-                proxy,
                 method,
                 backend_url,
                 headers,
@@ -3792,6 +4099,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_proxy_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             tls_config,
             h3_config,
@@ -3817,7 +4125,6 @@ impl Http3ConnectionPool {
         let mut sr_for_request = pooled.send_request;
         Self::do_open_bidi_backend_stream(
             &mut sr_for_request,
-            proxy,
             method,
             backend_url,
             headers,
@@ -3854,6 +4161,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = self.pool_key_for_target_with_current_generation(
             proxy,
@@ -3866,7 +4175,6 @@ impl Http3ConnectionPool {
             let mut sr = pooled.send_request;
             match Self::do_open_bidi_backend_stream(
                 &mut sr,
-                proxy,
                 method,
                 backend_url,
                 headers,
@@ -3899,6 +4207,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_target_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             H3ConnectionTarget {
                 host: target_host,
@@ -3936,7 +4245,6 @@ impl Http3ConnectionPool {
         let mut sr_for_request = pooled.send_request;
         Self::do_open_bidi_backend_stream(
             &mut sr_for_request,
-            proxy,
             method,
             backend_url,
             headers,
@@ -3980,7 +4288,6 @@ impl Http3ConnectionPool {
     ) -> Result<H3StreamingResponse, (H3PoolError, Option<Incoming>)> {
         let backend_stream = match Self::open_streaming_incoming_backend_stream(
             send_request,
-            proxy,
             method,
             backend_url,
             headers,
@@ -4014,7 +4321,6 @@ impl Http3ConnectionPool {
     /// fails.
     async fn open_streaming_incoming_backend_stream(
         send_request: &mut H3SendRequest,
-        proxy: &Proxy,
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
@@ -4024,7 +4330,6 @@ impl Http3ConnectionPool {
             .parse()
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
 
-        let _host = uri.host().unwrap_or(&proxy.backend_host);
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
         let req_method: http::Method = method.parse().map_err(|_| {
@@ -4047,6 +4352,7 @@ impl Http3ConnectionPool {
             send_request
                 .send_request(req)
                 .await
+                .map(|stream| H3BackendStream::new(stream, send_request.clone()))
                 .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))
         })
         .await
@@ -4080,12 +4386,7 @@ impl Http3ConnectionPool {
         while let Some(frame_result) =
             await_h3_dispatch(auth, true, None, async { Ok(frontend_body.frame().await) }).await?
         {
-            let frame = frame_result.map_err(|e| {
-                H3PoolError::post_wire(anyhow::anyhow!(
-                    "Client disconnected while sending request body: {}",
-                    e
-                ))
-            })?;
+            let frame = frame_result.map_err(|e| h1h2_client_upload_read_error(&e))?;
             let Ok(mut chunk) = frame.into_data() else {
                 continue;
             };
@@ -4093,9 +4394,7 @@ impl Http3ConnectionPool {
             if max_request_body_size > 0 {
                 total_sent += len;
                 if total_sent > max_request_body_size {
-                    return Err(H3PoolError::post_wire(anyhow::anyhow!(
-                        "Request body exceeds maximum size"
-                    )));
+                    return Err(h3_request_body_too_large_error());
                 }
             }
             if len == 0 {
@@ -4116,9 +4415,15 @@ impl Http3ConnectionPool {
             bytes_seen.fetch_add(len as u64, Ordering::Release);
         }
         if require_h2_end_stream && !hyper::body::Body::is_end_stream(&frontend_body) {
-            return Err(H3PoolError::post_wire(anyhow::anyhow!(
-                "Client disconnected while sending request body: HTTP/2 stream reset before END_STREAM"
-            )));
+            // A reset hyper reported as a clean end carries no proof the
+            // client left (issue #6776): an incomplete upload, `400`, never a
+            // client-closed request.
+            return Err(H3PoolError::client_request(
+                H3ClientRequestFault::MalformedBody,
+                anyhow::anyhow!(
+                    "incomplete client request body: HTTP/2 stream ended before END_STREAM"
+                ),
+            ));
         }
         await_h3_write_under_authorization(
             auth,
@@ -4181,6 +4486,9 @@ impl Http3ConnectionPool {
         // stream is FINished; lets the dispatch separate an upload-phase stall (client
         // fault) from a header-wait timeout (backend fault). Forwarded verbatim.
         upload_complete: Arc<AtomicBool>,
+        // Route-configured credential header locations stripped from request
+        // trailers. Forwarded verbatim to `do_request_streaming_body`.
+        trailer_credential_header_names: &[String],
         auth: H3Authorization<'_>,
         tls_config_fn: impl FnOnce() -> TlsFut,
     ) -> H3PoolResult<H3StreamingResponse>
@@ -4191,6 +4499,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
 
         // No thread-local fast path for streaming body. A post-wire failure may
@@ -4214,6 +4524,7 @@ impl Http3ConnectionPool {
                 header_read_timeout_ms,
                 Arc::clone(&stream_opened),
                 Arc::clone(&upload_complete),
+                trailer_credential_header_names,
                 auth,
             )
             .await
@@ -4251,6 +4562,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_proxy_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             tls_config,
             h3_config,
@@ -4288,6 +4600,7 @@ impl Http3ConnectionPool {
             header_read_timeout_ms,
             stream_opened,
             upload_complete,
+            trailer_credential_header_names,
             auth,
         )
         .await
@@ -4298,40 +4611,6 @@ impl Http3ConnectionPool {
     /// response body.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn request_streaming_incoming_body_under_authorization<TlsFut>(
-        &self,
-        proxy: &Proxy,
-        method: &str,
-        backend_url: &str,
-        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
-        frontend_body: Incoming,
-        require_h2_end_stream: bool,
-        max_request_body_size: usize,
-        bytes_seen: Arc<AtomicU64>,
-        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
-        auth: H3Authorization<'_>,
-        tls_config_fn: impl FnOnce() -> TlsFut,
-    ) -> H3PoolResult<H3StreamingResponse>
-    where
-        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
-    {
-        self.request_streaming_incoming_body_inner(
-            proxy,
-            method,
-            backend_url,
-            headers,
-            frontend_body,
-            require_h2_end_stream,
-            max_request_body_size,
-            bytes_seen,
-            grpc_messages,
-            auth,
-            tls_config_fn,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn request_streaming_incoming_body_inner<TlsFut>(
         &self,
         proxy: &Proxy,
         method: &str,
@@ -4352,6 +4631,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = self.pool_key_with_current_generation(proxy, start);
 
@@ -4406,6 +4687,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_proxy_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             tls_config,
             h3_config,
@@ -4484,6 +4766,9 @@ impl Http3ConnectionPool {
         // stream is FINished; lets the dispatch separate an upload-phase stall (client
         // fault) from a header-wait timeout (backend fault). Forwarded verbatim.
         upload_complete: Arc<AtomicBool>,
+        // Route-configured credential header locations stripped from request
+        // trailers. Forwarded verbatim to `do_request_streaming_body`.
+        trailer_credential_header_names: &[String],
         auth: H3Authorization<'_>,
         tls_config_fn: impl FnOnce() -> TlsFut,
     ) -> H3PoolResult<H3StreamingResponse>
@@ -4494,6 +4779,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = self.pool_key_for_target_with_current_generation(
             proxy,
@@ -4517,6 +4804,7 @@ impl Http3ConnectionPool {
                 header_read_timeout_ms,
                 Arc::clone(&stream_opened),
                 Arc::clone(&upload_complete),
+                trailer_credential_header_names,
                 auth,
             )
             .await
@@ -4551,6 +4839,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_target_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             H3ConnectionTarget {
                 host: target_host,
@@ -4600,6 +4889,7 @@ impl Http3ConnectionPool {
             header_read_timeout_ms,
             stream_opened,
             upload_complete,
+            trailer_credential_header_names,
             auth,
         )
         .await
@@ -4609,51 +4899,6 @@ impl Http3ConnectionPool {
     /// explicit host/port target.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn request_with_target_streaming_incoming_body_under_authorization<TlsFut>(
-        &self,
-        proxy: &Proxy,
-        target_host: &str,
-        target_port: u16,
-        // DestinationRule policy port for this dispatch — the selected target's
-        // `dispatch_policy_port()` via `crate::proxy::dispatch_policy_port_for_target`.
-        // Equals `target_port` unless a `targetPort` remap applies. Used ONLY
-        // for `connectionPool.tcp.maxConnections` admission; the dial address,
-        // TLS/SNI and the pool key all stay on `target_host:target_port`.
-        target_policy_port: u16,
-        method: &str,
-        backend_url: &str,
-        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
-        frontend_body: Incoming,
-        require_h2_end_stream: bool,
-        max_request_body_size: usize,
-        bytes_seen: Arc<AtomicU64>,
-        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
-        auth: H3Authorization<'_>,
-        tls_config_fn: impl FnOnce() -> TlsFut,
-    ) -> H3PoolResult<H3StreamingResponse>
-    where
-        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
-    {
-        self.request_with_target_streaming_incoming_body_inner(
-            proxy,
-            target_host,
-            target_port,
-            target_policy_port,
-            method,
-            backend_url,
-            headers,
-            frontend_body,
-            require_h2_end_stream,
-            max_request_body_size,
-            bytes_seen,
-            grpc_messages,
-            auth,
-            tls_config_fn,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn request_with_target_streaming_incoming_body_inner<TlsFut>(
         &self,
         proxy: &Proxy,
         target_host: &str,
@@ -4682,6 +4927,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = self.pool_key_for_target_with_current_generation(
             proxy,
@@ -4740,6 +4987,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_target_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             H3ConnectionTarget {
                 host: target_host,
@@ -4794,35 +5042,10 @@ impl Http3ConnectionPool {
     }
 
     /// Send an HTTP/3 request, returning headers and a stream handle for the
-    /// response body. Same pool key / fallback / reconnect logic as `request()`.
+    /// response body. Same pool key / fallback / reconnect logic as the
+    /// buffered `request()` path.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn request_streaming_under_authorization<TlsFut>(
-        &self,
-        proxy: &Proxy,
-        method: &str,
-        backend_url: &str,
-        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
-        body: bytes::Bytes,
-        auth: H3Authorization<'_>,
-        tls_config_fn: impl FnOnce() -> TlsFut,
-    ) -> H3PoolResult<H3StreamingResponse>
-    where
-        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
-    {
-        self.request_streaming_inner(
-            proxy,
-            method,
-            backend_url,
-            headers,
-            body,
-            auth,
-            tls_config_fn,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn request_streaming_inner<TlsFut>(
         &self,
         proxy: &Proxy,
         method: &str,
@@ -4839,6 +5062,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
 
         // Snapshot the SVID generation once for the whole request. See
@@ -4955,6 +5180,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_proxy_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             tls_config,
             h3_config,
@@ -5015,47 +5241,12 @@ impl Http3ConnectionPool {
     where
         TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
     {
-        self.request_with_target_streaming_inner(
-            proxy,
-            target_host,
-            target_port,
-            target_policy_port,
-            method,
-            backend_url,
-            headers,
-            body,
-            auth,
-            tls_config_fn,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn request_with_target_streaming_inner<TlsFut>(
-        &self,
-        proxy: &Proxy,
-        target_host: &str,
-        target_port: u16,
-        // DestinationRule policy port for this dispatch — the selected target's
-        // `dispatch_policy_port()` via `crate::proxy::dispatch_policy_port_for_target`.
-        // Equals `target_port` unless a `targetPort` remap applies. Used ONLY
-        // for `connectionPool.tcp.maxConnections` admission; the dial address,
-        // TLS/SNI and the pool key all stay on `target_host:target_port`.
-        target_policy_port: u16,
-        method: &str,
-        backend_url: &str,
-        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
-        body: bytes::Bytes,
-        auth: H3Authorization<'_>,
-        tls_config_fn: impl FnOnce() -> TlsFut,
-    ) -> H3PoolResult<H3StreamingResponse>
-    where
-        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
-    {
         let conns_per_backend = proxy
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         // Pin the SVID generation across cache probe + retry shards. See
         // `request()` for the rationale.
@@ -5142,6 +5333,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_target_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             H3ConnectionTarget {
                 host: target_host,
@@ -5221,7 +5413,7 @@ impl Http3ConnectionPool {
 
         [
             measure(|pool, proxy, tls, _, auth, _| {
-                pool.request_streaming_inner(
+                pool.request_streaming_under_authorization(
                     proxy,
                     "POST",
                     "https://127.0.0.1/",
@@ -5232,7 +5424,7 @@ impl Http3ConnectionPool {
                 )
             }),
             measure(|pool, proxy, tls, _, auth, _| {
-                pool.request_with_target_streaming_inner(
+                pool.request_with_target_streaming_under_authorization(
                     proxy,
                     &proxy.backend_host,
                     proxy.backend_port,
@@ -5248,6 +5440,7 @@ impl Http3ConnectionPool {
             measure(|pool, proxy, tls, cfg, _, at| {
                 pool.create_or_get_proxy_sender_with_connect_deadline(
                     String::new(),
+                    0,
                     proxy,
                     tls.clone(),
                     cfg.clone(),
@@ -5257,6 +5450,7 @@ impl Http3ConnectionPool {
             measure(|pool, proxy, tls, cfg, _, at| {
                 pool.create_or_get_target_sender_with_connect_deadline(
                     String::new(),
+                    0,
                     proxy,
                     H3ConnectionTarget {
                         host: &proxy.backend_host,
@@ -5269,7 +5463,7 @@ impl Http3ConnectionPool {
                 )
             }),
             measure(|pool, proxy, tls, cfg, _, at| {
-                pool.create_connection(proxy, tls, Some(cfg), Some(at))
+                pool.create_connection(proxy, tls, cfg, Some(at))
             }),
             measure(|pool, proxy, tls, cfg, _, at| {
                 pool.create_connection_to_target(
@@ -5278,7 +5472,7 @@ impl Http3ConnectionPool {
                     proxy.backend_port,
                     proxy.backend_port,
                     tls,
-                    Some(cfg),
+                    cfg,
                     Some(at),
                 )
             }),
@@ -5436,7 +5630,8 @@ impl Http3Client {
         let req = req_builder.body(())?;
 
         // Send request
-        let mut stream = send_request.send_request(req).await?;
+        let mut stream =
+            H3BackendStream::new(send_request.send_request(req).await?, send_request.clone());
 
         // Send the body in bounded slices, each under its own write watermark.
         //
@@ -5665,33 +5860,29 @@ mod h3_pool_error_tests {
     }
 
     #[test]
+    fn an_oversized_upload_is_a_typed_post_wire_client_fault() {
+        // Issue #7187: consumers key the 413 on the typed fault, never the text.
+        let e = h3_request_body_too_large_error();
+        assert_eq!(
+            e.client_request_fault(),
+            Some(H3ClientRequestFault::BodyTooLarge)
+        );
+        assert!(e.request_on_wire());
+        assert!(!e.connection_error());
+        assert_eq!(e.proven_client_abort(), None);
+        assert_eq!(e.to_string(), "Request body exceeds maximum size");
+        let text_only =
+            H3PoolError::post_wire(anyhow::anyhow!("Request body exceeds maximum size"));
+        assert_eq!(text_only.client_request_fault(), None);
+    }
+
+    #[test]
     fn post_wire_marks_request_committed() {
         let e = H3PoolError::post_wire(anyhow::anyhow!("send_data failed"));
         assert!(
             e.request_on_wire(),
             "post_wire constructor must report request_on_wire=true"
         );
-    }
-
-    #[test]
-    fn promote_on_wire_if_only_promotes_false_to_true() {
-        // The pool's retry chain calls `e.promote_on_wire_if(any_request_on_wire)`
-        // on each fresh-connect setup `?` exit. The contract is asymmetric:
-        // `condition=true` flips false → true; `condition=false` is a no-op.
-        let pre = H3PoolError::pre_wire(anyhow::anyhow!("connect refused"));
-        let promoted = pre.promote_on_wire_if(true);
-        assert!(promoted.request_on_wire());
-
-        // `condition=false` must NOT demote an already-true flag — that's
-        // exactly the case where an earlier post-wire attempt set the
-        // flag and a later pre-wire setup failure would otherwise clobber
-        // it. Verify both directions: `true → true` is idempotent and
-        // `false on an already-true` is a no-op.
-        let post = H3PoolError::post_wire(anyhow::anyhow!("recv_response failed"));
-        assert!(post.promote_on_wire_if(false).request_on_wire());
-
-        let post = H3PoolError::post_wire(anyhow::anyhow!("recv_response failed"));
-        assert!(post.promote_on_wire_if(true).request_on_wire());
     }
 
     #[test]
@@ -5802,71 +5993,6 @@ mod h3_pool_error_tests {
         );
     }
 
-    /// Codex P1 regression: when an earlier internal attempt set
-    /// `any_request_on_wire = true` (post-wire) and then `tls_config_fn()`
-    /// or `create_or_get_proxy_sender()` fails on the fresh-connect
-    /// fallback, the pool MUST promote the sticky flag onto the resulting
-    /// `H3PoolError::pre_wire`. Without that promotion, the gateway sees
-    /// `request_on_wire=false`, treats the call as pre-wire, and replays
-    /// a non-idempotent request via `retry_on_connect_failure` even
-    /// though the FIRST internal attempt may already have been processed
-    /// by the backend.
-    ///
-    /// **Coverage scope.** This test is unit-level and only verifies the
-    /// closure shape — `H3PoolError::pre_wire(e).promote_on_wire_if(true)`
-    /// returns `request_on_wire=true`. It does NOT exercise the live
-    /// `Http3ConnectionPool::request*` retry chain (cached attempt's
-    /// post-wire failure → fresh-connect setup failure) end-to-end,
-    /// because doing that requires a scripted QUIC backend that:
-    /// (a) accepts the QUIC handshake, (b) accepts the stream open, (c)
-    /// fails the body / response so the cached attempt is post-wire,
-    /// then (d) refuses subsequent connect attempts so the fresh-connect
-    /// setup also fails. The functional test
-    /// `retry_on_connect_failure_fires_with_empty_methods_and_statuses`
-    /// covers the gateway-level retry contract end-to-end via ECONNREFUSED
-    /// but does not tickle this specific cached-success → fresh-connect
-    /// setup-failure ordering. Tracked as a follow-up coverage gap; the
-    /// closure-shape assertion below is the regression guard for the
-    /// fix that this PR introduces.
-    #[test]
-    fn pre_wire_setup_failure_after_post_wire_attempt_preserves_sticky_flag() {
-        // Simulate: any_request_on_wire = true (an earlier internal attempt
-        // sent the request body). Now tls_config_fn() fails.
-        let any_request_on_wire = true;
-        let synthetic_setup_failure = anyhow::anyhow!("synthetic tls_config_fn() failure");
-
-        let propagated: H3PoolError =
-            H3PoolError::pre_wire(synthetic_setup_failure).promote_on_wire_if(any_request_on_wire);
-
-        assert!(
-            propagated.request_on_wire(),
-            "TLS / sender-creation failure path must propagate sticky \
-             request_on_wire=true so the gateway respects retry_on_methods \
-             instead of replaying via retry_on_connect_failure. If this \
-             assertion fails, a future refactor likely reverted to the \
-             bare `map_err(pre_wire)?` shape — restore the closure form: \
-             `|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire)`"
-        );
-    }
-
-    #[test]
-    fn pre_wire_setup_failure_with_no_prior_post_wire_attempt_stays_pre_wire() {
-        // Counterpart: if NO earlier internal attempt sent the body
-        // (any_request_on_wire = false), the same closure must NOT
-        // mistakenly mark the error as post-wire.
-        let any_request_on_wire = false;
-        let synthetic_setup_failure = anyhow::anyhow!("synthetic tls_config_fn() failure");
-
-        let propagated: H3PoolError =
-            H3PoolError::pre_wire(synthetic_setup_failure).promote_on_wire_if(any_request_on_wire);
-
-        assert!(
-            !propagated.request_on_wire(),
-            "Setup failure with no prior post-wire attempt must remain \
-             request_on_wire=false so retry_on_connect_failure can fire"
-        );
-    }
-
     #[test]
     fn graceful_close_constructor_marks_post_wire_and_graceful() {
         // The graceful-close constructor is used at the four `recv_response`
@@ -5901,29 +6027,6 @@ mod h3_pool_error_tests {
 
         let post = H3PoolError::post_wire(anyhow::anyhow!("send_data failed"));
         assert!(!post.is_graceful_close());
-    }
-
-    #[test]
-    fn promote_on_wire_if_preserves_graceful_close_flag() {
-        // The pool's internal retry chain pipes errors through
-        // `.promote_on_wire_if(any_request_on_wire)` on every fresh-connect
-        // setup `?` exit. That helper only modifies `request_on_wire` —
-        // a graceful-close error that flows through the chain MUST keep
-        // `is_graceful_close()=true` so the gateway suppression still fires.
-        let e = H3PoolError::graceful_close(anyhow::anyhow!(
-            "recv_response after graceful remote close"
-        ));
-        let promoted_true = e.promote_on_wire_if(true);
-        assert!(promoted_true.is_graceful_close());
-        assert!(promoted_true.request_on_wire());
-
-        let e = H3PoolError::graceful_close(anyhow::anyhow!(
-            "recv_response after graceful remote close"
-        ));
-        let promoted_false = e.promote_on_wire_if(false);
-        assert!(promoted_false.is_graceful_close());
-        // request_on_wire stays true (graceful_close constructor sets it true)
-        assert!(promoted_false.request_on_wire());
     }
 }
 
@@ -5975,7 +6078,7 @@ mod h3_pool_health_tests {
 
     fn install_provider() {
         // rustls 0.23 requires a process-wide crypto provider before any
-        // `ClientConfig::builder()` / `ServerConfig::builder()` call. The
+        // provider-less `ClientConfig` / `ServerConfig` builder call. The
         // "ring" provider is installed wholesale by the gateway main; in
         // unit tests several test mods may race to install — `_ = ...`
         // ignores the "already installed" return.
@@ -6009,11 +6112,14 @@ mod h3_pool_health_tests {
     fn make_server_endpoint(addr: SocketAddr) -> Endpoint {
         let (cert, key) = issue_cert();
 
-        let mut server_crypto =
-            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .with_no_client_auth()
-                .with_single_cert(vec![cert], key)
-                .expect("server config");
+        let mut server_crypto = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            crate::fips::base_crypto_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 is supported")
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("server config");
         server_crypto.alpn_protocols = vec![b"h3".to_vec()];
 
         let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
@@ -6079,11 +6185,14 @@ mod h3_pool_health_tests {
             }
         }
 
-        let mut client_crypto =
-            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(AcceptAny))
-                .with_no_client_auth();
+        let mut client_crypto = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            crate::fips::base_crypto_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 is supported")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAny))
+        .with_no_client_auth();
         client_crypto.alpn_protocols = vec![b"h3".to_vec()];
 
         let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)

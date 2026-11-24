@@ -22,6 +22,10 @@
 #   --wallclock-budget-seconds N (per invocation, default 4200)
 #   --experiment-manifest PATH (explicit opt-in; default remains experiment.json)
 #   --no-process-usage          (diagnostic only; paired comparisons invalid)
+#   --settle | --no-settle      (first-start settle before pair 1; default on for the
+#                                comparison lanes, off for profile/trace/observation lanes)
+#   --host-flags | --no-host-flags (record host CPU beside each sample and flag the
+#                                samples a host disturbance touched; same default)
 #   --pool-profile calibration|profile (separate fixed-window H2/gRPC lane)
 #   --h1-profile calibration|cutoff|diagnostic (separate manual H1 lane; see docs/h1_internal_profile.md)
 #   --h2-window default|64k     (http2/grpcs only; default $BENCH_H2_WINDOW or `default`)
@@ -34,6 +38,22 @@
 # (#6038). Connection windows and competitor gateways keep their settings.
 # `--grpc-client-connections per-rpc` makes the gRPC client open and close one
 # connection per call (#6022 item 6). Both are recorded in manifest.json.
+#
+# First-start settle: on GitHub-hosted runners the provisioner's job daemon uses
+# about one core for 4-5 s the first time a new binary or container image runs
+# in a job, 2-12 s after that start. Measured cells in that window lost 20-25%
+# of their CPU, always for the arms that ran an image first in pair 1. Before the
+# first measured pair the runner therefore starts every distinct binary/image
+# once, drives a discarded load, and waits (host_settle.py) until the host
+# is quiet. What each hold saw is recorded in host_settle.json. Best effort: an
+# arm that cannot start or be held is skipped and the run continues.
+#
+# Host-disturbance flags: a shared runner takes CPU for its own housekeeping
+# and sometimes does less work per CPU-second. The sampler records host CPU
+# beside each sample (process_usage.py --host-cpu) and, after the last pair,
+# host_disturbance.py marks the samples and paired comparisons such a
+# disturbance touched and prints them. Flagging only: nothing measured changes
+# and no sample is dropped.
 #
 # All gateways (including Ferrum) run in Docker with --network host so no gateway
 # has a native-binary advantage. proto_backend and proto_bench run natively
@@ -81,6 +101,11 @@ PAIRS=2
 ADAPTIVE=false
 WALLCLOCK_BUDGET=4200
 PROCESS_USAGE=true
+# auto = on for the plain comparison lane, off for profile/trace/observation lanes.
+SETTLE=auto
+# auto = the same lanes: profile, trace and observation lanes keep their own
+# fixed sampler arguments and manifest.
+HOST_FLAGS=auto
 BASELINE_IMAGE="${FERRUM_BASELINE_IMAGE:-}"
 PAIR=0
 ORDER_POSITION=0
@@ -96,7 +121,6 @@ h1_trace_pid=""
 h1_trace_output=""
 POOL_PROFILE=""
 UDP_PROFILE=""
-H2_GUARD_OBSERVE=0
 # Workflow-level dispatch inputs arrive as environment because the hosted
 # benchmark job that invokes this runner is frozen (see the workflow header).
 H2_WINDOW="${BENCH_H2_WINDOW:-default}"
@@ -117,6 +141,10 @@ while [[ $# -gt 0 ]]; do
         --adaptive) ADAPTIVE=true; shift ;;
         --wallclock-budget-seconds) WALLCLOCK_BUDGET="$2"; shift 2 ;;
         --no-process-usage) PROCESS_USAGE=false; shift ;;
+        --settle) SETTLE=true; shift ;;
+        --no-settle) SETTLE=false; shift ;;
+        --host-flags) HOST_FLAGS=true; shift ;;
+        --no-host-flags) HOST_FLAGS=false; shift ;;
         --h1-profile) H1_PROFILE="$2"; shift 2 ;;
         --h2-profile) H2_CPU_PROFILE="$2"; shift 2 ;;
         --profile-builds) H1_TRACE_BUILDS="$2"; shift 2 ;;
@@ -375,6 +403,10 @@ KRAKEND_IMAGE="krakend:2.13.11"
 BACKEND_PID=""
 REDIS_CID=""
 GATEWAY_CID=""
+# First-start settle: the subshell holding one arm's discarded start, and how
+# the last one ended.
+SETTLE_PID=""
+SETTLE_STATUS=0
 sampler_pid=""
 sampler_stop_file=""
 CERT_DIR="$SCRIPT_DIR/certs"
@@ -439,6 +471,12 @@ check_ports_available() {
 
 cleanup() {
     echo "[cleanup] stopping processes this run started..."
+    if [ -n "$SETTLE_PID" ]; then
+        # A settle subshell owns everything it started: ask it to take that
+        # down and wait until it has.
+        kill -TERM "$SETTLE_PID" 2>/dev/null || true
+        wait "$SETTLE_PID" 2>/dev/null || true
+    fi
     if [ -n "$sampler_pid" ]; then
         if [ -n "$sampler_stop_file" ]; then
             touch "$sampler_stop_file"
@@ -1245,6 +1283,9 @@ run_bench() {
         sampler_args+=(--http3)
         case "$gateway" in envoy|envoy-limit-4) sampler_args+=(--envoy) ;; esac
     fi
+    if [ "$HOST_FLAGS" = true ]; then
+        sampler_args+=(--host-cpu)
+    fi
     if [ "$PROCESS_USAGE" = true ]; then
         : > "$usage"
         # /proc/<container-pid>/io requires ptrace read permission across UIDs.
@@ -1296,16 +1337,6 @@ run_bench() {
     else
         echo '{"available":false,"error":"process usage unavailable or disabled"}' > "$usage"
     fi
-    if [ "$H2_GUARD_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
-        mkdir -p "$OUTPUT_DIR/diagnostics"
-        python3 "$SCRIPT_DIR/h2_guard_snapshot.py" \
-            "$OUTPUT_DIR/diagnostics/${gateway}_${payload}_guard_before.json" \
-            --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID"
-    fi
-    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
-        python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
-            --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation start
-    fi
     # Backend connection/echo counters around the client, H2 family only
     # (#6022 item 6). Best effort: a missing snapshot marks the stamp unavailable.
     local backend_stats_before="$diagnostics/${gateway}_${payload}_backend_stats_before.json"
@@ -1343,10 +1374,6 @@ run_bench() {
             --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" \
             || rc=$?
     fi
-    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
-        python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
-            --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation end --exit-code "$rc"
-    fi
     if [ "$PROTOCOL" = http2 ] || [ "$PROTOCOL" = grpcs ]; then
         curl -sf --max-time 5 http://127.0.0.1:3010/bench-stats \
             > "$backend_stats_after" 2>/dev/null || true
@@ -1373,10 +1400,6 @@ run_bench() {
         cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
     fi
     if [ "$target" = "gateway" ] && [ -n "$GATEWAY_CID" ]; then
-        if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
-            python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_guard_after.json" \
-                --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID"
-        fi
         docker logs --timestamps "$GATEWAY_CID" > "$diagnostics/${gateway}_${payload}.log" 2>&1 || true
         if [[ "$gateway" == envoy* ]]; then
             curl --max-time 5 -fsS 'http://127.0.0.1:15000/stats?format=json' \
@@ -1413,10 +1436,6 @@ run_bench() {
         python3 "$SCRIPT_DIR/h2_diagnostics.py" "$out" "$usage" \
             "$diagnostics/${gateway}_${payload}_backend.log"
     fi
-    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
-        python3 "$SCRIPT_DIR/h2_guard_observation.py" "$out" "$usage" \
-            "$diagnostics/${gateway}_${payload}.log"
-    fi
     local rps
     rps=$(python3 -c "import json; print(f\"{json.load(open('$out'))['rps']:,.0f}\")" 2>/dev/null || echo "?")
     echo "[bench]   → RPS=$rps"
@@ -1440,6 +1459,185 @@ run_bench() {
         python3 "$SCRIPT_DIR/h1_trace.py" request-teardown --output "$h1_trace_output" \
             || echo '[trace] teardown not verified; capture remains incomplete' >&2
     fi
+}
+
+# ── First-start settle ──────────────────────────────────────────────────────
+# Seconds of discarded load per first start. In measured cells, under
+# continuous load, the host's reaction began 2-12 s after an arm's first start
+# and had run its course within about 20 s. With only a short load it had
+# sometimes not begun by the time the arm was released (3 of 14 starts in one
+# run) and landed in pair 1 after all. The arm therefore carries traffic, as
+# it will in the measured cells, for that whole window.
+SETTLE_LOAD_SECONDS=20
+
+# Discarded client run against the arm that is currently up. Uses run_bench's
+# target and its workload flags for the comparison lanes, records nothing and
+# never fails the run.
+settle_load() {
+    local target="$1"  # "gateway" or "direct"
+    local params
+    params=($(bench_params))
+    local bench_proto="${params[0]}"
+    local bench_target="${params[1]}"
+    if [ "$target" = direct ]; then bench_target="${params[2]}"; fi
+    local extra_args=("${params[@]:3}")
+    if [ "$H2_WINDOW" != default ]; then
+        extra_args+=(--h2-stream-window "$H2_STREAM_WINDOW")
+    fi
+    if [ "$GRPC_CLIENT_CONNECTIONS" = per-rpc ]; then
+        extra_args+=(--connection-per-request)
+    fi
+    local settle_payload="${PAYLOAD_SIZES%% *}"
+    local settle_concurrency
+    settle_concurrency=$(scale_concurrency_for_payload "$settle_payload" "$CONCURRENCY")
+    local settle_cmd=("$SCRIPT_DIR/target/release/proto_bench" "$bench_proto"
+        --target "$bench_target" --duration "$SETTLE_LOAD_SECONDS"
+        --concurrency "$settle_concurrency" --payload-size "$settle_payload"
+        --json "${extra_args[@]}")
+    if [ -n "$TIMEOUT_CMD" ]; then
+        $TIMEOUT_CMD 90s "${settle_cmd[@]}" >/dev/null 2>&1 || true
+    else
+        "${settle_cmd[@]}" >/dev/null 2>&1 || true
+    fi
+}
+
+# What the host would recognise as "already seen": the image ID for a
+# container arm, the built binaries for direct. Empty when it cannot be told.
+settle_identity() {
+    if [ "$1" = direct ]; then
+        cksum "$SCRIPT_DIR/target/release/proto_backend" \
+            "$SCRIPT_DIR/target/release/proto_bench" 2>/dev/null | cksum | tr -d ' \n' || true
+    else
+        docker image inspect "$2" --format '{{.Id}}' 2>/dev/null || true
+    fi
+}
+
+# Everything one settle subshell started, taken down however the subshell ends.
+settle_teardown() {
+    trap - EXIT
+    trap '' TERM INT HUP
+    if [ -n "$SETTLE_HELPER_PID" ]; then
+        kill "$SETTLE_HELPER_PID" 2>/dev/null || true
+    fi
+    stop_gateway
+    stop_pid "$BACKEND_PID"
+    if [ -n "$SETTLE_SCRATCH" ]; then rm -rf "$SETTLE_SCRATCH"; fi
+}
+
+# One arm's discarded first start: bring it up, drive the discarded load, hold
+# until the host is quiet, take it down. Sets SETTLE_STATUS and never fails.
+#
+# It runs in a subshell of its own because a settle must cost the run nothing:
+# - start_backend and start_redis report a start that fails by ending the
+#   shell, which here ends only the subshell;
+# - the subshell removes what it started on every way out, a signal included
+#   (cleanup() signals it through SETTLE_PID);
+# - no shell state a start function sets reaches the measured pairs, and
+#   OUTPUT_DIR points at a scratch directory, so nothing a start function
+#   writes lands in the results.
+# The start uses the arm's image with default arguments (Envoy with stream
+# limit 100, ferrum without an experiment arm's environment): the host reacts
+# to an image's first start, not to a container's arguments.
+settle_arm() {
+    local gw="$1"
+    local image="$2"
+    local record="$3"
+    SETTLE_STATUS=0
+    (
+        BACKEND_PID=""
+        GATEWAY_CID=""
+        REDIS_CID=""
+        SETTLE_HELPER_PID=""
+        SETTLE_SCRATCH=""
+        trap 'exit 143' TERM INT HUP
+        trap settle_teardown EXIT
+        SETTLE_SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/ferrum-bench-settle.XXXXXX") || exit 1
+        OUTPUT_DIR="$SETTLE_SCRATCH"
+        # Per-process CPU before anything of this arm exists, so the record
+        # can show what the host's own processes used during the load too.
+        python3 "$SCRIPT_DIR/host_settle.py" snapshot \
+            --output "$SETTLE_SCRATCH/before_start.json" || true
+        start_backend || exit 1
+        case "$gw" in
+            direct) ;;
+            ferrum|ferrum-exp-*) start_ferrum ;;
+            ferrum-baseline) FERRUM_IMAGE="$BASELINE_IMAGE" start_ferrum ;;
+            envoy|envoy-limit-4) ENVOY_STREAM_LIMIT=100 start_envoy ;;
+            kong) start_kong ;;
+            tyk) start_tyk ;;
+            krakend) start_krakend ;;
+        esac || exit 1
+        # The hold is timed from here, with every process of the arm up: an
+        # image pull or a slow start must not use up the minimum hold.
+        local since
+        since=$(python3 -c 'import time; print(f"{time.time():.3f}")') || exit 1
+        if [ "$gw" = direct ]; then settle_load direct; else settle_load gateway; fi
+        # In the background so a signal ends the hold at once: bash runs a
+        # trap only after a foreground command returns.
+        python3 "$SCRIPT_DIR/host_settle.py" wait --arm "$gw" --image "$image" \
+            --since "$since" --baseline "$SETTLE_SCRATCH/before_start.json" \
+            --output "$record" &
+        SETTLE_HELPER_PID=$!
+        wait "$SETTLE_HELPER_PID" || exit $?
+        SETTLE_HELPER_PID=""
+    ) &
+    SETTLE_PID=$!
+    wait "$SETTLE_PID" || SETTLE_STATUS=$?
+    SETTLE_PID=""
+}
+
+# Start every distinct binary/image once, before any measured pair, and hold
+# until the host is quiet. Arms that share an image (ferrum and ferrum-exp-*,
+# envoy and envoy-limit-4) settle once: the host reacts to the image, not to
+# the container. An image already settled on this host since boot (an earlier
+# invocation of this runner in the same job, i.e. iteration 2 onwards) is not
+# held again; the marker lives outside the results. Nothing here is a sample:
+# no file is written under pairs/. Best effort throughout: an arm that cannot
+# start or be held is skipped and left for the measured pair to report.
+settle_first_starts() {
+    local record="$1"
+    local arms="$2"
+    local settled=" "
+    local gw image identity marker
+    local marker_dir=""
+    if [ -r /proc/sys/kernel/random/boot_id ]; then
+        marker_dir="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ferrum-bench-first-start/$(cat /proc/sys/kernel/random/boot_id)"
+        mkdir -p "$marker_dir" 2>/dev/null || marker_dir=""
+    fi
+    rm -f "$record"
+    for gw in $arms; do
+        case "$gw" in
+            direct) image="host:proto_backend" ;;
+            ferrum|ferrum-exp-*) image="$FERRUM_IMAGE" ;;
+            ferrum-baseline) image="$BASELINE_IMAGE" ;;
+            envoy|envoy-limit-4) image="$ENVOY_IMAGE" ;;
+            kong) image="$KONG_IMAGE" ;;
+            tyk) image="$TYK_IMAGE" ;;
+            krakend) image="$KRAKEND_IMAGE" ;;
+            *) continue ;;
+        esac
+        case "$settled" in *" $image "*) continue ;; esac
+        settled+="$image "
+        identity=$(settle_identity "$gw" "$image")
+        marker=""
+        if [ -n "$marker_dir" ] && [ -n "$identity" ]; then
+            marker="$marker_dir/${identity//[^A-Za-z0-9._-]/_}"
+            if [ -e "$marker" ]; then
+                echo "[settle] $gw ($image) already settled on this host since boot"
+                python3 "$SCRIPT_DIR/host_settle.py" note --arm "$gw" --image "$image" \
+                    --reason already_started --output "$record" || true
+                continue
+            fi
+        fi
+        echo "[settle] first start of $gw ($image)"
+        settle_arm "$gw" "$image" "$record"
+        if [ "$SETTLE_STATUS" -ne 0 ]; then
+            # The measured pair reports an arm that cannot start.
+            echo "[settle] $gw was not settled (status $SETTLE_STATUS); continuing"
+            continue
+        fi
+        if [ -n "$marker" ]; then : > "$marker" || true; fi
+    done
 }
 
 # ── Orchestration ───────────────────────────────────────────────────────────
@@ -1487,12 +1685,6 @@ main() {
                 "$GATEWAYS" "$ADAPTIVE" "$PAYLOAD_SIZES")
             if [ -n "$campaign" ]; then
                 H2_OBSERVE=1
-                H2_GUARD_OBSERVE=$(python3 "$SCRIPT_DIR/experiment_arms.py" guard \
-                    "$EXPERIMENT_MANIFEST" "$PROTOCOL")
-                if [ "$H2_GUARD_OBSERVE" -eq 1 ] && { [ "${GITHUB_ACTIONS:-}" != true ] || [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; }; then
-                    echo "[experiment] guard observation is hosted-only" >&2
-                    exit 2
-                fi
                 PAIRS="${campaign%% *}"
                 PAYLOAD_SIZES="${campaign#* }"
                 if [ "$PROCESS_USAGE" != true ]; then
@@ -1544,6 +1736,18 @@ with open(sys.argv[1], "w") as manifest:
                "baseline_image": sys.argv[16] or None,
                "sample_schema": 2}, manifest)
 PYEOF
+    if [ "$HOST_FLAGS" = auto ]; then
+        if [ -n "$H1_PROFILE$POOL_PROFILE$UDP_PROFILE$H2_CPU_PROFILE" ] \
+            || [ "$H1_TRACE" != none ] || [ "$H2_OBSERVE" -eq 1 ]; then
+            HOST_FLAGS=false
+        else
+            HOST_FLAGS=true
+        fi
+    fi
+    if [ "$HOST_FLAGS" = true ]; then
+        # The runner's CPU model decides which disturbances to expect.
+        python3 "$SCRIPT_DIR/host_disturbance.py" record-host "$root_output/manifest.json" || true
+    fi
     if [ "$H3_BUDGET" -ne 0 ]; then
         cp "${H3_EXPERIMENT_MANIFEST:-$SCRIPT_DIR/h3_experiment.json}" "$root_output/h3_experiment.json"
     fi
@@ -1567,14 +1771,6 @@ PYEOF
         --format '{{.Id}} {{json .RepoTags}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
         > "$root_output/images.txt"
     if [ "$H2_OBSERVE" -eq 1 ] || [ -n "$H1_PROFILE" ] || [ -n "$UDP_PROFILE" ]; then
-        if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
-            local source_identity
-            source_identity=$(docker image inspect "$FERRUM_IMAGE" --format '{{index .Config.Labels "io.ferrum.h2-guard-source"}}')
-            if [ "$source_identity" != "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118" ]; then
-                echo "[experiment] image is not the pinned guard diagnostic build" >&2
-                exit 2
-            fi
-        fi
         # Pin the resolved ID for every arm, even if a mutable tag is retargeted.
         FERRUM_IMAGE=$(docker image inspect "$FERRUM_IMAGE" --format '{{.Id}}')
         if [ -n "$BASELINE_IMAGE" ]; then
@@ -1612,6 +1808,22 @@ PYEOF
         # Preserve tag and immutable image evidence; no vendor correspondence inferred.
         docker image inspect "$KONG_IMAGE" > "$root_output/kong-image.json"
         KONG_IMAGE=$(docker image inspect "$KONG_IMAGE" --format '{{.Id}}')
+    fi
+    # Profile, trace and H2-observation lanes keep their fixed, separately
+    # verified process and manifest accounting; the comparison lanes, the
+    # HTTP/3 budget lane included, settle first starts by default.
+    if [ "$SETTLE" = auto ]; then
+        # Without /proc the hold has nothing to observe, so it would only add
+        # idle starts (macOS and BSD development hosts).
+        if [ -n "$H1_PROFILE$POOL_PROFILE$UDP_PROFILE$H2_CPU_PROFILE" ] \
+            || [ "$H1_TRACE" != none ] || [ "$H2_OBSERVE" -eq 1 ] || [ ! -r /proc/stat ]; then
+            SETTLE=false
+        else
+            SETTLE=true
+        fi
+    fi
+    if [ "$SETTLE" = true ]; then
+        settle_first_starts "$root_output/host_settle.json" "$expected_gateways"
     fi
     local requested_pairs="$PAIRS"
     local final_pairs="$PAIRS"
@@ -1660,19 +1872,6 @@ PYEOF
                     if [[ "$gw" == envoy* ]]; then
                         cp "$SCRIPT_DIR/envoy_runtime.yaml" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
                     fi
-                fi
-                if [ "$H2_GUARD_OBSERVE" -eq 1 ] && [ "$gw" != direct ]; then
-                    # Explicit trigger/HTTP ack/log-fence smoke before offered work.
-                    python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.json" \
-                        --identity "$gw" "$PROTOCOL" 0 "$PAIR" "$HOST_ID"
-                    docker logs --timestamps "$GATEWAY_CID" \
-                        > "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.log" 2>&1 || true
-                    python3 "$SCRIPT_DIR/h2_guard/verify.py" smoke \
-                        "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.json" || {
-                        echo "[guard] snapshot smoke incomplete; retained raw evidence" >&2
-                        stop_gateway
-                        continue
-                    }
                 fi
                 for size in $PAYLOAD_SIZES; do
                     if [ "$gw" = direct ]; then
@@ -1732,6 +1931,14 @@ plan.update(pairs=int(sys.argv[2]), adaptive_extension=sys.argv[3] == "true")
 with open(path, "w") as f:
     json.dump(plan, f, indent=2)
 PYEOF
+    if [ "$HOST_FLAGS" = true ]; then
+        # After the last summary: it annotates the files the summary wrote.
+        # Reporting only, so a failure here must not fail a finished run.
+        python3 "$SCRIPT_DIR/host_disturbance.py" annotate "$OUTPUT_DIR" "$PROTOCOL" \
+            --gateways "$expected_gateways" --payload-sizes "$PAYLOAD_SIZES" \
+            --pairs "$final_pairs" \
+            || echo "[flags] host-disturbance flags could not be computed; samples are unmarked"
+    fi
     # The diagnostic supervisor reports only AFTER bounded cleanup and records
     # truthful termination status even if this runner never reaches this point.
     echo "[main] done. results in $OUTPUT_DIR"

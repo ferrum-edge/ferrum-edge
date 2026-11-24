@@ -755,11 +755,10 @@ async fn an_untouched_budget_still_grants_the_whole_configured_timeout() {
 
 mod confidentiality {
     use ferrum_edge::proxy::ktls_confidentiality::{
-        KTLS_CONFIDENTIALITY_RESERVE_RECORDS, KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES,
-        KtlsConfidentialityError, KtlsConfidentialityGuard, KtlsConfidentialityPolicy,
-        KtlsDirection, KtlsObservation, KtlsSessionLimits, MAX_TLS_PLAINTEXT_BYTES,
-        MIN_TLS12_AEAD_RECORD_WIRE_BYTES, charge_or_observe, receive_record_bound,
-        stable_receive_ceiling, transmit_record_bound,
+        KTLS_CONFIDENTIALITY_RESERVE_RECORDS, KtlsConfidentialityError, KtlsConfidentialityGuard,
+        KtlsConfidentialityPolicy, KtlsDirection, KtlsObservation, KtlsSessionLimits,
+        MAX_TLS_PLAINTEXT_BYTES, MIN_TLS12_AEAD_RECORD_WIRE_BYTES, charge_or_observe,
+        receive_record_bound, transmit_record_bound,
     };
     use ferrum_edge::socket_opts::ktls::KtlsCipher;
 
@@ -819,46 +818,6 @@ mod confidentiality {
             "the bound must not assume maximally sized records"
         );
         assert_eq!(receive_record_bound(0), 1);
-    }
-
-    #[test]
-    fn the_stable_ceiling_covers_the_pinned_buffer_and_the_queue_behind_it() {
-        // Once `SO_RCVBUF` is pinned the kernel only admits more data while the
-        // queue sits below the pinned size, so every later instant satisfies
-        // `queued <= max(queued_at_pin, pinned)`. Summing the two terms is a
-        // strict over-approximation of that maximum, and the overshoot headroom
-        // covers the one super-frame Linux may admit past the limit.
-        let pinned = 425_984u64;
-        let queued = 12_000u64;
-        assert_eq!(
-            stable_receive_ceiling(pinned, queued),
-            pinned + queued + KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES
-        );
-        // Data queued under the old, unknowable buffer size is what the
-        // `FIONREAD` term exists for: a large pre-pin queue must raise the
-        // ceiling even when the pin came out small.
-        let shrunk = stable_receive_ceiling(64 * 1024, 8 * 1024 * 1024);
-        assert!(
-            shrunk >= 8 * 1024 * 1024,
-            "a queue larger than the pinned buffer must still be covered, got {shrunk}"
-        );
-        // Both terms are attacker-influenced only upwards, so the arithmetic
-        // must saturate rather than wrap into a tiny ceiling.
-        assert_eq!(stable_receive_ceiling(u64::MAX, u64::MAX), u64::MAX);
-    }
-
-    #[test]
-    fn the_pinned_request_is_a_preference_and_never_the_bound() {
-        // The request is only what `setsockopt` is asked for; Linux clamps it to
-        // `net.core.rmem_max` and then doubles it, so the readback — modelled
-        // here as an arbitrary pinned value unrelated to the request — is what
-        // the ceiling is built from.
-        let clamped_far_below_the_request = 64 * 1024u64;
-        assert_eq!(
-            stable_receive_ceiling(clamped_far_below_the_request, 0),
-            clamped_far_below_the_request + KTLS_RECEIVE_QUEUE_OVERSHOOT_BYTES,
-            "the ceiling must follow the kernel readback, not the requested size"
-        );
     }
 
     #[test]
@@ -1093,15 +1052,15 @@ mod confidentiality {
     }
 
     #[test]
-    fn a_receive_step_is_charged_before_every_syscall_at_the_pinned_size() {
+    fn a_receive_step_is_charged_before_every_syscall_at_the_fixed_ceiling() {
         // The pre-charge is what keeps `true_seq <= observed_seq + charges`, so
         // the number of splices a single observation window covers must follow
-        // the pinned ceiling exactly — not a value re-measured later.
+        // the session's fixed ceiling exactly — not a value re-measured later.
         let policy = KtlsConfidentialityPolicy {
             limits: aes_limits(),
             initial_transmit_seq: 0,
             initial_receive_seq: 0,
-            stable_receive_ceiling: stable_receive_ceiling(425_984, 0),
+            stable_receive_ceiling: 425_984 + 1024 * 1024,
         };
         let mut guard = policy
             .guard(KtlsDirection::Receive)

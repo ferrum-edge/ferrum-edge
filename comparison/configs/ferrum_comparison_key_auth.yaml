@@ -1,4 +1,5 @@
 ---
+version: "1"
 # Ferrum Edge comparison benchmark configuration — key-auth enabled
 # Includes a health check proxy plus one authenticated echo proxy
 
@@ -42,7 +43,7 @@ consumers:
     custom_id: "benchmark"
     credentials:
       keyauth:
-        - key: "test-api-key"
+        - key: "comparison-key-auth-0001"
 
 plugin_configs:
   - id: "plugin-keyauth-bench"

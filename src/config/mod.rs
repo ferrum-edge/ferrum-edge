@@ -6,6 +6,8 @@
 //! - `stable_file` — Shared bounded stable-file reader for authoritative config docs
 //! - `batch_atomicity` — Graph-level all-or-nothing vocabulary for `POST /batch`
 //! - `db_loader` — Database config loader with incremental polling
+//! - `store_policy` — Backend-neutral persistence policy shared by the SQL and
+//!   MongoDB stores (identity keyspace, delete-refusal predicates, spec hash)
 //! - `file_loader` — YAML/JSON file loader with version migration
 //! - `gateway_trust` — Namespace-keyed gateway trust-bundle resource
 //! - `config_backup` — On-disk JSON backup for DB-unreachable startup failover
@@ -20,8 +22,7 @@
 //! - `pool_config` — Connection pool configuration (global defaults + per-proxy overrides)
 
 // The fault-injection seam is driven by external tests through the lib target's
-// `_test_support` shim; the bin target recompiles this module without those
-// callers, so its installers would otherwise read as dead code there.
+// `_test_support` shim.
 #[allow(dead_code)]
 pub mod batch_atomicity;
 pub mod conf_file;
@@ -47,18 +48,18 @@ pub mod mongo_store;
 /// Shared namespace projection for `GatewayConfig` snapshots.
 pub mod namespace_filter;
 // The registry's fault-injection installer is driven by external tests through
-// the lib target; the bin target recompiles this module without that caller, so
-// it would otherwise read as dead code there.
+// the lib target's `_test_support` shim.
 #[allow(dead_code)]
 pub mod namespace_registry;
 pub mod plugin_trigger;
 pub mod policy_graph_scope;
 pub mod pool_config;
-#[allow(dead_code)] // Public DOC-03 inventory is consumed by external tests, not the binary crate.
+#[allow(dead_code)] // Public DOC-03 inventory is consumed by external tests
 pub mod public_env_inventory;
 /// In-process database-mode admin write live-apply coordinator (issue #3926).
 #[allow(dead_code)]
 pub mod runtime_config_apply;
+pub mod store_policy;
 /// TEST-ONLY debug-build database outage control for functional fixtures.
 /// See the module docs — not a production configuration surface.
 #[allow(dead_code)] // arm_path / disarm_for_tests are exercised by external unit tests.
@@ -69,6 +70,7 @@ pub mod yaml_alias_budget;
 
 #[allow(unused_imports)] // AutoBool is used by unit tests but not directly by the binary
 pub use env_config::AutoBool;
+pub use env_config::CompressionAdmissionPolicy;
 #[allow(unused_imports)] // DbTlsMode is used by unit tests and public config consumers
 pub use env_config::{
     AdminHttpExposure, BackendAllowIps, BackendEgressPolicy, DbTlsMode, EffectiveSqlBackend,

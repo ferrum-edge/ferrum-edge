@@ -97,7 +97,6 @@ impl OwnedShellError {
     }
 
     /// When process-group cleanup could not be proven after the deadline.
-    #[allow(dead_code)] // Public library API exercised by the external unit-test crate; unused by the binary target.
     pub fn deadline_cleanup_error(&self) -> Option<&str> {
         match self {
             Self::DeadlineCleanupFailed { error } => Some(error.as_str()),

@@ -307,26 +307,28 @@ fn cache_diagnostics_withhold_values_before_startup_and_reload_log_emission() {
             vec!["Removed security plugin", "is not supported"],
             false,
         ),
+        // `stdout_logging` is `KeepLastKnownGood`: an unconstructible access
+        // log rejects the generation instead of being omitted.
         (
             "stdout_logging",
             json!({"filter": {"errors_only": DIAGNOSTIC_VALUE}}),
             None,
             vec!["filter.errors_only", "must be a boolean"],
-            true,
+            false,
         ),
         (
             "stdout_logging",
             json!({"filter": {(DIAGNOSTIC_VALUE): true}}),
             None,
             vec!["unknown configuration key(s)", "`stdout_logging.filter`"],
-            true,
+            false,
         ),
         (
             "stdout_logging",
             json!({"filter": {"status_code_max": 918273641}}),
             None,
-            vec!["`filter.status_code_max`", "must be between 0 and 65535"],
-            true,
+            vec!["`filter.status_code_max`", "must be between 0 and 999"],
+            false,
         ),
         (
             "request_size_limiting",
@@ -376,13 +378,12 @@ fn cache_diagnostics_withhold_values_before_startup_and_reload_log_emission() {
     for value in [json!(DIAGNOSTIC_VALUE), json!(918273641), json!(true)] {
         cases.push((
             "ip_restriction",
-            json!({"allow": ["127.0.0.1"], "mode": value}),
+            json!({"allow": value}),
             None,
             vec![
                 "config validation failed",
-                "`mode`",
-                "`allow_first`",
-                "`deny_first`",
+                "`allow`",
+                "must be an array of IP/CIDR strings",
             ],
             false,
         ));
@@ -567,18 +568,18 @@ fn cache_diagnostics_preserve_ordered_causes_after_adversarial_identities() {
         }))
         .unwrap(),
     );
-    let mut invalid_mode = make_plugin_config_with_json(
+    let mut invalid_allow = make_plugin_config_with_json(
         "second",
         "ip_restriction",
-        json!({"allow": ["127.0.0.1"], "mode": true}),
+        json!({"allow": true}),
         PluginScope::Global,
         None,
     );
     // A trigger forces concrete construction during candidate admission too;
     // an ordinary IP restriction is otherwise only a topology placeholder.
-    invalid_mode.trigger =
+    invalid_allow.trigger =
         Some(serde_json::from_value(json!({"when": {"match": {"method": ["GET"]}}})).unwrap());
-    let config = make_config(vec![], vec![triggered, invalid_mode]);
+    let config = make_config(vec![], vec![triggered, invalid_allow]);
     for error in [
         validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
             .expect_err("candidate admission must preserve both rejections"),
@@ -591,10 +592,10 @@ fn cache_diagnostics_preserve_ordered_causes_after_adversarial_identities() {
         let trigger = rendered
             .find("trigger: `path` regex is invalid or too large")
             .unwrap();
-        let mode = rendered
-            .find("`mode` must be `allow_first` or `deny_first`")
+        let allow = rendered
+            .find("`allow` must be an array of IP/CIDR strings")
             .unwrap();
-        assert!(trigger < mode, "{rendered}");
+        assert!(trigger < allow, "{rendered}");
     }
 }
 
@@ -960,6 +961,27 @@ fn every_admission_gating_plugin_marks_the_flavor_views_it_cannot_run_on() {
             minimal_plugin_config("ai_tool_governor"),
             true,
             true,
+        ),
+        (
+            "sse with its default GET and Accept admission",
+            "sse",
+            json!({}),
+            true,
+            true,
+        ),
+        (
+            "sse with only the Accept check",
+            "sse",
+            json!({"require_get_method": false}),
+            true,
+            true,
+        ),
+        (
+            "sse with both request checks disabled",
+            "sse",
+            json!({"require_get_method": false, "require_accept_header": false}),
+            false,
+            false,
         ),
     ];
 
@@ -1845,13 +1867,16 @@ fn multiple_cors_instances_must_remain_contiguous() {
 
 #[test]
 fn stream_only_interloper_is_ignored_by_cors_contiguity_on_full_rebuild() {
+    // A WebSocket-only plugin is attachable to an HTTP proxy but runs in no
+    // HTTP/gRPC chain. (`udp_rate_limiting` used to play this role; a
+    // proxy-scoped attachment of it to an HTTP proxy is now refused.)
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["cors-a", "udp", "cors-b"])],
         vec![
             cors_config("cors-a", &["GET"], &["X-Test"], Some(100), None),
             make_plugin_config_with_priority(
                 "udp",
-                "udp_rate_limiting",
+                "ws_rate_limiting",
                 PluginScope::Proxy,
                 Some("p1"),
                 true,
@@ -1873,13 +1898,11 @@ fn stream_only_interloper_is_ignored_by_cors_contiguity_on_full_rebuild() {
             vec!["cors", "cors", "__cors_finalizer"]
         );
     }
-    assert_eq!(
+    assert!(
         cache
-            .get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Udp)
+            .get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::WebSocket)
             .iter()
-            .map(|plugin| plugin.name())
-            .collect::<Vec<_>>(),
-        vec!["udp_rate_limiting"]
+            .any(|plugin| plugin.name() == "ws_rate_limiting")
     );
 }
 
@@ -1891,7 +1914,7 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
             cors_config("cors-a", &["GET"], &["X-Test"], Some(100), None),
             make_plugin_config_with_priority(
                 "udp",
-                "udp_rate_limiting",
+                "ws_rate_limiting",
                 PluginScope::Proxy,
                 Some("p1"),
                 true,
@@ -1907,7 +1930,7 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
             cors_config("cors-a", &["GET"], &["X-Test"], Some(100), None),
             make_plugin_config_with_priority(
                 "udp",
-                "udp_rate_limiting",
+                "ws_rate_limiting",
                 PluginScope::Proxy,
                 Some("p1"),
                 true,
@@ -1934,7 +1957,7 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
             .iter()
             .map(|plugin| plugin.name())
             .collect::<Vec<_>>(),
-        vec!["cors", "udp_rate_limiting", "cors", "__cors_finalizer"]
+        vec!["cors", "ws_rate_limiting", "cors", "__cors_finalizer"]
     );
 
     let http_interleaved = make_config(
@@ -3070,16 +3093,24 @@ fn istio_route_transform_consumers_preserve_same_name_global_rules() {
 
 #[test]
 fn test_invalid_optional_proxy_scoped_plugin_still_shadows_global() {
+    // `transaction_debugger` is `OptionalFailOpen` (`stdout_logging` is
+    // `KeepLastKnownGood` and would reject the generation instead).
     let config = make_config(
         vec![
             make_proxy("p1", "/api", vec!["ps1"]),
             make_proxy("p2", "/web", vec![]),
         ],
         vec![
-            make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
+            make_plugin_config(
+                "g1",
+                "transaction_debugger",
+                PluginScope::Global,
+                None,
+                true,
+            ),
             make_plugin_config_with_json(
                 "ps1",
-                "stdout_logging",
+                "transaction_debugger",
                 json!("bad-config"),
                 PluginScope::Proxy,
                 Some("p1"),
@@ -3095,8 +3126,69 @@ fn test_invalid_optional_proxy_scoped_plugin_still_shadows_global() {
     assert_eq!(cache.get_plugins("ferrum", "p2").len(), 1);
     assert_eq!(
         cache.get_plugins("ferrum", "p2")[0].name(),
-        "stdout_logging"
+        "transaction_debugger"
     );
+}
+
+/// `stdout_logging` is the access log and is registered `KeepLastKnownGood`:
+/// a reload that cannot construct it is refused, and the previous generation —
+/// including its logger — keeps serving instead of a logger-less one.
+#[test]
+fn invalid_stdout_logging_reload_keeps_the_previous_logger() {
+    assert_eq!(
+        ferrum_edge::plugins::plugin_failure_policy("stdout_logging"),
+        Some(ferrum_edge::plugins::PluginFailurePolicy::KeepLastKnownGood)
+    );
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config(
+            "access-log",
+            "stdout_logging",
+            PluginScope::Global,
+            None,
+            true,
+        )],
+    );
+    let invalid = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "access-log",
+            "stdout_logging",
+            json!({"filtr": {"errors_only": true}}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+
+    assert!(
+        PluginCache::new(&invalid).is_err(),
+        "startup has no previous generation to keep and must fail"
+    );
+
+    let cache = PluginCache::new(&valid).unwrap();
+    let before = cache.get_plugins("ferrum", "p1");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].name(), "stdout_logging");
+
+    let error = cache
+        .rebuild(&invalid)
+        .expect_err("an unconstructible access log must reject the full rebuild");
+    assert!(error.contains("stdout_logging"), "{error}");
+    assert!(Arc::ptr_eq(&before, &cache.get_plugins("ferrum", "p1")));
+
+    let delta = ConfigDelta::compute(&valid, &invalid);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&valid, &invalid);
+    cache
+        .apply_delta(
+            &invalid,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .expect_err("an unconstructible access log must reject the delta reload");
+    let after = cache.get_plugins("ferrum", "p1");
+    assert!(Arc::ptr_eq(&before, &after));
+    assert_eq!(after[0].name(), "stdout_logging");
 }
 
 #[test]
@@ -3234,11 +3326,14 @@ fn test_optional_custom_plugin_validation_failure_is_omitted() {
     );
 }
 
+/// Issue #7144: `ws_frame_logging` is a log sink, so it is
+/// `KeepLastKnownGood` like every other log sink: an invalid config rejects the
+/// initial cache and a reload, and the previous generation keeps serving.
 #[test]
-fn test_ws_frame_logging_invalid_config_is_omitted_on_admission_and_reload() {
+fn test_ws_frame_logging_invalid_config_keeps_last_known_good_on_admission_and_reload() {
     assert_eq!(
         ferrum_edge::plugins::plugin_failure_policy("ws_frame_logging"),
-        Some(ferrum_edge::plugins::PluginFailurePolicy::OptionalFailOpen)
+        Some(ferrum_edge::plugins::PluginFailurePolicy::KeepLastKnownGood)
     );
 
     let invalid = make_config(
@@ -3251,15 +3346,9 @@ fn test_ws_frame_logging_invalid_config_is_omitted_on_admission_and_reload() {
             Some("p1"),
         )],
     );
-    let cache = PluginCache::new(&invalid)
-        .expect("OptionalFailOpen must admit snapshot despite bad config");
     assert!(
-        cache.get_plugins("ferrum", "p1").is_empty(),
-        "invalid ws_frame_logging must be omitted from published cache"
-    );
-    assert!(
-        !cache.requires_ws_frame_hooks("ferrum", "p1"),
-        "omitted logger must not force frame-hook selection"
+        PluginCache::new(&invalid).is_err(),
+        "an invalid ws_frame_logging must reject the initial cache"
     );
 
     let valid = make_config(
@@ -3305,12 +3394,17 @@ fn test_ws_frame_logging_invalid_config_is_omitted_on_admission_and_reload() {
             &delta.removed_proxy_ids,
             delta.global_plugin_configs_changed,
         )
-        .expect("OptionalFailOpen reload must publish by omitting the bad instance");
-    assert!(
-        cache.get_plugins("ferrum", "p1").is_empty(),
-        "reload must omit oversized payload_preview_bytes rather than clamp"
+        .expect_err("oversized payload_preview_bytes must reject the reload, not clamp");
+    assert_eq!(
+        cache
+            .get_plugins("ferrum", "p1")
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["ws_frame_logging"],
+        "the rejected reload keeps the previously published logger"
     );
-    assert!(!cache.requires_ws_frame_hooks("ferrum", "p1"));
+    assert!(cache.requires_ws_frame_hooks("ferrum", "p1"));
 }
 
 #[test]
@@ -3431,7 +3525,7 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
             json!({
                 "ttl_seconds": 60,
                 "vary_by_headers": ["x-tenant"],
-                "cache_key_include_consumer": true
+                "anonymous_caller_scope": "shared"
             }),
             PluginScope::Proxy,
             Some("p1"),
@@ -3450,7 +3544,7 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
             json!({
                 "ttl_seconds": 60,
                 "vary_by_header": ["x-tenant"],
-                "cache_key_include_consumr": true
+                "anonymous_caller_scop": "shared"
             }),
             PluginScope::Proxy,
             Some("p1"),
@@ -3468,8 +3562,8 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
         "reload error must path-qualify Vary typo: {error}"
     );
     assert!(
-        error.contains("\"config.cache_key_include_consumr\""),
-        "reload error must path-qualify consumer typo: {error}"
+        error.contains("\"config.anonymous_caller_scop\""),
+        "reload error must path-qualify the caller-scope typo: {error}"
     );
 
     let after = cache.get_plugins("ferrum", "p1");
@@ -3638,6 +3732,7 @@ async fn test_request_mirror_unknown_key_reload_keeps_last_known_good() {
             "request-mirror-1",
             "request_mirror",
             json!({
+                "allow_plaintext": true,
                 "mirror_host": "mirror.local",
                 "percentage": 0,
                 "mirror_request_body": false
@@ -3657,6 +3752,7 @@ async fn test_request_mirror_unknown_key_reload_keeps_last_known_good() {
             "request-mirror-1",
             "request_mirror",
             json!({
+                "allow_plaintext": true,
                 "mirror_host": "mirror.local",
                 "mirror_protcol": "https",
                 "percentage": 0,
@@ -4065,6 +4161,64 @@ fn test_request_view_stays_on_single_generation_after_rebuild() {
     );
 }
 
+/// Issue #7207: a request view holds the one shared per-(proxy, protocol)
+/// entry instead of an `Arc` clone of every phase list. Building views must
+/// leave the reference counts of the lists themselves untouched, while every
+/// accessor still hands out the cache generation's own lists.
+#[test]
+fn test_request_view_shares_one_entry_instead_of_cloning_phase_lists() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["auth", "transform"])],
+        vec![
+            make_plugin_config("auth", "key_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "transform",
+                "request_transformer",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let auth = cache.get_auth_plugins("ferrum", "p1", ProxyProtocol::Http);
+    let plugins_refs = Arc::strong_count(&plugins);
+    let auth_refs = Arc::strong_count(&auth);
+
+    let views: Vec<_> = (0..8)
+        .map(|_| cache.request_view("ferrum", "p1", ProxyProtocol::Http))
+        .collect();
+    let cloned = views[0].clone();
+
+    assert_eq!(
+        Arc::strong_count(&plugins),
+        plugins_refs,
+        "building or cloning a view must not clone the plugin list"
+    );
+    assert_eq!(
+        Arc::strong_count(&auth),
+        auth_refs,
+        "building or cloning a view must not clone the auth list"
+    );
+    for view in views.iter().chain(std::iter::once(&cloned)) {
+        assert!(Arc::ptr_eq(&view.plugins(), &plugins));
+        assert!(Arc::ptr_eq(&view.auth_plugins(), &auth));
+        assert!(
+            view.capabilities()
+                .has(PluginCapabilities::MODIFIES_REQUEST_HEADERS)
+        );
+    }
+    assert!(
+        cache
+            .get_capabilities("ferrum", "p1", ProxyProtocol::Http)
+            .has(PluginCapabilities::MODIFIES_REQUEST_HEADERS)
+    );
+    let names: Vec<&str> = plugins.iter().map(|plugin| plugin.name()).collect();
+    assert!(names.contains(&"key_auth") && names.contains(&"request_transformer"));
+    assert_eq!(auth.len(), 1);
+}
+
 #[tokio::test]
 async fn test_request_view_precomputes_response_committed_hook_capability() {
     let mut audit = make_plugin_config_with_json(
@@ -4415,6 +4569,123 @@ fn test_request_view_precomputes_key_auth_header_redaction() {
         view.request_headers_to_redact().as_ref(),
         &["x-tenant-credential"]
     );
+}
+
+#[tokio::test]
+async fn test_request_view_filters_every_key_auth_array_header_from_trailers() {
+    use ferrum_edge::_test_support::{
+        h1_h2_upload_source_forwarded_frames_for_route,
+        sanitized_backend_request_trailers_for_route,
+    };
+
+    for hide_credentials in [true, false] {
+        let config = make_config(
+            vec![make_proxy("p1", "/api", vec!["keyauth"])],
+            vec![make_plugin_config_with_json(
+                "keyauth",
+                "key_auth",
+                json!({
+                    "key_location": ["query:key", "header:X-First", "header:X-Last"],
+                    "hide_credentials": hide_credentials
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            )],
+        );
+        let cache = PluginCache::new(&config).unwrap();
+        // Each protocol view publishes the list carried by its late request
+        // trailer boundaries, regardless of primary-header preservation.
+        for protocol in [
+            ProxyProtocol::Http,
+            ProxyProtocol::Grpc,
+            ProxyProtocol::WebSocket,
+        ] {
+            let view = cache.request_view("ferrum", "p1", protocol);
+            let names = view.request_headers_to_redact();
+            assert_eq!(names.as_ref(), &["x-first", "x-last"]);
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let trailers = [("x-first", "a"), ("x-last", "b"), ("x-checksum", "keep")];
+            let expected = vec![("x-checksum".to_string(), "keep".to_string())];
+            let (data, forwarded) =
+                h1_h2_upload_source_forwarded_frames_for_route(b"payload", &trailers, &names).await;
+            assert_eq!(data.as_slice(), b"payload");
+            assert_eq!(forwarded, expected);
+            assert_eq!(
+                sanitized_backend_request_trailers_for_route(&trailers, &names),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn test_request_view_redacts_openapi_validator_bypass_header() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["oav"])],
+        vec![make_plugin_config_with_json(
+            "oav",
+            "openapi_validator",
+            json!({
+                "bypass": {"header_present": {"X-Bypass-Validator": "bypass-secret-0123456789"}},
+                "operations": [{
+                    "method": "GET",
+                    "path_template": "/items",
+                    "path_regex": "^/items$",
+                    "responses": {"200": {"application/json": {"type": "object"}}}
+                }]
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(
+        view.request_headers_to_redact().as_ref(),
+        &["x-bypass-validator"]
+    );
+}
+
+#[test]
+fn test_request_view_registers_custom_mcp_session_headers() {
+    // Custom MCP session header names reach the route's credential-header
+    // registry through ordinary plugin-cache composition, which is what
+    // diagnostics/OPA redaction, replay partitioning and request_mirror read.
+    let config = make_config(
+        vec![make_proxy("p1", "/mcp", vec!["mcp"])],
+        vec![make_plugin_config_with_json(
+            "mcp",
+            "mcp_gateway",
+            json!({
+                "enabled": true,
+                "mode": "aggregate_router",
+                "endpoint": {"path": "/mcp", "protocol_versions": ["2025-11-25"]},
+                "sessions": {
+                    "initialize_upstreams": "passthrough",
+                    "downstream_session_header": "X-Client-Session",
+                    "upstream_session_header": "x-proof"
+                },
+                "servers": {
+                    "github": {
+                        "upstream_url": "http://127.0.0.1:9/mcp",
+                        "namespace": "github",
+                        "enabled": true
+                    }
+                }
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+    let names = view.request_headers_to_redact();
+    assert!(
+        names.iter().any(|name| name == "x-client-session"),
+        "{names:?}"
+    );
+    assert!(names.iter().any(|name| name == "x-proof"), "{names:?}");
 }
 
 #[test]
@@ -5120,6 +5391,493 @@ fn streaming_ai_federation_deduplication_gate_fires_in_candidate_and_runtime() {
         .expect("buffered ai_federation must still compose with request_deduplication at runtime");
 }
 
+/// `opa` allow obligations (`decision_request_headers`) make it a request-header
+/// mutator. An untriggered instance must therefore be constructed in candidate
+/// admission, so a late OPA mutator ordered at or after a replay gate is refused
+/// before an admin write is stored, exactly as runtime cache construction
+/// refuses it (PR #6860 review). Without obligations, or at OPA's default
+/// priority, both boundaries admit the composition.
+#[test]
+fn opa_obligation_header_mutation_gates_replay_in_candidate_and_runtime() {
+    let opa = |obligations: bool, priority_override: Option<u16>| {
+        let mut config = json!({
+            "opa_host": "http://127.0.0.1:8181",
+            "policy_path": "ferrum/authz/allow"
+        });
+        if obligations {
+            config["decision_request_headers"] = json!(["x-tenant"]);
+        }
+        let mut plugin =
+            make_plugin_config_with_json("opa", "opa", config, PluginScope::Proxy, Some("p1"));
+        plugin.priority_override = priority_override;
+        plugin
+    };
+    for (replay_name, replay_priority) in [
+        (
+            "response_caching",
+            ferrum_edge::plugins::priority::RESPONSE_CACHING,
+        ),
+        (
+            "request_deduplication",
+            ferrum_edge::plugins::priority::REQUEST_DEDUPLICATION,
+        ),
+    ] {
+        let config_with = |opa_config: PluginConfig| {
+            make_config(
+                vec![make_proxy("p1", "/api", vec!["replay", "opa"])],
+                vec![
+                    make_plugin_config("replay", replay_name, PluginScope::Proxy, Some("p1"), true),
+                    opa_config,
+                ],
+            )
+        };
+        let expected_error = format!("every {replay_name} instance");
+        for priority in [replay_priority, 4000] {
+            let late_mutator = config_with(opa(true, Some(priority)));
+            let candidate_error =
+                validate_plugin_composition_candidate_with_real_ip_header_for_test(
+                    &late_mutator,
+                    None,
+                )
+                .expect_err("candidate must reject OPA header mutation at or after replay");
+            assert!(
+                candidate_error.contains(&expected_error),
+                "{candidate_error}"
+            );
+            let runtime_error = PluginCache::new(&late_mutator)
+                .err()
+                .expect("runtime cache must repeat the fail-closed ordering refusal");
+            assert!(runtime_error.contains(&expected_error), "{runtime_error}");
+        }
+
+        for admitted in [
+            config_with(opa(false, Some(4000))),
+            config_with(opa(true, None)),
+            config_with(opa(true, Some(replay_priority - 1))),
+        ] {
+            validate_plugin_composition_candidate_with_real_ip_header_for_test(&admitted, None)
+                .expect("candidate must admit OPA without a late header mutation");
+            PluginCache::new(&admitted)
+                .expect("runtime must admit OPA without a late header mutation");
+        }
+    }
+}
+
+/// An `opa` obligation destination that an authentication plugin on the same
+/// chain owns as a credential location is refused on both admission
+/// boundaries, whatever the owner's `hide_credentials` setting and whichever
+/// equivalent spelling (ASCII case, `_` or `-`) names it (PR #6860 review).
+#[test]
+fn opa_obligation_destination_cannot_be_an_active_credential_location() {
+    let owner = |owner_name: &str, hide_credentials: bool| {
+        let mut config = json!({"hide_credentials": hide_credentials});
+        let location_key = match owner_name {
+            "key_auth" => "key_location",
+            "jwt_auth" => "token_lookup",
+            _ => panic!("unexpected credential owner {owner_name}"),
+        };
+        config[location_key] = json!("header:X-Account");
+        make_plugin_config_with_json("owner", owner_name, config, PluginScope::Proxy, Some("p1"))
+    };
+    let opa = |destination: &str| {
+        make_plugin_config_with_json(
+            "opa",
+            "opa",
+            json!({
+                "opa_host": "http://127.0.0.1:8181",
+                "policy_path": "ferrum/authz/allow",
+                "decision_request_headers": [destination]
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )
+    };
+    let config_with = |owner_name: &str, hide_credentials: bool, destination: &str| {
+        make_config(
+            vec![make_proxy("p1", "/api", vec!["owner", "opa"])],
+            vec![owner(owner_name, hide_credentials), opa(destination)],
+        )
+    };
+
+    for (owner_name, hide_credentials) in [
+        ("key_auth", true),
+        ("key_auth", false),
+        ("jwt_auth", true),
+        ("jwt_auth", false),
+    ] {
+        for destination in ["x-account", "X-Account", "x_account"] {
+            let config = config_with(owner_name, hide_credentials, destination);
+            let candidate_error =
+                validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+                    .expect_err("candidate must refuse a credential-owned obligation destination");
+            assert!(
+                candidate_error.contains("decision_request_headers")
+                    && candidate_error.contains(owner_name),
+                "{owner_name} {destination} hide={hide_credentials}: {candidate_error}"
+            );
+            let runtime_error = PluginCache::new(&config)
+                .err()
+                .expect("runtime cache must repeat the refusal");
+            assert!(
+                runtime_error.contains("decision_request_headers")
+                    && runtime_error.contains(owner_name),
+                "{owner_name} {destination} hide={hide_credentials}: {runtime_error}"
+            );
+        }
+
+        let unrelated = config_with(owner_name, hide_credentials, "x-tenant");
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&unrelated, None)
+            .expect("an unrelated obligation destination composes with the credential owner");
+        PluginCache::new(&unrelated)
+            .expect("an unrelated obligation destination composes with the credential owner");
+    }
+}
+
+/// WAF/OpenAPI bypass secrets and MCP session IDs are credential publishers
+/// without being authentication plugins. Candidate views and runtime cache
+/// construction must reject their conflicts before publishing a generation.
+#[test]
+fn opa_obligation_destination_cannot_be_a_non_auth_credential_location() {
+    for owner_name in ["waf", "openapi_validator", "mcp_gateway"] {
+        let mut owner_config = minimal_plugin_config(owner_name);
+        match owner_name {
+            "waf" => {
+                owner_config["global_exemptions"] = json!({
+                    "header_present": {"X-Account": "trusted-hop-shared-secret"}
+                });
+            }
+            "openapi_validator" => {
+                owner_config["bypass"] = json!({
+                    "header_present": {"X-Account": "trusted-hop-shared-secret"}
+                });
+            }
+            "mcp_gateway" => {
+                owner_config["sessions"] = json!({"downstream_session_header": "X-Account"});
+            }
+            _ => unreachable!("all credential publishers are listed above"),
+        }
+        let config_with = |destination: &str, owner_enabled: bool| {
+            let mut owner = make_plugin_config_with_json(
+                "owner",
+                owner_name,
+                owner_config.clone(),
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            owner.enabled = owner_enabled;
+            // Exercise built-in OPA detection through the priority wrapper.
+            let mut opa = make_plugin_config_with_json(
+                "opa",
+                "opa",
+                json!({
+                    "opa_host": "http://127.0.0.1:8181",
+                    "policy_path": "ferrum/authz/allow",
+                    "decision_request_headers": [destination],
+                    "fail_open": true
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            opa.priority_override = Some(ferrum_edge::plugins::priority::OPA + 1);
+            make_config(
+                vec![make_proxy("p1", "/api", vec!["owner", "opa"])],
+                vec![owner, opa],
+            )
+        };
+
+        for destination in ["x-account", "X-Account", "x_account"] {
+            let config = config_with(destination, true);
+            let candidate_error =
+                validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+                    .expect_err("candidate must refuse non-authentication credential conflicts");
+            let runtime_error = PluginCache::new(&config)
+                .err()
+                .expect("runtime construction must repeat the credential conflict refusal");
+            for error in [candidate_error, runtime_error] {
+                assert!(
+                    error.contains("decision_request_headers") && error.contains(owner_name),
+                    "{owner_name} {destination}: {error}"
+                );
+                assert!(!error.contains("trusted-hop-shared-secret"));
+            }
+        }
+
+        for admitted in [
+            config_with("x-tenant", true),
+            config_with("x-account", false),
+        ] {
+            validate_plugin_composition_candidate_with_real_ip_header_for_test(&admitted, None)
+                .expect("unrelated destinations and disabled owners must be admitted");
+            PluginCache::new(&admitted)
+                .expect("runtime must admit unrelated destinations and disabled owners");
+        }
+    }
+}
+
+#[test]
+fn opa_obligations_check_custom_credential_publishers_on_overlapping_protocols() {
+    struct CredentialPublisher {
+        headers: Vec<String>,
+        protocols: &'static [ProxyProtocol],
+    }
+
+    #[async_trait::async_trait]
+    impl Plugin for CredentialPublisher {
+        fn name(&self) -> &str {
+            "custom_credential_publisher"
+        }
+
+        fn request_headers_to_redact(&self) -> &[String] {
+            &self.headers
+        }
+
+        fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+            self.protocols
+        }
+    }
+
+    let opa: Arc<dyn Plugin> = Arc::new(
+        ferrum_edge::plugins::opa::Opa::new(
+            &json!({
+                "opa_host": "http://127.0.0.1:8181",
+                "policy_path": "ferrum/authz/allow",
+                "decision_request_headers": ["x-account"]
+            }),
+            PluginHttpClient::default(),
+        )
+        .expect("valid OPA config"),
+    );
+    for (protocols, conflicts) in [
+        (ferrum_edge::plugins::HTTP_ONLY_PROTOCOLS, true),
+        (ferrum_edge::plugins::TCP_ONLY_PROTOCOLS, false),
+    ] {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::clone(&opa),
+            Arc::new(CredentialPublisher {
+                headers: vec!["X_Account".to_string()],
+                protocols,
+            }),
+        ];
+        let result =
+            ferrum_edge::_test_support::validate_plugin_security_composition_for_test(&plugins);
+        if conflicts {
+            let error = result.expect_err("custom credential conflicts must fail admission");
+            assert!(error.contains("custom_credential_publisher"), "{error}");
+            assert!(error.contains("decision_request_headers"), "{error}");
+        } else {
+            result.expect("a stream-only credential publisher cannot conflict with OPA");
+        }
+    }
+}
+
+/// `ai_semantic_cache` answers a HIT from its final-request-body hook and the
+/// final-body chain stops at the first `RejectBinary`, so a fail-closed
+/// final-request-body policy ordered at or after the cache — by a
+/// `priority_override` on either side — would be bypassed by every hit. Both
+/// candidate admission and runtime cache construction must refuse that, while
+/// the default ordering (and the documented `ai_federation` dispatcher after
+/// the cache) stays admitted.
+#[tokio::test]
+async fn ai_semantic_cache_must_follow_every_final_request_body_policy() {
+    let cache = |priority_override: Option<u16>| {
+        let mut config = make_plugin_config(
+            "cache",
+            "ai_semantic_cache",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        );
+        config.priority_override = priority_override;
+        config
+    };
+    let waf = |priority_override: Option<u16>| {
+        let mut config = make_plugin_config("waf", "waf", PluginScope::Proxy, Some("p1"), true);
+        config.priority_override = priority_override;
+        config
+    };
+    let compose = |plugins: Vec<PluginConfig>| {
+        let ids: Vec<String> = plugins.iter().map(|plugin| plugin.id.clone()).collect();
+        make_config(
+            vec![make_proxy(
+                "p1",
+                "/api",
+                ids.iter().map(String::as_str).collect(),
+            )],
+            plugins,
+        )
+    };
+
+    for (label, config) in [
+        (
+            "cache overridden ahead of waf",
+            compose(vec![cache(Some(2000)), waf(None)]),
+        ),
+        (
+            "waf overridden after the cache",
+            compose(vec![cache(None), waf(Some(5000))]),
+        ),
+        (
+            "waf at the cache's priority",
+            compose(vec![
+                cache(None),
+                waf(Some(ferrum_edge::plugins::priority::AI_SEMANTIC_CACHE)),
+            ]),
+        ),
+    ] {
+        let candidate_error =
+            validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+                .expect_err(label);
+        assert!(
+            candidate_error.contains("must run before every ai_semantic_cache instance"),
+            "{label}: {candidate_error}"
+        );
+        let runtime_error = PluginCache::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("{label}: runtime cache must repeat the refusal"));
+        assert!(
+            runtime_error.contains("must run before every ai_semantic_cache instance"),
+            "{label}: {runtime_error}"
+        );
+    }
+
+    let federation = |streaming: bool| {
+        let mut config = json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "api_key": "sk-test-key",
+                "model_patterns": ["gpt-*"]
+            }]
+        });
+        if streaming {
+            config["streaming"] = json!({"enabled": true});
+        }
+        make_plugin_config_with_json(
+            "federation",
+            "ai_federation",
+            config,
+            PluginScope::Proxy,
+            Some("p1"),
+        )
+    };
+    for (label, config) in [
+        ("default ordering", compose(vec![waf(None), cache(None)])),
+        (
+            "buffered federation after the cache",
+            compose(vec![waf(None), cache(None), federation(false)]),
+        ),
+        (
+            "streaming federation after the cache",
+            compose(vec![waf(None), cache(None), federation(true)]),
+        ),
+    ] {
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+            .unwrap_or_else(|error| panic!("{label} must be admitted: {error}"));
+        if let Err(error) = PluginCache::new(&config) {
+            panic!("{label} must build at runtime: {error}");
+        }
+    }
+}
+
+/// A body-rule `request_transformer` refuses an ambiguous JSON body from its
+/// final request-body hook (GHSA-pq95-952r-2x32), so it is a finalized request
+/// policy: an `ai_semantic_cache` hit ordered at or ahead of it would answer
+/// before that refusal. Header/query-only instances never refuse there and keep
+/// composing in any order.
+#[tokio::test]
+async fn ai_semantic_cache_must_follow_a_body_rule_request_transformer() {
+    let cache = |priority_override: Option<u16>| {
+        let mut config = make_plugin_config(
+            "cache",
+            "ai_semantic_cache",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        );
+        config.priority_override = priority_override;
+        config
+    };
+    let transformer = |rules: serde_json::Value, priority_override: Option<u16>| {
+        let mut config = make_plugin_config_with_json(
+            "transformer",
+            "request_transformer",
+            json!({ "rules": rules }),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        config.priority_override = priority_override;
+        config
+    };
+    let body_rules = || json!([{"operation": "remove", "target": "body", "key": "user.role"}]);
+    let header_rules =
+        || json!([{"operation": "add", "target": "header", "key": "x-tagged", "value": "1"}]);
+    let compose = |plugins: Vec<PluginConfig>| {
+        let ids: Vec<String> = plugins.iter().map(|plugin| plugin.id.clone()).collect();
+        make_config(
+            vec![make_proxy(
+                "p1",
+                "/api",
+                ids.iter().map(String::as_str).collect(),
+            )],
+            plugins,
+        )
+    };
+
+    for (label, config) in [
+        (
+            "cache overridden ahead of the transformer",
+            compose(vec![cache(Some(2500)), transformer(body_rules(), None)]),
+        ),
+        (
+            "transformer overridden after the cache",
+            compose(vec![cache(None), transformer(body_rules(), Some(4100))]),
+        ),
+        (
+            "transformer at the cache's priority",
+            compose(vec![
+                cache(None),
+                transformer(
+                    body_rules(),
+                    Some(ferrum_edge::plugins::priority::AI_SEMANTIC_CACHE),
+                ),
+            ]),
+        ),
+    ] {
+        let candidate_error =
+            validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+                .expect_err(label);
+        assert!(
+            candidate_error.contains("must run before every ai_semantic_cache instance")
+                && candidate_error.contains("request_transformer"),
+            "{label}: {candidate_error}"
+        );
+        let runtime_error = PluginCache::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("{label}: runtime cache must repeat the refusal"));
+        assert!(
+            runtime_error.contains("must run before every ai_semantic_cache instance"),
+            "{label}: {runtime_error}"
+        );
+    }
+
+    for (label, config) in [
+        (
+            "default ordering",
+            compose(vec![transformer(body_rules(), None), cache(None)]),
+        ),
+        (
+            "header-only transformer after the cache",
+            compose(vec![cache(None), transformer(header_rules(), Some(4100))]),
+        ),
+    ] {
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+            .unwrap_or_else(|error| panic!("{label} must be admitted: {error}"));
+        if let Err(error) = PluginCache::new(&config) {
+            panic!("{label} must build at runtime: {error}");
+        }
+    }
+}
+
 #[test]
 fn candidate_security_validation_constructs_custom_capabilities_without_builtin_gate() {
     let source = include_str!("../../../src/plugin_cache.rs");
@@ -5316,6 +6074,211 @@ fn finalized_request_policy_candidate_inventory_covers_every_builtin_override() 
             "{plugin_name} must appear in exactly one candidate inventory \
              (SECURITY_COMPOSITION_PLUGIN_NAMES or FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS); \
              full={in_full} cheap={in_cheap}"
+        );
+    }
+}
+
+/// Built-ins whose `request_headers_to_redact()` names are deliberately not
+/// candidate-visible: candidate admission neither constructs them nor gives
+/// them a stand-in credential parser. Each entry names the only header the
+/// plugin can publish, and that header must be one `opa`
+/// `decision_request_headers` already refuses at config parse, so the
+/// candidate-time `opa` obligation refusal cannot miss it.
+const CREDENTIAL_PUBLISHER_CANDIDATE_EXEMPTIONS: &[(&str, &str)] = &[
+    // `ldap_auth` always publishes exactly `authorization`.
+    ("ldap_auth", "authorization"),
+];
+
+/// The body of the function whose `fn` keyword starts at `fn_offset`, with
+/// line comments removed and whitespace squeezed out.
+fn squeezed_fn_body(source: &str, fn_offset: usize) -> Option<String> {
+    let after = &source[fn_offset..];
+    let open = after.find('{')?;
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, ch) in after[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                // Braces inside string or char literals are not parsed; an
+                // unbalanced one ends the scan instead of underflowing.
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &after[open + 1..close?];
+    Some(
+        body.lines()
+            .map(|line| line.split("//").next().unwrap_or(line))
+            .flat_map(str::chars)
+            .filter(|ch| !ch.is_whitespace())
+            .collect(),
+    )
+}
+
+/// The name a built-in plugin reports: the string literal after the nearest
+/// preceding `fn name(&self) -> &str {` or `impl_auth_plugin!(` invocation.
+fn reported_plugin_name(before: &str) -> Option<String> {
+    let marker = [
+        before.rfind("fn name(&self) -> &str {"),
+        before.rfind("impl_auth_plugin!("),
+    ]
+    .into_iter()
+    .flatten()
+    .max()?;
+    let rest = &before[marker..];
+    let rest = &rest[rest.find('"')? + 1..];
+    Some(rest[..rest.find('"')?].to_string())
+}
+
+fn collect_plugin_sources(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+    for entry in std::fs::read_dir(dir).expect("plugin source directory must be readable") {
+        let path = entry.expect("directory entry").path();
+        if path.is_dir() {
+            collect_plugin_sources(&path, out);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            let source = std::fs::read_to_string(&path).expect("read plugin source");
+            out.push((path, source));
+        }
+    }
+}
+
+#[test]
+fn every_request_header_redaction_publisher_is_candidate_visible() {
+    // `opa` refuses a `decision_request_headers` destination that any plugin
+    // on the chain publishes through `request_headers_to_redact()`, and the
+    // admin write sees only the candidate view of that chain. A built-in that
+    // publishes credential names but is neither fully constructed
+    // (SECURITY_COMPOSITION_PLUGIN_NAMES) nor given a stand-in parser in the
+    // cheap finalized-policy view would let a write persist an obligation that
+    // every later cache rebuild refuses. Pin every production override.
+    let cache_source = include_str!("../../../src/plugin_cache.rs");
+    let bounded = |start: &str, end: &str| -> &'static str {
+        let from = cache_source
+            .find(start)
+            .unwrap_or_else(|| panic!("{start} must exist"));
+        let to = cache_source[from..]
+            .find(end)
+            .map(|offset| from + offset)
+            .unwrap_or_else(|| panic!("{start} must terminate"));
+        &cache_source[from..to]
+    };
+    let full_names = bounded("const SECURITY_COMPOSITION_PLUGIN_NAMES", "];");
+    let cheap_specs = bounded("const FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS", "];");
+    let stand_in_parsers = bounded(
+        "let credential_headers = match spec.name {",
+        "_ => Ok(Vec::new()),",
+    );
+
+    let plugins_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugins");
+    let mut sources = Vec::new();
+    collect_plugin_sources(&plugins_dir, &mut sources);
+
+    let mut publishers: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for (path, source) in &sources {
+        let mut offset = 0;
+        while let Some(found) = source[offset..].find("fn request_headers_to_redact(&self)") {
+            let at = offset + found;
+            offset = at + "fn request_headers_to_redact(&self)".len();
+            let body = squeezed_fn_body(source, at)
+                .unwrap_or_else(|| panic!("{}: request_headers_to_redact() body", path.display()));
+            // The `Plugin` trait default publishes nothing.
+            if body == "&[]" {
+                continue;
+            }
+            let name = reported_plugin_name(&source[..at]).unwrap_or_else(|| {
+                panic!(
+                    "{}: request_headers_to_redact() override must follow the plugin's name()",
+                    path.display()
+                )
+            });
+            publishers.push((name, path.clone()));
+        }
+    }
+    publishers.sort();
+    publishers.dedup();
+    assert!(
+        publishers.iter().any(|(name, _)| name == "key_auth")
+            && publishers.iter().any(|(name, _)| name == "waf"),
+        "the scan must find the known macro-implemented and direct publishers: {publishers:?}"
+    );
+
+    for (name, path) in &publishers {
+        let quoted = format!("\"{name}\"");
+        let constructed = full_names.contains(&quoted);
+        let parsed = cheap_specs.contains(&quoted)
+            && stand_in_parsers
+                .find(&format!("{quoted} =>"))
+                .map(|start| {
+                    let arm = &stand_in_parsers[start + quoted.len() + 3..];
+                    &arm[..arm.find("=>").unwrap_or(arm.len())]
+                })
+                .is_some_and(|arm| arm.contains("credential_headers_for_composition("));
+        let exemption = CREDENTIAL_PUBLISHER_CANDIDATE_EXEMPTIONS
+            .iter()
+            .find(|(exempt, _)| exempt == name);
+        assert!(
+            constructed || parsed || exemption.is_some(),
+            "{name} ({}) publishes request_headers_to_redact() but candidate admission cannot \
+             see it: add it to SECURITY_COMPOSITION_PLUGIN_NAMES, give its \
+             FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS entry a credential_headers_for_composition \
+             stand-in parser, or record a reserved-name exemption",
+            path.display()
+        );
+        assert!(
+            exemption.is_none() || !(constructed || parsed),
+            "{name} is candidate-visible, so its exemption is stale"
+        );
+    }
+
+    for (exempt, header) in CREDENTIAL_PUBLISHER_CANDIDATE_EXEMPTIONS {
+        let (_, path) = publishers
+            .iter()
+            .find(|(name, _)| name == exempt)
+            .unwrap_or_else(|| panic!("exemption {exempt} names no current publisher"));
+        let source = std::fs::read_to_string(path).expect("read exempt plugin source");
+        let squeezed: String = source.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let published = format!("request_headers_to_redact:vec![\"{header}\".to_string()],");
+        let mut initializers = 0;
+        let mut rest = squeezed.as_str();
+        while let Some(at) = rest.find("request_headers_to_redact:") {
+            let tail = &rest[at..];
+            if !tail.starts_with("request_headers_to_redact:Vec<String>,") {
+                assert!(
+                    tail.starts_with(&published),
+                    "{exempt} may publish only {header:?}: {}",
+                    tail.chars().take(120).collect::<String>()
+                );
+                initializers += 1;
+            }
+            rest = &tail["request_headers_to_redact:".len()..];
+        }
+        assert!(initializers >= 1, "{exempt}: publisher initializer");
+        assert!(
+            !squeezed.contains("request_headers_to_redact.push(")
+                && !squeezed.contains("request_headers_to_redact.extend("),
+            "{exempt} must not grow its published names at runtime"
+        );
+
+        let opa = |destination: &str| {
+            json!({
+                "opa_host": "http://127.0.0.1:8181",
+                "policy_path": "ferrum/authz/allow",
+                "decision_request_headers": [destination],
+            })
+        };
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("opa", &opa("x-tenant")).is_ok(),
+            "control: an ordinary obligation destination is accepted"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("opa", &opa(header)).is_err(),
+            "opa must refuse {header:?} at parse, which is what exempts {exempt}"
         );
     }
 }
@@ -6643,7 +7606,7 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
     assert!(
         error
             .to_string()
-            .contains("jwt_auth: unknown config key \"audience\""),
+            .contains("jwt_auth: `config`: unknown configuration key(s): \"config.audience\""),
         "unexpected reload error: {error}"
     );
 
@@ -6663,7 +7626,7 @@ async fn rejected_staged_jwks_candidate_cannot_leave_stricter_policy_on_live_sto
 
     let server = wiremock::MockServer::start().await;
     let uri = format!("{}/staged-policy/jwks.json", server.uri());
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache_for_test();
 
     let published_max_stale = Duration::from_secs(7_200);
@@ -8533,7 +9496,7 @@ fn test_apply_delta_invalid_optional_proxy_scoped_plugin_shadows_global() {
         ],
         vec![make_plugin_config(
             "global-stdout",
-            "stdout_logging",
+            "transaction_debugger",
             PluginScope::Global,
             None,
             true,
@@ -8549,14 +9512,14 @@ fn test_apply_delta_invalid_optional_proxy_scoped_plugin_shadows_global() {
         vec![
             make_plugin_config(
                 "global-stdout",
-                "stdout_logging",
+                "transaction_debugger",
                 PluginScope::Global,
                 None,
                 true,
             ),
             make_plugin_config_with_json(
                 "bad-stdout",
-                "stdout_logging",
+                "transaction_debugger",
                 json!("bad-config"),
                 PluginScope::Proxy,
                 Some("p1"),
@@ -8595,7 +9558,7 @@ fn test_apply_delta_invalid_optional_proxy_group_plugin_shadows_global() {
         ],
         vec![make_plugin_config(
             "global-stdout",
-            "stdout_logging",
+            "transaction_debugger",
             PluginScope::Global,
             None,
             true,
@@ -8611,14 +9574,14 @@ fn test_apply_delta_invalid_optional_proxy_group_plugin_shadows_global() {
         vec![
             make_plugin_config(
                 "global-stdout",
-                "stdout_logging",
+                "transaction_debugger",
                 PluginScope::Global,
                 None,
                 true,
             ),
             make_plugin_config_with_json(
                 "bad-group",
-                "stdout_logging",
+                "transaction_debugger",
                 json!("bad-config"),
                 PluginScope::ProxyGroup,
                 None,
@@ -8781,6 +9744,180 @@ fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries(
                 .is_empty()
         );
     }
+}
+
+/// Issue #7198: the process-global named-schema registry is promoted only
+/// after every fallible step of a cache build. Committing before the
+/// lifecycle generations, the mesh exporter or the api_chargeback overflow
+/// reservations let a refused reload (for example an overflow budget that
+/// cannot reserve new rows) leave the registry on the rejected generation
+/// while the published cache stayed on the old one. The overflow refusal
+/// depends on process-global billing state, so the ordering is pinned
+/// structurally, like the other plugin-cache source guards in this file.
+#[test]
+fn named_schema_registry_commits_after_every_fallible_cache_build_step() {
+    let source = include_str!("../../../src/plugin_cache.rs");
+    let body = |start: &str, end: &str| -> &str {
+        source
+            .split(start)
+            .nth(1)
+            .and_then(|rest| rest.split(end).next())
+            .unwrap_or_else(|| panic!("missing {start}"))
+    };
+    let assert_commit_after = |name: &str, body: &str, steps: &[&str]| {
+        let commit = body
+            .find("registry::commit_reload()")
+            .unwrap_or_else(|| panic!("{name} must commit the registry"));
+        for step in steps {
+            let position = body
+                .find(step)
+                .unwrap_or_else(|| panic!("{name} must run {step}"));
+            assert!(
+                position < commit,
+                "{name}: {step} must run before commit_reload"
+            );
+        }
+    };
+
+    let full = body(
+        "fn build_inner_with_prior_states(",
+        "fn build_inner_with_existing_client(",
+    );
+    assert_commit_after(
+        "full build",
+        full,
+        &[
+            "Self::build_cache(",
+            "build_proxy_lifecycle_generations(",
+            "extract_mesh_bpf_metrics_exporter(&globals)",
+            "prepare_global_overflow_reservations(config)",
+        ],
+    );
+    let build_cache = body("fn build_cache(", "\n}\n");
+    assert!(
+        !build_cache.contains("commit_reload()"),
+        "build_cache must return its bracket open for the caller to commit"
+    );
+
+    let delta = body(
+        "fn build_delta_inner_with_country_mmdb_session(",
+        "pub fn apply_delta(",
+    );
+    assert_commit_after(
+        "delta build",
+        delta,
+        &[
+            "extract_mesh_bpf_metrics_exporter(&new_globals)",
+            "build_proxy_lifecycle_generations_with_advances(",
+            "prepare_global_overflow_reservations(config)",
+        ],
+    );
+}
+
+#[test]
+fn transaction_log_schema_delta_reload_rebuilds_proxy_group_schema_ref_consumers() {
+    // Regression: a proxy-group logger with `schema_ref` was retained across
+    // an incremental reload whenever its own row was unchanged, so it kept the
+    // schema compiled at construction after the referenced named definition
+    // changed — a newly added privacy `omit` never reached that sink.
+    use ferrum_edge::plugins::utils::log_schema::registry;
+
+    let _guard = registry::lock_for_tests();
+    registry::reset_for_tests();
+
+    let audit_v1 = json!({
+        "summary_type": "http",
+        "static_fields": { "schema_version": "v1" }
+    });
+    let definitions = |audit: serde_json::Value, extra: bool| {
+        let mut schemas = serde_json::Map::new();
+        schemas.insert("audit".to_string(), audit);
+        if extra {
+            schemas.insert("unrelated".to_string(), json!({}));
+        }
+        json!({ "schemas": schemas })
+    };
+    let schema_plugin = make_plugin_config_with_json(
+        "schemas",
+        "transaction_log_schema",
+        definitions(audit_v1.clone(), false),
+        PluginScope::Global,
+        None,
+    );
+    let group_logger = make_plugin_config_with_json(
+        "group-log",
+        "stdout_logging",
+        json!({ "schema_ref": "audit" }),
+        PluginScope::ProxyGroup,
+        None,
+    );
+    let proxies = || {
+        vec![
+            make_proxy("p1", "/api", vec!["group-log"]),
+            make_proxy("p2", "/web", vec!["group-log"]),
+        ]
+    };
+    let config_v1 = make_config(proxies(), vec![schema_plugin.clone(), group_logger.clone()]);
+    let cache = PluginCache::new(&config_v1).expect("initial cache");
+    let apply = |old: &GatewayConfig, new: &GatewayConfig| {
+        let delta = ConfigDelta::compute(old, new);
+        assert!(delta.global_plugin_configs_changed);
+        let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(old, new);
+        cache
+            .apply_delta(
+                new,
+                &proxy_ids,
+                &delta.removed_proxy_ids,
+                delta.global_plugin_configs_changed,
+            )
+            .expect("schema delta reload");
+    };
+    let group_ptr =
+        |proxy: &str| plugin_ptr_by_name(&cache.get_plugins("ferrum", proxy), "stdout_logging");
+    let original = group_ptr("p1");
+    assert_eq!(original, group_ptr("p2"), "one shared group instance");
+
+    // A global change that leaves the referenced definition byte-identical
+    // keeps the shared instance (and whatever state it holds).
+    let mut schema_same = schema_plugin.clone();
+    schema_same.config = definitions(audit_v1, true);
+    schema_same.updated_at += chrono::Duration::seconds(1);
+    let config_same = make_config(proxies(), vec![schema_same.clone(), group_logger.clone()]);
+    apply(&config_v1, &config_same);
+    assert_eq!(
+        group_ptr("p1"),
+        original,
+        "unchanged definition keeps the instance"
+    );
+    assert_eq!(group_ptr("p2"), original);
+
+    // Changing the referenced definition replaces the group instance, and the
+    // replacement is still shared by every associated proxy.
+    let mut schema_v2 = schema_same;
+    schema_v2.config = definitions(
+        json!({
+            "summary_type": "http",
+            "omit": ["client_ip", "consumer_username"],
+            "static_fields": { "schema_version": "v2" }
+        }),
+        true,
+    );
+    schema_v2.updated_at += chrono::Duration::seconds(1);
+    let config_v2 = make_config(proxies(), vec![schema_v2, group_logger]);
+    apply(&config_same, &config_v2);
+    let replaced = group_ptr("p1");
+    assert_ne!(
+        replaced, original,
+        "changed definition rebuilds the group logger"
+    );
+    assert_eq!(
+        replaced,
+        group_ptr("p2"),
+        "the rebuilt instance stays shared"
+    );
+    let audit = registry::lookup_named("audit").expect("audit committed");
+    assert!(audit.omits_tag("client_ip"));
+    assert!(audit.omits_tag("consumer_username"));
 }
 
 #[test]
@@ -9470,8 +10607,10 @@ fn test_priority_override_preserves_ws_parser_policy_and_framing() {
     let limits = limiter
         .websocket_size_limits()
         .expect("priority wrapper delegates parser policy");
-    assert_eq!(limits.max_frame_bytes, 65_536);
-    assert_eq!(limits.max_message_bytes, 262_144);
+    for direction in [&limits.client_to_backend, &limits.backend_to_client] {
+        assert_eq!(direction.max_frame_bytes, 65_536);
+        assert_eq!(direction.max_message_bytes, 262_144);
+    }
 }
 
 #[test]
@@ -10035,7 +11174,7 @@ fn test_request_conditional_unbounded_trailer_policy_follows_waf_exemptions() {
         vec![enforcing_response_header_waf(
             "waf1",
             "p1",
-            json!({ "paths": ["/internal/*"], "consumers": ["trusted-partner"] }),
+            json!({ "paths": ["/internal/*"], "consumers": ["trusted-partner"], "match": "any" }),
         )],
     );
     let cache = PluginCache::new(&config).unwrap();
@@ -10063,11 +11202,22 @@ fn test_request_conditional_unbounded_trailer_policy_follows_waf_exemptions() {
     // Consumer identity is established by the authentication phase, so this case
     // only resolves correctly because the request paths defer the decision to the
     // finalized request context instead of reading it at intake.
+    let mut partner = super::plugin_utils::create_test_consumer();
+    partner.username = "trusted-partner".to_string();
     let mut by_consumer = trailer_policy_ctx("GET", "/api/orders");
-    by_consumer.authenticated_identity = Some("trusted-partner".to_string());
+    by_consumer.identified_consumer = Some(Arc::new(partner));
     assert!(
         !view.unbounded_response_trailer_policy_applies(&by_consumer),
         "a consumer-exempt request must preserve its backend trailers"
+    );
+
+    // An unmapped external identity spelling the Consumer name is not exempt
+    // (GHSA-rxwj-x6c6-f4j5).
+    let mut external = trailer_policy_ctx("GET", "/api/orders");
+    external.authenticated_identity = Some("trusted-partner".to_string());
+    assert!(
+        view.unbounded_response_trailer_policy_applies(&external),
+        "an external identity must not inherit a Consumer exemption"
     );
 }
 
@@ -10972,10 +12122,16 @@ fn test_invalid_optional_proxy_group_plugin_still_shadows_global() {
             make_proxy("p2", "/web", vec![]),
         ],
         vec![
-            make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
+            make_plugin_config(
+                "g1",
+                "transaction_debugger",
+                PluginScope::Global,
+                None,
+                true,
+            ),
             make_plugin_config_with_json(
                 "group1",
-                "stdout_logging",
+                "transaction_debugger",
                 json!("bad-config"),
                 PluginScope::ProxyGroup,
                 None,
@@ -10991,7 +12147,7 @@ fn test_invalid_optional_proxy_group_plugin_still_shadows_global() {
     assert_eq!(cache.get_plugins("ferrum", "p2").len(), 1);
     assert_eq!(
         cache.get_plugins("ferrum", "p2")[0].name(),
-        "stdout_logging"
+        "transaction_debugger"
     );
 }
 
@@ -11158,7 +12314,7 @@ fn test_tcp_only_plugin_excluded_from_http() {
 fn test_udp_only_plugin_included_for_udp_excluded_from_others() {
     // udp_rate_limiting supports UDP_ONLY_PROTOCOLS
     let config = make_config(
-        vec![make_proxy("p1", "/udp-svc", vec!["ps1"])],
+        vec![make_udp_proxy("p1", vec!["ps1"], BackendScheme::Udp)],
         vec![make_plugin_config(
             "ps1",
             "udp_rate_limiting",
@@ -11235,9 +12391,11 @@ fn test_all_protocols_plugin_included_for_all_protocol_types() {
 #[test]
 fn test_mixed_protocol_plugins_filtered_correctly_per_protocol() {
     // tcp_connection_throttle = TCP_ONLY, udp_rate_limiting = UDP_ONLY,
-    // cors = HTTP_ONLY, stdout_logging = ALL_PROTOCOLS
+    // cors = HTTP_ONLY, stdout_logging = ALL_PROTOCOLS. The UDP limiter is a
+    // global policy: a proxy-scoped attachment to this TCP proxy is refused
+    // visibly, while a global one is filtered per protocol view.
     let config = make_config(
-        vec![make_tcp_proxy("p1", vec!["ps1", "ps2", "ps3", "ps4"])],
+        vec![make_tcp_proxy("p1", vec!["ps1", "ps3", "ps4"])],
         vec![
             make_plugin_config(
                 "ps1",
@@ -11246,13 +12404,7 @@ fn test_mixed_protocol_plugins_filtered_correctly_per_protocol() {
                 Some("p1"),
                 true,
             ),
-            make_plugin_config(
-                "ps2",
-                "udp_rate_limiting",
-                PluginScope::Proxy,
-                Some("p1"),
-                true,
-            ),
+            make_plugin_config("ps2", "udp_rate_limiting", PluginScope::Global, None, true),
             make_plugin_config("ps3", "cors", PluginScope::Proxy, Some("p1"), true),
             make_plugin_config(
                 "ps4",
@@ -11342,6 +12494,113 @@ fn test_tcp_connection_throttle_rejects_udp_and_dtls_attachments() {
         .err()
         .expect("HTTP-family attachment must fail visibly");
     assert!(error.contains("HTTP-family"), "{error}");
+}
+
+/// `udp_rate_limiting` is a datagram hook only. A proxy/proxy-group attachment
+/// to a TCP or HTTP-family proxy would be filtered out of every protocol view
+/// that proxy runs — configured protection that never enforces — so it must
+/// fail visibly, the mirror of `tcp_connection_throttle`'s rule. Globals keep
+/// per-protocol filtering.
+#[test]
+fn test_udp_rate_limiting_rejects_tcp_and_http_attachments() {
+    for (label, proxy) in [
+        ("http", make_proxy("p1", "/api", vec!["udp-rl"])),
+        ("tcp", make_tcp_proxy("p1", vec!["udp-rl"])),
+    ] {
+        let config = make_config(
+            vec![proxy],
+            vec![make_plugin_config(
+                "udp-rl",
+                "udp_rate_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            )],
+        );
+        let error = PluginCache::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("{label}: non-UDP attachment must fail visibly"));
+        assert!(error.contains("udp_rate_limiting"), "{label}: {error}");
+        assert!(
+            error.contains("only UDP/DTLS is supported"),
+            "{label}: {error}"
+        );
+
+        let mut disabled = config.clone();
+        disabled.plugin_configs[0].enabled = false;
+        PluginCache::new(&disabled)
+            .unwrap_or_else(|error| panic!("{label}: a disabled attachment is inert: {error}"));
+    }
+
+    for scheme in [BackendScheme::Udp, BackendScheme::Dtls] {
+        let config = make_config(
+            vec![make_udp_proxy("p1", vec!["udp-rl"], scheme)],
+            vec![make_plugin_config(
+                "udp-rl",
+                "udp_rate_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            )],
+        );
+        PluginCache::new(&config)
+            .unwrap_or_else(|error| panic!("{scheme:?} attachment is supported: {error}"));
+    }
+
+    let global_over_http = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config(
+            "udp-rl",
+            "udp_rate_limiting",
+            PluginScope::Global,
+            None,
+            true,
+        )],
+    );
+    PluginCache::new(&global_over_http)
+        .expect("a global UDP limiter keeps per-protocol filtering in a mixed deployment");
+}
+
+/// Fix round 2 (PR6868-MUSE-5): a global `udp_rate_limiting` keeps
+/// per-protocol filtering, but one with no UDP/DTLS proxy at all is inert and
+/// says so.
+#[test]
+fn test_global_udp_rate_limiting_without_udp_proxy_warns() {
+    const WARNING: &str = "has no UDP/DTLS proxy to protect";
+    let global = || {
+        make_plugin_config(
+            "udp-rl",
+            "udp_rate_limiting",
+            PluginScope::Global,
+            None,
+            true,
+        )
+    };
+
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    PluginCache::new(&make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![global()],
+    ))
+    .expect("an inert global UDP limiter still loads");
+    drop(guard);
+    assert!(logs.contents().contains(WARNING), "{}", logs.contents());
+
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    PluginCache::new(&make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_udp_proxy("p2", vec![], BackendScheme::Udp),
+        ],
+        vec![global()],
+    ))
+    .expect("a mixed deployment loads");
+    drop(guard);
+    assert!(
+        !logs.contents().contains(WARNING),
+        "a global limiter that covers a UDP proxy is not inert: {}",
+        logs.contents()
+    );
 }
 
 #[test]
@@ -11457,7 +12716,7 @@ async fn test_tcp_connection_throttle_partial_rejection_rolls_back_all_instances
     let mut wide = make_plugin_config_with_json(
         "wide",
         "tcp_connection_throttle",
-        json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0}),
+        json!({"max_connections_per_key": 2}),
         PluginScope::Proxy,
         Some("p1"),
     );
@@ -11465,7 +12724,7 @@ async fn test_tcp_connection_throttle_partial_rejection_rolls_back_all_instances
     let mut strict = make_plugin_config_with_json(
         "strict",
         "tcp_connection_throttle",
-        json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+        json!({"max_connections_per_key": 1}),
         PluginScope::Proxy,
         Some("p1"),
     );
@@ -11493,6 +12752,58 @@ async fn test_tcp_connection_throttle_partial_rejection_rolls_back_all_instances
     assert_eq!(cache.total_rate_limiter_keys(), 0);
 }
 
+/// `/admin/metrics` reports live occupancy, not just distinct keys: one key
+/// holding two connections counts two, across every configured policy.
+#[tokio::test]
+async fn test_tcp_connection_throttle_active_connections_counts_live_permits() {
+    let config = make_config(
+        vec![make_tcp_proxy("p1", vec!["wide", "strict"])],
+        vec![
+            make_plugin_config_with_json(
+                "wide",
+                "tcp_connection_throttle",
+                json!({"max_connections_per_key": 2}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "strict",
+                "tcp_connection_throttle",
+                json!({"max_connections_per_key": 5}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    assert_eq!(cache.tcp_connection_throttle_active_connections(), 0);
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
+    assert_eq!(plugins.len(), 2);
+
+    let mut first = make_tcp_stream_context("10.0.0.1");
+    assert!(run_tcp_connect_chain(&plugins, &mut first).await);
+    let mut second = make_tcp_stream_context("10.0.0.1");
+    assert!(run_tcp_connect_chain(&plugins, &mut second).await);
+    // Two connections under one key in each of two policies: four permits,
+    // while the distinct-key view sees only one key per policy.
+    assert_eq!(cache.tcp_connection_throttle_active_connections(), 4);
+    assert_eq!(cache.total_rate_limiter_keys(), 2);
+
+    // A refused connection holds nothing.
+    let mut refused = make_tcp_stream_context("10.0.0.1");
+    assert!(!run_tcp_connect_chain(&plugins, &mut refused).await);
+    assert_eq!(cache.tcp_connection_throttle_active_connections(), 4);
+
+    let mut other = make_tcp_stream_context("10.0.0.2");
+    assert!(run_tcp_connect_chain(&plugins, &mut other).await);
+    assert_eq!(cache.tcp_connection_throttle_active_connections(), 6);
+
+    first.release_admission_permits();
+    second.release_admission_permits();
+    other.release_admission_permits();
+    assert_eq!(cache.tcp_connection_throttle_active_connections(), 0);
+}
+
 #[tokio::test]
 async fn test_tcp_connection_throttle_full_reload_preserves_live_admissions() {
     let initial = make_config(
@@ -11500,7 +12811,7 @@ async fn test_tcp_connection_throttle_full_reload_preserves_live_admissions() {
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -11532,7 +12843,7 @@ async fn test_tcp_connection_throttle_delta_reload_applies_new_limit_to_shared_s
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -11543,8 +12854,7 @@ async fn test_tcp_connection_throttle_delta_reload_applies_new_limit_to_shared_s
     assert!(run_tcp_connect_chain(&old_plugins, &mut old_connection).await);
 
     let mut replacement = initial.clone();
-    replacement.plugin_configs[0].config =
-        json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0});
+    replacement.plugin_configs[0].config = json!({"max_connections_per_key": 2});
     replacement.plugin_configs[0].updated_at = Utc::now();
     cache
         .apply_delta(
@@ -11572,7 +12882,7 @@ async fn test_tcp_connection_throttle_decreased_limit_waits_for_old_permits_to_d
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 2}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -11585,8 +12895,7 @@ async fn test_tcp_connection_throttle_decreased_limit_waits_for_old_permits_to_d
     assert!(run_tcp_connect_chain(&old_plugins, &mut second).await);
 
     let mut replacement = initial.clone();
-    replacement.plugin_configs[0].config =
-        json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0});
+    replacement.plugin_configs[0].config = json!({"max_connections_per_key": 1});
     cache.rebuild(&replacement).unwrap();
     let new_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut blocked = make_tcp_stream_context("10.0.0.5");
@@ -11605,7 +12914,7 @@ async fn test_tcp_connection_throttle_scope_move_keeps_same_proxy_accounting() {
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -11634,7 +12943,7 @@ async fn test_tcp_connection_throttle_rejected_reload_keeps_old_generation() {
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -11662,7 +12971,7 @@ async fn test_tcp_connection_throttle_removed_policy_is_generation_isolated() {
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -11801,6 +13110,33 @@ fn test_modifies_request_headers_flag_computed() {
         caps.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS),
         "request_transformer should set MODIFIES_REQUEST_HEADERS"
     );
+}
+
+#[test]
+fn request_transformer_joins_the_websocket_handshake_view() {
+    // request_transformer-SOL-3: header/query rules (and route-header
+    // finalization) must run on WebSocket handshakes too.
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "request_transformer",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let websocket = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::WebSocket);
+    assert!(
+        websocket
+            .iter()
+            .any(|plugin| plugin.name() == "request_transformer"),
+        "the WebSocket view must carry request_transformer"
+    );
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::WebSocket);
+    assert!(caps.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS));
 }
 
 #[test]
@@ -12149,6 +13485,34 @@ fn test_third_party_correlation_capability_cannot_claim_reserved_header() {
 }
 
 #[test]
+fn test_third_party_correlation_capability_cannot_claim_stripped_gateway_owned_headers() {
+    // Composition admission shares the constructor's reservation: backend
+    // gateway assertions (stripped and regenerated by outbound refresh) and the
+    // literal X-Real-IP (dropped for untrusted peers) can never carry a
+    // correlation ID to the backend, whatever FERRUM_REAL_IP_HEADER says.
+    for claim in [
+        "x-geo-country",
+        " X_Geo_Country ",
+        "x_geo-country",
+        "X-Authenticated-Identity",
+        " X-Real-IP ",
+    ] {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RawCorrelationClaimPlugin { claim })];
+        for real_ip_header in [None, Some("cf-connecting-ip")] {
+            let error = validate_correlation_id_composition_with_real_ip_header_for_test(
+                &plugins,
+                real_ip_header,
+            )
+            .expect_err("a stripped gateway-owned correlation claim must fail closed");
+            assert!(
+                error.contains("reserved protocol-managed or security-sensitive header ownership"),
+                "{claim:?} / {real_ip_header:?}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_shipped_custom_correlation_plugin_cannot_claim_reserved_header() {
     if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
         return;
@@ -12250,7 +13614,7 @@ fn test_modifies_request_headers_flag_false_when_no_plugin_modifies() {
 }
 
 #[test]
-fn test_decoded_query_params_capability_preserved_with_priority_override() {
+fn test_query_predicate_hint_preserved_with_priority_override() {
     let mut plugin_config = make_plugin_config_with_json(
         "ps1",
         "mesh_route_dispatch",
@@ -12270,47 +13634,14 @@ fn test_decoded_query_params_capability_preserved_with_priority_override() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let dispatch = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "mesh_route_dispatch")
+        .expect("mesh_route_dispatch is cached");
     assert!(
-        caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
-        "mesh_route_dispatch query-param rules must opt HTTP/3 into decoded query materialization"
-    );
-}
-
-#[test]
-fn test_key_auth_query_location_enables_decoded_h3_query_capability() {
-    let query_config = make_config(
-        vec![make_proxy("p1", "/api", vec!["keyauth"])],
-        vec![make_plugin_config_with_json(
-            "keyauth",
-            "key_auth",
-            json!({"key_location": "query:api_key"}),
-            PluginScope::Proxy,
-            Some("p1"),
-        )],
-    );
-    let query_cache = PluginCache::new(&query_config).unwrap();
-    assert!(
-        query_cache
-            .get_capabilities("ferrum", "p1", ProxyProtocol::Http)
-            .has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS)
-    );
-
-    let header_config = make_config(
-        vec![make_proxy("p1", "/api", vec!["keyauth"])],
-        vec![make_plugin_config_with_json(
-            "keyauth",
-            "key_auth",
-            json!({"key_location": "header:X-API-Key"}),
-            PluginScope::Proxy,
-            Some("p1"),
-        )],
-    );
-    let header_cache = PluginCache::new(&header_config).unwrap();
-    assert!(
-        !header_cache
-            .get_capabilities("ferrum", "p1", ProxyProtocol::Http)
-            .has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS)
+        dispatch.requires_decoded_query_params(),
+        "priority_override must forward the query-predicate hint early route-total planning reads"
     );
 }
 
@@ -12320,7 +13651,7 @@ fn test_opa_body_buffering_is_deferred_until_after_authentication() {
         "ps1",
         "opa",
         json!({
-            "opa_host": "http://opa.internal:8181",
+            "opa_host": "https://opa.internal:8181",
             "policy_path": "ferrum/authz/allow",
             "include_body": true,
             "max_body_bytes": 4096
@@ -12362,7 +13693,7 @@ fn test_opa_is_cached_for_grpc_and_websocket_protocols() {
         "ps1",
         "opa",
         json!({
-            "opa_host": "http://opa.internal:8181",
+            "opa_host": "https://opa.internal:8181",
             "policy_path": "ferrum/authz/allow",
         }),
         PluginScope::Proxy,
@@ -12407,6 +13738,31 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
         caps.has(PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT),
         "WAF plugin must set NEEDS_FINAL_REQUEST_BODY_CONTEXT so the proxy \
          passes a mutable RequestContext into on_final_request_body hooks"
+    );
+}
+
+#[test]
+fn request_transformer_body_rules_select_the_context_aware_body_hook() {
+    // PR #6858 review SOL-2: a chain whose only body plugin is a
+    // request_transformer must still route H1/H2 through the context-aware
+    // transform so `request_transformer.body_skipped` is published.
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config_with_json(
+            "ps1",
+            "request_transformer",
+            json!({"rules": [{"operation": "remove", "target": "body", "key": "internal.secret"}]}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
+    assert!(caps.has(PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT));
+    assert!(caps.has(PluginCapabilities::MODIFIES_REQUEST_BODY));
+    assert!(
+        !caps.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS),
+        "body rules alone must not force the per-request header-map copy"
     );
 }
 
@@ -12472,7 +13828,7 @@ fn test_ai_federation_sets_terminal_final_body_and_finalized_egress_capabilities
 }
 
 #[test]
-fn test_decoded_query_params_capability_false_for_method_only_route_dispatch() {
+fn test_query_predicate_hint_false_for_method_only_route_dispatch() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["ps1"])],
         vec![make_plugin_config_with_json(
@@ -12490,18 +13846,21 @@ fn test_decoded_query_params_capability_false_for_method_only_route_dispatch() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let dispatch = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "mesh_route_dispatch")
+        .expect("mesh_route_dispatch is cached");
     assert!(
-        !caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
-        "method/header-only route dispatch must preserve HTTP/3 raw query materialization"
+        !dispatch.requires_decoded_query_params(),
+        "method/header-only route dispatch declares no query predicate"
     );
 }
 
 #[test]
-fn test_request_transformer_query_rules_do_not_set_decoded_h3_query_capability() {
-    // Ordered query rules parse retained raw/outbound query themselves. Opting
-    // into the shared pre-auth decoded map would change key_auth/JWT/HMAC and
-    // cache/policy acceptance merely by attaching an unrelated transformer.
+fn test_request_transformer_query_rules_do_not_declare_query_predicates() {
+    // Ordered query rules parse the retained raw/outbound query themselves;
+    // they mutate the query rather than decide on it.
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["ps1"])],
         vec![make_plugin_config_with_json(
@@ -12518,11 +13877,6 @@ fn test_request_transformer_query_rules_do_not_set_decoded_h3_query_capability()
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
-    assert!(
-        !caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
-        "request_transformer query rules must preserve HTTP/3 raw pre-auth query materialization"
-    );
     let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     let transformer = plugins
         .iter()
@@ -12535,7 +13889,7 @@ fn test_request_transformer_query_rules_do_not_set_decoded_h3_query_capability()
 fn test_requires_udp_datagram_hooks_flag_with_udp_rate_limiting() {
     // udp_rate_limiting returns true for requires_udp_datagram_hooks()
     let config = make_config(
-        vec![make_proxy("p1", "/udp-svc", vec!["ps1"])],
+        vec![make_udp_proxy("p1", vec!["ps1"], BackendScheme::Udp)],
         vec![make_plugin_config(
             "ps1",
             "udp_rate_limiting",
@@ -12601,12 +13955,6 @@ fn test_auth_plugins_precomputed_for_protocol() {
     let auth = cache.get_auth_plugins("ferrum", "p1", ProxyProtocol::Http);
     assert_eq!(auth.len(), 1);
     assert_eq!(auth[0].name(), "key_auth");
-
-    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
-    assert!(
-        caps.has(PluginCapabilities::HAS_AUTH_PLUGINS),
-        "key_auth should set HAS_AUTH_PLUGINS"
-    );
 
     // TCP should not have key_auth (HTTP_FAMILY only)
     let tcp_auth = cache.get_auth_plugins("ferrum", "p1", ProxyProtocol::Tcp);
@@ -12740,10 +14088,6 @@ fn test_request_view_contains_all_precomputed_fields() {
     assert!(
         view.capabilities()
             .has(PluginCapabilities::MODIFIES_REQUEST_HEADERS)
-    );
-    assert!(
-        view.capabilities()
-            .has(PluginCapabilities::HAS_AUTH_PLUGINS)
     );
 
     // Buffering flags
@@ -14434,18 +15778,28 @@ fn candidate_and_runtime_reject_every_runtime_composition_rule() {
 
 #[test]
 fn candidate_ordering_matches_runtime_for_ties_scopes_and_stream_only_interlopers() {
-    // Equal priorities follow config order for proxy instances, not association
-    // order. Put the interloper last in associations to expose that difference.
-    for middle_name in ["ip_restriction", "udp_rate_limiting"] {
+    // Equal priorities break ties by plugin name (issue #6614), so an
+    // equal-priority HTTP interloper sorts after both `cors` instances and can
+    // no longer split them, whatever the config or association order. A
+    // distinct middle priority still splits them, and only an HTTP interloper
+    // makes that an error. Admission and runtime must agree in every scope and
+    // under both input orders.
+    for (middle_name, middle_priority, expect_ok) in [
+        ("ip_restriction", 100, true),
+        ("ws_rate_limiting", 100, true),
+        ("ip_restriction", 150, false),
+        ("ws_rate_limiting", 150, true),
+    ] {
+        let last_priority = if middle_priority == 100 { 100 } else { 200 };
         let mut first = cors_config("a", &["GET"], &["X-Test"], Some(100), None);
-        let mut last = cors_config("b", &["GET"], &["X-Test"], Some(100), None);
+        let mut last = cors_config("b", &["GET"], &["X-Test"], Some(last_priority), None);
         let mut middle = make_plugin_config_with_priority(
             "middle",
             middle_name,
             PluginScope::Proxy,
             Some("p1"),
             true,
-            Some(100),
+            Some(middle_priority),
             None,
         );
         for scope in [
@@ -14457,28 +15811,24 @@ fn candidate_ordering_matches_runtime_for_ties_scopes_and_stream_only_interloper
                 pc.scope = scope.clone();
                 pc.proxy_id = (scope == PluginScope::Proxy).then(|| "p1".to_string());
             }
-            let associations = if scope == PluginScope::ProxyGroup {
-                vec!["a", "middle", "b"]
-            } else {
-                vec!["a", "b", "middle"]
-            };
-            let config = make_config(
-                vec![make_proxy("p1", "/api", associations)],
-                vec![first.clone(), middle.clone(), last.clone()],
-            );
-            let admission =
-                validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None);
-            let runtime = PluginCache::new(&config);
-            assert_eq!(
-                admission.is_ok(),
-                middle_name == "udp_rate_limiting",
-                "{middle_name}/{scope:?}: {admission:?}"
-            );
-            assert_eq!(
-                runtime.is_ok(),
-                admission.is_ok(),
-                "{middle_name}/{scope:?}"
-            );
+            for reversed in [false, true] {
+                let mut associations = vec!["a", "middle", "b"];
+                let mut plugin_configs = vec![first.clone(), middle.clone(), last.clone()];
+                if reversed {
+                    associations.reverse();
+                    plugin_configs.reverse();
+                }
+                let config =
+                    make_config(vec![make_proxy("p1", "/api", associations)], plugin_configs);
+                let label =
+                    format!("{middle_name}@{middle_priority}/{scope:?}/reversed={reversed}");
+                let admission = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+                    &config, None,
+                );
+                let runtime = PluginCache::new(&config);
+                assert_eq!(admission.is_ok(), expect_ok, "{label}: {admission:?}");
+                assert_eq!(runtime.is_ok(), admission.is_ok(), "{label}");
+            }
         }
     }
 }
@@ -14522,5 +15872,1703 @@ fn candidate_topology_does_not_open_node_local_geo_database() {
             error.contains("cors instances must remain contiguous"),
             "{error}"
         );
+    }
+}
+
+// ── Deterministic equal-priority ordering (issue #6614) ─────────────────────
+
+fn update_header_transformer(
+    id: &str,
+    value: &str,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+) -> PluginConfig {
+    make_plugin_config_with_json(
+        id,
+        "request_transformer",
+        json!({"rules": [{
+            "operation": "update",
+            "target": "header",
+            "key": "x-order",
+            "value": value
+        }]}),
+        scope,
+        proxy_id,
+    )
+}
+
+fn chain_names(cache: &PluginCache, proxy_id: &str) -> Vec<String> {
+    cache
+        .get_plugins("ferrum", proxy_id)
+        .iter()
+        .map(|plugin| plugin.name().to_string())
+        .collect()
+}
+
+async fn final_order_header(cache: &PluginCache, proxy_id: &str) -> Option<String> {
+    let plugins = cache.get_plugins_for_protocol("ferrum", proxy_id, ProxyProtocol::Http);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    for plugin in plugins.iter() {
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+    headers.get("x-order").cloned()
+}
+
+#[test]
+fn equal_priority_plugins_order_by_name_regardless_of_config_order() {
+    let mut size_limit = make_plugin_config(
+        "a-size",
+        "response_size_limiting",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    size_limit.priority_override = Some(500);
+    let mut ip_filter = make_plugin_config(
+        "z-ip",
+        "ip_restriction",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    ip_filter.priority_override = Some(500);
+
+    let forward = make_config(
+        vec![make_proxy("p1", "/api", vec!["a-size", "z-ip"])],
+        vec![size_limit.clone(), ip_filter.clone()],
+    );
+    let reversed = make_config(
+        vec![make_proxy("p1", "/api", vec!["z-ip", "a-size"])],
+        vec![ip_filter, size_limit],
+    );
+
+    let forward_names = chain_names(&PluginCache::new(&forward).unwrap(), "p1");
+    let reversed_names = chain_names(&PluginCache::new(&reversed).unwrap(), "p1");
+    assert_eq!(
+        forward_names,
+        vec!["ip_restriction", "response_size_limiting"]
+    );
+    assert_eq!(
+        forward_names, reversed_names,
+        "config row order must not reorder equal-priority plugins"
+    );
+}
+
+#[tokio::test]
+async fn same_plugin_instances_order_by_config_id_regardless_of_row_order() {
+    let a = update_header_transformer("rt-a", "a", PluginScope::Proxy, Some("p1"));
+    let b = update_header_transformer("rt-b", "b", PluginScope::Proxy, Some("p1"));
+
+    let forward = make_config(
+        vec![make_proxy("p1", "/api", vec!["rt-a", "rt-b"])],
+        vec![a.clone(), b.clone()],
+    );
+    let reversed = make_config(
+        vec![make_proxy("p1", "/api", vec!["rt-b", "rt-a"])],
+        vec![b, a],
+    );
+
+    // `update` is last-writer-wins, so the surviving value names the instance
+    // that ran last: ascending id order puts `rt-b` after `rt-a`.
+    let forward_cache = PluginCache::new(&forward).unwrap();
+    assert_eq!(
+        final_order_header(&forward_cache, "p1").await.as_deref(),
+        Some("b")
+    );
+    let reversed_cache = PluginCache::new(&reversed).unwrap();
+    assert_eq!(
+        final_order_header(&reversed_cache, "p1").await.as_deref(),
+        Some("b")
+    );
+
+    // A reload that only reorders rows keeps the same chain order.
+    forward_cache.rebuild(&reversed).unwrap();
+    assert_eq!(
+        final_order_header(&forward_cache, "p1").await.as_deref(),
+        Some("b")
+    );
+}
+
+#[tokio::test]
+async fn proxy_group_instances_order_by_config_id_regardless_of_association_order() {
+    let a = update_header_transformer("pg-a", "a", PluginScope::ProxyGroup, None);
+    let b = update_header_transformer("pg-b", "b", PluginScope::ProxyGroup, None);
+
+    let forward = make_config(
+        vec![make_proxy("p1", "/api", vec!["pg-a", "pg-b"])],
+        vec![a.clone(), b.clone()],
+    );
+    let reversed = make_config(
+        vec![make_proxy("p1", "/api", vec!["pg-b", "pg-a"])],
+        vec![b, a],
+    );
+
+    let forward_cache = PluginCache::new(&forward).unwrap();
+    let reversed_cache = PluginCache::new(&reversed).unwrap();
+    assert_eq!(
+        final_order_header(&forward_cache, "p1").await.as_deref(),
+        Some("b")
+    );
+    assert_eq!(
+        final_order_header(&reversed_cache, "p1").await.as_deref(),
+        Some("b")
+    );
+}
+
+// ---- PluginInstanceWrapper forwards every capability predicate (#6606) ----
+
+/// Build a single-plugin HTTP proxy whose instance carries a `priority_override`,
+/// so the cache publishes it inside `PluginInstanceWrapper`, and return that
+/// published instance.
+fn wrapped_http_instance(plugin_name: &str, config: serde_json::Value) -> Arc<dyn Plugin> {
+    let mut plugin = make_plugin_config_with_json(
+        "wrapped",
+        plugin_name,
+        config,
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin.priority_override = Some(4321);
+    let cache = PluginCache::new(&make_config(
+        vec![make_proxy("p1", "/api", vec!["wrapped"])],
+        vec![plugin],
+    ))
+    .unwrap_or_else(|error| panic!("{plugin_name} with priority_override must admit: {error}"));
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let instance = plugins
+        .iter()
+        .find(|plugin| plugin.name() == plugin_name)
+        .unwrap_or_else(|| panic!("{plugin_name} must be published"))
+        .clone();
+    assert_eq!(
+        instance.priority(),
+        4321,
+        "the published {plugin_name} instance must be the priority-override wrapper"
+    );
+    instance
+}
+
+#[test]
+fn wrapped_mtls_auth_still_declares_an_authenticated_stream_principal() {
+    let instance = wrapped_http_instance("mtls_auth", json!({"cert_field": "subject_cn"}));
+    assert!(
+        instance.admits_authenticated_stream_principal(),
+        "a priority-overridden mtls_auth must keep its stream-principal declaration"
+    );
+    assert!(
+        !ferrum_edge::_test_support::ktls_handoff_eligible_for_test(
+            true,
+            false,
+            false,
+            std::slice::from_ref(&instance),
+        ),
+        "a wrapped mtls_auth must keep the listener off the kTLS handoff"
+    );
+}
+
+#[test]
+fn wrapped_cors_keeps_its_strict_origin_policy_declaration() {
+    let instance = wrapped_http_instance(
+        "cors",
+        json!({"allowed_origins": ["https://trusted.example"]}),
+    );
+    assert!(instance.cors_uses_strict_origin_policy());
+}
+
+#[test]
+fn wrapped_response_caching_keeps_its_origin_response_declaration() {
+    let instance = wrapped_http_instance("response_caching", json!({"ttl_seconds": 60}));
+    assert!(instance.rejects_with_origin_response());
+}
+
+/// Names of the methods declared directly inside the first `{ ... }` block
+/// that follows `header` in `source` (a trait or an `impl` block).
+fn block_method_names(source: &str, header: &str) -> std::collections::BTreeSet<String> {
+    let start = source
+        .find(header)
+        .unwrap_or_else(|| panic!("{header} must exist"));
+    let body_start = start + header.len();
+    let end = source[body_start..]
+        .find("\n}\n")
+        .map(|offset| body_start + offset)
+        .unwrap_or_else(|| panic!("{header} block must terminate"));
+    source[body_start..end]
+        .lines()
+        .filter_map(|line| {
+            let rest = line
+                .strip_prefix("    async fn ")
+                .or_else(|| line.strip_prefix("    fn "))?;
+            let name: String = rest
+                .chars()
+                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+                .collect();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
+/// Every `Plugin` trait method must be overridden by `PluginInstanceWrapper`.
+/// A missing forward silently resolves to the trait default for any instance
+/// carrying a `priority_override` or trigger, which is how #6606 dropped
+/// `admits_authenticated_stream_principal` and two CORS/diagnostic predicates.
+#[test]
+fn plugin_instance_wrapper_forwards_every_plugin_trait_method() {
+    let trait_methods = block_method_names(
+        include_str!("../../../src/plugins/mod.rs"),
+        "pub trait Plugin: Any + Send + Sync {",
+    );
+    let wrapper_methods = block_method_names(
+        include_str!("../../../src/plugin_cache.rs"),
+        "impl Plugin for PluginInstanceWrapper {",
+    );
+    assert!(
+        trait_methods.len() > 100 && wrapper_methods.len() > 100,
+        "source scan must find the Plugin trait and the wrapper impl \
+         (trait={}, wrapper={})",
+        trait_methods.len(),
+        wrapper_methods.len()
+    );
+    // The wrapper is deliberately NOT the deferred-CORS marker; see the
+    // `PluginInstanceWrapper` docs in src/plugin_cache.rs.
+    const DELIBERATELY_NOT_FORWARDED: &[&str] = &["is_deferred_cors_wrapper"];
+    let missing: Vec<&String> = trait_methods
+        .iter()
+        .filter(|name| {
+            !wrapper_methods.contains(*name) && !DELIBERATELY_NOT_FORWARDED.contains(&name.as_str())
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "PluginInstanceWrapper must forward every Plugin trait method; missing: {missing:?}"
+    );
+    let stale: Vec<&String> = wrapper_methods
+        .iter()
+        .filter(|name| !trait_methods.contains(*name))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "PluginInstanceWrapper overrides names the Plugin trait no longer declares: {stale:?}"
+    );
+}
+
+/// A route-miss `404` has no proxy view, so its summary goes to the global
+/// access logs the cache precomputes: global, trigger-free `stdout_logging`
+/// instances only. A generation without one exposes nothing, which is what
+/// keeps the dispatchers' no-logger route miss allocation-free.
+#[test]
+fn unrouted_transaction_log_plugins_are_global_trigger_free_stdout_loggers() {
+    let without_global_logger = make_config(
+        vec![make_proxy("p1", "/api", vec!["scoped-log"])],
+        vec![
+            make_plugin_config(
+                "scoped-log",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "global-debugger",
+                "transaction_debugger",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&without_global_logger).unwrap();
+    assert!(
+        cache.unrouted_transaction_log_plugins().is_empty(),
+        "proxy-scoped loggers and other global sinks never receive route misses"
+    );
+
+    let trigger: PluginTrigger = serde_json::from_value(json!({
+        "when": {"match": {"method": ["GET"]}}
+    }))
+    .unwrap();
+    let with_global_logger = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![
+            make_plugin_config(
+                "global-log",
+                "stdout_logging",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+            make_plugin_config_with_priority(
+                "gated-log",
+                "stdout_logging",
+                PluginScope::Global,
+                None,
+                true,
+                None,
+                Some(trigger),
+            ),
+            make_plugin_config(
+                "global-debugger",
+                "transaction_debugger",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+        ],
+    );
+    cache.rebuild(&with_global_logger).unwrap();
+    let sinks = cache.unrouted_transaction_log_plugins();
+    assert_eq!(
+        sinks.len(),
+        1,
+        "only the trigger-free global stdout_logging instance receives route misses"
+    );
+    assert_eq!(sinks[0].name(), "stdout_logging");
+    assert!(!sinks[0].has_execution_trigger());
+
+    cache.rebuild(&without_global_logger).unwrap();
+    assert!(
+        cache.unrouted_transaction_log_plugins().is_empty(),
+        "removing the global logger restores the no-logger route-miss path"
+    );
+}
+
+#[tokio::test]
+async fn unrouted_correlation_policies_are_global_ordered_and_rebuilt() {
+    let mut early = make_plugin_config_with_json(
+        "global-early",
+        "correlation_id",
+        json!({"header_name": "x-internal-id", "inbound_policy": "generate"}),
+        PluginScope::Global,
+        None,
+    );
+    early.priority_override = Some(40);
+    let mut late = make_plugin_config_with_json(
+        "global-late",
+        "correlation_id",
+        json!({"header_name": "x-external-id"}),
+        PluginScope::Global,
+        None,
+    );
+    late.priority_override = Some(60);
+    let without_globals = make_config(
+        vec![make_proxy("p1", "/api", vec!["scoped-id"])],
+        vec![
+            make_plugin_config(
+                "scoped-id",
+                "correlation_id",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "disabled-id",
+                "correlation_id",
+                PluginScope::Global,
+                None,
+                false,
+            ),
+            make_plugin_config(
+                "global-log",
+                "stdout_logging",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&without_globals).unwrap();
+    assert!(cache.unrouted_correlation_plugins().is_empty());
+    let mut with_globals = without_globals.clone();
+    with_globals.plugin_configs.extend([late, early]);
+    cache.rebuild(&with_globals).unwrap();
+    let policies = cache.unrouted_correlation_plugins();
+    assert_eq!(policies.len(), 2);
+    assert_eq!(policies[0].priority(), 40);
+    assert_eq!(policies[1].priority(), 60);
+    for method in ["GET", "POST"] {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), method.into(), "/miss".into());
+        ctx.headers
+            .insert("x-external-id".into(), "client-123".into());
+        let headers = ferrum_edge::proxy::prepare_unrouted_correlation(&policies, &mut ctx).await;
+        let canonical = headers.get("x-internal-id").unwrap();
+        assert!(uuid::Uuid::parse_str(canonical).is_ok());
+        assert_eq!(ctx.metadata.get("request_id"), Some(canonical));
+        assert_eq!(
+            headers.get("x-external-id").map(String::as_str),
+            Some("client-123")
+        );
+        assert!(
+            !headers.contains_key("x-request-id"),
+            "scoped instance never runs"
+        );
+    }
+    cache.rebuild(&without_globals).unwrap();
+    assert!(cache.unrouted_correlation_plugins().is_empty());
+}
+
+// ── Trigger-skipped owners still sanitize gateway-owned request headers ─────
+
+/// Run one published chain the way the dispatchers do (`on_request_received`
+/// takes the trigger decision, `before_proxy` reuses it) and return the
+/// backend-bound header map.
+async fn backend_headers_after_before_proxy(
+    cache: &PluginCache,
+    ctx: &mut RequestContext,
+    mut headers: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let plugins = cache.get_plugins("ferrum", "p1");
+    for plugin in plugins.iter() {
+        plugin.on_request_received(ctx).await;
+    }
+    for plugin in plugins.iter() {
+        assert!(matches!(
+            plugin.before_proxy(ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+    headers
+}
+
+/// `None`: no trigger. `Some(method)`: a trigger selecting only `POST`, driven
+/// by a request with `method`, so `GET` is the skipped request.
+const OWNED_HEADER_TRIGGER_CASES: [Option<&str>; 3] = [None, Some("POST"), Some("GET")];
+
+fn post_only_trigger() -> PluginTrigger {
+    serde_json::from_value(json!({"when": {"match": {"method": ["POST"]}}})).unwrap()
+}
+
+/// Regression: a `jwks_auth` / `oauth2_introspection` / `oidc_relying_party`
+/// instance whose execution trigger skips a request must still remove the
+/// client copies of the `claim_headers` destinations it owns. Those headers are
+/// documented as gateway-owned and always sanitized, so a client that misses
+/// the trigger (for example a sibling `key_auth` consumer) must not be able to
+/// forward a forged `X-User-Email` to the backend. Before the fix the wrapper
+/// returned from `before_proxy` without running the only sanitizer.
+#[tokio::test]
+async fn trigger_skipped_claim_owning_auth_instance_still_strips_owned_destinations() {
+    for plugin_name in ["jwks_auth", "oauth2_introspection", "oidc_relying_party"] {
+        for case in OWNED_HEADER_TRIGGER_CASES {
+            let mut config = minimal_plugin_config(plugin_name);
+            config["providers"][0]["claim_headers"] = json!({"email": "X-User-Email"});
+            let mut auth = make_plugin_config_with_json(
+                "auth",
+                plugin_name,
+                config,
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            auth.trigger = case.map(|_| post_only_trigger());
+            let cache = PluginCache::new(&make_config(
+                vec![make_proxy("p1", "/", vec!["auth"])],
+                vec![auth],
+            ))
+            .unwrap_or_else(|error| panic!("{plugin_name}: {error}"));
+            let method = case.unwrap_or("GET");
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                method.to_string(),
+                "/api/orders".to_string(),
+            );
+            let forged = HashMap::from([
+                ("x-user-email".to_string(), "ceo@corp.example".to_string()),
+                ("X_User_Email".to_string(), "ceo@corp.example".to_string()),
+                ("x-unrelated".to_string(), "kept".to_string()),
+            ]);
+            let headers = backend_headers_after_before_proxy(&cache, &mut ctx, forged).await;
+
+            let skipped = case == Some("GET");
+            assert_eq!(
+                ctx.metadata
+                    .get("plugin_trigger.auth.skipped")
+                    .map(String::as_str),
+                skipped.then_some("true"),
+                "{plugin_name} {case:?}: unexpected trigger decision"
+            );
+            assert!(
+                !headers.keys().any(|name| {
+                    name.eq_ignore_ascii_case("x-user-email")
+                        || name.eq_ignore_ascii_case("x_user_email")
+                }),
+                "{plugin_name} {case:?}: a client claim-destination copy reached the backend"
+            );
+            assert_eq!(
+                headers.get("x-unrelated").map(String::as_str),
+                Some("kept"),
+                "{plugin_name} {case:?}: only owned destinations are sanitized"
+            );
+        }
+    }
+}
+
+/// An auth instance that owns no claim destination has nothing to sanitize: a
+/// skipped instance leaves a same-named client header alone, exactly as the
+/// untriggered instance does.
+#[tokio::test]
+async fn trigger_skipped_auth_instance_without_claim_headers_strips_nothing() {
+    for case in OWNED_HEADER_TRIGGER_CASES {
+        let mut auth = make_plugin_config_with_json(
+            "auth",
+            "jwks_auth",
+            minimal_plugin_config("jwks_auth"),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        auth.trigger = case.map(|_| post_only_trigger());
+        let cache = PluginCache::new(&make_config(
+            vec![make_proxy("p1", "/", vec!["auth"])],
+            vec![auth],
+        ))
+        .unwrap();
+        let method = case.unwrap_or("GET");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            method.to_string(),
+            "/api/orders".to_string(),
+        );
+        let client = HashMap::from([("x-user-email".to_string(), "me@example".to_string())]);
+        let headers = backend_headers_after_before_proxy(&cache, &mut ctx, client).await;
+        assert_eq!(
+            headers.get("x-user-email").map(String::as_str),
+            Some("me@example"),
+            "{case:?}"
+        );
+    }
+}
+
+/// Same contract for `spiffe_identity` `forward_identity`: the fixed
+/// `x-ferrum-peer-spiffe-id` header is gateway-owned on every request, so a
+/// trigger-skipped instance must still drop a client-chosen value.
+#[tokio::test]
+async fn trigger_skipped_spiffe_identity_still_strips_forwarded_identity_header() {
+    for case in OWNED_HEADER_TRIGGER_CASES {
+        let mut spiffe = make_plugin_config_with_json(
+            "sid",
+            "spiffe_identity",
+            json!({"forward_identity": true}),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        spiffe.trigger = case.map(|_| post_only_trigger());
+        let cache = PluginCache::new(&make_config(
+            vec![make_proxy("p1", "/", vec!["sid"])],
+            vec![spiffe],
+        ))
+        .unwrap();
+        let method = case.unwrap_or("GET");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            method.to_string(),
+            "/api/orders".to_string(),
+        );
+        let forged = HashMap::from([
+            (
+                "x-ferrum-peer-spiffe-id".to_string(),
+                "spiffe://corp.example/ns/admin/sa/root".to_string(),
+            ),
+            (
+                "X_Ferrum_Peer_Spiffe_Id".to_string(),
+                "spiffe://corp.example/ns/admin/sa/root".to_string(),
+            ),
+        ]);
+        let headers = backend_headers_after_before_proxy(&cache, &mut ctx, forged).await;
+        assert_eq!(
+            ctx.metadata
+                .get("plugin_trigger.sid.skipped")
+                .map(String::as_str),
+            (case == Some("GET")).then_some("true"),
+            "{case:?}: unexpected trigger decision"
+        );
+        assert!(
+            headers.is_empty(),
+            "{case:?}: a client SPIFFE identity copy reached the backend: {headers:?}"
+        );
+    }
+}
+
+/// Owned claim destinations join the route's request-trailer strip list,
+/// whatever any trigger decides: a trigger-excluded client cannot restate a
+/// gateway claim assertion (`claim_headers` or `output_claim_headers`) in
+/// request trailers, in any case or `_` spelling, on the H1/H2 upload seam or
+/// the H3 relays. Unrelated trailers survive, and claim destinations do not
+/// become credential names.
+#[tokio::test]
+async fn owned_claim_destinations_are_stripped_from_request_trailers() {
+    use ferrum_edge::_test_support::{
+        h1_h2_upload_source_forwarded_frames_for_route,
+        sanitized_backend_request_trailers_for_route,
+    };
+
+    let mut config = minimal_plugin_config("jwks_auth");
+    config["providers"][0]["claim_headers"] = json!({"email": "X-User-Email"});
+    config["providers"][0]["output_claim_headers"] = json!([
+        {"claim": "sub", "header": "X-User-Sub"}
+    ]);
+    let mut auth =
+        make_plugin_config_with_json("auth", "jwks_auth", config, PluginScope::Proxy, Some("p1"));
+    auth.trigger = Some(post_only_trigger());
+    let cache = PluginCache::new(&make_config(
+        vec![make_proxy("p1", "/", vec!["auth"])],
+        vec![auth],
+    ))
+    .unwrap();
+    let trailers = [
+        ("x-user-email", "ceo@corp.example"),
+        ("x_user_email", "ceo@corp.example"),
+        ("x-user-sub", "root"),
+        ("x-checksum", "keep"),
+    ];
+    let expected = vec![("x-checksum".to_string(), "keep".to_string())];
+    let mut views = vec![cache.grpc_web_request_view("ferrum", "p1")];
+    for protocol in [
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+    ] {
+        views.push(cache.request_view("ferrum", "p1", protocol));
+    }
+    for view in views {
+        assert!(
+            !view
+                .request_headers_to_redact()
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("x-user-email")),
+            "a claim destination is not a credential location"
+        );
+        let names = view.request_trailer_strip_headers();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (data, forwarded) =
+            h1_h2_upload_source_forwarded_frames_for_route(b"payload", &trailers, &names).await;
+        assert_eq!(data.as_slice(), b"payload");
+        assert_eq!(forwarded, expected, "{names:?}");
+        assert_eq!(
+            sanitized_backend_request_trailers_for_route(&trailers, &names),
+            expected
+        );
+    }
+}
+
+/// A trigger-admitted instance installs a verified claim. A trigger-skipped
+/// sibling owning the same destination (through `claim_headers` or
+/// `output_claim_headers`) must not erase it, in either priority order, while
+/// a client copy is still removed.
+#[tokio::test]
+async fn trigger_skipped_sibling_never_erases_an_admitted_instance_verified_claim() {
+    use super::jwks_auth_support::{build_rsa_jwks_from_pem, create_rs256_token};
+
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let admitted_config = json!({"providers": [{
+        "jwks": build_rsa_jwks_from_pem(public_key_pem),
+        "claim_headers": {"email": "X-User-Email"}
+    }]});
+    let claim_headers = json!({"claim_headers": {"email": "X-User-Email"}});
+    let output_claim_headers = json!({
+        "output_claim_headers": [{"claim": "email", "header": "X-User-Email"}]
+    });
+    let token = create_rs256_token(
+        &json!({"sub": "alice", "email": "verified@example.test"}),
+        private_key_pem,
+    );
+    let consumer_index = ferrum_edge::consumer_index::ConsumerIndex::new(&[]);
+    for ownership in [claim_headers, output_claim_headers] {
+        for (admitted_priority, skipped_priority) in [(1000, 1010), (1010, 1000)] {
+            let label = format!("{ownership} admitted={admitted_priority}");
+            let mut skipped_config = minimal_plugin_config("jwks_auth");
+            for (key, value) in ownership.as_object().unwrap() {
+                skipped_config["providers"][0][key] = value.clone();
+            }
+            let mut admitted = make_plugin_config_with_json(
+                "admitted",
+                "jwks_auth",
+                admitted_config.clone(),
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            admitted.priority_override = Some(admitted_priority);
+            let mut skipped = make_plugin_config_with_json(
+                "skipped",
+                "jwks_auth",
+                skipped_config,
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            skipped.priority_override = Some(skipped_priority);
+            skipped.trigger = Some(post_only_trigger());
+            let cache = PluginCache::new(&make_config(
+                vec![make_proxy("p1", "/", vec!["admitted", "skipped"])],
+                vec![admitted, skipped],
+            ))
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+            let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+            let plugins = view.plugins();
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "GET".to_string(),
+                "/api/orders".to_string(),
+            );
+            ctx.headers
+                .insert("authorization".to_string(), format!("Bearer {token}"));
+            ferrum_edge::_test_support::apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+            for plugin in plugins.iter() {
+                plugin.on_request_received(&mut ctx).await;
+            }
+            let rejection = ferrum_edge::proxy::run_authentication_phase(
+                AuthMode::Multi,
+                plugins.as_slice(),
+                &mut ctx,
+                &consumer_index,
+            )
+            .await;
+            assert!(
+                rejection.is_none(),
+                "{label}: the admitted instance authenticates"
+            );
+
+            let mut headers = ctx.headers.clone();
+            headers.insert("X_User_Email".to_string(), "ceo@corp.example".to_string());
+            let result = ferrum_edge::_test_support::run_before_proxy_hooks_for_test(
+                plugins.as_slice(),
+                &mut ctx,
+                &mut headers,
+            )
+            .await;
+            assert!(matches!(result, PluginResult::Continue), "{label}");
+            assert_eq!(
+                ctx.metadata
+                    .get("plugin_trigger.skipped.skipped")
+                    .map(String::as_str),
+                Some("true"),
+                "{label}: the sibling must be trigger-skipped"
+            );
+            assert_eq!(
+                headers.get("x-user-email").map(String::as_str),
+                Some("verified@example.test"),
+                "{label}: the verified claim must survive"
+            );
+            assert!(!headers.contains_key("X_User_Email"), "{label}");
+
+            // The authoritative final pass keeps the installed pair too.
+            ferrum_edge::_test_support::run_final_backend_header_policy_hooks_for_test(
+                plugins.as_slice(),
+                &ctx,
+                &mut headers,
+            );
+            assert_eq!(
+                headers.get("x-user-email").map(String::as_str),
+                Some("verified@example.test"),
+                "{label}: the final assertion pass keeps an installed claim"
+            );
+        }
+    }
+}
+
+/// OPA `decision_request_headers` join the route's request-trailer strip
+/// list too, and mark the route as owning asserted headers.
+#[tokio::test]
+async fn opa_decision_request_headers_are_stripped_from_request_trailers() {
+    use ferrum_edge::_test_support::{
+        h1_h2_upload_source_forwarded_frames_for_route,
+        sanitized_backend_request_trailers_for_route,
+    };
+
+    let mut config = minimal_plugin_config("opa");
+    config["decision_request_headers"] = json!(["X-Tenant"]);
+    let opa = make_plugin_config_with_json("opa", "opa", config, PluginScope::Proxy, Some("p1"));
+    let cache = PluginCache::new(&make_config(
+        vec![make_proxy("p1", "/", vec!["opa"])],
+        vec![opa],
+    ))
+    .unwrap();
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+    assert!(view.owns_request_assertion_headers());
+    assert!(
+        !view
+            .request_headers_to_redact()
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("x-tenant")),
+        "a decision header is not a credential location"
+    );
+    let names = view.request_trailer_strip_headers();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let trailers = [
+        ("x-tenant", "blue"),
+        ("x_tenant", "blue"),
+        ("x-checksum", "keep"),
+    ];
+    let expected = vec![("x-checksum".to_string(), "keep".to_string())];
+    let (_, forwarded) =
+        h1_h2_upload_source_forwarded_frames_for_route(b"payload", &trailers, &names).await;
+    assert_eq!(forwarded, expected);
+    assert_eq!(
+        sanitized_backend_request_trailers_for_route(&trailers, &names),
+        expected
+    );
+}
+
+/// Run one request through `plugin_configs` on proxy `p1` the way the
+/// dispatchers do (`on_request_received` on the request view the frontend
+/// selects, then the shared `before_proxy` funnel) and return the funnel's
+/// status: `None` for `Continue`, `Some(status)` for a rejection.
+async fn before_proxy_funnel_status(
+    plugin_configs: Vec<PluginConfig>,
+    content_type: &str,
+) -> Option<u16> {
+    use ferrum_edge::_test_support::{
+        apply_request_view_trailer_policy_for_test, run_before_proxy_hooks_for_test,
+        set_request_wire_protocol_for_test,
+    };
+    use ferrum_edge::config::types::HttpWireTransport;
+
+    let ids: Vec<String> = plugin_configs.iter().map(|pc| pc.id.clone()).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let cache = PluginCache::new(&make_config(
+        vec![make_proxy("p1", "/", ids)],
+        plugin_configs,
+    ))
+    .unwrap();
+    let is_grpc_web = content_type.starts_with("application/grpc-web");
+    let view = if is_grpc_web {
+        cache.grpc_web_request_view("ferrum", "p1")
+    } else {
+        cache.request_view("ferrum", "p1", ProxyProtocol::Http)
+    };
+    let plugins = view.plugins();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/svc.Echo/Call".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), content_type.to_string());
+    set_request_wire_protocol_for_test(&mut ctx, HttpWireTransport::Http2, is_grpc_web);
+    apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+    for plugin in plugins.iter() {
+        plugin.on_request_received(&mut ctx).await;
+    }
+    let mut headers = ctx.headers.clone();
+    match run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await {
+        PluginResult::Continue => None,
+        PluginResult::Reject { status_code, .. } => Some(status_code),
+        PluginResult::RejectBinary { status_code, .. } => Some(status_code),
+    }
+}
+
+const GRPC_WEB_BINARY: &str = "application/grpc-web+proto";
+const GRPC_WEB_TEXT: &str = "application/grpc-web-text+proto";
+
+fn grpc_web_translator() -> PluginConfig {
+    make_plugin_config_with_json("gw", "grpc_web", json!({}), PluginScope::Proxy, Some("p1"))
+}
+
+/// Untranslated gRPC-Web is forwarded byte-for-byte, body-embedded `0x80`
+/// trailer frame included, and only the `grpc_web` translator parses that
+/// frame. On a route that owns gateway-assertion request headers such a
+/// request is refused with `415` before any `before_proxy` hook runs, in
+/// binary and text framing. A translated request, a route without owned
+/// assertions, and a non-gRPC-Web request are unaffected.
+#[tokio::test]
+async fn untranslated_grpc_web_is_refused_on_a_route_owning_assertion_headers() {
+    // (translator present, claim-owning auth, request content type, refused)
+    let cases = [
+        (false, true, GRPC_WEB_BINARY, true),
+        (false, true, GRPC_WEB_TEXT, true),
+        (true, true, GRPC_WEB_BINARY, false),
+        (true, true, GRPC_WEB_TEXT, false),
+        (false, false, GRPC_WEB_BINARY, false),
+        (false, true, "application/json", false),
+    ];
+    for (translator, claim_owning, content_type, refused) in cases {
+        let label = format!("translator={translator} claims={claim_owning} {content_type}");
+        let mut auth_config = minimal_plugin_config("jwks_auth");
+        if claim_owning {
+            auth_config["providers"][0]["claim_headers"] = json!({"email": "X-User-Email"});
+        }
+        let mut plugin_configs = vec![make_plugin_config_with_json(
+            "auth",
+            "jwks_auth",
+            auth_config,
+            PluginScope::Proxy,
+            Some("p1"),
+        )];
+        if translator {
+            plugin_configs.push(grpc_web_translator());
+        }
+        let status = before_proxy_funnel_status(plugin_configs, content_type).await;
+        assert_eq!(status, refused.then_some(415), "{label}");
+    }
+}
+
+/// `spiffe_identity` with `forward_identity` owns `x-ferrum-peer-spiffe-id`
+/// on every request, so a SPIFFE-only route counts as owning an asserted
+/// header: untranslated gRPC-Web is refused there in binary and text framing,
+/// even when the instance's own trigger skips the request. `forward_identity:
+/// false` owns nothing, and a translator admits the request.
+#[tokio::test]
+async fn untranslated_grpc_web_is_refused_on_a_spiffe_forwarding_route() {
+    let path_trigger: PluginTrigger =
+        serde_json::from_value(json!({"when": {"match": {"path": {"prefix": ["/other"]}}}}))
+            .unwrap();
+    // (forward_identity, trigger skips the instance, translator, content type, refused)
+    let cases = [
+        (true, false, false, GRPC_WEB_BINARY, true),
+        (true, false, false, GRPC_WEB_TEXT, true),
+        (true, true, false, GRPC_WEB_BINARY, true),
+        (true, true, false, GRPC_WEB_TEXT, true),
+        (false, false, false, GRPC_WEB_BINARY, false),
+        (true, false, true, GRPC_WEB_BINARY, false),
+        (true, false, true, GRPC_WEB_TEXT, false),
+    ];
+    for (forward_identity, skipped, translator, content_type, refused) in cases {
+        let label = format!(
+            "forward={forward_identity} skipped={skipped} translator={translator} {content_type}"
+        );
+        let mut spiffe = make_plugin_config_with_json(
+            "sid",
+            "spiffe_identity",
+            json!({"forward_identity": forward_identity}),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        if skipped {
+            spiffe.trigger = Some(path_trigger.clone());
+        }
+        let mut plugin_configs = vec![spiffe];
+        if translator {
+            plugin_configs.push(grpc_web_translator());
+        }
+        let status = before_proxy_funnel_status(plugin_configs, content_type).await;
+        assert_eq!(status, refused.then_some(415), "{label}");
+    }
+}
+
+/// The trigger-skipped translator case cannot arise: `grpc_web` publishes a
+/// contextless response-trailer policy, so publication refuses a trigger on
+/// it, and an untranslated gRPC-Web request always means "no translator".
+#[test]
+fn grpc_web_translator_cannot_carry_an_execution_trigger() {
+    let mut translator = grpc_web_translator();
+    translator.trigger = Some(post_only_trigger());
+    let config = make_config(vec![make_proxy("p1", "/", vec!["gw"])], vec![translator]);
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("a triggered grpc_web translator must be refused");
+    assert!(error.contains("response-trailer"), "{error}");
+}
+
+/// One `request_transformer` header rule; `field` names the value-bearing key
+/// (`value` or `new_key`), empty for a removal.
+fn transformer_header_rule(
+    operation: &str,
+    key: &str,
+    field: &str,
+    value: &str,
+) -> serde_json::Value {
+    let mut rule = json!({"operation": operation, "target": "header", "key": key});
+    if !field.is_empty() {
+        rule[field] = json!(value);
+    }
+    rule
+}
+
+/// A `jwks_auth` instance with an inline (static) JWKS, so runtime cache
+/// construction needs no Tokio runtime (a `jwks_uri` provider starts a live
+/// JWKS refresher) and the synchronous admission tests exercise both
+/// boundaries.
+fn claim_owning_jwks(claims: bool) -> PluginConfig {
+    use super::jwks_auth_support::build_rsa_jwks_from_pem;
+
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let mut config = json!({"providers": [{"jwks": build_rsa_jwks_from_pem(public_key_pem)}]});
+    if claims {
+        config["providers"][0]["claim_headers"] = json!({"email": "X-User-Email"});
+    }
+    make_plugin_config_with_json("auth", "jwks_auth", config, PluginScope::Proxy, Some("p1"))
+}
+
+/// Publication outcome on both admission boundaries (candidate admission and
+/// runtime cache construction), which must agree.
+fn composition_error(plugin_configs: Vec<PluginConfig>) -> Option<String> {
+    let ids: Vec<String> = plugin_configs.iter().map(|pc| pc.id.clone()).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let config = make_config(vec![make_proxy("p1", "/", ids)], plugin_configs);
+    let candidate =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None).err();
+    let runtime = PluginCache::new(&config).err();
+    assert_eq!(
+        candidate.is_some(),
+        runtime.is_some(),
+        "admission boundaries disagree: {candidate:?} / {runtime:?}"
+    );
+    runtime
+}
+
+fn header_transformer(rule: serde_json::Value) -> PluginConfig {
+    make_plugin_config_with_json(
+        "rt",
+        "request_transformer",
+        json!({"rules": [rule]}),
+        PluginScope::Proxy,
+        Some("p1"),
+    )
+}
+
+/// A configured request-header write that could re-author a header another
+/// plugin on the chain owns as a gateway assertion (a template copying the
+/// client value back, a literal, a rename) is refused at publication, in any
+/// case or `_` spelling. An unrelated key and a removal of the owned header
+/// are admitted alongside the same owner.
+#[test]
+fn request_header_writes_cannot_re_author_an_owned_assertion() {
+    for refused in [
+        transformer_header_rule("update", "x-user-email", "value", "$(header.x-user-email)"),
+        transformer_header_rule("add", "X_User_Email", "value", "ceo@corp.example"),
+        transformer_header_rule("rename", "x-forged", "new_key", "x-user-email"),
+    ] {
+        let error = composition_error(vec![claim_owning_jwks(true), header_transformer(refused)])
+            .expect("a write to an owned assertion must be refused");
+        assert!(error.contains("owns as a gateway assertion"), "{error}");
+        assert!(error.contains("jwks_auth"), "{error}");
+        assert!(error.contains("request_transformer"), "{error}");
+    }
+    for admitted in [
+        transformer_header_rule("add", "x-tenant", "value", "blue"),
+        transformer_header_rule("remove", "x-user-email", "", ""),
+    ] {
+        let error = composition_error(vec![claim_owning_jwks(true), header_transformer(admitted)]);
+        assert_eq!(error, None);
+    }
+}
+
+/// On a chain that owns gateway-asserted request headers but carries no
+/// `grpc_web` translator, a configured write that could relabel the request
+/// as gRPC-Web (`content-type` from a template, a rename, or a gRPC-Web
+/// literal) is refused at publication. A translator, a non-gRPC-Web literal,
+/// or a chain without owned assertions admits the same rule.
+#[test]
+fn content_type_relabel_to_grpc_web_is_refused_on_untranslated_assertion_chains() {
+    let grpc_web_literal = transformer_header_rule(
+        "update",
+        "content-type",
+        "value",
+        "application/grpc-web+proto",
+    );
+    // (rule, chain owns assertions, translator present, refused)
+    let cases = [
+        (grpc_web_literal.clone(), true, false, true),
+        (
+            transformer_header_rule("update", "Content-Type", "value", "$(header.x-ct)"),
+            true,
+            false,
+            true,
+        ),
+        (
+            transformer_header_rule("rename", "x-ct", "new_key", "content-type"),
+            true,
+            false,
+            true,
+        ),
+        (
+            transformer_header_rule("add", "Content_Type", "value", "application/grpc-web"),
+            true,
+            false,
+            true,
+        ),
+        (grpc_web_literal.clone(), true, true, false),
+        (
+            transformer_header_rule("update", "content-type", "value", "application/json"),
+            true,
+            false,
+            false,
+        ),
+        (grpc_web_literal, false, false, false),
+    ];
+    for (rule, owns, translator, refused) in cases {
+        let label = format!("{rule} owns={owns} translator={translator}");
+        let mut plugin_configs = vec![claim_owning_jwks(owns), header_transformer(rule)];
+        if translator {
+            plugin_configs.push(grpc_web_translator());
+        }
+        let error = composition_error(plugin_configs);
+        assert_eq!(error.is_some(), refused, "{label}: {error:?}");
+        if let Some(error) = error {
+            assert!(error.contains("`content-type`"), "{label}: {error}");
+        }
+    }
+}
+
+/// The final gateway-assertion pass is authoritative over the outbound map:
+/// a later writer that restores a client value under an owned destination (a
+/// `correlation_id` preserving the client's `x-user-role` after the
+/// trigger-skipped owner sanitized it, or a template re-inserting a client
+/// value) loses it, whatever the owner's trigger decided.
+#[tokio::test]
+async fn final_assertion_pass_strips_an_owned_header_a_later_writer_restored() {
+    use ferrum_edge::_test_support::{
+        apply_request_view_trailer_policy_for_test, run_before_proxy_hooks_for_test,
+        run_final_backend_header_policy_hooks_for_test,
+    };
+
+    let mut auth_config = minimal_plugin_config("jwks_auth");
+    auth_config["providers"][0]["claim_headers"] = json!({"role": "X-User-Role"});
+    let mut auth = make_plugin_config_with_json(
+        "auth",
+        "jwks_auth",
+        auth_config,
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    auth.trigger = Some(post_only_trigger());
+    let mut correlation = make_plugin_config_with_json(
+        "corr",
+        "correlation_id",
+        json!({"header_name": "x-user-role", "inbound_policy": "preserve"}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    correlation.priority_override = Some(1500);
+    let cache = PluginCache::new(&make_config(
+        vec![make_proxy("p1", "/", vec!["auth", "corr"])],
+        vec![auth, correlation],
+    ))
+    .unwrap();
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+    assert!(
+        view.capabilities()
+            .has(PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY),
+        "a route owning asserted headers runs the final pass on every ladder"
+    );
+    let plugins = view.plugins();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/orders".to_string(),
+    );
+    ctx.headers.insert("x-user-role".into(), "admin".into());
+    apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+    for plugin in plugins.iter() {
+        plugin.on_request_received(&mut ctx).await;
+    }
+    let mut headers = ctx.headers.clone();
+    let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        headers.get("x-user-role").map(String::as_str),
+        Some("admin"),
+        "the later correlation writer restored the client value"
+    );
+
+    run_final_backend_header_policy_hooks_for_test(&plugins, &ctx, &mut headers);
+    assert!(!headers.contains_key("x-user-role"), "{headers:?}");
+
+    // A template-style re-insert under a folded spelling goes the same way.
+    headers.insert("X_User_Role".into(), "admin".into());
+    headers.insert("x-unrelated".into(), "kept".into());
+    run_final_backend_header_policy_hooks_for_test(&plugins, &ctx, &mut headers);
+    assert!(!headers.contains_key("X_User_Role"), "{headers:?}");
+    assert_eq!(headers.get("x-unrelated").map(String::as_str), Some("kept"));
+}
+
+/// The relabel refusal trusts only the translator's own marker for THIS
+/// request: with `grpc_web` configured but declining a plain request, a
+/// `request_transformer` that sets a gRPC-Web `content-type` is refused with
+/// `415` at the end of the pass. A request the translator actually translated
+/// is admitted.
+#[tokio::test]
+async fn relabel_to_grpc_web_is_refused_unless_this_request_was_translated() {
+    let relabel = transformer_header_rule(
+        "update",
+        "content-type",
+        "value",
+        "application/grpc-web+proto",
+    );
+    for (content_type, expected) in [("application/json", Some(415)), (GRPC_WEB_BINARY, None)] {
+        let plugin_configs = vec![
+            claim_owning_jwks(true),
+            grpc_web_translator(),
+            header_transformer(relabel.clone()),
+        ];
+        let status = before_proxy_funnel_status(plugin_configs, content_type).await;
+        assert_eq!(status, expected, "{content_type}");
+    }
+}
+
+/// Two client `Content-Type` field lines materialize as one `", "`-joined
+/// value (`application/json, application/grpc-web+proto`), which a backend
+/// resolving the singleton field to its last member reads as gRPC-Web. The
+/// ingress protocol guard refuses the two lines with `400`; behind it, the
+/// end-of-pass check treats any list of media types, or a single type whose
+/// essence is gRPC-Web, as a gRPC-Web relabel and refuses it with `415` on an
+/// untranslated assertion route. A single JSON type, a quoted multipart
+/// boundary holding a gRPC-Web-looking token, a route owning no assertion,
+/// and translated gRPC-Web pass.
+#[tokio::test]
+async fn a_joined_content_type_with_a_grpc_web_member_is_refused_on_assertion_routes() {
+    let joined = "application/json, application/grpc-web+proto";
+    let status = before_proxy_funnel_status(vec![claim_owning_jwks(true)], joined).await;
+    assert_eq!(status, Some(415), "joined gRPC-Web member");
+    let listed = "application/json, text/plain";
+    let status = before_proxy_funnel_status(vec![claim_owning_jwks(true)], listed).await;
+    assert_eq!(status, Some(415), "non-singleton media type");
+
+    // A gRPC-Web essence is gRPC-Web whatever its parameters (an invalid one
+    // here), in any case.
+    let essence = "Application/GRPC-Web+proto; charset";
+    let status = before_proxy_funnel_status(vec![claim_owning_jwks(true)], essence).await;
+    assert_eq!(status, Some(415), "untranslated gRPC-Web essence");
+
+    let json = "application/json";
+    let status = before_proxy_funnel_status(vec![claim_owning_jwks(true)], json).await;
+    assert_eq!(status, None, "single JSON type");
+    // Parameter values are never inspected: a quoted boundary holding a
+    // gRPC-Web-looking token is one multipart media type.
+    let multipart = r#"multipart/form-data; boundary="a,application/grpc-web,b""#;
+    let status = before_proxy_funnel_status(vec![claim_owning_jwks(true)], multipart).await;
+    assert_eq!(status, None, "quoted boundary");
+    let status = before_proxy_funnel_status(vec![claim_owning_jwks(false)], joined).await;
+    assert_eq!(status, None, "route owning no assertion");
+    let translated = vec![claim_owning_jwks(true), grpc_web_translator()];
+    let status = before_proxy_funnel_status(translated, GRPC_WEB_BINARY).await;
+    assert_eq!(status, None, "translated gRPC-Web");
+}
+
+/// Candidate admission reads `owned_request_assertion_header_names()` and
+/// `configured_request_header_writes()`, so every built-in that overrides
+/// either must be fully constructed there (`SECURITY_COMPOSITION_PLUGIN_NAMES`):
+/// otherwise an admin write could persist a composition every later cache
+/// rebuild refuses.
+#[test]
+fn every_owned_assertion_and_header_write_publisher_is_candidate_visible() {
+    let cache_source = include_str!("../../../src/plugin_cache.rs");
+    let full_names_start = cache_source
+        .find("const SECURITY_COMPOSITION_PLUGIN_NAMES")
+        .expect("security-composition allowlist must exist");
+    let full_names_end = cache_source[full_names_start..]
+        .find("];")
+        .map(|offset| full_names_start + offset)
+        .expect("security-composition allowlist must terminate");
+    let full_names = &cache_source[full_names_start..full_names_end];
+
+    let plugins_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugins");
+    let mut sources = Vec::new();
+    collect_plugin_sources(&plugins_dir, &mut sources);
+    let mut publishers: Vec<String> = Vec::new();
+    for signature in [
+        "fn owned_request_assertion_header_names(&self)",
+        "fn configured_request_header_writes(&self)",
+    ] {
+        for (path, source) in &sources {
+            let mut offset = 0;
+            while let Some(found) = source[offset..].find(signature) {
+                let at = offset + found;
+                offset = at + signature.len();
+                let body = squeezed_fn_body(source, at)
+                    .unwrap_or_else(|| panic!("{}: {signature} body", path.display()));
+                // The `Plugin` trait default publishes nothing.
+                if body == "Vec::new()" {
+                    continue;
+                }
+                let name = reported_plugin_name(&source[..at])
+                    .unwrap_or_else(|| panic!("{}: {signature} owner", path.display()));
+                publishers.push(name);
+            }
+        }
+    }
+    publishers.sort();
+    publishers.dedup();
+    assert!(
+        publishers.iter().any(|name| name == "jwks_auth")
+            && publishers.iter().any(|name| name == "request_transformer"),
+        "the scan must find the known publishers: {publishers:?}"
+    );
+    for name in &publishers {
+        assert!(
+            full_names.contains(&format!("\"{name}\"")),
+            "{name} publishes owned assertions or header writes but candidate admission \
+             cannot see it: add it to SECURITY_COMPOSITION_PLUGIN_NAMES"
+        );
+    }
+}
+
+/// The raw-line reconstruction boundaries (the native-gRPC / HBONE /
+/// mesh-mTLS / Unix merge and the WebSocket handshake collector) keep a
+/// client's original field lines whenever their joined form equals the
+/// sanitized value. For an owned assertion that is never permission: once the
+/// ladder drops the client's lines for the route's owned names, a verified
+/// compound claim (`alice, admin`, installed once) reaches the backend as one
+/// gateway value, a skipped owner leaves the name absent, and unrelated
+/// repeated metadata keeps its own field lines.
+#[tokio::test]
+async fn raw_reconstruction_never_restores_client_lines_for_an_owned_assertion() {
+    use ferrum_edge::_test_support::{
+        apply_request_view_trailer_policy_for_test, collect_forwardable_websocket_headers_for_test,
+        run_before_proxy_hooks_for_test, run_final_backend_header_policy_hooks_for_test,
+        strip_route_owned_assertion_field_lines_for_test,
+    };
+    use ferrum_edge::proxy::headers::merge_proxy_headers_preserving_repeated;
+
+    use super::jwks_auth_support::{build_rsa_jwks_from_pem, create_rs256_token};
+
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let token = create_rs256_token(
+        &json!({"sub": "alice", "user": ["alice", "admin"]}),
+        private_key_pem,
+    );
+    let consumer_index = ferrum_edge::consumer_index::ConsumerIndex::new(&[]);
+    for skipped in [false, true] {
+        let mut auth = make_plugin_config_with_json(
+            "auth",
+            "jwks_auth",
+            json!({"providers": [{
+                "jwks": build_rsa_jwks_from_pem(public_key_pem),
+                "claim_headers": {"user": "X-App-User"},
+                "claim_headers_separator": ", "
+            }]}),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        if skipped {
+            auth.trigger = Some(post_only_trigger());
+        }
+        let cache = PluginCache::new(&make_config(
+            vec![make_proxy("p1", "/", vec!["auth"])],
+            vec![auth],
+        ))
+        .unwrap();
+        let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+        let plugins = view.plugins();
+
+        // The client sent two `x-app-user` lines (and repeated unrelated
+        // metadata); the materialized view joins each with `, `.
+        let mut raw = hyper::HeaderMap::new();
+        raw.append("x-app-user", "alice".parse().unwrap());
+        raw.append("x-app-user", "admin".parse().unwrap());
+        raw.append("x-md", "a".parse().unwrap());
+        raw.append("x-md", "b".parse().unwrap());
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api/orders".to_string(),
+        );
+        ctx.headers
+            .insert("authorization".to_string(), format!("Bearer {token}"));
+        ctx.headers
+            .insert("x-app-user".into(), "alice, admin".into());
+        ctx.headers.insert("x-md".into(), "a, b".into());
+        apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+        for plugin in plugins.iter() {
+            plugin.on_request_received(&mut ctx).await;
+        }
+        let rejection = ferrum_edge::proxy::run_authentication_phase(
+            AuthMode::Multi,
+            plugins.as_slice(),
+            &mut ctx,
+            &consumer_index,
+        )
+        .await;
+        assert!(rejection.is_none(), "skipped={skipped}");
+        let mut headers = ctx.headers.clone();
+        let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue));
+        run_final_backend_header_policy_hooks_for_test(&plugins, &ctx, &mut headers);
+        let expected = (!skipped).then_some("alice, admin");
+        assert_eq!(
+            headers.get("x-app-user").map(String::as_str),
+            expected,
+            "skipped={skipped}"
+        );
+
+        // Without the ladder's strip the merge would restore the client's two
+        // lines, because their joined form equals the verified value.
+        if !skipped {
+            let mut unguarded = raw.clone();
+            merge_proxy_headers_preserving_repeated(&mut unguarded, &headers);
+            assert_eq!(unguarded.get_all("x-app-user").iter().count(), 2);
+        }
+
+        strip_route_owned_assertion_field_lines_for_test(&ctx, &mut raw);
+        let mut merged = raw.clone();
+        merge_proxy_headers_preserving_repeated(&mut merged, &headers);
+        let owned_lines: Vec<&str> = merged
+            .get_all("x-app-user")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        let expected_lines: Vec<&str> = expected.into_iter().collect();
+        assert_eq!(owned_lines, expected_lines, "skipped={skipped}: merge");
+        assert_eq!(
+            merged.get_all("x-md").iter().count(),
+            2,
+            "skipped={skipped}"
+        );
+
+        let forwarded = collect_forwardable_websocket_headers_for_test(&raw, &headers);
+        let owned_lines: Vec<&str> = forwarded
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-app-user"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(owned_lines, expected_lines, "skipped={skipped}: ws");
+        let unrelated = forwarded
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-md"))
+            .count();
+        assert_eq!(unrelated, 2, "skipped={skipped}: websocket metadata");
+    }
+}
+
+/// The secured-mesh retry replay (and request mirroring) rebuild the backend
+/// request from the context's retained wire view, not from the dispatch body.
+/// After the final assertion pass that view drops the client's lines for the
+/// route's owned assertion names too, so a replay merges in only the approved
+/// value, once; unrelated repeated metadata keeps its lines. Both ladders run
+/// the strip right after the final pass.
+#[test]
+fn mesh_retry_replay_wire_view_drops_client_lines_for_owned_assertions() {
+    use ferrum_edge::_test_support::{
+        raw_headers_snapshot_for_test, set_request_trailer_strip_headers_for_test,
+        strip_route_owned_assertion_raw_lines_for_test,
+    };
+    use ferrum_edge::proxy::headers::merge_proxy_headers_preserving_repeated;
+
+    let mut raw = hyper::HeaderMap::new();
+    raw.append("x-app-user", "alice".parse().unwrap());
+    raw.append("x_app_user", "admin".parse().unwrap());
+    raw.append("x-md", "a".parse().unwrap());
+    raw.append("x-md", "b".parse().unwrap());
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/orders".to_string(),
+    );
+    ctx.set_raw_headers(raw);
+    set_request_trailer_strip_headers_for_test(&mut ctx, vec!["x-app-user".to_string()]);
+    strip_route_owned_assertion_raw_lines_for_test(&mut ctx);
+
+    let mut replay = raw_headers_snapshot_for_test(&ctx).expect("retained wire view");
+    assert!(replay.get("x-app-user").is_none());
+    assert!(replay.get("x_app_user").is_none());
+    let approved = HashMap::from([
+        ("x-app-user".to_string(), "alice, admin".to_string()),
+        ("x-md".to_string(), "a, b".to_string()),
+    ]);
+    merge_proxy_headers_preserving_repeated(&mut replay, &approved);
+    let owned_lines: Vec<&str> = replay
+        .get_all("x-app-user")
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(owned_lines, vec!["alice, admin"]);
+    assert_eq!(replay.get_all("x-md").iter().count(), 2);
+
+    let proxy_source = include_str!("../../../src/proxy/mod.rs");
+    let raw_strip = proxy_source
+        .find("ctx.strip_route_owned_assertion_raw_lines();")
+        .expect("the H1/H2 ladder strips the retained wire view");
+    assert!(
+        proxy_source[..raw_strip].ends_with("client_request_body.raw_headers_mut());\n    "),
+        "the H1/H2 ladder strips the wire view right after the dispatch body"
+    );
+    assert!(
+        include_str!("../../../src/http3/server.rs")
+            .contains("ctx.strip_route_owned_assertion_raw_lines();"),
+        "the H3 ladder must strip the retained wire view after its final pass"
+    );
+}
+
+/// `oidc_relying_party` `forward_access_token` owns the backend
+/// `Authorization` only on the requests the instance runs for. A
+/// trigger-skipped instance leaves a sibling mechanism's forwarded bearer
+/// token in place (the relayed header is a credential the backend verifies,
+/// not a gateway identity assertion), while an admitted instance with no
+/// relayable session token still removes the client's copy.
+#[tokio::test]
+async fn oidc_forward_access_token_owns_authorization_only_when_the_instance_runs() {
+    use ferrum_edge::_test_support::{
+        apply_request_view_trailer_policy_for_test, run_before_proxy_hooks_for_test,
+        run_final_backend_header_policy_hooks_for_test,
+    };
+
+    for (skipped, expected) in [(true, Some("Bearer client-token")), (false, None)] {
+        let mut config = minimal_plugin_config("oidc_relying_party");
+        config["providers"][0]["forward_access_token"] = json!(true);
+        let mut oidc = make_plugin_config_with_json(
+            "oidc",
+            "oidc_relying_party",
+            config,
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        if skipped {
+            oidc.trigger = Some(post_only_trigger());
+        }
+        let cache = PluginCache::new(&make_config(
+            vec![make_proxy("p1", "/", vec!["oidc"])],
+            vec![oidc],
+        ))
+        .unwrap();
+        let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+        let plugins = view.plugins();
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api/orders".to_string(),
+        );
+        ctx.headers
+            .insert("authorization".into(), "Bearer client-token".into());
+        apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+        for plugin in plugins.iter() {
+            plugin.on_request_received(&mut ctx).await;
+        }
+        let mut headers = ctx.headers.clone();
+        let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "skipped={skipped}"
+        );
+        run_final_backend_header_policy_hooks_for_test(&plugins, &ctx, &mut headers);
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            expected,
+            "skipped={skipped}"
+        );
+    }
+}
+
+/// Every owned backend-equivalence class reaches the backend as at most ONE
+/// field. A `correlation_id` that preserves the client's `x_app_user` after
+/// `jwks_auth` installed the verified `x-app-user` restores an equal-valued
+/// alias the backend boundaries would emit as a second field line; the final
+/// pass keeps only the owner's own entry, and a cleared (missing claim) or
+/// trigger-skipped owner leaves none, in the map, the raw-line merge and the
+/// WebSocket handshake collector alike.
+#[tokio::test]
+async fn an_owned_assertion_reaches_the_backend_as_one_field_across_spellings() {
+    use ferrum_edge::_test_support::{
+        apply_request_view_trailer_policy_for_test, collect_forwardable_websocket_headers_for_test,
+        run_before_proxy_hooks_for_test, run_final_backend_header_policy_hooks_for_test,
+        strip_route_owned_assertion_field_lines_for_test,
+    };
+    use ferrum_edge::proxy::headers::{
+        field_names_equivalent_for_backends, merge_proxy_headers_preserving_repeated,
+    };
+
+    use super::jwks_auth_support::{build_rsa_jwks_from_pem, create_rs256_token};
+
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let consumer_index = ferrum_edge::consumer_index::ConsumerIndex::new(&[]);
+    let owned = |name: &str| field_names_equivalent_for_backends(name, "x-app-user");
+    let with_user = json!({"sub": "alice", "user": "alice"});
+    let without_user = json!({"sub": "alice"});
+    // (label, token claims, owner skipped by its trigger, value at the backend)
+    let cases = [
+        ("installed", &with_user, false, Some("alice")),
+        ("missing claim", &without_user, false, None),
+        ("skipped owner", &with_user, true, None),
+    ];
+    for (label, claims, skipped, expected) in cases {
+        let token = create_rs256_token(claims, private_key_pem);
+        let mut auth = make_plugin_config_with_json(
+            "auth",
+            "jwks_auth",
+            json!({"providers": [{
+                "jwks": build_rsa_jwks_from_pem(public_key_pem),
+                "claim_headers": {"user": "X-App-User"}
+            }]}),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        if skipped {
+            auth.trigger = Some(post_only_trigger());
+        }
+        // Runs after the owner's `before_proxy` and preserves the client's
+        // `x_app_user` value under that spelling.
+        let mut correlation = make_plugin_config_with_json(
+            "corr",
+            "correlation_id",
+            json!({"header_name": "x_app_user", "inbound_policy": "preserve"}),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        correlation.priority_override = Some(1500);
+        let cache = PluginCache::new(&make_config(
+            vec![make_proxy("p1", "/", vec!["auth", "corr"])],
+            vec![auth, correlation],
+        ))
+        .unwrap();
+        let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+        let plugins = view.plugins();
+
+        let mut raw = hyper::HeaderMap::new();
+        raw.append("x_app_user", "alice".parse().unwrap());
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api/orders".to_string(),
+        );
+        ctx.headers
+            .insert("authorization".to_string(), format!("Bearer {token}"));
+        ctx.headers.insert("x_app_user".into(), "alice".into());
+        apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+        for plugin in plugins.iter() {
+            plugin.on_request_received(&mut ctx).await;
+        }
+        let rejection = ferrum_edge::proxy::run_authentication_phase(
+            AuthMode::Multi,
+            plugins.as_slice(),
+            &mut ctx,
+            &consumer_index,
+        )
+        .await;
+        assert!(rejection.is_none(), "{label}");
+        let mut headers = ctx.headers.clone();
+        let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue), "{label}");
+        // The later writer restored the client's alias spelling.
+        assert_eq!(
+            headers.get("x_app_user").map(String::as_str),
+            Some("alice"),
+            "{label}"
+        );
+
+        run_final_backend_header_policy_hooks_for_test(&plugins, &ctx, &mut headers);
+        let expected_values: Vec<&str> = expected.into_iter().collect();
+        let map_values: Vec<&str> = headers
+            .iter()
+            .filter(|(name, _)| owned(name.as_str()))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(map_values, expected_values, "{label}: map");
+        assert_eq!(
+            headers.get("x-app-user").map(String::as_str),
+            expected,
+            "{label}: the owner's own entry"
+        );
+
+        strip_route_owned_assertion_field_lines_for_test(&ctx, &mut raw);
+        let mut merged = raw.clone();
+        merge_proxy_headers_preserving_repeated(&mut merged, &headers);
+        let merged_values: Vec<&str> = merged
+            .iter()
+            .filter(|(name, _)| owned(name.as_str()))
+            .map(|(_, value)| value.to_str().unwrap())
+            .collect();
+        assert_eq!(merged_values, expected_values, "{label}: merge");
+
+        let forwarded = collect_forwardable_websocket_headers_for_test(&raw, &headers);
+        let forwarded_values: Vec<&str> = forwarded
+            .iter()
+            .filter(|(name, _)| owned(name.as_str()))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(forwarded_values, expected_values, "{label}: websocket");
     }
 }

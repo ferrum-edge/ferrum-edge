@@ -1103,6 +1103,18 @@ fn jwt_expiration_hint_is_bounded_and_refuses_non_jws_shapes() {
     // An oversized payload segment is not parsed at all.
     let oversized = "A".repeat(9 * 1024);
     assert!(jwt_expiration_hint(&format!("a.{oversized}.c")).is_none());
+    // The segment cap alone bounds the decoded payload: an exactly 8 KiB
+    // segment (6 KiB of JSON) is still parsed, one byte more is not.
+    let mut padded = br#"{"exp":2000000000,"pad":""#.to_vec();
+    padded.resize(6 * 1024 - 2, b'p');
+    padded.extend_from_slice(br#""}"#);
+    let at_cap = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&padded);
+    assert_eq!(at_cap.len(), 8 * 1024);
+    assert_eq!(
+        jwt_expiration_hint(&format!("a.{at_cap}.c")),
+        Some(2_000_000_000)
+    );
+    assert!(jwt_expiration_hint(&format!("a.{at_cap}A.c")).is_none());
 }
 
 /// Unix epoch zero and negative NumericDate values are plainly expired. They
@@ -2289,6 +2301,55 @@ fn mesh_runtime_config_parses_stock_xds_allow_plaintext_canonical_forms() {
             "value {:?}",
             value
         );
+    }
+}
+
+/// Issue #7237: `FERRUM_MESH_DNS_PROXY_ENABLED` used to treat anything other
+/// than `true`/`1` as `false`, so `yes` silently disabled the DNS proxy. It now
+/// parses like every sibling mesh bool.
+#[test]
+fn mesh_runtime_config_rejects_malformed_dns_proxy_enabled() {
+    use ferrum_edge::modes::mesh::MeshRuntimeConfig;
+
+    use crate::unit::env_lock::EnvGuard;
+
+    for raw in ["yes", "on", "tru"] {
+        let env = EnvGuard::new(&["FERRUM_MESH_DNS_PROXY_ENABLED"]);
+        env.set("FERRUM_MESH_DNS_PROXY_ENABLED", raw);
+
+        let err = MeshRuntimeConfig::from_env_config(&mesh_runtime_env_config())
+            .expect_err("malformed explicit bool must fail startup");
+        assert!(err.contains("FERRUM_MESH_DNS_PROXY_ENABLED"), "{err}");
+        assert!(err.contains("true, false, 1, or 0"), "{err}");
+    }
+}
+
+#[test]
+fn mesh_runtime_config_parses_dns_proxy_enabled_canonical_forms() {
+    use ferrum_edge::modes::mesh::MeshRuntimeConfig;
+
+    use crate::unit::env_lock::EnvGuard;
+
+    let cases = [
+        (None, false),
+        (Some("   "), false),
+        (Some("false"), false),
+        (Some("0"), false),
+        (Some("TRUE"), true),
+        (Some(" True "), true),
+        (Some("1"), true),
+    ];
+
+    for (value, expected) in cases {
+        let env = EnvGuard::new(&["FERRUM_MESH_DNS_PROXY_ENABLED"]);
+        match value {
+            Some(raw) => env.set("FERRUM_MESH_DNS_PROXY_ENABLED", raw),
+            None => env.unset("FERRUM_MESH_DNS_PROXY_ENABLED"),
+        }
+
+        let runtime = MeshRuntimeConfig::from_env_config(&mesh_runtime_env_config())
+            .unwrap_or_else(|err| panic!("canonical form {:?} must parse: {err}", value));
+        assert_eq!(runtime.dns_enabled, expected, "value {:?}", value);
     }
 }
 

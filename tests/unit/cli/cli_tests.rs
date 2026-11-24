@@ -768,7 +768,7 @@ fn test_infer_file_mode_yields_to_conf_file_mode() {
         || {
             unsafe { std::env::set_var("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml") };
 
-            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some("database"));
+            ferrum_edge::cli::infer_file_mode_from_conf(Some("database"), None);
 
             assert!(
                 std::env::var("FERRUM_MODE").is_err(),
@@ -793,9 +793,27 @@ fn test_infer_file_mode_treats_blank_conf_mode_as_unset() {
                 std::env::set_var("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml");
             }
 
-            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some(""));
+            ferrum_edge::cli::infer_file_mode_from_conf(Some(""), None);
 
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
+        },
+    );
+}
+
+/// A `FERRUM_FILE_CONFIG_PATH` set only in the settings file selects file mode
+/// too: the seam the tests drive is the implementation `infer_file_mode()` runs.
+#[test]
+fn test_infer_file_mode_honors_conf_file_spec_path() {
+    without_env_vars(
+        &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
+        || {
+            ferrum_edge::cli::infer_file_mode_from_conf(None, Some("/tmp/spec.yaml"));
+
+            assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
+            assert!(
+                std::env::var("FERRUM_FILE_CONFIG_PATH").is_err(),
+                "a settings-file spec path must not be replaced by discovery"
+            );
         },
     );
 }
@@ -832,7 +850,7 @@ fn test_run_explicit_spec_does_not_override_conf_file_mode() {
                 "overrides must not synthesize a mode before inference"
             );
 
-            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some("database"));
+            ferrum_edge::cli::infer_file_mode_from_conf(Some("database"), None);
 
             assert!(
                 std::env::var("FERRUM_MODE").is_err(),
@@ -863,7 +881,7 @@ fn test_validate_explicit_spec_does_not_override_conf_file_mode() {
                 allow_empty_namespace: false,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
-            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some("cp"));
+            ferrum_edge::cli::infer_file_mode_from_conf(Some("cp"), None);
 
             assert!(
                 std::env::var("FERRUM_MODE").is_err(),
@@ -1409,9 +1427,31 @@ fn test_execute_health_rejects_503_with_200_ok_body() {
     );
     let err = result.expect_err("503 with '200 OK' body must be unhealthy");
     assert!(
-        err.contains("503"),
-        "error should report the real status line, got: {err}"
+        err.contains("HTTP status 503"),
+        "error should report the real status code, got: {err}"
     );
+}
+
+/// The `health` command prints its error through the startup renderer, which
+/// withholds quoted spans. The numeric status must survive that rendering so
+/// an operator can tell 503 from 401/404/500 (issue #7229).
+#[test]
+fn test_execute_health_rendered_error_keeps_numeric_status() {
+    for (response, code) in [
+        (
+            &b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"[..],
+            "503",
+        ),
+        (
+            &b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"[..],
+            "401",
+        ),
+    ] {
+        let (result, _) = run_health_against_response(false, response);
+        let err = result.expect_err("a non-200 status must be unhealthy");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(err), &[]);
+        assert_eq!(rendered, format!("Unhealthy: HTTP status {code}"));
+    }
 }
 
 #[test]
@@ -1473,7 +1513,7 @@ fn test_execute_health_uses_final_non200_after_informational_response() {
           HTTP/1.1 503 Service Unavailable\r\nContent-Length: 6\r\n\r\n200 OK",
     );
     let error = result.expect_err("the final 503 must be unhealthy");
-    assert!(error.contains("503 Service Unavailable"), "{error}");
+    assert!(error.contains("HTTP status 503"), "{error}");
 }
 
 #[test]
@@ -1484,7 +1524,7 @@ fn test_execute_health_treats_101_as_final_unhealthy_response() {
           HTTP/1.1 200 OK\r\n\r\n",
     );
     let error = result.expect_err("101 must not be skipped in search of a later 200");
-    assert!(error.contains("101 Switching Protocols"), "{error}");
+    assert!(error.contains("HTTP status 101"), "{error}");
 }
 
 #[test]
@@ -1571,8 +1611,11 @@ fn test_execute_health_escapes_untrusted_status_text() {
     );
 }
 
+/// A non-200 reason phrase is peer-controlled text: the error reports only the
+/// parsed numeric status (issue #7229), so neither a raw control nor any of
+/// the reason text reaches it.
 #[test]
-fn test_execute_health_escapes_non200_reason_text() {
+fn test_execute_health_omits_non200_reason_text() {
     let response = "HTTP/1.1 503 unsafe\u{85}reason\r\n\r\n";
     let (result, _) = run_health_against_response(false, response.as_bytes());
     let error = result.expect_err("503 must be unhealthy");
@@ -1580,10 +1623,7 @@ fn test_execute_health_escapes_non200_reason_text() {
         !error.contains('\u{85}'),
         "raw control reached error text: {error:?}"
     );
-    assert!(
-        error.contains("\\u{85}"),
-        "reason was not rendered safely: {error}"
-    );
+    assert_eq!(error, "Unhealthy: HTTP status 503");
 }
 
 #[test]

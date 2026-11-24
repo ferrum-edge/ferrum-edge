@@ -39,6 +39,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import sys
@@ -162,7 +163,11 @@ def api_get(url: str, token: str | None) -> Any:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         raise ReportError(f"GET {url} failed with HTTP {error.code}") from error
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+    # `URLError`, `TimeoutError` and connection resets are `OSError`s;
+    # `JSONDecodeError` and `UnicodeDecodeError` are `ValueError`s; a truncated
+    # body raises `http.client.IncompleteRead`. Every one is a failed read,
+    # not a traceback that loses a long report run (issue #7283).
+    except (OSError, http.client.HTTPException, ValueError) as error:
         raise ReportError(f"GET {url} failed: {error}") from error
 
 
@@ -919,6 +924,44 @@ def self_test() -> int:
             pass
         else:  # pragma: no cover - the loader must fail closed
             raise AssertionError("an empty inventory must be rejected")
+
+    class _Body:
+        def __init__(self, payload: bytes | BaseException) -> None:
+            self.payload = payload
+
+        def __enter__(self) -> "_Body":
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            if isinstance(self.payload, BaseException):
+                raise self.payload
+            return self.payload
+
+    original_urlopen = urllib.request.urlopen
+    try:
+        for label, outcome in (
+            ("truncated body", _Body(http.client.IncompleteRead(b"{", 10))),
+            ("connection reset", ConnectionResetError("reset by peer")),
+            ("invalid UTF-8", _Body(b"\xff\xfe")),
+            ("invalid JSON", _Body(b"{not json")),
+        ):
+            def fake_urlopen(*_args: object, _outcome: object = outcome, **_kwargs: object):
+                if isinstance(_outcome, BaseException):
+                    raise _outcome
+                return _outcome
+
+            urllib.request.urlopen = fake_urlopen  # type: ignore[assignment]
+            try:
+                api_get("https://api.github.invalid/x", None)
+            except ReportError:
+                pass
+            else:  # pragma: no cover - a failed read must not return data
+                raise AssertionError(f"{label} must raise ReportError")
+    finally:
+        urllib.request.urlopen = original_urlopen  # type: ignore[assignment]
 
     markdown = render_markdown(summary)
     assert "# Hosted CI latency report" in markdown

@@ -10,7 +10,7 @@
 //! renames against non-existent fields (or reject valid ones), and
 //! operators would get confusing errors.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ChargeEvent, compile_charge_event_projection, serialize_json_each_row,
@@ -38,6 +38,7 @@ fn fully_populated_http() -> TransactionSummary {
         timestamp_received: "2026-05-11T12:00:00Z".into(),
         client_ip: "10.0.0.1".into(),
         consumer_username: Some("alice".into()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: Some("jwt_auth"),
         http_method: "GET".into(),
         request_path: "/things".into(),
@@ -59,6 +60,7 @@ fn fully_populated_http() -> TransactionSummary {
         error_class: Some(ErrorClass::ConnectionTimeout),
         body_error_class: Some(ErrorClass::ConnectionReset),
         body_completed: true,
+        response_delivery: Default::default(),
         bytes_sent: 100,
         bytes_received: 200,
         // Nonzero on purpose: both counters are skipped by the native
@@ -67,7 +69,7 @@ fn fully_populated_http() -> TransactionSummary {
         grpc_request_messages: 3,
         grpc_response_messages: 5,
         mirror: true,
-        metadata: HashMap::from([
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([
             ("trace_id".to_string(), "abc".to_string()),
             ("request_protocol".to_string(), "grpc".to_string()),
             ("grpc_status".to_string(), "14".to_string()),
@@ -86,6 +88,7 @@ fn fully_populated_stream() -> StreamTransactionSummary {
         proxy_name: Some("db-front".into()),
         client_ip: "10.0.0.2".into(),
         consumer_username: Some("svc-account".into()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: Some("mtls_auth"),
         backend_target: "10.5.0.20:5432".into(),
         backend_resolved_ip: Some("10.5.0.20".into()),
@@ -101,7 +104,10 @@ fn fully_populated_stream() -> StreamTransactionSummary {
         timestamp_connected: "2026-05-11T12:00:00Z".into(),
         timestamp_disconnected: "2026-05-11T12:01:40Z".into(),
         sni_hostname: Some("db.internal".into()),
-        metadata: HashMap::from([("session_id".to_string(), "xyz".to_string())]),
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([(
+            "session_id".to_string(),
+            "xyz".to_string(),
+        )]),
     }
 }
 
@@ -210,8 +216,12 @@ fn ws_disconnect_fields_registry_matches_expected() {
         "consumer_username",
         "auth_method",
         "backend_target",
+        "http_method",
+        "request_path",
+        "handshake_status_code",
         "protocol",
         "listen_port",
+        "connection_id",
         "duration_ms",
         "frames_client_to_backend",
         "frames_backend_to_client",

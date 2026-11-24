@@ -12,8 +12,8 @@
 
 use crate::scaffolding::port_registry::TestSocket;
 
-use crate::common::{TestGateway, spawn_http_echo};
-use std::time::Duration;
+use crate::common::{TestGateway, spawn_http_echo, spawn_http_identifying};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -63,6 +63,23 @@ async fn start_header_echo_server() -> (u16, JoinHandle<()>) {
         }
     });
     (port, handle)
+}
+
+/// GET `url` and return its status and JSON body. Panics on a transport error
+/// or a non-JSON body, so a caller asserting on the result cannot pass on an
+/// unanswered request.
+async fn get_json(client: &reqwest::Client, url: &str) -> (u16, serde_json::Value) {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("request to {url} failed: {e}"));
+    let status = resp.status().as_u16();
+    let body = resp
+        .json()
+        .await
+        .unwrap_or_else(|e| panic!("response from {url} is not JSON: {e}"));
+    (status, body)
 }
 
 // ============================================================================
@@ -148,12 +165,27 @@ plugin_configs: []
         .await
         .expect("start gateway");
 
-    // Verify initial proxy exists
+    // The initial proxy routes to the echo backend, and the route the reload
+    // adds does not exist yet (so a later 200 can only come from the reload).
     let client = reqwest::Client::new();
-    let response = client.get(gateway.proxy_url("/api/v1")).send().await;
-    assert!(
-        response.is_ok(),
-        "Initial proxy should be accessible before reload"
+    let (status, body) = get_json(&client, &gateway.proxy_url("/api/v1/one")).await;
+    assert_eq!(
+        status, 200,
+        "initial proxy must route before reload: {body}"
+    );
+    assert_eq!(
+        body["echo"], "/one",
+        "initial proxy must strip /api/v1 and reach the echo backend"
+    );
+    let before = client
+        .get(gateway.proxy_url("/api/v2/two"))
+        .send()
+        .await
+        .expect("pre-reload request to /api/v2/two");
+    assert_eq!(
+        before.status().as_u16(),
+        404,
+        "/api/v2 must not route before the reload adds it"
     );
 
     // Rewrite the config file in place with a second proxy added.
@@ -184,24 +216,46 @@ plugin_configs: []
         .expect("file-mode harness must populate config_path");
     std::fs::write(config_path, updated_config).expect("rewrite config");
 
-    // SIGHUP the running gateway (Unix only — file-mode reload on Windows is
-    // not supported by the gateway itself).
-    #[cfg(unix)]
-    {
-        let pid = gateway.pid().expect("gateway still running");
-        let _ = std::process::Command::new("kill")
-            .args(["-HUP", &pid.to_string()])
-            .output();
-    }
-
-    sleep(Duration::from_secs(2)).await;
-
-    // Verify new proxy is routable
-    let response = client.get(gateway.proxy_url("/api/v2")).send().await;
+    // SIGHUP the running gateway (file-mode reload is Unix-only; the functional
+    // suite runs on Linux) and require that the signal was actually delivered.
+    let pid = gateway.pid().expect("gateway still running");
+    let kill = std::process::Command::new("kill")
+        .args(["-HUP", &pid.to_string()])
+        .output()
+        .expect("run kill -HUP");
     assert!(
-        response.is_ok(),
-        "New proxy should be accessible after SIGHUP reload"
+        kill.status.success(),
+        "kill -HUP {pid} failed: {}",
+        String::from_utf8_lossy(&kill.stderr)
     );
+
+    // Poll the added route until the reloaded config serves it.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let body: serde_json::Value = loop {
+        let resp = client.get(gateway.proxy_url("/api/v2/two")).send().await;
+        if let Ok(resp) = resp
+            && resp.status().is_success()
+        {
+            break resp.json().await.expect("reloaded route returns JSON");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "/api/v2 did not start routing within 15s of SIGHUP; the reload did not apply"
+        );
+        sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        body["echo"], "/two",
+        "the reloaded route must strip /api/v2 and reach the echo backend"
+    );
+
+    // The proxy that survived the reload keeps routing.
+    let (status, body) = get_json(&client, &gateway.proxy_url("/api/v1/one")).await;
+    assert_eq!(
+        status, 200,
+        "initial proxy must still route after reload: {body}"
+    );
+    assert_eq!(body["echo"], "/one");
 }
 
 #[ignore]
@@ -226,8 +280,12 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_file_mode_multiple_backends() {
-    let backend1 = spawn_http_echo().await.expect("spawn echo1");
-    let backend2 = spawn_http_echo().await.expect("spawn echo2");
+    let backend1 = spawn_http_identifying("backend-1")
+        .await
+        .expect("spawn backend 1");
+    let backend2 = spawn_http_identifying("backend-2")
+        .await
+        .expect("spawn backend 2");
 
     let config = format!(
         r#"
@@ -261,18 +319,18 @@ plugin_configs: []
         .await
         .expect("start gateway");
 
+    // Each listen path must reach its own backend, with the listen path
+    // stripped.
     let client = reqwest::Client::new();
-    let resp1 = client
-        .get(gateway.proxy_url("/api/backend1/test"))
-        .send()
-        .await;
-    assert!(resp1.is_ok(), "Request to backend1 should succeed");
-
-    let resp2 = client
-        .get(gateway.proxy_url("/api/backend2/test"))
-        .send()
-        .await;
-    assert!(resp2.is_ok(), "Request to backend2 should succeed");
+    for (path, server) in [
+        ("/api/backend1/test", "backend-1"),
+        ("/api/backend2/test", "backend-2"),
+    ] {
+        let (status, body) = get_json(&client, &gateway.proxy_url(path)).await;
+        assert_eq!(status, 200, "{path} must route: {body}");
+        assert_eq!(body["server"], server, "{path} reached the wrong backend");
+        assert_eq!(body["path"], "/test", "{path} was not stripped");
+    }
 }
 
 #[ignore]

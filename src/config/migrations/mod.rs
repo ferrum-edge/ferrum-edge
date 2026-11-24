@@ -1,16 +1,7 @@
-pub(crate) mod mysql_collation_probe;
 pub(crate) mod sql_dialect;
 pub(crate) mod sql_statements;
 pub mod v001_initial_schema;
 
-#[allow(unused_imports)] // Re-exported for external unit tests / public API consumers.
-pub use mysql_collation_probe::{
-    IdentityBearingColumn, LiveColumnCollation, LiveTableCollation,
-    REQUIRED_MYSQL_IDENTITY_COLLATION, StaleCollationFinding, find_stale_column_collations,
-    find_stale_table_collations, format_affected_columns_summary, identity_bearing_columns,
-    inspect_mysql_identity_collations, merge_stale_collation_findings,
-    remediation_alter_statements, warn_stale_mysql_identity_collations,
-};
 pub use sql_statements::{
     split_plugin_migration_statements, statements_require_non_transactional_postgres,
 };
@@ -280,6 +271,26 @@ pub fn mysql_drop_index_missing_is_benign(statement: &str, error_number: Option<
     is_drop_index && error_number == Some(1091)
 }
 
+/// Whether a MySQL `CREATE INDEX` failure means the index already exists.
+///
+/// Only the structured server error 1061 (`ER_DUP_KEYNAME`) qualifies. The
+/// V001 baseline strips `IF NOT EXISTS` for MySQL and tolerates exactly this
+/// code; matching the rendered error text instead would also accept unrelated
+/// failures whose message happens to contain the digits.
+pub fn mysql_create_index_exists_is_benign(error_number: Option<u16>) -> bool {
+    error_number == Some(1061)
+}
+
+/// The structured MySQL server error number of a sqlx error, if it is one.
+pub(crate) fn mysql_error_number(error: &sqlx::Error) -> Option<u16> {
+    error
+        .as_database_error()
+        .and_then(|database_error| {
+            database_error.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+        })
+        .map(sqlx::mysql::MySqlDatabaseError::number)
+}
+
 fn map_plugin_statement_result<T>(
     db_type: &str,
     statement: &str,
@@ -288,15 +299,8 @@ fn map_plugin_statement_result<T>(
     match result {
         Ok(_) => Ok(()),
         Err(e) => {
-            let missing_index_is_benign = {
-                let error_number = e
-                    .as_database_error()
-                    .and_then(|database_error| {
-                        database_error.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
-                    })
-                    .map(sqlx::mysql::MySqlDatabaseError::number);
-                db_type == "mysql" && mysql_drop_index_missing_is_benign(statement, error_number)
-            };
+            let missing_index_is_benign = db_type == "mysql"
+                && mysql_drop_index_missing_is_benign(statement, mysql_error_number(&e));
             if missing_index_is_benign {
                 Ok(())
             } else {
@@ -816,8 +820,9 @@ impl MigrationRunner {
 
     /// Ensure the `_ferrum_migrations` tracking table exists.
     ///
-    /// MySQL's `TEXT` type is reported as `BLOB` by the `Any` driver, which
-    /// prevents `try_get::<String>()`. Use `VARCHAR` for MySQL compatibility.
+    /// SQLx 0.8's `Any` driver reported MySQL `TEXT` as `BLOB`, which
+    /// prevented `try_get::<String>()`; 0.9 reports it as text. The table keeps
+    /// `VARCHAR` columns for MySQL.
     async fn ensure_tracking_table(
         &self,
         connection: &mut AnyConnection,
@@ -869,7 +874,8 @@ impl MigrationRunner {
             ),
             other => anyhow::bail!("Unsupported database type for migrations: {other:?}"),
         };
-        Ok(sqlx::query(&sql)
+        // `table` is one of the two fixed tracking-table names above.
+        Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
             .fetch_optional(&mut *connection)
             .await?
             .is_some())
@@ -877,11 +883,11 @@ impl MigrationRunner {
 
     /// Return the migration INSERT statement with the correct bind parameter
     /// syntax for the target database. PostgreSQL uses `$N`, MySQL/SQLite use `?`.
-    fn migration_insert_sql(db_type: &str) -> String {
+    fn migration_insert_sql(db_type: &str) -> &'static str {
         if db_type == "postgres" {
-            "INSERT INTO _ferrum_migrations (version, name, applied_at, checksum, execution_time_ms) VALUES ($1, $2, $3, $4, $5)".to_string()
+            "INSERT INTO _ferrum_migrations (version, name, applied_at, checksum, execution_time_ms) VALUES ($1, $2, $3, $4, $5)"
         } else {
-            "INSERT INTO _ferrum_migrations (version, name, applied_at, checksum, execution_time_ms) VALUES (?, ?, ?, ?, ?)".to_string()
+            "INSERT INTO _ferrum_migrations (version, name, applied_at, checksum, execution_time_ms) VALUES (?, ?, ?, ?, ?)"
         }
     }
 
@@ -1002,7 +1008,6 @@ impl MigrationRunner {
         Ok(())
     }
 
-    #[allow(dead_code)] // core-only helper for run_pending; production uses validate_known_history_locked
     async fn validate_core_history_locked(
         &self,
         connection: &mut AnyConnection,
@@ -1056,7 +1061,6 @@ impl MigrationRunner {
     ///
     /// This helper is intentionally core-only. Production startup uses
     /// [`Self::run_pending_with_plugin_history`] for combined validation.
-    #[allow(dead_code)] // exercised via external migration tests; production uses run_pending_with_plugin_history
     pub async fn run_pending(&self) -> Result<Vec<MigrationRecord>, anyhow::Error> {
         let mut migration_lock =
             MigrationConnectionLock::acquire(&self.pool, &self.db_type).await?;
@@ -1152,7 +1156,7 @@ impl MigrationRunner {
 
             let now = Utc::now().to_rfc3339();
             let insert_sql = Self::migration_insert_sql(&self.db_type);
-            sqlx::query(&insert_sql)
+            sqlx::query(insert_sql)
                 .bind(migration.version() as i32)
                 .bind(migration.name())
                 .bind(&now)
@@ -1176,13 +1180,6 @@ impl MigrationRunner {
 
             newly_applied.push(record);
         }
-
-        // MySQL-only: warn when upgraded deployments still carry a non-
-        // utf8mb4_0900_bin identity collation. Warn-and-continue (never refuse
-        // startup) — matching the pending-plugin-migration posture. No-op on
-        // PostgreSQL / SQLite; MongoDB never reaches MigrationRunner.
-        mysql_collation_probe::warn_stale_mysql_identity_collations(connection, &self.db_type)
-            .await;
 
         Ok(newly_applied)
     }
@@ -1257,11 +1254,11 @@ impl MigrationRunner {
     }
 
     /// Return the INSERT statement for the plugin migration tracking table.
-    fn plugin_migration_insert_sql(db_type: &str) -> String {
+    fn plugin_migration_insert_sql(db_type: &str) -> &'static str {
         if db_type == "postgres" {
-            "INSERT INTO _ferrum_plugin_migrations (plugin_name, version, name, applied_at, checksum, execution_time_ms) VALUES ($1, $2, $3, $4, $5, $6)".to_string()
+            "INSERT INTO _ferrum_plugin_migrations (plugin_name, version, name, applied_at, checksum, execution_time_ms) VALUES ($1, $2, $3, $4, $5, $6)"
         } else {
-            "INSERT INTO _ferrum_plugin_migrations (plugin_name, version, name, applied_at, checksum, execution_time_ms) VALUES (?, ?, ?, ?, ?, ?)".to_string()
+            "INSERT INTO _ferrum_plugin_migrations (plugin_name, version, name, applied_at, checksum, execution_time_ms) VALUES (?, ?, ?, ?, ?, ?)"
         }
     }
 
@@ -1375,6 +1372,9 @@ impl MigrationRunner {
                     })?;
                 let non_transactional =
                     statements_require_non_transactional_postgres(&self.db_type, &statements);
+                // Plugin migration SQL is compiled-in plugin source
+                // (`CustomPluginMigration`), never runtime input, so each split
+                // statement is asserted SQL-safe where it is executed below.
                 let now;
                 if non_transactional {
                     // PostgreSQL online DDL such as CREATE INDEX CONCURRENTLY
@@ -1384,13 +1384,15 @@ impl MigrationRunner {
                         map_plugin_statement_result(
                             &self.db_type,
                             statement,
-                            sqlx::query(statement).execute(&mut *connection).await,
+                            sqlx::query(sqlx::AssertSqlSafe(*statement))
+                                .execute(&mut *connection)
+                                .await,
                         )?;
                     }
                     now = Utc::now().to_rfc3339();
                     let elapsed_ms = start.elapsed().as_millis() as i64;
                     let insert_sql = Self::plugin_migration_insert_sql(&self.db_type);
-                    sqlx::query(&insert_sql)
+                    sqlx::query(insert_sql)
                         .bind(*plugin_name)
                         .bind(migration.version as i32)
                         .bind(migration.name)
@@ -1409,13 +1411,15 @@ impl MigrationRunner {
                         map_plugin_statement_result(
                             &self.db_type,
                             statement,
-                            sqlx::query(statement).execute(&mut *connection).await,
+                            sqlx::query(sqlx::AssertSqlSafe(*statement))
+                                .execute(&mut *connection)
+                                .await,
                         )?;
                     }
                     now = Utc::now().to_rfc3339();
                     let elapsed_ms = start.elapsed().as_millis() as i64;
                     let insert_sql = Self::plugin_migration_insert_sql(&self.db_type);
-                    sqlx::query(&insert_sql)
+                    sqlx::query(insert_sql)
                         .bind(*plugin_name)
                         .bind(migration.version as i32)
                         .bind(migration.name)
@@ -1436,13 +1440,15 @@ impl MigrationRunner {
                         map_plugin_statement_result(
                             "mysql",
                             statement,
-                            sqlx::query(statement).execute(&mut *connection).await,
+                            sqlx::query(sqlx::AssertSqlSafe(*statement))
+                                .execute(&mut *connection)
+                                .await,
                         )?;
                     }
                     now = Utc::now().to_rfc3339();
                     let elapsed_ms = start.elapsed().as_millis() as i64;
                     let insert_sql = Self::plugin_migration_insert_sql(&self.db_type);
-                    sqlx::query(&insert_sql)
+                    sqlx::query(insert_sql)
                         .bind(*plugin_name)
                         .bind(migration.version as i32)
                         .bind(migration.name)
@@ -1459,13 +1465,15 @@ impl MigrationRunner {
                         map_plugin_statement_result(
                             &self.db_type,
                             statement,
-                            sqlx::query(statement).execute(&mut *tx).await,
+                            sqlx::query(sqlx::AssertSqlSafe(*statement))
+                                .execute(&mut *tx)
+                                .await,
                         )?;
                     }
                     now = Utc::now().to_rfc3339();
                     let elapsed_ms = start.elapsed().as_millis() as i64;
                     let insert_sql = Self::plugin_migration_insert_sql(&self.db_type);
-                    sqlx::query(&insert_sql)
+                    sqlx::query(insert_sql)
                         .bind(*plugin_name)
                         .bind(migration.version as i32)
                         .bind(migration.name)

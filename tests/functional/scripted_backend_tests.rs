@@ -634,6 +634,103 @@ async fn h2_alpn_fallback_downgrades_capability() {
     assert_eq!(r2.body_text(), "ok");
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// AWS-LC record-layer cipher suites, selected explicitly
+// ────────────────────────────────────────────────────────────────────────────
+//
+// `FERRUM_TLS_AEAD_BACKEND=auto` selects AWS-LC's cipher suites only on
+// AVX-512 CPUs, which most hosted runners are not, so without an explicit
+// selection the real binary would rarely run on them here. Forcing the backend
+// makes every run cover the bootstrap selection, its startup record, and a
+// backend TLS leg built on those suites carrying a body that spans many
+// records. The scripted backend negotiates with its own (ring) provider, so
+// this is also AWS-LC interoperating with another implementation.
+//
+// The ordinary build only: on a FIPS build there is no selection to make.
+#[cfg(not(feature = "fips"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn forced_aws_lc_record_layer_serves_backend_tls() {
+    let ca = TestCa::new("scripted-aead-root").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    // 256 KiB: sixteen full TLS records, and not a repeating block.
+    let body: String = (0..256 * 1024usize)
+        .map(|index| char::from(b'a' + ((index * 7 + index / 26) % 26) as u8))
+        .collect();
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body.as_bytes());
+    let backend = ScriptedTlsBackend::builder(
+        reservation.into_listener(),
+        TlsConfig::new(cert, key).with_alpn(vec![b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(response))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn backend");
+
+    let yaml = file_mode_yaml_for_backend_with(
+        backend_port,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_tls_verify_server_cert": false,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .mode_binary()
+        .file_config(yaml)
+        .log_level("info")
+        .env("FERRUM_TLS_NO_VERIFY", "true")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
+        .env("FERRUM_TLS_AEAD_BACKEND", "aws-lc")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    // The selection is fixed at bootstrap and recorded once tracing exists.
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| logs.contains("TLS record-layer cipher suites"),
+            Duration::from_secs(10),
+        )
+        .await;
+    assert!(
+        logs.contains("backend=aws-lc, requested=aws-lc, reason=operator-override"),
+        "the startup record must name the forced backend and why; logs:\n{logs}"
+    );
+    // Forcing AWS-LC moves TLS over TCP only: QUIC packets stay on ring.
+    assert!(
+        logs.contains("quic_packet_protection=ring"),
+        "the startup record must say QUIC packet protection stayed on ring; logs:\n{logs}"
+    );
+
+    let client = harness.http_client().expect("client");
+    let resp = client
+        .get(&harness.proxy_url("/api/bulk"))
+        .await
+        .expect("response");
+    assert_eq!(resp.status, StatusCode::OK);
+    assert!(
+        resp.body_text() == body,
+        "the proxied body must match what the TLS backend sent ({} bytes received, {} expected)",
+        resp.body_bytes.len(),
+        body.len()
+    );
+    assert!(
+        backend.handshakes_completed() >= 1,
+        "the gateway must have completed a TLS handshake with the backend"
+    );
+}
+
 /// Poll `GET /backend-capabilities` until exactly one entry exists AND its
 /// `plain_http.h2_tls` field is `"unsupported"`. Returns the entry on
 /// success, `None` on timeout. Mirrors the helper in
@@ -1385,6 +1482,153 @@ async fn ai_token_metrics_retry_sse_release_honors_origin_headers_and_opt_in() {
                 backend.assert_no_step_errors().await;
             }
         }
+    }
+}
+
+// ai_token_metrics meters AWS event-stream (Bedrock InvokeModelWithResponseStream
+// / ConverseStream) incrementally, so a retry-enabled route must release it to
+// stream exactly like SSE (PR #6857 review MUSE-1). The AWS SDK sends neither
+// `Accept: text/event-stream` nor `stream: true`, so only the post-header
+// retry-release vote can keep the stream live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn ai_token_metrics_retry_releases_aws_event_stream() {
+    use base64::Engine;
+
+    const MID_STREAM_PAUSE: Duration = Duration::from_secs(5);
+    const FIRST_MESSAGE_DEADLINE: Duration = Duration::from_millis(2500);
+    let bedrock_message = |inner: serde_json::Value| {
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&inner).expect("inner chunk"));
+        let payload = serde_json::to_vec(&json!({"bytes": encoded})).expect("payload");
+        ferrum_edge::_test_support::encode_aws_event_stream_message_for_test(b"", &payload)
+    };
+    let first = bedrock_message(json!({
+        "type": "content_block_delta",
+        "delta": {"type": "text_delta", "text": "hello"}
+    }));
+    let last = bedrock_message(json!({
+        "type": "message_stop",
+        "amazon-bedrock-invocationMetrics": {"inputTokenCount": 30, "outputTokenCount": 20}
+    }));
+
+    for retry_first in [false, true] {
+        let reservation = reserve_port().await.expect("reserve backend port");
+        let backend_port = reservation.port;
+        let mut scripts = Vec::new();
+        if retry_first {
+            scripts.push(vec![
+                HttpStep::ExpectRequest(RequestMatcher::method_path("POST", "/invoke")),
+                HttpStep::RespondStatus {
+                    status: 503,
+                    reason: "Service Unavailable".into(),
+                },
+                HttpStep::RespondHeader {
+                    name: "Connection".into(),
+                    value: "close".into(),
+                },
+                HttpStep::RespondBodyChunk(b"{}".to_vec()),
+                HttpStep::RespondBodyEnd,
+            ]);
+        }
+        scripts.push(vec![
+            HttpStep::ExpectRequest(RequestMatcher::method_path("POST", "/invoke")),
+            HttpStep::RespondStatus {
+                status: 200,
+                reason: "OK".into(),
+            },
+            HttpStep::RespondHeader {
+                name: "Content-Type".into(),
+                value: "application/vnd.amazon.eventstream".into(),
+            },
+            HttpStep::RespondHeader {
+                name: "Connection".into(),
+                value: "close".into(),
+            },
+            HttpStep::RespondBodyChunk(first.clone()),
+            HttpStep::Sleep(MID_STREAM_PAUSE),
+            HttpStep::RespondBodyChunk(last.clone()),
+            HttpStep::RespondBodyEnd,
+        ]);
+        let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+            .connection_scripts(scripts)
+            .spawn()
+            .expect("spawn backend");
+        let config = json!({
+            "version": "1",
+            "proxies": [{
+                "id": "token-retry-aws",
+                "listen_path": "/invoke",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": backend_port,
+                "strip_listen_path": false,
+                "backend_read_timeout_ms": 0,
+                "retry": {
+                    "max_retries": 2,
+                    "retryable_status_codes": [503],
+                    "retryable_methods": ["POST"],
+                    "retry_on_connect_failure": false,
+                },
+                "plugins": [{"plugin_config_id": "tokens"}],
+            }],
+            "consumers": [],
+            "upstreams": [],
+            "plugin_configs": [{
+                "id": "tokens",
+                "proxy_id": "token-retry-aws",
+                "plugin_name": "ai_token_metrics",
+                "scope": "proxy",
+                "enabled": true,
+                "config": {},
+            }],
+        });
+        let harness = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(to_file_mode_yaml(&config))
+            .pool_warmup_enabled(false)
+            .spawn()
+            .await
+            .expect("spawn gateway");
+        let request_body = json!({"inputText": "hello"}).to_string();
+        let client = harness.http_client().expect("client");
+        let request = client
+            .request(reqwest::Method::POST, &harness.proxy_url("/invoke"))
+            .header("content-type", "application/json")
+            .body(request_body.clone());
+        let (mut response, mut body) = tokio::time::timeout(FIRST_MESSAGE_DEADLINE, async {
+            let mut response = request.send().await.expect("response headers");
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = Vec::new();
+            while body.len() < first.len() {
+                let chunk = response
+                    .chunk()
+                    .await
+                    .expect("read message")
+                    .expect("message");
+                body.extend_from_slice(&chunk);
+            }
+            (response, body)
+        })
+        .await
+        .expect("first event-stream message arrives before the backend's mid-stream pause ends");
+        assert_eq!(body, first, "retry_first={retry_first}");
+        tokio::time::timeout(MID_STREAM_PAUSE + Duration::from_secs(5), async {
+            while let Some(chunk) = response.chunk().await.expect("drain event stream") {
+                body.extend_from_slice(&chunk);
+            }
+        })
+        .await
+        .expect("stream finishes");
+        let mut expected = first.clone();
+        expected.extend_from_slice(&last);
+        assert_eq!(body, expected, "every byte is forwarded unchanged");
+        assert_eq!(
+            backend.received_requests().await.len(),
+            if retry_first { 2 } else { 1 }
+        );
+        backend.assert_no_matcher_mismatches().await;
+        backend.assert_no_step_errors().await;
     }
 }
 
@@ -2548,7 +2792,7 @@ fn diagnostic_token(extra: serde_json::Value) -> String {
         }
     }
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = jsonwebtoken::EncodingKey::from_secret(DIAGNOSTIC_JWT_SECRET.as_bytes());
+    let key = jsonwebtoken::EncodingKey::from_secret(DIAGNOSTIC_JWT_SECRET.as_bytes()).unwrap();
     jsonwebtoken::encode(&header, &claims, &key).expect("encode diagnostics JWT")
 }
 
@@ -3171,6 +3415,469 @@ async fn diagnostic_refs_all_mode_marks_plugin_and_routing_rejections() {
         assert!(attempt.get("status").is_none(), "{body}");
     }
     drop(backend);
+}
+
+/// gRPC-Web routes whose backend is never reached: one behind `key_auth`,
+/// one whose `allowed_methods` admits only `GET`.
+fn diagnostic_grpc_web_yaml(refused_port: u16) -> String {
+    to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [
+            {
+                "id": "diag-grpc-web",
+                "listen_path": "/grpcweb",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": refused_port,
+                "strip_listen_path": true,
+                "plugins": [
+                    {"plugin_config_id": "diag-grpc-web"},
+                    {"plugin_config_id": "diag-grpc-web-key-auth"},
+                ],
+            },
+            {
+                "id": "diag-grpc-web-get",
+                "listen_path": "/grpcweb-get",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": refused_port,
+                "strip_listen_path": true,
+                "allowed_methods": ["GET"],
+                "plugins": [{"plugin_config_id": "diag-grpc-web-get"}],
+            },
+        ],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "diag-grpc-web",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "diag-grpc-web",
+                "enabled": true,
+                "config": {},
+            },
+            {
+                "id": "diag-grpc-web-key-auth",
+                "plugin_name": "key_auth",
+                "scope": "proxy",
+                "proxy_id": "diag-grpc-web",
+                "enabled": true,
+                "config": {"key_location": "header:X-Api-Key"},
+            },
+            {
+                "id": "diag-grpc-web-get",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "diag-grpc-web-get",
+                "enabled": true,
+                "config": {},
+            },
+        ],
+    }))
+}
+
+/// A gRPC message frame carrying `payload`.
+fn grpc_message_frame(payload: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(payload.len() + 5);
+    framed.push(0x00);
+    framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    framed.extend_from_slice(payload);
+    framed
+}
+
+/// The `grpc-status` of a gRPC-Web trailer frame. The gateway's encoder
+/// writes one `name: value` line per field (`grpc-status: 16\r\n`).
+fn grpc_web_trailer_status(frame: &[u8]) -> u32 {
+    assert_eq!(frame.first(), Some(&0x80), "a trailer frame: {frame:?}");
+    assert!(frame.len() >= 5, "a complete frame header: {frame:?}");
+    let declared = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+    assert_eq!(
+        frame.len(),
+        5 + declared,
+        "one whole trailer frame: {frame:?}"
+    );
+    let trailers = String::from_utf8_lossy(&frame[5..]).into_owned();
+    let statuses: Vec<u32> = trailers
+        .split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("grpc-status"))
+        .map(|(_, value)| value.trim().parse().expect("numeric grpc-status"))
+        .collect();
+    assert_eq!(statuses.len(), 1, "one grpc-status trailer: {trailers:?}");
+    statuses[0]
+}
+
+/// Check a gateway gRPC-Web rejection head and body: HTTP `200`, a non-zero
+/// `grpc-status` only in the body trailer frame, and the one reference
+/// exposed to browser callers. Returns the reference and the gRPC status.
+fn grpc_web_rejection_reference(
+    status: u16,
+    headers: &http::HeaderMap,
+    body: &[u8],
+    content_type: &str,
+) -> (String, u32) {
+    use base64::Engine;
+    assert_eq!(status, 200, "gRPC-Web answers 200: {headers:?}");
+    assert!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with(content_type)),
+        "{headers:?}"
+    );
+    assert!(
+        !headers.contains_key("grpc-status"),
+        "terminal metadata rides only in the body: {headers:?}"
+    );
+    let frame = if content_type.ends_with("-text") {
+        base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .expect("base64 gRPC-Web-text body")
+    } else {
+        body.to_vec()
+    };
+    let grpc_status = grpc_web_trailer_status(&frame);
+    assert_ne!(grpc_status, 0, "a rejection is not OK: {headers:?}");
+    let reference = rejection_reference(headers);
+    let exposed: Vec<String> = headers
+        .get_all("access-control-expose-headers")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect();
+    for name in ["grpc-status", "grpc-message", "x-ferrum-diagnostic-ref"] {
+        assert_eq!(
+            exposed.iter().filter(|exposed| *exposed == name).count(),
+            1,
+            "{name} exposed once: {headers:?}"
+        );
+    }
+    (reference, grpc_status)
+}
+
+/// One client-visible response.
+struct ObservedResponse {
+    protocol: &'static str,
+    status: u16,
+    headers: http::HeaderMap,
+    body: Vec<u8>,
+}
+
+const GRPC_WEB_BINARY: &str = "application/grpc-web+proto";
+const GRPC_WEB_TEXT: &str = "application/grpc-web-text";
+const NATIVE_GRPC: &str = "application/grpc";
+const ALL_PROTOCOLS: &[&str] = &["http1", "http2", "http3"];
+
+/// Send one gRPC (native or gRPC-Web, by `content_type`) request with
+/// `method` to `path` on each of `protocols` (`http1`, `http2` h2c, `http3`).
+async fn send_grpc_on_protocols(
+    gateway: &TestGateway,
+    https_port: u16,
+    method: &http::Method,
+    path: &str,
+    content_type: &str,
+    protocols: &[&str],
+) -> Vec<ObservedResponse> {
+    use base64::Engine;
+    let body = if *method != http::Method::POST {
+        Vec::new()
+    } else if content_type.ends_with("-text") {
+        base64::engine::general_purpose::STANDARD
+            .encode(grpc_message_frame(b"ping"))
+            .into_bytes()
+    } else {
+        grpc_message_frame(b"ping")
+    };
+    let mut request_headers = vec![
+        ("content-type", content_type),
+        ("x-api-key", DIAGNOSTIC_API_KEY),
+    ];
+    if content_type == NATIVE_GRPC {
+        request_headers.push(("te", "trailers"));
+    } else {
+        request_headers.push(("x-grpc-web", "1"));
+    }
+    let mut observed = Vec::new();
+    for &protocol in protocols {
+        let context = format!("{method} {path} {content_type} {protocol}");
+        if protocol == "http3" {
+            // Retry only until the QUIC listener answers at all; the first
+            // response is the one asserted.
+            let h3 = Http3Client::insecure().expect("h3 client");
+            let h3_url = format!("https://localhost:{https_port}{path}");
+            let mut options =
+                crate::scaffolding::clients::GetOptions::default().method(method.clone());
+            for (name, value) in &request_headers {
+                options = options.header(*name, *value);
+            }
+            let options = options.body(bytes::Bytes::from(body.clone()));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let response = loop {
+                match h3.get_with_options(&h3_url, options.clone()).await {
+                    Ok(response) => break response,
+                    Err(_) if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(err) => panic!("{context}: did not complete: {err}"),
+                }
+            };
+            observed.push(ObservedResponse {
+                protocol: "http3",
+                status: response.status.as_u16(),
+                headers: response.headers,
+                body: response.body_bytes.to_vec(),
+            });
+            continue;
+        }
+        let (protocol, version) = if protocol == "http2" {
+            ("http2", reqwest::Version::HTTP_2)
+        } else {
+            ("http1", reqwest::Version::HTTP_11)
+        };
+        let builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
+        let client = if version == reqwest::Version::HTTP_2 {
+            builder.http2_prior_knowledge()
+        } else {
+            builder.http1_only()
+        }
+        .build()
+        .expect("client");
+        let mut request = client.request(method.clone(), gateway.proxy_url(path));
+        for (name, value) in &request_headers {
+            request = request.header(*name, *value);
+        }
+        if !body.is_empty() {
+            request = request.body(body.clone());
+        }
+        let response = request.send().await.expect(&context);
+        assert_eq!(response.version(), version, "{context}");
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let bytes = response.bytes().await.expect("response body");
+        observed.push(ObservedResponse {
+            protocol,
+            status,
+            headers,
+            body: bytes.to_vec(),
+        });
+    }
+    observed
+}
+
+/// A gateway rejection the test drives, and what its reference must resolve
+/// to.
+struct ExpectedRejection {
+    method: http::Method,
+    path: &'static str,
+    content_types: &'static [&'static str],
+    protocols: &'static [&'static str],
+    grpc_status: Option<u32>,
+    proxy_id: Option<&'static str>,
+    source: &'static str,
+    phase: &'static str,
+    plugin: Option<&'static str>,
+}
+
+// Issue #7407: with `FERRUM_DIAGNOSTIC_REFS=all`, every tokenless gateway
+// rejection that reaches the client as a gRPC-Web trailer-frame error (HTTP
+// `200`, `grpc-status` in the body) carries a reference on HTTP/1.1, HTTP/2
+// and HTTP/3, binary and text, exposed to browser callers, that resolves to
+// `status: 200` and the rejecting phase: a `key_auth` plugin rejection, a
+// route miss, an `allowed_methods` refusal and the gRPC non-`POST` refusal.
+// Native gRPC Trailers-Only rejections of the same kinds keep, or now get,
+// theirs, bound to the `200` head rather than the admission status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn diagnostic_refs_all_mode_marks_grpc_web_rejections_on_every_protocol() {
+    let refused = reserve_refused_tcp_port().expect("reserve refused backend port");
+    let gateway = TestGateway::builder()
+        .mode_file(diagnostic_grpc_web_yaml(refused.port))
+        .log_level("warn")
+        .jwt_secret(DIAGNOSTIC_JWT_SECRET)
+        .jwt_issuer(DIAGNOSTIC_JWT_ISSUER)
+        .env("FERRUM_DIAGNOSTIC_REFS", "all")
+        .env("FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND", "1000")
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
+    let admin = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("admin client");
+    let reader = diagnostic_token(json!({"scope": "diagnostics:read", "ns": ["ferrum"]}));
+
+    let cases = [
+        ExpectedRejection {
+            method: http::Method::POST,
+            path: "/grpcweb/diag.Echo/Call",
+            content_types: &[GRPC_WEB_BINARY, GRPC_WEB_TEXT],
+            protocols: ALL_PROTOCOLS,
+            grpc_status: Some(16),
+            proxy_id: Some("diag-grpc-web"),
+            source: "plugin",
+            phase: "authenticate",
+            plugin: Some("key_auth"),
+        },
+        ExpectedRejection {
+            method: http::Method::POST,
+            path: "/no-such-grpc-route/diag.Echo/Call",
+            content_types: &[GRPC_WEB_BINARY, GRPC_WEB_TEXT],
+            protocols: ALL_PROTOCOLS,
+            grpc_status: None,
+            proxy_id: None,
+            source: "routing",
+            phase: "route_not_found",
+            plugin: None,
+        },
+        ExpectedRejection {
+            method: http::Method::POST,
+            path: "/grpcweb-get/diag.Echo/Call",
+            content_types: &[GRPC_WEB_BINARY, GRPC_WEB_TEXT],
+            protocols: ALL_PROTOCOLS,
+            grpc_status: None,
+            proxy_id: Some("diag-grpc-web-get"),
+            source: "gateway",
+            phase: "allowed_methods",
+            plugin: None,
+        },
+        // Every frontend classifies a gRPC-Web request as gRPC before the
+        // non-`POST` gate.
+        ExpectedRejection {
+            method: http::Method::GET,
+            path: "/grpcweb/diag.Echo/Call",
+            content_types: &[GRPC_WEB_BINARY, GRPC_WEB_TEXT],
+            protocols: ALL_PROTOCOLS,
+            grpc_status: Some(3),
+            proxy_id: Some("diag-grpc-web"),
+            source: "gateway",
+            phase: "grpc_post_required",
+            plugin: None,
+        },
+        // Native gRPC Trailers-Only: the plugin rejection, the `allowed_methods`
+        // refusal (logged as `405`, referenced on its `200` head) and the
+        // non-`POST` refusal.
+        ExpectedRejection {
+            method: http::Method::POST,
+            path: "/grpcweb/diag.Echo/Call",
+            content_types: &[NATIVE_GRPC],
+            protocols: &["http2", "http3"],
+            grpc_status: Some(16),
+            proxy_id: Some("diag-grpc-web"),
+            source: "plugin",
+            phase: "authenticate",
+            plugin: Some("key_auth"),
+        },
+        ExpectedRejection {
+            method: http::Method::POST,
+            path: "/grpcweb-get/diag.Echo/Call",
+            content_types: &[NATIVE_GRPC],
+            protocols: &["http2", "http3"],
+            grpc_status: None,
+            proxy_id: Some("diag-grpc-web-get"),
+            source: "gateway",
+            phase: "allowed_methods",
+            plugin: None,
+        },
+        ExpectedRejection {
+            method: http::Method::GET,
+            path: "/grpcweb/diag.Echo/Call",
+            content_types: &[NATIVE_GRPC],
+            protocols: &["http2", "http3"],
+            grpc_status: Some(3),
+            proxy_id: Some("diag-grpc-web"),
+            source: "gateway",
+            phase: "grpc_post_required",
+            plugin: None,
+        },
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for case in &cases {
+        for &content_type in case.content_types {
+            let observed = send_grpc_on_protocols(
+                &gateway,
+                https_port,
+                &case.method,
+                case.path,
+                content_type,
+                case.protocols,
+            )
+            .await;
+            assert_eq!(observed.len(), case.protocols.len());
+            for response in observed {
+                let context = format!(
+                    "{} {} {content_type} {}",
+                    case.method, case.path, response.protocol
+                );
+                let (reference, grpc_status) = if content_type == NATIVE_GRPC {
+                    assert_eq!(response.status, 200, "{context}: {:?}", response.headers);
+                    let grpc_status: u32 = response
+                        .headers
+                        .get("grpc-status")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{context}: Trailers-Only grpc-status: {:?}",
+                                response.headers
+                            )
+                        });
+                    assert_ne!(grpc_status, 0, "{context}");
+                    (rejection_reference(&response.headers), grpc_status)
+                } else {
+                    grpc_web_rejection_reference(
+                        response.status,
+                        &response.headers,
+                        &response.body,
+                        content_type,
+                    )
+                };
+                if let Some(expected) = case.grpc_status {
+                    assert_eq!(grpc_status, expected, "{context}");
+                }
+                assert!(
+                    seen.insert(reference.clone()),
+                    "{context}: a fresh reference"
+                );
+                let lookup_url = gateway.admin_url(&format!("/diagnostics/v1/refs/{reference}"));
+                let body = resolve_detail(&admin, &lookup_url, &reader).await;
+                assert_eq!(body["protocol"], response.protocol, "{context}: {body}");
+                assert_eq!(
+                    body["status"], 200,
+                    "{context}: bound to the wire head: {body}"
+                );
+                assert!(body["gateway_error"].is_null(), "{context}: {body}");
+                let detail = &body["detail"];
+                match case.proxy_id {
+                    Some(proxy_id) => assert_eq!(detail["proxy_id"], proxy_id, "{context}: {body}"),
+                    None => assert!(detail["proxy_id"].is_null(), "{context}: {body}"),
+                }
+                assert_eq!(
+                    detail["backend_dispatch"], "not_dispatched",
+                    "{context}: {body}"
+                );
+                let rejection = &detail["rejection"];
+                assert_eq!(rejection["source"], case.source, "{context}: {body}");
+                assert_eq!(rejection["phase"], case.phase, "{context}: {body}");
+                match case.plugin {
+                    Some(plugin) => assert_eq!(rejection["plugin"], plugin, "{context}: {body}"),
+                    None => assert!(rejection.get("plugin").is_none(), "{context}: {body}"),
+                }
+                assert!(
+                    !body.to_string().contains(DIAGNOSTIC_API_KEY),
+                    "{context}: {body}"
+                );
+            }
+        }
+    }
 }
 
 // `errors` keeps its #5767 contract: a plugin rejection and a routing miss

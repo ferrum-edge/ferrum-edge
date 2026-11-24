@@ -1,0 +1,126 @@
+name: Dependabot Auto-Merge
+
+# Queues GitHub auto-merge on Dependabot's own pull requests so a green
+# dependency bump lands without a maintainer click. Queuing is not merging:
+# GitHub merges only after every required check passes on the PR head,
+# including `Trusted Cross Build Policy`, whose action pin rotation check admits
+# a changed action pin only as a forward upstream release
+# (docs/dependency-policy.md → "Automated dependency merges").
+#
+# - `pull_request_target` runs this file from `main`, never from the PR, and no
+#   step checks out or executes PR content. The jobs hold only the built-in
+#   `GITHUB_TOKEN`; no stored credential exists. Only the two `gh` jobs get a
+#   write grant; the third-party metadata action reads with `pull-requests:
+#   read` in a job of its own.
+# - Only a PR Dependabot opened, on a branch of this repository, whose latest
+#   push was Dependabot's, is queued. Any other push to that branch withdraws
+#   the queued merge, so a human-edited bump goes back to human review.
+# - semver-major updates are left for a maintainer.
+# - The merge method is a merge commit: the publication gate binds Trusted Cross
+#   Build Policy evidence to the merge commit's second parent.
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+    branches:
+      - main
+
+permissions: {}
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # The third-party metadata action runs in its own job with a read-only token.
+  # It only reads the pull request's commits through the API, so it never holds
+  # the write grant that queuing needs; the write job below runs nothing but
+  # the runner's `gh`.
+  metadata:
+    name: Read Dependabot update metadata
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]'
+      && github.actor == 'dependabot[bot]'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      update-type: ${{ steps.metadata.outputs.update-type }}
+      dependency-names: ${{ steps.metadata.outputs.dependency-names }}
+    steps:
+      - id: metadata
+        name: Read Dependabot update metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+
+      - name: Leave a semver-major update for a maintainer
+        if: steps.metadata.outputs.update-type == 'version-update:semver-major'
+        env:
+          DEPENDENCIES: ${{ steps.metadata.outputs.dependency-names }}
+        run: |
+          echo "::notice::semver-major update (${DEPENDENCIES}) is left for maintainer review"
+
+  queue:
+    name: Queue Dependabot auto-merge
+    needs: metadata
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]'
+      && github.actor == 'dependabot[bot]'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && needs.metadata.outputs.update-type != 'version-update:semver-major'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Queue a merge-commit auto-merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          UPDATE_TYPE: ${{ needs.metadata.outputs.update-type }}
+          DEPENDENCIES: ${{ needs.metadata.outputs.dependency-names }}
+        run: |
+          set -euo pipefail
+          queued="$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null')"
+          if [ "$queued" = "true" ]; then
+            echo "Auto-merge is already queued for #${PR_NUMBER}"
+            exit 0
+          fi
+          echo "Queuing auto-merge for #${PR_NUMBER} (${UPDATE_TYPE:-digest}): ${DEPENDENCIES}"
+          gh pr merge "$PR_NUMBER" --auto --merge
+
+  withdraw:
+    name: Withdraw auto-merge after a non-Dependabot push
+    if: >-
+      github.event.action == 'synchronize'
+      && github.event.pull_request.user.login == 'dependabot[bot]'
+      && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    # disablePullRequestAutoMerge needs the same grant as enabling it: with
+    # `pull-requests: write` alone GitHub answers "Resource not accessible by
+    # integration" (#6591). Like `queue`, the job executes no PR content.
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Withdraw the queued merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          queued="$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null')"
+          if [ "$queued" != "true" ]; then
+            echo "No auto-merge is queued for #${PR_NUMBER}"
+            exit 0
+          fi
+          echo "::notice::${ACTOR} pushed to Dependabot PR #${PR_NUMBER}; withdrawing auto-merge"
+          gh pr merge "$PR_NUMBER" --disable-auto

@@ -410,6 +410,73 @@ fn redact_url_redacts_mongodb_auth_mechanism_properties_tokens() {
     assert!(redacted_ports.contains("AWS_SESSION_TOKEN:***"));
 }
 
+/// GHSA-wqrm-jcch-972x: URI builders percent-encode `:` and `,` inside
+/// `authMechanismProperties`, and drivers decode the value before splitting
+/// it. The scrubber must match the decoded properties, not the raw text.
+#[test]
+fn redact_url_redacts_percent_encoded_auth_mechanism_properties() {
+    let cases = [
+        // Encoded `:` delimiter (upper and lower case hex).
+        "authMechanismProperties=AWS_SESSION_TOKEN%3Afixture-session-value",
+        "authMechanismProperties=AWS_SESSION_TOKEN%3afixture-session-value",
+        // Encoded `,` between a benign and a credential-bearing property.
+        "authMechanismProperties=CANONICALIZE_HOST_NAME%3Atrue%2CAWS_SESSION_TOKEN%3Afixture-session-value",
+        "authMechanismProperties=CANONICALIZE_HOST_NAME:true%2cAWS_SESSION_TOKEN:fixture-session-value",
+        // Percent-encoded property name.
+        "authMechanismProperties=AWS_SESSION_TOK%45N:fixture-session-value",
+        // Doubly encoded name: still unreadable after one decode, so redacted.
+        "authMechanismProperties=AWS_SESSION_TOK%2545N:fixture-session-value",
+        // OIDC-style credential property.
+        "authMechanismProperties=ENVIRONMENT%3Aazure%2CTOKEN_RESOURCE%3Afixture-session-value",
+        // Doubly encoded delimiter: no decoded `:`, so the entry fails closed.
+        "authMechanismProperties=AWS_SESSION_TOKEN%253Afixture-session-value",
+        // Encoded key name as well as encoded delimiter.
+        "authMechanismPropert%69es=AWS_SESSION_TOKEN%3Afixture-session-value",
+    ];
+    for query in cases {
+        for prefix in [
+            // Single host: parsed by `url::Url`.
+            "mongodb://u:p@db0/ferrum?authMechanism=MONGODB-AWS&",
+            // Multi-host with ports: the fallback redactor.
+            "mongodb://u:p@db0:27017,db1:27017/ferrum?authMechanism=MONGODB-AWS&",
+        ] {
+            let redacted = redact_url(&format!("{prefix}{query}"));
+            assert!(
+                !redacted.contains("fixture-session-value"),
+                "encoded mechanism property leaked for case {query}"
+            );
+            assert!(
+                redacted.contains("authMechanism=MONGODB-AWS"),
+                "unrelated option was lost for case {query}"
+            );
+        }
+    }
+
+    // Benign properties stay readable once decoded; the credential is masked.
+    let redacted = redact_url(concat!(
+        "mongodb://u:p@db0/ferrum?authMechanismProperties=",
+        "CANONICALIZE_HOST_NAME%3Atrue%2CAWS_SESSION_TOKEN%3Afixture-session-value"
+    ));
+    assert!(
+        redacted
+            .contains("authMechanismProperties=CANONICALIZE_HOST_NAME:true,AWS_SESSION_TOKEN:***"),
+        "unexpected redaction shape: {redacted}"
+    );
+
+    // A malformed entry with no decoded delimiter is withheld whole.
+    let malformed = redact_url(
+        "mongodb://u:p@db0/ferrum?authMechanismProperties=SERVICE_NAME:mongodb%2Cfixture-bare-value",
+    );
+    assert!(
+        !malformed.contains("fixture-bare-value"),
+        "malformed entry leaked: {malformed}"
+    );
+    assert!(
+        malformed.contains("SERVICE_NAME:mongodb,***"),
+        "{malformed}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // extract_known_ids — tests
 // ---------------------------------------------------------------------------
@@ -689,11 +756,11 @@ fn incremental_result_not_empty_with_added_consumer() {
 
 #[test]
 fn failover_topology_state_transitions_and_opt_in_risk_marker() {
-    let state = DbFailoverTopologyState::new();
+    let state = DbFailoverTopologyState::new(());
     assert!(state.primary_active());
     assert!(!state.status().opt_in_writes_enabled_during_window);
 
-    state.mark_failover("sqlite:///tmp/failover.db");
+    state.publish_failover((), "sqlite:///tmp/failover.db");
     let status = state.status();
     assert!(!status.primary_active);
     assert_eq!(
@@ -705,11 +772,14 @@ fn failover_topology_state_transitions_and_opt_in_risk_marker() {
     assert!(!status.allow_writes);
 
     // Failback remains allowed when no Admin mutation was admitted.
-    state.mark_primary("sqlite:///tmp/primary.db");
+    let permit = state
+        .ensure_primary_failback_allowed()
+        .expect("failback is not fenced without an admitted write");
+    state.publish_primary((), permit, "sqlite:///tmp/primary.db");
     assert!(state.primary_active());
     assert!(!state.status().opt_in_writes_enabled_during_window);
 
-    state.mark_failover("sqlite:///tmp/failover.db");
+    state.publish_failover((), "sqlite:///tmp/failover.db");
     state.set_allow_writes(true);
     let status = state.status();
     assert!(status.allow_writes);
@@ -720,7 +790,7 @@ fn failover_topology_state_transitions_and_opt_in_risk_marker() {
 
     // Switching failover URLs must preserve the sticky opt-in risk marker and
     // must not spam additional transition warnings (silent URL refresh).
-    state.mark_failover("sqlite:///tmp/failover-2.db");
+    state.publish_failover((), "sqlite:///tmp/failover-2.db");
     let status = state.status();
     assert!(!status.primary_active);
     assert!(status.opt_in_writes_enabled_during_window);
@@ -734,7 +804,7 @@ fn failover_topology_state_transitions_and_opt_in_risk_marker() {
     state.note_admin_write();
     assert!(state.ensure_primary_failback_allowed().is_err());
     assert!(state.status().primary_failback_fenced);
-    state.mark_failover("sqlite:///tmp/failover-3.db");
+    state.publish_failover((), "sqlite:///tmp/failover-3.db");
     assert!(
         state.status().primary_failback_fenced,
         "switching failover URLs must not clear the admission fence"
@@ -743,20 +813,74 @@ fn failover_topology_state_transitions_and_opt_in_risk_marker() {
 }
 
 #[test]
-fn failover_topology_mark_primary_emits_clear_window() {
-    let state = DbFailoverTopologyState::new();
-    state.mark_failover("postgres://***/***/ferrum");
-    state.mark_primary("postgres://***/***/ferrum");
+fn failover_topology_publish_primary_emits_clear_window() {
+    let state = DbFailoverTopologyState::new(());
+    state.publish_failover((), "postgres://***/***/ferrum");
+    let permit = state.ensure_primary_failback_allowed().unwrap();
+    state.publish_primary((), permit, "postgres://***/***/ferrum");
     assert!(state.primary_active());
     assert!(!state.status().opt_in_writes_enabled_during_window);
     assert!(state.status().failover_since_unix_ms.is_none());
 }
 
+/// Issue #7033: `publish_primary` consumes the permit only a passing
+/// `ensure_primary_failback_allowed` returns. A permit issued before a later
+/// failover write is refused by `revalidate_primary_failback`, and even a
+/// broken caller that finalizes with it cannot erase the fence: it holds
+/// until operator reconciliation and restart.
+#[test]
+fn failover_topology_stale_failback_permit_is_refused_and_never_clears_fence() {
+    use ferrum_edge::config::db_backend::primary_failback_fenced;
+
+    let state = DbFailoverTopologyState::new(());
+    // A permit taken while failover writes are still unfenced is fresh.
+    state.publish_failover((), "sqlite:///tmp/failover.db");
+    let permit = state.ensure_primary_failback_allowed().unwrap();
+    assert!(state.revalidate_primary_failback(&permit).is_ok());
+
+    // Once a failover write is admitted, no new permit can be obtained and
+    // the earlier one is stale.
+    state.note_admin_write();
+    assert!(state.status().primary_failback_fenced);
+    let fenced = state
+        .ensure_primary_failback_allowed()
+        .expect_err("an admitted failover write must fence failback");
+    assert!(primary_failback_fenced(&fenced));
+    let stale = state
+        .revalidate_primary_failback(&permit)
+        .expect_err("a permit issued before the failover write must be refused");
+    assert!(primary_failback_fenced(&stale));
+
+    // Publishers abort on the revalidation above; if a broken caller
+    // finalizes anyway, the fence must stay set and visible.
+    state.publish_primary((), permit, "sqlite:///tmp/primary.db");
+    let status = state.status();
+    assert!(status.primary_active);
+    assert!(
+        status.primary_failback_fenced,
+        "publish_primary must never clear the failover-write fence"
+    );
+}
+
+/// The permit's generation only moves for writes admitted on failover, so a
+/// permit taken while the primary is active stays fresh across primary-side
+/// writes.
+#[test]
+fn failover_topology_permit_stays_fresh_across_primary_writes() {
+    let state = DbFailoverTopologyState::new(());
+    let permit = state.ensure_primary_failback_allowed().unwrap();
+    state.note_admin_write();
+    assert!(state.revalidate_primary_failback(&permit).is_ok());
+    state.publish_primary((), permit, "sqlite:///tmp/primary.db");
+    assert!(state.primary_active());
+    assert!(!state.status().primary_failback_fenced);
+}
+
 #[test]
 fn failover_topology_opt_in_at_transition_marks_window() {
-    let state = DbFailoverTopologyState::new();
+    let state = DbFailoverTopologyState::new(());
     state.set_allow_writes(true);
-    state.mark_failover("sqlite:///tmp/failover.db");
+    state.publish_failover((), "sqlite:///tmp/failover.db");
     assert!(
         state.status().opt_in_writes_enabled_during_window,
         "opt-in already enabled at failover transition must mark the window"
@@ -764,6 +888,117 @@ fn failover_topology_opt_in_at_transition_marks_window() {
     // Repeated set_allow_writes(true) must stay sticky without clearing.
     state.set_allow_writes(true);
     assert!(state.status().opt_in_writes_enabled_during_window);
+}
+
+/// Issue #7061: the handle and its topology are one publication. Publishing
+/// replaces both and returns the previous handle; status derives from the
+/// same snapshot as the handle.
+#[test]
+fn failover_topology_publication_replaces_handle_and_topology_together() {
+    let state = DbFailoverTopologyState::new("primary-0");
+    let (handle, status) = state.handle_and_status();
+    assert_eq!(handle, "primary-0");
+    assert!(status.primary_active);
+
+    assert_eq!(
+        state.publish_failover("failover-1", "db://failover"),
+        "primary-0"
+    );
+    let (handle, status) = state.handle_and_status();
+    assert_eq!(handle, "failover-1");
+    assert!(!status.primary_active);
+    assert_eq!(status.active_url_redacted.as_deref(), Some("db://failover"));
+
+    let permit = state.ensure_primary_failback_allowed().unwrap();
+    assert_eq!(
+        state.publish_primary("primary-2", permit, "db://primary"),
+        "failover-1"
+    );
+    let (handle, status) = state.handle_and_status();
+    assert_eq!(handle, "primary-2");
+    assert!(status.primary_active);
+    assert_eq!(status.active_url_redacted.as_deref(), Some("db://primary"));
+    assert_eq!(state.handle(), "primary-2");
+}
+
+/// Issue #7061: a concurrent observer never sees a primary handle next to
+/// failover topology (or the reverse), nor a primary status that still
+/// carries the failover URL or window start, however publications and
+/// opt-in policy updates interleave.
+#[test]
+fn failover_topology_publication_is_one_consistent_cut_under_concurrency() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let state = Arc::new(DbFailoverTopologyState::new(true));
+    let done = Arc::new(AtomicBool::new(false));
+    // Every observer and the toggler must be running before publication
+    // starts, so they overlap it; each observer also samples at least once
+    // before it checks for completion.
+    let start = Arc::new(std::sync::Barrier::new(6));
+    let observers: Vec<_> = (0..4)
+        .map(|_| {
+            let state = Arc::clone(&state);
+            let done = Arc::clone(&done);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                let mut observed = 0u64;
+                loop {
+                    let (on_primary_handle, status) = state.handle_and_status();
+                    assert_eq!(
+                        on_primary_handle, status.primary_active,
+                        "handle and topology must come from one publication: {status:?}"
+                    );
+                    if status.primary_active {
+                        assert!(status.failover_since_unix_ms.is_none(), "{status:?}");
+                        assert_ne!(
+                            status.active_url_redacted.as_deref(),
+                            Some("db://failover"),
+                            "{status:?}"
+                        );
+                    } else {
+                        assert!(status.failover_since_unix_ms.is_some(), "{status:?}");
+                        assert_eq!(
+                            status.active_url_redacted.as_deref(),
+                            Some("db://failover"),
+                            "{status:?}"
+                        );
+                    }
+                    observed += 1;
+                    if done.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+                observed
+            })
+        })
+        .collect();
+    let toggler = {
+        let state = Arc::clone(&state);
+        let done = Arc::clone(&done);
+        let start = Arc::clone(&start);
+        std::thread::spawn(move || {
+            start.wait();
+            while !done.load(Ordering::Acquire) {
+                state.set_allow_writes(true);
+                state.set_allow_writes(false);
+            }
+        })
+    };
+    start.wait();
+    for _ in 0..2_000 {
+        state.publish_failover(false, "db://failover");
+        let permit = state
+            .ensure_primary_failback_allowed()
+            .expect("no Admin write was admitted on failover");
+        state.publish_primary(true, permit, "db://primary");
+    }
+    done.store(true, Ordering::Release);
+    toggler.join().expect("toggler thread");
+    for observer in observers {
+        assert!(observer.join().expect("observer thread") > 0);
+    }
 }
 
 #[test]

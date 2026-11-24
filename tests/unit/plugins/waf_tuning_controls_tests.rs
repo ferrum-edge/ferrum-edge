@@ -722,6 +722,33 @@ async fn excluded_query_parameter_is_skipped_by_that_rule_only() {
 }
 
 #[tokio::test]
+async fn excluded_parameters_cannot_carry_semicolon_hidden_payloads() {
+    // Issue #6579: a `;`-splitting backend reads `q` and `file` below as
+    // parameters of their own, so an excluded carrier must not hide them.
+    let xss = recommended_with_overrides(json!({
+        "FE-XSS-001": { "exclude": { "query_params": ["html"] } }
+    }));
+    let (result, request) = query(&xss, "html=ok;q=%3Cscript%3Ealert(1)").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-XSS-001"));
+    // `%3B` is content: the excluded `html` value stays excluded.
+    let (result, request) = query(&xss, "html=ok%3Bq%3D%3Cscript%3Ealert(1)").await;
+    assert!(
+        !listed(&request, "waf.rule_hits", "FE-XSS-001"),
+        "{:?} {:?}",
+        result,
+        meta(&request, "waf.rule_hits")
+    );
+
+    let traversal = recommended_with_overrides(json!({
+        "FE-PATHTRAV-001": { "exclude": { "query_params": ["relpath"] } }
+    }));
+    let (result, request) = query(&traversal, "relpath=../assets;file=../../etc/shadow").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-PATHTRAV-001"));
+}
+
+#[tokio::test]
 async fn whole_url_rules_recheck_the_url_without_excluded_pairs() {
     // FE-PATHTRAV-001 scans the whole URL, which cannot attribute a match to
     // one pair; with an exclusion it re-runs over the URL minus that pair.
@@ -762,6 +789,65 @@ async fn parameter_pollution_ignores_an_excluded_repeated_parameter() {
     );
 
     let (result, request) = query(&plugin, "ids=1&ids=2&role=user&role=admin").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-HPP-001"));
+}
+
+#[tokio::test]
+async fn hpp_exclusions_apply_under_the_semicolon_separator_convention() {
+    // Issue #6579: a `;`-splitting backend reads `x=;tags=2` as a second `tags`.
+    // An excluded name may still repeat that way, while a conflicting
+    // non-excluded name smuggled behind `;` is still parameter pollution.
+    let plugin = recommended_with_overrides(json!({
+        "FE-HPP-001": { "exclude": { "query_params": ["tags"] } }
+    }));
+    let (result, request) = query(&plugin, "tags=1&x=;tags=2").await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "{:?}",
+        meta(&request, "waf.rule_hits")
+    );
+
+    let (result, request) = query(&plugin, "tags=1&role=user&x=;role=admin").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-HPP-001"));
+}
+
+#[tokio::test]
+async fn hpp_false_positive_filters_are_judged_per_separator_convention() {
+    // Issue #6579: the `&`-only view of this query, with `tags` excluded, is
+    // exactly the permitted `role=read&role=write`. A `;`-splitting backend
+    // also receives `role=admin`, and that view is not covered by the filter.
+    let plugin = recommended_with_overrides(json!({
+        "FE-HPP-001": {
+            "exclude": { "query_params": ["tags"] },
+            "fp_filters": ["^role=read&role=write$"]
+        }
+    }));
+    let (result, request) = query(&plugin, "role=read&role=write").await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "{:?}",
+        meta(&request, "waf.rule_hits")
+    );
+
+    let (result, request) = query(&plugin, "role=read&role=write&tags=x;role=admin").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-HPP-001"));
+}
+
+#[tokio::test]
+async fn hpp_filters_see_exactly_the_pairs_conflict_detection_judged() {
+    // The `&` reading has conflicting `id` values; the filter must judge that
+    // reading's retained pairs, not a rebuild that resurrects `;safe=1` from
+    // the excluded `ignore` pair.
+    let plugin = recommended_with_overrides(json!({
+        "FE-HPP-001": {
+            "exclude": { "query_params": ["ignore"] },
+            "fp_filters": ["^id=1;v=x&id=1&safe=1$"]
+        }
+    }));
+    let (result, request) = query(&plugin, "id=1;v=x&id=1&ignore=;safe=1").await;
     assert!(matches!(result, PluginResult::Reject { .. }));
     assert!(listed(&request, "waf.rule_hits", "FE-HPP-001"));
 }
@@ -953,10 +1039,66 @@ async fn encoding_specials_judge_the_url_without_excluded_parameters() {
 }
 
 #[tokio::test]
+async fn url_encoding_rules_ignore_valid_multibyte_text_and_score_overlong_once() {
+    // Issue #7142: FE-ENCODING-002's URL regex matched every `%E0..` / `%F0..`
+    // lead byte, so URL-encoded emoji and Indic/Thai text raised an encoding
+    // hit; and an overlong marker on a URL was also reported under
+    // FE-ENCODING-001, so disabling 002 did not stop it.
+    let plugin = recommended_with_overrides(json!({
+        "FE-ENCODING-001": { "action": "enforce" },
+        "FE-ENCODING-002": { "action": "enforce" }
+    }));
+    for valid in [
+        "q=%F0%9F%98%80",          // emoji
+        "q=%E0%A4%A8%E0%A4%AE",    // Devanagari
+        "q=%E0%B8%AA%E0%B8%A7",    // Thai
+        "q=%f0%9f%91%8d%e0%ae%a4", // lowercase emoji + Tamil
+    ] {
+        let (_, request) = query(&plugin, valid).await;
+        for rule in ["FE-ENCODING-001", "FE-ENCODING-002"] {
+            assert!(
+                !listed(&request, "waf.rule_hits", rule),
+                "{rule} must not flag valid UTF-8 {valid}: {:?}",
+                meta(&request, "waf.rule_hits")
+            );
+        }
+    }
+
+    for overlong in [
+        "p=%c0%ae%c0%ae",
+        "p=%C0%AF",
+        "p=%e0%80%af",
+        "p=%F0%80%80%AF",
+    ] {
+        let (result, request) = query(&plugin, overlong).await;
+        assert!(matches!(result, PluginResult::Reject { .. }), "{overlong}");
+        assert!(
+            listed(&request, "waf.rule_hits", "FE-ENCODING-002"),
+            "{overlong}: {:?}",
+            meta(&request, "waf.rule_hits")
+        );
+        assert!(
+            !listed(&request, "waf.rule_hits", "FE-ENCODING-001"),
+            "overlong UTF-8 belongs to FE-ENCODING-002 only ({overlong})"
+        );
+    }
+
+    // With FE-ENCODING-002 disabled, an overlong URL marker raises nothing.
+    let plugin = recommended_with_overrides(json!({
+        "FE-ENCODING-001": { "action": "enforce" },
+        "FE-ENCODING-002": { "action": "disabled" }
+    }));
+    let (_, request) = query(&plugin, "p=%c0%ae%c0%ae").await;
+    for rule in ["FE-ENCODING-001", "FE-ENCODING-002"] {
+        assert!(!listed(&request, "waf.rule_hits", rule), "{rule}");
+    }
+}
+
+#[tokio::test]
 async fn a_method_override_exclusion_covers_the_override_special() {
-    // `FE-HEADER-002` fires on the override header's name and, through its
-    // special, on an override that differs from the request method. A header
-    // exclusion suppresses both, case-insensitively.
+    // `FE-HEADER-002` fires, through its special, on an override that differs
+    // from the request method. A header exclusion suppresses it,
+    // case-insensitively.
     let strict = recommended_with_overrides(json!({}));
     let (result, request) = with_header(&strict, "x-http-method-override", "DELETE").await;
     assert!(
@@ -982,6 +1124,24 @@ async fn a_method_override_exclusion_covers_the_override_special() {
     }));
     let (result, request) = with_header(&unrelated, "x-http-method-override", "DELETE").await;
     assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-HEADER-002"));
+}
+
+#[tokio::test]
+async fn a_method_override_that_restates_the_request_method_is_not_a_hit() {
+    // The rule is special-only: the header's presence alone is not the
+    // signal, an override to a different method is.
+    let strict = recommended_with_overrides(json!({}));
+    for same in ["GET", "get"] {
+        let (result, request) = with_header(&strict, "x-http-method-override", same).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{:?}",
+            meta(&request, "waf.rule_hits")
+        );
+        assert!(!listed(&request, "waf.rule_hits", "FE-HEADER-002"));
+    }
+    let (_, request) = with_header(&strict, "x-http-method-override", "DELETE").await;
     assert!(listed(&request, "waf.rule_hits", "FE-HEADER-002"));
 }
 

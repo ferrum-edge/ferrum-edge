@@ -2,7 +2,7 @@
 //! [`StreamTransactionSummary`], and WebSocket disconnect log entries.
 //!
 //! The schema customization layer validates operator-supplied field names
-//! (in `omit`, `rename`, `order`, derived `from`) against these tables.
+//! (in `omit`, `rename`, `order`, `transforms`) against these tables.
 //! Drift between this registry and the structs is caught by the integration
 //! test in `tests/integration/log_schema_registry_tests.rs`.
 
@@ -83,6 +83,17 @@ impl RecordFamily {
     /// `metadata` policy (`nested` / `omit` / `flatten`) meaningful.
     pub const fn has_metadata(self) -> bool {
         matches!(self, Self::TransactionSummary | Self::DebugDiagnostic)
+    }
+
+    /// `true` when per-field value `transforms` are supported.
+    ///
+    /// Only the shipping transaction-summary family exposes its string fields
+    /// to the transform path (`SchemaSerializable::native_text`). The
+    /// chargeback families carry identifiers whose exact values are billing
+    /// keys, and the debugger's diagnostic names are a different inventory, so
+    /// a transform there is rejected rather than silently not applied.
+    pub const fn supports_transforms(self) -> bool {
+        matches!(self, Self::TransactionSummary)
     }
 
     /// `true` when `kind` is representable from this family's records.
@@ -293,6 +304,10 @@ pub const HTTP_FIELDS: &[FieldMeta] = &[
         is_timestamp: false,
     },
     FieldMeta {
+        name: "response_delivery",
+        is_timestamp: false,
+    },
+    FieldMeta {
         name: "bytes_sent",
         is_timestamp: false,
     },
@@ -448,11 +463,27 @@ pub const WS_DISCONNECT_FIELDS: &[FieldMeta] = &[
         is_timestamp: false,
     },
     FieldMeta {
+        name: "http_method",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "request_path",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "handshake_status_code",
+        is_timestamp: false,
+    },
+    FieldMeta {
         name: "protocol",
         is_timestamp: false,
     },
     FieldMeta {
         name: "listen_port",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "connection_id",
         is_timestamp: false,
     },
     FieldMeta {
@@ -1226,7 +1257,7 @@ mod tests {
         // tests/integration/log_schema_registry_tests.rs verifies the
         // actual serde output keys match these. This is the cheap
         // unit-test guard against accidental deletions.
-        assert_eq!(HTTP_FIELDS.len(), 32);
+        assert_eq!(HTTP_FIELDS.len(), 33);
     }
 
     #[test]
@@ -1236,6 +1267,6 @@ mod tests {
 
     #[test]
     fn websocket_disconnect_fields_match_expected_count() {
-        assert_eq!(WS_DISCONNECT_FIELDS.len(), 21);
+        assert_eq!(WS_DISCONNECT_FIELDS.len(), 25);
     }
 }

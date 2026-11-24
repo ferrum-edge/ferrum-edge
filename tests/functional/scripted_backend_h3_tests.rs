@@ -709,6 +709,34 @@ async fn wait_for_capability_entry(
     }
 }
 
+/// Wait for the single capability entry to report `plain_http.h3 ==
+/// "supported"`, i.e. for the gateway to be ready to dispatch natively over
+/// HTTP/3.
+///
+/// "An entry exists" is not that: a background refresh (warmup off) publishes
+/// an HTTPS target's HTTP/2 verdict as soon as that probe answers, with
+/// `plain_http.h3` still `unknown`, and merges the HTTP/3 verdict when its
+/// probe finishes. At the deadline this returns whatever entry is published
+/// (or `None`) instead of failing here, so that the caller's `h3` assertion
+/// reports the state it found. Every caller must therefore assert
+/// `plain_http.h3` on the result; none may discard it.
+async fn wait_for_h3_supported_entry(
+    harness: &GatewayHarness,
+    timeout: Duration,
+) -> Result<Option<Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let entry = fetch_capability_entry(harness).await?;
+        let h3_supported = entry
+            .as_ref()
+            .is_some_and(|entry| entry["plain_http"]["h3"].as_str() == Some("supported"));
+        if h3_supported || std::time::Instant::now() >= deadline {
+            return Ok(entry);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Wait for the single capability entry's H3 class to match `expected`.
 async fn wait_for_h3_class(
     harness: &GatewayHarness,
@@ -869,6 +897,79 @@ async fn spawn_h3_harness_with_explicit_https_port_config_and_env(
     );
 }
 
+/// Exercise the card refusal with native H3 on both sides of the gateway.
+/// The TCP responder supplies only an ordinary complete body, and the recorded
+/// H3 request proves this assertion did not run through a fallback backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn multipart_partial_agent_card_is_refused_on_native_h3() {
+    use super::functional_a2a_gateway_http_card_test::{
+        CARD_PATH, MULTIPART_TYPE, assert_partial_card_refused, card_gateway_config,
+        multipart_card_body,
+    };
+
+    let ca = TestCa::new("a2a-multipart-h3").expect("backend CA");
+    let (cert, key) = ca.valid().expect("backend certificate");
+    let (tcp, udp) = reserve_colocated_tcp_udp().await.expect("backend ports");
+    let backend_port = tcp.port;
+    let _tcp_backend = spawn_h2_bridge_backend(tcp.into_listener(), &cert, &key, b"fallback");
+    let body = multipart_card_body();
+    // Leave the connection waiting for the next request after each completed
+    // response, so QUIC connection teardown cannot race the client's body read.
+    let steps = (0..8).flat_map(|_| {
+        vec![
+            H3Step::AcceptStream,
+            H3Step::RespondHeaders(vec![
+                (":status", "206".to_string()),
+                ("content-type", MULTIPART_TYPE.to_string()),
+                ("content-length", body.len().to_string()),
+                ("etag", "\"card-v1\"".to_string()),
+            ]),
+            H3Step::RespondData(body.clone()),
+            H3Step::RespondTrailers(vec![]),
+        ]
+    });
+    let backend = ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(cert, key))
+        .steps(steps)
+        .spawn()
+        .expect("native H3 backend");
+    let mut config = card_gateway_config(backend_port, true);
+    config["proxies"][0]["backend_scheme"] = json!("https");
+    config["proxies"][0]["backend_tls_verify_server_cert"] = json!(false);
+    config["proxies"][0]["pool_enable_http2"] = json!(true);
+    let (gateway, _, https_port) = spawn_h3_harness_with_explicit_https_port_config_and_env(
+        serde_yaml::to_string(&config).expect("config YAML"),
+        true,
+        None,
+        &[],
+    )
+    .await;
+    let entry = wait_for_h3_class(&gateway, "supported", Duration::from_secs(15))
+        .await
+        .expect("capability registry")
+        .expect("native H3 supported");
+    assert_eq!(entry["plain_http"]["h3"], "supported");
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let response = client
+        .get_with_options(
+            &format!("https://127.0.0.1:{https_port}{CARD_PATH}"),
+            GetOptions::default().header("range", "bytes=0-17,19-"),
+        )
+        .await
+        .expect("H3 card response");
+    assert!(response.body_error.is_none(), "{:?}", response.body_error);
+    assert_partial_card_refused(response.status, &response.headers, &response.body_bytes);
+    assert!(
+        backend
+            .received_requests()
+            .await
+            .iter()
+            .any(|request| request.path == CARD_PATH)
+    );
+    assert!(backend.step_errors().await.is_empty());
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Test 1 — H2/TLS backend with no UDP listener.
 // Capability probe must classify h3 = Unsupported, h2_tls = Supported.
@@ -965,9 +1066,14 @@ async fn h3_cross_protocol_refused_connect_sets_x_gateway_error() {
     let _keep_port_bound = refused;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test]
 #[ignore]
-async fn h3_quic_phase_failures_are_observable_and_recoverable() {
+fn h3_quic_phase_failures_are_observable_and_recoverable() {
+    crate::common::in_process_gateway_runtime(2)
+        .block_on(h3_quic_phase_failures_are_observable_and_recoverable_inner());
+}
+
+async fn h3_quic_phase_failures_are_observable_and_recoverable_inner() {
     for (name, connection_step) in [
         ("reject-handshake", H3Step::RejectHandshake),
         ("drop-initial", H3Step::DropInitialPacket),
@@ -1100,7 +1206,7 @@ async fn h3_backend_connection_close_mid_request_downgrades_capability() {
         spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
 
     // Wait for initial probe to populate h3=Supported.
-    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let pre = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch pre-entry")
         .expect("registry populated within timeout");
@@ -1223,7 +1329,7 @@ async fn h3_non_graceful_close_downgrades_via_connection_error_false_path() {
     let (harness, _ca_pem, _https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
 
-    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let pre = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("pre-entry")
         .expect("registry populated");
@@ -1426,7 +1532,7 @@ async fn h3_frontend_to_h3_backend_failure_downgrades_from_server_path() {
     let (harness, _ca_pem, _https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
 
-    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let pre = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("pre-entry")
         .expect("registry populated");
@@ -1955,9 +2061,15 @@ async fn h3_native_pool_synthesizes_host_from_upstream_target_not_proxy_backend_
 
     // Wait for capability classification — gateway must see h3=supported
     // before it'll route via the native H3 pool.
-    let _ = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
-        .expect("registry populated");
+        .expect("fetch capability entry")
+        .expect("registry populated within timeout");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "expected h3=supported so the request uses the native H3 backend path; entry: {entry:#?}"
+    );
 
     // H3 client sends only `:authority` (no explicit Host). Mimics curl,
     // Chromium, Firefox, reqwest defaults.
@@ -2067,7 +2179,7 @@ async fn h1_frontend_to_native_h3_backend_uses_frontend_forwarding_metadata() {
         .await
         .expect("spawn gateway");
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -2169,7 +2281,7 @@ async fn h1_frontend_to_native_h3_strips_spoofed_client_forwarded() {
         .await
         .expect("spawn gateway");
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -2358,7 +2470,7 @@ async fn transformer_added_stream_marker_reclassifies_h3_capable_dispatch() {
         .await
         .expect("spawn gateway");
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("capability entry")
         .expect("registry populated");
@@ -2487,7 +2599,7 @@ async fn bodyless_native_h3_sse_response_is_governed() {
         .await
         .expect("spawn gateway");
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("capability entry")
         .expect("registry populated");
@@ -2646,7 +2758,7 @@ async fn h2_frontend_streaming_h3_recovers_graceful_goaway_after_complete_body()
         .await
         .expect("spawn gateway");
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -3005,7 +3117,7 @@ async fn spawn_h3_streaming_harness_with_config(
     }
     let harness = builder.spawn().await.expect("spawn gateway");
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -3058,7 +3170,7 @@ async fn spawn_h3_frontend_refined_buffering_harness(
     )
     .await;
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -3974,7 +4086,7 @@ async fn h3_native_grpc_unary_preserves_body_and_trailers() {
     let (harness, _ca_pem, _https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, false, Some(1)).await;
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -4084,7 +4196,7 @@ async fn h3_native_grpc_bidi_server_responds_before_client_half_close() {
 
     let (harness, _ca_pem, https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, false, Some(1)).await;
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -4186,7 +4298,7 @@ async fn assert_h3_native_grpc_trailers_only_preserves_terminal_metadata(remove_
     let config = file_mode_yaml_for_h3_with_terminal_security(backend_port, remove_terminal);
     let (harness, _ca_pem, _https_port) =
         spawn_h3_harness_with_explicit_https_port_and_config(config, false, Some(1)).await;
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -4371,7 +4483,7 @@ async fn h3_native_grpc_server_streaming_preserves_frames_and_trailers() {
     let (harness, _ca_pem, _https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, false, Some(1)).await;
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -4514,7 +4626,7 @@ async fn h3_native_grpc_streaming_governs_application_metadata_only() {
     )
     .await;
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -4631,7 +4743,7 @@ async fn h3_frontend_mid_body_stream_reset_downgrades_and_bridges() {
     let (harness, _ca_pem, https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
 
-    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let pre = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("pre-entry")
         .expect("registry populated");
@@ -4736,7 +4848,7 @@ async fn h3_frontend_mid_body_graceful_goaway_keeps_capability_supported() {
     let (harness, _ca_pem, _https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
 
-    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let pre = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("pre-entry")
         .expect("registry populated");
@@ -4996,7 +5108,7 @@ async fn h3_buffered_auth_logging_plugins_preserve_backend_trailers() {
     let (harness, _ca_pem, https_port) =
         spawn_h3_harness_with_explicit_https_port_and_config(yaml, true, None).await;
 
-    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let pre = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("pre-entry")
         .expect("registry populated");
@@ -5266,7 +5378,7 @@ async fn spawn_h3_trailer_policy_harness_with_trailers(
     let (harness, _ca_pem, https_port) =
         spawn_h3_harness_with_explicit_https_port_and_config(yaml, true, None).await;
 
-    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let pre = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("pre-entry")
         .expect("registry populated");
@@ -6159,6 +6271,10 @@ fn h3_body_waf_plugin_config(target: &str) -> Value {
     if target == "response_body" {
         config["response_inspection"] = json!(true);
         config["response_body_inspection"] = json!(true);
+        // The fixture serves `application/octet-stream`; this test pins the
+        // oversize relay, not the unlisted-type disposition, so keep that body
+        // on the streaming path.
+        config["on_unlisted_response_content_type"] = json!("allow");
     }
     json!({
         "id": "h3-oversize-waf",

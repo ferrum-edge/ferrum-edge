@@ -762,12 +762,12 @@ fn target_refs_rejected_on_shared_scope_consumers() {
         peer_authentications: vec![PeerAuthentication {
             name: "pa".to_string(),
             namespace: WAYPOINT_NS.to_string(),
-            scope: Some(scope.clone()),
-            selector: None,
+            scope: scope.clone(),
             mtls_mode: Default::default(),
             port_overrides: HashMap::new(),
         }],
         request_authentications: vec![MeshRequestAuthentication {
+            refused: false,
             name: "ra".to_string(),
             namespace: WAYPOINT_NS.to_string(),
             scope: scope.clone(),

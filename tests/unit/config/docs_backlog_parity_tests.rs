@@ -4,13 +4,11 @@
 //! superseded "roadmap / not yet implemented" claims cannot quietly return in
 //! the ledgers this reconciliation owns. `include_str!` only — no runtime.
 
-const PRODUCTION_READINESS: &str = include_str!("../../../PRODUCTION_READINESS.md");
 const RESPONSE_BODY_STREAMING: &str = include_str!("../../../docs/response_body_streaming.md");
 const MESH_SUPPORTED_MATRIX: &str = include_str!("../../../docs/mesh_supported_matrix.md");
 const NODE_AGENT: &str = include_str!("../../../docs/node_agent.md");
 const SPIRE_DEPLOYMENT: &str = include_str!("../../../docs/spire_deployment.md");
 const PROTOCOL_PERF_REGRESSION: &str = include_str!("../../../docs/protocol_perf_regression.md");
-const ISSUE_2110_REGISTER: &str = include_str!("../../../docs/backlog/issue_2110_register.md");
 const MULTICLUSTER_RUNBOOK: &str =
     include_str!("../../../docs/mesh_multicluster_federation_runbook.md");
 const SCRIPTED_BACKEND_PLAN: &str =
@@ -18,65 +16,6 @@ const SCRIPTED_BACKEND_PLAN: &str =
 const PLUGINS_DOC: &str = include_str!("../../../docs/plugins.md");
 const FEATURES: &str = include_str!("../../../FEATURES.md");
 const RATE_LIMITING_SRC: &str = include_str!("../../../src/plugins/rate_limiting.rs");
-
-#[test]
-fn production_readiness_does_not_track_completed_epic_rows_as_open() {
-    assert!(
-        !PRODUCTION_READINESS.contains("No Helm chart for core gateway modes | Low | TRACKED"),
-        "PR-013 Helm chart is shipped (charts/ferrum-gateway); disposition must not stay TRACKED"
-    );
-    assert!(
-        !PRODUCTION_READINESS
-            .contains("Log schema not applied to WsDisconnectLogEntry | Low | TRACKED"),
-        "PR-007 WsDisconnect schema support is implemented; disposition must not stay TRACKED"
-    );
-    assert!(
-        !PRODUCTION_READINESS.contains("Stress tests excluded from CI | Low | TRACKED"),
-        "PR-014 scheduled scaling-regression.yml covers the excluded stress suites"
-    );
-    assert!(
-        PRODUCTION_READINESS.contains("#2475"),
-        "remote-discovery JWT audience binding (#2475) must remain recorded as implemented"
-    );
-    assert!(
-        PRODUCTION_READINESS.contains("intentional mixed strategy"),
-        "k8s status ownership must document the intentional RMW+SSA mixed strategy"
-    );
-    assert!(
-        PRODUCTION_READINESS.contains("<!-- launch-readiness:historical -->"),
-        "historical launch-readiness marker must remain after the gate was removed"
-    );
-    assert!(
-        !PRODUCTION_READINESS.contains("live gate is authoritative"),
-        "removed launch gate must not be cited as live authority"
-    );
-    assert!(
-        !PRODUCTION_READINESS.contains("Subsequent launch state is owned by the live gate"),
-        "removed launch gate / policy inventory must not own subsequent launch state"
-    );
-    assert!(
-        PRODUCTION_READINESS
-            .contains("| Provenance-complete mesh/HBONE/DNS perf baselines | #3332 |"),
-        "open #3332 must remain in the residual map"
-    );
-    assert!(
-        PRODUCTION_READINESS.contains("#3892"),
-        "still-open 2026-08-15 scaling-regression tracker #3892 must remain recorded as OPEN"
-    );
-    assert!(
-        !PRODUCTION_READINESS.contains("| Live OIDC / OAuth2 introspection coverage | #3333 |"),
-        "closed #3333 must not remain a residual-map live row"
-    );
-    assert!(
-        !PRODUCTION_READINESS
-            .contains("| EgressGateway UDP `ServiceEntry` materialization | #3263 |"),
-        "closed #3263 must not remain a residual-map live row"
-    );
-    assert!(
-        PRODUCTION_READINESS.contains("#3263") && PRODUCTION_READINESS.contains("#3671"),
-        "closed #3263 must be recorded as implemented with its closing PR"
-    );
-}
 
 #[test]
 fn response_streaming_decision_flow_matches_retry_header_contract() {
@@ -151,6 +90,47 @@ fn mesh_supported_matrix_product_deferral_index_is_current() {
     );
 }
 
+/// Issues #7390, #7423: the sidecar GA headline must not claim VirtualService
+/// routing until a live weighted-split assertion gates the Sidecar `http[]`
+/// projection, and FEATURES must qualify route splits by topology.
+#[test]
+fn virtual_service_http_routing_is_scoped_to_the_topologies_that_apply_it() {
+    let headline_start = MESH_SUPPORTED_MATRIX
+        .find("**GA track — Ferrum-native sidecar mesh.**")
+        .expect("matrix keeps the sidecar GA headline");
+    let headline_end = MESH_SUPPORTED_MATRIX[headline_start..]
+        .find("\n- **")
+        .map_or(MESH_SUPPORTED_MATRIX.len(), |end| headline_start + end);
+    let headline = &MESH_SUPPORTED_MATRIX[headline_start..headline_end];
+    assert!(
+        !headline.contains("`VirtualService` routing"),
+        "the sidecar GA headline must not claim VirtualService routing"
+    );
+    assert!(
+        headline.contains("is **not** part of the sidecar GA track"),
+        "the headline must say VirtualService http[] routing is outside the sidecar GA track"
+    );
+    for topology in [
+        "| Sidecar | Applied",
+        "| ServiceWaypoint (GAMMA) | **Not applied**",
+        "| Ambient | **Not applied**",
+        "| NodeWaypoint | Applied",
+    ] {
+        assert!(
+            MESH_SUPPORTED_MATRIX.contains(topology),
+            "matrix must state the VirtualService http[] outcome per topology: {topology}"
+        );
+    }
+    assert!(
+        MESH_SUPPORTED_MATRIX.contains("mesh_http_routes: sidecar_and_node_waypoint"),
+        "matrix must name the status field that reports the scope"
+    );
+    assert!(
+        FEATURES.contains("Ambient and ServiceWaypoint data planes do not apply `http[]` routes"),
+        "FEATURES must qualify VirtualService route splits by topology"
+    );
+}
+
 #[test]
 fn node_agent_udp_live_coverage_cites_closed_trackers_and_enrolled_destination_gate() {
     assert!(
@@ -203,75 +183,6 @@ fn protocol_perf_regression_documents_mesh_e2e_status() {
         PROTOCOL_PERF_REGRESSION.contains("frozen Trusted Cross automation")
             && PROTOCOL_PERF_REGRESSION.contains("Benches deferred (not yet implemented)"),
         "runbook must state the protected mesh README is frozen historical prose"
-    );
-}
-
-#[test]
-fn issue_2110_register_maps_completed_work_and_live_trackers() {
-    assert!(
-        ISSUE_2110_REGISTER.contains("Historical snapshot only"),
-        "register must be labeled historical, not live backlog"
-    );
-    assert!(
-        ISSUE_2110_REGISTER.contains("#2475"),
-        "remote-discovery JWT audience binding must remain recorded as implemented"
-    );
-    assert!(
-        ISSUE_2110_REGISTER.contains("intentional mixed strategy"),
-        "k8s status ownership must document the intentional RMW+SSA mixed strategy"
-    );
-    for issue in ["#3228", "#3299", "#3302", "#3304", "#3331", "#3332"] {
-        assert!(
-            ISSUE_2110_REGISTER.contains(issue),
-            "register must keep completed/open residual {issue} recorded"
-        );
-    }
-    assert!(
-        !ISSUE_2110_REGISTER.contains("## Live dedicated trackers"),
-        "frozen register must not keep a live dedicated-trackers heading"
-    );
-    assert!(
-        ISSUE_2110_REGISTER.contains("not a live tracker"),
-        "register must say it is not a live tracker"
-    );
-    assert!(
-        ISSUE_2110_REGISTER.contains("CLOSED (COMPLETED, 2026-07-28)"),
-        "register must record that GitHub issue #2110 is closed"
-    );
-    // #3263 moved from the live-tracker table to the completed table.
-    assert!(
-        ISSUE_2110_REGISTER
-            .contains("| EgressGateway UDP `ServiceEntry` materialization | Implemented"),
-        "completed #3263 must be recorded as implemented, not as a live residual"
-    );
-    assert!(
-        ISSUE_2110_REGISTER.contains("| Ambient UDP enrolled-destination round trip | Implemented"),
-        "completed #3621 must be recorded as implemented, not as a live residual"
-    );
-    assert!(
-        ISSUE_2110_REGISTER
-            .contains("functional_mesh_live_source_capture_udp_manager_hbone_round_trip"),
-        "completed #3621 must name the live source-capture gate"
-    );
-    assert!(
-        ISSUE_2110_REGISTER.contains("node-waypoint-ebpf-live")
-            && ISSUE_2110_REGISTER.contains("enrolled-pod `tc_inbound` guard"),
-        "completed #3621 must name the complementary live eBPF admit proof"
-    );
-    assert!(
-        ISSUE_2110_REGISTER.contains("EnvoyFilter / WasmPlugin"),
-        "explicit non-goals must remain documented"
-    );
-    assert!(
-        !ISSUE_2110_REGISTER.contains("TLS-SNI L4 routing “on roadmap”"),
-        "completed TLS-SNI support must not remain a roadmap deferral"
-    );
-    assert!(
-        ISSUE_2110_REGISTER.contains("frozen")
-            && ISSUE_2110_REGISTER.contains("tests/performance/mesh/README.md")
-            && ISSUE_2110_REGISTER.contains("mesh-hbone-e2e")
-            && ISSUE_2110_REGISTER.contains("mesh-dns-e2e"),
-        "register must explain the protected mesh README stays historical while naming live suites"
     );
 }
 
@@ -376,10 +287,18 @@ fn features_cli_section_counts_every_shipped_subcommand() {
 }
 
 #[test]
-fn rate_limiting_plugin_still_has_no_configurable_max_entries_key() {
+fn rate_limiting_plugin_cap_is_configurable_only_as_max_state_entries() {
     assert!(
         !RATE_LIMITING_SRC.contains("\"max_entries\""),
         "if rate_limiting ever gains a real `max_entries` config key, FEATURES.md's plugin-cache \
          bullet and docs/cache_management.md's rate-limiting paragraph must be updated together"
+    );
+    assert!(
+        RATE_LIMITING_SRC.contains("\"max_state_entries\""),
+        "rate_limiting's local key cap is the `max_state_entries` config key"
+    );
+    assert!(
+        FEATURES.contains("`rate_limiting` exposes its 100,000-key ceiling as `max_state_entries`"),
+        "FEATURES.md's plugin-cache bullet must name the one configurable rate-limit cap"
     );
 }

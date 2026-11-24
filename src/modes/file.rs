@@ -147,26 +147,51 @@ pub fn apply_file_config_candidate(
     candidate: Result<GatewayConfig, anyhow::Error>,
 ) {
     match candidate {
-        Ok(new_config) => match proxy_state.update_config(new_config) {
-            proxy::ConfigApplyOutcome::Applied => {
-                info!("Configuration reloaded successfully");
-                crate::modes::clear_config_rejected_after_accepted_full_reload(
-                    config_rejected,
-                    "file reload",
+        Ok(new_config) => {
+            // The file-mode sibling of the database stores' rename guard: a
+            // Consumer renamed while the reloaded file's `access_control`
+            // policy still names its previous username would silently detach
+            // that allow or deny entry (exact matching), so the reload is
+            // refused. Renaming the entry in the same file is accepted.
+            let rename_conflicts = crate::plugins::access_control::consumer_rename_conflicts(
+                &proxy_state.current_config(),
+                &new_config,
+            );
+            if !rename_conflicts.is_empty() {
+                // Sanitize each conflict on its own before joining, like every
+                // other reload diagnostic that bypasses the startup renderer.
+                let rendered: Vec<String> = rename_conflicts
+                    .iter()
+                    .map(|conflict| crate::startup::sanitize_startup_cause(conflict, &[]))
+                    .collect();
+                error!(
+                    "Configuration reload rejected, keeping previous config: {}",
+                    rendered.join("; ")
                 );
-            }
-            proxy::ConfigApplyOutcome::Unchanged => {
-                info!("Configuration reload valid but unchanged");
-                crate::modes::clear_config_rejected_after_accepted_full_reload(
-                    config_rejected,
-                    "file reload",
-                );
-            }
-            proxy::ConfigApplyOutcome::Rejected { .. } => {
-                error!("Configuration reload rejected, keeping previous config");
                 config_rejected.store(true, Ordering::Relaxed);
+                return;
             }
-        },
+            match proxy_state.update_config(new_config) {
+                proxy::ConfigApplyOutcome::Applied => {
+                    info!("Configuration reloaded successfully");
+                    crate::modes::clear_config_rejected_after_accepted_full_reload(
+                        config_rejected,
+                        "file reload",
+                    );
+                }
+                proxy::ConfigApplyOutcome::Unchanged => {
+                    info!("Configuration reload valid but unchanged");
+                    crate::modes::clear_config_rejected_after_accepted_full_reload(
+                        config_rejected,
+                        "file reload",
+                    );
+                }
+                proxy::ConfigApplyOutcome::Rejected { .. } => {
+                    error!("Configuration reload rejected, keeping previous config");
+                    config_rejected.store(true, Ordering::Relaxed);
+                }
+            }
+        }
         Err(e) => {
             error!(
                 "Configuration reload failed, keeping previous config: {}",
@@ -183,8 +208,8 @@ pub fn apply_file_config_candidate(
 /// 1. Drive requests through the gateway via the bound listeners' addresses.
 /// 2. Read state out of [`ServeHandles::proxy_state`] (e.g. metrics,
 ///    capability registry, dispatch kind).
-/// 3. Trigger shutdown by `send`-ing `true` on the [`tokio::sync::watch`]
-///    channel passed to `serve()`.
+/// 3. Trigger shutdown with [`crate::overload::ShutdownSender::shutdown`]
+///    on the sender passed to `serve()`.
 /// 4. Await graceful drain by `await`ing [`ServeHandles::join`].
 pub struct ServeHandles {
     /// Shared proxy state. Tests can read metrics, swap config, etc.
@@ -197,17 +222,14 @@ pub struct ServeHandles {
     /// Gateway API listener-port lifecycle. Exposed so in-process callers can
     /// read the ports actually bound and any refusal / bind failure, rather
     /// than inferring listener state from traffic.
-    #[allow(dead_code)] // The binary path never reads it back; tests do.
     pub gateway_listeners: Arc<GatewayListenerManager>,
     /// Bounded realization status those listeners publish (issue #3810). The
     /// same handle `AdminState` reads for authenticated `/health` detail, so an
     /// in-process caller observes exactly what an operator would.
-    #[allow(dead_code)] // The binary path never reads it back; tests do.
     pub gateway_listener_status: Arc<crate::proxy::gateway_listener_status::GatewayListenerStatus>,
     /// Local addresses each listener is bound to (resolved from the pre-bound
     /// listener, **not** read from `EnvConfig`). Tests use this to build
     /// canonical proxy/admin URLs.
-    #[allow(dead_code)] // The binary path drops this immediately; tests read it.
     pub bound: BoundAddresses,
     /// Listener task handles (proxy HTTP/HTTPS/H3 + admin HTTP/HTTPS).
     /// These exit cleanly when the shutdown signal fires, so [`Self::join`]
@@ -232,7 +254,7 @@ pub struct ServeHandles {
     ///    promptly. Without this, an in-flight `handle.await` for a
     ///    still-serving listener blocks forever and the binary stays alive
     ///    with one dead listener.
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
     /// `FERRUM_SHUTDOWN_DRAIN_SECONDS` snapshot — bound on the in-flight
     /// request drain that runs between listener exit and background-task
     /// drain.
@@ -252,11 +274,11 @@ pub(crate) type ListenerTaskResult = Result<(), anyhow::Error>;
 pub(crate) type ListenerJoinHandle = JoinHandle<ListenerTaskResult>;
 
 async fn shutdown_file_background_startup_tasks(
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     proxy_state: &ProxyState,
     mut background_handles: Vec<JoinHandle<()>>,
 ) {
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     proxy_state.stream_listener_manager.shutdown_all().await;
     background_handles.extend(proxy_state.health_checker.take_active_check_handles());
     join_background_handles(background_handles, BACKGROUND_DRAIN_TIMEOUT).await;
@@ -274,7 +296,7 @@ pub struct BoundAddresses {
 impl ServeHandles {
     /// Wait for every spawned listener / background task to finish.
     ///
-    /// Callers must trigger shutdown on the [`tokio::sync::watch::Sender`]
+    /// Callers must trigger shutdown on the [`crate::overload::ShutdownSender`]
     /// they passed into [`serve`] before awaiting this future, otherwise
     /// `join()` will hang waiting for accept loops that never exit.
     ///
@@ -322,7 +344,7 @@ impl ServeHandles {
             // accept loops forever and `join()` would never return.
             let shutdown_tx = self.shutdown_tx.clone();
             await_fallible_listener_handles(self.listener_handles, move || {
-                let _ = shutdown_tx.send(true);
+                shutdown_tx.shutdown();
             })
             .await
         };
@@ -348,6 +370,9 @@ impl ServeHandles {
             )
             .await;
         }
+        // Shutdown now closes whatever is still pending, while observability
+        // delivery is open, so those requests settle their terminals (issue #6768).
+        crate::overload::end_shutdown_drain_wait(&self.proxy_state.overload).await;
         // Release backend transport pools that hold kernel objects (issue
         // #3731): after the bounded in-flight drain, no further request may be
         // served, so idle sidecar-ingress Unix carriers must not outlive it.
@@ -355,6 +380,13 @@ impl ServeHandles {
         let mut background_handles = self.background_handles;
         background_handles.extend(self.proxy_state.health_checker.take_active_check_handles());
         join_background_handles(background_handles, self.background_drain_timeout).await;
+        crate::admin::audit::shutdown_local_retention_delivery(Duration::from_secs(
+            self.proxy_state
+                .env_config
+                .shutdown_drain_seconds
+                .clamp(5, 60),
+        ))
+        .await;
         crate::observability_delivery::shutdown(Duration::from_millis(
             self.proxy_state.env_config.log_shutdown_drain_timeout_ms,
         ))
@@ -372,7 +404,7 @@ impl ServeHandles {
     /// loops orphan, holding sockets across the in-process retry path
     /// and poisoning subsequent attempts in the same process.
     pub async fn shutdown_and_join(self) -> Result<(), anyhow::Error> {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.shutdown();
         self.join().await
     }
 }
@@ -618,7 +650,7 @@ fn resolve_http3_bind_addr(env_config: &EnvConfig, bound_https: Option<SocketAdd
 /// SIGHUP reload handler installed on top.
 pub async fn run(
     env_config: EnvConfig,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<(), anyhow::Error> {
     info!(
         "Starting in file mode with log level: {}",
@@ -780,7 +812,7 @@ pub async fn serve(
     env_config: EnvConfig,
     config: GatewayConfig,
     mut prebound: ServeOptions,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<ServeHandles, anyhow::Error> {
     info!(
         "file::serve: starting in-process gateway with {} proxies, {} consumers",
@@ -923,6 +955,7 @@ pub async fn serve(
         Some(shutdown_tx.subscribe()),
         reserved_ports.clone(),
     )?;
+    proxy_state.overload.attach_shutdown(&shutdown_tx);
     crate::runtime_metrics::global().configure(
         env_config.status_counts_max_entries,
         env_config.runtime_metrics_pool_tracking_enabled,
@@ -1028,7 +1061,7 @@ pub async fn serve(
     ) {
         Ok(Some(candidate)) => {
             let mut config = candidate.config;
-            info!("Loading TLS configuration with client certificate verification...");
+            info!("Loading TLS configuration...");
             tls::enable_early_data(&mut config, &tls_policy);
             if env_config.ktls_enabled.could_be_enabled() {
                 tls::enable_secret_extraction_for_ktls(&mut config);
@@ -1147,6 +1180,10 @@ pub async fn serve(
     let gateway_listener_status =
         Arc::new(crate::proxy::gateway_listener_status::GatewayListenerStatus::new());
     crate::proxy::gateway_listener_status::install_for_metrics(&gateway_listener_status);
+    // No configuration database in this mode: durable admin audit records are
+    // retained in the bounded local retention file (issue #7200). Start the
+    // worker that adopts and drains the spool into it before admin traffic.
+    crate::admin::audit::start_local_retention_delivery(env_config.admin_audit_enabled);
     let admin_state = AdminState {
         db: None,
         jwt_manager,
@@ -1190,7 +1227,6 @@ pub async fn serve(
             crate::admin::api_specs::DefaultExternalDocumentLoader {
                 egress: env_config.backend_allow_ips.clone(),
                 dns_cache: None,
-                fixtures: std::collections::HashMap::new(),
             },
         ),
         runtime_config_apply: None,
@@ -1707,7 +1743,7 @@ pub async fn serve(
         if env_config.pool_warmup_enabled {
             proxy_state.warmup_connection_pools().await;
         }
-        proxy_state.set_h3_websocket_listener_started(h3_listener_started);
+        proxy_state.set_h3_listener_started(h3_listener_started);
         startup_ready.store(true, Ordering::Release);
         info!("Gateway startup complete; /health now reports ready");
         Ok(())
@@ -1884,7 +1920,8 @@ mod tests {
     #[cfg(panic = "unwind")]
     #[tokio::test]
     async fn await_listener_handles_signals_shutdown_so_remaining_listeners_can_exit() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let mut listener_a_rx = shutdown_tx.subscribe();
         let listener_a = tokio::spawn(async move {
@@ -1904,7 +1941,7 @@ mod tests {
         let trigger_tx = shutdown_tx.clone();
         let started = Instant::now();
         let result = await_listener_handles(vec![listener_a, panicker, listener_b], move || {
-            let _ = trigger_tx.send(true);
+            trigger_tx.shutdown();
         })
         .await;
         let elapsed = started.elapsed();
@@ -1948,7 +1985,8 @@ mod tests {
 
     #[tokio::test]
     async fn await_fallible_listener_handles_signals_shutdown_so_remaining_listeners_can_exit() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let mut listener_a_rx = shutdown_tx.subscribe();
         let listener_a = tokio::spawn(async move {
@@ -1974,7 +2012,7 @@ mod tests {
                 ("listener b".to_string(), listener_b),
             ],
             move || {
-                let _ = trigger_tx.send(true);
+                trigger_tx.shutdown();
             },
         )
         .await;

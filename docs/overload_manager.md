@@ -99,6 +99,16 @@ FERRUM_OVERLOAD_LOOP_WARN_US=10000            # log warning (10ms)
 FERRUM_OVERLOAD_LOOP_CRITICAL_US=500000       # reject connections (500ms)
 ```
 
+Each monitor tick spawns one `yield_now()` probe per runtime worker and waits
+for them for at most `FERRUM_OVERLOAD_LOOP_CRITICAL_US`, bounded by
+`FERRUM_OVERLOAD_CHECK_INTERVAL_MS`. A probe that has not run by then is
+reported as at least that budget, so a stall that reaches the critical
+threshold trips it, and shorter stalls report their measured latency in
+`event_loop_latency_us`. Because the wait never exceeds one check interval, a
+`FERRUM_OVERLOAD_LOOP_CRITICAL_US` above `FERRUM_OVERLOAD_CHECK_INTERVAL_MS`
+(in microseconds) can never be reached: keep the critical threshold at or
+below the check interval.
+
 ## Admin Endpoint
 
 `GET /overload` is tiered like `/health` and `/status`:
@@ -188,6 +198,14 @@ pre-handshake cap. The value is a diagnostic mirror of the DTLS demux counter
 and can lag the exact in-server counter by a single increment/decrement window,
 so treat it as operational telemetry rather than an admission-control source.
 
+Two bounded, redacted DTLS material reload slots sit beside it:
+`stream_listeners.frontend_dtls_reload` (the ordinary `FERRUM_DTLS_*` operator
+slot) and `stream_listeners.mesh_node_waypoint_dtls_reload` (the owner-scoped
+mesh NodeWaypoint DTLS slot). Each reports `generation`,
+`last_swapped_listeners`, `last_success_unix`, `last_failure_unix`, and a
+fixed-cardinality `last_outcome` (`none`, `accepted`, `rejected`); a rejected
+mesh PeerAuthentication candidate appears only in the mesh slot.
+
 Mitigation knobs:
 - `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` bounds how long a peer can hold DTLS demux state before completing the handshake.
 - `FERRUM_UDP_MAX_SESSIONS` caps total UDP/DTLS sessions per proxy, including DTLS peers still in handshake.
@@ -256,8 +274,10 @@ failure, so a resource that starts serving on a later reconcile clears its entry
 | Platform | FD Monitoring | FD Limit |
 |----------|--------------|----------|
 | Linux | Kernel open-FD aggregate from `stat(/proc/self/fd).st_size` (Linux 6.2+); directory walk of `/proc/self/fd` on older kernels | `getrlimit(RLIMIT_NOFILE)`, falling back to `/proc/sys/fs/nr_open` when the hard cap is unlimited |
-| macOS | `proc_pidinfo(PROC_PIDLISTFDS)` | `getrlimit(RLIMIT_NOFILE)`; an unlimited hard cap disables the FD tier |
+| macOS | `proc_pidinfo(PROC_PIDLISTFDS)`, counting the entries it writes (the size-only call returns table capacity, not the open count) | `getrlimit(RLIMIT_NOFILE)`; an unlimited hard cap disables the FD tier |
 | Windows | Not available (ratios are 0.0) | Not available |
+
+On Linux and macOS a failed FD count fails closed: the count is reported as the maximum value, which forces FD pressure to critical.
 
 Event loop latency and connection monitoring work on all platforms.
 

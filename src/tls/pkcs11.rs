@@ -106,7 +106,6 @@ impl Pkcs11KeyConfig {
         let key_type = uri
             .options
             .get("key_type")
-            .or_else(|| uri.options.get("type"))
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
             .unwrap_or(DEFAULT_KEY_TYPE);
@@ -994,6 +993,15 @@ mod tests {
         let error = parse_config("pkcs11://edge-ecdsa?module=/usr/lib/pkcs11.so&key_type=ec")
             .expect_err("EC keys are not supported yet");
         assert!(error.to_string().contains("only RSA keys are supported"));
+    }
+
+    #[test]
+    fn type_is_not_an_alias_of_key_type() {
+        // Issue #7218: only the documented `key_type` option selects the key
+        // type; `type=ec` is an unknown option, not a refused EC request.
+        let config = parse_config("pkcs11://edge-rsa?module=/usr/lib/pkcs11.so&type=ec")
+            .expect("`type` does not select the key type");
+        assert_eq!(config.label.as_deref(), Some("edge-rsa"));
     }
 
     #[test]

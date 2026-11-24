@@ -39,9 +39,9 @@ use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshCorsOriginMatch, MeshCorsPolicy, MeshDestinationRule, MeshPolicy,
     MeshProxyConfig, MeshRequestAuthentication, MeshService, MeshSidecar, MeshTelemetryConfig,
-    MeshTelemetryResource, MeshVirtualServiceCorsPolicy, MeshWaypointBinding, MtlsMode,
-    OutboundTrafficPolicy, PeerAuthentication, PolicyScope, ServiceEntry, Workload,
-    WorkloadSelector,
+    MeshTelemetryResource, MeshVirtualServiceCorsPolicy, MeshVirtualServiceHttpRoutes,
+    MeshWaypointBinding, MtlsMode, OutboundTrafficPolicy, PeerAuthentication, PolicyScope,
+    ServiceEntry, Workload, WorkloadSelector,
 };
 use serde_json::{Value, json};
 
@@ -1310,8 +1310,9 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
         peer_authentications: vec![PeerAuthentication {
             name: name("peer-auth"),
             namespace: "shared".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "shared".to_string(),
+            },
             mtls_mode: MtlsMode::default(),
             port_overrides: HashMap::new(),
         }],
@@ -1327,6 +1328,7 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
             workload_selector: None,
         }],
         request_authentications: vec![MeshRequestAuthentication {
+            refused: false,
             name: name("request-auth"),
             namespace: "shared".to_string(),
             scope: scope.clone(),
@@ -1362,6 +1364,12 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
                 unmatched_preflights: None,
             },
         }],
+        virtual_service_http_routes: vec![MeshVirtualServiceHttpRoutes {
+            name: name("http-routes"),
+            namespace: "shared".to_string(),
+            export_to: Vec::new(),
+            proxy_ids: vec![format!("istio-vs-shared-{marker}-0")],
+        }],
         proxy_configs: vec![MeshProxyConfig {
             name: name("proxy-config"),
             namespace: "shared".to_string(),
@@ -1390,7 +1398,7 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
 }
 
 /// Per-collection object counts, in the order [`MeshConfig`] declares them.
-fn collection_counts(mesh: &MeshConfig) -> [usize; 12] {
+fn collection_counts(mesh: &MeshConfig) -> [usize; 13] {
     [
         mesh.workloads.len(),
         mesh.services.len(),
@@ -1401,6 +1409,7 @@ fn collection_counts(mesh: &MeshConfig) -> [usize; 12] {
         mesh.telemetry_resources.len(),
         mesh.destination_rules.len(),
         mesh.virtual_service_cors_policies.len(),
+        mesh.virtual_service_http_routes.len(),
         mesh.proxy_configs.len(),
         mesh.sidecars.len(),
         mesh.waypoint_bindings.len(),
@@ -1430,6 +1439,7 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         telemetry_resources: _,
         destination_rules: _,
         virtual_service_cors_policies: _,
+        virtual_service_http_routes: _,
         proxy_configs: _,
         sidecars: _,
         waypoint_bindings: _,
@@ -1447,6 +1457,8 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         node_waypoint_assertors: _,
         node_waypoint_capture_destinations: _,
         node_waypoint_capture_peer_authentications: _,
+        node_waypoint_capture_mesh_policies: _,
+        node_waypoint_capture_inventory_state: _,
         local_inbound_services: _,
         local_ingress_listeners: _,
         sidecar_ingress_declared: _,
@@ -1481,7 +1493,7 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
     let base = all_collections("base", "base");
     assert_eq!(
         base.object_identities().len(),
-        12,
+        13,
         "every namespaced collection must contribute exactly one identity"
     );
     assert_eq!(
@@ -1496,7 +1508,7 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
     composed.overlay_objects_from(&all_collections("k8s", "k8s"));
     assert_eq!(
         collection_counts(&composed),
-        [2; 12],
+        [2; 13],
         "every namespaced collection must be layered, not skipped"
     );
 
@@ -1506,7 +1518,7 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
     collided.overlay_objects_from(&overlay);
     assert_eq!(
         collection_counts(&collided),
-        [1; 12],
+        [1; 13],
         "a same-key collision must resolve to one object per collection"
     );
     assert_eq!(
@@ -1524,7 +1536,7 @@ fn every_namespaced_collection_is_withdrawn_and_restores_its_base() {
         &authoritative_overlay(Some(all_collections("k8s", "k8s"))),
         &managed,
     );
-    assert_eq!(collection_counts(mesh_of(&active)), [2; 12]);
+    assert_eq!(collection_counts(mesh_of(&active)), [2; 13]);
 
     let withdrawn = merge_k8s_translation(&active, &authoritative_overlay(None), &managed);
 

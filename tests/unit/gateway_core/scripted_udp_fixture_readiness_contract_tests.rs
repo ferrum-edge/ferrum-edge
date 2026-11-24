@@ -1,5 +1,10 @@
 //! Static contract: the scripted UDP functional fixture must bind readiness
-//! to the spawned child (issue #4373).
+//! to the spawned child (issue #4373) and prove it with the per-attempt JWT
+//! ownership barrier, not the metrics-token `/health` tier alone (issue #7076).
+//!
+//! The shared barrier itself (`wait_for_owned_gateway_identity`) and the
+//! wrapper's budget are pinned by `bespoke_spawner_readiness_contract_tests.rs`;
+//! this file keeps the UDP fixture's own spawn-side rules.
 //!
 //! `include_str!` only — no runtime, no production bypass.
 
@@ -11,8 +16,8 @@ fn squeezed(src: &str) -> String {
 
 fn helper_region(src: &str) -> &str {
     let start = src
-        .find("fn mint_observability_token()")
-        .expect("scripted UDP fixture must mint a per-attempt observability token");
+        .find("fn spawn_gateway(")
+        .expect("scripted UDP fixture must keep its spawn helper");
     let end = src
         .find("struct GatewayFixture")
         .expect("scripted UDP fixture must keep GatewayFixture after the spawn helper");
@@ -25,12 +30,21 @@ fn scripted_udp_fixture_binds_readiness_to_spawned_child_identity() {
     let compact = squeezed(region);
 
     assert!(
-        region.contains("crate::common::probe_gateway_identity"),
-        "readiness must use the shared probe_gateway_identity contract"
+        compact
+            .contains("crate::common::wait_for_owned_gateway_identity(child,admin_port,identity,"),
+        "readiness must use the shared child-bound JWT ownership barrier"
     );
     assert!(
-        compact.contains("env(\"FERRUM_METRICS_BEARER_TOKEN\",observability_token)"),
-        "each spawn must configure FERRUM_METRICS_BEARER_TOKEN for this child"
+        !compact.contains("wait_for_child_gateway_readiness"),
+        "the metrics-token /health tier alone is not ownership (issue #7076)"
+    );
+    assert!(
+        compact.contains("wait_for_owned_gateway(child.child_mut(),admin_port,&identity)"),
+        "the barrier must be bound to the child spawned by this attempt"
+    );
+    assert!(
+        compact.contains("letidentity=crate::common::SpawnedGatewayIdentity::mint("),
+        "each spawn attempt must mint a unique identity"
     );
     assert!(
         compact.contains("env_remove(\"FERRUM_METRICS_ALLOWED_CIDRS\")"),
@@ -40,35 +54,22 @@ fn scripted_udp_fixture_binds_readiness_to_spawned_child_identity() {
     let extra_at = compact
         .find("for(k,v)inextra_env{cmd.env(k,v);}")
         .expect("extra_env must still be applied");
-    let token_at = compact
-        .find("env(\"FERRUM_METRICS_BEARER_TOKEN\",observability_token)")
-        .expect("identity token env must be present");
+    let identity_at = compact
+        .find("identity.apply_to_command(&mutcmd);")
+        .expect("the attempt identity must be applied to the gateway Command");
     assert!(
-        token_at > extra_at,
-        "identity env must be applied after extra_env so callers cannot replace this child's token"
+        identity_at > extra_at,
+        "identity env must be applied after extra_env so callers cannot replace this child's \
+         credentials"
     );
 
     assert!(
-        compact.contains("Uuid::new_v4()"),
-        "each spawn attempt must mint a unique observability identity"
+        compact.contains("crate::common::GatewayChildGuard::new(cmd.spawn()?)"),
+        "the spawned gateway must be owned by GatewayChildGuard from the instant of spawn"
     );
-    assert!(
-        region.contains("child.try_wait()?"),
-        "the assigned child must be inspected around probes"
-    );
-    assert!(
-        region.contains("exited during startup")
-            && region.contains("exited after proving ownership"),
-        "an exited assigned child must void the attempt before and after a probe"
-    );
-    assert!(
-        region.contains("ready: true"),
-        "the barrier must require authenticated health detail with ready:true"
-    );
-    assert!(
-        region.contains("PROBE_SLICE") && compact.contains("remaining.min(PROBE_SLICE)"),
-        "identity probes must be sliced so try_wait runs between them"
-    );
+    // `Child::try_wait` before every probe and after the successful one now
+    // lives in the shared helper; the harness's `jwt_ownership_*` /
+    // `child_readiness_*` tests pin it.
     assert!(
         compact.contains("std::process::Stdio::null()")
             && !compact.contains("std::process::Stdio::piped()"),

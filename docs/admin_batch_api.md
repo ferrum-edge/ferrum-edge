@@ -61,10 +61,24 @@ Set `FERRUM_MONGO_REPLICA_SET` (or a `?replicaSet=` option on `FERRUM_DB_URL`) t
 enable the endpoint. Individual resource endpoints (`POST /proxies`,
 `POST /consumers`, …) are unaffected and continue to work on standalone MongoDB.
 
-Because a MongoDB transaction is bounded by the server's oplog entry size (16 MB
-by default) and `transactionLifetimeLimitSeconds`, very large single requests can
-exceed those limits. That failure is still atomic — nothing is applied — but
-split such imports into several smaller `POST /batch` requests.
+Three separate limits bound one batch, and none of them is a 16 MB cap on the
+whole transaction:
+
+- **Ferrum's request-body cap.** `POST /batch` uses the standard 1 MiB admin
+  request-body limit, on every backend. This is the limit a large import hits
+  first.
+- **BSON document / oplog entry size.** MongoDB caps each document, and each
+  oplog entry, at 16 MiB. On every supported server version (4.4.2+) a
+  transaction's writes are spread across as many oplog entries as needed, so
+  this bounds individual documents, not the transaction's total size.
+- **Transaction lifetime and resources.** A transaction that runs longer than
+  `transactionLifetimeLimitSeconds` (60 s by default) is aborted, and a large
+  transaction also holds locks and cache for its whole duration.
+
+Exceeding any of them still fails atomically — nothing is applied. For large
+imports, send several smaller `POST /batch` requests (see
+[Chunking Strategy](#chunking-strategy)); each one is atomic on its own, not across
+requests.
 
 ## Endpoint
 
@@ -116,14 +130,14 @@ Plaintext Basic-auth passwords are hashed during batch preparation. This require
       "username": "user-1",
       "custom_id": "tenant-1",
       "credentials": {
-        "keyauth": [{ "key": "api-key-abc123" }]
+        "keyauth": [{ "key": "api-key-abc123-0123456789" }]
       }
     },
     {
       "username": "user-2",
       "custom_id": "tenant-2",
       "credentials": {
-        "keyauth": [{ "key": "api-key-def456" }]
+        "keyauth": [{ "key": "api-key-def456-0123456789" }]
       }
     }
   ]
@@ -183,73 +197,6 @@ Plaintext Basic-auth passwords are hashed during batch preparation. This require
         {"host": "10.0.1.1", "port": 8080, "weight": 100},
         {"host": "10.0.1.2", "port": 8080, "weight": 100}
       ]
-    }
-  ]
-}
-```
-
-### Full Example
-
-Create consumers, proxies, and plugin configs in a single request:
-
-```json
-{
-  "consumers": [
-    {
-      "username": "tenant-1",
-      "credentials": {"keyauth": [{ "key": "key-001" }]}
-    },
-    {
-      "username": "tenant-2",
-      "credentials": {"keyauth": [{ "key": "key-002" }]}
-    }
-  ],
-  "proxies": [
-    {
-      "id": "proxy-1",
-      "name": "svc-1",
-      "listen_path": "/svc/1",
-      "backend_scheme": "http",
-      "backend_host": "localhost",
-      "backend_port": 9090
-    },
-    {
-      "id": "proxy-2",
-      "name": "svc-2",
-      "listen_path": "/svc/2",
-      "backend_scheme": "http",
-      "backend_host": "localhost",
-      "backend_port": 9090
-    }
-  ],
-  "plugin_configs": [
-    {
-      "plugin_name": "key_auth",
-      "enabled": true,
-      "scope": "proxy",
-      "proxy_id": "proxy-1",
-      "config": {}
-    },
-    {
-      "plugin_name": "access_control",
-      "enabled": true,
-      "scope": "proxy",
-      "proxy_id": "proxy-1",
-      "config": {"allowed_consumers": ["tenant-1"]}
-    },
-    {
-      "plugin_name": "key_auth",
-      "enabled": true,
-      "scope": "proxy",
-      "proxy_id": "proxy-2",
-      "config": {}
-    },
-    {
-      "plugin_name": "access_control",
-      "enabled": true,
-      "scope": "proxy",
-      "proxy_id": "proxy-2",
-      "config": {"allowed_consumers": ["tenant-2"]}
     }
   ]
 }
@@ -572,50 +519,7 @@ done
 
 ## Pagination on List Endpoints
 
-All list endpoints (`GET /proxies`, `GET /consumers`, `GET /plugins/config`, `GET /upstreams`) support pagination via query parameters:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `limit`   | 100     | Maximum number of items to return (max: 1000; `0` means the default) |
-| `offset`  | 0       | Number of items to skip (max: 2^63 - 1) |
-
-An omitted `limit` applies the default of 100, and a `limit` above 1000 is
-capped at 1000, so list endpoints never return an unbounded collection. Use
-`GET /backup` for a full export. Malformed or negative `limit`/`offset` values,
-and offsets above 2^63 - 1, are rejected with `400`. Validation runs after
-authentication, so an unauthenticated caller still receives `401`. See
-[Pagination](admin_api.md#pagination) for the full contract.
-
-### Paginated Request
-
-```bash
-# Get the first 50 proxies
-curl -s "http://localhost:9000/proxies?limit=50" \
-  -H "Authorization: Bearer $TOKEN"
-
-# Get the next 50
-curl -s "http://localhost:9000/proxies?limit=50&offset=50" \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-### Response Format
-
-List responses always use the pagination envelope, whether or not `limit` and
-`offset` are supplied:
-
-```json
-{
-  "data": [ ... ],
-  "pagination": {
-    "offset": 50,
-    "limit": 50,
-    "total": 3000
-  }
-}
-```
-
-`pagination.limit` reports the page size the server applied — 100 when the
-request omitted `limit` — not the number of items in `data`.
+List endpoints (`GET /proxies`, `GET /consumers`, `GET /plugins/config`, `GET /upstreams`) are paginated with `limit`/`offset`; see [Pagination](admin_api.md#pagination) for the full contract.
 
 ## Database Considerations
 

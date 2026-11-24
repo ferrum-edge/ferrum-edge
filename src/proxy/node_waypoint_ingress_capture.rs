@@ -561,11 +561,12 @@ mod tests {
             PeerAuthentication {
                 name: name.to_string(),
                 namespace: namespace.to_string(),
-                scope: None,
-                selector: Some(WorkloadSelector {
-                    labels,
-                    namespace: Some(namespace.to_string()),
-                }),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels,
+                        namespace: Some(namespace.to_string()),
+                    },
+                },
                 mtls_mode: mode,
                 port_overrides: HashMap::new(),
             }
@@ -746,10 +747,9 @@ mod tests {
             let payments_strict = PeerAuthentication {
                 name: "payments-default".to_string(),
                 namespace: "payments".to_string(),
-                scope: Some(PolicyScope::Namespace {
+                scope: PolicyScope::Namespace {
                     namespace: "payments".to_string(),
-                }),
-                selector: None,
+                },
                 mtls_mode: MtlsMode::Strict,
                 port_overrides: HashMap::new(),
             };
@@ -787,10 +787,9 @@ mod tests {
             mesh.peer_authentications = vec![PeerAuthentication {
                 name: "own-view-permissive".to_string(),
                 namespace: "payments".to_string(),
-                scope: Some(PolicyScope::Namespace {
+                scope: PolicyScope::Namespace {
                     namespace: "payments".to_string(),
-                }),
-                selector: None,
+                },
                 mtls_mode: MtlsMode::Permissive,
                 port_overrides: HashMap::new(),
             }];
@@ -868,6 +867,61 @@ mod tests {
                 )
                 .is_none(),
                 "a port the destination workload does not declare must be refused"
+            );
+        }
+
+        /// Addresses compare canonically, the same rule the relay ownership
+        /// guard and `mesh_authz`'s capture-destination scope index use, so the
+        /// two inbound surfaces cannot disagree about which workload owns an
+        /// address written in another spelling.
+        #[test]
+        fn destination_addresses_match_canonically() {
+            let mesh = capture_mesh(
+                vec![workload("payments", "ledger", "10.244.1.7", "ledger")],
+                Vec::new(),
+            );
+            let mapped = resolve_node_waypoint_capture_destination(
+                format!("[::ffff:10.244.1.7]:{APP_PORT}").parse().unwrap(),
+                &mesh,
+                true,
+            )
+            .expect("an IPv4-mapped original destination resolves its IPv4 record");
+            assert_eq!(
+                mapped
+                    .entry
+                    .node_waypoint_policy_scope
+                    .as_ref()
+                    .expect("scope")
+                    .namespace,
+                "payments"
+            );
+
+            let mesh = capture_mesh(
+                vec![workload(
+                    "payments",
+                    "ledger",
+                    "::ffff:10.244.1.7",
+                    "ledger",
+                )],
+                Vec::new(),
+            );
+            assert!(
+                resolve_node_waypoint_capture_destination(
+                    format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
+                    &mesh,
+                    true,
+                )
+                .is_some(),
+                "an IPv4-mapped record resolves its IPv4 original destination"
+            );
+            assert!(
+                resolve_node_waypoint_capture_destination(
+                    format!("10.244.1.8:{APP_PORT}").parse().unwrap(),
+                    &mesh,
+                    true,
+                )
+                .is_none(),
+                "a different address still resolves nothing"
             );
         }
     }

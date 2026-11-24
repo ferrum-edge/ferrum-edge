@@ -280,6 +280,27 @@ impl<E> Builder<E> {
         self
     }
 
+    /// FERRUM PATCH 008: bound how long a response body may wait for the
+    /// client to open its flow-control window.
+    ///
+    /// While a response body pipe holds a chunk it cannot send because the
+    /// client has granted no window for it (the stream or connection window
+    /// is exhausted), a timer runs. Each chunk handed to h2 disarms it, and so
+    /// does a wait that has window in hand but a full send buffer, which only
+    /// the transport can drain. If it fires, the stream is reset with
+    /// `CANCEL` and the response body is dropped. Time spent waiting for the
+    /// response body itself never counts.
+    ///
+    /// This needs a [`timer`](Self::timer). On a connection without one,
+    /// every response with a body is reset with `INTERNAL_ERROR` before its
+    /// headers are sent rather than served unbounded.
+    ///
+    /// Passing `None` disables it. Default is `None`.
+    pub fn response_write_timeout(&mut self, timeout: impl Into<Option<Duration>>) -> &mut Self {
+        self.h2_builder.response_write_timeout = timeout.into();
+        self
+    }
+
     /// Set the timer used in background tasks.
     pub fn timer<M>(&mut self, timer: M) -> &mut Self
     where

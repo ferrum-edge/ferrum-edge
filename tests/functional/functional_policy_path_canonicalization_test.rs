@@ -17,8 +17,7 @@ use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
 
 use bytes::Bytes;
 use ferrum_edge::tls::acme::{
-    AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeOrderRecord, AcmeOrderStatus,
-    AcmeOrderStore,
+    AcmeHttp01ChallengeRecord, AcmeOrderInput, AcmeOrderRecord, AcmeOrderStatus, AcmeOrderStore,
 };
 use http::{HeaderMap, Method, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -500,6 +499,21 @@ const CASES: &[Case] = &[
         status: 400,
         backend_target: Backend::Never,
         why: "encoded brace cannot be forwarded literally",
+    },
+    Case {
+        target: "/canon/a%5Eb",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "encoded caret cannot be forwarded literally",
+    },
+    // Literal `^` is admitted by `http::uri::PathAndQuery` and kept in the
+    // canonical path, and `url` 2.5.9+ percent-encodes it to `%5E` on the
+    // backend request line across both the direct H1 pool and reqwest.
+    Case {
+        target: "/canon/a^b",
+        status: 200,
+        backend_target: Backend::Exact("/canon/a%5Eb"),
+        why: "literal caret is forwarded as %5E matching url 2.5.9 across H1/H2/H3",
     },
     Case {
         target: "/canon/caf%C3%A9",
@@ -1454,7 +1468,7 @@ const ACME_KEY_AUTHORIZATION: &str = "tok_ABC-123.policy-path-thumbprint";
 /// creation uses.
 fn seed_pending_http01_order(store_dir: &std::path::Path) {
     let store = AcmeOrderStore::open(store_dir).expect("open ACME order store");
-    let order = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+    let order = AcmeOrderRecord::new(AcmeOrderInput {
         id: "policy-path-http01-order".to_string(),
         certificate_id: None,
         domains: vec!["policy-path.example.com".to_string()],

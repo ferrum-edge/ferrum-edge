@@ -199,35 +199,6 @@ fn test_batch_tier3_burst() {
     assert_eq!(tracker.get_batch_limit(NS, "proxy-1"), 6000);
 }
 
-// ── Jitter-based tier bumping ───────────────────────────────────────────────
-
-#[test]
-fn test_jitter_bumps_buffer_tier() {
-    let tracker = AdaptiveBufferTracker::new(true, false, 300, 8192, 262_144, 65_536, 64);
-    tracker.record_connection(NS, "p1", 4096);
-    assert_eq!(tracker.get_buffer_size(NS, "p1"), 8192);
-
-    tracker.record_jitter(NS, "p1", 15_000);
-    assert_eq!(tracker.get_buffer_size(NS, "p1"), 32 * 1024);
-}
-
-#[test]
-fn test_jitter_no_bump_when_low() {
-    let tracker = AdaptiveBufferTracker::new(true, false, 300, 8192, 262_144, 65_536, 64);
-    tracker.record_connection(NS, "p1", 4096);
-    tracker.record_jitter(NS, "p1", 5_000);
-    assert_eq!(tracker.get_buffer_size(NS, "p1"), 8192);
-}
-
-#[test]
-fn test_jitter_no_bump_beyond_max_tier() {
-    let tracker = AdaptiveBufferTracker::new(true, false, 300, 8192, 1_048_576, 65_536, 64);
-    tracker.record_connection(NS, "p1", 10 * 1024 * 1024);
-    let size_before = tracker.get_buffer_size(NS, "p1");
-    tracker.record_jitter(NS, "p1", 50_000);
-    assert_eq!(tracker.get_buffer_size(NS, "p1"), size_before);
-}
-
 // ── Concurrency ────────────────────────────────────────────────────────────
 
 #[test]
@@ -296,19 +267,6 @@ fn same_proxy_id_in_two_namespaces_keeps_independent_batch_state() {
     assert_eq!(tracker.get_batch_limit(NS_A, SHARED_ID), 64);
     assert_eq!(tracker.get_batch_limit(NS_B, SHARED_ID), 6000);
     assert_eq!(tracker.get_batch_limit("team-c", SHARED_ID), 6000);
-}
-
-#[test]
-fn jitter_bump_does_not_leak_across_namespaces() {
-    let tracker = AdaptiveBufferTracker::new(true, false, 300, 8192, 262_144, 65_536, 64);
-
-    tracker.record_connection(NS_A, SHARED_ID, 4096);
-    tracker.record_connection(NS_B, SHARED_ID, 4096);
-    // Only team-b's traffic is jittery.
-    tracker.record_jitter(NS_B, SHARED_ID, 15_000);
-
-    assert_eq!(tracker.get_buffer_size(NS_A, SHARED_ID), 8192);
-    assert_eq!(tracker.get_buffer_size(NS_B, SHARED_ID), 32 * 1024);
 }
 
 #[test]

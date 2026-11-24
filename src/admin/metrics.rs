@@ -11,9 +11,6 @@ use std::collections::BTreeMap;
 
 /// Operating modes that construct an [`crate::admin::AdminState`] and serve
 /// authenticated `GET /admin/metrics`.
-// The binary target does not consume this contract inventory directly; the
-// repository's external unit/OpenAPI contract suites do.
-#[allow(dead_code)]
 pub const ADMIN_METRICS_MODES: &[&str] = &["database", "file", "cp", "dp", "mesh", "node_agent"];
 
 /// Top-level authenticated `/admin/metrics` payload.
@@ -27,8 +24,10 @@ pub struct AdminMetrics {
     pub caches: AdminMetricsCaches,
     pub consumer_index: AdminMetricsConsumerIndex,
     pub rate_limiting: AdminMetricsRateLimiting,
+    pub adaptive_concurrency: AdminMetricsAdaptiveConcurrency,
     pub tcp_connection_throttle: AdminMetricsTcpConnectionThrottle,
-    /// Present only in database mode when the delta-poll registry is installed.
+    /// Present only in database and CP modes when the delta-poll registry is
+    /// installed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_polling: Option<DatabaseDeltaPollMetricsSnapshot>,
 }
@@ -179,17 +178,47 @@ pub struct AdminMetricsRateLimiting {
     pub tracked_key_count: usize,
 }
 
+/// Live `adaptive_concurrency` limiter state across every policy, summed at
+/// read time. Per-target values stay out of this response so its size is
+/// independent of `max_tracked_keys`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdminMetricsAdaptiveConcurrency {
+    /// Live `adaptive_concurrency` policies (one per namespace + plugin-config id).
+    pub policy_count: usize,
+    /// Backend targets tracked across those policies.
+    pub tracked_target_count: u64,
+    /// Sum of the tracked targets' current adaptive limits.
+    pub limit_total: u64,
+    /// Sum of the tracked targets' current in-flight admissions.
+    pub in_flight_total: u64,
+}
+
+impl AdminMetricsAdaptiveConcurrency {
+    pub const fn empty() -> Self {
+        Self {
+            policy_count: 0,
+            tracked_target_count: 0,
+            limit_total: 0,
+            in_flight_total: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AdminMetricsTcpConnectionThrottle {
     pub enforcement_scope: &'static str,
     pub replica_limit_behavior: &'static str,
+    /// Live TCP connections this process currently holds under every
+    /// configured `tcp_connection_throttle` policy, summed across keys.
+    pub active_connections: u64,
 }
 
 impl AdminMetricsTcpConnectionThrottle {
-    pub const fn process_local() -> Self {
+    pub const fn process_local(active_connections: u64) -> Self {
         Self {
             enforcement_scope: "process_local",
             replica_limit_behavior: "configured_limit_per_replica",
+            active_connections,
         }
     }
 }
@@ -378,7 +407,8 @@ pub fn empty_proxy_metrics(mode: &str) -> AdminMetrics {
         rate_limiting: AdminMetricsRateLimiting {
             tracked_key_count: 0,
         },
-        tcp_connection_throttle: AdminMetricsTcpConnectionThrottle::process_local(),
+        adaptive_concurrency: AdminMetricsAdaptiveConcurrency::empty(),
+        tcp_connection_throttle: AdminMetricsTcpConnectionThrottle::process_local(0),
         database_polling: None,
     }
 }
@@ -395,10 +425,18 @@ pub fn build_admin_metrics(
     database_polling: Option<DatabaseDeltaPollMetricsSnapshot>,
 ) -> AdminMetrics {
     let source_status = config_source_status(db_available).to_string();
+    // Only DB-backed config sources (database and CP) poll for deltas; CP has
+    // no proxy state, so this must be attached on both branches below.
+    let database_polling = if mode == "database" || mode == "cp" {
+        database_polling
+    } else {
+        None
+    };
 
     let Some(ps) = proxy_state else {
         let mut metrics = empty_proxy_metrics(mode);
         metrics.gateway.config_source_status = source_status;
+        metrics.database_polling = database_polling;
         return metrics;
     };
 
@@ -496,6 +534,8 @@ pub fn build_admin_metrics(
         total_consumers,
     ) = ps.consumer_index.auth_type_counts();
 
+    let (adaptive_policy_count, adaptive_totals) = ps.plugin_cache.adaptive_concurrency_totals();
+
     let mut status_codes_per_second = BTreeMap::new();
     for entry in ps.windowed_metrics.status_codes_per_second.iter() {
         status_codes_per_second.insert(
@@ -571,21 +611,22 @@ pub fn build_admin_metrics(
         rate_limiting: AdminMetricsRateLimiting {
             tracked_key_count: ps.plugin_cache.total_rate_limiter_keys(),
         },
-        tcp_connection_throttle: AdminMetricsTcpConnectionThrottle::process_local(),
-        database_polling: if mode == "database" || mode == "cp" {
-            database_polling
-        } else {
-            None
+        adaptive_concurrency: AdminMetricsAdaptiveConcurrency {
+            policy_count: adaptive_policy_count,
+            tracked_target_count: adaptive_totals.tracked_targets,
+            limit_total: adaptive_totals.limit,
+            in_flight_total: adaptive_totals.in_flight,
         },
+        tcp_connection_throttle: AdminMetricsTcpConnectionThrottle::process_local(
+            ps.plugin_cache.tcp_connection_throttle_active_connections(),
+        ),
+        database_polling,
     }
 }
 
 /// Canonical fixtures covering every mode and the circuit-breaker / health
 /// variants the OpenAPI contract must accept. Used by contract tests so the
 /// typed model remains the single source of truth for response shape.
-// External test crates consume this helper through the library target; the
-// separately compiled binary target has no production caller.
-#[allow(dead_code)]
 pub fn contract_fixtures() -> Vec<AdminMetrics> {
     let mut fixtures = Vec::new();
 
@@ -628,6 +669,12 @@ pub fn contract_fixtures() -> Vec<AdminMetrics> {
         ),
         AdminMetricsCircuitBreaker::direct_backend("ferrum", "proxy-search", "half_open", 3, 1),
     ];
+    breakers_and_health.adaptive_concurrency = AdminMetricsAdaptiveConcurrency {
+        policy_count: 2,
+        tracked_target_count: 3,
+        limit_total: 96,
+        in_flight_total: 7,
+    };
     breakers_and_health.health_check = AdminMetricsHealthCheck {
         unhealthy_target_count: 2,
         unhealthy_targets: vec![
@@ -660,7 +707,6 @@ pub fn contract_fixtures() -> Vec<AdminMetrics> {
     fixtures
 }
 
-#[allow(dead_code)] // Called by the external contract-fixture entry point.
 fn proxy_serving_fixture(mode: &str) -> AdminMetrics {
     let mut metrics = empty_proxy_metrics(mode);
     metrics.gateway.config_source_status = if mode == "database" {
@@ -700,7 +746,6 @@ fn proxy_serving_fixture(mode: &str) -> AdminMetrics {
     metrics
 }
 
-#[allow(dead_code)] // Called by the external contract-fixture entry point.
 fn sample_database_polling() -> DatabaseDeltaPollMetricsSnapshot {
     DatabaseDeltaPollMetricsSnapshot {
         rejected_deltas_total: 0,

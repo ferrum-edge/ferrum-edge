@@ -3,8 +3,11 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 use crate::plugins::RequestContext;
+use crate::plugins::utils::auth_flow::constant_time_eq;
+use crate::plugins::utils::principal;
 use crate::util::unknown_keys::reject_unknown_keys;
 
+use super::config_values::optional_string_vec_in;
 use super::rules::IpCidr;
 
 /// Fixed-shape global exemption object keys. `header_present` remains an
@@ -14,9 +17,32 @@ const GLOBAL_EXEMPTION_KEYS: &[&str] = &[
     "methods",
     "consumers",
     "ips",
+    "match",
     "header_present",
     "fp_capture_filters",
 ];
+
+/// Minimum length of a `header_present` value.
+///
+/// The value is the only thing that separates a trusted hop from any client:
+/// a client chooses its own headers, so a presence-only entry, or one keyed on
+/// a guessable value, lets every caller switch rule enforcement off for its
+/// own request. Requiring a long shared secret (compared in constant time)
+/// makes the entry unforgeable without access to the trusted hop's config.
+pub(crate) const MIN_HEADER_PRESENT_SECRET_CHARS: usize = 16;
+
+/// How the request-wide short-circuit criteria (`paths`, `methods`, `ips`,
+/// `consumers`) combine.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ExemptionMatch {
+    /// Default. Every configured criterion must match, so adding a criterion
+    /// narrows the exemption: `{paths: ["/health"], methods: ["GET"]}` exempts
+    /// `GET /health`, not every GET plus every method on `/health`.
+    #[default]
+    All,
+    /// Any one configured criterion exempts the whole request.
+    Any,
+}
 
 #[derive(Debug, Default)]
 pub struct CompiledExemptions {
@@ -24,7 +50,8 @@ pub struct CompiledExemptions {
     methods: Vec<String>,
     consumers: HashSet<String>,
     ips: Vec<IpCidr>,
-    header_present: HashMap<String, Option<String>>,
+    match_mode: ExemptionMatch,
+    header_present: HashMap<String, String>,
     fp_capture_filters: Option<RegexSet>,
 }
 
@@ -46,7 +73,25 @@ impl CompiledExemptions {
             "waf: `config.global_exemptions`: ",
         )?;
 
-        let paths = optional_string_vec(object, "paths")?.unwrap_or_default();
+        let paths =
+            optional_string_vec_in(object, "paths", "global_exemptions.")?.unwrap_or_default();
+        // Exemptions are matched against the canonical request path, exactly
+        // like rule `conditions.paths`, so a non-canonical exact or `prefix*`
+        // value (a percent escape, `//`, a dot segment — easily copied from a
+        // raw access log) could never match and would silently exempt
+        // nothing. Refuse it at admission with the same canonical-path rules
+        // (GHSA-fcqw-793q-wg5x). A `~regex` is regex text and is left alone.
+        for (index, path) in paths.iter().enumerate() {
+            if path.starts_with('~') {
+                continue;
+            }
+            let literal = path.strip_suffix('*').unwrap_or(path.as_str());
+            if let Some(reason) = crate::policy_path::non_canonical_policy_path_reason(literal) {
+                return Err(format!(
+                    "waf: `global_exemptions.paths[{index}]` is not a canonical path: {reason}"
+                ));
+            }
+        }
         let path_set = if paths.is_empty() {
             None
         } else {
@@ -59,16 +104,16 @@ impl CompiledExemptions {
                 })?
         };
 
-        let methods = optional_string_vec(object, "methods")?
+        let methods = optional_string_vec_in(object, "methods", "global_exemptions.")?
             .unwrap_or_default()
             .into_iter()
             .map(|method| method.to_ascii_uppercase())
             .collect::<Vec<_>>();
-        let consumers = optional_string_vec(object, "consumers")?
+        let consumers = optional_string_vec_in(object, "consumers", "global_exemptions.")?
             .unwrap_or_default()
             .into_iter()
             .collect();
-        let ips = optional_string_vec(object, "ips")?
+        let ips = optional_string_vec_in(object, "ips", "global_exemptions.")?
             .unwrap_or_default()
             .into_iter()
             .map(|raw| {
@@ -77,8 +122,18 @@ impl CompiledExemptions {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let match_mode = match object.get("match") {
+            None | Some(Value::Null) => ExemptionMatch::All,
+            Some(Value::String(raw)) if raw == "all" => ExemptionMatch::All,
+            Some(Value::String(raw)) if raw == "any" => ExemptionMatch::Any,
+            Some(_) => {
+                return Err("waf: `global_exemptions.match` must be \"all\" or \"any\"".to_string());
+            }
+        };
         let header_present = parse_header_present(object.get("header_present"))?;
-        let fp_filters = optional_string_vec(object, "fp_capture_filters")?.unwrap_or_default();
+        let fp_filters =
+            optional_string_vec_in(object, "fp_capture_filters", "global_exemptions.")?
+                .unwrap_or_default();
         let fp_capture_filters = if fp_filters.is_empty() {
             None
         } else {
@@ -93,53 +148,73 @@ impl CompiledExemptions {
             methods,
             consumers,
             ips,
+            match_mode,
             header_present,
             fp_capture_filters,
         })
     }
 
     pub fn request_short_circuits(&self, ctx: &RequestContext) -> bool {
-        if self
-            .path_set
-            .as_ref()
-            .is_some_and(|paths| paths.is_match(&ctx.path))
-        {
-            return true;
-        }
         // This predicate runs several times per request (authorize, both body
         // buffering decisions, response phases), so each check is skipped
         // outright when its list is empty and none allocates: methods compare
         // case-insensitively in place instead of uppercasing the request
-        // method, and the client IP is parsed only when an IP exemption exists.
-        if !self.methods.is_empty()
-            && self
-                .methods
-                .iter()
-                .any(|method| method.eq_ignore_ascii_case(&ctx.method))
-        {
-            return true;
+        // method, and the client IP comes from the context's shared canonical
+        // parse (IPv4-mapped IPv6 already folded to IPv4), read only when an
+        // IP exemption exists.
+        let criteria = [
+            self.path_set
+                .as_ref()
+                .map(|paths| paths.is_match(&ctx.path)),
+            (!self.methods.is_empty()).then(|| {
+                self.methods
+                    .iter()
+                    .any(|method| method.eq_ignore_ascii_case(&ctx.method))
+            }),
+            (!self.ips.is_empty()).then(|| {
+                ctx.canonical_client_ip()
+                    .is_some_and(|client_ip| self.ips.iter().any(|cidr| cidr.matches(client_ip)))
+            }),
+            // Consumer usernames name mapped Consumers only: an unmapped
+            // external principal whose identity string equals a listed
+            // username is not that Consumer (GHSA-rxwj-x6c6-f4j5).
+            (!self.consumers.is_empty()).then(|| {
+                principal::consumer_username(ctx)
+                    .is_some_and(|username| self.consumers.contains(username))
+            }),
+        ];
+        let mut configured = criteria.into_iter().flatten();
+        match self.match_mode {
+            ExemptionMatch::Any => configured.any(|matched| matched),
+            // An exemption with no criterion configured exempts nothing.
+            ExemptionMatch::All => {
+                let mut any_configured = false;
+                for matched in configured {
+                    if !matched {
+                        return false;
+                    }
+                    any_configured = true;
+                }
+                any_configured
+            }
         }
-        if !self.ips.is_empty()
-            && let Ok(client_ip) = ctx.client_ip.parse()
-            && self.ips.iter().any(|cidr| cidr.matches(client_ip))
-        {
-            return true;
-        }
-        if !self.consumers.is_empty()
-            && let Some(identity) = ctx.effective_identity()
-            && self.consumers.contains(identity)
-        {
-            return true;
-        }
-        false
     }
 
+    /// Lowercase `header_present` header names, whose values are secrets.
+    pub fn header_present_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.header_present.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Whether a `header_present` entry suppresses every rule for this
+    /// request. Each entry requires the exact configured secret value,
+    /// compared in constant time; header presence alone never matches.
     pub fn suppresses_rule_for_request(&self, ctx: &RequestContext) -> bool {
         self.header_present.iter().any(|(name, expected)| {
-            let Some(actual) = ctx.headers.get(name) else {
-                return false;
-            };
-            expected.as_ref().is_none_or(|expected| actual == expected)
+            ctx.headers
+                .get(name)
+                .is_some_and(|actual| constant_time_eq(actual.as_bytes(), expected.as_bytes()))
         })
     }
 
@@ -180,57 +255,51 @@ fn exemption_path_pattern(raw: String) -> String {
     }
 }
 
-fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, Option<String>>, String> {
+fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, String>, String> {
     match value {
         None | Some(Value::Null) => Ok(HashMap::new()),
         Some(Value::Object(map)) => {
             // Intentionally open: keys are operator-defined header names.
             let mut parsed = HashMap::new();
             for (key, value) in map {
-                let expected = if value.is_null() {
-                    None
-                } else {
-                    Some(value.as_str().ok_or_else(|| {
-                        "waf: global_exemptions.header_present values must be strings or null"
-                            .to_string()
-                    })?)
-                };
-                parsed.insert(key.to_ascii_lowercase(), expected.map(str::to_string));
+                if key.is_empty() {
+                    return Err(
+                        "waf: global_exemptions.header_present keys must not be empty".to_string(),
+                    );
+                }
+                // A client chooses its own headers, so presence alone (or a
+                // short, guessable value) would let any caller disable every
+                // rule for its own request. Only a shared secret that a
+                // trusted hop injects is accepted.
+                let expected = value.as_str().ok_or_else(|| {
+                    format!(
+                        "waf: global_exemptions.header_present values must be secret strings of \
+                         at least {MIN_HEADER_PRESENT_SECRET_CHARS} characters; presence-only (null) \
+                         entries are not accepted because clients choose their own headers"
+                    )
+                })?;
+                if expected.chars().count() < MIN_HEADER_PRESENT_SECRET_CHARS {
+                    return Err(format!(
+                        "waf: global_exemptions.header_present values must be at least \
+                         {MIN_HEADER_PRESENT_SECRET_CHARS} characters; use a shared secret that only \
+                         a trusted hop injects"
+                    ));
+                }
+                if parsed
+                    .insert(key.to_ascii_lowercase(), expected.to_string())
+                    .is_some()
+                {
+                    return Err(
+                        "waf: global_exemptions.header_present contains case-equivalent \
+                         duplicate header names"
+                            .to_string(),
+                    );
+                }
             }
             Ok(parsed)
         }
         Some(other) => Err(format!(
             "waf: global_exemptions.header_present must be an object, got {other:?}",
-            other = other.to_string()
-        )),
-    }
-}
-
-fn optional_string_vec(
-    object: &serde_json::Map<String, Value>,
-    key: &str,
-) -> Result<Option<Vec<String>>, String> {
-    match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Array(values)) => {
-            let mut parsed = Vec::with_capacity(values.len());
-            for value in values {
-                let Some(raw) = value.as_str() else {
-                    return Err(format!(
-                        "waf: global_exemptions.{key} entries must be strings"
-                    ));
-                };
-                if raw.is_empty() {
-                    return Err(format!(
-                        "waf: global_exemptions.{key} entries must be non-empty"
-                    ));
-                }
-                parsed.push(raw.to_string());
-            }
-            Ok(Some(parsed))
-        }
-        Some(other) => Err(format!(
-            "waf: global_exemptions.{key} must be an array, got {other:?}",
             other = other.to_string()
         )),
     }
@@ -308,5 +377,91 @@ mod tests {
         let exemptions = CompiledExemptions::from_config(Some(&floating)).unwrap();
         let nested = RequestContext::new("127.0.0.1".into(), "GET".into(), "/team/admin".into());
         assert!(exemptions.request_short_circuits(&nested));
+    }
+
+    #[test]
+    fn criteria_combine_with_and_by_default() {
+        let config = serde_json::json!({"paths":["/health"], "methods":["GET"]});
+        let exemptions = CompiledExemptions::from_config(Some(&config)).unwrap();
+
+        let both = RequestContext::new("127.0.0.1".into(), "GET".into(), "/health".into());
+        assert!(exemptions.request_short_circuits(&both));
+        let method_only = RequestContext::new("127.0.0.1".into(), "GET".into(), "/admin".into());
+        assert!(!exemptions.request_short_circuits(&method_only));
+        let path_only = RequestContext::new("127.0.0.1".into(), "POST".into(), "/health".into());
+        assert!(!exemptions.request_short_circuits(&path_only));
+
+        let ip_and_path = serde_json::json!({"paths":["/internal/*"], "ips":["10.0.0.0/8"]});
+        let exemptions = CompiledExemptions::from_config(Some(&ip_and_path)).unwrap();
+        let inside = RequestContext::new("10.1.2.3".into(), "GET".into(), "/internal/x".into());
+        assert!(exemptions.request_short_circuits(&inside));
+        let outside = RequestContext::new("192.0.2.1".into(), "GET".into(), "/internal/x".into());
+        assert!(!exemptions.request_short_circuits(&outside));
+    }
+
+    #[test]
+    fn match_any_restores_or_semantics() {
+        let config = serde_json::json!({"paths":["/health"], "methods":["OPTIONS"], "match":"any"});
+        let exemptions = CompiledExemptions::from_config(Some(&config)).unwrap();
+        let method_only = RequestContext::new("127.0.0.1".into(), "OPTIONS".into(), "/x".into());
+        assert!(exemptions.request_short_circuits(&method_only));
+        let path_only = RequestContext::new("127.0.0.1".into(), "POST".into(), "/health".into());
+        assert!(exemptions.request_short_circuits(&path_only));
+        let neither = RequestContext::new("127.0.0.1".into(), "POST".into(), "/x".into());
+        assert!(!exemptions.request_short_circuits(&neither));
+    }
+
+    #[test]
+    fn empty_exemptions_exempt_nothing_in_either_mode() {
+        for mode in ["all", "any"] {
+            let config = serde_json::json!({"match": mode, "fp_capture_filters": ["x"]});
+            let exemptions = CompiledExemptions::from_config(Some(&config)).unwrap();
+            let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+            assert!(!exemptions.request_short_circuits(&ctx), "{mode}");
+        }
+        let error = CompiledExemptions::from_config(Some(&serde_json::json!({"match": "either"})))
+            .unwrap_err();
+        assert!(error.contains("`global_exemptions.match`"), "{error}");
+    }
+
+    #[test]
+    fn header_present_requires_a_long_secret_value() {
+        for (value, needle) in [
+            (serde_json::Value::Null, "presence-only"),
+            (serde_json::json!("short"), "at least 16 characters"),
+            (serde_json::json!(true), "presence-only"),
+        ] {
+            let config = serde_json::json!({"header_present": {"x-waf-bypass": value}});
+            let error = CompiledExemptions::from_config(Some(&config)).unwrap_err();
+            assert!(error.contains(needle), "{error}");
+        }
+
+        let duplicate = serde_json::json!({"header_present": {
+            "X-Waf-Bypass": "0123456789abcdef",
+            "x-waf-bypass": "fedcba9876543210"
+        }});
+        let error = CompiledExemptions::from_config(Some(&duplicate)).unwrap_err();
+        assert!(error.contains("duplicate"), "{error}");
+    }
+
+    #[test]
+    fn header_present_matches_only_the_exact_secret() {
+        let secret = "s3cr3t-from-the-trusted-hop";
+        let config = serde_json::json!({"header_present": {"X-Waf-Bypass": secret}});
+        let exemptions = CompiledExemptions::from_config(Some(&config)).unwrap();
+
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+        assert!(!exemptions.suppresses_rule_for_request(&ctx));
+        for forged in [
+            "",
+            "1",
+            "s3cr3t-from-the-trusted-ho",
+            "s3cr3t-from-the-trusted-hop!",
+        ] {
+            ctx.headers.insert("x-waf-bypass".into(), forged.into());
+            assert!(!exemptions.suppresses_rule_for_request(&ctx), "{forged:?}");
+        }
+        ctx.headers.insert("x-waf-bypass".into(), secret.into());
+        assert!(exemptions.suppresses_rule_for_request(&ctx));
     }
 }

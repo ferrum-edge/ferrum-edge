@@ -21,6 +21,12 @@ pub(crate) mod preconditions;
 pub mod provisioning;
 pub mod spec_codec;
 mod tls_management;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use tls_management::{
+    TlsReferenceScanHookAction, set_tls_reference_scan_hook_for_tests,
+    set_tls_store_delete_hook_for_tests,
+};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -476,7 +482,9 @@ pub struct AdminState {
     /// Process-level OpenAPI external `$ref` gate and budgets (from EnvConfig).
     pub external_ref_policy: std::sync::Arc<crate::admin::api_specs::ExternalRefProcessPolicy>,
     /// Loader used when external `$ref` resolution is effectively enabled.
-    pub external_ref_loader: std::sync::Arc<crate::admin::api_specs::DefaultExternalDocumentLoader>,
+    /// Serving modes install [`crate::admin::api_specs::DefaultExternalDocumentLoader`];
+    /// tests substitute their own in-memory loader through the trait.
+    pub external_ref_loader: std::sync::Arc<dyn crate::admin::api_specs::ExternalDocumentLoader>,
     /// Database-mode coordinator that waits for the poll-loop reload to publish
     /// a covering `config_changes` watermark before admin mutations return 2xx
     /// (issue #3926). `None` in every other mode and in tests that do not run
@@ -926,7 +934,6 @@ impl AdminState {
     }
 }
 
-static READ_ONLY_REJECTION_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static READ_ONLY_REJECTION_WARN_LAST_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Count and emit a bounded structured warning for one admin mutation refused
@@ -936,7 +943,6 @@ fn note_read_only_rejection() {
     let total = crate::plugins::prometheus_metrics::global_registry()
         .record_admin_read_only_rejection()
         .saturating_add(1);
-    READ_ONLY_REJECTION_LOG_COUNT.store(total, Ordering::Relaxed);
 
     let should_sample = total == 1 || total.is_multiple_of(1_024);
     if !should_sample {
@@ -967,13 +973,9 @@ fn note_read_only_rejection() {
     );
 }
 
-// Consumed only by the external `tests/` crates. `src/lib.rs` and `src/main.rs`
-// both declare the full module tree, so in the BIN target this has no caller and
-// `-D warnings` would reject it as dead code.
-#[allow(dead_code)]
+// Consumed only by the external `tests/` crates.
 #[doc(hidden)]
 pub fn reset_read_only_rejection_observability_for_test() {
-    READ_ONLY_REJECTION_LOG_COUNT.store(0, Ordering::Relaxed);
     READ_ONLY_REJECTION_WARN_LAST_MS.store(0, Ordering::Relaxed);
     crate::plugins::prometheus_metrics::global_registry()
         .reset_admin_read_only_rejection_metrics_for_test();
@@ -1436,6 +1438,13 @@ impl Drop for AdminActivityGuard {
 /// has finished writing the response and dropped the body.
 struct GuardedAdminBody {
     inner: Full<Bytes>,
+    /// `GET /charges` delivery acknowledgement, fired once hyper has taken
+    /// the complete document from this body (issue #5276). A response dropped
+    /// before then — a scrape cancelled while the registry was rendering, or a
+    /// stream reset before the body was polled — acknowledges nothing. Taking
+    /// the body is not proof the peer received it, so the registry confirms
+    /// collection only after two such deliveries.
+    delivery_ack: Option<plugins::api_chargeback::ChargesDeliveryAck>,
     _guard: AdminActivityGuard,
 }
 
@@ -1443,8 +1452,27 @@ impl GuardedAdminBody {
     fn new(inner: Full<Bytes>, guard: AdminActivityGuard) -> Self {
         Self {
             inner,
+            delivery_ack: None,
             _guard: guard,
         }
+    }
+
+    /// Wrap a dispatched admin response, moving a `/charges` delivery
+    /// acknowledgement out of the response extensions into the body so it
+    /// fires only once the body has been taken.
+    fn wrap_response(response: Response<Full<Bytes>>, guard: AdminActivityGuard) -> Response<Self> {
+        let (mut parts, inner) = response.into_parts();
+        let delivery_ack = parts
+            .extensions
+            .remove::<plugins::api_chargeback::ChargesDeliveryAck>();
+        Response::from_parts(
+            parts,
+            Self {
+                inner,
+                delivery_ack,
+                _guard: guard,
+            },
+        )
     }
 }
 
@@ -1456,8 +1484,20 @@ impl http_body::Body for GuardedAdminBody {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
         // `Full<Bytes>` is `Unpin`, so the projection is a plain reborrow.
-        http_body::Body::poll_frame(std::pin::Pin::new(&mut self.get_mut().inner), cx)
+        let polled = http_body::Body::poll_frame(std::pin::Pin::new(&mut this.inner), cx);
+        if this.delivery_ack.is_some() {
+            let body_taken = match &polled {
+                std::task::Poll::Ready(None) => true,
+                std::task::Poll::Ready(Some(Ok(_))) => http_body::Body::is_end_stream(&this.inner),
+                _ => false,
+            };
+            if body_taken && let Some(ack) = this.delivery_ack.take() {
+                ack.acknowledge();
+            }
+        }
+        polled
     }
 
     fn is_end_stream(&self) -> bool {
@@ -1467,6 +1507,31 @@ impl http_body::Body for GuardedAdminBody {
     fn size_hint(&self) -> http_body::SizeHint {
         http_body::Body::size_hint(&self.inner)
     }
+}
+
+/// Drive an admin response through the connection body wrapper exactly as
+/// [`serve_admin_io`] does and collect its body, so tests can observe what the
+/// wrapper does once hyper takes the document (issue #5276).
+///
+/// Reached through `_test_support`.
+pub(crate) async fn collect_guarded_admin_response_for_test(
+    response: Response<Full<Bytes>>,
+) -> Bytes {
+    let guard = AdminActivityGuard::new(Arc::new(AdminConnActivity::new()));
+    let guarded = GuardedAdminBody::wrap_response(response, guard);
+    match guarded.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(never) => match never {},
+    }
+}
+
+/// Wrap an admin response as [`serve_admin_io`] does, then drop it without
+/// polling its body: a connection that went away before writing the response.
+///
+/// Reached through `_test_support`.
+pub(crate) fn drop_guarded_admin_response_unpolled_for_test(response: Response<Full<Bytes>>) {
+    let guard = AdminActivityGuard::new(Arc::new(AdminConnActivity::new()));
+    drop(GuardedAdminBody::wrap_response(response, guard));
 }
 
 /// Drive one accepted admin connection (plaintext or TLS-terminated) to
@@ -1520,15 +1585,18 @@ async fn serve_admin_io<I>(
                 && session.is_retired()
             {
                 session.record_fenced();
-                let response = json_response(
-                    StatusCode::UNAUTHORIZED,
-                    &json!({ "error": "Client certificate trust withdrawn" }),
+                let response = with_admin_challenge(
+                    json_response(
+                        StatusCode::UNAUTHORIZED,
+                        &json!({ "error": "Client certificate trust withdrawn" }),
+                    ),
+                    crate::plugins::utils::auth_flow::CLIENT_CERTIFICATE_AUTHENTICATION_CHALLENGE,
                 );
                 let guarded = response.map(|inner| GuardedAdminBody::new(inner, guard));
                 return Ok::<_, hyper::Error>(guarded);
             }
             let response = handle_admin_request(req, state, client_ip).await?;
-            let guarded = response.map(|inner| GuardedAdminBody::new(inner, guard));
+            let guarded = GuardedAdminBody::wrap_response(response, guard);
             Ok::<_, hyper::Error>(guarded)
         }
     });
@@ -1967,6 +2035,130 @@ pub fn advancing_u32_offset(offset: u32, item_count: usize, total: i64) -> Optio
 enum ChargebackFormat {
     Prometheus,
     Json,
+}
+
+/// A rendered `/charges` document plus the acknowledgement its delivery owes
+/// the registry.
+type RenderedCharges = (String, Option<plugins::api_chargeback::ChargesDeliveryAck>);
+
+/// Render `/charges` from the process-global registry on the blocking pool.
+///
+/// An uncached render walks the whole registry (up to `max_entries` rows, and
+/// up to [`plugins::api_chargeback::MAX_RENDER_ATTEMPTS`] walks under reload
+/// churn) and serializes it synchronously; running it inline would occupy an
+/// async worker shared with the data plane for the whole walk. The returned
+/// receipt is not acknowledged here — see
+/// [`plugins::api_chargeback::ChargesDeliveryAck`].
+async fn render_charges_off_worker(
+    registry: Arc<plugins::api_chargeback::ChargebackRegistry>,
+    format: ChargebackFormat,
+) -> Result<RenderedCharges, String> {
+    let rendered = tokio::task::spawn_blocking(move || {
+        let rendered = match format {
+            ChargebackFormat::Json => registry.render_json_pending(),
+            ChargebackFormat::Prometheus => registry.render_prometheus_pending(),
+        };
+        rendered.map(|(output, receipt)| {
+            (
+                output,
+                Some(plugins::api_chargeback::ChargesDeliveryAck::new(
+                    registry, receipt,
+                )),
+            )
+        })
+    })
+    .await;
+    match rendered {
+        Ok(result) => result,
+        Err(join_error) => Err(format!(
+            "api_chargeback: /charges render task failed: {join_error}"
+        )),
+    }
+}
+
+/// Whether a verified admin token is a designated `/charges` billing
+/// collector: its `scope` claim grants
+/// [`plugins::api_chargeback::CHARGES_COLLECT_SCOPE`]. Tier-aware through
+/// [`crate::admin::jwt_auth::VerifiedAdminToken::grants_scope`], so a token
+/// verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET` is never a collector, and the
+/// `role` claim never implies the scope (GHSA-jjvr-vvwv-8qmh).
+fn charges_collection_granted(token: &crate::admin::jwt_auth::VerifiedAdminToken) -> bool {
+    token.grants_scope(plugins::api_chargeback::CHARGES_COLLECT_SCOPE)
+}
+
+/// `GET /charges`, after authentication and the namespace-bounded global-route
+/// gate.
+///
+/// Every authenticated caller receives the same document. Only a designated
+/// collector (`acknowledges_collection`, from [`charges_collection_granted`])
+/// also carries the delivery acknowledgement that counts toward the
+/// two-hand-off rule for idle-row eviction (issue #5276). Dashboards, drift
+/// tools, viewer-key tokens, and ad-hoc reads are side-effect free, so they
+/// cannot make rows the billing collector never saw evictable
+/// (GHSA-jjvr-vvwv-8qmh).
+async fn charges_response(
+    registry: Option<Arc<plugins::api_chargeback::ChargebackRegistry>>,
+    query: Option<&str>,
+    acknowledges_collection: bool,
+) -> Response<Full<Bytes>> {
+    let format = match parse_chargeback_format(query) {
+        Ok(format) => format,
+        Err(resp) => return *resp,
+    };
+    let rendered = match registry {
+        Some(registry) => render_charges_off_worker(registry, format).await,
+        None => {
+            let empty = match format {
+                ChargebackFormat::Json => crate::plugins::api_chargeback::empty_charges_json(),
+                ChargebackFormat::Prometheus => {
+                    crate::plugins::api_chargeback::empty_charges_prometheus()
+                }
+            };
+            empty.map(|output| (output, None))
+        }
+    };
+    match rendered {
+        Ok((output, delivery_ack)) => {
+            let content_type = match format {
+                ChargebackFormat::Json => "application/json",
+                ChargebackFormat::Prometheus => "text/plain; version=0.0.4; charset=utf-8",
+            };
+            match with_admin_security_headers(Response::builder())
+                .status(StatusCode::OK)
+                .header("Content-Type", content_type)
+                .body(Full::new(Bytes::from(output)))
+            {
+                Ok(mut resp) => {
+                    // Collection is acknowledged by the connection's body
+                    // wrapper once it has taken this document, never here at
+                    // render time (issue #5276), and only for a designated
+                    // collector (GHSA-jjvr-vvwv-8qmh).
+                    if acknowledges_collection && let Some(ack) = delivery_ack {
+                        resp.extensions_mut().insert(ack);
+                    }
+                    resp
+                }
+                Err(_) => admin_builder_failure_response(),
+            }
+        }
+        // Fail closed: never serialize non-finite monetary values as JSON
+        // null (serde_json's default for Inf/NaN) or publish non-finite
+        // Prometheus samples.
+        Err(err) => json_response(StatusCode::INTERNAL_SERVER_ERROR, &json!({"error": err})),
+    }
+}
+
+/// `GET /charges` as the dispatcher answers it for `authorization`, against an
+/// explicit registry instead of the process-global one. `None` when the token
+/// does not verify. Reached through `_test_support`.
+pub(crate) async fn charges_response_for_test(
+    jwt_manager: &JwtManager,
+    authorization: &str,
+    registry: Arc<plugins::api_chargeback::ChargebackRegistry>,
+    query: Option<&str>,
+) -> Option<Response<Full<Bytes>>> {
+    let token = jwt_manager.verify_request(Some(authorization)).ok()?;
+    Some(charges_response(Some(registry), query, charges_collection_granted(&token)).await)
 }
 
 fn parse_chargeback_format(
@@ -2440,9 +2632,7 @@ fn namespace_serving_block(state: &AdminState) -> serde_json::Value {
 /// the wire; this constant is the spelling used in `openapi.yaml` and the docs.
 ///
 /// Consumed by the external `tests/` crates (spec parity and response
-/// assertions); `src/main.rs` declares the same module tree, so in the BIN
-/// target it has no caller and `-D warnings` would reject it as dead code.
-#[allow(dead_code)]
+/// assertions).
 pub const NAMESPACE_UNSERVED_HEADER: &str = "X-Ferrum-Namespace-Unserved";
 
 /// Lowercase wire form of [`NAMESPACE_UNSERVED_HEADER`].
@@ -2530,14 +2720,6 @@ fn unserved_namespace_warned() -> std::sync::MutexGuard<'static, HashSet<(String
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Emit one bounded structured WARN for an **accepted** admin mutation that
-/// targeted a namespace this process's data plane does not route (issue #5447).
-///
-/// Deduplicated per `(namespace, resource kind)` so a provisioning client
-/// looping over one tenant logs once rather than once per resource, and rate
-/// limited to one line per [`UNSERVED_NAMESPACE_WARN_WINDOW_MS`] once the
-/// bounded dedup set is full. Called only after the dispatcher returned `2xx`:
-/// a rejected write is not the silent-success condition being reported.
 /// Outcome of consulting the bounded `(namespace, resource kind)` dedup set in
 /// [`note_unserved_namespace_mutation`].
 enum UnservedWarnAdmission {
@@ -2549,6 +2731,14 @@ enum UnservedWarnAdmission {
     SetFull,
 }
 
+/// Emit one bounded structured WARN for an **accepted** admin mutation that
+/// targeted a namespace this process's data plane does not route (issue #5447).
+///
+/// Deduplicated per `(namespace, resource kind)` so a provisioning client
+/// looping over one tenant logs once rather than once per resource, and rate
+/// limited to one line per [`UNSERVED_NAMESPACE_WARN_WINDOW_MS`] once the
+/// bounded dedup set is full. Called only after the dispatcher returned `2xx`:
+/// a rejected write is not the silent-success condition being reported.
 fn note_unserved_namespace_mutation(marker: &UnservedNamespaceMutation) {
     let total = UNSERVED_NAMESPACE_MUTATION_COUNT
         .fetch_add(1, Ordering::Relaxed)
@@ -2602,9 +2792,7 @@ fn note_unserved_namespace_mutation(marker: &UnservedNamespaceMutation) {
 }
 
 /// Reset the issue #5447 warning bookkeeping. Consumed only by the external
-/// `tests/` crates; `src/main.rs` declares the same module tree, so in the BIN
-/// target this has no caller and `-D warnings` would reject it as dead code.
-#[allow(dead_code)]
+/// `tests/` crates.
 #[doc(hidden)]
 pub fn reset_unserved_namespace_observability_for_test() {
     unserved_namespace_warned().clear();
@@ -2616,7 +2804,6 @@ pub fn reset_unserved_namespace_observability_for_test() {
 /// Process-cumulative count of accepted admin mutations that targeted a
 /// namespace this process's data plane does not serve. Test-only observation of
 /// [`note_unserved_namespace_mutation`].
-#[allow(dead_code)]
 #[doc(hidden)]
 pub fn unserved_namespace_mutation_count_for_test() -> u64 {
     UNSERVED_NAMESPACE_MUTATION_COUNT.load(Ordering::Relaxed)
@@ -2625,7 +2812,6 @@ pub fn unserved_namespace_mutation_count_for_test() -> u64 {
 /// How many `WARN` lines [`note_unserved_namespace_mutation`] actually emitted.
 /// In-process tests capture no gateway logs, so this counter is the observable
 /// proof that the `(namespace, resource kind)` deduplication holds.
-#[allow(dead_code)]
 #[doc(hidden)]
 pub fn unserved_namespace_warn_emitted_count_for_test() -> u64 {
     UNSERVED_NAMESPACE_WARN_EMITTED.load(Ordering::Relaxed)
@@ -2868,11 +3054,27 @@ fn observability_detail_allowed_with(
 
 /// Whether the caller presented a valid Admin API JWT that is not
 /// namespace-bounded ([`AuditActor::is_namespace_bounded`]): the detail tier
-/// describes the whole process, not one tenant. Some detailed health fields are
-/// derived using the Admin API signing secret and must not be exposed through
-/// the broader metrics-token/CIDR observability tier.
+/// describes the whole process, not one tenant. Values keyed by the Admin API
+/// signing secret are gated separately by [`admin_secret_keyed_detail_allowed`].
 fn admin_jwt_detail_allowed(state: &AdminState, auth_header: Option<&str>) -> bool {
     verified_admin_actor(state, auth_header).is_some_and(|actor| !actor.is_namespace_bounded())
+}
+
+/// Whether a detail-tier caller may also see values keyed by
+/// `FERRUM_ADMIN_JWT_SECRET` (`cp_dp_trust.active_generation`): only a
+/// fleet-wide token that the primary key itself verified
+/// (GHSA-crqx-mp2f-v8c8).
+///
+/// Such a token is already an HMAC under that secret, so one more keyed value
+/// gives its holder no new offline verifier for guesses of the secret. A
+/// `FERRUM_ADMIN_JWT_VIEWER_SECRET` token, a metrics bearer token, and a
+/// metrics-allowlisted source hold no such MAC, and for them a keyed value
+/// over known input would be exactly that verifier.
+fn admin_secret_keyed_detail_allowed(actor: Option<&AuditActor>) -> bool {
+    actor.is_some_and(|actor| {
+        actor.key_tier == crate::admin::jwt_auth::AdminKeyTier::Primary
+            && !actor.is_namespace_bounded()
+    })
 }
 
 /// The actor of a valid Admin API JWT in `auth_header`, or `None` when none was
@@ -3006,6 +3208,21 @@ fn diagnostic_ref_not_found_response() -> Response<Full<Bytes>> {
     )
 }
 
+/// Attach the admin API's `WWW-Authenticate` challenge to a `401` (RFC 9110
+/// §15.5.2, issue #6774). The admin API accepts RFC 6750 bearer JWTs; the
+/// client-certificate trust fence names the certificate instead. `challenge`
+/// is always a compiled-in, header-valid literal.
+fn with_admin_challenge(
+    mut response: Response<Full<Bytes>>,
+    challenge: &'static str,
+) -> Response<Full<Bytes>> {
+    response.headers_mut().insert(
+        hyper::header::WWW_AUTHENTICATE,
+        HeaderValue::from_static(challenge),
+    );
+    response
+}
+
 /// `401` response for `/metrics` when the caller is not authorized to scrape.
 /// Advertises the supported credential scheme so well-behaved scrapers can
 /// retry with a token.
@@ -3015,14 +3232,12 @@ fn metrics_unauthorized_response() -> Response<Full<Bytes>> {
     or the client must be in FERRUM_METRICS_ALLOWED_CIDRS"
     }))
     .unwrap_or_default();
-    Response::builder()
+    with_admin_security_headers(Response::builder())
         .status(StatusCode::UNAUTHORIZED)
         .header("Content-Type", "application/json")
         .header("WWW-Authenticate", "Bearer")
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
         .body(Full::new(Bytes::from(body)))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))))
+        .unwrap_or_else(|_| admin_builder_failure_response())
 }
 
 /// Handle an admin API request. `client_ip` is the peer address of the admin
@@ -3077,6 +3292,12 @@ pub async fn handle_admin_request(
         .map(|response| response.status().as_u16())
         .unwrap_or(500);
     audit::finalize_unconsumed_intent(&slot, status).await;
+    // Every dispatched admin response carries the admin security headers
+    // (issue #7074), including one a handler built by hand. Fields a handler
+    // set explicitly are kept.
+    if let Ok(response) = result.as_mut() {
+        insert_missing_admin_security_headers(response.headers_mut());
+    }
     // Mark the accepted-but-unrouted namespace on the way out (issue #5447).
     // Scoped to `2xx` mutations: a rejected write never reached the store so it
     // is not the silent-success condition, and a read has `GET /status` as its
@@ -3151,6 +3372,7 @@ async fn handle_admin_request_inner(
         let admin_jwt_detail = admin_actor
             .as_ref()
             .is_some_and(|actor| !actor.is_namespace_bounded());
+        let admin_secret_keyed_detail = admin_secret_keyed_detail_allowed(admin_actor.as_ref());
         let detailed = observability_detail_allowed_with(
             &state,
             admin_jwt_detail,
@@ -3181,7 +3403,9 @@ async fn handle_admin_request_inner(
                     "status": "connected",
                     "type": db.db_type()
                 });
-                if let Some(stats) = db.pool_stats() {
+                // Pool stats are authenticated detail (issue #7216): built
+                // only for the detailed tier, never for an anonymous probe.
+                if detailed && let Some(stats) = db.pool_stats() {
                     db_info["pool"] = serde_json::to_value(&stats).unwrap_or_else(|_| json!(null));
                 }
                 health_status["database"] = db_info;
@@ -3203,7 +3427,10 @@ async fn handle_admin_request_inner(
             health_status["status"] = json!("degraded");
         }
 
-        if let Some(db) = &state.db {
+        // Failover topology and admission fences are authenticated detail and
+        // change neither `status` nor `ready`, so they are built only for the
+        // detailed tier (issue #7216).
+        if detailed && let Some(db) = &state.db {
             let topology = db.failover_topology_status();
             if !topology.primary_active {
                 let mut failover = json!({
@@ -3226,6 +3453,35 @@ async fn handle_admin_request_inner(
                     _ => {
                         health_status["database"] = json!({
                             "failover_topology": failover
+                        });
+                    }
+                }
+            }
+
+            // Process-local mTLS DNS admission fences (issue #7031). Present
+            // only while at least one namespace is fenced; authenticated
+            // detail tier only, like `failover_topology`. The snapshot walks
+            // the store's fence registry, so unauthenticated (minimal) and
+            // tenant probes must never pay for it. Does not change
+            // `status`/`ready`: reconnect/failover stay available and only the
+            // fenced namespaces' admissions fail closed.
+            let fence = db.mtls_dns_admission_fence_status();
+            if fence.fenced() {
+                let mut fence_info = json!({
+                    "fenced": true,
+                    "retained_fences": fence.retained_fences,
+                    "namespaces": fence.namespaces,
+                });
+                if let Some(since) = fence.oldest_retained_since_unix_ms {
+                    fence_info["oldest_retained_since_unix_ms"] = json!(since);
+                }
+                match health_status.get_mut("database") {
+                    Some(serde_json::Value::Object(map)) => {
+                        map.insert("mtls_dns_admission_fence".to_string(), fence_info);
+                    }
+                    _ => {
+                        health_status["database"] = json!({
+                            "mtls_dns_admission_fence": fence_info
                         });
                     }
                 }
@@ -3373,10 +3629,11 @@ async fn handle_admin_request_inner(
             // identifier. Authenticated detail only — never the coarse probe.
             if let Some(mut trust) = crate::grpc::cp_trust_health::snapshot() {
                 // This identifier is an HMAC under FERRUM_ADMIN_JWT_SECRET.
-                // Metrics-only credentials and CIDR allowlists authorize the
-                // operational counters above, but never an offline verifier
-                // for guesses of the Admin API signing secret.
-                if !admin_jwt_detail {
+                // Viewer-key tokens, metrics-only credentials, and CIDR
+                // allowlists authorize the operational counters above, but
+                // never an offline verifier for guesses of the Admin API
+                // signing secret (GHSA-crqx-mp2f-v8c8).
+                if !admin_secret_keyed_detail {
                     trust.active_generation = None;
                 }
                 // Booleans, seconds, counters, a closed-set reason, and the
@@ -3409,7 +3666,7 @@ async fn handle_admin_request_inner(
             health_status["status"] = json!("degraded");
         }
 
-        if let Some(failures) = state.serving_listener_failures.as_ref() {
+        if detailed && let Some(failures) = state.serving_listener_failures.as_ref() {
             let snapshot = failures.snapshot();
             if snapshot.failures_total > 0 {
                 health_status["listener_failures"] =
@@ -3428,7 +3685,9 @@ async fn handle_admin_request_inner(
         // explicit `certified: false`: Ferrum is not itself a validated
         // cryptographic module, and a status scraper must not be able to read
         // "enforcing" as "certified". See docs/fips.md.
-        health_status["fips"] = crate::fips::status_metadata();
+        if detailed {
+            health_status["fips"] = crate::fips::status_metadata();
+        }
 
         // Data-plane namespace scope (issue #5447). The Admin API is
         // deliberately multi-namespace, but a proxy data plane serves exactly
@@ -3462,18 +3721,21 @@ async fn handle_admin_request_inner(
             health_status["status"] = json!("degraded");
         }
 
-        // Report cached config availability for resilience visibility
-        if let Some(config) = state.cached_gateway_config() {
-            health_status["cached_config"] = json!({
-                "available": true,
-                "loaded_at": config.loaded_at.to_rfc3339(),
-                "proxy_count": config.proxies.len(),
-                "consumer_count": config.consumers.len(),
-            });
-        } else {
-            health_status["cached_config"] = json!({
-                "available": false
-            });
+        // Report cached config availability for resilience visibility.
+        // Authenticated detail only (issue #7216): it never changes `status`.
+        if detailed {
+            if let Some(config) = state.cached_gateway_config() {
+                health_status["cached_config"] = json!({
+                    "available": true,
+                    "loaded_at": config.loaded_at.to_rfc3339(),
+                    "proxy_count": config.proxies.len(),
+                    "consumer_count": config.consumers.len(),
+                });
+            } else {
+                health_status["cached_config"] = json!({
+                    "available": false
+                });
+            }
         }
 
         if (state.mode == "database" || state.mode == "cp")
@@ -3484,40 +3746,48 @@ async fn handle_admin_request_inner(
             // reload-latency signal only: a disconnected or degraded watcher
             // never forces `status: degraded`, because periodic polling remains
             // authoritative and keeps applying committed changes.
-            let change_stream = snapshot.change_stream.clone();
-            if let Some(degraded) = snapshot.degraded {
+            //
+            // A degraded poll loop degrades the coarse `status` for every
+            // tier; the `database_polling` object itself is authenticated
+            // detail and is built only for the detailed tier (issue #7216).
+            if snapshot.degraded.is_some() {
                 health_status["status"] = json!("degraded");
-                let mut polling = json!({
-                    "status": "degraded",
-                    "reason": degraded.reason,
-                    "resource_category": degraded.resource_category,
-                    "validation_category": degraded.validation_category,
-                    "consecutive_identical_rejections": degraded.consecutive_identical_rejections,
-                    "current_backoff_bucket": degraded.current_backoff_bucket,
-                    "current_backoff_seconds": degraded.current_backoff_seconds,
-                    "escalated": degraded.escalated,
-                });
-                if let Some(at) = snapshot.last_poll_completed_at {
-                    polling["last_poll_completed_at"] = json!(at);
-                }
-                health_status["database_polling"] = polling;
-            } else {
-                let mut polling = json!({
-                    "status": "ok",
-                    "consecutive_identical_rejections": snapshot.consecutive_identical_rejections,
-                    "current_backoff_bucket": snapshot.current_backoff_bucket,
-                    "current_backoff_seconds": snapshot.current_backoff_seconds,
-                });
-                if let Some(at) = snapshot.last_poll_completed_at {
-                    polling["last_poll_completed_at"] = json!(at);
-                }
-                health_status["database_polling"] = polling;
             }
-            if let Some(change_stream) = change_stream
-                && let Ok(value) = serde_json::to_value(&change_stream)
-                && let Some(polling) = health_status.get_mut("database_polling")
-            {
-                polling["change_stream"] = value;
+            if detailed {
+                let change_stream = snapshot.change_stream.clone();
+                if let Some(degraded) = snapshot.degraded {
+                    let mut polling = json!({
+                        "status": "degraded",
+                        "reason": degraded.reason,
+                        "resource_category": degraded.resource_category,
+                        "validation_category": degraded.validation_category,
+                        "consecutive_identical_rejections": degraded.consecutive_identical_rejections,
+                        "current_backoff_bucket": degraded.current_backoff_bucket,
+                        "current_backoff_seconds": degraded.current_backoff_seconds,
+                        "escalated": degraded.escalated,
+                    });
+                    if let Some(at) = snapshot.last_poll_completed_at {
+                        polling["last_poll_completed_at"] = json!(at);
+                    }
+                    health_status["database_polling"] = polling;
+                } else {
+                    let mut polling = json!({
+                        "status": "ok",
+                        "consecutive_identical_rejections": snapshot.consecutive_identical_rejections,
+                        "current_backoff_bucket": snapshot.current_backoff_bucket,
+                        "current_backoff_seconds": snapshot.current_backoff_seconds,
+                    });
+                    if let Some(at) = snapshot.last_poll_completed_at {
+                        polling["last_poll_completed_at"] = json!(at);
+                    }
+                    health_status["database_polling"] = polling;
+                }
+                if let Some(change_stream) = change_stream
+                    && let Ok(value) = serde_json::to_value(&change_stream)
+                    && let Some(polling) = health_status.get_mut("database_polling")
+                {
+                    polling["change_stream"] = value;
+                }
             }
         }
 
@@ -3556,11 +3826,14 @@ async fn handle_admin_request_inner(
             health_status["config_rejected"] = json!(true);
         }
 
-        if state
-            .proxy_state
-            .as_ref()
-            .is_some_and(|ps| ps.config.load_full().mesh.is_some())
-            || state.mode == "mesh"
+        // Mesh egress-scope / config-stream detail never changes `status`, so
+        // it is built only for the detailed tier (issue #7216).
+        if detailed
+            && (state
+                .proxy_state
+                .as_ref()
+                .is_some_and(|ps| ps.config.load().mesh.is_some())
+                || state.mode == "mesh")
         {
             let egress_health = state
                 .mesh_runtime_state
@@ -3868,59 +4141,75 @@ async fn handle_admin_request_inner(
         {
             metrics_output.push_str(&exporter.render_prometheus());
         }
-        let resp = Response::builder()
+        let resp = with_admin_security_headers(Response::builder())
             .status(StatusCode::OK)
             .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-            .header("X-Content-Type-Options", "nosniff")
-            .header("Cache-Control", "no-store")
             .body(Full::new(Bytes::from(metrics_output)))
-            .unwrap_or_else(|_| {
-                Response::new(Full::new(Bytes::from("# error rendering metrics\n")))
-            });
+            .unwrap_or_else(|_| admin_builder_failure_response());
         return Ok(resp);
     }
 
-    // Authenticate. The `diagnostics:read` scope is read from the same verified
-    // claims, so the diagnostic reference lookup never re-verifies the token.
-    let (auth, diagnostics_read) = match state.jwt_manager.verify_request(auth_header.as_deref()) {
+    // Authenticate. The `diagnostics:read` and `charges:collect` scopes are
+    // read from the same verified claims, so neither route re-verifies the
+    // token.
+    let (auth, token_scopes) = match state.jwt_manager.verify_request(auth_header.as_deref()) {
         Ok(token_data) => match AuditActor::from_verified(&token_data) {
             Ok(actor) => {
                 // Tier-aware: a viewer-key token's `scope` claims grant nothing.
                 let diagnostics_read = token_data.grants_scope(DIAGNOSTICS_READ_SCOPE);
-                (actor, diagnostics_read)
+                let charges_collect = charges_collection_granted(&token_data);
+                (actor, (diagnostics_read, charges_collect))
             }
             Err(message) => {
-                return Ok(json_response(
-                    StatusCode::UNAUTHORIZED,
-                    &json!({"error": message}),
+                return Ok(with_admin_challenge(
+                    json_response(StatusCode::UNAUTHORIZED, &json!({"error": message})),
+                    crate::plugins::utils::auth_flow::BEARER_INVALID_TOKEN_CHALLENGE,
                 ));
             }
         },
         Err(JwtError::NotConfigured) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": "Admin authentication is unavailable"}),
+            return Ok(with_admin_challenge(
+                json_response(
+                    StatusCode::UNAUTHORIZED,
+                    &json!({"error": "Admin authentication is unavailable"}),
+                ),
+                crate::plugins::utils::auth_flow::BEARER_AUTHENTICATION_CHALLENGE,
             ));
         }
         Err(JwtError::MissingHeader) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": "Missing Authorization header"}),
+            return Ok(with_admin_challenge(
+                json_response(
+                    StatusCode::UNAUTHORIZED,
+                    &json!({"error": "Missing Authorization header"}),
+                ),
+                crate::plugins::utils::auth_flow::BEARER_AUTHENTICATION_CHALLENGE,
             ));
         }
         Err(JwtError::InvalidHeaderFormat) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": "Invalid Authorization header format"}),
+            return Ok(with_admin_challenge(
+                json_response(
+                    StatusCode::UNAUTHORIZED,
+                    &json!({"error": "Invalid Authorization header format"}),
+                ),
+                crate::plugins::utils::auth_flow::BEARER_INVALID_REQUEST_CHALLENGE,
             ));
         }
         Err(JwtError::VerificationFailed(msg)) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": format!("Token verification failed: {}", msg)}),
+            // One static body for every verification failure: reflecting the
+            // jsonwebtoken reason (expired vs bad signature vs wrong issuer or
+            // audience) would give unauthenticated callers a validation-policy
+            // oracle. The reason never contains the token itself.
+            debug!(reason = %msg, "Admin API token verification failed");
+            return Ok(with_admin_challenge(
+                json_response(
+                    StatusCode::UNAUTHORIZED,
+                    &json!({"error": "Token verification failed"}),
+                ),
+                crate::plugins::utils::auth_flow::BEARER_INVALID_TOKEN_CHALLENGE,
             ));
         }
     };
+    let (diagnostics_read, charges_collect) = token_scopes;
 
     // Peer address + bounded request ID for security-sensitive audit events.
     // Built after authentication so unauthenticated probes never mint correlation
@@ -3948,73 +4237,16 @@ async fn handle_admin_request_inner(
     // or a later accepted generation cannot honor its configured pool shard count.
     if path == "/charges" && method == Method::GET {
         let registry = crate::plugins::api_chargeback::try_global_registry();
-        match parse_chargeback_format(req.uri().query()) {
-            Ok(ChargebackFormat::Json) => {
-                let json_result = match registry.as_ref() {
-                    Some(registry) => registry.render_json(),
-                    None => crate::plugins::api_chargeback::empty_charges_json(),
-                };
-                match json_result {
-                    Ok(json_output) => {
-                        let resp = Response::builder()
-                            .status(StatusCode::OK)
-                            .header("Content-Type", "application/json")
-                            .header("X-Content-Type-Options", "nosniff")
-                            .header("Cache-Control", "no-store")
-                            .body(Full::new(Bytes::from(json_output)))
-                            .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
-                        return Ok(resp);
-                    }
-                    Err(err) => {
-                        // Fail closed: never serialize non-finite monetary values as
-                        // JSON null (serde_json's default for Inf/NaN).
-                        return Ok(json_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &json!({"error": err}),
-                        ));
-                    }
-                }
-            }
-            Ok(ChargebackFormat::Prometheus) => {
-                let prom_result = match registry.as_ref() {
-                    Some(registry) => registry.render_prometheus(),
-                    None => crate::plugins::api_chargeback::empty_charges_prometheus(),
-                };
-                match prom_result {
-                    Ok(prom_output) => {
-                        let resp = Response::builder()
-                            .status(StatusCode::OK)
-                            .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-                            .header("X-Content-Type-Options", "nosniff")
-                            .header("Cache-Control", "no-store")
-                            .body(Full::new(Bytes::from(prom_output)))
-                            .unwrap_or_else(|_| {
-                                Response::new(Full::new(Bytes::from("# error rendering charges\n")))
-                            });
-                        return Ok(resp);
-                    }
-                    Err(err) => {
-                        // Fail closed: never publish non-finite Prometheus samples.
-                        return Ok(json_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &json!({"error": err}),
-                        ));
-                    }
-                }
-            }
-            Err(resp) => return Ok(*resp),
-        }
+        return Ok(charges_response(registry, query.as_deref(), charges_collect).await);
     }
 
     if path == "/charges/sink/status" && method == Method::GET {
         let status_output = crate::plugins::api_chargeback_sink::render_status_json();
-        let resp = Response::builder()
+        let resp = with_admin_security_headers(Response::builder())
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
-            .header("X-Content-Type-Options", "nosniff")
-            .header("Cache-Control", "no-store")
             .body(Full::new(Bytes::from(status_output)))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+            .unwrap_or_else(|_| admin_builder_failure_response());
         return Ok(resp);
     }
 
@@ -4201,6 +4433,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            // This arm returns before the shared `If-Match` refusal below, so
+            // it applies the same fail-closed contract itself: a create never
+            // evaluates `If-Match`, so it refuses the header instead of
+            // ignoring it (issue #7439).
+            if req.headers().contains_key(hyper::header::IF_MATCH) {
+                drop(req.into_body());
+                return Ok(if_match_unsupported_response());
+            }
             return api_specs::handlers::handle_post_api_spec(req, &state, &auth, &namespace).await;
         }
         (Method::PUT, ["api-specs", id]) => {
@@ -4243,6 +4483,14 @@ async fn handle_admin_request_inner(
         (Method::DELETE, ["api-specs", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
+            }
+            // The cascade delete is unconditional and returns before the shared
+            // `If-Match` refusal below. Refuse the header here so a client that
+            // sends the spec's `ETag` never believes the delete was conditional
+            // (issue #7439).
+            if req.headers().contains_key(hyper::header::IF_MATCH) {
+                drop(req.into_body());
+                return Ok(if_match_unsupported_response());
             }
             if let Err(e) = crate::config::types::validate_resource_id(id) {
                 return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
@@ -4378,10 +4626,7 @@ async fn handle_admin_request_inner(
             return Ok(resp);
         }
         drop(req.into_body());
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": IF_MATCH_UNSUPPORTED_MESSAGE}),
-        ));
+        return Ok(if_match_unsupported_response());
     }
 
     let body_bytes = match body_consuming_route_role(&method, segments_peek.as_slice()) {
@@ -4498,7 +4743,7 @@ async fn handle_admin_request_inner(
             crud::handle_list::<Proxy>(&state, &pagination, auth.role, &namespace).await
         }
         (Method::GET, ["proxies", id]) => {
-            crud::handle_get::<Proxy>(&state, id, auth.role, &namespace).await
+            crud::handle_get::<Proxy>(&state, id, auth.role, auth.key_tier, &namespace).await
         }
         (Method::GET, ["proxies", id, "mcp", "tools"]) => {
             let pagination = route_pagination!();
@@ -4531,6 +4776,7 @@ async fn handle_admin_request_inner(
                 &namespace,
                 route_live_apply_mode!(),
                 if_match,
+                uri.query(),
             )
             .await
         }
@@ -4571,7 +4817,7 @@ async fn handle_admin_request_inner(
             .await
         }
         (Method::GET, ["consumers", id]) => {
-            crud::handle_get::<Consumer>(&state, id, auth.role, &namespace).await
+            crud::handle_get::<Consumer>(&state, id, auth.role, auth.key_tier, &namespace).await
         }
         (Method::GET, ["consumers", id, "verification"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -4599,6 +4845,7 @@ async fn handle_admin_request_inner(
                 &namespace,
                 route_live_apply_mode!(),
                 if_match,
+                uri.query(),
             )
             .await
         }
@@ -4624,6 +4871,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             handle_update_credentials(
                 &state,
                 &auth,
@@ -4632,6 +4880,7 @@ async fn handle_admin_request_inner(
                 &body_bytes,
                 &namespace,
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -4639,6 +4888,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             handle_append_credential(
                 &state,
                 &auth,
@@ -4647,6 +4897,7 @@ async fn handle_admin_request_inner(
                 &body_bytes,
                 &namespace,
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -4654,6 +4905,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             handle_delete_credential_by_index(
                 &state,
                 &auth,
@@ -4662,6 +4914,7 @@ async fn handle_admin_request_inner(
                 index,
                 &namespace,
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -4669,6 +4922,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             handle_delete_credentials(
                 &state,
                 &auth,
@@ -4676,6 +4930,7 @@ async fn handle_admin_request_inner(
                 cred_type,
                 &namespace,
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -4712,7 +4967,7 @@ async fn handle_admin_request_inner(
             .await
         }
         (Method::GET, ["plugins", "config", id]) => {
-            crud::handle_get::<PluginConfig>(&state, id, auth.role, &namespace).await
+            crud::handle_get::<PluginConfig>(&state, id, auth.role, auth.key_tier, &namespace).await
         }
         (Method::PUT, ["plugins", "config", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -4727,6 +4982,7 @@ async fn handle_admin_request_inner(
                 &namespace,
                 route_live_apply_mode!(),
                 if_match,
+                uri.query(),
             )
             .await
         }
@@ -4767,7 +5023,7 @@ async fn handle_admin_request_inner(
             .await
         }
         (Method::GET, ["upstreams", id]) => {
-            crud::handle_get::<Upstream>(&state, id, auth.role, &namespace).await
+            crud::handle_get::<Upstream>(&state, id, auth.role, auth.key_tier, &namespace).await
         }
         (Method::PUT, ["upstreams", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -4782,6 +5038,7 @@ async fn handle_admin_request_inner(
                 &namespace,
                 route_live_apply_mode!(),
                 if_match,
+                uri.query(),
             )
             .await
         }
@@ -4849,7 +5106,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_get::<GatewayTrustBundleRecord>(&state, id, auth.role, &namespace).await
+            crud::handle_get::<GatewayTrustBundleRecord>(
+                &state,
+                id,
+                auth.role,
+                auth.key_tier,
+                &namespace,
+            )
+            .await
         }
         (Method::PUT, ["gateway-trust-bundles", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -4864,6 +5128,7 @@ async fn handle_admin_request_inner(
                 route_live_apply_mode!(),
                 // Trust bundles keep their own body `revision` contract.
                 None,
+                uri.query(),
             )
             .await
         }
@@ -5377,10 +5642,13 @@ async fn handle_admin_request_inner(
         // Cluster status (CP/DP connection info)
         (Method::GET, ["cluster"]) => handle_cluster_status(&state).await,
 
-        // Live-apply cursor status (issue #4139). Operator-gated like the
-        // other convergence/status surfaces: it discloses only change-log
-        // sequence numbers and topology epochs — no resource data — and is
-        // how a `?apply=async` bulk client proves its writes are live. Not
+        // Live-apply cursor status (issue #4139). Operator-gated, as the role
+        // table in `docs/admin_api.md` lists it, unlike the read-only viewer
+        // introspection routes (`/cluster`, `/mesh/config-drift`,
+        // `/mesh/slice-drift`, `/mesh/federation`; issue #7216). It discloses
+        // only change-log sequence numbers and topology epochs — no resource
+        // data — and is how a `?apply=async` bulk client proves its writes are
+        // live. Not
         // namespace-scoped: cursors are process-topology values, not
         // tenant-addressed resources (writes to non-served namespaces never
         // mint one).
@@ -5436,8 +5704,11 @@ async fn handle_admin_request_inner(
             &json!({"error": "Not Found"}),
         )),
     };
+    // No `state.db` requirement: `POST /admin/tls/rotate` is served in file,
+    // DP and mesh modes too, and `record_operation_audit` finalizes the
+    // admitted intent through the spool when there is no database (#7216).
     if state.admin_audit_enabled
-        && let (Ok(http_response), Some(db)) = (response.as_ref(), state.db.as_ref())
+        && let Ok(http_response) = response.as_ref()
         && http_response.status().is_success()
         && tls_mutation_audit_descriptor(&method, segments.as_slice(), None).is_some()
     {
@@ -5467,9 +5738,7 @@ async fn handle_admin_request_inner(
                 audit_namespace_for_request(segments.as_slice(), &namespace),
                 json!({"path": path}),
             );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
-                log_audit_enqueue_failure(&error);
-            }
+            record_operation_audit(&state, event).await;
         }
     }
     response
@@ -5497,7 +5766,6 @@ fn tls_mutation_audit_descriptor(
     };
     let resource_type = match segments.get(2).copied() {
         Some("certificates") => "tls_certificate",
-        Some("private-keys") => "tls_private_key",
         Some("ca-bundles") => "tls_ca_bundle",
         Some("crls") => "tls_crl",
         Some("ocsp-responses") => "tls_ocsp_response",
@@ -5811,7 +6079,7 @@ async fn handle_mesh_config_drift_get(
             let proto = ps.env_config.mesh_config_protocol.as_str();
             let cp_url = ps
                 .env_config
-                .resolved_dp_cp_grpc_urls()
+                .dp_cp_grpc_urls
                 .first()
                 .cloned()
                 .unwrap_or_default();
@@ -6376,17 +6644,27 @@ async fn ensure_credential_unique(
     }
 }
 
-async fn ensure_mtls_consumer_candidate(
+/// Run the requested consumer credential uniqueness checks against one
+/// candidate snapshot and answer the first failing kind (mTLS, then HMAC,
+/// then JWT) with `409`, or `503` when the snapshot cannot be loaded.
+async fn ensure_consumer_credential_candidate(
     db: &dyn DatabaseBackend,
     namespace: &str,
     consumer: &Consumer,
+    checks: crud::ConsumerCredentialChecks,
 ) -> Result<(), Box<Response<Full<Bytes>>>> {
-    match crud::mtls_consumer_candidate_errors(db, namespace, consumer).await {
-        Ok(errors) if errors.is_empty() => Ok(()),
-        Ok(errors) => Err(Box::new(json_response(
-            StatusCode::CONFLICT,
-            &json!({"error": errors.join("; ")}),
-        ))),
+    match crud::consumer_credential_candidate_errors(db, namespace, consumer, checks).await {
+        Ok(found) => {
+            for errors in [found.mtls, found.hmac, found.jwt] {
+                if !errors.is_empty() {
+                    return Err(Box::new(json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": errors.join("; ")}),
+                    )));
+                }
+            }
+            Ok(())
+        }
         Err(error) => Err(Box::new(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &db_error_response(&error),
@@ -6394,22 +6672,21 @@ async fn ensure_mtls_consumer_candidate(
     }
 }
 
-async fn ensure_hmac_consumer_candidate(
+async fn ensure_mtls_consumer_candidate(
     db: &dyn DatabaseBackend,
     namespace: &str,
     consumer: &Consumer,
 ) -> Result<(), Box<Response<Full<Bytes>>>> {
-    match crud::hmac_consumer_candidate_errors(db, namespace, consumer).await {
-        Ok(errors) if errors.is_empty() => Ok(()),
-        Ok(errors) => Err(Box::new(json_response(
-            StatusCode::CONFLICT,
-            &json!({"error": errors.join("; ")}),
-        ))),
-        Err(error) => Err(Box::new(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &db_error_response(&error),
-        ))),
-    }
+    ensure_consumer_credential_candidate(
+        db,
+        namespace,
+        consumer,
+        crud::ConsumerCredentialChecks {
+            mtls: true,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 async fn persist_consumer_update(
@@ -6425,9 +6702,21 @@ async fn persist_consumer_update(
     // its credential index entries. Revalidate retained HMAC credentials even
     // when the requested mutation targets another credential type, so stale or
     // out-of-band duplicates fail before the datastore uniqueness backstop.
-    if !consumer.credential_entries("hmac_auth").is_empty()
-        && let Err(response) =
-            ensure_hmac_consumer_candidate(db.as_ref(), &consumer.namespace, &consumer).await
+    // Same for retained `jwt` secrets: a secret shared with another Consumer
+    // in the namespace lets either sign as the other. Both checks share one
+    // candidate snapshot.
+    let retained_checks = crud::ConsumerCredentialChecks {
+        mtls: false,
+        hmac: !consumer.credential_entries("hmac_auth").is_empty(),
+        jwt: !consumer.credential_entries("jwt").is_empty(),
+    };
+    if let Err(response) = ensure_consumer_credential_candidate(
+        db.as_ref(),
+        &consumer.namespace,
+        &consumer,
+        retained_checks,
+    )
+    .await
     {
         return *response;
     }
@@ -6543,6 +6832,11 @@ async fn recover_late_credential_update(
 
 const MTLS_DNS_ADMISSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `rollback_errors` entry reported when a failed compensating rollback
+/// retains the restore's namespace admission guard for operator recovery.
+const RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE: &str =
+    "namespace admission guard retained; manual recovery required";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 enum MtlsDnsAdmissionMutationState {
@@ -6566,12 +6860,175 @@ impl MtlsDnsAdmissionMutationState {
     }
 }
 
+/// Phase of a multi-phase restore (clear → import → compensating rollback)
+/// held under one mTLS DNS admission guard.
+///
+/// This is deliberately separate from [`MtlsDnsAdmissionMutationState`]: that
+/// state answers "has a single dispatched mutation returned?", and every
+/// nested `run_mutation` (the import, the rollback) settles it. The restore
+/// phase answers "is the namespace in a half-restored state?", which no
+/// single mutation's completion can resolve on its own (issue #7032).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum MtlsDnsRestorePhase {
+    /// No multi-phase restore is in progress; Drop follows the single-mutation
+    /// state alone.
+    Idle = 0,
+    /// The namespace clear committed (or its atomic outcome is ambiguous) and
+    /// no import or rollback has reached a definitive result yet.
+    Cleared = 1,
+    /// The import completed without errors.
+    ImportedOk = 2,
+    /// The import returned errors; the namespace is cleared and partially
+    /// imported until a compensating rollback completes.
+    ImportedWithErrors = 3,
+    /// A compensating rollback completed and the prior config was replayed.
+    RolledBack = 4,
+    /// A compensating rollback ran but failed: the namespace may be cleared,
+    /// partially imported, or partially replayed. The fence stays retained
+    /// for operator recovery.
+    RollbackIncomplete = 5,
+}
+
+impl MtlsDnsRestorePhase {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Idle,
+            1 => Self::Cleared,
+            2 => Self::ImportedOk,
+            3 => Self::ImportedWithErrors,
+            4 => Self::RolledBack,
+            5 => Self::RollbackIncomplete,
+            // Unknown values fail closed: treat them as an incomplete restore.
+            _ => Self::Cleared,
+        }
+    }
+
+    fn release_on_drop(self) -> bool {
+        matches!(self, Self::Idle | Self::ImportedOk | Self::RolledBack)
+    }
+}
+
+/// Shared hold state for one mTLS DNS admission guard, cloned into every
+/// [`MtlsDnsAdmissionOperation`]. Drop releases the durable fence only when
+/// both the single-mutation state and the restore phase allow it.
+#[derive(Debug)]
+pub(crate) struct MtlsDnsAdmissionHoldState {
+    mutation_state: AtomicU8,
+    restore_phase: AtomicU8,
+}
+
+impl MtlsDnsAdmissionHoldState {
+    pub(crate) fn new() -> Self {
+        Self {
+            mutation_state: AtomicU8::new(MtlsDnsAdmissionMutationState::NotStarted as u8),
+            restore_phase: AtomicU8::new(MtlsDnsRestorePhase::Idle as u8),
+        }
+    }
+
+    fn restore_phase(&self) -> MtlsDnsRestorePhase {
+        MtlsDnsRestorePhase::from_u8(self.restore_phase.load(Ordering::Acquire))
+    }
+
+    fn set_restore_phase(&self, phase: MtlsDnsRestorePhase) {
+        self.restore_phase.store(phase as u8, Ordering::Release);
+    }
+
+    pub(crate) fn release_on_drop(&self) -> bool {
+        MtlsDnsAdmissionMutationState::from_u8(self.mutation_state.load(Ordering::Acquire))
+            .release_on_drop()
+            && self.restore_phase().release_on_drop()
+    }
+
+    /// Track one dispatched mutation. On exit the prior state is restored
+    /// when it was already uncertain (a nested mutation must not settle an
+    /// outer uncertain one); otherwise the mutation is recorded as settled,
+    /// which preserves single-mutation behaviour.
+    pub(crate) async fn run_mutation<T, F>(&self, mutation: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let prior = MtlsDnsAdmissionMutationState::from_u8(self.mutation_state.swap(
+            MtlsDnsAdmissionMutationState::InFlightOrUncertain as u8,
+            Ordering::AcqRel,
+        ));
+        let result = mutation.await;
+        let exit = match prior {
+            MtlsDnsAdmissionMutationState::InFlightOrUncertain => prior,
+            MtlsDnsAdmissionMutationState::NotStarted | MtlsDnsAdmissionMutationState::Settled => {
+                MtlsDnsAdmissionMutationState::Settled
+            }
+        };
+        self.mutation_state.store(exit as u8, Ordering::Release);
+        result
+    }
+
+    /// Run the restore's namespace clear. A successful clear enters
+    /// [`MtlsDnsRestorePhase::Cleared`] before the future returns, so request
+    /// cancellation at any later await point retains the fence.
+    pub(crate) async fn run_restore_clear<T, E, F>(&self, clear: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        let result = self.run_mutation(clear).await;
+        if result.is_ok() {
+            self.set_restore_phase(MtlsDnsRestorePhase::Cleared);
+        }
+        result
+    }
+
+    /// Run the restore import and record whether it completed cleanly.
+    pub(crate) async fn run_restore_import<T, F>(
+        &self,
+        import: F,
+        succeeded: impl FnOnce(&T) -> bool,
+    ) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let result = self.run_mutation(import).await;
+        self.set_restore_phase(if succeeded(&result) {
+            MtlsDnsRestorePhase::ImportedOk
+        } else {
+            MtlsDnsRestorePhase::ImportedWithErrors
+        });
+        result
+    }
+
+    /// Run a compensating rollback. Only a completed rollback leaves the
+    /// incomplete-restore phase; a failed one enters
+    /// [`MtlsDnsRestorePhase::RollbackIncomplete`] and keeps the fence
+    /// retained, whatever phase the restore was in before.
+    pub(crate) async fn run_restore_rollback<T, E, F>(&self, rollback: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        let result = self.run_mutation(rollback).await;
+        self.set_restore_phase(if result.is_ok() {
+            MtlsDnsRestorePhase::RolledBack
+        } else {
+            MtlsDnsRestorePhase::RollbackIncomplete
+        });
+        result
+    }
+
+    // External tests reach these through the lib target's `_test_support`
+    // shim.
+    pub(crate) fn mark_restore_cleared_for_test(&self) {
+        self.set_restore_phase(MtlsDnsRestorePhase::Cleared);
+    }
+
+    pub(crate) fn mark_restore_import_failed_for_test(&self) {
+        self.set_restore_phase(MtlsDnsRestorePhase::ImportedWithErrors);
+    }
+}
+
 #[derive(Clone)]
 struct MtlsDnsAdmissionOperation {
     db: Arc<dyn DatabaseBackend>,
     namespace: String,
     guard_owner: String,
-    mutation_state: Arc<AtomicU8>,
+    hold: Arc<MtlsDnsAdmissionHoldState>,
     released: Arc<AtomicBool>,
 }
 
@@ -6595,16 +7052,28 @@ impl MtlsDnsAdmissionOperation {
     where
         F: std::future::Future<Output = T>,
     {
-        self.mutation_state.store(
-            MtlsDnsAdmissionMutationState::InFlightOrUncertain as u8,
-            Ordering::Release,
-        );
-        let result = mutation.await;
-        self.mutation_state.store(
-            MtlsDnsAdmissionMutationState::Settled as u8,
-            Ordering::Release,
-        );
-        result
+        self.hold.run_mutation(mutation).await
+    }
+
+    async fn run_restore_clear<T, E, F>(&self, clear: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        self.hold.run_restore_clear(clear).await
+    }
+
+    async fn run_restore_import<T, F>(&self, import: F, succeeded: impl FnOnce(&T) -> bool) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        self.hold.run_restore_import(import, succeeded).await
+    }
+
+    async fn run_restore_rollback<T, E, F>(&self, rollback: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        self.hold.run_restore_rollback(rollback).await
     }
 }
 
@@ -6612,12 +7081,20 @@ struct MtlsDnsAdmissionGuardLifecycle {
     db: Arc<dyn DatabaseBackend>,
     namespace: String,
     guard_owner: String,
-    mutation_state: Arc<AtomicU8>,
+    hold: Arc<MtlsDnsAdmissionHoldState>,
     released: Arc<AtomicBool>,
     armed: bool,
 }
 
 impl MtlsDnsAdmissionGuardLifecycle {
+    /// Acquire the guard in a detached task. If the request is cancelled while
+    /// acquisition is pending, the undelivered lifecycle is dropped in that
+    /// task and its Drop releases the new durable owner.
+    ///
+    /// A restore never reacquires this guard over a half-restored namespace:
+    /// lost-lease recovery keeps the original owner across the namespace
+    /// lease reacquisition (issue #7062), so no window opens in which the
+    /// fence is released.
     async fn acquire(db: Arc<dyn DatabaseBackend>, namespace: &str) -> Result<Self, anyhow::Error> {
         let namespace = namespace.to_string();
         let acquire_db = db.clone();
@@ -6629,7 +7106,8 @@ impl MtlsDnsAdmissionGuardLifecycle {
                 .await
                 .map(|guard_owner| Self::new(acquire_db, &acquire_namespace, guard_owner));
             // If the request disappeared while acquisition was in flight, the
-            // undelivered lifecycle is dropped here and starts bounded cleanup.
+            // undelivered lifecycle is dropped here and its Drop starts
+            // bounded cleanup.
             let _ = result_tx.send(result);
         });
         result_rx.await.map_err(|_| {
@@ -6642,9 +7120,7 @@ impl MtlsDnsAdmissionGuardLifecycle {
             db,
             namespace: namespace.to_string(),
             guard_owner,
-            mutation_state: Arc::new(AtomicU8::new(
-                MtlsDnsAdmissionMutationState::NotStarted as u8,
-            )),
+            hold: Arc::new(MtlsDnsAdmissionHoldState::new()),
             released: Arc::new(AtomicBool::new(false)),
             armed: true,
         }
@@ -6655,7 +7131,7 @@ impl MtlsDnsAdmissionGuardLifecycle {
             db: self.db.clone(),
             namespace: self.namespace.clone(),
             guard_owner: self.guard_owner.clone(),
-            mutation_state: self.mutation_state.clone(),
+            hold: self.hold.clone(),
             released: self.released.clone(),
         }
     }
@@ -6664,11 +7140,26 @@ impl MtlsDnsAdmissionGuardLifecycle {
         &self.guard_owner
     }
 
-    fn retain_uncertain(&self) {
-        self.mutation_state.store(
-            MtlsDnsAdmissionMutationState::InFlightOrUncertain as u8,
-            Ordering::Release,
-        );
+    /// Enter the incomplete-restore phase: the namespace clear committed (or
+    /// its atomic outcome is ambiguous), so Drop must retain the durable fence
+    /// until an import or compensating rollback reaches a definitive result.
+    /// Nested `run_mutation` calls cannot settle this phase.
+    fn retain_restore_cleared(&self) {
+        self.hold.set_restore_phase(MtlsDnsRestorePhase::Cleared);
+    }
+
+    /// Record that the import failed (including a lost admission lease during
+    /// import), so the namespace is cleared and partially imported.
+    fn retain_restore_import_failed(&self) {
+        self.hold
+            .set_restore_phase(MtlsDnsRestorePhase::ImportedWithErrors);
+    }
+
+    /// Whether the restore phase allows an explicit release: no multi-phase
+    /// restore is in progress, the import succeeded, or the compensating
+    /// rollback completed. A half-restored namespace keeps its fence.
+    fn restore_phase_allows_release(&self) -> bool {
+        self.hold.restore_phase().release_on_drop()
     }
 
     async fn release(&mut self) -> Result<(), anyhow::Error> {
@@ -6693,13 +7184,16 @@ impl Drop for MtlsDnsAdmissionGuardLifecycle {
         if !self.armed || self.released.load(Ordering::Acquire) {
             return;
         }
-        let state =
-            MtlsDnsAdmissionMutationState::from_u8(self.mutation_state.load(Ordering::Acquire));
-        if !state.release_on_drop() {
+        if !self.hold.release_on_drop() {
             warn!(
                 namespace = %self.namespace,
-                "mTLS DNS admission guard retained because a dispatched mutation has an uncertain outcome"
+                "mTLS DNS admission guard retained because a dispatched mutation or multi-phase restore has an uncertain outcome"
             );
+            // Keep the durable fence and fail closed for the namespace, but
+            // let the backend drop any process-wide reconnect pin the guard
+            // held (issue #7031): this owner will never call release.
+            self.db
+                .retain_uncertain_mtls_dns_admission_guard(&self.namespace, &self.guard_owner);
             return;
         }
 
@@ -6744,9 +7238,7 @@ pub(crate) fn mtls_dns_admission_unavailable_response() -> Response<Full<Bytes>>
     response
 }
 
-// External tests reach this through the lib target's `_test_support` shim;
-// the bin target recompiles this module without that caller.
-#[allow(dead_code)]
+// External tests reach this through the lib target's `_test_support` shim.
 pub(crate) fn mtls_dns_admission_drop_should_release_for_test(
     mutation_started: bool,
     outcome_settled: bool,
@@ -6759,6 +7251,43 @@ pub(crate) fn mtls_dns_admission_drop_should_release_for_test(
         MtlsDnsAdmissionMutationState::NotStarted
     };
     state.release_on_drop()
+}
+
+/// Model `handle_restore`'s lost-lease recovery being abandoned (issue
+/// #7062): after a committed clear (and, with `after_import`, an import with
+/// errors), the namespace lease reacquisition is cancelled while it waits
+/// behind another holder, and the request drops the restore guard it kept
+/// across that reacquisition. Returns the abandoned guard owner.
+// External tests reach this through the lib target's `_test_support` shim.
+pub(crate) async fn abandon_restore_lost_lease_recovery_for_test(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    after_import: bool,
+) -> Result<String, anyhow::Error> {
+    // Another writer holds the namespace lease, so the recovery waits.
+    let competing_admission = crud::lock_namespace_config_admission(db.clone(), namespace).await?;
+    let restore_guard = MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace).await?;
+    let guard_owner = restore_guard.guard_owner().to_string();
+    let operation = restore_guard.operation();
+    operation
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .map_err(|()| anyhow::anyhow!("test clear failed"))?;
+    if after_import {
+        restore_guard.retain_restore_import_failed();
+    }
+    {
+        let reacquire = crud::lock_namespace_config_admission(db.clone(), namespace);
+        tokio::pin!(reacquire);
+        std::future::poll_fn(|context| {
+            let _ = std::future::Future::poll(reacquire.as_mut(), context);
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+    drop(restore_guard);
+    drop(competing_admission);
+    Ok(guard_owner)
 }
 
 /// Hold the datastore namespace guard across an admin read/modify/write
@@ -6941,14 +7470,33 @@ struct PersistCounts {
 
 const DATABASE_OPERATION_FAILED_MESSAGE: &str = "Database unavailable — operation failed";
 pub(crate) const IF_MATCH_UNSUPPORTED_MESSAGE: &str = "If-Match is only supported on PUT and \
-     DELETE of /proxies/{id}, /upstreams/{id}, /consumers/{id}, /plugins/config/{id}, \
-     and POST /restore";
+     DELETE of /proxies/{id}, /upstreams/{id}, /consumers/{id}, /plugins/config/{id}, on the \
+     /consumers/{id}/credentials/{type}[/{index}] mutations, and on POST /restore";
+
+/// `400` for a mutating route that does not evaluate `If-Match`.
+fn if_match_unsupported_response() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::BAD_REQUEST,
+        &json!({"error": IF_MATCH_UNSUPPORTED_MESSAGE}),
+    )
+}
 
 /// Routes that evaluate `If-Match` (see `preconditions`). Every other mutating
 /// route refuses the header instead of ignoring it.
 fn if_match_route(method: &Method, segments: &[&str]) -> bool {
     if method == Method::POST && segments == ["restore"] {
         return true;
+    }
+    // The credential sub-routes rewrite the whole Consumer, so they are
+    // conditioned on the Consumer's own tag (issue #7393): an index or a
+    // per-type replacement chosen from a read is only meaningful while the
+    // Consumer still has the representation that read returned.
+    match segments {
+        ["consumers", _, "credentials", _] => {
+            return matches!(*method, Method::PUT | Method::POST | Method::DELETE);
+        }
+        ["consumers", _, "credentials", _, _] => return *method == Method::DELETE,
+        _ => {}
     }
     (method == Method::PUT || method == Method::DELETE)
         && matches!(
@@ -7403,9 +7951,7 @@ fn intervening_clear_recovery_candidate(
 }
 
 #[doc(hidden)]
-// External tests reach this through the lib target's `_test_support` shim;
-// the bin target recompiles this module without that caller.
-#[allow(dead_code)]
+// External tests reach this through the lib target's `_test_support` shim.
 pub(crate) fn intervening_clear_recovery_candidate_for_test(
     snapshot: GatewayConfig,
     current: GatewayConfig,
@@ -7448,9 +7994,13 @@ async fn restore_snapshot_after_intervening_clear(
             identity_errors.join("; ")
         )]);
     }
+    let validation_http_client = match plugin_validation_http_client(state) {
+        Ok(client) => client,
+        Err(error) => return Err(vec![error]),
+    };
     match crud::validate_transaction_log_schema_graph_on_blocking_pool(
         candidate,
-        plugin_validation_http_client(state),
+        validation_http_client,
     )
     .await
     {
@@ -7648,9 +8198,7 @@ fn plan_additive_rollback_api_specs(
 /// Test view of [`plan_additive_rollback_api_specs`]: the replayed spec ids, the
 /// skipped/cleared counts, and each replayed proxy's surviving ownership tag.
 #[doc(hidden)]
-// External tests reach this through the lib target's `_test_support` shim;
-// the bin target recompiles this module without that caller.
-#[allow(dead_code)]
+// External tests reach this through the lib target's `_test_support` shim.
 #[allow(clippy::type_complexity)]
 pub(crate) fn plan_additive_rollback_api_specs_for_test(
     snapshot: GatewayConfig,
@@ -7696,7 +8244,7 @@ async fn finish_failed_restore(
     let guard_owner = guard.guard_owner().to_string();
     let operation = guard.operation();
     let (mut rollback_status, mut rollback_errors) = match operation
-        .run_mutation(rollback_failed_restore(
+        .run_restore_rollback(rollback_failed_restore(
             db.as_ref(),
             namespace,
             snapshot,
@@ -7715,7 +8263,20 @@ async fn finish_failed_restore(
             ("incomplete", Some(errors))
         }
     };
-    if let Err(_error) = guard.release().await {
+    // A failed rollback leaves a cleared, partially imported, or partially
+    // replayed namespace: retain the durable fence (as the unknown-outcome
+    // clear path does) instead of admitting writes over it (issue #7032).
+    let fence_retained = !guard.restore_phase_allows_release();
+    if fence_retained {
+        error!(
+            namespace = %namespace,
+            "Restore: rollback incomplete; namespace admission guard retained for manual recovery"
+        );
+        rollback_status = "incomplete";
+        rollback_errors
+            .get_or_insert_with(Vec::new)
+            .push(RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE.to_string());
+    } else if let Err(_error) = guard.release().await {
         error_persistence_failure_redacted("restore_rollback_guard_release");
         rollback_status = "incomplete";
         rollback_errors
@@ -7741,6 +8302,9 @@ async fn finish_failed_restore(
     let error_message = match rollback_status {
         "completed" => "Restore failed; restore rolled back and prior config retained",
         // "incomplete"
+        _ if fence_retained => {
+            "Restore failed and rollback of prior config was incomplete; the namespace admission guard was retained and manual recovery is required."
+        }
         _ => "Restore failed and rollback of prior config was incomplete; manual recovery required",
     };
 
@@ -7789,7 +8353,7 @@ async fn finish_failed_restore_after_intervening_clear(
     let guard_owner = guard.guard_owner().to_string();
     let operation = guard.operation();
     let (mut rollback_status, mut rollback_errors) = match operation
-        .run_mutation(restore_snapshot_after_intervening_clear(
+        .run_restore_rollback(restore_snapshot_after_intervening_clear(
             state,
             db.as_ref(),
             namespace,
@@ -7809,7 +8373,19 @@ async fn finish_failed_restore_after_intervening_clear(
             ("incomplete", Some(errors))
         }
     };
-    if let Err(_error) = guard.release().await {
+    // As in `finish_failed_restore`: a failed additive rollback retains the
+    // durable fence for operator recovery (issue #7032).
+    let fence_retained = !guard.restore_phase_allows_release();
+    if fence_retained {
+        error!(
+            namespace = %namespace,
+            "Restore: additive rollback incomplete; namespace admission guard retained for manual recovery"
+        );
+        rollback_status = "incomplete";
+        rollback_errors
+            .get_or_insert_with(Vec::new)
+            .push(RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE.to_string());
+    } else if let Err(_error) = guard.release().await {
         error_persistence_failure_redacted("restore_additive_rollback_guard_release");
         rollback_status = "incomplete";
         rollback_errors
@@ -7835,6 +8411,8 @@ async fn finish_failed_restore_after_intervening_clear(
     let mut response = json!({
         "error": if rollback_status == "completed" {
             "Restore lost namespace admission during clear; prior and intervening config resources were preserved"
+        } else if fence_retained {
+            "Restore lost namespace admission during clear and additive rollback was incomplete; the namespace admission guard was retained and manual recovery is required."
         } else {
             "Restore lost namespace admission during clear and additive rollback was incomplete; manual recovery required"
         },
@@ -7899,7 +8477,7 @@ async fn finish_unknown_atomic_delete_failure(
     clear_error: String,
     guard: &MtlsDnsAdmissionGuardLifecycle,
 ) -> Response<Full<Bytes>> {
-    guard.retain_uncertain();
+    guard.retain_restore_cleared();
     let event = audit::AuditEvent::new(
         actor,
         "restore",
@@ -7948,6 +8526,7 @@ fn normalize_credential_set(cred_value: Value) -> Result<Value, Box<Response<Ful
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_update_credentials(
     state: &AdminState,
     actor: &AuditActor,
@@ -7956,6 +8535,7 @@ async fn handle_update_credentials(
     body: &[u8],
     namespace: &str,
     apply_mode: LiveApplyMode,
+    if_match: Option<&preconditions::IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -8003,6 +8583,11 @@ async fn handle_update_credentials(
                 Ok(consumer) => consumer,
                 Err(resp) => return *resp,
             };
+        if let Some(refusal) =
+            crud::consumer_if_match_refusal(state, if_match, consumer_id, &consumer)
+        {
+            return refusal;
+        }
         let before = consumer.clone();
         consumer
             .credentials
@@ -8077,6 +8662,7 @@ async fn handle_delete_credentials(
     cred_type: &str,
     namespace: &str,
     apply_mode: LiveApplyMode,
+    if_match: Option<&preconditions::IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -8109,6 +8695,11 @@ async fn handle_delete_credentials(
                 Ok(consumer) => consumer,
                 Err(resp) => return *resp,
             };
+        if let Some(refusal) =
+            crud::consumer_if_match_refusal(state, if_match, consumer_id, &consumer)
+        {
+            return refusal;
+        }
         // Whole-Consumer PUT preserves credential types the ordinary response
         // projection hides, so this route is the only way to remove them. It
         // therefore also accepts an unknown/custom type that the Consumer
@@ -8163,6 +8754,7 @@ async fn handle_delete_credentials(
 }
 
 /// POST /consumers/:id/credentials/:type — Append a credential entry for zero-downtime rotation.
+#[allow(clippy::too_many_arguments)]
 async fn handle_append_credential(
     state: &AdminState,
     actor: &AuditActor,
@@ -8171,6 +8763,7 @@ async fn handle_append_credential(
     body: &[u8],
     namespace: &str,
     apply_mode: LiveApplyMode,
+    if_match: Option<&preconditions::IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -8220,6 +8813,11 @@ async fn handle_append_credential(
                 Ok(consumer) => consumer,
                 Err(resp) => return *resp,
             };
+        if let Some(refusal) =
+            crud::consumer_if_match_refusal(state, if_match, consumer_id, &consumer)
+        {
+            return refusal;
+        }
         let before = consumer.clone();
         let new_value = match consumer.credentials.get(cred_type) {
             Some(Value::Array(arr)) => {
@@ -8230,7 +8828,15 @@ async fn handle_append_credential(
             _ => Value::Array(vec![new_cred]),
         };
 
-        let limit = max_credentials_per_type();
+        // A configured-but-invalid rotation ceiling is a server-side
+        // configuration error: refuse the write with a response instead of
+        // enforcing a silently substituted default (issue #6754).
+        let limit = match max_credentials_per_type() {
+            Ok(limit) => limit,
+            Err(error) => {
+                return json_response(StatusCode::INTERNAL_SERVER_ERROR, &json!({"error": error}));
+            }
+        };
         if let Value::Array(ref arr) = new_value
             && arr.len() > limit
         {
@@ -8310,6 +8916,13 @@ async fn handle_append_credential(
 
 /// DELETE /consumers/:id/credentials/:type/:index — Remove a specific credential entry by index.
 ///
+/// The index is a position in the array the caller last read, and every entry
+/// reads back redacted, so an index alone cannot say which credential the
+/// caller meant once another writer has appended or removed one. `If-Match`
+/// with the Consumer's `ETag` from that read pins the array: it is compared
+/// under the namespace admission lease, so a changed Consumer is refused with
+/// `412` and nothing is removed (issue #7393).
+#[allow(clippy::too_many_arguments)]
 async fn handle_delete_credential_by_index(
     state: &AdminState,
     actor: &AuditActor,
@@ -8318,6 +8931,7 @@ async fn handle_delete_credential_by_index(
     index_str: &str,
     namespace: &str,
     apply_mode: LiveApplyMode,
+    if_match: Option<&preconditions::IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -8366,6 +8980,11 @@ async fn handle_delete_credential_by_index(
                 Ok(consumer) => consumer,
                 Err(resp) => return *resp,
             };
+        if let Some(refusal) =
+            crud::consumer_if_match_refusal(state, if_match, consumer_id, &consumer)
+        {
+            return refusal;
+        }
         let before = consumer.clone();
         let cred_value = match consumer.credentials.get_mut(cred_type) {
             Some(value) => value,
@@ -8503,29 +9122,29 @@ async fn handle_list_plugin_types() -> Result<Response<Full<Bytes>>, hyper::Erro
     ))
 }
 
-pub(crate) fn plugin_validation_http_client(state: &AdminState) -> plugins::PluginHttpClient {
-    state
-        .proxy_state
-        .as_ref()
-        .map(|proxy_state| proxy_state.plugin_http_client.clone())
-        .unwrap_or_else(|| {
-            // No ProxyState (e.g. control plane): build a validation client that
-            // still carries the configured backend IP policy, so a plugin whose
-            // endpoint resolves to a denied literal IP is rejected at the admin
-            // boundary instead of being accepted here and rejected later by DPs.
-            // The real-IP header is also safe to resolve from this CP: ConfigSync
-            // rejects every DP that does not advertise the same effective value
-            // before any snapshot can be distributed.
-            //
-            // Compression codec gates and the request-body ceiling must also
-            // match serving PluginCache admission so CP cannot accept a
-            // max_decompressed_request_size that DPs later reject.
-            plugins::PluginHttpClient::default_with_backend_allow_ips(
-                state.backend_allow_ips.clone(),
-            )
+pub(crate) fn plugin_validation_http_client(
+    state: &AdminState,
+) -> Result<plugins::PluginHttpClient, String> {
+    if let Some(proxy_state) = state.proxy_state.as_ref() {
+        return Ok(proxy_state.plugin_http_client.clone());
+    }
+    let compression_policy = crate::config::CompressionAdmissionPolicy::from_process_env()?;
+    Ok({
+        // No ProxyState (e.g. control plane): build a validation client that
+        // still carries the configured backend IP policy, so a plugin whose
+        // endpoint resolves to a denied literal IP is rejected at the admin
+        // boundary instead of being accepted here and rejected later by DPs.
+        // The real-IP header is also safe to resolve from this CP: ConfigSync
+        // rejects every DP that does not advertise the same effective value
+        // before any snapshot can be distributed.
+        //
+        // Compression codec gates and the request-body ceiling must also
+        // match serving PluginCache admission so CP cannot accept a
+        // max_decompressed_request_size that DPs later reject.
+        plugins::PluginHttpClient::default_with_backend_allow_ips(state.backend_allow_ips.clone())
             .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-            .with_process_compression_admission_policy()
-        })
+            .with_compression_admission_policy(compression_policy)
+    })
 }
 
 /// Collect plugin-name and plugin-definition admission errors for an
@@ -8547,13 +9166,22 @@ pub(crate) fn collect_plugin_config_admission_errors(
     // Built once: on a control plane (no `ProxyState`) this constructs a fresh
     // validation client, and restore admits payloads with far more plugin rows
     // than a batch write.
-    let http_client = plugin_validation_http_client(state);
+    let http_client = match plugin_validation_http_client(state) {
+        Ok(client) => client,
+        Err(error) => {
+            validation_errors.push(error);
+            return;
+        }
+    };
     for plugin_config in plugin_configs {
         if !known_plugins.contains(&plugin_config.plugin_name.as_str()) {
             validation_errors.push(format!(
                 "PluginConfig '{}': unknown plugin name '{}'",
                 plugin_config.id, plugin_config.plugin_name
             ));
+            // The definition check below would report the same unknown name
+            // a second time (issue #7216).
+            continue;
         }
         if crate::plugins::transaction_log_schema::participates_in_config_graph(plugin_config) {
             if let Err(err) = crate::plugins::validate_plugin_config_policy_only(
@@ -8573,8 +9201,40 @@ pub(crate) fn collect_plugin_config_admission_errors(
                 "PluginConfig '{}': invalid config: {}",
                 plugin_config.id, err
             ));
+        } else if plugin_config.enabled {
+            // Managed JWKS references must name an existing, usable record
+            // (issue #7277), exactly like a single `POST /plugins/config`.
+            for err in crate::plugins::utils::jwks_store::plugin_managed_jwks_source_errors(
+                &plugin_config.plugin_name,
+                &plugin_config.config,
+            ) {
+                validation_errors.push(format!(
+                    "PluginConfig '{}': invalid config: {}",
+                    plugin_config.id, err
+                ));
+            }
         }
     }
+}
+
+/// Managed JWKS references (`managed://jwks/<id>#jwks`) an enabled plugin
+/// write carries must name a record that exists in this node's managed TLS
+/// store and holds a usable key set (issue #7277). The admin node is the one
+/// `/admin/tls/jwks` writes land on, so the check is authoritative here even
+/// in CP mode. Reads the store on the blocking pool.
+pub(crate) async fn managed_jwks_source_admission_errors(pc: &PluginConfig) -> Vec<String> {
+    if !pc.enabled
+        || !crate::plugins::utils::jwks_store::plugin_may_reference_managed_jwks(&pc.plugin_name)
+    {
+        return Vec::new();
+    }
+    let plugin_name = pc.plugin_name.clone();
+    let config = pc.config.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::plugins::utils::jwks_store::plugin_managed_jwks_source_errors(&plugin_name, &config)
+    })
+    .await
+    .unwrap_or_else(|_| vec!["managed JWKS source check did not complete".to_string()])
 }
 
 pub(crate) fn validate_plugin_config_definition(
@@ -8593,6 +9253,13 @@ pub(crate) fn validate_plugin_config_definition(
     // unbounded regex or malformed CIDR is seen.
     if let Some(trigger) = pc.trigger.as_ref() {
         trigger.validate()?;
+    }
+    // Native librdkafka keys are refused even on a disabled row, so a stored
+    // config can never carry one (issue #6539).
+    if let Some(error) =
+        plugins::kafka_logging::disabled_config_native_key_refusal(&pc.plugin_name, &pc.config)
+    {
+        return Err(error);
     }
     if !pc.enabled {
         return Ok(());
@@ -8626,15 +9293,12 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
     if let Some((cached_at, ref bytes)) = **cached
         && cached_at.elapsed() < METRICS_CACHE_TTL
     {
-        let resp = Response::builder()
+        let resp = with_admin_security_headers(Response::builder())
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
             .header("X-Cache", "hit")
-            .header("X-Content-Type-Options", "nosniff")
-            .header("Cache-Control", "no-store")
-            .header("X-Frame-Options", "DENY")
             .body(Full::new(bytes.clone()))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+            .unwrap_or_else(|_| admin_builder_failure_response());
         return Ok(resp);
     }
 
@@ -8644,15 +9308,12 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
 
     cache.store(Arc::new(Some((Instant::now(), body_bytes.clone()))));
 
-    let resp = Response::builder()
+    let resp = with_admin_security_headers(Response::builder())
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .header("X-Cache", "miss")
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .header("X-Frame-Options", "DENY")
         .body(Full::new(body_bytes))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+        .unwrap_or_else(|_| admin_builder_failure_response());
     Ok(resp)
 }
 
@@ -8689,15 +9350,12 @@ async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Byte
     if let Some((cached_at, ref bytes)) = **cached
         && cached_at.elapsed() < Duration::from_millis(ttl_ms)
     {
-        let resp = Response::builder()
+        let resp = with_admin_security_headers(Response::builder())
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
             .header("X-Cache", "hit")
-            .header("X-Content-Type-Options", "nosniff")
-            .header("Cache-Control", "no-store")
-            .header("X-Frame-Options", "DENY")
             .body(Full::new(bytes.clone()))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+            .unwrap_or_else(|_| admin_builder_failure_response());
         return Ok(resp);
     }
 
@@ -8706,15 +9364,12 @@ async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Byte
     let body_bytes = Bytes::from(body_str);
     cache.store(Arc::new(Some((Instant::now(), body_bytes.clone()))));
 
-    let resp = Response::builder()
+    let resp = with_admin_security_headers(Response::builder())
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .header("X-Cache", "miss")
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .header("X-Frame-Options", "DENY")
         .body(Full::new(body_bytes))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+        .unwrap_or_else(|_| admin_builder_failure_response());
     Ok(resp)
 }
 
@@ -8741,8 +9396,7 @@ fn batch_ref_faults() -> std::sync::MutexGuard<'static, BatchRefFaultMap> {
 /// same parse the handler runs before any deletion, not the later semantic
 /// validation.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn restore_envelope_admission_for_test(body: &[u8]) -> Result<(), serde_json::Error> {
     crate::util::json_object::from_json_object_slice::<RestorePayload>(body).map(|_| ())
 }
@@ -8752,8 +9406,7 @@ pub(crate) fn restore_envelope_admission_for_test(body: &[u8]) -> Result<(), ser
 /// Same object-only parse `POST /batch` maps to `400` with
 /// `{"error": "Invalid JSON body: …"}` — the restore envelope's error shape.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn batch_envelope_admits_for_test(body: &[u8]) -> bool {
     crate::util::json_object::from_json_object_slice::<BatchCreateRequest>(body).is_ok()
 }
@@ -8764,7 +9417,6 @@ pub(crate) fn batch_envelope_admits_for_test(body: &[u8]) -> bool {
 /// Test-only support for [`restore_envelope_field_names_for_test`] and
 /// [`batch_envelope_field_names_for_test`]; nothing in the serving paths
 /// constructs one.
-#[allow(dead_code)]
 #[derive(Default)]
 struct RestoreFieldNameCollector {
     fields: Vec<String>,
@@ -8811,8 +9463,7 @@ impl<'de> serde::Deserializer<'de> for &mut RestoreFieldNameCollector {
 /// `RestoreRequest.properties`, so adding a Rust member fails that test until
 /// the published schema describes it.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn restore_envelope_field_names_for_test() -> Vec<String> {
     serde_struct_field_names::<RestorePayload>()
 }
@@ -8824,13 +9475,11 @@ pub(crate) fn restore_envelope_field_names_for_test() -> Vec<String> {
 /// [`restore_envelope_field_names_for_test`] uses. The OpenAPI contract test
 /// asserts set-equality against `BatchCreateRequest.properties`.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn batch_envelope_field_names_for_test() -> Vec<String> {
     serde_struct_field_names::<BatchCreateRequest>()
 }
 
-#[allow(dead_code)]
 fn serde_struct_field_names<T>() -> Vec<String>
 where
     T: for<'de> Deserialize<'de>,
@@ -8846,8 +9495,7 @@ where
 /// for `namespace`. Keyed per namespace so tests sharing a process cannot
 /// perturb each other. Always clear the fault when the test finishes.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn set_batch_reference_check_fault(namespace: &str, detail: Option<&str>) {
     let mut faults = batch_ref_faults();
     match detail {
@@ -8968,7 +9616,9 @@ async fn batch_existing_resource_conflict(
 
 fn batch_needs_consumer_snapshot(batch: &RestorePayload) -> bool {
     batch.consumers.iter().any(|consumer| {
-        consumer.has_credential("mtls_auth") || !consumer.credential_entries("hmac_auth").is_empty()
+        consumer.has_credential("mtls_auth")
+            || !consumer.credential_entries("hmac_auth").is_empty()
+            || !consumer.credential_entries("jwt").is_empty()
     }) || batch
         .plugin_configs
         .iter()
@@ -8976,10 +9626,17 @@ fn batch_needs_consumer_snapshot(batch: &RestorePayload) -> bool {
 }
 
 fn batch_needs_mtls_plugin_compat(batch: &RestorePayload) -> bool {
+    // A scoped `spiffe_identity` row shares `mtls_auth`'s stream
+    // TLS-termination requirement, so it is screened against the persisted
+    // stream proxies it can attach to even when the batch carries none.
     batch
         .proxies
         .iter()
         .any(|proxy| proxy.dispatch_kind.is_stream())
+        || batch
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.plugin_name == "spiffe_identity")
 }
 
 fn batch_submits_plugin_graph(batch: &RestorePayload) -> bool {
@@ -9013,6 +9670,21 @@ fn stream_listener_bucket(candidate: &GatewayConfig, ports: &HashSet<u16>) -> Ga
     };
     bucket.resolve_upstream_tls();
     bucket
+}
+
+/// Batch stream ports that a persisted stream proxy in `candidate` (the
+/// namespace snapshot, before the batch is overlaid) already listens on. The
+/// running listener is expected to own those sockets, so the batch skips the
+/// OS bind probe for them, as `crud::validate_stream_port_candidate` reports
+/// for a single write.
+fn persisted_batch_stream_ports(candidate: &GatewayConfig, ports: &HashSet<u16>) -> HashSet<u16> {
+    candidate
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.dispatch_kind.is_stream())
+        .filter_map(|proxy| proxy.listen_port)
+        .filter(|port| ports.contains(port))
+        .collect()
 }
 
 fn overlay_batch_proxies(candidate: &mut GatewayConfig, proxies: &[Proxy]) {
@@ -9230,10 +9902,19 @@ async fn handle_batch_create(
         .filter(|proxy| proxy.dispatch_kind.is_stream())
         .filter_map(|proxy| proxy.listen_port)
         .collect();
+    // Batch stream ports a persisted stream proxy already listens on; the OS
+    // bind probe below skips them. Filled from the full namespace snapshot,
+    // which one of the two branches below always loads when the batch carries
+    // stream listeners.
+    let mut persisted_stream_ports: HashSet<u16> = HashSet::new();
 
     if batch_needs_consumer_snapshot(&batch) {
         match db.load_namespace_snapshot(namespace).await {
             Ok(mut candidate_config) => {
+                persisted_stream_ports.extend(persisted_batch_stream_ports(
+                    &candidate_config,
+                    &batch_stream_ports,
+                ));
                 overlay_batch_consumers(&mut candidate_config, &batch.consumers);
                 overlay_batch_proxies(&mut candidate_config, &batch.proxies);
                 overlay_batch_plugin_configs(&mut candidate_config, &batch.plugin_configs);
@@ -9262,6 +9943,21 @@ async fn handle_batch_create(
                 {
                     validation_errors.extend(errors);
                 }
+                // Same for JWT secrets, limited to collisions that involve a
+                // submitted Consumer so pre-existing (load-quarantined)
+                // duplicates between other Consumers never block the batch.
+                let jwt_batch_consumer_ids: Vec<&str> = batch
+                    .consumers
+                    .iter()
+                    .filter(|consumer| !consumer.credential_entries("jwt").is_empty())
+                    .map(|consumer| consumer.id.as_str())
+                    .collect();
+                if !jwt_batch_consumer_ids.is_empty()
+                    && let Err(errors) = candidate_config
+                        .validate_unique_jwt_credentials_for_consumers(&jwt_batch_consumer_ids)
+                {
+                    validation_errors.extend(errors);
+                }
             }
             Err(error) => {
                 warn_persistence_failure_redacted("batch_credential_candidate_load");
@@ -9281,6 +9977,10 @@ async fn handle_batch_create(
         };
         match candidate {
             Ok(mut candidate_config) => {
+                persisted_stream_ports.extend(persisted_batch_stream_ports(
+                    &candidate_config,
+                    &batch_stream_ports,
+                ));
                 overlay_batch_proxies(&mut candidate_config, &batch.proxies);
                 overlay_batch_plugin_configs(&mut candidate_config, &batch.plugin_configs);
                 if let Err(errors) = candidate_config.validate_mtls_auth_compatibility() {
@@ -9296,6 +9996,47 @@ async fn handle_batch_create(
             Err(error) => {
                 warn_persistence_failure_redacted("batch_mtls_compat_candidate_load");
                 return Ok(batch_candidate_db_failure(&error));
+            }
+        }
+    }
+
+    // Process-level listener admission, mirroring single-resource proxy
+    // writes (`after_validate` for `Proxy` in crud.rs, issue #7214): a proxy
+    // on a process-global frontend it can never be served on, a stream
+    // listener on a reserved gateway port, and a new stream port the host
+    // cannot bind are refused here rather than at listener reconcile. A CP
+    // cannot know its DPs' ports and skips these, as single writes do.
+    if state.mode != "cp" {
+        let mut probed_stream_ports: HashSet<(u16, bool)> = HashSet::new();
+        for proxy in &batch.proxies {
+            if let Some(error) = crud::process_global_frontend_conflict(state, proxy) {
+                validation_errors.push(error);
+            }
+            if !proxy.dispatch_kind.is_stream() {
+                continue;
+            }
+            let Some(port) = proxy.listen_port else {
+                continue;
+            };
+            if state.reserved_ports.contains(&port) {
+                validation_errors.push(format!(
+                    "Proxy '{}' listen_port {} conflicts with a gateway reserved port \
+                     (proxy/admin/gRPC listener)",
+                    proxy.id, port
+                ));
+                continue;
+            }
+            let udp = proxy.dispatch_kind.is_udp();
+            if persisted_stream_ports.contains(&port) || !probed_stream_ports.insert((port, udp)) {
+                continue;
+            }
+            if let Err(error) =
+                check_port_available(port, &state.stream_proxy_bind_address, udp).await
+            {
+                validation_errors.push(format!(
+                    "Proxy '{}' listen_port {} is not available on the host: {}",
+                    proxy.id, port, error
+                ));
             }
         }
     }
@@ -9377,49 +10118,60 @@ async fn handle_batch_create(
         .collect();
 
     for proxy in &batch.proxies {
-        if let Some(upstream_id) = proxy.upstream_id.as_deref()
-            && !batch_upstream_ids.contains(upstream_id)
-        {
-            match batch_reference_lookup(
-                namespace,
-                db.check_upstream_exists(upstream_id, namespace).await,
-            ) {
-                Ok(true) => {}
-                Ok(false) => {
-                    // Upstream reads are namespace-predicated (issue #2122
-                    // DB-M1): an upstream in another namespace reports as
-                    // missing, so cross-namespace references are rejected
-                    // without disclosing other tenants' resources.
-                    validation_errors.push(format!(
-                        "Proxy '{}' references upstream_id '{}' that does not exist in namespace '{}'",
-                        proxy.id, upstream_id, namespace
-                    ));
+        // One namespace-predicated read of a persisted upstream serves the
+        // existence, API-spec ownership and subset checks below.
+        let persisted_upstream = match proxy.upstream_id.as_deref() {
+            Some(upstream_id) if !batch_upstream_ids.contains(upstream_id) => {
+                match batch_reference_lookup(
+                    namespace,
+                    db.get_upstream(namespace, upstream_id).await,
+                ) {
+                    Ok(Some(upstream)) => Some(upstream),
+                    Ok(None) => {
+                        // Upstream reads are namespace-predicated (issue #2122
+                        // DB-M1): an upstream in another namespace reports as
+                        // missing, so cross-namespace references are rejected
+                        // without disclosing other tenants' resources.
+                        validation_errors.push(format!(
+                            "Proxy '{}' references upstream_id '{}' that does not exist in namespace '{}'",
+                            proxy.id, upstream_id, namespace
+                        ));
+                        None
+                    }
+                    Err(response) => return Ok(response),
                 }
-                Err(response) => return Ok(response),
             }
+            _ => None,
+        };
+        // Same ownership rule as single-resource proxy admission (issue
+        // #7214): a spec-owned upstream may only back a proxy of the same
+        // spec. Batch strips `api_spec_id` from every submitted resource, so
+        // a batch proxy is never spec-owned and batch upstreams never are.
+        if let (Some(upstream_id), Some(owner_spec_id)) = (
+            proxy.upstream_id.as_deref(),
+            persisted_upstream
+                .as_ref()
+                .and_then(|upstream| upstream.api_spec_id.as_deref()),
+        ) {
+            validation_errors.push(format!(
+                "Proxy '{}' references upstream_id '{}' that is owned by api_spec '{}'; create a hand-managed upstream or update the owning API spec",
+                proxy.id, upstream_id, owner_spec_id
+            ));
         }
         if let (Some(upstream_id), Some(subset_name)) = (
             proxy.upstream_id.as_deref(),
             proxy.upstream_subset.as_deref(),
         ) {
-            let subset_exists = if let Some(upstream) = batch_upstreams.get(upstream_id) {
-                upstream
-                    .subsets
-                    .as_ref()
-                    .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name))
-            } else {
-                match batch_reference_lookup(
-                    namespace,
-                    db.get_upstream(namespace, upstream_id).await,
-                ) {
-                    Ok(Some(upstream)) => upstream
+            let subset_exists = batch_upstreams
+                .get(upstream_id)
+                .copied()
+                .or(persisted_upstream.as_ref())
+                .is_some_and(|upstream| {
+                    upstream
                         .subsets
                         .as_ref()
-                        .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name)),
-                    Ok(None) => false,
-                    Err(response) => return Ok(response),
-                }
-            };
+                        .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name))
+                });
             if !subset_exists {
                 validation_errors.push(format!(
                     "Proxy '{}' references upstream_subset '{}' that is not defined on upstream_id '{}'",
@@ -9497,6 +10249,48 @@ async fn handle_batch_create(
                     ));
                 }
                 Err(response) => return Ok(response),
+            }
+        }
+
+        // Single-resource `openapi_validator` precondition (issue #7214): the
+        // target proxy must carry an attached API spec. A proxy created by
+        // this batch never can (batch strips `api_spec_id`), so only a
+        // persisted target can satisfy it.
+        if plugin_config.plugin_name == "openapi_validator" {
+            if plugin_config.scope != PluginScope::Proxy {
+                validation_errors.push(format!(
+                    "PluginConfig '{}': openapi_validator requires scope 'proxy'",
+                    plugin_config.id
+                ));
+            } else {
+                match plugin_config.proxy_id.as_deref() {
+                    None => validation_errors.push(format!(
+                        "PluginConfig '{}': openapi_validator requires proxy_id",
+                        plugin_config.id
+                    )),
+                    Some(proxy_id) if batch_proxy_ids.contains(proxy_id) => {
+                        validation_errors.push(format!(
+                            "PluginConfig '{}': openapi_validator requires a proxy with an attached api_spec; proxy '{}' is created by this batch and cannot carry one",
+                            plugin_config.id, proxy_id
+                        ));
+                    }
+                    Some(proxy_id) => {
+                        match batch_reference_lookup(
+                            namespace,
+                            db.get_proxy(namespace, proxy_id).await,
+                        ) {
+                            Ok(Some(proxy)) if proxy.api_spec_id.is_none() => {
+                                validation_errors.push(format!(
+                                    "PluginConfig '{}': openapi_validator requires a proxy with an attached api_spec",
+                                    plugin_config.id
+                                ));
+                            }
+                            // A missing proxy is already reported above.
+                            Ok(_) => {}
+                            Err(response) => return Ok(response),
+                        }
+                    }
+                }
             }
         }
 
@@ -9969,7 +10763,7 @@ fn serialize_backup_payload(
 }
 
 fn backup_attachment_response(body_bytes: Vec<u8>, source: &'static str) -> Response<Full<Bytes>> {
-    Response::builder()
+    with_admin_security_headers(Response::builder())
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .header(
@@ -9977,15 +10771,8 @@ fn backup_attachment_response(body_bytes: Vec<u8>, source: &'static str) -> Resp
             "attachment; filename=\"ferrum-backup.json\"",
         )
         .header("X-Data-Source", source)
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::from(body_bytes)))
-        .unwrap_or_else(|_| {
-            Response::new(Full::new(Bytes::from(
-                "{\"error\":\"Internal Server Error\"}",
-            )))
-        })
+        .unwrap_or_else(|_| admin_builder_failure_response())
 }
 
 /// Load BackupExport config + raw API-spec documents and serialize them while
@@ -10384,52 +11171,124 @@ async fn validate_restore_candidate_on_blocking_pool(
     cert_expiry_days: u64,
     backend_allow_ips: crate::config::BackendEgressPolicy,
 ) -> Result<(GatewayConfig, Vec<String>), anyhow::Error> {
-    let (candidate, result) = tokio::task::spawn_blocking(move || {
-        // Identity first: restore stamps namespaces from the already-validated
-        // X-Ferrum-Namespace header, but payload resource IDs are hostile
-        // boundary input. Reject malformed IDs before any other domain check so
-        // a wiped-and-rewritten namespace cannot persist `|`-bearing identities
-        // that would later collide after `namespace|id` encoding (issue #3094).
-        let result = ValidationPipeline::new(&mut candidate)
-            .validate_resource_ids(ValidationAction::Collect)
-            .validate_all_fields_with_ip_policy(
-                cert_expiry_days,
-                &backend_allow_ips,
-                ValidationAction::Collect,
-            )
-            .validate_unique_resource_ids(ValidationAction::Collect)
-            .validate_unique_consumer_identities(ValidationAction::Collect)
-            .validate_unique_consumer_credentials(ValidationAction::Collect)
-            // Name uniqueness is enforced by `POST /batch`, file mode, and a
-            // real unique index on `(namespace, name)` in every backend. It
-            // must be refused here too, before the destructive clear, or a
-            // duplicate-name payload wipes the namespace and only then fails
-            // during persistence (issue #4265).
-            .validate_unique_upstream_names(ValidationAction::Collect)
-            .validate_unique_proxy_names(ValidationAction::Collect)
-            .validate_hosts(ValidationAction::Collect)
-            .validate_regex_listen_paths(ValidationAction::Collect)
-            .validate_listen_path_encodings(ValidationAction::Collect)
-            .validate_unique_listen_paths(ValidationAction::Collect)
-            .validate_stream_proxies(ValidationAction::Collect)
-            .validate_plugin_configs(&backend_allow_ips, ValidationAction::Collect)
-            .validate_upstream_references(ValidationAction::Collect)
-            .validate_mesh_route_dispatch_references(ValidationAction::Collect)
-            .validate_plugin_references(ValidationAction::Collect)
-            .run();
-        (candidate, result)
+    tokio::task::spawn_blocking(move || {
+        let errors = restore_candidate_validation_errors(
+            &mut candidate,
+            cert_expiry_days,
+            &backend_allow_ips,
+        );
+        (candidate, errors)
     })
     .await
-    .map_err(|error| anyhow::anyhow!("restore validation task failed: {error}"))?;
+    .map_err(|error| anyhow::anyhow!("restore validation task failed: {error}"))
+}
 
-    let errors = match result {
+/// Every database-independent admission error for a restore candidate, in the
+/// order the restore response reports them: the validation pipeline, then
+/// operator-provided upstream fields, then `allowed_ws_origins` admission.
+///
+/// Runs on the blocking pool through
+/// [`validate_restore_candidate_on_blocking_pool`]; tests reach it
+/// synchronously through `_test_support`.
+fn restore_candidate_validation_errors(
+    candidate: &mut GatewayConfig,
+    cert_expiry_days: u64,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Vec<String> {
+    // Identity first: restore stamps namespaces from the already-validated
+    // X-Ferrum-Namespace header, but payload resource IDs are hostile
+    // boundary input. Reject malformed IDs before any other domain check so
+    // a wiped-and-rewritten namespace cannot persist `|`-bearing identities
+    // that would later collide after `namespace|id` encoding (issue #3094).
+    //
+    // Field validation uses the admission variant: restore refuses `"*"` /
+    // non-origin `allowed_ws_origins` below, so the #5454 grandfathering
+    // warning ("stored database/control-plane config is still loaded") would
+    // be false here. File mode avoids it the same way (issue #7218).
+    let result = ValidationPipeline::new(candidate)
+        .validate_resource_ids(ValidationAction::Collect)
+        .validate_all_fields_for_admission_with_ip_policy(
+            cert_expiry_days,
+            backend_allow_ips,
+            ValidationAction::Collect,
+        )
+        .validate_unique_resource_ids(ValidationAction::Collect)
+        .validate_unique_consumer_identities(ValidationAction::Collect)
+        .validate_unique_consumer_credentials(ValidationAction::Collect)
+        // Name uniqueness is enforced by `POST /batch`, file mode, and a
+        // real unique index on `(namespace, name)` in every backend. It
+        // must be refused here too, before the destructive clear, or a
+        // duplicate-name payload wipes the namespace and only then fails
+        // during persistence (issue #4265).
+        .validate_unique_upstream_names(ValidationAction::Collect)
+        .validate_unique_proxy_names(ValidationAction::Collect)
+        .validate_hosts(ValidationAction::Collect)
+        .validate_regex_listen_paths(ValidationAction::Collect)
+        .validate_listen_path_encodings(ValidationAction::Collect)
+        .validate_unique_listen_paths(ValidationAction::Collect)
+        .validate_stream_proxies(ValidationAction::Collect)
+        .validate_plugin_configs(backend_allow_ips, ValidationAction::Collect)
+        .validate_upstream_references(ValidationAction::Collect)
+        .validate_mesh_route_dispatch_references(ValidationAction::Collect)
+        .validate_plugin_references(ValidationAction::Collect)
+        .run();
+
+    let mut errors = match result {
         Ok(errors) => errors,
         Err(error) => vec![error.to_string()],
     };
-    Ok((candidate, errors))
+    // Restore is an operator-provided admin write, so reject mesh-PROJECTED
+    // upstream fields the same way direct POST/PUT does. This check is
+    // intentionally NOT part of the shared `validate_all_fields` step (that
+    // step also runs on the mesh slice-apply path, where mesh-projected
+    // upstreams legitimately carry these fields); operator paths invoke it
+    // explicitly.
+    for upstream in &candidate.upstreams {
+        if let Err(errs) = upstream.validate_operator_provided_fields() {
+            for e in errs {
+                errors.push(format!("Upstream '{}': {}", upstream.id, e));
+            }
+        }
+    }
+    // Restore is an operator write, so reject CORS-style `"*"` / non-origin
+    // `allowed_ws_origins` the same way `POST /proxies` does. Load snapshots
+    // warn instead of failing (issue #5454).
+    errors.extend(candidate.allowed_ws_origins_admission_errors());
+    errors
+}
+
+/// Restore candidate admission errors computed on the calling thread, so a
+/// test can capture the logs validation emits.
+///
+/// Reached through `_test_support`.
+pub(crate) fn restore_candidate_validation_errors_for_test(
+    candidate: &mut GatewayConfig,
+    cert_expiry_days: u64,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Vec<String> {
+    restore_candidate_validation_errors(candidate, cert_expiry_days, backend_allow_ips)
 }
 
 /// Restore the gateway configuration from a backup payload.
+/// `restore_errors` for a lost-lease recovery response that returns while the
+/// restore guard is still held (issue #7062). Its Drop retains the durable
+/// fence whenever the restore phase forbids release, so the response says the
+/// namespace needs manual recovery.
+fn restore_recovery_errors(
+    guard: &MtlsDnsAdmissionGuardLifecycle,
+    namespace: &str,
+    mut errors: Vec<String>,
+) -> Vec<String> {
+    if !guard.restore_phase_allows_release() {
+        error!(
+            namespace = %namespace,
+            "Restore: lost-lease recovery did not complete; namespace admission guard retained for manual recovery"
+        );
+        errors.push(RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE.to_string());
+    }
+    errors
+}
+
 async fn handle_restore(
     state: &AdminState,
     actor: &AuditActor,
@@ -10624,23 +11483,6 @@ async fn handle_restore(
             ));
         }
     };
-    // Restore is an operator-provided admin write, so reject mesh-PROJECTED
-    // upstream fields the same way direct POST/PUT does. This check is
-    // intentionally NOT part of the shared `validate_all_fields` step (that
-    // step also runs on the mesh slice-apply path, where mesh-projected
-    // upstreams legitimately carry these fields); operator paths invoke it
-    // explicitly.
-    for upstream in &candidate.upstreams {
-        if let Err(errs) = upstream.validate_operator_provided_fields() {
-            for e in errs {
-                validation_errors.push(format!("Upstream '{}': {}", upstream.id, e));
-            }
-        }
-    }
-    // Restore is an operator write, so reject CORS-style `"*"` / non-origin
-    // `allowed_ws_origins` the same way `POST /proxies` does. Load snapshots
-    // warn instead of failing (issue #5454).
-    validation_errors.extend(candidate.allowed_ws_origins_admission_errors());
     if candidate
         .plugin_configs
         .iter()
@@ -10991,7 +11833,10 @@ async fn handle_restore(
     let delete_operation = restore_guard.operation();
     let delete_completion = match namespace_config_admission_guard
         .run_to_completion_while_held(
-            delete_operation.run_mutation(db.delete_all_resources(namespace, &restore_mode)),
+            // A successful clear enters the incomplete-restore phase inside
+            // the dispatched future, so cancellation at any later await point
+            // (including inside the admission wrapper) retains the fence.
+            delete_operation.run_restore_clear(db.delete_all_resources(namespace, &restore_mode)),
         )
         .await
     {
@@ -11008,28 +11853,26 @@ async fn handle_restore(
         crud::NamespaceConfigAdmissionCompletion::Held(result) => (result, None),
         crud::NamespaceConfigAdmissionCompletion::Lost { result, error } => (result, Some(error)),
     };
-    if delete_result.is_ok() {
-        // A cancelled restore after a successful clear is still an incomplete
-        // multi-phase mutation. Retain the durable fence until import or
-        // compensating rollback reaches a definitive result.
-        restore_guard.retain_uncertain();
-    }
+    // A successful clear already entered `MtlsDnsRestorePhase::Cleared`
+    // (inside `run_restore_clear`): a cancelled restore after the clear is
+    // still an incomplete multi-phase mutation, and the durable fence stays
+    // retained until import or compensating rollback reaches a definitive
+    // result. Nested `run_mutation` calls cannot settle that phase.
     if let Some(_error) = delete_admission_error {
         error_persistence_failure_redacted("restore_namespace_admission_lost_during_clear");
         let lost_generation = namespace_config_admission_guard.generation();
-        if let Err(release_error) = restore_guard.release().await {
-            let response_error = redacted_recovery_error_message(
-                "restore_guard_release_before_clear_recovery",
-                "Config admission was lost during restore clear and the restore guard could not be released before recovery",
-                &release_error,
-            );
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({
-                    "error": response_error,
-                    "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
-                }),
-            ));
+        // The restore guard (the durable mTLS DNS fence) is NOT released for
+        // recovery (issue #7062): it stays held across the lease reacquisition
+        // below and carries the recovery, so no window exists in which guarded
+        // writes are admitted over a cleared or partially cleared namespace.
+        // A failed or cancelled reacquisition drops it in an incomplete phase,
+        // and its Drop retains the fence. A clear that failed without a
+        // definitive atomic abort may have removed some rows, so it is
+        // incomplete too.
+        if let Err(error) = delete_result.as_ref()
+            && (!error.mode().is_atomic() || error.has_unknown_commit_result())
+        {
+            restore_guard.retain_restore_cleared();
         }
         drop(namespace_config_admission_guard);
         namespace_config_admission_guard = match crud::lock_namespace_config_admission(
@@ -11049,30 +11892,17 @@ async fn handle_restore(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({
                         "error": response_error,
-                        "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
+                        "restore_errors": restore_recovery_errors(
+                            &restore_guard,
+                            namespace,
+                            vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+                        ),
                     }),
                 ));
             }
         };
         let intervening_write =
             !namespace_config_admission_guard.immediately_succeeds_generation(lost_generation);
-        restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace).await {
-            Ok(guard) => guard,
-            Err(recovery_error) => {
-                let response_error = redacted_recovery_error_message(
-                    "restore_guard_reacquire_after_clear",
-                    "Config admission was reacquired after restore clear, but the restore guard could not be reacquired",
-                    &recovery_error,
-                );
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({
-                        "error": response_error,
-                        "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
-                    }),
-                ));
-            }
-        };
         if delete_result.is_ok() {
             let restore_errors = vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()];
             let rollback = async {
@@ -11122,7 +11952,11 @@ async fn handle_restore(
                             StatusCode::SERVICE_UNAVAILABLE,
                             &json!({
                                 "error": response_error,
-                                "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
+                                "restore_errors": restore_recovery_errors(
+                                    &restore_guard,
+                                    namespace,
+                                    vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+                                ),
                             }),
                         )
                     }
@@ -11130,11 +11964,18 @@ async fn handle_restore(
             );
         }
         if intervening_write {
+            // A clear that may have removed rows leaves the guard in the
+            // cleared phase: returning drops it and its Drop keeps the fence.
+            let restore_errors = restore_recovery_errors(
+                &restore_guard,
+                namespace,
+                vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+            );
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({
                     "error": "Config admission was lost during a failed restore clear after another writer acquired the namespace lease",
-                    "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
+                    "restore_errors": restore_errors,
                     "rollback": "not_needed_after_intervening_write",
                 }),
             ));
@@ -11152,7 +11993,7 @@ async fn handle_restore(
                 // receive an acknowledgement. Retain the fence across
                 // cancellation until an owner-qualified verification resolves
                 // that ambiguity.
-                restore_guard.retain_uncertain();
+                restore_guard.retain_restore_cleared();
                 let verification = db.count_namespace_resources(namespace).await;
                 if verification.is_err() {
                     error_persistence_failure_redacted(
@@ -11218,13 +12059,10 @@ async fn handle_restore(
     // transactions to keep WAL/redo size bounded.
     let import_operation = restore_guard.operation();
     let import_completion = match namespace_config_admission_guard
-        .run_to_completion_while_held(import_operation.run_mutation(persist_payload_resources(
-            db.as_ref(),
-            &payload,
-            namespace,
-            false,
-            &restore_mode,
-        )))
+        .run_to_completion_while_held(import_operation.run_restore_import(
+            persist_payload_resources(db.as_ref(), &payload, namespace, false, &restore_mode),
+            |(_, errors, _): &(PersistCounts, Vec<String>, bool)| errors.is_empty(),
+        ))
         .await
     {
         Ok(result) => result,
@@ -11244,21 +12082,13 @@ async fn handle_restore(
         } => {
             error_persistence_failure_redacted("restore_namespace_admission_lost_during_import");
             errors.insert(0, NAMESPACE_ADMISSION_LOST_MESSAGE.to_string());
+            restore_guard.retain_restore_import_failed();
             let lost_generation = namespace_config_admission_guard.generation();
-            if let Err(release_error) = restore_guard.release().await {
-                let response_error = redacted_recovery_error_message(
-                    "restore_guard_release_before_import_rollback",
-                    "Config admission was lost during restore import and the restore guard could not be released before rollback",
-                    &release_error,
-                );
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({
-                        "error": response_error,
-                        "restore_errors": errors,
-                    }),
-                ));
-            }
+            // As after a lost clear (issue #7062): the restore guard keeps the
+            // durable fence across the lease reacquisition and carries the
+            // rollback. Every early return below drops it in the failed-import
+            // phase, so its Drop retains the fence over the partially imported
+            // namespace.
             drop(namespace_config_admission_guard);
             let rollback_guard = match crud::lock_namespace_config_admission(db.clone(), namespace)
                 .await
@@ -11274,12 +12104,17 @@ async fn handle_restore(
                         StatusCode::SERVICE_UNAVAILABLE,
                         &json!({
                             "error": response_error,
-                            "restore_errors": errors,
+                            "restore_errors": restore_recovery_errors(&restore_guard, namespace, errors),
                         }),
                     ));
                 }
             };
             if !rollback_guard.immediately_succeeds_generation(lost_generation) {
+                errors.push(RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE.to_string());
+                error!(
+                    namespace = %namespace,
+                    "Restore: import rollback skipped after an intervening namespace lease; namespace admission guard retained for manual recovery"
+                );
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({
@@ -11289,25 +12124,6 @@ async fn handle_restore(
                     }),
                 ));
             }
-            restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace)
-                .await
-            {
-                Ok(guard) => guard,
-                Err(rollback_error) => {
-                    let response_error = redacted_recovery_error_message(
-                        "restore_guard_reacquire_for_import_rollback",
-                        "Config admission was reacquired after restore import, but the restore guard could not be reacquired",
-                        &rollback_error,
-                    );
-                    return Ok(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &json!({
-                            "error": response_error,
-                            "restore_errors": errors,
-                        }),
-                    ));
-                }
-            };
             let rollback = finish_failed_restore(
                 state,
                 db.clone(),
@@ -11334,7 +12150,14 @@ async fn handle_restore(
                         );
                         json_response(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            &json!({"error": response_error}),
+                            &json!({
+                                "error": response_error,
+                                "restore_errors": restore_recovery_errors(
+                                    &restore_guard,
+                                    namespace,
+                                    vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+                                ),
+                            }),
                         )
                     }
                 },
@@ -11403,6 +12226,23 @@ async fn handle_restore(
                 }
             },
         );
+    }
+
+    // Releases are driven by the recorded restore phase, so a successful
+    // import must have entered `ImportedOk`. Any other phase means the
+    // namespace may be half-restored: fail closed and keep the fence.
+    if !restore_guard.restore_phase_allows_release() {
+        error!(
+            namespace = %namespace,
+            "Restore: import outcome was not recorded as successful; namespace admission guard retained for manual recovery"
+        );
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({
+                "error": "Restore outcome requires manual verification; the namespace admission guard was retained",
+                "restore_errors": [RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE],
+            }),
+        ));
     }
 
     if let Err(_error) = restore_guard.release().await {
@@ -12463,48 +13303,85 @@ async fn handle_config_apply_status(
     ))
 }
 
+/// The response security headers every admin API response carries (issue
+/// #7074): `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and
+/// `X-Frame-Options: DENY`.
+///
+/// The policy is uniform on purpose, including Prometheus text, `401`, `304`
+/// and bodiless responses: the admin API is never meant to be framed, sniffed
+/// or cached, and a per-endpoint exception is how copies drift. A response
+/// builder sets them with [`with_admin_security_headers`]; whatever the
+/// dispatcher returns is then completed by
+/// [`insert_missing_admin_security_headers`] in [`handle_admin_request`], so a
+/// new endpoint that builds its own response still inherits the policy. A
+/// handler that needs a different `Cache-Control` sets it explicitly; the
+/// final pass only fills absent fields.
+pub(crate) fn with_admin_security_headers(
+    builder: hyper::http::response::Builder,
+) -> hyper::http::response::Builder {
+    builder
+        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(hyper::header::CACHE_CONTROL, "no-store")
+        .header(hyper::header::X_FRAME_OPTIONS, "DENY")
+}
+
+/// Insert each admin security header ([`with_admin_security_headers`]) that a
+/// response does not already carry. Existing values are left untouched.
+pub(crate) fn insert_missing_admin_security_headers(headers: &mut hyper::HeaderMap) {
+    headers
+        .entry(hyper::header::X_CONTENT_TYPE_OPTIONS)
+        .or_insert(HeaderValue::from_static("nosniff"));
+    headers
+        .entry(hyper::header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
+    headers
+        .entry(hyper::header::X_FRAME_OPTIONS)
+        .or_insert(HeaderValue::from_static("DENY"));
+}
+
 pub(in crate::admin) fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
     let body_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".into());
-    Response::builder()
+    with_admin_security_headers(Response::builder())
         .status(status)
         .header("Content-Type", "application/json")
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::from(body_str)))
-        .unwrap_or_else(|_| {
-            Response::new(Full::new(Bytes::from(
-                "{\"error\":\"Internal Server Error\"}",
-            )))
-        })
+        .unwrap_or_else(|_| admin_builder_failure_response())
 }
 
 pub(in crate::admin) fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
-    Response::builder()
+    with_admin_security_headers(Response::builder())
         .status(status)
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::new()))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+        .unwrap_or_else(|_| admin_builder_failure_response())
+}
+
+/// Last-resort answer when an admin `http::response::Builder` rejects a
+/// prepared response. `Response::new` defaults to `200 OK`, so a bare fallback
+/// would report an internal failure as success to automation and probes
+/// (#6775); this one is an explicit `500` with a fixed body.
+pub(crate) fn admin_builder_failure_response() -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from_static(
+        b"{\"error\":\"Internal Server Error\"}",
+    )));
+    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    let headers = response.headers_mut();
+    headers.insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+    insert_missing_admin_security_headers(headers);
+    response
 }
 
 /// JSON response with X-Data-Source: cached header to indicate stale/cached data.
 fn json_response_with_stale(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
     let body_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".into());
-    Response::builder()
+    with_admin_security_headers(Response::builder())
         .status(status)
         .header("Content-Type", "application/json")
         .header("X-Data-Source", "cached")
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::from(body_str)))
-        .unwrap_or_else(|_| {
-            Response::new(Full::new(Bytes::from(
-                "{\"error\":\"Internal Server Error\"}",
-            )))
-        })
+        .unwrap_or_else(|_| admin_builder_failure_response())
 }
 
 /// Body of the `503` a by-id read answers when the database read failed and

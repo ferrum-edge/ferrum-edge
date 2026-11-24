@@ -702,7 +702,8 @@ pub(crate) fn apply_to_generated_proxy(
     proxy: &mut Proxy,
     listen_port: u16,
 ) {
-    let (factor, posture, parent_refs) = resolve_for_route(acc, object, listen_port);
+    let (factor, posture, parent_refs) =
+        resolve_for_route(acc, object, &proxy.namespace, listen_port);
     // `None` out of the resolver is the dual-acknowledged `mode: Unlimited`
     // override. Encode it as the explicit `0` sentinel so
     // `Proxy::normalize_fields()` cannot later project the finite default over
@@ -720,14 +721,19 @@ pub(crate) fn apply_to_generated_proxy(
     }
 }
 
+/// `proxy_namespace` is the Gateway namespace the generated proxy lives in: a
+/// cross-namespace UDPRoute materializes one proxy per parent Gateway
+/// namespace, and each represents only the claims on that namespace's
+/// listeners.
 fn resolve_for_route(
     acc: &K8sAccumulator,
     object: &K8sObject,
+    proxy_namespace: &str,
     listen_port: u16,
 ) -> (Option<f32>, UdpAmplificationPosture, Vec<String>) {
     let matching: Vec<_> = gateway_api::udp_route_surviving_listener_claims(object, acc)
         .into_iter()
-        .filter(|claim| claim.port == listen_port)
+        .filter(|claim| claim.port == listen_port && claim.listener.namespace == proxy_namespace)
         .collect();
     if matching.is_empty() {
         return (

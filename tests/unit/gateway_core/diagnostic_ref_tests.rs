@@ -23,7 +23,7 @@
 //!   `fd1_` references keep resolving on the untagged store that minted them.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use ferrum_edge::diagnostic_ref::{
@@ -109,6 +109,7 @@ fn summary(status: u16, class: Option<ErrorClass>) -> TransactionSummary {
         timestamp_received: "2026-09-27T00:00:00Z".to_string(),
         client_ip: "203.0.113.7".to_string(),
         consumer_username: Some("alice".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         http_method: "POST".to_string(),
         request_path: "/orders/secret-path?token=abc".to_string(),
@@ -132,12 +133,13 @@ fn summary(status: u16, class: Option<ErrorClass>) -> TransactionSummary {
         error_class: class,
         body_error_class: None,
         body_completed: false,
+        response_delivery: Default::default(),
         bytes_sent: 0,
         bytes_received: 0,
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -1105,6 +1107,233 @@ fn error_response_classification_is_status_or_grpc_status() {
     assert!(!is_error_response(200, &grpc));
 }
 
+// ── gRPC-Web trailer-frame rejections (issue #7407) ─────────────────────────
+
+const GRPC_WEB_BASE_EXPOSE: &str = "grpc-status, grpc-message, grpc-status-details-bin";
+
+/// The head of a gateway-generated gRPC-Web error: HTTP `200`, the terminal
+/// `grpc-status` only in the body trailer frame, the base expose list.
+fn grpc_web_error_headers(content_type: &str) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    headers.insert("content-type", content_type.parse().unwrap());
+    headers.insert("x-grpc-web", "1".parse().unwrap());
+    headers.insert(
+        "access-control-expose-headers",
+        GRPC_WEB_BASE_EXPOSE.parse().unwrap(),
+    );
+    headers
+}
+
+fn grpc_web_rejected_slot(
+    phase: &str,
+    plugin: &str,
+    status: u16,
+) -> std::sync::Arc<DiagnosticSlot> {
+    let slot = DiagnosticSlot::shared();
+    slot.note_rejecting_plugin(plugin);
+    slot.record_rejection(
+        DiagnosticRejection::new(phase, slot.rejecting_plugin(), status).with_grpc_web_error(),
+    );
+    slot
+}
+
+fn expose_list(headers: &http::HeaderMap) -> Vec<String> {
+    headers
+        .get_all("access-control-expose-headers")
+        .iter()
+        .flat_map(|value| value.to_str().unwrap().split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect()
+}
+
+#[test]
+fn all_mode_stamps_grpc_web_trailer_frame_rejections_and_exposes_the_reference() {
+    let store = all_mode_store();
+    // The reject funnel records the normalized gRPC status (`200`) on most
+    // paths and the pre-translation HTTP status on others; both describe the
+    // same `200` gRPC-Web head.
+    for (content_type, recorded_status) in [
+        ("application/grpc-web+proto", 200u16),
+        ("application/grpc-web-text", 401),
+        ("Application/GRPC-Web", 200),
+    ] {
+        let slot = grpc_web_rejected_slot("authenticate", "key_auth", recorded_status);
+        let mut headers = grpc_web_error_headers(content_type);
+        headers.insert(DIAGNOSTIC_REF_HEADER, UNKNOWN_REF.parse().unwrap());
+        let stamped = stamp_response_headers(
+            &store,
+            Some(&slot),
+            DiagnosticProtocol::Http1,
+            200,
+            &mut headers,
+        )
+        .unwrap_or_else(|| panic!("{content_type}: a gRPC-Web rejection is referenced"));
+
+        let values: Vec<_> = headers.get_all(DIAGNOSTIC_REF_HEADER).iter().collect();
+        assert_eq!(values.len(), 1, "{content_type}: exactly one reference");
+        assert_eq!(values[0].to_str().unwrap(), stamped);
+        assert_eq!(
+            expose_list(&headers),
+            [
+                "grpc-status",
+                "grpc-message",
+                "grpc-status-details-bin",
+                DIAGNOSTIC_REF_HEADER
+            ],
+            "{content_type}: the base list is kept and the reference is exposed once"
+        );
+        let view = store.lookup_at(Instant::now(), &stamped).unwrap();
+        assert_eq!(view.status, 200, "{content_type}: bound to the wire head");
+        assert_eq!(view.gateway_error, None);
+    }
+}
+
+#[test]
+fn grpc_web_rejections_are_never_referenced_on_a_guess() {
+    let store = all_mode_store();
+    // No gRPC-Web error was recorded: a `200` gRPC-Web head (a translated
+    // backend response, a short-circuit answering OK) is not an error.
+    for slot in [
+        DiagnosticSlot::shared(),
+        plugin_rejected_slot("before_proxy", "request_termination", 200),
+    ] {
+        let mut headers = grpc_web_error_headers("application/grpc-web+proto");
+        let stamped = stamp_response_headers(
+            &store,
+            Some(&slot),
+            DiagnosticProtocol::Http2,
+            200,
+            &mut headers,
+        );
+        assert!(stamped.is_none(), "{headers:?}");
+        assert_eq!(
+            expose_list(&headers).len(),
+            3,
+            "the expose list is untouched"
+        );
+    }
+
+    // A recorded gRPC-Web error marks only a `200` gRPC-Web head.
+    let slot = grpc_web_rejected_slot("authenticate", "key_auth", 200);
+    let mut json = rejection_headers();
+    assert!(
+        stamp_response_headers(
+            &store,
+            Some(&slot),
+            DiagnosticProtocol::Http1,
+            200,
+            &mut json
+        )
+        .is_none(),
+        "a non-gRPC-Web 200 head is not the rejection's"
+    );
+    let mut later = grpc_web_error_headers("application/grpc-web");
+    assert!(
+        stamp_response_headers(
+            &store,
+            Some(&slot),
+            DiagnosticProtocol::Http1,
+            503,
+            &mut later
+        )
+        .is_none(),
+        "a head with another status replaced the rejection"
+    );
+
+    // A rejection answered with its own HTTP status (the client lost its
+    // gRPC-Web representation) keeps the ordinary rule.
+    let untranslated = grpc_web_rejected_slot("authenticate", "key_auth", 401);
+    let mut headers = rejection_headers();
+    assert!(
+        stamp_response_headers(
+            &store,
+            Some(&untranslated),
+            DiagnosticProtocol::Http1,
+            401,
+            &mut headers,
+        )
+        .is_some()
+    );
+    assert!(
+        !headers.contains_key("access-control-expose-headers"),
+        "only a gRPC-Web head gains the expose entry"
+    );
+
+    // `errors` mode keeps its token-only contract.
+    let errors = default_store();
+    let mut headers = grpc_web_error_headers("application/grpc-web+proto");
+    assert!(
+        stamp_response_headers(
+            &errors,
+            Some(&slot),
+            DiagnosticProtocol::Http1,
+            200,
+            &mut headers
+        )
+        .is_none()
+    );
+    assert_eq!(store.minted_total(), 1);
+    assert_eq!(errors.minted_total(), 0);
+}
+
+#[test]
+fn tokened_grpc_web_errors_expose_the_reference_once() {
+    let store = default_store();
+    // A gateway gRPC-Web error carrying `X-Gateway-Error`, with a configured
+    // CORS list that already names the reference in another spelling.
+    let mut headers = grpc_web_error_headers("application/grpc-web+proto");
+    headers.insert("x-gateway-error", "backend_timeout".parse().unwrap());
+    let stamped = stamp(&store, DiagnosticProtocol::Http2, 200, &mut headers);
+    assert!(stamped.is_some(), "the token marks the response");
+    assert_eq!(
+        expose_list(&headers).last().map(String::as_str),
+        Some(DIAGNOSTIC_REF_HEADER)
+    );
+
+    let mut already = grpc_web_error_headers("application/grpc-web");
+    already.insert("x-gateway-error", "backend_timeout".parse().unwrap());
+    already.insert(
+        "access-control-expose-headers",
+        "grpc-status, X-Ferrum-Diagnostic-Ref".parse().unwrap(),
+    );
+    assert!(stamp(&store, DiagnosticProtocol::Http1, 200, &mut already).is_some());
+    assert_eq!(
+        expose_list(&already),
+        ["grpc-status", DIAGNOSTIC_REF_HEADER]
+    );
+
+    // No expose field: nothing to extend, and none is invented.
+    let mut bare = http::HeaderMap::new();
+    bare.insert("content-type", "application/grpc-web".parse().unwrap());
+    bare.insert("x-gateway-error", "backend_timeout".parse().unwrap());
+    assert!(stamp(&store, DiagnosticProtocol::Http3, 200, &mut bare).is_some());
+    assert!(!bare.contains_key("access-control-expose-headers"));
+}
+
+#[test]
+fn grpc_web_response_classification_is_the_content_type_prefix() {
+    use ferrum_edge::diagnostic_ref::is_grpc_web_response;
+    for content_type in [
+        "application/grpc-web",
+        "application/grpc-web+proto",
+        "application/grpc-web-text",
+        "application/grpc-web-text+proto",
+        "APPLICATION/GRPC-WEB+json",
+    ] {
+        let headers = grpc_web_error_headers(content_type);
+        assert!(is_grpc_web_response(&headers), "{content_type}");
+    }
+    for content_type in [
+        "application/grpc",
+        "application/grpc+proto",
+        "application/json",
+    ] {
+        let headers = grpc_web_error_headers(content_type);
+        assert!(!is_grpc_web_response(&headers), "{content_type}");
+    }
+    assert!(!is_grpc_web_response(&http::HeaderMap::new()));
+}
+
 #[test]
 fn rejection_detail_carries_only_bounded_labels() {
     let plugin = DiagnosticRejection::new("authorize", Some("access_control"), 403);
@@ -1144,6 +1373,7 @@ fn rejection_detail_carries_only_bounded_labels() {
         "client_disconnect_buffered_h3_bridge_upload",
         "authorization_expired_buffered_grpc_upload",
         "invalid_h3_upload",
+        "gateway_closed_h3_upload",
     ] {
         let rejection = DiagnosticRejection::new(phase, None, 499);
         assert_eq!(rejection.phase, phase);
@@ -1417,12 +1647,52 @@ async fn rejection_log_funnel_records_the_rejecting_phase_and_plugin() {
     assert_eq!(rejection.phase, "circuit_breaker_open");
     assert_eq!(rejection.plugin, None);
 
+    // Issue #7158: every frontend names the open-breaker rejection
+    // `circuit_breaker_open`; the former H3-only `circuit_breaker` spelling is
+    // no longer a gateway phase and records as any unlisted label does.
+    let retired_slot = DiagnosticSlot::shared();
+    let retired_ctx = context_with_slot(&retired_slot);
+    log_rejection(&retired_ctx, 503, "circuit_breaker").await;
+    let rejection = retired_slot.rejection().expect("rejection recorded");
+    assert_eq!(rejection.phase, "other");
+
     // The recorded phase is a compiled-in label, whatever the caller passed.
     let unlisted_slot = DiagnosticSlot::shared();
     let unlisted_ctx = context_with_slot(&unlisted_slot);
     log_rejection(&unlisted_ctx, 500, "operator-configured-policy-name").await;
     let rejection = unlisted_slot.rejection().expect("rejection recorded");
     assert_eq!(rejection.phase, "other");
+}
+
+// Issues #7156 / #7157: the gateway-authored invalid-backend-path and missing
+// WebSocket upgrade 500s and the native-H3 mesh dispatch-required 502 are
+// logged under their own compiled-in phases, never `other`.
+#[tokio::test]
+async fn internal_error_exits_record_their_own_rejection_phase() {
+    for phase in [
+        ferrum_edge::diagnostic_ref::INVALID_BACKEND_PATH_PHASE,
+        ferrum_edge::diagnostic_ref::WEBSOCKET_UPGRADE_UNAVAILABLE_PHASE,
+        ferrum_edge::diagnostic_ref::MESH_TRANSPORT_DISPATCH_REQUIRED_PHASE,
+    ] {
+        let slot = DiagnosticSlot::shared();
+        let ctx = context_with_slot(&slot);
+        log_rejection(&ctx, 500, phase).await;
+        let rejection = slot.rejection().expect("rejection recorded");
+        assert_eq!(rejection.source, DiagnosticRejectionSource::Gateway);
+        assert_eq!(rejection.phase, phase);
+    }
+    assert_eq!(
+        ferrum_edge::diagnostic_ref::INVALID_BACKEND_PATH_PHASE,
+        "invalid_backend_path"
+    );
+    assert_eq!(
+        ferrum_edge::diagnostic_ref::WEBSOCKET_UPGRADE_UNAVAILABLE_PHASE,
+        "websocket_upgrade_unavailable"
+    );
+    assert_eq!(
+        ferrum_edge::diagnostic_ref::MESH_TRANSPORT_DISPATCH_REQUIRED_PHASE,
+        "mesh_transport_dispatch_required"
+    );
 }
 
 // Outside `all` mode a `4xx` rejection can never carry a reference (it has no

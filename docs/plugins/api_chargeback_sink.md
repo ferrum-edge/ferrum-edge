@@ -23,6 +23,23 @@ returns HTTP 200 or 204 **and** a complete, empty acknowledgement body with no
 HTTP status alone is never treated as proof of success: ClickHouse can return
 200 with an exception in the body, and incomplete drains are ambiguous.
 
+An exception reported under HTTP 200/204 is classified by its bounded numeric
+ClickHouse error code (from `X-ClickHouse-Exception-Code`, or from the
+`Code: <n>.` marker in the body when the header code is absent or unreadable).
+Known transient server conditions stay **retryable**, so the spool keeps the
+rows and replays them with unchanged event IDs after ClickHouse recovers:
+the codes ClickHouse's own client treats as retryable (`clickhouse-java`
+`ServerException`) — `UNEXPECTED_END_OF_FILE` (3), `FILE_DOESNT_EXIST` (107),
+`READONLY` (164), `TOO_MANY_SIMULTANEOUS_QUERIES` (202), `NO_FREE_CONNECTION`
+(203), `SOCKET_TIMEOUT` (209), `NETWORK_ERROR` (210), `MEMORY_LIMIT_EXCEEDED`
+(241), `TABLE_IS_READ_ONLY` (242), `TOO_MANY_PARTS` (252),
+`TOO_FEW_LIVE_REPLICAS` (285), `UNKNOWN_STATUS_OF_INSERT` (319),
+`SYSTEM_ERROR` (425), and `KEEPER_EXCEPTION` (999) — plus
+`ATTEMPT_TO_READ_AFTER_EOF` (32), `TIMEOUT_EXCEEDED` (159),
+`QUERY_WAS_CANCELLED` (394), and `CANNOT_SCHEDULE_TASK` (439). Every other code — and an exception whose code cannot be read — is
+**permanent** and isolated into dead-letter rows. Only the numeric code ever
+reaches diagnostics; the exception text is never logged or stored.
+
 Recommended async-insert settings wait for persistence:
 
 ```json
@@ -89,12 +106,22 @@ rejected set is the exact names `user`, `password`, `access_token`, and
 `passwd`, `secret`, or `token`.
 
 Use `clickhouse.username` together with `clickhouse.password_ref` instead.
+A nonempty `password_ref` **requires** a non-blank `clickhouse.username` — the
+password is only ever sent as that user's HTTP Basic password, so a reference
+without a username would be resolved and then silently discarded. An empty or
+whitespace-only `username` is rejected whether or not `password_ref` is set.
 `password_ref` names a `FERRUM_PLUGIN_SECRET_<NAME>` environment variable; the
 resolved value is sent as an HTTP Basic `Authorization` header, so it is never
 appended to a URL and never rendered in diagnostics. Because that header goes
 to the config-chosen `clickhouse.url`, any other variable — including every
 other `FERRUM_*` setting such as `FERRUM_ADMIN_JWT_SECRET` or `FERRUM_DB_URL` —
 is refused at admission.
+
+The names `database` and `query` (case-insensitive) are also reserved: the
+sink sets them itself from `clickhouse.database` and its fixed
+`INSERT INTO <table> FORMAT JSONEachRow` statement, and a second occurrence
+would leave the executed statement to ClickHouse's duplicate-parameter
+handling.
 
 Parameter *values* remain arbitrary bounded strings (ClickHouse settings are
 operator tuning), so the sink never renders the INSERT query string. Every
@@ -155,6 +182,35 @@ identity to land in another principal's row. The original of a digested value
 must be resolved at the identity provider; the gateway does not retain
 oversized credential-derived identities.
 
+**`consumer_id` is the principal, not the display name (GHSA-q9vj-rf66-3j58).**
+The transaction summary's `consumer_username` is the same string for a mapped
+Consumer `alice` and for an unmapped external principal `alice` verified by any
+external mechanism or provider, so it is never the billing key. A mapped
+Consumer's `consumer_id` is its username, unchanged. An unmapped external
+principal's is its namespaced key
+`external:<mechanism>:<authority>:<identity>`, where `<mechanism>` is the
+authentication plugin that verified it (for example `jwks_auth`) and
+`<authority>` is the opaque 64-hex digest of the verifying authority for
+mechanisms that accept more than one; either is `-` when absent (stream
+connections carry no realm). Two providers that issue the same subject
+therefore export two `consumer_id` values, and neither equals the Consumer's.
+An oversized or marker-bearing external key is stored in the digest form above,
+hashed under a separate domain from Consumer usernames, and a Consumer whose
+username itself begins with `external:` is always stored in digest form so it
+can never spell an external principal's `consumer_id`. `api_chargeback` keys its
+`/charges` rows the same way. External `consumer_id`s are only as fine-grained
+as the realm the mechanism commits: `soap_ws_security` currently commits no
+authority, so its principals are qualified by mechanism only
+(`external:soap_ws_security:-:<identity>`).
+
+Rows exported before this keying took effect — including rows still pending in
+the spool, which replay with their original bytes — carry bare display
+identities and are not realm-qualified, and a pre-upgrade bare value can equal a
+post-upgrade key. The shipped rollups group by `consumer_id` without the realm,
+so keep the eras separately attributable for the first realm-qualified rollout
+(a new `pricing_version`, which every rollup key includes, or a new table); see
+the upgrade guide.
+
 Delta emission, last-emitted bookkeeping, and stale-entry cleanup all use this
 same key. Display-name changes (consumer or proxy rename on reload) and
 distinct routes or protocols therefore produce separate snapshot rows instead of
@@ -205,7 +261,12 @@ only):
 
 - A new identity reserves one entry slot and its estimated retained bytes
   against the hard `max_entries`/`max_retained_bytes` ceilings (atomic CAS, no
-  global lock) **before** the key is published. Retained bytes are a single
+  global lock) **before** the key is published. The estimate charges every copy
+  the accumulator actually keeps for that identity's lifetime: the map key, the
+  entry's own metadata copy, and the last-emitted baseline key published by the
+  first committed emission (each identity string three times, plus the fixed
+  struct and map overhead), so the first emission never grows retained state
+  past budgets that admission already checked. Retained bytes are a single
   combined counter shared with staged overflow, so concurrent identity admission
   and overflow staging can never exceed the byte ceiling. A losing same-key
   inserter releases its reservation and refreshes the winner exactly once, so a
@@ -272,8 +333,9 @@ that same baseline. Thus one path, but never both, owns each pending delta.
 The periodic queue attempt may still be in flight during reload, but it uses
 the same event IDs as the durable spool rows, so aborting it cannot lose the
 delta and successful duplicate delivery cannot double-charge it. Repeated
-finalization is idempotent, and record hooks arriving after admission closes
-are ignored.
+finalization is idempotent. A record hook that arrives after admission closes
+(a request that outlived its generation) is not accumulated or spooled; each
+one is counted on `chargeback_sink_snapshot_late_charges_dropped_total`.
 
 Spool write failure leaves the generation unfinalized. After the bounded
 finalization deadline the sink reduces failed generations to a compact recovery
@@ -350,7 +412,11 @@ when serving starts.
 Admin, file-mode, and CP-DP admission share the OpenAPI
 `ApiChargebackSinkConfig` contract. It requires `config`, `clickhouse.url`, at
 least one valid pricing dimension, `spool.enabled` not disabled under snapshot
-mode, compatible `password_ref`/TLS settings, `clickhouse.tls.client_cert_file`
+mode, compatible `password_ref`/TLS settings, a non-blank `clickhouse.username`
+whenever `password_ref` is nonempty, a single-identifier `clickhouse.database`
+and a `clickhouse.table` of `table` or `database.table` (at most one dot), each
+part not starting with a digit, no reserved `database`/`query` names in `insert_query_params`, an enabled
+spool's `spool.max_bytes` of at least 1048576, `clickhouse.tls.client_cert_file`
 and `client_key_file` set together, and every numeric/length bound the
 constructor also enforces.
 
@@ -399,6 +465,16 @@ Apply the reference DDL before enabling the plugin:
 ```bash
 clickhouse-client < schemas/clickhouse/charges.sql
 ```
+
+> **Retention.** The reference DDL declares
+> `TTL toDateTime(received_at) + INTERVAL 13 MONTH` on `ferrum.charges_raw`, so
+> ClickHouse deletes raw charge events about 13 months after they are received.
+> The hourly/daily/monthly views read `charges_raw`, so they lose the same
+> history. If raw charges are your billing system of record, set the TTL your
+> record-keeping obligations require (or remove it) **before** the first apply:
+> the table is created with `CREATE TABLE IF NOT EXISTS`, so editing the file
+> and re-applying it later does not change an existing table's TTL — use
+> `ALTER TABLE ferrum.charges_raw MODIFY TTL ...` (or `REMOVE TTL`) instead.
 
 The DDL creates `ferrum.charges_raw` with `ReplacingMergeTree` idempotency on
 `event_id`, plus hourly, daily, and monthly views that read from
@@ -507,9 +583,8 @@ its ClickHouse default rather than written empty. The key is likewise omitted
 when the flag is `true` but the transaction carries no such metadata, so an
 absent column never distinguishes "disabled" from "unavailable".
 
-`request_id` reads the canonical `request_id` metadata first and falls back to
-the older `x-request-id` / `correlation_id` spellings only for custom plugins
-that predate the canonical contract. `trace_id` reads `trace_id` metadata first
+`request_id` reads the canonical `request_id` metadata (written by
+`correlation_id`); no other spelling is consulted. `trace_id` reads `trace_id` metadata first
 and falls back to the transaction's `traceparent` metadata. Disable either
 switch when the destination table has no such column, or when per-request
 identifiers must not be retained in the billing warehouse.
@@ -853,8 +928,14 @@ filename, and a lease horizon cannot prove otherwise.
 Within one process the exclusion is absolute: a live claim holds an in-memory
 lease, so no other accepted generation can mutate it. Across processes sharing a
 volume, the atomic rename provides exclusion while the live owner retains its
-descriptor. If the descriptor is lost through task abort or process failure,
-automatic recovery fails closed: the claim is left inert even after its deadline
+descriptor. A replay that is cancelled while it still owns that descriptor —
+the ordinary case when a reload retires a generation and aborts its replay
+worker mid-delivery — releases the claim through the same descriptor-bound
+release as a retryable failure before the descriptor is dropped, so the
+unchanged artifact (and its stable event IDs) returns to the replayable
+namespace for the replacement generation. If the descriptor is lost without
+that release (process failure, or a refused release), automatic recovery fails
+closed: the claim is left inert even after its deadline
 and must be reconciled by an operator who can establish its provenance. This
 trades unattended crash recovery for destination integrity; Ferrum never promotes
 an unproven pathname merely because its filename contains an `owner_tag`.
@@ -873,9 +954,9 @@ split, or skip a file:
 | Outcome | Status / cause | Replay behavior |
 | --- | --- | --- |
 | Delivered | HTTP 200 / 204 with a complete empty acknowledgement body and no exception header/markers | Remove the spool file after the accepted insert |
-| Retryable | network / timeout / TLS transport errors, incomplete acknowledgement drains, ambiguous non-empty 2xx bodies, HTTP 401, 403, 408, 429, 5xx, and other non-4xx failures | Keep the file, stop the current replay tick (newer files wait so order is preserved across transient outages) |
+| Retryable | network / timeout / TLS transport errors, incomplete acknowledgement drains, ambiguous non-empty 2xx bodies, HTTP 200/204 carrying a transient ClickHouse exception code (for example 159 `TIMEOUT_EXCEEDED` or 241 `MEMORY_LIMIT_EXCEEDED`), HTTP 401, 403, 408, 429, 5xx, and other non-4xx failures | Keep the file, stop the current replay tick (newer files wait so order is preserved across transient outages) |
 | Payload too large | HTTP 413 | Deterministically split the bounded replay batch (preferring `batch.size`, otherwise halving) without rewriting row bytes, so each event keeps its stable `event_id` idempotency identity. A single row that still returns 413 is durably dead-lettered |
-| Permanent | other HTTP 4xx (for example 400, 404, 409, 418, 422), or HTTP 200/204 whose body/`X-ClickHouse-Exception-Code` carries a ClickHouse exception | Deterministically bisect until minimal rejected rows are isolated, deliver good siblings, then durably hand the exact rejected rows to the private payload store and continue with newer spool files |
+| Permanent | other HTTP 4xx (for example 400, 404, 409, 418, 422), or HTTP 200/204 whose body/`X-ClickHouse-Exception-Code` carries a ClickHouse exception that is not one of the transient codes listed under [Durability Contract](#durability-contract) | Deterministically bisect until minimal rejected rows are isolated, deliver good siblings, then durably hand the exact rejected rows to the private payload store and continue with newer spool files |
 
 Replay batches are additionally capped at **128 rows** and **4 MiB**. A complete
 binary isolation tree therefore makes at most **255 HTTP attempts per batch**
@@ -987,25 +1068,21 @@ never evictable. Eviction applies the same ownership and stale-age test as
 reconciliation, so it can reclaim a crash-left temp but never unlink a peer
 generation's in-progress publish.
 
-### Migration and destination changes
+### Destination changes
 
 Ferrum never silently replays records it does not own to a newly configured
-destination. Two shapes are recognized and reported instead:
+destination. An **orphaned namespace** — a sibling `o<owner_digest>` directory
+left behind when the Ferrum namespace/ledger, ClickHouse endpoint, database, or
+table changed while the node id and plugin config id stayed the same — is
+reported instead.
 
-- **Pre-namespace (legacy) records** written directly under
-  `<spool.dir>/<node>/<YYYYMMDD>/`, which carry no ownership binding.
-- **Orphaned namespaces**: a sibling `o<owner_digest>` directory left behind when
-  the Ferrum namespace/ledger, ClickHouse endpoint, database, or table changed
-  while the node id and plugin config id stayed the same.
-
-Both are counted when the managed namespace is prepared (process start, or the
+Its records are counted when the managed namespace is prepared (process start, or the
 first tick after storage recovers) into `spool.unbound_files` /
 `spool.unbound_namespaces` in the status JSON, exported as
 `chargeback_sink_spool_unbound_files` and
 `chargeback_sink_spool_unbound_namespaces`, and logged with a rate-limited
 warning naming the counts and directories. The aggregate discovery pass shares
-one 100,000-entry traversal budget across the legacy tree and every sibling
-namespace; if that cap is reached, the warning sets `scan_truncated=true` and
+one 100,000-entry traversal budget across every sibling namespace; if that cap is reached, the warning sets `scan_truncated=true` and
 the exported counts are explicit lower bounds rather than performing unbounded
 work on a shared volume. They are **never** replayed, deleted, evicted, or
 rerouted. Reconciling them is an explicit operator action: either re-point the
@@ -1026,7 +1103,10 @@ probe is persistent operational evidence: status reports `spool.available=false`
 
 `spool.max_bytes` is a hard ceiling on **encoded** on-disk bytes owned by this
 sink under its managed namespace (after compression when `compression` is
-`zstd`). The budget and status/metrics count every retained file class:
+`zstd`). While spooling is enabled it must be at least **1048576** bytes. This
+is a policy floor, not a proof that every artifact fits: a smaller quota would
+refuse ordinary failed batches and snapshot chunks so often that neither
+spooling nor snapshot finalization could be relied on. The budget and status/metrics count every retained file class:
 
 - active data files (`*.ndjson` / `*.ndjson.zst`)
 - in-progress atomic-write temps (`*.write-<process_tag>-<generation>.tmp` and

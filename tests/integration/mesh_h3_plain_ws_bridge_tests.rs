@@ -563,9 +563,8 @@ fn shared_mesh_plain_helper_never_plaintext_falls_back() {
     );
     assert!(
         helper.contains("request_body_exceeded")
-            && helper.contains("streaming_h2_read_timeout_ms")
-            && helper.contains("h3_mesh_buffered_retry_response("),
-        "buffered H3 mesh dispatch must keep mesh-retry overflow and read-timeout fields"
+            && helper.contains("h3_mesh_buffered_retry_response(response, request_body_exceeded)"),
+        "buffered H3 mesh dispatch must keep the mesh-retry overflow field"
     );
     assert!(
         !helper.contains("proxy_to_backend_retry("),

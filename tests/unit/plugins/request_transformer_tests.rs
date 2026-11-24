@@ -1,7 +1,8 @@
 //! Tests for request_transformer plugin
 
 use ferrum_edge::plugins::{
-    HTTP_GRPC_PROTOCOLS, Plugin, RequestContext, priority, request_transformer::RequestTransformer,
+    HTTP_FAMILY_PROTOCOLS, Plugin, RequestContext, priority,
+    request_transformer::RequestTransformer,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -28,7 +29,8 @@ async fn test_request_transformer_creation() {
     .unwrap();
     assert_eq!(plugin.name(), "request_transformer");
     assert_eq!(plugin.priority(), priority::REQUEST_TRANSFORMER);
-    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
+    // Header/query rules also run on WebSocket handshakes (request_transformer-SOL-3).
+    assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
     assert!(plugin.modifies_request_headers());
     assert!(!plugin.modifies_request_body());
     assert!(!plugin.is_auth_plugin());
@@ -929,6 +931,9 @@ async fn test_request_transformer_modifies_request_headers_false_for_query_only(
 
 #[tokio::test]
 async fn test_request_transformer_modifies_request_headers_false_for_body_only() {
+    // Stale integrity fields are retired by proxy core over the final
+    // outbound headers, clone-on-write, so body rules no longer force a
+    // per-request header-map copy (PR #6858 review SOL-6).
     let plugin = RequestTransformer::new(&json!({
         "rules": [
             {"operation": "add", "target": "body", "key": "v", "value": "1"}
@@ -937,6 +942,16 @@ async fn test_request_transformer_modifies_request_headers_false_for_body_only()
     .unwrap();
     assert!(!plugin.modifies_request_headers());
     assert!(plugin.modifies_request_body());
+    assert!(!plugin.modifies_request_query());
+    // The context-aware body hook publishes the skip reason, so the H1/H2
+    // dispatcher must select it (PR #6858 review SOL-2).
+    assert!(plugin.needs_final_request_body_context());
+
+    let header_only = RequestTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "header", "key": "x-a", "value": "1"}]
+    }))
+    .unwrap();
+    assert!(!header_only.needs_final_request_body_context());
 }
 
 #[tokio::test]
@@ -1366,9 +1381,6 @@ fn test_request_transformer_overlay_gate_parsing() {
     use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
     use ferrum_edge::plugins::request_transformer::runtime_overlay;
 
-    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
-    runtime_overlay::reset_for_test();
-
     let mut fields = HashMap::new();
     fields.insert(
         "ferrum.request_transformer.public.enabled".to_string(),
@@ -1386,24 +1398,26 @@ fn test_request_transformer_overlay_gate_parsing() {
         "ferrum.request_transformer..enabled".to_string(),
         RuntimeValue::Bool(true),
     );
+    fields.insert(
+        "ferrum.response_transformer.public.enabled".to_string(),
+        RuntimeValue::Bool(true),
+    );
 
-    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
-    let snap = runtime_overlay::current_gates();
-    assert_eq!(snap.gate("public"), Some(false));
-    assert_eq!(snap.gate("internal"), Some(true));
-    assert_eq!(snap.gate("bad"), None);
-    assert_eq!(snap.gate(""), None);
-    assert_eq!(snap.gate("missing"), None);
+    let gates = runtime_overlay::scope_gates(&MeshRuntimeOverlay { fields });
+    assert_eq!(gates.get("public"), Some(&false));
+    assert_eq!(gates.get("internal"), Some(&true));
+    assert_eq!(gates.get("bad"), None);
+    assert_eq!(gates.get(""), None);
+    assert_eq!(gates.get("missing"), None);
+    assert_eq!(gates.len(), 2, "{gates:?}");
 
-    runtime_overlay::apply_overlay(&MeshRuntimeOverlay::default());
-    assert_eq!(runtime_overlay::current_gates().gate("public"), None);
+    assert!(runtime_overlay::scope_gates(&MeshRuntimeOverlay::default()).is_empty());
 }
 
 /// The gate is resolved from CONFIGURATION, not from live process-global state
 /// (GHSA-83rc-23c9-3g9x). Every case below therefore builds the instance from the
-/// effective config a mesh generation would have produced, and no case touches
-/// the process-global store — which is exactly the property being asserted: a
-/// store mutation cannot reach a constructed instance.
+/// effective config a mesh generation would have produced; there is no
+/// request-side process-global gate store for an instance to consult.
 ///
 /// Cross-generation and mid-request barriers live in
 /// `tests/integration/transformer_runtime_overlay_generation_tests.rs`.
@@ -1479,70 +1493,12 @@ async fn test_request_transformer_overlay_gate_resolves_from_effective_config() 
     );
 }
 
-/// A mutation of the process-global gate store must NOT change what an
-/// already-constructed instance does. This is the direct regression guard for the
-/// request-time lookup the advisory describes.
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn test_request_transformer_ignores_live_process_global_gate_mutations() {
-    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
-    use ferrum_edge::plugins::request_transformer::runtime_overlay;
-    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
-    runtime_overlay::reset_for_test();
-
-    // Built from a generation that resolved the gate to TRUE.
-    let plugin = RequestTransformer::new(&json!({
-        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
-        "runtime_overlay_scope": "gated",
-        "runtime_overlay_resolved_enabled": true
-    }))
-    .unwrap();
-
-    // Publish a CONTRADICTING gate into the live store, as a later accepted
-    // slice would. The instance must not observe it.
-    runtime_overlay::apply_overlay(&MeshRuntimeOverlay {
-        fields: HashMap::from([(
-            "ferrum.request_transformer.gated.enabled".to_string(),
-            RuntimeValue::Bool(false),
-        )]),
-    });
-
-    let mut headers: HashMap<String, String> = HashMap::new();
-    plugin.before_proxy(&mut make_ctx(), &mut headers).await;
-    assert_eq!(
-        headers.get("x-gated").map(String::as_str),
-        Some("yes"),
-        "a live store mutation must not reach an already-published instance"
-    );
-
-    // And the same in the other direction.
-    let disabled = RequestTransformer::new(&json!({
-        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
-        "runtime_overlay_scope": "gated",
-        "runtime_overlay_resolved_enabled": false
-    }))
-    .unwrap();
-    runtime_overlay::apply_overlay(&MeshRuntimeOverlay {
-        fields: HashMap::from([(
-            "ferrum.request_transformer.gated.enabled".to_string(),
-            RuntimeValue::Bool(true),
-        )]),
-    });
-    let mut headers: HashMap<String, String> = HashMap::new();
-    disabled.before_proxy(&mut make_ctx(), &mut headers).await;
-    assert!(
-        !headers.contains_key("x-gated"),
-        "a live store mutation must not enable an instance published as disabled"
-    );
-
-    runtime_overlay::reset_for_test();
-}
-
 #[test]
 fn test_request_transformer_disabled_generation_drops_mutation_and_buffering_capabilities() {
     let plugin = RequestTransformer::new(&json!({
         "rules": [
             {"operation": "add", "target": "header", "key": "X-Sanitized", "value": "yes"},
+            {"operation": "remove", "target": "query", "key": "debug"},
             {"operation": "remove", "target": "body", "key": "secret"}
         ],
         "runtime_overlay_scope": "gated",
@@ -1553,6 +1509,13 @@ fn test_request_transformer_disabled_generation_drops_mutation_and_buffering_cap
     assert!(
         !plugin.modifies_request_headers(),
         "a disabled generation must not force request-header cloning"
+    );
+    // request_transformer-claude-3: the query capability honors the same gate,
+    // so a disabled generation cannot trip later-than-dedup/cache composition
+    // refusals or early-route-total query accounting.
+    assert!(
+        !plugin.modifies_request_query(),
+        "a disabled generation must not advertise query mutation"
     );
     assert!(
         !plugin.modifies_request_body(),
@@ -1595,9 +1558,9 @@ async fn test_request_transformer_rejects_unknown_top_level_key() {
     }))
     .err()
     .expect("expected error for unknown top-level key");
-    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("unknown configuration key"), "got: {err}");
     assert!(err.contains("runtime_overlay_scpoe"), "got: {err}");
-    assert!(err.contains("under `config`"), "got: {err}");
+    assert!(err.contains("`config`: unknown"), "got: {err}");
 }
 
 #[tokio::test]
@@ -1615,7 +1578,7 @@ async fn test_request_transformer_rejects_unknown_header_rule_key() {
     }))
     .err()
     .expect("expected error for unknown header rule key");
-    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("unknown configuration key"), "got: {err}");
     assert!(err.contains("vaule"), "got: {err}");
     assert!(err.contains("config.rules[0]"), "got: {err}");
 }
@@ -2257,9 +2220,9 @@ async fn test_query_transform_does_not_log_secret_values() {
 }
 
 #[tokio::test]
-async fn test_query_rules_do_not_opt_into_decoded_h3_query_capability() {
-    // Query matching parses the retained raw/outbound query itself, so this
-    // plugin must not flip the shared pre-auth H3 decoded-query capability.
+async fn test_query_rules_do_not_declare_query_predicates() {
+    // Query matching parses the retained raw/outbound query itself; the
+    // transformer mutates the query rather than deciding on it.
     let with_query = RequestTransformer::new(&json!({
         "rules": [
             {"operation": "remove", "target": "query", "key": "token"}
@@ -2268,7 +2231,7 @@ async fn test_query_rules_do_not_opt_into_decoded_h3_query_capability() {
     .unwrap();
     assert!(
         !with_query.requires_decoded_query_params(),
-        "request_transformer must not force H3 pre-auth decoded query materialization"
+        "request_transformer query rules are mutations, not query predicates"
     );
 
     let header_only = RequestTransformer::new(&json!({
@@ -2278,96 +2241,6 @@ async fn test_query_rules_do_not_opt_into_decoded_h3_query_capability() {
     }))
     .unwrap();
     assert!(!header_only.requires_decoded_query_params());
-}
-
-#[tokio::test]
-async fn test_h3_raw_materialized_percent_encoded_query_name_transforms() {
-    // H3 pre-auth materialization keeps percent-encoded names in
-    // `ctx.query_params`. Ordered rules must still match the decoded name from
-    // the retained raw query and publish a decoded plugin-visible map afterward.
-    let plugin = RequestTransformer::new(&json!({
-        "rules": [
-            {"operation": "rename", "target": "query", "key": "api key", "new_key": "api_key"},
-            {"operation": "update", "target": "query", "key": "tag", "value": "green"}
-        ]
-    }))
-    .unwrap();
-    assert!(!plugin.requires_decoded_query_params());
-
-    let mut ctx = make_ctx();
-    ctx.set_raw_query_string("api%20key=secret&tag=red&keep=%ZZ".to_string());
-    ctx.materialize_query_params_raw();
-    assert_eq!(
-        ctx.query_params.get("api%20key").map(String::as_str),
-        Some("secret"),
-        "H3-style raw materialization must retain the percent-encoded name"
-    );
-    assert!(!ctx.query_params.contains_key("api key"));
-    assert_eq!(ctx.query_params.get("tag").map(String::as_str), Some("red"));
-
-    let mut headers = HashMap::new();
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
-
-    assert_eq!(
-        ctx.outbound_query_string(),
-        Some("api_key=secret&tag=green&keep=%ZZ")
-    );
-    assert!(!ctx.query_params.contains_key("api%20key"));
-    assert!(!ctx.query_params.contains_key("api key"));
-    assert_eq!(
-        ctx.query_params.get("api_key").map(String::as_str),
-        Some("secret")
-    );
-    assert_eq!(
-        ctx.query_params.get("tag").map(String::as_str),
-        Some("green")
-    );
-    // Unmodified keep pair stays in the decoded map with its lossy decode, while
-    // the outbound wire form retains the original invalid percent triplet.
-    assert_eq!(
-        ctx.query_params.get("keep").map(String::as_str),
-        Some("%ZZ")
-    );
-}
-
-#[tokio::test]
-async fn test_runtime_disabled_query_rules_preserve_h3_raw_preauth_map() {
-    // The gate rides the instance's effective config, so a runtime-disabled
-    // instance is one whose generation resolved the gate to false.
-    let plugin = RequestTransformer::new(&json!({
-        "rules": [
-            {"operation": "remove", "target": "query", "key": "token"}
-        ],
-        "runtime_overlay_scope": "gated",
-        "default_enabled": true,
-        "runtime_overlay_resolved_enabled": false
-    }))
-    .unwrap();
-    assert!(
-        !plugin.requires_decoded_query_params(),
-        "configured (even runtime-gated) query rules must not opt into decoded H3 materialization"
-    );
-
-    let mut ctx = make_ctx();
-    ctx.set_raw_query_string("tok%65n=secret&keep=1".to_string());
-    ctx.materialize_query_params_raw();
-    let pre_auth = ctx.query_params.clone();
-    assert_eq!(
-        pre_auth.get("tok%65n").map(String::as_str),
-        Some("secret"),
-        "pre-auth map must remain H3 raw while rules are runtime-disabled"
-    );
-    assert!(!pre_auth.contains_key("token"));
-
-    let mut headers = HashMap::new();
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
-
-    assert_eq!(ctx.outbound_query_string(), None);
-    assert_eq!(
-        ctx.query_params, pre_auth,
-        "runtime-disabled transformer must leave the H3 raw pre-auth map untouched"
-    );
-    assert!(!ctx.metadata.contains_key("ferrum:query_params_transformed"));
 }
 
 #[test]
@@ -2546,8 +2419,8 @@ fn json_and_untyped_uploads_keep_request_buffering() {
         "application/json; charset=utf-8",
         "application/merge-patch+json",
         // Framed gRPC `+json` satisfies `is_json_content_type`, so it stays
-        // buffered exactly as the transform treats it: declined only after the
-        // document parse fails.
+        // buffered exactly as the transform treats it: declined only after it
+        // has seen the bytes.
         "application/grpc+json",
     ] {
         let ctx = upload_ctx(Some(content_type));
@@ -2745,7 +2618,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         (
             json!({"rules": [{token: true}]}),
             "`config.rules[0]`",
-            "unknown config key",
+            "unknown configuration key",
         ),
         (
             json!({"rules": [{"target": 918273641}]}),
@@ -2761,5 +2634,1957 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
             assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Production-launch review fixes (request_transformer-SOL-*, -claude-*)
+// ---------------------------------------------------------------------------
+
+fn post_ctx() -> RequestContext {
+    RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test".to_string(),
+    )
+}
+
+/// Parse a JSON object into its members' raw lexemes, so assertions compare
+/// the exact bytes the backend receives rather than two values already rounded
+/// through the same `serde_json::Value` representation.
+fn raw_members(body: &[u8]) -> HashMap<String, String> {
+    let members: HashMap<String, Box<serde_json::value::RawValue>> =
+        serde_json::from_slice(body).expect("transformed body is a JSON object");
+    members
+        .into_iter()
+        .map(|(name, raw)| (name, raw.get().to_string()))
+        .collect()
+}
+
+#[tokio::test]
+async fn body_rewrite_preserves_lossy_number_lexemes_exactly() {
+    // request_transformer-SOL-1: removing an unrelated field re-serializes the
+    // whole document; numbers outside the 64-bit integer range and decimals
+    // beyond binary64 precision must reach the backend byte-for-byte.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let body = br#"{"id":18446744073709551617,"neg":-9223372036854775809,"pi":3.14159265358979323846264338327950288,"price":1.50,"tiny":2.5e-3,"zero":-0,"plain":42,"nested":[1.10,{"x":123456789012345678901234567890}],"debug":true}"#;
+    let out = plugin
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("the remove rule rewrites the body");
+    let members = raw_members(&out);
+    assert!(!members.contains_key("debug"));
+    assert_eq!(members["id"], "18446744073709551617");
+    assert_eq!(members["neg"], "-9223372036854775809");
+    assert_eq!(members["pi"], "3.14159265358979323846264338327950288");
+    assert_eq!(members["price"], "1.50");
+    assert_eq!(members["tiny"], "2.5e-3");
+    assert_eq!(members["zero"], "-0");
+    assert_eq!(members["plain"], "42");
+    assert_eq!(
+        members["nested"],
+        r#"[1.10,{"x":123456789012345678901234567890}]"#
+    );
+}
+
+#[tokio::test]
+async fn body_rename_and_update_keep_number_lexemes_where_they_land() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "body", "key": "amount", "new_key": "total"},
+            {"operation": "update", "target": "body", "key": "rate", "value": 5}
+        ]
+    }))
+    .unwrap();
+    let body = br#"{"amount":1.000000000000000000001,"rate":0.30000000000000000000001,"keep":98765432109876543210}"#;
+    let out = plugin
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("rename + update rewrite the body");
+    let members = raw_members(&out);
+    assert!(!members.contains_key("amount"));
+    assert_eq!(members["total"], "1.000000000000000000001");
+    assert_eq!(
+        members["rate"], "5",
+        "an overwritten number takes the rule value"
+    );
+    assert_eq!(members["keep"], "98765432109876543210");
+}
+
+#[tokio::test]
+async fn body_number_preservation_survives_stand_in_shaped_client_strings() {
+    // A client string shaped like a private stand-in stays a string AND no
+    // longer disables preservation of unrelated lossy numbers (PR #6858
+    // review SOL-4): the stand-in generation is chosen to be unused.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let body = br#"{"s":"\u0000ferrum-number-0:0","t":"\u0000ferrum-number-1:0","u":"\u0000ferrum-number:0","id":18446744073709551617,"pi":3.14159265358979323846264338327950288,"debug":true}"#;
+    let out = plugin
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("the remove rule rewrites the body");
+    let members = raw_members(&out);
+    assert!(!members.contains_key("debug"));
+    assert_eq!(members["s"], r#""\u0000ferrum-number-0:0""#);
+    assert_eq!(members["t"], r#""\u0000ferrum-number-1:0""#);
+    assert_eq!(members["u"], r#""\u0000ferrum-number:0""#);
+    assert_eq!(members["id"], "18446744073709551617");
+    assert_eq!(members["pi"], "3.14159265358979323846264338327950288");
+}
+
+fn integrity_headers(content_type: Option<&str>) -> HashMap<String, String> {
+    let mut headers: HashMap<String, String> = HashMap::new();
+    if let Some(content_type) = content_type {
+        headers.insert("content-type".to_string(), content_type.to_string());
+    }
+    headers.insert("content-digest".to_string(), "sha-256=:stale:".to_string());
+    headers.insert("Repr-Digest".to_string(), "sha-256=:stale:".to_string());
+    headers.insert("digest".to_string(), "SHA-256=stale".to_string());
+    headers.insert("content-md5".to_string(), "stale".to_string());
+    headers.insert("x-keep".to_string(), "1".to_string());
+    headers
+}
+
+fn retain_client_wire_headers(ctx: &mut RequestContext, headers: &HashMap<String, String>) {
+    let mut wire = http::HeaderMap::new();
+    for (name, value) in headers {
+        wire.insert(
+            http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value.parse::<http::HeaderValue>().unwrap(),
+        );
+    }
+    ctx.set_raw_headers(wire);
+}
+
+/// Run `before_proxy`, then the final-header boundary, retaining the pristine
+/// wire view as both frontends do. An unchanged map takes the no-copy path.
+async fn run_chain_then_retire(
+    plugins: &[&RequestTransformer],
+    ctx: &mut RequestContext,
+    inbound: HashMap<String, String>,
+) -> Option<HashMap<String, String>> {
+    retain_client_wire_headers(ctx, &inbound);
+    ctx.headers = inbound.clone();
+    let mut outbound = inbound.clone();
+    for plugin in plugins {
+        plugin.before_proxy(ctx, &mut outbound).await;
+    }
+    ctx.headers = inbound;
+    let mut owned = (outbound != ctx.headers).then_some(outbound);
+    ferrum_edge::_test_support::finalize_request_transformer_headers(ctx, &mut owned);
+    owned
+}
+
+/// Exercise both the ordinary H1/H2/H3 boundary and native H3's owned-map
+/// deferred boundary with the same behavioral assertions.
+fn finalize_body_rule_headers_on_surface(
+    ctx: &mut RequestContext,
+    outbound: &mut HashMap<String, String>,
+    in_map: bool,
+) {
+    if in_map {
+        ferrum_edge::_test_support::finalize_request_transformer_headers_in_map(ctx, outbound);
+    } else {
+        let mut owned = Some(std::mem::take(outbound));
+        ferrum_edge::_test_support::finalize_request_transformer_headers(ctx, &mut owned);
+        *outbound = owned.expect("an owned outbound map stays owned");
+    }
+}
+
+#[tokio::test]
+async fn body_skip_follows_later_header_and_route_content_type_relabels() {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let body = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let relabel_rule = json!({"operation": "update", "target": "header",
+        "key": "content-type", "value": "text/plain"});
+    let relabel = RequestTransformer::new(&json!({"rules": [relabel_rule.clone()]})).unwrap();
+    let raw: Vec<RawRouteHeaderTransformRule> =
+        serde_json::from_value(json!([relabel_rule])).unwrap();
+    let route_rules = Arc::new(parse_route_header_transforms(&raw, "test").unwrap());
+
+    for in_map in [false, true] {
+        for via_route in [false, true] {
+            let mut ctx = post_ctx();
+            let mut outbound =
+                HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+            retain_client_wire_headers(&mut ctx, &outbound);
+            body.before_proxy(&mut ctx, &mut outbound).await;
+            assert!(!ctx.metadata.contains_key(BODY_SKIPPED_METADATA_KEY));
+            if via_route {
+                ctx.route_override_request_transform = Some(route_rules.clone());
+                finalize_route_override_request_headers(&mut ctx, &mut outbound);
+            } else {
+                relabel.before_proxy(&mut ctx, &mut outbound).await;
+            }
+            // No digest and no body-hook call: this request streams after the
+            // final header relabel, but must still explain the skipped pass.
+            finalize_body_rule_headers_on_surface(&mut ctx, &mut outbound, in_map);
+            assert_eq!(
+                ctx.metadata
+                    .get(BODY_SKIPPED_METADATA_KEY)
+                    .map(String::as_str),
+                Some("non_json_content_type"),
+                "in_map={in_map}, via_route={via_route}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn body_skip_is_reconsidered_after_deferred_header_relabels() {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let body = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let relabel = RequestTransformer::new(&json!({"rules": [
+        {"operation": "update", "target": "header", "key": "content-type", "value": "application/json"}
+    ]}))
+    .unwrap();
+    for in_map in [false, true] {
+        let mut ctx = post_ctx();
+        let mut outbound = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+        body.before_proxy(&mut ctx, &mut outbound).await;
+        finalize_body_rule_headers_on_surface(&mut ctx, &mut outbound, in_map);
+        assert_eq!(
+            ctx.metadata
+                .get(BODY_SKIPPED_METADATA_KEY)
+                .map(String::as_str),
+            Some("non_json_content_type")
+        );
+        relabel.before_proxy(&mut ctx, &mut outbound).await;
+        finalize_body_rule_headers_on_surface(&mut ctx, &mut outbound, in_map);
+        assert!(!ctx.metadata.contains_key(BODY_SKIPPED_METADATA_KEY));
+
+        for (bytes, reason) in [
+            (b"not json".as_slice(), "parse_error"),
+            (b"{}".as_slice(), "no_rule_applied"),
+        ] {
+            assert!(
+                body.transform_request_body_with_context(
+                    &mut ctx,
+                    bytes,
+                    Some("application/json"),
+                    &outbound,
+                )
+                .await
+                .is_none()
+            );
+            for content_type in ["text/plain", "application/json"] {
+                outbound.insert("content-type".to_string(), content_type.to_string());
+                finalize_body_rule_headers_on_surface(&mut ctx, &mut outbound, in_map);
+                assert_eq!(
+                    ctx.metadata
+                        .get(BODY_SKIPPED_METADATA_KEY)
+                        .map(String::as_str),
+                    Some(reason),
+                    "in_map={in_map}, content_type={content_type}"
+                );
+            }
+        }
+    }
+}
+
+async fn assert_egress_overlay_preserves_body_outcome(bytes: &[u8], expected_skip: Option<&str>) {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let body = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    for in_map in [false, true] {
+        for overlay_type in ["text/plain", "application/json"] {
+            let mut ctx = post_ctx();
+            let mut outbound =
+                HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+            retain_client_wire_headers(&mut ctx, &outbound);
+            ctx.headers = outbound.clone();
+            body.before_proxy(&mut ctx, &mut outbound).await;
+            finalize_body_rule_headers_on_surface(&mut ctx, &mut outbound, in_map);
+            let replacement = body
+                .transform_request_body_with_context(
+                    &mut ctx,
+                    bytes,
+                    Some("application/json"),
+                    &outbound,
+                )
+                .await;
+            if expected_skip.is_none() {
+                let replacement = replacement.expect("the body rule must replace the body");
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&replacement).unwrap(),
+                    json!({"keep": true})
+                );
+            } else {
+                assert!(replacement.is_none());
+            }
+            assert_eq!(
+                ctx.metadata
+                    .get(BODY_SKIPPED_METADATA_KEY)
+                    .map(String::as_str),
+                expected_skip
+            );
+
+            // Exercise the actual post-body overlay boundaries, including the
+            // H1/H2 path that first materializes an owned outbound map here.
+            // JSON overlays must still retire newly introduced digests.
+            let overlay = integrity_headers(Some(overlay_type));
+            if in_map {
+                ferrum_edge::_test_support::apply_finalized_request_egress_header_overlay_in_map(
+                    &[],
+                    &ctx,
+                    &mut outbound,
+                    overlay,
+                    &[],
+                );
+            } else {
+                let mut owned = None;
+                ferrum_edge::_test_support::apply_finalized_request_egress_header_overlay(
+                    &[],
+                    &mut ctx,
+                    &mut owned,
+                    overlay,
+                    &[],
+                );
+                outbound = owned.expect("the overlay must materialize an outbound map");
+            }
+            assert_eq!(
+                outbound.get("content-type").map(String::as_str),
+                Some(overlay_type)
+            );
+            assert_eq!(
+                ctx.metadata
+                    .get(BODY_SKIPPED_METADATA_KEY)
+                    .map(String::as_str),
+                expected_skip,
+                "in_map={in_map}, overlay_type={overlay_type}"
+            );
+            if overlay_type == "application/json" {
+                for name in ["content-digest", "Repr-Digest", "digest", "content-md5"] {
+                    assert!(!outbound.contains_key(name), "{name}, in_map={in_map}");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn egress_header_relabel_preserves_body_parse_error() {
+    assert_egress_overlay_preserves_body_outcome(b"not json", Some("parse_error")).await;
+}
+
+#[tokio::test]
+async fn egress_header_relabel_preserves_body_no_rule_outcome() {
+    assert_egress_overlay_preserves_body_outcome(b"{}", Some("no_rule_applied")).await;
+}
+
+#[tokio::test]
+async fn egress_header_relabel_does_not_resurrect_skip_after_body_replacement() {
+    assert_egress_overlay_preserves_body_outcome(br#"{"debug":true,"keep":true}"#, None).await;
+}
+
+#[tokio::test]
+async fn body_skip_requires_an_enabled_body_rule_instance() {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    for config in [
+        json!({"rules": [{"operation": "remove", "target": "header", "key": "x-unused"}]}),
+        json!({"rules": [{"operation": "remove", "target": "body", "key": "debug"}],
+            "runtime_overlay_scope": "disabled", "default_enabled": false}),
+    ] {
+        let plugin = RequestTransformer::new(&config).unwrap();
+        let mut ctx = post_ctx();
+        let outbound =
+            run_chain_then_retire(&[&plugin], &mut ctx, integrity_headers(Some("text/plain")))
+                .await;
+        assert!(outbound.is_none(), "no digest retirement or header copy");
+        assert!(!ctx.metadata.contains_key(BODY_SKIPPED_METADATA_KEY));
+    }
+}
+
+#[tokio::test]
+async fn digest_retirement_uses_client_framing_on_each_dispatch_surface() {
+    let body = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    for in_map in [false, true] {
+        for (client_length, backend_length, retired) in [
+            (Some("2"), Some("0"), true),
+            (None, Some("0"), true),
+            (Some("0"), None, false),
+            (Some("0"), Some("2"), false),
+        ] {
+            let mut ctx = post_ctx();
+            let mut outbound = integrity_headers(Some("application/json"));
+            if let Some(length) = client_length {
+                outbound.insert("content-length".to_string(), length.to_string());
+            }
+            retain_client_wire_headers(&mut ctx, &outbound);
+            body.before_proxy(&mut ctx, &mut outbound).await;
+            // Other hooks / finalized-egress overlays can mutate the map;
+            // request_transformer itself forbids authoring Content-Length.
+            if let Some(length) = backend_length {
+                outbound.insert("content-length".to_string(), length.to_string());
+            } else {
+                outbound.remove("content-length");
+            }
+            // Even the materialized view can change; only the wire snapshot
+            // can prove the original client framing.
+            ctx.headers = outbound.clone();
+            finalize_body_rule_headers_on_surface(&mut ctx, &mut outbound, in_map);
+            for name in ["content-digest", "Repr-Digest", "digest", "content-md5"] {
+                assert_eq!(
+                    !outbound.contains_key(name),
+                    retired,
+                    "{name}, in_map={in_map}, client={client_length:?}, backend={backend_length:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn uncertain_client_framing_cannot_exempt_digest_retirement() {
+    let body = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    for in_map in [false, true] {
+        for uncertain in [
+            "missing_snapshot",
+            "transfer_encoding",
+            "duplicate_length",
+            "invalid_length",
+        ] {
+            let mut ctx = post_ctx();
+            let mut outbound = integrity_headers(Some("application/json"));
+            outbound.insert("content-length".to_string(), "0".to_string());
+            if uncertain != "missing_snapshot" {
+                let mut wire = http::HeaderMap::new();
+                wire.insert("content-length", http::HeaderValue::from_static("0"));
+                match uncertain {
+                    "transfer_encoding" => {
+                        wire.insert(
+                            "transfer-encoding",
+                            http::HeaderValue::from_static("chunked"),
+                        );
+                    }
+                    "duplicate_length" => {
+                        wire.append("content-length", http::HeaderValue::from_static("0"));
+                    }
+                    "invalid_length" => {
+                        wire.append(
+                            "content-length",
+                            http::HeaderValue::from_bytes(b"\xff").unwrap(),
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                ctx.set_raw_headers(wire);
+            }
+            body.before_proxy(&mut ctx, &mut outbound).await;
+            finalize_body_rule_headers_on_surface(&mut ctx, &mut outbound, in_map);
+            assert!(!outbound.contains_key("content-digest"), "{uncertain}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn body_rules_retire_stale_request_integrity_headers_over_final_headers() {
+    // request_transformer-SOL-2: a digest computed over the client's bytes
+    // must not reach the backend beside a body the rules may rewrite.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "body", "key": "gateway_added", "value": true}]
+    }))
+    .unwrap();
+    for content_type in [
+        Some("application/json"),
+        Some("application/vnd.api+json"),
+        None,
+    ] {
+        let mut ctx = post_ctx();
+        let outbound = run_chain_then_retire(&[&plugin], &mut ctx, integrity_headers(content_type))
+            .await
+            .expect("the retirement materializes an outbound copy");
+        for stale in ["content-digest", "Repr-Digest", "digest", "content-md5"] {
+            assert!(
+                !outbound.contains_key(stale),
+                "{stale} must be removed for {content_type:?}"
+            );
+            // The original inbound view is never mutated.
+            assert!(ctx.headers.contains_key(stale));
+        }
+        assert_eq!(outbound.get("x-keep").map(String::as_str), Some("1"));
+    }
+}
+
+#[tokio::test]
+async fn digest_retirement_follows_a_later_content_type_rewrite() {
+    // PR #6858 review SOL-1: a later header-only instance turns a declared
+    // `text/plain` upload into JSON the body rules then rewrite. The decision
+    // is taken over the FINAL headers, so the digest is still retired.
+    let body = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let relabel = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "content-type", "value": "application/json"}]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx();
+    let outbound = run_chain_then_retire(
+        &[&body, &relabel],
+        &mut ctx,
+        integrity_headers(Some("text/plain")),
+    )
+    .await
+    .expect("the relabel produced an outbound copy");
+    assert_eq!(
+        outbound.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    assert!(!outbound.contains_key("content-digest"));
+    assert!(!outbound.contains_key("content-md5"));
+
+    // Without the relabel the declared non-JSON upload keeps its digest.
+    let mut ctx = post_ctx();
+    let outbound =
+        run_chain_then_retire(&[&body], &mut ctx, integrity_headers(Some("text/plain"))).await;
+    assert!(outbound.is_none(), "nothing to retire, nothing copied");
+}
+
+#[tokio::test]
+async fn integrity_headers_survive_when_body_rules_cannot_rewrite() {
+    let body_plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "body", "key": "gateway_added", "value": true}]
+    }))
+    .unwrap();
+
+    // A body proven empty by `Content-Length: 0` is never rewritten.
+    let mut ctx = make_ctx();
+    let mut inbound = integrity_headers(None);
+    inbound.insert("content-length".to_string(), "0".to_string());
+    let outbound = run_chain_then_retire(&[&body_plugin], &mut ctx, inbound).await;
+    assert!(outbound.is_none());
+
+    // Framed gRPC JSON can never parse as one document.
+    let mut ctx = post_ctx();
+    let outbound = run_chain_then_retire(
+        &[&body_plugin],
+        &mut ctx,
+        integrity_headers(Some("application/grpc+json")),
+    )
+    .await;
+    assert!(outbound.is_none());
+
+    // Header-only rules never touch the body.
+    let header_plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "header", "key": "x-a", "value": "1"}]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx();
+    let outbound = run_chain_then_retire(
+        &[&header_plugin],
+        &mut ctx,
+        integrity_headers(Some("application/json")),
+    )
+    .await
+    .expect("the header rule produced an outbound copy");
+    assert!(outbound.contains_key("content-digest"));
+}
+
+#[tokio::test]
+async fn requests_without_integrity_fields_take_the_no_copy_path() {
+    // PR #6858 review SOL-6: a JSON request with no digest allocates no
+    // outbound copy and no per-request plugin state for the retirement.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let mut inbound: HashMap<String, String> = HashMap::new();
+    inbound.insert("content-type".to_string(), "application/json".to_string());
+    let mut ctx = post_ctx();
+    let outbound = run_chain_then_retire(&[&plugin], &mut ctx, inbound).await;
+    assert!(outbound.is_none());
+}
+
+#[test]
+fn admission_refuses_path_param_assertion_destinations() {
+    // request_transformer-claude-1: the router's `x-path-param-*` captures
+    // are gateway assertions nothing re-asserts after `before_proxy`.
+    for destination in [
+        "x-path-param-account",
+        "X-Path-Param-Id",
+        "X_Path_Param_Account",
+        "x_path-param-tenant",
+    ] {
+        for operation in ["add", "update", "rename"] {
+            let rule = if operation == "rename" {
+                json!({"target": "header", "operation": operation,
+                    "key": "x-legacy-account", "new_key": destination})
+            } else {
+                json!({"target": "header", "operation": operation,
+                    "key": destination, "value": "forged"})
+            };
+            let error = RequestTransformer::new(&json!({"rules": [rule]}))
+                .err()
+                .expect("an x-path-param-* destination must fail admission");
+            assert!(
+                error.contains("`rule[0]`"),
+                "{operation} {destination}: {error}"
+            );
+            assert!(
+                error.contains("`x-path-param-*`"),
+                "{operation} {destination}: {error}"
+            );
+        }
+        for rule in [
+            json!({"target": "header", "operation": "remove", "key": destination}),
+            json!({"target": "header", "operation": "rename",
+                "key": destination, "new_key": "x-captured"}),
+        ] {
+            assert!(RequestTransformer::new(&json!({"rules": [rule]})).is_ok());
+        }
+    }
+    for destination in ["x-path-param", "x-path-params-id"] {
+        let config = json!({"rules": [
+            {"target": "header", "operation": "add", "key": destination, "value": "v"}
+        ]});
+        assert!(
+            RequestTransformer::new(&config).is_ok(),
+            "{destination} is outside the route-capture namespace"
+        );
+    }
+}
+
+#[test]
+fn admission_refuses_underscore_spellings_of_gateway_owned_destinations() {
+    // request_transformer-claude-2: CGI-style backends fold `_` onto `-`, so
+    // the underscore spelling lands on the gateway-owned variable.
+    for destination in [
+        "X_Forwarded_For",
+        "x_forwarded_proto",
+        "x_forwarded-host",
+        "content_length",
+        "Transfer_Encoding",
+        "proxy_authorization",
+        "keep_alive",
+        "proxy_connection",
+        "x_ferrum_original_content_encoding",
+        "x_grpc_web_mode",
+    ] {
+        for operation in ["add", "update", "rename"] {
+            let rule = if operation == "rename" {
+                json!({"target": "header", "operation": operation,
+                    "key": "x-origin-ip", "new_key": destination})
+            } else {
+                json!({"target": "header", "operation": operation,
+                    "key": destination, "value": "client-chosen"})
+            };
+            let error = RequestTransformer::new(&json!({"rules": [rule]}))
+                .err()
+                .expect("a folded gateway-owned destination must fail admission");
+            assert!(
+                error.contains(&destination.to_ascii_lowercase()),
+                "{operation} {destination}: {error}"
+            );
+            assert!(
+                error.contains("gateway-owned"),
+                "{operation} {destination}: {error}"
+            );
+        }
+        for rule in [
+            json!({"target": "header", "operation": "remove", "key": destination}),
+            json!({"target": "header", "operation": "rename",
+                "key": destination, "new_key": "x-captured"}),
+        ] {
+            assert!(RequestTransformer::new(&json!({"rules": [rule]})).is_ok());
+        }
+    }
+}
+
+#[test]
+fn body_paths_with_empty_segments_fail_admission() {
+    // request_transformer-claude-4.
+    for key in ["", "user.", ".user", "a..b", "a.\\\\."] {
+        for rule in [
+            json!({"operation": "add", "target": "body", "key": key, "value": "x"}),
+            json!({"operation": "update", "target": "body", "key": key, "value": "x"}),
+            json!({"operation": "remove", "target": "body", "key": key}),
+            json!({"operation": "rename", "target": "body", "key": key, "new_key": "moved"}),
+            json!({"operation": "rename", "target": "body", "key": "source", "new_key": key}),
+        ] {
+            let error = RequestTransformer::new(&json!({"rules": [rule]}))
+                .err()
+                .unwrap_or_else(|| panic!("empty segment in {key:?} must fail admission"));
+            assert!(error.contains("empty path segment"), "{key:?}: {error}");
+        }
+    }
+    // Escaped literal dots are single non-empty segments.
+    for key in ["meta.weird\\.key", "trailing\\.", "\\.leading"] {
+        assert!(
+            RequestTransformer::new(&json!({"rules": [
+                {"operation": "update", "target": "body", "key": key, "value": "x"}
+            ]}))
+            .is_ok(),
+            "{key:?} has no empty segment"
+        );
+    }
+}
+
+#[tokio::test]
+async fn header_and_query_values_resolve_bounded_template_variables() {
+    // request_transformer-claude-5.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "x-user-copy", "value": "$(consumer.username)"},
+            {"operation": "add", "target": "header", "key": "x-client", "value": "ip=$(client_ip)"},
+            {"operation": "update", "target": "header", "key": "x-req", "value": "$(request_id)"},
+            {"operation": "update", "target": "header", "key": "x-tenant-copy", "value": "t-$(header.x-tenant)-$(query.region)"},
+            {"operation": "add", "target": "header", "key": "x-literal", "value": "cost $$(5) $ ok"},
+            {"operation": "add", "target": "query", "key": "tenant", "value": "$(header.x-tenant)"}
+        ]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.identified_consumer = Some(std::sync::Arc::new(
+        super::plugin_utils::create_test_consumer(),
+    ));
+    ctx.metadata
+        .insert("request_id".to_string(), "req-123".to_string());
+    ctx.set_raw_query_string("region=eu%2Dwest".to_string());
+    // Header sources resolve from the ORIGINAL client headers.
+    ctx.headers
+        .insert("x-tenant".to_string(), "acme".to_string());
+    let mut headers = ctx.headers.clone();
+
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_eq!(
+        headers.get("x-user-copy").map(String::as_str),
+        Some("testuser")
+    );
+    assert_eq!(
+        headers.get("x-client").map(String::as_str),
+        Some("ip=127.0.0.1")
+    );
+    assert_eq!(headers.get("x-req").map(String::as_str), Some("req-123"));
+    assert_eq!(
+        headers.get("x-tenant-copy").map(String::as_str),
+        Some("t-acme-eu-west")
+    );
+    assert_eq!(
+        headers.get("x-literal").map(String::as_str),
+        Some("cost $(5) $ ok")
+    );
+    let outbound = ctx.outbound_query_string().expect("query rule published");
+    assert!(outbound.contains("tenant=acme"), "{outbound}");
+    assert!(
+        !ctx.metadata
+            .contains_key(ferrum_edge::plugins::request_transformer::RULE_SKIPPED_METADATA_KEY)
+    );
+}
+
+#[tokio::test]
+async fn unresolvable_or_unsafe_templates_skip_the_rule_and_say_why() {
+    use ferrum_edge::plugins::request_transformer::RULE_SKIPPED_METADATA_KEY;
+
+    // Missing variable: no consumer, no partial value.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "x-user", "value": "user=$(consumer.username)"}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(!headers.contains_key("x-user"));
+    assert_eq!(
+        ctx.metadata
+            .get(RULE_SKIPPED_METADATA_KEY)
+            .map(String::as_str),
+        Some("template_unresolved")
+    );
+
+    // A decoded query value carrying CR/LF never becomes a header value.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "x-region", "value": "$(query.region)"}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("region=eu%0D%0AX-Injected:%201".to_string());
+    let mut headers: HashMap<String, String> = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(!headers.contains_key("x-region"));
+    assert!(!headers.contains_key("x-injected"));
+    assert_eq!(
+        ctx.metadata
+            .get(RULE_SKIPPED_METADATA_KEY)
+            .map(String::as_str),
+        Some("template_invalid_header_value")
+    );
+
+    // An authentication-owned query credential is never a template source,
+    // even under an innocuous name the classifier would not flag.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "x-copied", "value": "$(query.locale)"}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("locale=s3cr3t".to_string());
+    ctx.metadata.insert(
+        "auth.strip_query_param.locale".to_string(),
+        "true".to_string(),
+    );
+    let mut headers: HashMap<String, String> = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(!headers.contains_key("x-copied"));
+    assert_eq!(
+        ctx.metadata
+            .get(RULE_SKIPPED_METADATA_KEY)
+            .map(String::as_str),
+        Some("template_unresolved")
+    );
+}
+
+#[test]
+fn malformed_or_credential_templates_fail_admission() {
+    for (value, reason) in [
+        ("$(nope)", "unknown template variable"),
+        ("$(consumer.username", "unterminated"),
+        ("$(header.authorization)", "credential-bearing header"),
+        ("$(header.Cookie)", "credential-bearing header"),
+        // Any delimiter spelling of a credential header, and any name the
+        // shared sensitive-name classifier flags (PR #6858 review SOL-3).
+        ("$(header.x_api_key)", "credential-bearing header"),
+        ("$(header.X_Auth_Token)", "credential-bearing header"),
+        ("$(header.x-session-secret)", "credential-bearing header"),
+        ("$(query.api_key)", "credential-bearing query parameter"),
+        (
+            "$(query.access_token)",
+            "credential-bearing query parameter",
+        ),
+        ("$(query.password)", "credential-bearing query parameter"),
+        ("$(header.bad name)", "valid HTTP header"),
+        ("$(query.)", "must name a query parameter"),
+        (
+            "$(client_ip)$(client_ip)$(client_ip)$(client_ip)$(client_ip)$(client_ip)$(client_ip)$(client_ip)$(client_ip)",
+            "more than 8 template variables",
+        ),
+    ] {
+        for target in ["header", "query"] {
+            let error = RequestTransformer::new(&json!({"rules": [
+                {"operation": "update", "target": target, "key": "x-dest", "value": value}
+            ]}))
+            .err()
+            .unwrap_or_else(|| panic!("{target} value {value:?} must fail admission"));
+            assert!(error.contains(reason), "{target} {value:?}: {error}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn body_non_application_publishes_a_value_free_reason() {
+    // request_transformer-claude-6.
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "internal.secret"}]
+    }))
+    .unwrap();
+    let headers: HashMap<String, String> = HashMap::new();
+
+    let mut ctx = post_ctx();
+    let out = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            b"{not json SENSITIVE",
+            Some("application/json"),
+            &headers,
+        )
+        .await;
+    assert!(out.is_none());
+    assert_eq!(
+        ctx.metadata
+            .get(BODY_SKIPPED_METADATA_KEY)
+            .map(String::as_str),
+        Some("parse_error")
+    );
+
+    let mut ctx = post_ctx();
+    let out = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            br#"{"internal":{"other":"SENSITIVE"}}"#,
+            Some("application/json"),
+            &headers,
+        )
+        .await;
+    assert!(out.is_none());
+    assert_eq!(
+        ctx.metadata
+            .get(BODY_SKIPPED_METADATA_KEY)
+            .map(String::as_str),
+        Some("no_rule_applied")
+    );
+
+    let mut ctx = post_ctx();
+    let out = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            br#"{"internal":{"secret":"SENSITIVE"}}"#,
+            Some("application/json"),
+            &headers,
+        )
+        .await;
+    assert!(out.is_some());
+    assert!(!ctx.metadata.contains_key(BODY_SKIPPED_METADATA_KEY));
+
+    // A declared non-JSON upload is reported at the final-header boundary,
+    // before the streaming path skips the body hook entirely.
+    let mut ctx = post_ctx();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    finalize_body_rule_headers_on_surface(&mut ctx, &mut headers, false);
+    assert_eq!(
+        ctx.metadata
+            .get(BODY_SKIPPED_METADATA_KEY)
+            .map(String::as_str),
+        Some("non_json_content_type")
+    );
+    for value in ctx.metadata.values() {
+        assert!(!value.contains("SENSITIVE"));
+    }
+}
+
+#[tokio::test]
+async fn templates_cannot_copy_a_credential_an_earlier_rename_relabelled() {
+    // PR #6858 review SOL-3: `rename authorization -> x-context` followed by
+    // a template over `x-context` must not publish the credential under an
+    // innocuous query name (secondary egress would not recognise it). Header
+    // sources resolve from the ORIGINAL client headers, so the renamed name
+    // carries nothing.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "header", "key": "authorization", "new_key": "x-context"},
+            {"operation": "add", "target": "query", "key": "trace", "value": "ref=$(header.x-context)"}
+        ]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "Bearer SECRET-TOKEN".to_string(),
+    );
+    let mut headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        headers.get("x-context").map(String::as_str),
+        Some("Bearer SECRET-TOKEN"),
+        "the rename itself still applies"
+    );
+    assert!(
+        ctx.outbound_query_string()
+            .is_none_or(|query| !query.contains("SECRET")),
+        "{:?}",
+        ctx.outbound_query_string()
+    );
+
+    // The same holds across instances for query renames: the second
+    // instance reads the original client query, where `k` never existed.
+    let rename = RequestTransformer::new(&json!({
+        "rules": [{"operation": "rename", "target": "query", "key": "sig", "new_key": "k"}]
+    }))
+    .unwrap();
+    let copy = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "x-copied", "value": "v=$(query.k)"}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("sig=SECRET-SIG".to_string());
+    let mut headers = ctx.headers.clone();
+    rename.before_proxy(&mut ctx, &mut headers).await;
+    copy.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        ctx.outbound_query_string()
+            .is_some_and(|query| query.contains("k="))
+    );
+    assert!(!headers.contains_key("x-copied"));
+}
+
+#[tokio::test]
+async fn digest_retirement_covers_a_lengthless_get_body() {
+    // PR #6858 review SOL-7: an HTTP/2 or HTTP/3 GET may carry DATA without
+    // `Content-Length`, and the body pass rewrites it all the same, so the
+    // method alone never proves the body empty.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    let outbound = run_chain_then_retire(
+        &[&plugin],
+        &mut ctx,
+        integrity_headers(Some("application/json")),
+    )
+    .await
+    .expect("the stale digest is retired");
+    assert!(!outbound.contains_key("content-digest"));
+    assert!(!outbound.contains_key("content-md5"));
+}
+
+#[tokio::test]
+async fn digest_retirement_covers_a_digest_introduced_by_a_later_rename() {
+    // PR #6858 review SOL-8: the body instance saw no integrity field, but a
+    // later header-only instance renames one into `Content-Digest`. Core
+    // inspects the FINAL headers, so it is still retired.
+    let body = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let rename = RequestTransformer::new(&json!({
+        "rules": [{"operation": "rename", "target": "header", "key": "x-wire-digest", "new_key": "content-digest"}]
+    }))
+    .unwrap();
+    let mut inbound: HashMap<String, String> = HashMap::new();
+    inbound.insert("content-type".to_string(), "application/json".to_string());
+    inbound.insert("x-wire-digest".to_string(), "sha-256=:stale:".to_string());
+    let mut ctx = post_ctx();
+    let outbound = run_chain_then_retire(&[&body, &rename], &mut ctx, inbound)
+        .await
+        .expect("the rename produced an outbound copy");
+    assert!(!outbound.contains_key("x-wire-digest"));
+    assert!(
+        !outbound.contains_key("content-digest"),
+        "a digest introduced after the body instance ran must still be retired"
+    );
+}
+
+#[test]
+fn skip_reasons_survive_default_log_serialization() {
+    // PR #6858 review SOL-9: the fixed reason literals are reviewed safe
+    // metadata, so default transaction logs show which reason applied.
+    use ferrum_edge::plugins::TransactionSummary;
+    use ferrum_edge::plugins::request_transformer::{
+        BODY_SKIPPED_METADATA_KEY, RULE_SKIPPED_METADATA_KEY,
+    };
+    use ferrum_edge::plugins::utils::metadata_redaction::metadata_value_is_redacted;
+
+    assert!(!metadata_value_is_redacted(BODY_SKIPPED_METADATA_KEY));
+    assert!(!metadata_value_is_redacted(RULE_SKIPPED_METADATA_KEY));
+    let summary = TransactionSummary {
+        metadata: [
+            (
+                BODY_SKIPPED_METADATA_KEY.to_string(),
+                "parse_error".to_string(),
+            ),
+            (
+                RULE_SKIPPED_METADATA_KEY.to_string(),
+                "template_unresolved".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        ..TransactionSummary::default()
+    };
+    let rendered = serde_json::to_value(&summary)
+        .expect("summary serializes")
+        .to_string();
+    assert!(rendered.contains("parse_error"), "{rendered}");
+    assert!(rendered.contains("template_unresolved"), "{rendered}");
+    // Only the two exact keys are reviewed, not the namespace.
+    assert!(metadata_value_is_redacted("request_transformer.other"));
+}
+
+#[tokio::test]
+async fn digest_retirement_folds_underscore_spellings() {
+    // Muse round-2 MUSE-3(b): `Content_Digest` folds onto the same CGI
+    // variable as `Content-Digest` at Rack/WSGI/PHP backends.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let mut inbound: HashMap<String, String> = HashMap::new();
+    inbound.insert("content-type".to_string(), "application/json".to_string());
+    inbound.insert("content_digest".to_string(), "sha-256=:stale:".to_string());
+    inbound.insert("Repr_Digest".to_string(), "sha-256=:stale:".to_string());
+    let mut ctx = post_ctx();
+    let outbound = run_chain_then_retire(&[&plugin], &mut ctx, inbound)
+        .await
+        .expect("the stale digests are retired");
+    assert!(!outbound.contains_key("content_digest"));
+    assert!(!outbound.contains_key("Repr_Digest"));
+}
+
+// ---------------------------------------------------------------------------
+// GHSA-pq95-952r-2x32: duplicate-member and BOM-prefixed JSON request bodies.
+// ---------------------------------------------------------------------------
+
+fn privileged_field_stripper() -> Arc<dyn Plugin> {
+    Arc::new(
+        RequestTransformer::new(&json!({"rules": [
+            {"operation": "remove", "target": "body", "key": "user.role"},
+            {"operation": "rename", "target": "body", "key": "user.token", "new_key": "user.redacted"}
+        ]}))
+        .unwrap(),
+    )
+}
+
+fn json_request_headers() -> HashMap<String, String> {
+    HashMap::from([("content-type".to_string(), "application/json".to_string())])
+}
+
+fn bom(document: &[u8]) -> Vec<u8> {
+    [b"\xEF\xBB\xBF".as_slice(), document].concat()
+}
+
+/// `prefix` followed by a unique-member subtree nested 200 deep: past
+/// `serde_json`'s 128-level recursion limit, inside the duplicate-key screen's
+/// 256-level budget, so the screen accepts it as well-formed.
+fn deeper_than_serde(prefix: &[u8]) -> Vec<u8> {
+    [
+        prefix,
+        "[".repeat(200).as_bytes(),
+        "]".repeat(200).as_bytes(),
+        b"}".as_slice(),
+    ]
+    .concat()
+}
+
+fn assert_ambiguous_body_rejected(result: &ferrum_edge::plugins::PluginResult, case: &str) {
+    match result {
+        ferrum_edge::plugins::PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(*status_code, 400, "{case}");
+            assert!(
+                body.contains("duplicate JSON object member names"),
+                "{case}: {body}"
+            );
+            assert!(!body.contains("admin"), "{case}: no body byte is echoed");
+        }
+        other => panic!("{case}: an ambiguous JSON body must be refused, got {other:?}"),
+    }
+}
+
+/// Bodies whose JSON objects repeat a member name (an ancestor of a targeted
+/// leaf, a sibling elsewhere, an escaped spelling of the same name, BOM or no
+/// BOM), plus a document past the screen's depth budget.
+fn ambiguous_request_bodies() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        (
+            "duplicate ancestor",
+            br#"{"user":{"role":"admin","token":"t0k"},"user":{"name":"a"}}"#.to_vec(),
+        ),
+        (
+            "BOM-prefixed duplicate ancestor",
+            bom(br#"{"user":{"role":"admin"},"user":{"name":"a"}}"#),
+        ),
+        (
+            "escaped duplicate ancestor",
+            br#"{"user":{"role":"admin"},"\u0075ser":{"name":"a"}}"#.to_vec(),
+        ),
+        (
+            "escaped duplicate leaf",
+            br#"{"user":{"role":"admin","\u0072ole":"viewer"}}"#.to_vec(),
+        ),
+        (
+            "unrelated sibling duplicate",
+            br#"{"user":{"role":"admin"},"a":1,"a":2}"#.to_vec(),
+        ),
+        (
+            "well-formed but deeper than serde_json can materialize",
+            deeper_than_serde(br#"{"user":{"role":"admin"},"deep":"#),
+        ),
+        (
+            "BOM-prefixed and deeper than serde_json can materialize",
+            bom(&deeper_than_serde(br#"{"user":{"role":"admin"},"deep":"#)),
+        ),
+        (
+            "screen depth budget exhausted",
+            [
+                br#"{"user":{"role":"admin"},"deep":"#.as_slice(),
+                "[".repeat(300).as_bytes(),
+                "]".repeat(300).as_bytes(),
+                b"}".as_slice(),
+            ]
+            .concat(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn ambiguous_json_body_is_refused_by_the_final_hook_not_forwarded() {
+    let plugin = privileged_field_stripper();
+    let headers = json_request_headers();
+    for (case, body) in ambiguous_request_bodies() {
+        let mut ctx = post_ctx();
+        assert!(
+            plugin
+                .transform_request_body_with_context(
+                    &mut ctx,
+                    &body,
+                    Some("application/json"),
+                    &headers
+                )
+                .await
+                .is_none(),
+            "{case}: the transform must not rewrite an ambiguous document"
+        );
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await;
+        assert_ambiguous_body_rejected(&result, case);
+        // The latch is consumed: a second finalization does not reject again.
+        assert!(matches!(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, &body)
+                .await,
+            ferrum_edge::plugins::PluginResult::Continue
+        ));
+    }
+}
+
+/// The production H1/H2 shape (transform and final hook on the compatibility
+/// clone) and the native H3 shape (both on the real context) refuse the
+/// request; an absent `Content-Type` is screened the same way because the body
+/// rules still parse it as JSON.
+#[tokio::test]
+async fn ambiguous_json_body_is_refused_on_h1_h2_and_h3_body_stages() {
+    let plugins = vec![privileged_field_stripper()];
+    for headers in [json_request_headers(), HashMap::new()] {
+        for (case, body) in ambiguous_request_bodies() {
+            let mut ctx = post_ctx();
+            let (_, result) =
+                ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+                    &plugins,
+                    &mut ctx,
+                    &headers,
+                    body.clone(),
+                )
+                .await;
+            assert_ambiguous_body_rejected(&result, &format!("H1/H2 {case}"));
+
+            let mut ctx = post_ctx();
+            let (_, result) =
+                ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+                    &plugins, &mut ctx, &headers, &body,
+                )
+                .await;
+            assert_ambiguous_body_rejected(&result, &format!("H3 {case}"));
+        }
+    }
+}
+
+/// A later instance cannot launder the refusal: with two instances the first
+/// latches and the final stage still refuses.
+#[tokio::test]
+async fn ambiguous_json_body_is_refused_with_multiple_instances() {
+    let plugins = vec![
+        privileged_field_stripper(),
+        Arc::new(
+            RequestTransformer::new(&json!({"rules": [
+                {"operation": "add", "target": "body", "key": "added", "value": 1}
+            ]}))
+            .unwrap(),
+        ) as Arc<dyn Plugin>,
+    ];
+    let mut ctx = post_ctx();
+    let (_, result) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &plugins,
+            &mut ctx,
+            &json_request_headers(),
+            br#"{"user":{"role":"admin"},"user":{}}"#.to_vec(),
+        )
+        .await;
+    assert_ambiguous_body_rejected(&result, "two instances");
+}
+
+/// The context-free compatibility hook has no rejection channel, so it must
+/// not return `None` (which forwards the original ambiguous bytes).
+#[tokio::test]
+async fn context_free_transform_never_forwards_an_ambiguous_body() {
+    let plugin = privileged_field_stripper();
+    let replacement = plugin
+        .transform_request_body(
+            br#"{"user":{"role":"admin"},"user":{}}"#,
+            Some("application/json"),
+            &json_request_headers(),
+        )
+        .await;
+    assert_eq!(replacement, Some(Vec::new()));
+}
+
+/// A BOM-prefixed document has its `remove` and `rename` rules applied; the
+/// backend receives the re-serialized document without the BOM.
+#[tokio::test]
+async fn bom_prefixed_json_body_has_remove_and_rename_applied() {
+    let plugins = vec![privileged_field_stripper()];
+    let body = bom(br#"{"user":{"role":"admin","token":"t0k","name":"a"}}"#);
+    for headers in [json_request_headers(), HashMap::new()] {
+        let mut ctx = post_ctx();
+        let (transformed, result) =
+            ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+                &plugins,
+                &mut ctx,
+                &headers,
+                body.clone(),
+            )
+            .await;
+        assert!(
+            matches!(result, ferrum_edge::plugins::PluginResult::Continue),
+            "got {result:?}"
+        );
+        assert!(!transformed.starts_with(b"\xEF\xBB\xBF"));
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&transformed).expect("the rewrite is JSON");
+        assert_eq!(rewritten, json!({"user": {"name": "a", "redacted": "t0k"}}));
+    }
+}
+
+/// Bytes that are not JSON at all keep their existing behavior: unchanged,
+/// `parse_error` published, and no refusal.
+#[tokio::test]
+async fn non_json_body_keeps_parse_error_behavior() {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let plugins = vec![privileged_field_stripper()];
+    for body in [
+        b"role=admin&role=viewer".to_vec(),
+        br#"{"user":{"role":"admin"},"user":"#.to_vec(),
+    ] {
+        let mut ctx = post_ctx();
+        let (transformed, result) =
+            ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+                &plugins,
+                &mut ctx,
+                &HashMap::new(),
+                &body,
+            )
+            .await;
+        assert!(
+            matches!(result, ferrum_edge::plugins::PluginResult::Continue),
+            "got {result:?}"
+        );
+        assert_eq!(transformed, body);
+        assert_eq!(
+            ctx.metadata
+                .get(BODY_SKIPPED_METADATA_KEY)
+                .map(String::as_str),
+            Some("parse_error")
+        );
+    }
+}
+
+/// An instance with only header/query rules does not screen bodies at all: it
+/// does not claim the body, and a duplicate-member body passes through it.
+#[tokio::test]
+async fn header_and_query_only_instance_does_not_screen_bodies() {
+    let plugin: Arc<dyn Plugin> = Arc::new(
+        RequestTransformer::new(&json!({"rules": [
+            {"operation": "add", "target": "header", "key": "x-tagged", "value": "1"},
+            {"operation": "remove", "target": "query", "key": "debug"}
+        ]}))
+        .unwrap(),
+    );
+    assert!(!plugin.modifies_request_body());
+    let body = br#"{"user":{"role":"admin"},"user":{}}"#.to_vec();
+    let headers = json_request_headers();
+
+    let mut ctx = post_ctx();
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &headers
+            )
+            .await
+            .is_none()
+    );
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+
+    let mut ctx = post_ctx();
+    let (transformed, result) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &[plugin],
+            &mut ctx,
+            &headers,
+            body.clone(),
+        )
+        .await;
+    assert!(
+        matches!(result, ferrum_edge::plugins::PluginResult::Continue),
+        "got {result:?}"
+    );
+    assert_eq!(transformed, body);
+}
+
+/// A final-body policy between two transformer instances, used to prove the
+/// refusal stays at its producer's position in the chain.
+struct FinalBodyBlocker;
+
+#[async_trait::async_trait]
+impl Plugin for FinalBodyBlocker {
+    fn name(&self) -> &str {
+        "final_body_blocker"
+    }
+
+    async fn on_final_request_body_with_context(
+        &self,
+        _ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> ferrum_edge::plugins::PluginResult {
+        ferrum_edge::plugins::PluginResult::Reject {
+            status_code: 403,
+            body: r#"{"error":"blocked"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+/// The refusal belongs to the instance whose body rules produced it: a
+/// header-only or RTDS-disabled sibling ordered first can neither issue it
+/// (jumping ahead of a policy between them) nor consume it.
+#[tokio::test]
+async fn ambiguous_body_refusal_is_bound_to_its_producing_instance() {
+    let header_only: Arc<dyn Plugin> = Arc::new(
+        RequestTransformer::new(&json!({"rules": [
+            {"operation": "add", "target": "header", "key": "x-tagged", "value": "1"}
+        ]}))
+        .unwrap(),
+    );
+    let disabled: Arc<dyn Plugin> = Arc::new(
+        RequestTransformer::new(&json!({
+            "rules": [{"operation": "remove", "target": "body", "key": "user.role"}],
+            "runtime_overlay_scope": "dup-test",
+            "default_enabled": false
+        }))
+        .unwrap(),
+    );
+    let producer = privileged_field_stripper();
+    let headers = json_request_headers();
+    let body = br#"{"user":{"role":"admin"},"user":{}}"#.to_vec();
+
+    // Direct hook order: siblings answer `Continue` and leave the refusal in
+    // place; only the producer consumes it.
+    let mut ctx = post_ctx();
+    for plugin in [&header_only, &disabled, &producer] {
+        let _ = plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &headers,
+            )
+            .await;
+    }
+    for sibling in [&header_only, &disabled] {
+        assert!(matches!(
+            sibling
+                .on_final_request_body_with_context(&mut ctx, &headers, &body)
+                .await,
+            ferrum_edge::plugins::PluginResult::Continue
+        ));
+    }
+    assert_ambiguous_body_rejected(
+        &producer
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await,
+        "producer",
+    );
+
+    // Chain order: the policy between the siblings and the producer decides
+    // first, so a sibling did not issue the producer's refusal early.
+    let plugins = vec![
+        header_only.clone(),
+        disabled.clone(),
+        Arc::new(FinalBodyBlocker) as Arc<dyn Plugin>,
+        producer.clone(),
+    ];
+    for (stage, result) in [
+        (
+            "H1/H2",
+            ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+                &plugins,
+                &mut post_ctx(),
+                &headers,
+                body.clone(),
+            )
+            .await
+            .1,
+        ),
+        (
+            "H3",
+            ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+                &plugins,
+                &mut post_ctx(),
+                &headers,
+                &body,
+            )
+            .await
+            .1,
+        ),
+    ] {
+        match result {
+            ferrum_edge::plugins::PluginResult::Reject { status_code, .. } => {
+                assert_eq!(
+                    status_code, 403,
+                    "{stage}: the earlier policy decides first"
+                )
+            }
+            other => panic!("{stage}: expected the blocker's rejection, got {other:?}"),
+        }
+    }
+
+    // Without the blocker, the producer still refuses behind its siblings.
+    let plugins = vec![header_only, disabled, producer];
+    let (_, result) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &plugins,
+            &mut post_ctx(),
+            &headers,
+            body,
+        )
+        .await;
+    assert_ambiguous_body_rejected(&result, "mixed chain");
+}
+
+/// The refusal carries the typed gateway request-representation terminal
+/// provenance, handed back from the H1/H2 hook clone and set on the live H3
+/// context, so response-side policy (a response size ceiling) cannot rewrite
+/// the `400` into a `502`. An accepted body carries none.
+#[tokio::test]
+async fn ambiguous_body_refusal_is_a_gateway_representation_terminal() {
+    use ferrum_edge::_test_support::gateway_representation_response_selected_for_test;
+
+    let plugins = vec![privileged_field_stripper()];
+    let headers = json_request_headers();
+    let ambiguous = br#"{"user":{"role":"admin"},"user":{}}"#.to_vec();
+
+    let mut ctx = post_ctx();
+    let (_, result) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &plugins,
+            &mut ctx,
+            &headers,
+            ambiguous.clone(),
+        )
+        .await;
+    assert_ambiguous_body_rejected(&result, "H1/H2");
+    assert!(gateway_representation_response_selected_for_test(&ctx));
+
+    let mut ctx = post_ctx();
+    let (_, result) = ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+        &plugins, &mut ctx, &headers, &ambiguous,
+    )
+    .await;
+    assert_ambiguous_body_rejected(&result, "H3");
+    assert!(gateway_representation_response_selected_for_test(&ctx));
+
+    let mut ctx = post_ctx();
+    let (_, result) = ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+        &plugins,
+        &mut ctx,
+        &headers,
+        br#"{"user":{"role":"admin"}}"#,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+    assert!(!gateway_representation_response_selected_for_test(&ctx));
+}
+
+/// Genuine framed gRPC `+json` uploads the client declared skip the
+/// duplicate-member screen: frames never start like a JSON document, so even a
+/// frame payload that repeats a member (or a body above the screen memo's
+/// threshold) is neither screened nor refused, keeps the `parse_error` outcome
+/// it always had, and stays on the buffered path as before.
+#[tokio::test]
+async fn framed_grpc_json_requests_skip_screening() {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let plugin = privileged_field_stripper();
+    let message = br#"{"user":{"role":"admin"},"user":{}}"#;
+    let mut framed = vec![0u8];
+    framed.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    framed.extend_from_slice(message);
+    let mut large = framed.clone();
+    large.resize(8192, b' ');
+    use base64::Engine;
+    let text = base64::engine::general_purpose::STANDARD
+        .encode(&framed)
+        .into_bytes();
+
+    for (content_type, body) in [
+        ("application/grpc+json", &framed),
+        ("application/grpc+json", &large),
+        ("application/grpc-web+json", &framed),
+        ("application/grpc-web-text+json", &text),
+    ] {
+        assert!(
+            plugin.should_buffer_request_body(&upload_ctx(Some(content_type))),
+            "{content_type}: the buffering vote is unchanged"
+        );
+        let headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        let mut ctx = post_ctx();
+        retain_client_wire_headers(&mut ctx, &headers);
+        assert!(
+            plugin
+                .transform_request_body_with_context(&mut ctx, body, Some(content_type), &headers)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            ctx.metadata
+                .get(BODY_SKIPPED_METADATA_KEY)
+                .map(String::as_str),
+            Some("parse_error"),
+            "{content_type}"
+        );
+        assert!(matches!(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body)
+                .await,
+            ferrum_edge::plugins::PluginResult::Continue
+        ));
+    }
+}
+
+/// A client's own framed `+json` declaration is not proof of framing: a bare
+/// JSON body under it (BOM and leading whitespace included) is transformed when
+/// unambiguous and refused when it repeats a member.
+#[tokio::test]
+async fn client_labelled_framed_json_with_a_bare_json_body_is_still_governed() {
+    let plugin = privileged_field_stripper();
+    for content_type in [
+        "application/grpc+json",
+        "application/grpc-web+json",
+        "application/grpc-web-text+json",
+    ] {
+        let headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        for clean in [
+            br#"{"user":{"role":"admin","name":"a"}}"#.to_vec(),
+            bom(b" \n\t{\"user\":{\"role\":\"admin\",\"name\":\"a\"}}"),
+        ] {
+            let mut ctx = post_ctx();
+            retain_client_wire_headers(&mut ctx, &headers);
+            let rewritten = plugin
+                .transform_request_body_with_context(&mut ctx, &clean, Some(content_type), &headers)
+                .await
+                .unwrap_or_else(|| panic!("{content_type}: a bare JSON body must be rewritten"));
+            let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+            assert_eq!(rewritten, json!({"user": {"name": "a"}}), "{content_type}");
+        }
+
+        let mut ctx = post_ctx();
+        retain_client_wire_headers(&mut ctx, &headers);
+        let ambiguous = br#"{"user":{"role":"admin"},"user":{}}"#;
+        assert!(
+            plugin
+                .transform_request_body_with_context(
+                    &mut ctx,
+                    ambiguous,
+                    Some(content_type),
+                    &headers
+                )
+                .await
+                .is_none()
+        );
+        assert_ambiguous_body_rejected(
+            &plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, ambiguous)
+                .await,
+            content_type,
+        );
+    }
+}
+
+/// The framed-gRPC exemption is decided from the client's wire media type, not
+/// from a label a header rule wrote: a bare JSON upload relabelled to
+/// `application/grpc+json` stays buffered, screened, and rewritten.
+#[tokio::test]
+async fn relabelled_bare_json_upload_is_not_exempted_as_framed_grpc() {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let plugin = privileged_field_stripper();
+    let wire = json_request_headers();
+    for relabel in [
+        "application/grpc+json",
+        "application/grpc-web+json",
+        "application/grpc-web-text+json",
+    ] {
+        let outbound = HashMap::from([("content-type".to_string(), relabel.to_string())]);
+
+        // Buffering vote: the label alone does not release the upload.
+        let mut vote = upload_ctx(Some("application/json"));
+        vote.headers = outbound.clone();
+        assert!(
+            plugin.should_buffer_request_body(&vote),
+            "{relabel}: a relabelled JSON upload must stay buffered"
+        );
+
+        // Transform: an unambiguous document is still rewritten.
+        let mut ctx = post_ctx();
+        retain_client_wire_headers(&mut ctx, &wire);
+        let rewritten = plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                br#"{"user":{"role":"admin","name":"a"}}"#,
+                Some(relabel),
+                &outbound,
+            )
+            .await
+            .expect("a relabelled bare JSON document must be rewritten");
+        let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(rewritten, json!({"user": {"name": "a"}}), "{relabel}");
+        assert!(!ctx.metadata.contains_key(BODY_SKIPPED_METADATA_KEY));
+
+        // Transform + final hook: an ambiguous document is still refused.
+        let mut ctx = post_ctx();
+        retain_client_wire_headers(&mut ctx, &wire);
+        let body = br#"{"user":{"role":"admin"},"user":{}}"#;
+        assert!(
+            plugin
+                .transform_request_body_with_context(&mut ctx, body, Some(relabel), &outbound)
+                .await
+                .is_none()
+        );
+        assert_ambiguous_body_rejected(
+            &plugin
+                .on_final_request_body_with_context(&mut ctx, &outbound, body)
+                .await,
+            relabel,
+        );
+    }
+}
+
+/// Integrity-field retirement follows rewrite eligibility: a header rule that
+/// relabels a digest-bearing JSON upload as framed gRPC-Web does not stop the
+/// body rules from rewriting it (a BOM-prefixed document included), so its
+/// stale digests must not reach the backend beside the rewritten bytes. A
+/// client-declared framed upload keeps its fields
+/// (`integrity_headers_survive_when_body_rules_cannot_rewrite`).
+#[tokio::test]
+async fn relabelled_bom_json_upload_retires_stale_integrity_headers() {
+    let relabel = RequestTransformer::new(&json!({"rules": [
+        {"operation": "update", "target": "header", "key": "content-type",
+         "value": "application/grpc-web+json"}
+    ]}))
+    .unwrap();
+    let body_plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+
+    let mut ctx = post_ctx();
+    let outbound = run_chain_then_retire(
+        &[&relabel, &body_plugin],
+        &mut ctx,
+        integrity_headers(Some("application/json")),
+    )
+    .await
+    .expect("the relabelled upload's stale digests must be retired");
+    for field in ["content-digest", "repr-digest", "digest", "content-md5"] {
+        assert!(
+            !outbound.keys().any(|name| name.eq_ignore_ascii_case(field)),
+            "{field} must be retired: {outbound:?}"
+        );
+    }
+    assert_eq!(outbound.get("x-keep").map(String::as_str), Some("1"));
+    assert_eq!(
+        outbound.get("content-type").map(String::as_str),
+        Some("application/grpc-web+json")
+    );
+
+    // And the transform does rewrite that representation.
+    let rewritten = body_plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            &bom(br#"{"debug":true,"keep":1}"#),
+            Some("application/grpc-web+json"),
+            &outbound,
+        )
+        .await
+        .expect("the relabelled BOM-prefixed JSON body is rewritten");
+    let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+    assert_eq!(rewritten, json!({"keep": 1}));
+}
+
+/// GHSA-c259-vchc-3vgr: the outbound strip removes a whole `&` segment whose
+/// `;` sub-pair names an auth-marked credential, so a template reading that
+/// carrier must not copy the embedded credential into another field. The
+/// mark comes from a real auth discovery hook.
+#[tokio::test]
+async fn query_template_never_copies_a_carrier_embedding_a_marked_alias() {
+    use ferrum_edge::plugins::request_transformer::RULE_SKIPPED_METADATA_KEY;
+
+    let jwt = ferrum_edge::plugins::jwt_auth::JwtAuth::new(&json!({
+        "token_lookup": "query:tenant_jwt",
+        "hide_credentials": true
+    }))
+    .unwrap();
+    for (operation, target) in [("update", "header"), ("add", "query")] {
+        let plugin = RequestTransformer::new(&json!({
+            "rules": [{"operation": operation, "target": target, "key": "x-copied", "value": "$(query.carrier)"}]
+        }))
+        .unwrap();
+        let mut ctx = make_ctx();
+        ctx.set_raw_query_string("carrier=;tenant_jwt=aliased-secret&page=1".to_string());
+        ctx.materialize_query_params();
+        jwt.mark_query_credentials_for_redaction(&mut ctx);
+        assert!(
+            ctx.metadata
+                .contains_key("auth.strip_query_param.tenant_jwt")
+        );
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(!headers.contains_key("x-copied"), "{target}");
+        assert_eq!(
+            ctx.metadata
+                .get(RULE_SKIPPED_METADATA_KEY)
+                .map(String::as_str),
+            Some("template_unresolved"),
+            "{target}"
+        );
+        let forwarded = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+        assert!(
+            !forwarded.contains("aliased-secret"),
+            "{target}: {forwarded}"
+        );
+        assert!(!forwarded.contains("x-copied"), "{target}: {forwarded}");
+    }
+
+    // An unmarked `;` inside a carrier value still resolves.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "x-copied", "value": "$(query.carrier)"}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("carrier=a;b=c&page=1".to_string());
+    ctx.materialize_query_params();
+    jwt.mark_query_credentials_for_redaction(&mut ctx);
+    let mut headers: HashMap<String, String> = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(headers.get("x-copied").map(String::as_str), Some("a;b=c"));
+}
+
+/// A blocked carrier occurrence keeps last-occurrence-wins semantics: it
+/// retires an earlier clean occurrence (the template is unresolved), while a
+/// later clean occurrence still wins. The outer name is compared decoded.
+#[tokio::test]
+async fn query_template_blocked_carrier_keeps_last_occurrence_semantics() {
+    use ferrum_edge::plugins::request_transformer::RULE_SKIPPED_METADATA_KEY;
+
+    let jwt = ferrum_edge::plugins::jwt_auth::JwtAuth::new(&json!({
+        "token_lookup": "query:tenant_jwt",
+        "hide_credentials": true
+    }))
+    .unwrap();
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "x-copied", "value": "$(query.carrier)"}]
+    }))
+    .unwrap();
+    for (raw_query, expected) in [
+        ("carrier=plain&carrier=;tenant_jwt=aliased-secret", None),
+        (
+            "carrier=;tenant_jwt=aliased-secret&carrier=plain",
+            Some("plain"),
+        ),
+        ("carrier=plain&c%61rrier=;tenant_jwt=aliased-secret", None),
+        (
+            "c%61rrier=;tenant_jwt=aliased-secret&carrier=plain",
+            Some("plain"),
+        ),
+    ] {
+        let mut ctx = make_ctx();
+        ctx.set_raw_query_string(raw_query.to_string());
+        ctx.materialize_query_params();
+        jwt.mark_query_credentials_for_redaction(&mut ctx);
+        let mut headers: HashMap<String, String> = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(
+            headers.get("x-copied").map(String::as_str),
+            expected,
+            "{raw_query}"
+        );
+        if expected.is_none() {
+            assert_eq!(
+                ctx.metadata
+                    .get(RULE_SKIPPED_METADATA_KEY)
+                    .map(String::as_str),
+                Some("template_unresolved"),
+                "{raw_query}"
+            );
+        }
+    }
+}
+
+/// GHSA-c259-vchc-3vgr: the template snapshot uses the outbound strip's own
+/// raw / percent-decoded / form-decoded name rule for top-level names as well
+/// as `;` sub-pairs. With the literal escaped configured name
+/// `workspace%2Dslot`, a top-level occurrence under that raw spelling is the
+/// marked credential, so `$(query.workspace-slot)` must not copy it.
+#[tokio::test]
+async fn query_template_never_copies_a_raw_spelling_marked_credential() {
+    use ferrum_edge::plugins::request_transformer::RULE_SKIPPED_METADATA_KEY;
+
+    let jwt = ferrum_edge::plugins::jwt_auth::JwtAuth::new(&json!({
+        "token_lookup": "query:workspace%2Dslot",
+        "hide_credentials": true
+    }))
+    .unwrap();
+    for (operation, target) in [("update", "header"), ("add", "query")] {
+        let plugin = RequestTransformer::new(&json!({
+            "rules": [{"operation": operation, "target": target, "key": "x-copied", "value": "$(query.workspace-slot)"}]
+        }))
+        .unwrap();
+        let mut ctx = make_ctx();
+        ctx.set_raw_query_string(
+            "carrier=;workspace%2Dslot=raw-secret&workspace%2Dslot=raw-secret&page=1".to_string(),
+        );
+        ctx.materialize_query_params();
+        jwt.mark_query_credentials_for_redaction(&mut ctx);
+        assert!(
+            ctx.metadata
+                .contains_key("auth.strip_query_param.workspace%2Dslot")
+        );
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(!headers.contains_key("x-copied"), "{target}");
+        if target == "header" {
+            assert_eq!(
+                ctx.metadata
+                    .get(RULE_SKIPPED_METADATA_KEY)
+                    .map(String::as_str),
+                Some("template_unresolved")
+            );
+        }
+        let forwarded = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+        assert!(!forwarded.contains("raw-secret"), "{target}: {forwarded}");
+        assert!(!forwarded.contains("x-copied"), "{target}: {forwarded}");
     }
 }
