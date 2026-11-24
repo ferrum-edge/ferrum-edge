@@ -12,6 +12,13 @@ fn ctx(method: &str, path: &str) -> RequestContext {
     RequestContext::new("203.0.113.10".into(), method.into(), path.into())
 }
 
+/// A mapped gateway Consumer with the given username.
+fn consumer_named(username: &str) -> ferrum_edge::config::types::Consumer {
+    let mut consumer = super::plugin_utils::create_test_consumer();
+    consumer.username = username.to_string();
+    consumer
+}
+
 /// Build a WAF for the rule-semantics tests in this file.
 ///
 /// Pins `scan_budget_ms: 0` (unbounded) unless the config sets its own budget.
@@ -302,7 +309,7 @@ async fn waf_clears_preexisting_reserved_metadata_before_evaluation() {
 }
 
 #[tokio::test]
-async fn consumer_scoped_request_rule_uses_authenticated_identity() {
+async fn consumer_scoped_request_rule_uses_mapped_consumer_only() {
     let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
@@ -330,8 +337,24 @@ async fn consumer_scoped_request_rule_uses_authenticated_identity() {
             .is_some_and(|hits| hits.contains("CUSTOM-CONSUMER-QUERY"))
     );
 
+    // GHSA-rxwj-x6c6-f4j5: an unmapped external identity that spells the
+    // listed Consumer username is not that Consumer.
+    let mut external_ctx = ctx("GET", "/search");
+    external_ctx.authenticated_identity = Some("alice".into());
+    external_ctx.set_raw_query_string("q=needle".into());
+    assert!(matches!(
+        plugin.authorize(&mut external_ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !external_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-CONSUMER-QUERY"))
+    );
+
     let mut authenticated_ctx = ctx("GET", "/search");
-    authenticated_ctx.authenticated_identity = Some("alice".into());
+    authenticated_ctx.identified_consumer = Some(std::sync::Arc::new(consumer_named("alice")));
     authenticated_ctx.set_raw_query_string("q=needle".into());
     let result = plugin.authorize(&mut authenticated_ctx).await;
 
@@ -343,6 +366,44 @@ async fn consumer_scoped_request_rule_uses_authenticated_identity() {
             .map(String::as_str),
         Some("CUSTOM-CONSUMER-QUERY")
     );
+}
+
+#[tokio::test]
+async fn equals_rule_sees_the_first_semicolon_sub_pair() {
+    // Issue #6579: a `;`-splitting backend receives `role=admin` from
+    // `role=admin;note=ok`, so an exact-value rule must see it too.
+    let plugin = waf(json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-ROLE-ADMIN",
+            "name": "exact admin role",
+            "category": "custom",
+            "severity": "high",
+            "target": "query_values",
+            "match_kind": "equals",
+            "pattern": "admin",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    for query in ["role=admin", "role=admin;note=ok"] {
+        let mut request = ctx("GET", "/api");
+        request.set_raw_query_string(query.into());
+        assert!(
+            matches!(
+                plugin.authorize(&mut request).await,
+                PluginResult::Reject { .. }
+            ),
+            "{query}"
+        );
+    }
+    // `%3B` is content: the value is `admin;note=ok`, not `admin`.
+    let mut encoded = ctx("GET", "/api");
+    encoded.set_raw_query_string("role=admin%3Bnote%3Dok".into());
+    assert!(matches!(
+        plugin.authorize(&mut encoded).await,
+        PluginResult::Continue
+    ));
 }
 
 #[tokio::test]
@@ -553,7 +614,10 @@ async fn body_encoding_specials_trigger_buffering_without_body_rules() {
     binary_req_ctx
         .headers
         .insert("content-type".into(), "application/octet-stream".into());
-    assert!(!plugin.should_buffer_request_body(&binary_req_ctx));
+    // Unlisted bodies are never scanned; the default
+    // `on_unlisted_content_type: fail_closed` still buffers one here because
+    // the enforcing encoding special makes it refusable.
+    assert!(plugin.should_buffer_request_body(&binary_req_ctx));
 
     let mut resp_ctx = ctx("GET", "/download");
     let response_headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
@@ -586,7 +650,9 @@ async fn body_encoding_specials_trigger_buffering_without_body_rules() {
             b"file=%252e%252e%252fetc",
         )
         .await;
-    assert!(matches!(result, PluginResult::Continue));
+    // Not scanned: the enforcing special makes the unlisted response refusable
+    // under the default `on_unlisted_response_content_type: fail_closed`.
+    assert!(refused_as_unlisted(&result, &binary_resp_ctx));
 }
 
 #[tokio::test]
@@ -769,6 +835,1138 @@ async fn custom_body_json_path_fp_filter_suppresses_json_ld_script() {
         .await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(!suppressed.metadata.contains_key("waf.rule_hits"));
+}
+
+fn enforcing_json_path_waf(with_body_text_rule: bool) -> Waf {
+    let mut rules = vec![json!({
+        "id": "CUSTOM-JSON-CANARY",
+        "category": "custom",
+        "severity": "high",
+        "target": { "type": "body_json_path", "path": "user.bio" },
+        "match_kind": "contains",
+        "pattern": "forbidden-canary",
+        "action": "enforce"
+    })];
+    if with_body_text_rule {
+        rules.push(json!({
+            "id": "CUSTOM-TEXT-OTHER",
+            "category": "custom",
+            "severity": "high",
+            "target": "body_text",
+            "match_kind": "contains",
+            "pattern": "unrelated-marker",
+            "action": "enforce"
+        }));
+    }
+    waf(json!({ "include_default_rules": false, "custom_rules": rules })).unwrap()
+}
+
+fn json_path_rule_hit(result: &PluginResult, ctx: &RequestContext) -> bool {
+    matches!(result, PluginResult::Reject { .. })
+        && ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.split(',').any(|hit| hit == "CUSTOM-JSON-CANARY"))
+}
+
+type BodyEncoder = fn(&str) -> Vec<u8>;
+
+#[tokio::test]
+async fn body_json_path_rule_inspects_utf16_and_utf32_json_bodies() {
+    let forbidden = r#"{"user":{"bio":"forbidden-canary"}}"#;
+    let benign = r#"{"user":{"bio":"ordinary"}}"#;
+    let cases: [(&str, &str, BodyEncoder); 25] = [
+        ("utf-8", "application/json", |t| t.as_bytes().to_vec()),
+        ("utf-8 bom", "application/json", |t| {
+            with_bom(&[0xEF, 0xBB, 0xBF], t.as_bytes())
+        }),
+        (
+            "utf-16le declared",
+            "application/json; charset=utf-16le",
+            |t| encode_utf16(t, false),
+        ),
+        (
+            "utf-16be declared",
+            "application/json; charset=utf-16be",
+            |t| encode_utf16(t, true),
+        ),
+        ("utf-16 bare le", "application/json; charset=utf-16", |t| {
+            encode_utf16(t, false)
+        }),
+        ("utf-16 bare be", "application/json; charset=utf-16", |t| {
+            encode_utf16(t, true)
+        }),
+        ("utf-16le bom", "application/json", |t| {
+            with_bom(UTF16_LE_BOM, &encode_utf16(t, false))
+        }),
+        ("utf-16le undeclared", "application/json", |t| {
+            encode_utf16(t, false)
+        }),
+        ("utf-16be undeclared", "application/json", |t| {
+            encode_utf16(t, true)
+        }),
+        (
+            "utf-32le declared",
+            "application/json; charset=utf-32le",
+            |t| encode_utf32(t, false),
+        ),
+        (
+            "utf-32be declared",
+            "application/json; charset=utf-32be",
+            |t| encode_utf32(t, true),
+        ),
+        ("utf-32le bom", "application/json", |t| {
+            with_bom(UTF32_LE_BOM, &encode_utf32(t, false))
+        }),
+        ("utf-32be bom", "application/json", |t| {
+            with_bom(UTF32_BE_BOM, &encode_utf32(t, true))
+        }),
+        ("utf-32le undeclared", "application/json", |t| {
+            encode_utf32(t, false)
+        }),
+        ("utf-32be undeclared", "application/json", |t| {
+            encode_utf32(t, true)
+        }),
+        // A misleading or unknown non-wide charset over BOMless wide text.
+        (
+            "utf-16le declared utf-8",
+            "application/json; charset=utf-8",
+            |t| encode_utf16(t, false),
+        ),
+        (
+            "utf-16be declared utf-8",
+            "application/json; charset=utf-8",
+            |t| encode_utf16(t, true),
+        ),
+        (
+            "utf-32le unknown label",
+            "application/json; charset=x-unknown",
+            |t| encode_utf32(t, false),
+        ),
+        (
+            "utf-32be declared utf-8",
+            "application/json; charset=utf-8",
+            |t| encode_utf32(t, true),
+        ),
+        // A declared endianness that disagrees with the BOM: both readings
+        // are inspected.
+        (
+            "utf-16be declared with le bom",
+            "application/json; charset=utf-16be",
+            |t| with_bom(UTF16_LE_BOM, &encode_utf16(t, false)),
+        ),
+        // A BOM of the other wide width than the declared charset: the
+        // BOM-honouring reading after the mark is inspected too. (The
+        // declared reading of the whole body starts with the BOM's code
+        // units, so it is never a JSON document here; the body-text
+        // counterpart covers that side.)
+        (
+            "utf-32le declared with utf-16be bom",
+            "application/json; charset=utf-32le",
+            |t| with_bom(&[0xFE, 0xFF], &encode_utf16(t, true)),
+        ),
+        (
+            "utf-32be declared with utf-16le bom",
+            "application/json; charset=utf-32be",
+            |t| with_bom(UTF16_LE_BOM, &encode_utf16(t, false)),
+        ),
+        (
+            "utf-32 declared with utf-16be bom",
+            "application/json; charset=utf-32",
+            |t| with_bom(&[0xFE, 0xFF], &encode_utf16(t, true)),
+        ),
+        (
+            "utf-16le declared with utf-32be bom",
+            "application/json; charset=utf-16le",
+            |t| with_bom(UTF32_BE_BOM, &encode_utf32(t, true)),
+        ),
+        (
+            "utf-16be declared with utf-32le bom",
+            "application/json; charset=utf-16be",
+            |t| with_bom(UTF32_LE_BOM, &encode_utf32(t, false)),
+        ),
+    ];
+    for with_body_text_rule in [false, true] {
+        let plugin = enforcing_json_path_waf(with_body_text_rule);
+        for (label, content_type, encode) in cases {
+            let (result, ctx) =
+                scan_body_with_content_type(&plugin, content_type, &encode(forbidden)).await;
+            assert!(
+                json_path_rule_hit(&result, &ctx),
+                "{label} (body_text rule: {with_body_text_rule}) must be enforced"
+            );
+            let (result, ctx) =
+                scan_body_with_content_type(&plugin, content_type, &encode(benign)).await;
+            assert!(
+                matches!(result, PluginResult::Continue),
+                "{label} (body_text rule: {with_body_text_rule}) benign body must pass"
+            );
+            assert!(!ctx.metadata.contains_key("waf.rule_hits"), "{label}");
+        }
+    }
+}
+
+fn container_json_path_waf(
+    path: &str,
+    match_kind: &str,
+    pattern: &str,
+    fp_filters: &[&str],
+) -> Waf {
+    let mut rule = json!({
+        "id": "CUSTOM-JSON-CANARY",
+        "category": "custom",
+        "severity": "high",
+        "target": { "type": "body_json_path", "path": path },
+        "match_kind": match_kind,
+        "pattern": pattern,
+        "action": "enforce"
+    });
+    if !fp_filters.is_empty() {
+        rule["fp_filters"] = json!(fp_filters);
+    }
+    waf(json!({ "include_default_rules": false, "custom_rules": [rule] })).unwrap()
+}
+
+#[tokio::test]
+async fn body_json_path_rule_with_many_matching_duplicates_records_one_hit() {
+    let plugin = enforcing_json_path_waf(false);
+    let mut body = String::from(r#"{"user":{"#);
+    for index in 0..20_000 {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push_str(r#""bio":"forbidden-canary""#);
+    }
+    body.push_str("}}");
+    let (result, ctx) =
+        scan_body_with_content_type(&plugin, "application/json", body.as_bytes()).await;
+    assert!(json_path_rule_hit(&result, &ctx));
+    assert_eq!(
+        ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-JSON-CANARY")
+    );
+}
+
+#[tokio::test]
+async fn body_json_path_container_rules_see_each_duplicate_reading() {
+    // `equals` on a container keeps matching the last-wins reading it matched
+    // before duplicates were preserved, and also matches the first-wins one.
+    let plugin = container_json_path_waf("user", "equals", r#"{"bio":"forbidden-canary"}"#, &[]);
+    for body in [
+        br#"{"user":{"bio":"forbidden-canary"}}"#.as_slice(),
+        br#"{"user":{"bio":"ordinary","bio":"forbidden-canary"}}"#,
+        br#"{"user":{"bio":"forbidden-canary","bio":"ordinary"}}"#,
+    ] {
+        let (result, ctx) = scan_body_with_content_type(&plugin, "application/json", body).await;
+        assert!(
+            json_path_rule_hit(&result, &ctx),
+            "{} must be enforced",
+            String::from_utf8_lossy(body)
+        );
+    }
+
+    // Duplicates nested inside an array are collapsed per reading too.
+    let plugin = container_json_path_waf("items", "equals", r#"[{"k":"forbidden-canary"}]"#, &[]);
+    for body in [
+        br#"{"items":[{"k":"ordinary","k":"forbidden-canary"}]}"#.as_slice(),
+        br#"{"items":[{"k":"forbidden-canary","k":"ordinary"}]}"#,
+    ] {
+        let (result, ctx) = scan_body_with_content_type(&plugin, "application/json", body).await;
+        assert!(
+            json_path_rule_hit(&result, &ctx),
+            "{} must be enforced",
+            String::from_utf8_lossy(body)
+        );
+    }
+
+    // A false-positive filter is evaluated per reading: a benign duplicate
+    // cannot suppress the reading that carries the forbidden value.
+    let plugin = container_json_path_waf("user", "contains", "forbidden-canary", &["ordinary"]);
+    for body in [
+        br#"{"user":{"bio":"ordinary","bio":"forbidden-canary"}}"#.as_slice(),
+        br#"{"user":{"bio":"forbidden-canary","bio":"ordinary"}}"#,
+    ] {
+        let (result, ctx) = scan_body_with_content_type(&plugin, "application/json", body).await;
+        assert!(
+            json_path_rule_hit(&result, &ctx),
+            "{} must be enforced",
+            String::from_utf8_lossy(body)
+        );
+    }
+    // Control: the filter still suppresses a single reading it matches.
+    let (result, _) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"user":{"bio":"forbidden-canary, ordinary"}}"#,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn body_json_path_rule_inspects_every_duplicate_member() {
+    let plugin = enforcing_json_path_waf(false);
+    let forbidden_bodies: [&[u8]; 6] = [
+        // Duplicate leaf, forbidden first (what a first-wins backend reads).
+        br#"{"user":{"bio":"forbidden-canary","bio":"ordinary"}}"#,
+        // Duplicate leaf, forbidden last.
+        br#"{"user":{"bio":"ordinary","bio":"forbidden-canary"}}"#,
+        // Duplicate enclosing object, both orders.
+        br#"{"user":{"bio":"forbidden-canary"},"user":{"bio":"ordinary"}}"#,
+        br#"{"user":{"bio":"ordinary"},"user":{"bio":"forbidden-canary"}}"#,
+        // An escaped spelling of a member name is the same member.
+        br#"{"user":{"b\u0069o":"forbidden-canary","bio":"ordinary"}}"#,
+        br#"{"u\u0073er":{"bio":"forbidden-canary"},"user":{"bio":"ordinary"}}"#,
+    ];
+    for body in forbidden_bodies {
+        let (result, ctx) = scan_body_with_content_type(&plugin, "application/json", body).await;
+        assert!(
+            json_path_rule_hit(&result, &ctx),
+            "{} must be enforced",
+            String::from_utf8_lossy(body)
+        );
+    }
+
+    // A wide-charset view gets the same duplicate-aware inspection.
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json; charset=utf-16le",
+        &encode_utf16(
+            r#"{"user":{"bio":"forbidden-canary"},"user":{"bio":"ordinary"}}"#,
+            false,
+        ),
+    )
+    .await;
+    assert!(json_path_rule_hit(&result, &ctx));
+
+    // Duplicates alone are not a hit: only a selected value can match.
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"user":{"bio":"ordinary","bio":"also ordinary"},"user":{"bio":"fine"}}"#,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+}
+
+async fn assert_json_path_verdicts(
+    plugin: &Waf,
+    content_type: &str,
+    forbidden: &[Vec<u8>],
+    benign: &[Vec<u8>],
+) {
+    for body in forbidden {
+        let (result, ctx) = scan_body_with_content_type(plugin, content_type, body).await;
+        assert!(
+            json_path_rule_hit(&result, &ctx),
+            "{content_type} {:?} must be enforced",
+            String::from_utf8_lossy(body)
+        );
+    }
+    for body in benign {
+        let (result, ctx) = scan_body_with_content_type(plugin, content_type, body).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{content_type} {:?} must pass",
+            String::from_utf8_lossy(body)
+        );
+        assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+    }
+}
+
+#[tokio::test]
+async fn body_json_path_rule_inspects_bodies_with_unpaired_surrogate_escapes() {
+    // `serde_json` refuses a `\u` escape naming an unpaired surrogate, while
+    // `JSON.parse`, `json.loads`, Jackson and Go accept it. One such string
+    // anywhere in the body must not hide the rest of the document.
+    let plugin = enforcing_json_path_waf(false);
+    let forbidden: Vec<Vec<u8>> = [
+        // Lone high surrogate.
+        br#"{"pad":"\ud800","user":{"bio":"forbidden-canary"}}"#.as_slice(),
+        // Lone low surrogate.
+        br#"{"pad":"\udc00","user":{"bio":"forbidden-canary"}}"#,
+        // Reversed pair: a low then a high surrogate, both unpaired.
+        br#"{"pad":"\udc00\ud800","user":{"bio":"forbidden-canary"}}"#,
+        // High surrogate followed by a non-surrogate escape (uppercase hex).
+        br#"{"pad":"\uD800\u0041","user":{"bio":"forbidden-canary"}}"#,
+        // High surrogate closing a string after the selected value.
+        br#"{"user":{"bio":"forbidden-canary"},"pad":"x\uDBFF"}"#,
+        // A valid pair stays a pair; the trailing high surrogate is unpaired.
+        br#"{"pad":"\ud83d\ude00\ud83d","user":{"bio":"forbidden-canary"}}"#,
+        // In a member name and inside the selected value itself.
+        br#"{"\ud800":1,"user":{"bio":"\udfffforbidden-canary"}}"#,
+        // An escaped backslash followed by a real unpaired escape.
+        br#"{"pad":"\\\ud800","user":{"bio":"forbidden-canary"}}"#,
+        // Control: a valid pair was already accepted by the strict parse.
+        br#"{"pad":"\ud83d\ude00","user":{"bio":"forbidden-canary"}}"#,
+        // Duplicated members are still all inspected on the lenient reading.
+        br#"{"user":{"bio":"forbidden-canary"},"user":{"bio":"ordinary"},"pad":"\udc00"}"#,
+        br#"{"user":{"bio":"ordinary"},"user":{"bio":"forbidden-canary"},"pad":"\ud800"}"#,
+        br#"{"user":{"bio":"forbidden-canary\ud800","bio":"ordinary"}}"#,
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect();
+    let benign: Vec<Vec<u8>> = [
+        br#"{"pad":"\ud800","user":{"bio":"ordinary"}}"#.as_slice(),
+        br#"{"pad":"\udc00\ud800","user":{"bio":"ordinary"},"user":{"bio":"fine"}}"#,
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect();
+    assert_json_path_verdicts(&plugin, "application/json", &forbidden, &benign).await;
+
+    // A UTF-8 byte-order mark and every UTF-16 / UTF-32 view get the same
+    // lenient reading: the escape is still ASCII text after transcoding.
+    let with_utf8_bom = |body: &Vec<u8>| with_bom(&[0xEF, 0xBB, 0xBF], body);
+    assert_json_path_verdicts(
+        &plugin,
+        "application/json",
+        &forbidden.iter().map(with_utf8_bom).collect::<Vec<_>>(),
+        &benign.iter().map(with_utf8_bom).collect::<Vec<_>>(),
+    )
+    .await;
+    let as_text = |body: &Vec<u8>| String::from_utf8(body.clone()).unwrap();
+    let wide: [(&str, BodyEncoder); 3] = [
+        ("application/json; charset=utf-16le", |t| {
+            encode_utf16(t, false)
+        }),
+        ("application/json", |t| {
+            with_bom(UTF16_LE_BOM, &encode_utf16(t, false))
+        }),
+        ("application/json; charset=utf-32be", |t| {
+            encode_utf32(t, true)
+        }),
+    ];
+    for (content_type, encode) in wide {
+        assert_json_path_verdicts(
+            &plugin,
+            content_type,
+            &forbidden
+                .iter()
+                .map(|body| encode(&as_text(body)))
+                .collect::<Vec<_>>(),
+            &benign
+                .iter()
+                .map(|body| encode(&as_text(body)))
+                .collect::<Vec<_>>(),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn body_json_path_lenient_reading_keeps_escaped_backslashes_literal() {
+    // `\\ud800` is an escaped backslash followed by the literal text `ud800`,
+    // not a surrogate escape: the lenient reading forced by the unpaired
+    // escape in `pad` must leave it alone.
+    let plugin = container_json_path_waf("user.bio", "equals", r"\ud800 forbidden-canary", &[]);
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"user":{"bio":"\\ud800 forbidden-canary"},"pad":"\ud800"}"#,
+    )
+    .await;
+    assert!(json_path_rule_hit(&result, &ctx));
+
+    // A real unpaired escape in the value decodes to U+FFFD, so the same
+    // `equals` rule does not see the literal escape text.
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"user":{"bio":"\ud800 forbidden-canary"}}"#,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+    let plugin = container_json_path_waf("user.bio", "equals", "\u{FFFD} forbidden-canary", &[]);
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"user":{"bio":"\ud800 forbidden-canary"}}"#,
+    )
+    .await;
+    assert!(json_path_rule_hit(&result, &ctx));
+}
+
+#[tokio::test]
+async fn body_json_path_rule_inspects_bodies_with_invalid_utf8_strings() {
+    // `serde_json` refuses invalid UTF-8 inside a string, while Go
+    // `encoding/json` and `TextDecoder`-based readers substitute U+FFFD and
+    // keep parsing.
+    let plugin = enforcing_json_path_waf(false);
+    let forbidden: Vec<Vec<u8>> = [
+        b"{\"pad\":\"\xff\",\"user\":{\"bio\":\"forbidden-canary\"}}".as_slice(),
+        // An overlong `/` and a UTF-8-encoded surrogate (CESU-8).
+        b"{\"pad\":\"\xc0\xaf\xed\xa0\x80\",\"user\":{\"bio\":\"forbidden-canary\"}}",
+        // Inside the selected value, combined with an unpaired escape.
+        b"{\"user\":{\"bio\":\"\xfeforbidden-canary\"},\"pad\":\"\\ud800\"}",
+        // Duplicated members on the lenient reading.
+        b"{\"user\":{\"bio\":\"forbidden-canary\"},\"user\":{\"bio\":\"ordinary\"},\"p\xff\":1}",
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect();
+    let benign: Vec<Vec<u8>> = [b"{\"pad\":\"\xff\",\"user\":{\"bio\":\"ordinary\"}}".as_slice()]
+        .iter()
+        .map(|body| body.to_vec())
+        .collect();
+    assert_json_path_verdicts(&plugin, "application/json", &forbidden, &benign).await;
+}
+
+/// JSON documents `serde_json` refuses even on the lenient reading, while
+/// common backend parsers accept them (`json.loads` takes `NaN`, `Infinity`
+/// and `1e400`; Jackson stops after the first document and allows a nesting
+/// depth far past 128; JSON5-style readers take comments and trailing commas).
+/// Every one carries only the benign `ordinary` value at `user.bio`.
+fn json_documents_the_parser_refuses() -> Vec<String> {
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    vec![
+        r#"{"user":{"bio":"ordinary"},"n":1e400}"#.to_string(),
+        r#"{"user":{"bio":"ordinary"},"n":-1e999}"#.to_string(),
+        format!(r#"{{"user":{{"bio":"ordinary"}},"pad":{deep}}}"#),
+        format!(r#"{{"pad":{deep},"user":{{"bio":"ordinary"}}}}"#),
+        r#"{"user":{"bio":"ordinary"},"n":NaN}"#.to_string(),
+        r#"[NaN,{"user":{"bio":"ordinary"}}]"#.to_string(),
+        r#"[Infinity,{"user":{"bio":"ordinary"}}]"#.to_string(),
+        r#"{"user":{"bio":"ordinary"},}"#.to_string(),
+        r#"{/* c */"user":{"bio":"ordinary"}}"#.to_string(),
+        r#"[// c
+{"user":{"bio":"ordinary"}}]"#
+            .to_string(),
+        r#"{'user':{'bio':'ordinary'}}"#.to_string(),
+        "  \r\n\t{\"user\":{\"bio\":\"ordinary\"},\"n\":1e400}".to_string(),
+        // An unpaired surrogate (repaired by the lenient reading) does not
+        // rescue a document that is refused for another reason.
+        r#"{"pad":"\ud800","user":{"bio":"ordinary"},"n":1e400}"#.to_string(),
+        // Openings only a lenient parser reads, with nothing else refused:
+        // leading comments, JavaScript / JSON5 whitespace (VT, FF, NBSP,
+        // a non-leading U+FEFF), an unquoted member name, the `)]}'`
+        // anti-XSSI prefix, `+` / `.` numbers, and a NUL Json.NET skips.
+        r#"/* c */{"user":{"bio":"ordinary"}}"#.to_string(),
+        "// c\n[{\"user\":{\"bio\":\"ordinary\"}}]".to_string(),
+        "\u{0B}{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        "\u{0C}{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        "\u{A0}{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        "{\u{FEFF}\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        r#"{user:{bio:"ordinary"}}"#.to_string(),
+        "{ $user : {\"bio\":\"ordinary\"}}".to_string(),
+        ")]}'\n{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        ")]}',\n[{\"user\":{\"bio\":\"ordinary\"}}]".to_string(),
+        r#"[+1,{"user":{"bio":"ordinary"}}]"#.to_string(),
+        r#"[.5,{"user":{"bio":"ordinary"}}]"#.to_string(),
+        "[\u{0}{\"user\":{\"bio\":\"ordinary\"}}]".to_string(),
+        // The same skippable forms where they compose: Unicode whitespace
+        // after a leading literal, a line comment ended by U+2028 / U+2029,
+        // whitespace or a comment before the anti-XSSI prefix.
+        "[true\u{A0},{\"user\":{\"bio\":\"ordinary\"}}]".to_string(),
+        "[null\u{FEFF},{\"user\":{\"bio\":\"ordinary\"}}]".to_string(),
+        "// c\u{2028}{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        "// c\u{2029}{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        " )]}'\n{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        "/* c */)]}'\n{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        // Gson-lenient names, values, separators and comments.
+        r#"{1:0,"user":{"bio":"ordinary"}}"#.to_string(),
+        r#"{x-y:0,"user":{"bio":"ordinary"}}"#.to_string(),
+        r#"{user={"bio":"ordinary"}}"#.to_string(),
+        r#"[foo,{"user":{"bio":"ordinary"}}]"#.to_string(),
+        r#"[foo;{"user":{"bio":"ordinary"}}]"#.to_string(),
+        "# c\n{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        // A refused container later in a sequence, its first member behind
+        // a long run of whitespace: the whole run is skipped before judging.
+        format!(
+            "null\n{{{}\"user\":{{\"bio\":\"ordinary\"}},\"n\":NaN}}",
+            " ".repeat(200)
+        ),
+        format!(
+            "null\n[{}{{\"user\":{{\"bio\":\"ordinary\"}}}},NaN]",
+            " ".repeat(200)
+        ),
+        // Java / .NET whitespace: a record separator and NEL.
+        "\u{1E}{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        "\u{85}{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+    ]
+}
+
+#[tokio::test]
+async fn body_json_path_rule_fails_closed_on_json_the_parser_refuses() {
+    // No path can be evaluated on these readings, so leaving them uninspected
+    // would let one such token switch every JSON-path rule off while the
+    // backend reads `user.bio`. The applicable rule records a hit instead.
+    let plugin = enforcing_json_path_waf(false);
+    let refused = json_documents_the_parser_refuses();
+    let as_bytes: Vec<Vec<u8>> = refused
+        .iter()
+        .map(|body| body.as_bytes().to_vec())
+        .collect();
+    assert_json_path_verdicts(&plugin, "application/json", &as_bytes, &[]).await;
+    // The declared content type plays no part: a backend that parses the raw
+    // body regardless of its label reads these too.
+    assert_json_path_verdicts(&plugin, "text/plain", &as_bytes, &[]).await;
+    let with_utf8_bom: Vec<Vec<u8>> = as_bytes
+        .iter()
+        .map(|body| with_bom(&[0xEF, 0xBB, 0xBF], body))
+        .collect();
+    assert_json_path_verdicts(&plugin, "application/json", &with_utf8_bom, &[]).await;
+
+    // Each UTF-16 / UTF-32 reading is judged the same way.
+    let wide: [(&str, BodyEncoder); 6] = [
+        ("application/json; charset=utf-16le", |t| {
+            encode_utf16(t, false)
+        }),
+        ("application/json; charset=utf-16be", |t| {
+            encode_utf16(t, true)
+        }),
+        ("application/json", |t| {
+            with_bom(UTF16_LE_BOM, &encode_utf16(t, false))
+        }),
+        ("application/json", |t| encode_utf16(t, true)),
+        ("application/json; charset=utf-32be", |t| {
+            encode_utf32(t, true)
+        }),
+        ("application/json", |t| {
+            with_bom(UTF32_LE_BOM, &encode_utf32(t, false))
+        }),
+    ];
+    for (content_type, encode) in wide {
+        let encoded: Vec<Vec<u8>> = refused.iter().map(|body| encode(body)).collect();
+        assert_json_path_verdicts(&plugin, content_type, &encoded, &[]).await;
+    }
+}
+
+#[tokio::test]
+async fn body_json_path_refused_json_is_decided_like_a_rule_match() {
+    // A refused reading is a hit on the rule, so a monitoring instance only
+    // observes it and the request continues.
+    let plugin = waf(json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-JSON-CANARY",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "body_json_path", "path": "user.bio" },
+            "match_kind": "contains",
+            "pattern": "forbidden-canary",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    for body in json_documents_the_parser_refuses() {
+        let (result, ctx) =
+            scan_body_with_content_type(&plugin, "application/json", body.as_bytes()).await;
+        assert!(matches!(result, PluginResult::Continue), "{body:?}");
+        assert_eq!(
+            ctx.metadata.get("waf.rule_hits").map(String::as_str),
+            Some("CUSTOM-JSON-CANARY"),
+            "{body:?} must be observed"
+        );
+    }
+
+    // `conditions` still scope the rule: out of scope, nothing is recorded.
+    let plugin = waf(json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-JSON-CANARY",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "body_json_path", "path": "user.bio" },
+            "match_kind": "contains",
+            "pattern": "forbidden-canary",
+            "action": "enforce",
+            "conditions": { "paths": ["/admin"] }
+        }]
+    }))
+    .unwrap();
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"user":{"bio":"ordinary"},"n":1e400}"#,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+}
+
+/// Text that is not a JSON document and does not open like one.
+fn bodies_that_do_not_open_like_json() -> Vec<Vec<u8>> {
+    [
+        b"user.bio=forbidden-canary".as_slice(),
+        b"[INFO] forbidden-canary",
+        b"[Note] see {\"user\":{\"bio\":\"ordinary\"}}",
+        b"[true-story] hello",
+        b"[nullify it] hello",
+        b"{{user.bio}} forbidden-canary",
+        b"{not json",
+        b"<user><bio>forbidden-canary</bio></user>",
+        b"forbidden-canary",
+        b"true story",
+        b"1 item",
+        b"null and void",
+        b"[",
+        b"{",
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect()
+}
+
+#[tokio::test]
+async fn body_json_path_rule_ignores_bodies_that_do_not_open_like_json() {
+    // A body that is not declared JSON is judged only when a reading opens
+    // like a JSON object or array; other bodies have nothing for a JSON-path
+    // rule to select and pass as before.
+    let plugin = enforcing_json_path_waf(false);
+    let not_json = bodies_that_do_not_open_like_json();
+    for content_type in [
+        "text/plain",
+        "application/x-www-form-urlencoded",
+        "application/xml",
+    ] {
+        assert_json_path_verdicts(&plugin, content_type, &[], &not_json).await;
+    }
+
+    // Declared JSON needs no sniff: the backend is told the body is JSON, so
+    // a body no reading of which parses fails closed.
+    for content_type in [
+        "application/json",
+        "application/vnd.api+json; charset=utf-8",
+        "text/json",
+    ] {
+        assert_json_path_verdicts(&plugin, content_type, &not_json, &[]).await;
+    }
+
+    // Blank bodies and lone scalars (which no non-empty path can select)
+    // pass under any declaration, and so do the raw bytes of a UTF-16 /
+    // UTF-32 document whose transcoded reading is clean.
+    let benign_document = r#"{"user":{"bio":"ordinary"}}"#;
+    let always_benign: Vec<Vec<u8>> = vec![
+        b"".to_vec(),
+        b"   \r\n".to_vec(),
+        b"42".to_vec(),
+        b"null".to_vec(),
+        b"\"forbidden-canary\"".to_vec(),
+        encode_utf16(benign_document, false),
+        encode_utf16(benign_document, true),
+        encode_utf32(benign_document, false),
+        encode_utf32(benign_document, true),
+        with_bom(UTF16_LE_BOM, &encode_utf16(benign_document, false)),
+        with_bom(UTF32_LE_BOM, &encode_utf32(benign_document, false)),
+        with_bom(UTF32_BE_BOM, &encode_utf32(benign_document, true)),
+    ];
+    for content_type in ["application/json", "text/plain"] {
+        assert_json_path_verdicts(&plugin, content_type, &[], &always_benign).await;
+    }
+}
+
+/// One RPC envelope: a flags byte, a 4-byte big-endian length, the message.
+fn rpc_frame(flags: u8, message: &[u8]) -> Vec<u8> {
+    let mut frame = vec![flags];
+    frame.extend_from_slice(&u32::try_from(message.len()).unwrap().to_be_bytes());
+    frame.extend_from_slice(message);
+    frame
+}
+
+#[tokio::test]
+async fn body_json_path_reads_framed_rpc_streams_as_their_messages() {
+    // A body that parses as a gRPC / gRPC-Web / Connect stream is read as its
+    // messages, as an RPC backend reads it. The benign message is 32 bytes,
+    // an ASCII space as the length's low byte, so the envelopes' NUL-skipping
+    // reading is ` {...}`: it must not by itself fail a legitimate stream
+    // closed, and it must not hide a message from the rules.
+    let plugin = enforcing_json_path_waf(false);
+    let benign = br#"{"user":{"bio":"ordinary-1234"}}"#;
+    assert_eq!(benign.len(), 32);
+    let forbidden = br#"{"user":{"bio":"forbidden-canary"}}"#;
+    for (content_type, end_flags) in [
+        ("application/grpc+json", 0x00),
+        ("application/grpc-web+json", 0x00),
+        ("application/connect+json", 0x02),
+    ] {
+        let mut clean = rpc_frame(0x00, benign);
+        clean.extend(rpc_frame(0x00, benign));
+        clean.extend(rpc_frame(end_flags, b"{}"));
+        let mut hidden = rpc_frame(0x00, benign);
+        hidden.extend(rpc_frame(0x00, forbidden));
+        let refused = rpc_frame(0x00, br#"{"user":{"bio":"ordinary"},"n":1e400}"#);
+        let mut after_empty = rpc_frame(0x00, b"");
+        after_empty.extend(rpc_frame(0x00, b"[\0{\"user\":{\"bio\":\"ordinary\"}}]"));
+        // A compressed message is decoded by the backend but not by the WAF,
+        // so it fails closed rather than passing unread.
+        let mut compressed = rpc_frame(0x00, benign);
+        compressed.extend(rpc_frame(0x01, b"\x1f\x8b\x08\x00compressed"));
+        assert_json_path_verdicts(
+            &plugin,
+            content_type,
+            &[hidden, refused, after_empty, compressed],
+            &[clean, Vec::new()],
+        )
+        .await;
+    }
+
+    // gRPC-Web text is base64 of the same envelopes, one or more padded
+    // flushes: its messages are read the same way.
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    let text = |frames: &[Vec<u8>]| -> Vec<u8> {
+        frames
+            .iter()
+            .map(|frame| BASE64.encode(frame))
+            .collect::<String>()
+            .into_bytes()
+    };
+    assert_json_path_verdicts(
+        &plugin,
+        "application/grpc-web-text+json",
+        &[
+            text(&[rpc_frame(0x00, benign), rpc_frame(0x00, forbidden)]),
+            text(&[rpc_frame(0x01, b"\x1f\x8b\x08\x00compressed")]),
+        ],
+        &[text(&[rpc_frame(0x00, benign), rpc_frame(0x00, benign)])],
+    )
+    .await;
+
+    // The media type and the framing are client-controlled and say nothing
+    // about the backend. These two valid envelopes are also, once their
+    // NULs are skipped as Json.NET does, the array
+    // `[{"user":{"bio":"forbidden-canary"}} ... ]`: a REST backend behind an
+    // `application/*+json` formatter reads `0.user.bio`.
+    let plugin_at_index =
+        container_json_path_waf("0.user.bio", "contains", "forbidden-canary", &[]);
+    let mut first = forbidden.to_vec();
+    first.resize(91, b' ');
+    let mut smuggled = rpc_frame(0x00, &first);
+    smuggled.extend(rpc_frame(0x00, &[b' '; 93]));
+    assert_eq!(smuggled[4], b'[');
+    assert_eq!(smuggled[5 + 91 + 4], b']');
+    // The same with a trailing comma supplied by a third envelope's length
+    // (44, `,`): the NUL-skipping reading is an array Json.NET accepts and
+    // `serde_json` refuses, so it fails closed instead of being outweighed by
+    // the messages that parse.
+    let mut trailing_comma = rpc_frame(0x00, &first);
+    trailing_comma.extend(rpc_frame(0x00, &[b' '; 44]));
+    trailing_comma.extend(rpc_frame(0x00, &[b' '; 93]));
+    assert_eq!(trailing_comma[5 + 91 + 4], b',');
+    let mut genuine = rpc_frame(0x00, benign);
+    genuine.extend(rpc_frame(0x00, benign));
+    for content_type in ["application/connect+json", "application/grpc+json"] {
+        assert_json_path_verdicts(
+            &plugin_at_index,
+            content_type,
+            &[smuggled.clone(), trailing_comma.clone()],
+            std::slice::from_ref(&genuine),
+        )
+        .await;
+    }
+
+    // A look-alike media type, or an exact one whose body is not a valid
+    // stream, is an ordinary body: Json.NET behind an `application/*+json`
+    // formatter reads this NUL-separated array.
+    let nul_array = b"[\0{\"user\":{\"bio\":\"forbidden-canary\"}}]".to_vec();
+    let mut overrun = rpc_frame(0x00, benign);
+    overrun.truncate(overrun.len() - 1);
+    for content_type in [
+        "application/grpcfake+json",
+        "application/grpc-website+json",
+        "application/connectx+json",
+        "application/grpc+json",
+        "application/grpc-web+json",
+        "application/grpc-web-text+json",
+        "application/connect+json",
+    ] {
+        assert_json_path_verdicts(
+            &plugin,
+            content_type,
+            &[nul_array.clone(), overrun.clone()],
+            &[],
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn body_json_path_rule_inspects_every_document_of_a_sequence() {
+    // Whitespace-separated documents (NDJSON, a leading scalar followed by an
+    // object, or a document followed by another that a first-value reader
+    // stops before) are all inspected.
+    let plugin = enforcing_json_path_waf(false);
+    let forbidden: Vec<Vec<u8>> = [
+        b"{\"user\":{\"bio\":\"ordinary\"}}\n{\"user\":{\"bio\":\"forbidden-canary\"}}\n"
+            .as_slice(),
+        b"{\"user\":{\"bio\":\"forbidden-canary\"}}\n{\"user\":{\"bio\":\"ordinary\"}}",
+        b"{\"user\":{\"bio\":\"forbidden-canary\"}}{\"user\":{\"bio\":\"ordinary\"}}",
+        b"[1] {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"{\"pad\":\"\\ud800\"}\r\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        // A leading scalar of every kind.
+        b"null\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"true {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"false\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"1\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"-2.5e3 {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"\"s\"\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        // One refused document makes the whole sequence refused, including
+        // after a leading scalar: the reading stopped at a JSON object.
+        b"{\"user\":{\"bio\":\"ordinary\"}}\n{\"n\":1e400}",
+        b"1\n{\"user\":{\"bio\":\"ordinary\"},\"n\":1e400}",
+        b"null [NaN, {\"user\":{\"bio\":\"ordinary\"}}]",
+        // Documents read before a refused one are still inspected, and
+        // reading resumes on the next line after one, as a line-by-line
+        // consumer does.
+        b"null\n{\"user\":{\"bio\":\"forbidden-canary\"}}\nNaN",
+        b"null\n{\"user\":{\"bio\":\"forbidden-canary\"}}\ngarbage\n",
+        b"null\nNaN\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"null\n1e400\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"NaN\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"garbage\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"{\"user\":{\"bio\":\"ordinary\"}}\n{\"n\":1e400}\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        // Reading resumes at the next token or container after a refused
+        // value, not at the next line: whitespace (any of it) separates
+        // documents, and a string that swallowed a line break does not hide
+        // the line after it.
+        b"null NaN {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"NaN {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"1e400 {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"null\rNaN\r{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"\"a\nb\" {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        // A container embedded in text, and one inside a refused container,
+        // are read too.
+        b"[INFO] {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"note: {\"user\":{\"bio\":\"forbidden-canary\"}} end",
+        b"null [NaN, {\"user\":{\"bio\":\"forbidden-canary\"}}]",
+        b"{\"user\":{\"bio\":\"forbidden-canary\"}} trailing",
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect();
+    let benign: Vec<Vec<u8>> = [
+        b"{\"user\":{\"bio\":\"ordinary\"}}\n{\"user\":{\"bio\":\"fine\"}}\n".as_slice(),
+        b"{\"user\":{\"bio\":\"ordinary\"}}{\"other\":1}",
+        b"{\"user\":{\"bio\":\"ordinary\"}}  \n  ",
+        b"null\n{\"user\":{\"bio\":\"ordinary\"}}",
+        b"1 2 3",
+        b"\"a\" \"b\"",
+        b"true\nfalse\nnull",
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect();
+    for content_type in ["application/json", "text/plain"] {
+        assert_json_path_verdicts(&plugin, content_type, &forbidden, &benign).await;
+    }
+    let encoded = |bodies: &[Vec<u8>]| -> Vec<Vec<u8>> {
+        bodies
+            .iter()
+            .map(|body| encode_utf16(std::str::from_utf8(body).unwrap(), false))
+            .collect()
+    };
+    assert_json_path_verdicts(
+        &plugin,
+        "application/json; charset=utf-16le",
+        &encoded(&forbidden[..]),
+        &encoded(&benign[..]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn body_json_path_recovery_keeps_a_container_the_refused_token_ran_into() {
+    // `serde_json` rejects `tru` only once it has consumed the `{` after it;
+    // a lenient sequence reader (Gson `JsonStreamParser`) reads the unquoted
+    // `tru` and then that object. Recovery must start the next document at
+    // the consumed `{`, not after it.
+    let plugin = enforcing_json_path_waf(false);
+    let forbidden: Vec<Vec<u8>> = [
+        b"tru{\"user\":{\"bio\":\"forbidden-canary\"}}".as_slice(),
+        b"nu{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"fals{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"NaN{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"1e400{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"null tru{\"user\":{\"bio\":\"forbidden-canary\"}}",
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect();
+    let benign: Vec<Vec<u8>> = [
+        b"tru{\"user\":{\"bio\":\"ordinary\"}}".as_slice(),
+        b"NaN{\"user\":{\"bio\":\"ordinary\"}}",
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect();
+    assert_json_path_verdicts(&plugin, "text/plain", &forbidden, &benign).await;
+    // Under a JSON declaration nothing here reads completely: fail closed.
+    assert_json_path_verdicts(&plugin, "application/json", &forbidden, &[]).await;
+    assert_json_path_verdicts(&plugin, "application/json", &benign, &[]).await;
+
+    // The same for an array, with the path into it.
+    let plugin = container_json_path_waf("0.user.bio", "contains", "forbidden-canary", &[]);
+    assert_json_path_verdicts(
+        &plugin,
+        "text/plain",
+        &[b"tru[{\"user\":{\"bio\":\"forbidden-canary\"}}]".to_vec()],
+        &[b"tru[{\"user\":{\"bio\":\"ordinary\"}}]".to_vec()],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn body_json_path_sniffed_utf16_reading_does_not_vouch_for_the_raw_bytes() {
+    // Without a declared wide charset or BOM, a backend defaults to UTF-8. A
+    // NUL-skipping one (Json.NET) then reads the raw bytes with their NULs
+    // skipped — here `[{"x":"", "user":{"bio":…},"y":""}]` — while the
+    // signature-sniffed UTF-16LE reading of the same bytes is a different,
+    // benign document whose string holds the ASCII middle as wide characters.
+    let plugin = container_json_path_waf("0.user.bio", "contains", "forbidden-canary", &[]);
+    let polyglot = |middle: &str| -> Vec<u8> {
+        assert!(middle.len().is_multiple_of(2));
+        let mut body = encode_utf16(r#"[{"x":""#, false);
+        body.extend_from_slice(middle.as_bytes());
+        body.extend(encode_utf16(r#""}]"#, false));
+        body
+    };
+    let forbidden = polyglot(r#"", "user":{"bio":"forbidden-canary"},"y":""#);
+    let benign = polyglot(r#"", "user":{"bio":"ordinary"},"y":""#);
+    for content_type in ["application/json", "text/plain"] {
+        assert_json_path_verdicts(
+            &plugin,
+            content_type,
+            std::slice::from_ref(&forbidden),
+            std::slice::from_ref(&benign),
+        )
+        .await;
+    }
+    // Declared UTF-16LE, the backend reads the wide document: benign. So is
+    // declared UTF-16 text with non-ASCII content. A quoted charset value is
+    // the same declaration.
+    for content_type in [
+        "application/json; charset=utf-16le",
+        "application/json; charset=\"utf-16le\"",
+        "application/json;charset=UTF-16LE",
+    ] {
+        assert_json_path_verdicts(
+            &plugin,
+            content_type,
+            &[],
+            &[
+                forbidden.clone(),
+                encode_utf16(r#"[{"user":{"bio":"łódź • ordinary"}}]"#, false),
+            ],
+        )
+        .await;
+    }
+    // Only the exact canonical `type/subtype; charset=<wide label>` declares
+    // a wide reading. Anything else — an empty or extra parameter (ASP.NET
+    // Core stops reading parameters at an empty one and defaults to UTF-8),
+    // a `charset` inside another parameter's quoted value, a duplicate, an
+    // alias label, malformed quoting — declares nothing, so the NUL-skipping
+    // reading is read and the hidden value hits.
+    for content_type in [
+        "application/json;;charset=utf-16le",
+        "application/json; ;charset=utf-16le",
+        "application/json;\t; charset=\"UTF-16LE\"",
+        "application/json; charset=utf-16le; x=1",
+        "application/json; x=1; charset=utf-16le",
+        "application/json; profile=\";charset=utf-16le\"",
+        "application/json; charset=utf-16le; profile=\";charset=utf-8\"",
+        "application/json; charset=utf-16le; charset=utf-16le",
+        "application/json; charset=utf-16le; broken",
+        "application/json; charset=\"utf-16le",
+        "application/json; charset=\"utf\\-16le\"",
+        "application/json; charset=unicode",
+    ] {
+        assert_json_path_verdicts(&plugin, content_type, std::slice::from_ref(&forbidden), &[])
+            .await;
+    }
+    // Two `Content-Type` field lines are folded into one comma-separated
+    // value, which is not canonical either (admitted here through
+    // `inspect_binary_body`).
+    let binary_plugin = waf(json!({
+        "include_default_rules": false,
+        "inspect_binary_body": true,
+        "custom_rules": [{
+            "id": "CUSTOM-JSON-CANARY",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "body_json_path", "path": "0.user.bio" },
+            "match_kind": "contains",
+            "pattern": "forbidden-canary",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    assert_json_path_verdicts(
+        &binary_plugin,
+        "application/json, application/json; charset=utf-16le",
+        std::slice::from_ref(&forbidden),
+        &[],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn body_json_path_lenient_work_is_bounded_per_body_and_fails_closed() {
+    // Every lenient reading of one body shares one work budget. A body whose
+    // opening checks would rescan the same long comment at every token
+    // exhausts it and fails closed instead of costing quadratic time.
+    let plugin = enforcing_json_path_waf(false);
+    let rescans = format!("null {}", "// ".repeat(20_000)).into_bytes();
+    assert_json_path_verdicts(&plugin, "text/plain", &[rescans], &[]).await;
+
+    // So does a framed stream of many refused messages: the budget is per
+    // body, not per message.
+    let mut many = Vec::new();
+    for _ in 0..2_000 {
+        many.extend(rpc_frame(0x00, &[b'['; 128]));
+    }
+    assert_json_path_verdicts(&plugin, "application/grpc+json", &[many], &[]).await;
+
+    // Ordinary prose of the same size stays well inside it.
+    let prose = "plain words and more words ".repeat(2_500).into_bytes();
+    assert_json_path_verdicts(&plugin, "text/plain", &[], &[prose]).await;
+}
+
+#[tokio::test]
+async fn body_json_path_prefix_scan_does_not_judge_the_cut_document() {
+    // A prefix scan cuts a valid document short by construction, so the
+    // documented `scan_truncated` opt-out keeps forwarding it rather than
+    // treating the cut as a refused document.
+    let plugin = waf(json!({
+        "include_default_rules": false,
+        "max_scan_bytes": 1024,
+        "on_body_too_large": "scan_truncated",
+        "custom_rules": [{
+            "id": "CUSTOM-JSON-CANARY",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "body_json_path", "path": "user.bio" },
+            "match_kind": "contains",
+            "pattern": "forbidden-canary",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let body = format!(
+        r#"{{"user":{{"bio":"ordinary"}},"pad":"{}"}}"#,
+        "x".repeat(4096)
+    );
+    let (result, ctx) =
+        scan_body_with_content_type(&plugin, "application/json", body.as_bytes()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+    assert_eq!(
+        ctx.metadata.get("waf.scan_truncated").map(String::as_str),
+        Some("true")
+    );
+
+    // The whole body fits: the same refused grammar is judged.
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"user":{"bio":"ordinary"},"n":1e400}"#,
+    )
+    .await;
+    assert!(json_path_rule_hit(&result, &ctx));
 }
 
 #[tokio::test]
@@ -1304,7 +2502,8 @@ fn request_exempt_from_waf_keeps_its_backend_trailers() {
             "paths": ["/internal/*"],
             "methods": ["OPTIONS"],
             "ips": ["198.51.100.0/24"],
-            "consumers": ["trusted-partner"]
+            "consumers": ["trusted-partner"],
+            "match": "any"
         },
         "custom_rules": [{
             "id": "CUSTOM-RESP-HEADER-EXEMPT",
@@ -1343,7 +2542,7 @@ fn request_exempt_from_waf_keeps_its_backend_trailers() {
     // Consumer identity only exists after authentication, which is exactly why
     // the resolution is deferred to the finalized request context.
     let mut by_consumer = ctx("GET", "/orders");
-    by_consumer.authenticated_identity = Some("trusted-partner".to_string());
+    by_consumer.identified_consumer = Some(std::sync::Arc::new(consumer_named("trusted-partner")));
 
     for exempt in [by_path, by_method, by_ip, by_consumer] {
         assert!(
@@ -2637,7 +3836,7 @@ fn intentional_open_maps_and_valid_closed_configs_still_construct() {
         },
         "global_exemptions": {
             "paths": ["/health"],
-            "header_present": { "x-skip-waf": null }
+            "header_present": { "x-skip-waf": "0123456789abcdef-waf-bypass" }
         },
         "custom_rules": [{
             "id": "CUSTOM-OPEN",
@@ -3258,7 +4457,8 @@ async fn inspect_multipart_gates_body_scanning() {
     let result = default_plugin
         .on_final_request_body_with_context(&mut default_ctx, &headers, b"bash -i")
         .await;
-    assert!(matches!(result, PluginResult::Continue));
+    // Not scanned: refused for its type by the fail-closed default instead.
+    assert!(refused_as_unlisted(&result, &default_ctx));
 
     let multipart_plugin = waf(json!({
         "inspect_multipart": true,
@@ -3616,7 +4816,7 @@ async fn utf16_transcoding_does_not_widen_binary_or_multipart_body_gates() {
     let (binary_result, binary_ctx) =
         scan_body_with_content_type(&plugin, "application/octet-stream; charset=utf-16le", &body)
             .await;
-    assert!(matches!(binary_result, PluginResult::Continue));
+    assert!(refused_as_unlisted(&binary_result, &binary_ctx));
     assert!(!monitored(&binary_ctx, "FE-SSRF-001"));
 
     let (multipart_result, multipart_ctx) = scan_body_with_content_type(
@@ -3625,7 +4825,7 @@ async fn utf16_transcoding_does_not_widen_binary_or_multipart_body_gates() {
         &body,
     )
     .await;
-    assert!(matches!(multipart_result, PluginResult::Continue));
+    assert!(refused_as_unlisted(&multipart_result, &multipart_ctx));
     assert!(!monitored(&multipart_ctx, "FE-SSRF-001"));
 
     let multipart_plugin = waf(json!({
@@ -3855,7 +5055,7 @@ async fn utf32_transcoding_does_not_change_utf8_or_utf16_body_matches() {
         &encode_utf32(payload, false),
     )
     .await;
-    assert!(matches!(binary_result, PluginResult::Continue));
+    assert!(refused_as_unlisted(&binary_result, &binary_ctx));
     assert!(!monitored(&binary_ctx, "FE-SQLI-001-B"));
 }
 
@@ -4230,7 +5430,7 @@ async fn global_exemptions_cover_ips_headers_and_capture_filters() {
         "rule_modes": { "FE-XSS-001": "enforce" },
         "global_exemptions": {
             "ips": ["10.0.0.0/8"],
-            "header_present": { "x-waf-fp": "known" },
+            "header_present": { "x-waf-fp": "known-trusted-hop-secret" },
             "fp_capture_filters": ["<script>safe</script>"]
         }
     }))
@@ -4243,7 +5443,9 @@ async fn global_exemptions_cover_ips_headers_and_capture_filters() {
     assert!(!ip_ctx.metadata.contains_key("waf.rule_hits"));
 
     let mut header_ctx = ctx("GET", "/search");
-    header_ctx.headers.insert("x-waf-fp".into(), "known".into());
+    header_ctx
+        .headers
+        .insert("x-waf-fp".into(), "known-trusted-hop-secret".into());
     header_ctx.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
     let result = plugin.authorize(&mut header_ctx).await;
     assert!(matches!(result, PluginResult::Continue));
@@ -4254,6 +5456,93 @@ async fn global_exemptions_cover_ips_headers_and_capture_filters() {
     let result = plugin.authorize(&mut capture_ctx).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(!capture_ctx.metadata.contains_key("waf.rule_hits"));
+}
+
+/// The IP exemption reads the context's shared canonical client address, in
+/// which an IPv4-mapped spelling is already the IPv4 caller it denotes, so an
+/// IPv6-only `::/0` exemption does not cover `::ffff:10.1.2.3` either.
+#[tokio::test]
+async fn ip_exemption_reads_the_shared_canonical_client_ip() {
+    let plugin = waf(json!({
+        "rule_modes": { "FE-XSS-001": "enforce" },
+        "global_exemptions": { "ips": ["::/0"] }
+    }))
+    .unwrap();
+
+    let mut mapped = RequestContext::new("::ffff:10.1.2.3".into(), "GET".into(), "/search".into());
+    mapped.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
+    assert!(!mapped.canonical_client_ip_is_initialized());
+    match plugin.authorize(&mut mapped).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("a mapped IPv4 caller must still be inspected, got {other:?}"),
+    }
+    assert!(
+        mapped.canonical_client_ip_is_initialized(),
+        "the exemption uses the shared parse rather than its own"
+    );
+}
+
+#[test]
+fn shared_config_readers_report_one_diagnostic_per_mistake() {
+    let err = waf(json!({ "global_exemptions": { "paths": [918273641] } })).unwrap_err();
+    assert!(
+        err.contains("`global_exemptions.paths` entries must be strings"),
+        "{err}"
+    );
+
+    // Root and custom-rule integers share one reader and one wording.
+    let err = waf(json!({ "paranoia_level": 300 })).unwrap_err();
+    assert!(err.contains("`paranoia_level` is too large"), "{err}");
+    let err = waf(json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "WAF_ENTRY_FIRST", "category": "c", "target": "query_values",
+            "pattern": "x", "paranoia_min": 300
+        }]
+    }))
+    .unwrap_err();
+    assert!(err.contains("`paranoia_min` is too large"), "{err}");
+}
+
+/// An IPv6-only exemption (`::/0`) must not exempt native IPv4 callers:
+/// matching an IPv4 caller against an IPv6 network would skip WAF inspection
+/// for every IPv4 client.
+#[tokio::test]
+async fn ipv6_ip_exemption_does_not_exempt_native_ipv4_callers() {
+    let plugin = waf(json!({
+        "rule_modes": { "FE-XSS-001": "enforce" },
+        "global_exemptions": { "ips": ["::/0"] }
+    }))
+    .unwrap();
+
+    let mut v4_ctx = RequestContext::new("10.1.2.3".into(), "GET".into(), "/search".into());
+    v4_ctx.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
+    match plugin.authorize(&mut v4_ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("an IPv4 caller must still be inspected, got {other:?}"),
+    }
+
+    let mut v6_ctx = RequestContext::new("2001:db8::7".into(), "GET".into(), "/search".into());
+    v6_ctx.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
+    assert!(matches!(
+        plugin.authorize(&mut v6_ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(!v6_ctx.metadata.contains_key("waf.rule_hits"));
+
+    // An IPv4 exemption still covers the IPv4-mapped spelling of its range.
+    let plugin = waf(json!({
+        "rule_modes": { "FE-XSS-001": "enforce" },
+        "global_exemptions": { "ips": ["10.0.0.0/8"] }
+    }))
+    .unwrap();
+    let mut mapped_ctx =
+        RequestContext::new("::ffff:10.1.2.3".into(), "GET".into(), "/search".into());
+    mapped_ctx.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
+    assert!(matches!(
+        plugin.authorize(&mut mapped_ctx).await,
+        PluginResult::Continue
+    ));
 }
 
 #[test]
@@ -4355,6 +5644,15 @@ fn monitored(ctx: &RequestContext, rule_id: &str) -> bool {
     ctx.metadata
         .get("waf.rule_hits")
         .is_some_and(|hits| hits.split(',').any(|hit| hit == rule_id))
+}
+
+/// The body was refused for its `Content-Type` (the default
+/// `on_unlisted_content_type: fail_closed` under an enforcing body policy)
+/// rather than scanned: no rule ran over it.
+fn refused_as_unlisted(result: &PluginResult, ctx: &RequestContext) -> bool {
+    matches!(result, PluginResult::Reject { .. })
+        && ctx.metadata.get("waf.block_reason").map(String::as_str) == Some("content_type")
+        && !ctx.metadata.contains_key("waf.rule_hits")
 }
 
 #[tokio::test]
@@ -5479,6 +6777,31 @@ async fn hpp_rule_blocks_plus_and_percent_space_key_aliases() {
 }
 
 #[tokio::test]
+async fn hpp_rule_blocks_a_conflicting_duplicate_smuggled_behind_a_semicolon() {
+    // Issue #6579: `tenant` occurs once under `&`-only parsing, twice with
+    // conflicting values for a backend that also splits on `;`.
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce"
+    }))
+    .unwrap();
+
+    let mut request = ctx("GET", "/search");
+    request.set_raw_query_string("tenant=admin&x=;tenant=victim".into());
+    assert!(matches!(
+        plugin.authorize(&mut request).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        request
+            .metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-HPP-001")
+    );
+}
+
+#[tokio::test]
 async fn rule_override_scopes_built_in_rule_to_paths() {
     let plugin = waf(json!({
         "mode": "enforce",
@@ -6297,6 +7620,7 @@ fn stream_ctx(first_bytes: &[u8], kind: StreamBytesKind) -> StreamConnectionCont
 fn udp_ctx(payload: &[u8], kind: StreamBytesKind) -> UdpDatagramContext<'_> {
     UdpDatagramContext {
         client_ip: Arc::from("203.0.113.10"),
+        client_ip_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 10)),
         proxy_id: Arc::from("udp-proxy"),
         proxy_name: Some(Arc::from("UDP Proxy")),
         listen_port: 9000,
@@ -6305,6 +7629,7 @@ fn udp_ctx(payload: &[u8], kind: StreamBytesKind) -> UdpDatagramContext<'_> {
         payload,
         payload_kind: kind,
         metadata_sink: None,
+        admission_datagram: false,
     }
 }
 
@@ -6631,7 +7956,7 @@ async fn stream_waf_udp_monitor_hit_records_metadata_via_sink() {
     // the hit rides the stream transaction summary by default (log_to_metadata is
     // on), not only when log_to_stdout is enabled — parity with the TCP path.
     let plugin = sig_waf("monitor");
-    let meta = std::sync::Mutex::new(std::collections::HashMap::new());
+    let meta = std::sync::Mutex::new(ferrum_edge::plugins::MetadataMap::default());
     let mut ctx = udp_ctx(b"q=1 union select 1", StreamBytesKind::PlaintextWire);
     ctx.metadata_sink = Some(UdpMetadataSink::new(&meta));
 
@@ -6669,7 +7994,7 @@ async fn stream_waf_udp_enforce_hit_records_blocked_metadata() {
     // An enforced UDP hit drops the datagram AND records a `blocked` action with
     // a block reason, so the drop is not silent in the transaction log.
     let plugin = sig_waf("enforce");
-    let meta = std::sync::Mutex::new(std::collections::HashMap::new());
+    let meta = std::sync::Mutex::new(ferrum_edge::plugins::MetadataMap::default());
     let mut ctx = udp_ctx(b"q=1 union select 1", StreamBytesKind::PlaintextWire);
     ctx.metadata_sink = Some(UdpMetadataSink::new(&meta));
 
@@ -6694,7 +8019,7 @@ async fn stream_waf_udp_clean_datagram_records_no_metadata() {
     // No hit → nothing recorded, so clean UDP traffic does not pollute the
     // transaction summary with WAF fields.
     let plugin = sig_waf("monitor");
-    let meta = std::sync::Mutex::new(std::collections::HashMap::new());
+    let meta = std::sync::Mutex::new(ferrum_edge::plugins::MetadataMap::default());
     let mut ctx = udp_ctx(b"perfectly benign payload", StreamBytesKind::PlaintextWire);
     ctx.metadata_sink = Some(UdpMetadataSink::new(&meta));
 
@@ -6723,7 +8048,7 @@ async fn stream_waf_udp_metadata_merges_across_datagrams_and_keeps_max_severity(
         }
     }))
     .unwrap();
-    let meta = std::sync::Mutex::new(std::collections::HashMap::new());
+    let meta = std::sync::Mutex::new(ferrum_edge::plugins::MetadataMap::default());
     let sink = UdpMetadataSink::new(&meta);
 
     // Datagram 1: high-severity hit.
@@ -6986,7 +8311,7 @@ fn waf_stream_metadata_ownership_documentation_matches_stream_support() {
     // documented ownership contract aligned with the conditional stream
     // support so logging/schema authors do not treat stream `waf.*` values as
     // unavailable or non-authoritative.
-    let docs = include_str!("../../../docs/plugins.md");
+    let docs = include_str!("../../../docs/waf.md");
     let note = docs
         .split("Reserved log-metadata namespace")
         .nth(1)
@@ -7037,8 +8362,8 @@ fn waf_custom_rule_path_regex_docs_match_unanchored_runtime() {
     // `global_exemptions.paths`. Runtime, docs/waf.md, and OpenAPI keep rule
     // conditions operator-authored and unanchored. Pin the three surfaces so
     // the plugin guide cannot drift back to the exemption grammar.
-    let plugin_docs = include_str!("../../../docs/plugins.md");
     let waf_guide = include_str!("../../../docs/waf.md");
+    let plugin_docs = waf_guide;
     let openapi = include_str!("../../../openapi.yaml");
 
     let custom_rule_table = plugin_docs
@@ -7463,14 +8788,16 @@ async fn request_wide_header_exemption_prevents_oversize_fail_closed_block() {
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "global_exemptions": {
-            "header_present": { "x-waf-exempt": null }
+            "header_present": { "x-waf-exempt": "trusted-hop-shared-secret" }
         },
         "custom_rules": [enforcing_request_body_rule()]
     }))
     .unwrap();
     let mut ctx = body_ctx();
-    ctx.headers
-        .insert("x-waf-exempt".to_string(), "true".to_string());
+    ctx.headers.insert(
+        "x-waf-exempt".to_string(),
+        "trusted-hop-shared-secret".to_string(),
+    );
     let headers = ctx.headers.clone();
 
     let result = plugin
@@ -7984,7 +9311,7 @@ async fn opaque_binary_content_type_still_skips_body_inspection() {
     )
     .await;
 
-    assert!(matches!(result, PluginResult::Continue));
+    assert!(refused_as_unlisted(&result, &request_ctx));
     assert!(!monitored(&request_ctx, "FE-SQLI-001-B"));
 }
 
@@ -8006,7 +9333,7 @@ async fn suffix_mapping_reuses_the_configured_allowlist_and_adds_no_hidden_types
         br#"{"q":"id=1 UNION SELECT password FROM users"}"#,
     )
     .await;
-    assert!(matches!(result, PluginResult::Continue));
+    assert!(refused_as_unlisted(&result, &request_ctx));
     assert!(!monitored(&request_ctx, "FE-SQLI-001-B"));
 
     // The configured entry itself is unaffected.
@@ -8031,7 +9358,7 @@ async fn multipart_gate_is_unchanged_by_the_suffix_rule() {
         b"id=1 UNION SELECT password FROM users",
     )
     .await;
-    assert!(matches!(result, PluginResult::Continue));
+    assert!(refused_as_unlisted(&result, &request_ctx));
     assert!(!monitored(&request_ctx, "FE-SQLI-001-B"));
 
     let multipart_plugin = waf(json!({
@@ -8075,7 +9402,11 @@ async fn scan_wide_direction(
 }
 
 fn wide_parity_waf() -> Waf {
+    // These fixtures test decoding parity, not the unlisted-type disposition,
+    // so unlisted bodies are forwarded rather than refused.
     waf(json!({
+        "on_unlisted_content_type": "allow",
+        "on_unlisted_response_content_type": "allow",
         "include_default_rules": false,
         "response_inspection": true,
         "response_body_inspection": true,
@@ -8146,6 +9477,282 @@ async fn wide_body_view_policy_matches_in_both_directions() {
 }
 
 #[tokio::test]
+async fn wrong_declared_wide_charset_still_scans_signature_readings() {
+    // Follow-up to #6729: a BOM-less body whose declared wide charset is
+    // wrong about width or endianness still gets the readings a
+    // byte-sniffing parser produces, on top of the declared readings.
+    let plugin = wide_parity_waf();
+    let text = r#"{"value":"inspection-marker"}"#;
+    for response in [false, true] {
+        let expected = if response {
+            "WIDE-RESPONSE"
+        } else {
+            "WIDE-REQUEST"
+        };
+        for (label, content_type, bytes) in [
+            // Wrong endianness, same width.
+            (
+                "utf-16be over LE",
+                "application/json; charset=utf-16be",
+                encode_utf16(text, false),
+            ),
+            (
+                "utf-16le over BE",
+                "application/json; charset=utf-16le",
+                encode_utf16(text, true),
+            ),
+            (
+                "utf-32be over LE",
+                "application/json; charset=utf-32be",
+                encode_utf32(text, false),
+            ),
+            (
+                "utf-32le over BE",
+                "application/json; charset=utf-32le",
+                encode_utf32(text, true),
+            ),
+            // Wrong width: declared readings plus the signature pair.
+            (
+                "utf-32le over UTF-16LE",
+                "application/json; charset=utf-32le",
+                encode_utf16(text, false),
+            ),
+            (
+                "utf-16le over UTF-32BE",
+                "application/json; charset=utf-16le",
+                encode_utf32(text, true),
+            ),
+            (
+                "bare utf-16 over UTF-32BE",
+                "application/json; charset=utf-16",
+                encode_utf32(text, true),
+            ),
+            (
+                "bare utf-32 over UTF-16LE",
+                "application/json; charset=utf-32",
+                encode_utf16(text, false),
+            ),
+        ] {
+            let (result, request) =
+                scan_wide_direction(&plugin, response, content_type, &bytes).await;
+            assert!(
+                matches!(result, PluginResult::Reject { .. }),
+                "response={response} {label}"
+            );
+            assert_eq!(
+                request.metadata.get("waf.rule_hits").unwrap(),
+                expected,
+                "{label}"
+            );
+        }
+        // Benign wide text under a wrong declaration is not a match either.
+        let (result, _) = scan_wide_direction(
+            &plugin,
+            response,
+            "application/json; charset=utf-16be",
+            &encode_utf16(r#"{"value":"ordinary"}"#, false),
+        )
+        .await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "benign response={response}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bom_width_disagreeing_with_declared_wide_charset_scans_both_readings() {
+    // A BOM whose width differs from the declared wide charset family: a
+    // declaration-honouring backend decodes the whole body (BOM bytes
+    // included) in the declared charset, while a BOM-sniffing one decodes the
+    // body after the mark in the BOM's charset. Both readings are scanned.
+    let plugin = wide_parity_waf();
+    let text = r#"{"value":"inspection-marker"}"#;
+    let benign = r#"{"value":"ordinary"}"#;
+    let shapes: [(&str, &str, BodyEncoder); 12] = [
+        // UTF-16 BOM under a UTF-32 declaration: the BOM's reading.
+        (
+            "utf-32le over UTF-16BE BOM",
+            "application/json; charset=utf-32le",
+            |t| with_bom(&[0xFE, 0xFF], &encode_utf16(t, true)),
+        ),
+        (
+            "utf-32be over UTF-16LE BOM",
+            "application/json; charset=utf-32be",
+            |t| with_bom(UTF16_LE_BOM, &encode_utf16(t, false)),
+        ),
+        (
+            "bare utf-32 over UTF-16BE BOM",
+            "application/json; charset=utf-32",
+            |t| with_bom(&[0xFE, 0xFF], &encode_utf16(t, true)),
+        ),
+        (
+            "bare utf-32 over UTF-16LE BOM",
+            "application/json; charset=utf-32",
+            |t| with_bom(UTF16_LE_BOM, &encode_utf16(t, false)),
+        ),
+        // UTF-32 BOM under a UTF-16 declaration: the declared reading.
+        (
+            "utf-16le over UTF-32BE BOM",
+            "application/json; charset=utf-16le",
+            |t| with_bom(UTF32_BE_BOM, &encode_utf16(t, false)),
+        ),
+        (
+            "utf-16be over UTF-32BE BOM",
+            "application/json; charset=utf-16be",
+            |t| with_bom(UTF32_BE_BOM, &encode_utf16(t, true)),
+        ),
+        (
+            "bare utf-16 over UTF-32BE BOM, LE text",
+            "application/json; charset=utf-16",
+            |t| with_bom(UTF32_BE_BOM, &encode_utf16(t, false)),
+        ),
+        (
+            "bare utf-16 over UTF-32BE BOM, BE text",
+            "application/json; charset=utf-16",
+            |t| with_bom(UTF32_BE_BOM, &encode_utf16(t, true)),
+        ),
+        // `FF FE 00 00` under an explicit big-endian UTF-16 declaration: the
+        // ambiguity readings stay, and the declared reading joins them.
+        (
+            "utf-16be over UTF-32LE BOM",
+            "application/json; charset=utf-16be",
+            |t| with_bom(UTF32_LE_BOM, &encode_utf16(t, true)),
+        ),
+        // The side the declared path already produced is still scanned.
+        (
+            "utf-16le over UTF-32BE BOM, UTF-32 text",
+            "application/json; charset=utf-16le",
+            |t| with_bom(UTF32_BE_BOM, &encode_utf32(t, true)),
+        ),
+        (
+            "utf-16be over UTF-32LE BOM, UTF-32 text",
+            "application/json; charset=utf-16be",
+            |t| with_bom(UTF32_LE_BOM, &encode_utf32(t, false)),
+        ),
+        (
+            "utf-32le over UTF-16BE BOM, UTF-32 text",
+            "application/json; charset=utf-32le",
+            // `FE FF 00 00` keeps the declared UTF-32 units aligned.
+            |t| with_bom(&[0xFE, 0xFF, 0x00, 0x00], &encode_utf32(t, false)),
+        ),
+    ];
+    for response in [false, true] {
+        let expected = if response {
+            "WIDE-RESPONSE"
+        } else {
+            "WIDE-REQUEST"
+        };
+        for (label, content_type, encode) in shapes {
+            let (result, request) =
+                scan_wide_direction(&plugin, response, content_type, &encode(text)).await;
+            assert!(
+                matches!(result, PluginResult::Reject { .. }),
+                "response={response} {label}"
+            );
+            assert_eq!(
+                request.metadata.get("waf.rule_hits").unwrap(),
+                expected,
+                "response={response} {label}"
+            );
+            let (result, request) =
+                scan_wide_direction(&plugin, response, content_type, &encode(benign)).await;
+            assert!(
+                matches!(result, PluginResult::Continue),
+                "benign response={response} {label}"
+            );
+            assert!(!request.metadata.contains_key("waf.rule_hits"), "{label}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn correctly_labelled_wide_body_adds_no_opposite_endian_view() {
+    // A BOM-less body whose explicit wide charset matches its signature's
+    // width and endianness is already read exactly as a byte-sniffing parser
+    // reads it, so the opposite-endian decode is not added. These markers
+    // appear only in that opposite-endian decode: `A` (U+0041) read with the
+    // wrong UTF-16 byte order is U+4100, and `Ā` (U+0100) read with the wrong
+    // UTF-32 byte order is U+10000.
+    let plugin = waf(json!({
+        "on_unlisted_content_type": "allow",
+        "include_default_rules": false,
+        "custom_rules": [
+            {
+                "id": "OPPOSITE-UTF16", "name": "opposite utf-16 reading", "category": "custom",
+                "severity": "high", "target": "body_text", "match_kind": "contains",
+                "pattern": "\u{4100}", "action": "enforce"
+            },
+            {
+                "id": "OPPOSITE-UTF32", "name": "opposite utf-32 reading", "category": "custom",
+                "severity": "high", "target": "body_text", "match_kind": "contains",
+                "pattern": "\u{10000}", "action": "enforce"
+            }
+        ]
+    }))
+    .unwrap();
+    let utf16_text = r#"{"v":"A"}"#;
+    let utf32_text = "{\"v\":\"\u{100}\"}";
+    for (charset, opposite, rule, bytes) in [
+        (
+            "utf-16le",
+            "utf-16be",
+            "OPPOSITE-UTF16",
+            encode_utf16(utf16_text, false),
+        ),
+        (
+            "utf-16be",
+            "utf-16le",
+            "OPPOSITE-UTF16",
+            encode_utf16(utf16_text, true),
+        ),
+        (
+            "utf-32le",
+            "utf-32be",
+            "OPPOSITE-UTF32",
+            encode_utf32(utf32_text, false),
+        ),
+        (
+            "utf-32be",
+            "utf-32le",
+            "OPPOSITE-UTF32",
+            encode_utf32(utf32_text, true),
+        ),
+    ] {
+        let (result, ctx) = scan_body_with_content_type(
+            &plugin,
+            &format!("application/json; charset={charset}"),
+            &bytes,
+        )
+        .await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "correctly labelled {charset} must not add the opposite-endian view"
+        );
+        assert!(!ctx.metadata.contains_key("waf.rule_hits"), "{charset}");
+        // Controls: the marker is reachable whenever the opposite-endian
+        // reading is legitimately scanned — an undeclared signature, a bare
+        // declaration, and a declaration that disagrees with the bytes.
+        for content_type in [
+            "application/json".to_string(),
+            format!("application/json; charset={}", &charset[..6]),
+            format!("application/json; charset={opposite}"),
+        ] {
+            let (result, ctx) = scan_body_with_content_type(&plugin, &content_type, &bytes).await;
+            assert!(
+                matches!(result, PluginResult::Reject { .. }),
+                "{charset} bytes under {content_type}"
+            );
+            assert_eq!(
+                ctx.metadata.get("waf.rule_hits").map(String::as_str),
+                Some(rule),
+                "{charset} bytes under {content_type}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn undeclared_wide_requests_match_the_default_pack_at_both_paranoia_levels() {
     for level in [1, 4] {
         let plugin = waf(json!({
@@ -8171,10 +9778,22 @@ async fn wide_body_inference_preserves_benign_binary_and_explicit_charset_contro
             assert!(matches!(result, PluginResult::Continue));
         }
         for (_, _, body) in wide_encodings("inspection-marker") {
-            // A declaration is not overridden by signature inference. Binary
-            // and multipart eligibility still precedes charset decoding.
+            // A non-wide charset declaration does not switch signature
+            // inference off: a byte-sniffing parser still reads the body as
+            // wide text whatever the header claims.
             for content_type in [
                 "application/json; charset=utf-8",
+                "application/json; charset=x-unknown-label",
+                "text/plain; charset=iso-8859-1",
+            ] {
+                let (result, _) = scan_wide_direction(&plugin, response, content_type, &body).await;
+                assert!(
+                    matches!(result, PluginResult::Reject { .. }),
+                    "{content_type} (response: {response})"
+                );
+            }
+            // Binary and multipart eligibility still precedes charset decoding.
+            for content_type in [
                 "application/octet-stream",
                 "multipart/form-data; boundary=fixture",
             ] {
@@ -8825,15 +10444,11 @@ fn request_and_response_size_only_claims_agree() {
 
 // ── Issue #5120: the main plugin reference states the real lifecycle ────────
 
-/// The `waf` section of `docs/plugins.md`, bounded at the next `###` heading so
-/// a neighbouring plugin's rows can never satisfy an assertion about this one.
+/// The canonical WAF reference, `docs/waf.md`. `docs/plugins.md` keeps only a
+/// summary that links here, so the summary block and parameter table pinned
+/// below live in this page.
 fn waf_plugins_doc_section() -> &'static str {
-    const PLUGINS_DOC: &str = include_str!("../../../docs/plugins.md");
-    let section = PLUGINS_DOC
-        .split("\n### `waf`\n")
-        .nth(1)
-        .expect("waf reference section");
-    section.split("\n### ").next().unwrap_or(section)
+    include_str!("../../../docs/waf.md")
 }
 
 /// `docs/plugins.md` is the reference most operators read first; its WAF
@@ -9454,4 +11069,53 @@ fn on_scan_timeout_openapi_runtime_parity() {
         Waf::new(&json!({ "mode": "monitor", "on_scan_timeout": null })).is_ok(),
         "runtime must accept an explicit null as the documented default"
     );
+}
+
+/// GHSA-rxwj-x6c6-f4j5: `global_exemptions.consumers` names mapped Consumers.
+/// In a multi-auth route (`key_auth` for the internal scanner Consumer,
+/// `jwks_auth` / `ldap_auth` / ... for end users), an external principal who
+/// registers the scanner's username is still scanned.
+#[tokio::test]
+async fn global_consumer_exemption_does_not_exempt_external_identity_with_same_name() {
+    let plugin = waf(json!({
+        "include_default_rules": false,
+        "global_exemptions": { "consumers": ["security-scanner"] },
+        "custom_rules": [{
+            "id": "CUSTOM-SCANNER-QUERY",
+            "name": "query marker",
+            "category": "custom",
+            "severity": "high",
+            "target": "query_values",
+            "match_kind": "contains",
+            "pattern": "needle",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    for mechanism in [
+        "jwks_auth",
+        "ldap_auth",
+        "oauth2_introspection",
+        "oidc_relying_party",
+        "soap_ws_security",
+    ] {
+        let mut external =
+            super::plugin_utils::committed_external_identity_context("security-scanner", mechanism);
+        external.set_raw_query_string("q=needle".into());
+        assert!(
+            matches!(
+                plugin.authorize(&mut external).await,
+                PluginResult::Reject { .. }
+            ),
+            "{mechanism}: an external identity must not inherit a Consumer exemption"
+        );
+    }
+
+    let mut scanner = super::plugin_utils::consumer_context("security-scanner");
+    scanner.set_raw_query_string("q=needle".into());
+    assert!(matches!(
+        plugin.authorize(&mut scanner).await,
+        PluginResult::Continue
+    ));
 }

@@ -1,0 +1,70 @@
+# Envoy server-side proxy, Istio-style sidecar ingress shape:
+# HTTP/2-over-mTLS listener (15006, client certificate required, SPIFFE
+# URI SAN of the
+# client workload pinned) -> plaintext local backend (18080).
+# CERT_DIR is substituted by the harness.
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9902 }
+
+static_resources:
+  listeners:
+    - name: inbound_mtls
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 15006 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              # Ferrum's SPIFFE inbound disables TLS session
+              # resumption; match it so pool churn costs align.
+              disable_stateless_session_resumption: true
+              disable_stateful_session_resumption: true
+              common_tls_context:
+                tls_params: { tls_minimum_protocol_version: TLSv1_3, tls_maximum_protocol_version: TLSv1_3 }
+                alpn_protocols: ["h2"]
+                tls_certificates:
+                  - certificate_chain: { filename: CERT_DIR/svc/svid.crt }
+                    private_key: { filename: CERT_DIR/svc/svid.key }
+                validation_context:
+                  trusted_ca:
+                    filename: CERT_DIR/svc/bundle.pem
+                  match_typed_subject_alt_names:
+                    - san_type: URI
+                      matcher: { exact: "spiffe://cluster.local/ns/ferrum/sa/client" }
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: mesh_inbound
+                codec_type: HTTP2
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: backend_plain
+                            timeout: 0s
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                access_log: []
+
+  clusters:
+    - name: backend_plain
+      connect_timeout: 5s
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend_plain
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 18080 }

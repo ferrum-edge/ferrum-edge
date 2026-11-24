@@ -130,7 +130,7 @@ struct RejectProviderNative {
 
 #[async_trait::async_trait]
 impl ResponseStreamInspector for RejectProviderNative {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
         if chunk
             .windows(b"chat.completion.chunk".len())
             .any(|window| window == b"chat.completion.chunk")
@@ -143,7 +143,7 @@ impl ResponseStreamInspector for RejectProviderNative {
         {
             ResponseStreamAction::Terminate(None)
         } else {
-            ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+            ResponseStreamAction::Forward(chunk.clone())
         }
     }
 }
@@ -1235,66 +1235,94 @@ async fn test_anthropic_rejects_malformed_and_unsupported_tool_choice() {
 async fn test_anthropic_extended_thinking_tool_choice_combinations() {
     let plugin = build(openai_and_anthropic_config());
 
-    // Manual enabled thinking + none/auto are admitted and forwarded.
-    for (tool_choice, expected) in [
-        (json!("none"), json!({"type": "none"})),
-        (json!("auto"), json!({"type": "auto"})),
-    ] {
-        let body = json!({
+    // Manual enabled thinking + tool_choice none is admitted and forwarded:
+    // no tool can be called, so no signed thinking block must be replayed.
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": weather_tools(),
+        "tool_choice": "none",
+        "thinking": {"type": "enabled", "budget_tokens": 1024}
+    });
+    let parsed = translate_anthropic_body(&body)
+        .await
+        .expect("thinking with none must translate");
+    assert_eq!(parsed["tool_choice"], json!({"type": "none"}));
+    assert_eq!(
+        parsed["thinking"],
+        json!({"type": "enabled", "budget_tokens": 1024})
+    );
+    assert_eq!(parsed["max_tokens"], json!(4096));
+
+    // Manual enabled thinking with callable tools (explicit `auto` or the
+    // implicit default) is refused up front (ai_stream_router-SOL-3): the
+    // signed thinking blocks Anthropic requires on the tool-result turn cannot
+    // round-trip through the OpenAI representation.
+    for tool_choice in [Some(json!("auto")), None] {
+        let mut body = json!({
             "model": "claude-3-5-sonnet",
             "stream": true,
             "max_tokens": 4096,
             "messages": [{"role": "user", "content": "weather?"}],
             "tools": weather_tools(),
-            "tool_choice": tool_choice,
             "thinking": {"type": "enabled", "budget_tokens": 1024}
         });
-        let parsed = translate_anthropic_body(&body)
-            .await
-            .expect("thinking with none/auto must translate");
-        assert_eq!(parsed["tool_choice"], expected);
-        assert_eq!(
-            parsed["thinking"],
-            json!({"type": "enabled", "budget_tokens": 1024})
-        );
-        assert_eq!(parsed["max_tokens"], json!(4096));
+        if let Some(tool_choice) = tool_choice {
+            body["tool_choice"] = tool_choice;
+        }
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(reject_status(&result), Some(400));
+        if let PluginResult::Reject { body, .. } = result {
+            assert!(body.contains("invalid_thinking"), "{body}");
+        }
+        assert!(ctx.route_override_backend_host.is_none());
     }
 
-    let adaptive = json!({
-        "model": "claude-3-5-sonnet",
-        "stream": true,
-        "messages": [{"role": "user", "content": "weather?"}],
-        "tools": weather_tools(),
-        "tool_choice": "auto",
-        "thinking": {"type": "adaptive"}
-    });
-    let parsed = translate_anthropic_body(&adaptive)
-        .await
-        .expect("adaptive thinking with auto must translate");
-    assert_eq!(parsed["thinking"], json!({"type": "adaptive"}));
-
-    // Adaptive thinking supports forced tool use (required / named).
-    for (tool_choice, expected) in [
-        (json!("required"), json!({"type": "any"})),
-        (
-            json!({"type": "function", "function": {"name": "get_weather"}}),
-            json!({"type": "tool", "name": "get_weather"}),
-        ),
+    // Adaptive thinking loses the same signed blocks across a tool turn, so it
+    // is refused with callable tools too (auto, required, named, implicit).
+    for tool_choice in [
+        Some(json!("auto")),
+        Some(json!("required")),
+        Some(json!({"type": "function", "function": {"name": "get_weather"}})),
+        None,
     ] {
-        let body = json!({
+        let mut body = json!({
             "model": "claude-3-5-sonnet",
             "stream": true,
             "messages": [{"role": "user", "content": "weather?"}],
             "tools": weather_tools(),
-            "tool_choice": tool_choice,
             "thinking": {"type": "adaptive"}
         });
-        let parsed = translate_anthropic_body(&body)
-            .await
-            .expect("adaptive thinking with forced tool_choice must translate");
-        assert_eq!(parsed["tool_choice"], expected);
-        assert_eq!(parsed["thinking"], json!({"type": "adaptive"}));
+        if let Some(tool_choice) = tool_choice {
+            body["tool_choice"] = tool_choice;
+        }
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(reject_status(&result), Some(400));
+        if let PluginResult::Reject { body, .. } = result {
+            assert!(body.contains("invalid_thinking"), "{body}");
+        }
     }
+
+    // Adaptive thinking with tools that cannot be called is still admitted.
+    let adaptive_none = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": weather_tools(),
+        "tool_choice": "none",
+        "thinking": {"type": "adaptive"}
+    });
+    let parsed = translate_anthropic_body(&adaptive_none)
+        .await
+        .expect("adaptive thinking with tool_choice none must translate");
+    assert_eq!(parsed["thinking"], json!({"type": "adaptive"}));
+    assert_eq!(parsed["tool_choice"], json!({"type": "none"}));
 
     // Forced tool use with manual enabled thinking is rejected at admission.
     for tool_choice in [
@@ -1576,7 +1604,12 @@ async fn test_normalizer_fails_closed_when_provider_emits_tool_use_under_none() 
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let mut collected = Vec::new();
-    match inspector.on_chunk(ANTHROPIC_TOOL_USE_SSE.as_bytes()).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(
+            ANTHROPIC_TOOL_USE_SSE.as_bytes(),
+        ))
+        .await
+    {
         ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
             collected.extend_from_slice(&b)
         }
@@ -1646,7 +1679,12 @@ async fn test_normalizer_still_emits_tool_calls_when_tool_choice_allows() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let mut collected = Vec::new();
-    match inspector.on_chunk(ANTHROPIC_TOOL_USE_SSE.as_bytes()).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(
+            ANTHROPIC_TOOL_USE_SSE.as_bytes(),
+        ))
+        .await
+    {
         ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
             collected.extend_from_slice(&b)
         }
@@ -1734,12 +1772,19 @@ async fn test_inspector_gating() {
             .response_stream_inspector(&ctx, 500, Some("text/event-stream"))
             .is_none()
     );
-    // Non-SSE → none.
-    assert!(
-        plugin
-            .response_stream_inspector(&ctx, 200, Some("application/json"))
-            .is_none()
-    );
+    // Non-SSE 2xx → a fail-closed inspector, never raw provider passthrough
+    // (ai_stream_router-CLAUDE-3).
+    let mut non_sse = plugin
+        .response_stream_inspector(&ctx, 200, Some("application/json"))
+        .expect("a claimed Anthropic 2xx non-SSE response must fail closed");
+    let out = String::from_utf8(forwarded(
+        non_sse
+            .on_chunk(&bytes::Bytes::from_static(b"{\"id\":\"msg\"}"))
+            .await,
+    ))
+    .unwrap();
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(!out.contains("msg"), "{out}");
 
     // OpenAI passthrough → no inspector even for a 2xx event-stream.
     let gpt = json!({"model": "gpt-4o", "stream": true, "messages": []});
@@ -1777,7 +1822,10 @@ async fn test_stream_normalizer_stage_precedes_policy_inspection() {
         normalizer,
     ])
     .expect("chained inspectors");
-    let output = match chain.on_chunk(ANTHROPIC_SSE.as_bytes()).await {
+    let output = match chain
+        .on_chunk(&bytes::Bytes::copy_from_slice(ANTHROPIC_SSE.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Forward(output) | ResponseStreamAction::Terminate(Some(output)) => {
             output
         }
@@ -1825,7 +1873,11 @@ async fn run_normalizer(chunk_size: usize) -> String {
 
     let mut collected = Vec::new();
     for chunk in ANTHROPIC_SSE.as_bytes().chunks(chunk_size) {
-        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
     }
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     String::from_utf8(collected).unwrap()
@@ -2125,6 +2177,81 @@ async fn test_endpoint_query_omits_previously_stripped_client_credentials() {
 }
 
 #[tokio::test]
+async fn test_endpoint_query_drops_semicolon_hidden_credentials_and_provider_params() {
+    // Issue #6579: a provider that also splits on `;` reads `carrier=;api_key=`
+    // as an `api_key` parameter and `x=;api-version=` as a second
+    // `api-version`. Neither may be folded into the provider path.
+    let plugin = build(azure_style_config());
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    ctx.set_raw_query_string(
+        "api_key=secret&carrier=;api_key=secret&x=;api-version=evil&foo=bar".to_string(),
+    );
+    ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let path = ctx.route_override_path.as_deref().expect("override path");
+    assert_eq!(
+        path,
+        "/openai/deployments/gpt/chat/completions?api-version=2024-02-01&foo=bar"
+    );
+    assert!(!path.contains("secret") && !path.contains("evil"), "{path}");
+}
+
+#[tokio::test]
+async fn test_endpoint_semicolon_query_names_are_protected_under_both_readings() {
+    // Issue #6579: an endpoint query `x=1;api-version=stable` owns
+    // `api-version` for a provider that splits on `;`, so neither an ordinary
+    // nor a `;`-hidden client `api-version` may be folded in.
+    let plugin = build(json!({
+        "providers": [{
+            "name": "azure",
+            "provider_type": "openai_compatible",
+            "endpoint": "https://azure.example.com/openai/deployments/gpt/chat/completions?x=1;api-version=stable",
+            "api_key": "sk-azure",
+            "model_patterns": ["gpt-*"]
+        }]
+    }));
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    ctx.set_raw_query_string(
+        "api-version=evil&carrier=;api-version=hidden&note=a%3Bb&foo=bar".to_string(),
+    );
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let path = ctx.route_override_path.as_deref().expect("override path");
+    assert!(!path.contains("evil") && !path.contains("hidden"), "{path}");
+    // `%3B` is content, so `note` is not mistaken for an endpoint parameter.
+    assert!(path.ends_with("&note=a%3Bb&foo=bar"), "{path}");
+}
+
+#[tokio::test]
+async fn test_endpoint_query_names_are_protected_under_form_decoding() {
+    // `tenant+id` is `tenant id` to a form-decoding provider, so it must not
+    // override the endpoint-owned `tenant%20id`; `%2B` stays a literal plus.
+    let plugin = build(json!({
+        "providers": [{
+            "name": "azure",
+            "provider_type": "openai_compatible",
+            "endpoint": "https://azure.example.com/openai/deployments/gpt/chat/completions?x=1;tenant%20id=trusted",
+            "api_key": "sk-azure",
+            "model_patterns": ["gpt-*"]
+        }]
+    }));
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    ctx.set_raw_query_string("tenant+id=other&tenant%2Bid=kept&foo=bar".to_string());
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let path = ctx.route_override_path.as_deref().expect("override path");
+    assert!(!path.contains("other"), "{path}");
+    assert!(path.ends_with("&tenant%2Bid=kept&foo=bar"), "{path}");
+}
+
+#[tokio::test]
 async fn test_endpoint_query_drops_client_duplicate_provider_params() {
     let plugin = build(azure_style_config());
     let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
@@ -2246,6 +2373,7 @@ async fn test_backend_tls_default_and_inherit() {
         san_allow_list: vec!["llm.internal.example.com".to_string()],
         san_allow_list_key_digest: Some("digest".to_string()),
         tls_refused: false,
+        suppress_global_client_identity: false,
     };
     let mut proxy = create_test_proxy();
     proxy.resolved_tls = inherited_tls.clone();
@@ -2258,7 +2386,10 @@ async fn test_backend_tls_default_and_inherit() {
             .map(String::as_str),
         Some("true")
     );
-    assert_eq!(ctx2.route_override_resolved_tls, Some(inherited_tls));
+    assert_eq!(
+        ctx2.route_override_resolved_tls,
+        Some(Arc::new(inherited_tls))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2310,7 +2441,10 @@ async fn test_normalizer_terminates_on_oversized_sse_event() {
     let mut terminated = None;
     // 1 MiB cap / 64 KiB chunks → must terminate well within 20 chunks.
     for i in 0..20 {
-        match inspector.on_chunk(&filler).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&filler))
+            .await
+        {
             ResponseStreamAction::Forward(bytes) => {
                 assert!(
                     bytes.is_empty(),
@@ -2331,7 +2465,9 @@ async fn test_normalizer_terminates_on_oversized_sse_event() {
 
     // After termination the inspector keeps the stream closed without
     // emitting the terminal payload a second time.
-    let after = inspector.on_chunk(b"data: {}\n\n").await;
+    let after = inspector
+        .on_chunk(&bytes::Bytes::from_static(b"data: {}\n\n"))
+        .await;
     match after {
         ResponseStreamAction::Terminate(None) => {}
         ResponseStreamAction::Terminate(Some(_)) => panic!("must not emit terminal bytes twice"),
@@ -2343,7 +2479,9 @@ async fn test_normalizer_terminates_on_oversized_sse_event() {
 async fn test_normalizer_rejects_complete_event_at_exact_boundary_plus_one() {
     let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
     let event = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
-    let action = inspector.on_chunk(&event).await;
+    let action = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&event))
+        .await;
     match action {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
@@ -2359,7 +2497,9 @@ async fn test_normalizer_accepts_complete_event_at_exact_per_event_boundary() {
     // Exact-cap frame that is not valid Anthropic JSON: the size gate must
     // admit it so malformed-JSON rejection (not oversized) is what fires.
     let event = oversized_complete_event(MAX_SSE_EVENT_BYTES);
-    let action = inspector.on_chunk(&event).await;
+    let action = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&event))
+        .await;
     match action {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
@@ -2387,12 +2527,18 @@ async fn test_normalizer_rejects_split_oversized_event_before_boundary() {
     let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
     let half = MAX_SSE_EVENT_BYTES / 2 + 1;
     let first = vec![b'x'; half];
-    match inspector.on_chunk(&first).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&first))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => assert!(bytes.is_empty()),
         other => panic!("first half under the cap must not terminate: {other:?}"),
     }
     let second = vec![b'y'; half];
-    match inspector.on_chunk(&second).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&second))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert_bound_termination(&text, "oversized");
@@ -2407,11 +2553,17 @@ async fn test_normalizer_rejects_when_boundary_arrives_with_final_oversized_byte
     // Fill exactly to the cap with no delimiter, then deliver the blank line
     // that would complete an oversized frame.
     let prefix = vec![b'z'; MAX_SSE_EVENT_BYTES];
-    match inspector.on_chunk(&prefix).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&prefix))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => assert!(bytes.is_empty()),
         other => panic!("exact-cap partial must wait for more bytes: {other:?}"),
     }
-    match inspector.on_chunk(b"\n\n").await {
+    match inspector
+        .on_chunk(&bytes::Bytes::from_static(b"\n\n"))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert_bound_termination(&text, "oversized");
@@ -2431,7 +2583,10 @@ async fn test_normalizer_many_small_events_stream_without_quadratic_growth() {
     for _ in 0..count {
         body.extend_from_slice(event);
     }
-    match inspector.on_chunk(&body).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&body))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => {
             assert!(
                 bytes.is_empty(),
@@ -2459,7 +2614,10 @@ async fn test_normalizer_rejects_excessive_normalized_output() {
         "event: message_start\n\
          data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{stream_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n"
     );
-    match inspector.on_chunk(start.as_bytes()).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(start.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Forward(_) => {}
         other => panic!("message_start must forward: {other:?}"),
     }
@@ -2486,7 +2644,10 @@ async fn test_normalizer_rejects_excessive_normalized_output() {
     let max_batches = MAX_SSE_EVENTS / batch_events;
 
     for index in 0..max_batches {
-        match inspector.on_chunk(&batch).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&batch))
+            .await
+        {
             ResponseStreamAction::Forward(_) => {}
             ResponseStreamAction::Terminate(Some(bytes)) => {
                 let text = String::from_utf8(bytes.to_vec()).unwrap();
@@ -2514,7 +2675,10 @@ async fn test_normalizer_terminal_provider_error_cannot_bypass_output_cap() {
         "event: message_start\n\
          data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{stream_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n"
     );
-    let mut forwarded = match inspector.on_chunk(start.as_bytes()).await {
+    let mut forwarded = match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(start.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => bytes.len(),
         other => panic!("message_start must forward: {other:?}"),
     };
@@ -2531,7 +2695,10 @@ async fn test_normalizer_terminal_provider_error_cannot_bypass_output_cap() {
     const PROVIDER_MESSAGE_BYTES: usize = 900 * 1024;
     let target = MAX_SSE_NORMALIZED_OUTPUT_BYTES - PROVIDER_MESSAGE_BYTES;
     while forwarded < target {
-        match inspector.on_chunk(&batch).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&batch))
+            .await
+        {
             ResponseStreamAction::Forward(bytes) => forwarded += bytes.len(),
             other => panic!("in-budget text deltas must forward: {other:?}"),
         }
@@ -2551,7 +2718,10 @@ async fn test_normalizer_terminal_provider_error_cannot_bypass_output_cap() {
         "terminal fixture must remain within the per-event cap"
     );
 
-    let terminal = match inspector.on_chunk(provider_error.as_bytes()).await {
+    let terminal = match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(provider_error.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => bytes,
         other => panic!("oversized normalized terminal output must terminate: {other:?}"),
     };
@@ -2586,7 +2756,10 @@ async fn test_normalizer_cumulative_body_exhaustion() {
     // The seventeenth must trip that budget specifically, well before either
     // the per-event or event-count limits.
     for index in 0..16 {
-        match inspector.on_chunk(&event).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&event))
+            .await
+        {
             ResponseStreamAction::Forward(bytes) => assert!(
                 bytes.is_empty(),
                 "valid ping frame {index} should produce no normalized output"
@@ -2594,7 +2767,10 @@ async fn test_normalizer_cumulative_body_exhaustion() {
             other => panic!("in-budget valid frame {index} must continue: {other:?}"),
         }
     }
-    match inspector.on_chunk(&event).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&event))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert_bound_termination(&text, "cumulative size limit");
@@ -2623,7 +2799,10 @@ async fn test_normalizer_event_count_exhaustion() {
         for _ in 0..n {
             chunk.extend_from_slice(event);
         }
-        match inspector.on_chunk(&chunk).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&chunk))
+            .await
+        {
             ResponseStreamAction::Forward(_) => seen += n,
             ResponseStreamAction::Terminate(bytes) => {
                 terminated = Some(bytes);
@@ -2652,7 +2831,10 @@ async fn test_normalizer_rejects_excessive_json_depth() {
         payload.push('}');
     }
     let frame = format!("data: {payload}\n\n");
-    match inspector.on_chunk(frame.as_bytes()).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(frame.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert_bound_termination(&text, "excessive JSON nesting");
@@ -2669,7 +2851,10 @@ async fn test_normalizer_trailing_incomplete_event_is_malformed() {
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tr\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"",
     );
-    match inspector.on_chunk(body.as_bytes()).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(body.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Forward(_) => {}
         other => panic!("incomplete trailing frame must wait for EOF: {other:?}"),
     }
@@ -2701,7 +2886,10 @@ async fn test_normalizer_sse_comment_frames_are_ignored() {
         "event: message_stop\n",
         "data: {\"type\":\"message_stop\"}\n\n",
     );
-    match inspector.on_chunk(body.as_bytes()).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(body.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) | ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert!(text.contains("\"content\":\"ok\""), "{text}");
@@ -2739,7 +2927,10 @@ async fn test_normalizer_streamed_path_enforces_complete_event_size_single_chunk
     // boundary — the original advisory reproduction.
     let mut chunk = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
     chunk.extend_from_slice(b"data: {\"type\":\"ping\"}\n\n");
-    match inspector.on_chunk(&chunk).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&chunk))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert_bound_termination(&text, "oversized");
@@ -2752,7 +2943,10 @@ async fn test_normalizer_streamed_path_enforces_complete_event_size_single_chunk
 async fn test_normalizer_malformed_utf8_fails_closed() {
     let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
     let frame = b"data: \xff\xfe not utf8\n\n";
-    match inspector.on_chunk(frame).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(frame))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert!(text.contains("upstream_error"), "{text}");
@@ -2780,7 +2974,7 @@ async fn test_concurrent_independent_normalizers() {
                 .expect("inspector");
             if i % 2 == 0 {
                 let bad = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
-                match inspector.on_chunk(&bad).await {
+                match inspector.on_chunk(&bytes::Bytes::copy_from_slice(&bad)).await {
                     ResponseStreamAction::Terminate(Some(bytes)) => {
                         let text = String::from_utf8(bytes.to_vec()).unwrap();
                         assert!(text.contains("oversized"), "{text}");
@@ -2799,7 +2993,7 @@ async fn test_concurrent_independent_normalizers() {
                     "data: {\"type\":\"message_stop\"}\n\n",
                 );
                 let mut out = Vec::new();
-                match inspector.on_chunk(ok.as_bytes()).await {
+                match inspector.on_chunk(&bytes::Bytes::copy_from_slice(ok.as_bytes())).await {
                     ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
                         out.extend_from_slice(&b);
                     }
@@ -3287,7 +3481,10 @@ async fn run_sse_bytes(body: &[u8]) -> (String, bool) {
         .expect("inspector");
     let mut collected = Vec::new();
     let mut terminated = false;
-    match inspector.on_chunk(body).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(body))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => collected.extend_from_slice(&bytes),
         ResponseStreamAction::Terminate(bytes) => {
             terminated = true;
@@ -3441,7 +3638,9 @@ async fn test_message_stop_terminates_without_waiting_for_extra_eof_bytes() {
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
-    let first = inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await;
+    let first = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(ANTHROPIC_SSE.as_bytes()))
+        .await;
     match first {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let out = String::from_utf8(bytes.to_vec()).unwrap();
@@ -3539,7 +3738,11 @@ async fn test_gzip_encoded_streamed_anthropic_sse_is_normalized() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("decoding inspector");
     let encoded = gzip_bytes(ANTHROPIC_SSE.as_bytes());
-    let mut collected = forwarded(inspector.on_chunk(&encoded).await);
+    let mut collected = forwarded(
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&encoded))
+            .await,
+    );
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
     assert!(out.contains("\"content\":\"Hello\""));
@@ -3573,7 +3776,11 @@ async fn test_gzip_streaming_decode_rejects_expansion_over_limit() {
         *byte = (i % 251) as u8;
     }
     let encoded = gzip_bytes(&oversized);
-    let mut collected = forwarded(inspector.on_chunk(&encoded).await);
+    let mut collected = forwarded(
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&encoded))
+            .await,
+    );
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
     assert!(out.contains("upstream_error"));
@@ -3618,7 +3825,11 @@ async fn test_gzip_streaming_decode_rejects_amplification_bomb() {
         "fixture must exceed the 1024:1 amplification ratio (compressed={})",
         encoded.len()
     );
-    let mid = forwarded(inspector.on_chunk(&encoded).await);
+    let mid = forwarded(
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&encoded))
+            .await,
+    );
     assert!(
         mid.is_empty(),
         "encoded frames must not be forwarded before decode completes"
@@ -3758,7 +3969,9 @@ async fn test_hostile_content_encoding_diagnostics_never_echo_raw_members() {
             .response_stream_inspector(&forged, 200, Some("text/event-stream"))
             .expect("fail-closed inspector");
         let frame = String::from_utf8(forwarded(
-            inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await,
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(ANTHROPIC_SSE.as_bytes()))
+                .await,
         ))
         .unwrap();
         assert!(frame.contains("upstream_error"), "{frame}");
@@ -3808,7 +4021,11 @@ async fn test_layered_gzip_br_chain_is_decoded_in_reverse_order() {
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("chain decoding inspector");
-    let held = forwarded(inspector.on_chunk(&layered).await);
+    let held = forwarded(
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&layered))
+            .await,
+    );
     assert!(held.is_empty(), "must not forward encoded chain frames");
     let out = String::from_utf8(forwarded(inspector.on_end().await)).unwrap();
     assert!(out.contains("\"content\":\"Hello\""));
@@ -3879,7 +4096,14 @@ async fn test_malformed_middle_layer_in_chain_fails_closed() {
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("chain decoding inspector");
-    assert!(forwarded(inspector.on_chunk(&truncated_chain).await).is_empty());
+    assert!(
+        forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(&truncated_chain))
+                .await
+        )
+        .is_empty()
+    );
     let out = String::from_utf8(forwarded(inspector.on_end().await)).unwrap();
     assert!(out.contains("upstream_error"));
     assert!(!out.contains("\"content\":\"Hello\""));
@@ -3961,7 +4185,9 @@ async fn test_forged_provider_encoding_metadata_fails_closed_without_forwarding(
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("fail-closed inspector");
     let out = String::from_utf8(forwarded(
-        inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(ANTHROPIC_SSE.as_bytes()))
+            .await,
     ))
     .unwrap();
     assert!(out.contains("upstream_error"));
@@ -3989,7 +4215,14 @@ async fn test_truncated_encoded_stream_fails_closed_without_partial_plaintext() 
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("chain decoding inspector");
-    assert!(forwarded(inspector.on_chunk(truncated).await).is_empty());
+    assert!(
+        forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(truncated))
+                .await
+        )
+        .is_empty()
+    );
     // Client/provider cancellation mid-stream: on_end sees a truncated coding
     // and must fail closed rather than normalize a partial decode.
     let out = String::from_utf8(forwarded(inspector.on_end().await)).unwrap();
@@ -5016,7 +5249,11 @@ async fn test_buffered_normalizer_matches_streaming_across_slice_boundaries() {
         .expect("inspector should be created");
     let mut collected = Vec::new();
     for chunk in body.as_bytes().chunks(4096) {
-        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
     }
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let streamed = String::from_utf8(collected).unwrap();
@@ -5062,14 +5299,16 @@ async fn test_upstream_error_envelope_is_serialized_through_the_bound() {
          document it replaced"
     );
 
-    // The same envelope is refused (leaving the response alone) when the
-    // response's retained ceiling cannot hold it, rather than being built first
-    // and measured after.
+    // The same envelope is refused when the response's retained ceiling cannot
+    // hold it, rather than being built first and measured after. The refusal
+    // replaces the provider body with an EMPTY one: leaving the response alone
+    // would deliver the raw provider bytes under the repaired OpenAI headers
+    // (ai_stream_router-CLAUDE-2).
     let mut tiny = post_ctx(&claude);
     let mut headers = json_headers();
     plugin.before_proxy(&mut tiny, &mut headers).await;
     tiny.max_response_body_size_bytes = 8;
-    assert!(
+    assert_eq!(
         plugin
             .normalize_response_body_with_context(
                 &mut tiny,
@@ -5078,10 +5317,10 @@ async fn test_upstream_error_envelope_is_serialized_through_the_bound() {
                 Some("text/event-stream"),
                 &response_headers,
             )
-            .await
-            .is_none(),
+            .await,
+        Some(Vec::new()),
         "an envelope larger than the retained ceiling must be refused during \
-         construction"
+         construction, and the raw provider body must still be replaced"
     );
 }
 
@@ -5123,20 +5362,36 @@ async fn test_buffered_normalizer_is_bounded_by_a_route_ceiling_below_the_slice_
         let mut headers = json_headers();
         plugin.before_proxy(&mut ctx, &mut headers).await;
         ctx.max_response_body_size_bytes = ceiling;
+        // The refusal never leaves the raw provider body in place
+        // (ai_stream_router-CLAUDE-2): the replacement is the bounded
+        // upstream-error terminal, or empty when even that cannot fit.
+        let refused = plugin
+            .normalize_response_body_with_context(
+                &mut ctx,
+                200,
+                body.as_bytes(),
+                Some("text/event-stream"),
+                &HashMap::new(),
+            )
+            .await
+            .expect("a refused normalization must still replace the provider body");
         assert!(
-            plugin
-                .normalize_response_body_with_context(
-                    &mut ctx,
-                    200,
-                    body.as_bytes(),
-                    Some("text/event-stream"),
-                    &HashMap::new(),
-                )
-                .await
-                .is_none(),
+            refused.len() <= ceiling,
             "a normalization larger than a {ceiling}-byte retained ceiling must be \
              refused, including ceilings below the buffered slice size"
         );
+        assert_ne!(refused, normalized);
+        let refused_text = std::str::from_utf8(&refused).expect("UTF-8 replacement");
+        assert!(
+            !refused_text.contains("content_block_delta"),
+            "raw provider framing must never be delivered"
+        );
+        if ceiling >= 512 {
+            assert!(refused_text.contains("upstream_error"), "{refused_text}");
+            assert!(refused_text.trim_end().ends_with("data: [DONE]"));
+        } else {
+            assert!(refused.is_empty());
+        }
     }
 
     // A ceiling that exactly covers the normalized output still admits it, so
@@ -6235,9 +6490,23 @@ async fn final_body_rejects_a_later_upstream_id_replacement() {
 async fn claim_commits_default_public_verification_for_an_https_provider() {
     let plugin = build(openai_and_anthropic_config());
     let (ctx, _raw) = claimed_ctx(&plugin, "gpt-4o").await;
+    // ai_stream_router-SOL-1: NOT `default_verify()`, whose unset CA / client
+    // identity the backend TLS builder would fill from gateway-global settings.
     assert_eq!(
         ctx.route_override_resolved_tls,
-        Some(BackendTlsConfig::default_verify())
+        Some(Arc::new(BackendTlsConfig::isolated_public_verify()))
+    );
+    let tls = ctx.route_override_resolved_tls.as_ref().unwrap();
+    assert!(tls.uses_system_trust_roots());
+    assert!(!tls.allows_global_no_verify());
+    assert!(tls.suppress_global_client_identity);
+    assert_eq!(
+        tls.effective_client_cert_path(Some("/etc/ferrum/gateway-client.pem")),
+        None
+    );
+    assert_eq!(
+        tls.effective_client_key_path(Some("/etc/ferrum/gateway-client.key")),
+        None
     );
 }
 
@@ -6249,29 +6518,32 @@ async fn final_body_rejects_later_backend_tls_weakening_clearing_and_retargeting
         |ctx| {
             let mut tls = BackendTlsConfig::default_verify();
             tls.verify_server_cert = false;
-            ctx.route_override_resolved_tls = Some(tls);
+            ctx.route_override_resolved_tls = Some(Arc::new(tls));
         },
         // SNI retargeted.
         |ctx| {
             let mut tls = BackendTlsConfig::default_verify();
             tls.sni = Some("evil.example.com".to_string());
-            ctx.route_override_resolved_tls = Some(tls);
+            ctx.route_override_resolved_tls = Some(Arc::new(tls));
         },
         // A different trust anchor.
         |ctx| {
             let mut tls = BackendTlsConfig::default_verify();
             tls.server_ca_cert_path = Some("/tmp/attacker-ca.pem".to_string());
-            ctx.route_override_resolved_tls = Some(tls);
+            ctx.route_override_resolved_tls = Some(Arc::new(tls));
         },
         // Ferrum's own backend mTLS identity attached to a third party.
         |ctx| {
             let mut tls = BackendTlsConfig::default_verify();
             tls.client_cert_path = Some("/tmp/gateway.pem".to_string());
             tls.client_key_path = Some("/tmp/gateway.key".to_string());
-            ctx.route_override_resolved_tls = Some(tls);
+            ctx.route_override_resolved_tls = Some(Arc::new(tls));
         },
         // Cleared entirely, which would fall back to the proxy's own resolution.
         |ctx| ctx.route_override_resolved_tls = None,
+        // Isolation dropped: `default_verify()` would inherit the gateway-global
+        // CA bundle, no-verify opt-out, and client identity.
+        |ctx| ctx.route_override_resolved_tls = Some(Arc::new(BackendTlsConfig::default_verify())),
     ];
     for mutate in mutations {
         let (mut ctx, raw) = claimed_ctx(&plugin, "gpt-4o").await;
@@ -6311,6 +6583,7 @@ async fn inherit_backend_tls_commits_the_proxy_resolution_and_rejects_later_muta
         san_allow_list: vec!["spiffe://internal/llm".to_string()],
         san_allow_list_key_digest: None,
         tls_refused: false,
+        suppress_global_client_identity: false,
     };
     let inherited = proxy.resolved_tls.clone();
 
@@ -6323,7 +6596,10 @@ async fn inherit_backend_tls_commits_the_proxy_resolution_and_rejects_later_muta
         plugin.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
-    assert_eq!(ctx.route_override_resolved_tls, Some(inherited.clone()));
+    assert_eq!(
+        ctx.route_override_resolved_tls,
+        Some(Arc::new(inherited.clone()))
+    );
     assert!(matches!(
         plugin
             .on_final_request_body_with_context(&mut ctx, &headers, &raw)
@@ -6334,7 +6610,7 @@ async fn inherit_backend_tls_commits_the_proxy_resolution_and_rejects_later_muta
     // Now weaken exactly one field of the inherited configuration.
     let mut weakened = inherited;
     weakened.verify_server_cert = false;
-    ctx.route_override_resolved_tls = Some(weakened);
+    ctx.route_override_resolved_tls = Some(Arc::new(weakened));
     let result = plugin
         .on_final_request_body_with_context(&mut ctx, &headers, &raw)
         .await;
@@ -7027,6 +7303,18 @@ async fn forged_meta_anthropic_ctx(plugin: &AiStreamRouter) -> RequestContext {
     ctx
 }
 
+/// `ANTHROPIC_SSE` with a `message_start.message.model` that differs from the
+/// committed `claude-3-5-sonnet`, so a normalizer that adopted the provider's
+/// report would be visible.
+fn anthropic_sse_reporting_a_different_model() -> String {
+    let sse = ANTHROPIC_SSE.replace(
+        "\"model\":\"claude-3-5-sonnet\"",
+        "\"model\":\"provider-reported-model\"",
+    );
+    assert!(sse.contains("provider-reported-model"));
+    sse
+}
+
 #[tokio::test]
 async fn streaming_normalizer_identity_comes_from_the_private_claim() {
     let plugin = build(openai_and_anthropic_config());
@@ -7036,7 +7324,10 @@ async fn streaming_normalizer_identity_comes_from_the_private_claim() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("the owning instance must still install its normalizer");
     let mut collected = Vec::new();
-    let chunk = inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await;
+    let sse = anthropic_sse_reporting_a_different_model();
+    let chunk = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(sse.as_bytes()))
+        .await;
     collected.extend_from_slice(&forwarded(chunk));
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
@@ -7049,6 +7340,10 @@ async fn streaming_normalizer_identity_comes_from_the_private_claim() {
         !out.contains("forged-identity"),
         "a metadata rewrite must not change the generation identity: {out}"
     );
+    assert!(
+        !out.contains("provider-reported-model"),
+        "the provider's message_start model must not replace the committed model: {out}"
+    );
 }
 
 #[tokio::test]
@@ -7056,11 +7351,12 @@ async fn buffered_normalizer_identity_comes_from_the_private_claim() {
     let plugin = build(openai_and_anthropic_config());
     let mut ctx = forged_meta_anthropic_ctx(&plugin).await;
 
+    let sse = anthropic_sse_reporting_a_different_model();
     let buffered = plugin
         .normalize_response_body_with_context(
             &mut ctx,
             200,
-            ANTHROPIC_SSE.as_bytes(),
+            sse.as_bytes(),
             Some("text/event-stream"),
             &HashMap::new(),
         )
@@ -7070,6 +7366,7 @@ async fn buffered_normalizer_identity_comes_from_the_private_claim() {
 
     assert!(out.contains("\"model\":\"claude-3-5-sonnet\""), "{out}");
     assert!(!out.contains("forged-identity"), "{out}");
+    assert!(!out.contains("provider-reported-model"), "{out}");
 }
 
 #[tokio::test]
@@ -7085,7 +7382,11 @@ async fn the_tool_use_guard_cannot_be_disarmed_through_metadata() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let mut collected = Vec::new();
-    let chunk = inspector.on_chunk(ANTHROPIC_TOOL_USE_SSE.as_bytes()).await;
+    let chunk = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(
+            ANTHROPIC_TOOL_USE_SSE.as_bytes(),
+        ))
+        .await;
     collected.extend_from_slice(&forwarded(chunk));
     let streamed = String::from_utf8(collected).unwrap();
     assert!(streamed.contains("upstream_error"), "{streamed}");
@@ -7187,7 +7488,9 @@ async fn only_the_owner_enforces_and_normalizes_under_a_forged_model_key() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("the owning instance normalizes");
     let mut collected = Vec::new();
-    let chunk = inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await;
+    let chunk = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(ANTHROPIC_SSE.as_bytes()))
+        .await;
     collected.extend_from_slice(&forwarded(chunk));
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
@@ -7287,7 +7590,11 @@ async fn run_gemini_normalizer(chunk_size: usize, body: &str, content_type: &str
     let (_plugin, _ctx, mut inspector) = claimed_gemini_inspector(content_type).await;
     let mut collected = Vec::new();
     for chunk in body.as_bytes().chunks(chunk_size.max(1)) {
-        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
     }
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     String::from_utf8(collected).unwrap()
@@ -7901,7 +8208,11 @@ async fn test_gemini_2xx_content_type_lifecycle_fail_closed() {
         let mut inspector = plugin
             .response_stream_inspector(&ctx, 200, None)
             .expect("missing Content-Type must install fail-closed inspector");
-        let mut collected = forwarded(inspector.on_chunk(b"raw-provider-bytes").await);
+        let mut collected = forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::from_static(b"raw-provider-bytes"))
+                .await,
+        );
         collected.extend_from_slice(&forwarded(inspector.on_end().await));
         let out = String::from_utf8(collected).unwrap();
         assert!(out.contains("upstream_error"), "{out}");
@@ -7939,7 +8250,11 @@ async fn test_gemini_2xx_content_type_lifecycle_fail_closed() {
         let mut inspector = plugin
             .response_stream_inspector(&ctx, 200, Some("text/plain"))
             .expect("unexpected Content-Type must install fail-closed inspector");
-        let mut collected = forwarded(inspector.on_chunk(b"not-normalized").await);
+        let mut collected = forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::from_static(b"not-normalized"))
+                .await,
+        );
         collected.extend_from_slice(&forwarded(inspector.on_end().await));
         let out = String::from_utf8(collected).unwrap();
         assert!(out.contains("unexpected Content-Type"), "{out}");
@@ -8251,7 +8566,11 @@ async fn test_gemini_function_call_and_tool_choice_none_fail_closed() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let mut collected = Vec::new();
-    collected.extend_from_slice(&forwarded(inspector.on_chunk(tools.as_bytes()).await));
+    collected.extend_from_slice(&forwarded(
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(tools.as_bytes()))
+            .await,
+    ));
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let text = String::from_utf8(collected).unwrap();
     assert!(text.contains("upstream_error"), "{text}");
@@ -8299,7 +8618,10 @@ async fn test_gemini_malformed_and_oversized_events_fail_closed() {
 
     let (_plugin, _ctx, mut inspector) = claimed_gemini_inspector("text/event-stream").await;
     let event = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
-    match inspector.on_chunk(&event).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&event))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert_bound_termination(&text, "oversized");
@@ -8307,6 +8629,49 @@ async fn test_gemini_malformed_and_oversized_events_fail_closed() {
         }
         other => panic!("oversized complete event must terminate: {other:?}"),
     }
+}
+
+/// Issue #7128: Gemini and Anthropic share one EOF rule. A final SSE event
+/// the provider ended without its blank-line terminator is transcoded, so a
+/// backend that omits the last `\n\n` still completes successfully; an
+/// unterminated event that cannot be read keeps the stable trailing-data
+/// diagnostic, and an unterminated non-terminal event is still a premature
+/// EOF.
+#[tokio::test]
+async fn test_gemini_unterminated_final_sse_event_is_transcoded() {
+    let terminated = run_gemini_normalizer(4096, GEMINI_SSE, "text/event-stream").await;
+    for suffix_len in [1, 2] {
+        let body = &GEMINI_SSE[..GEMINI_SSE.len() - suffix_len];
+        for chunk_size in [5, 4096] {
+            let out = run_gemini_normalizer(chunk_size, body, "text/event-stream").await;
+            assert_eq!(
+                strip_created(&out),
+                strip_created(&terminated),
+                "suffix {suffix_len}, chunk {chunk_size}"
+            );
+            assert!(!out.contains("upstream_error"), "{out}");
+            assert!(out.contains("\"finish_reason\":\"stop\""), "{out}");
+            assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+        }
+    }
+
+    let truncated = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hi\"}]}}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\"",
+    );
+    let out = run_gemini_normalizer(4096, truncated, "text/event-stream").await;
+    assert!(out.contains("malformed trailing data"), "{out}");
+    assert!(!out.contains("malformed Gemini JSON event"), "{out}");
+    assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+
+    let non_terminal = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hi\"}]}}]}";
+    let out = run_gemini_normalizer(4096, non_terminal, "text/event-stream").await;
+    assert!(out.contains("\"content\":\"Hi\""), "{out}");
+    assert!(
+        out.contains("before every candidate reached a terminal finishReason"),
+        "{out}"
+    );
+    assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
 }
 
 #[tokio::test]
@@ -8931,7 +9296,11 @@ async fn test_provider_usage_u64_overflow_fails_closed_without_wrapped_total() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("anthropic normalizer");
     let mut collected = Vec::new();
-    collected.extend_from_slice(&forwarded(inspector.on_chunk(anthropic.as_bytes()).await));
+    collected.extend_from_slice(&forwarded(
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(anthropic.as_bytes()))
+            .await,
+    ));
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let anthropic_out = String::from_utf8(collected).unwrap();
     assert!(anthropic_out.contains("upstream_error"), "{anthropic_out}");
@@ -9109,19 +9478,31 @@ async fn test_gemini_legacy_function_call_and_tool_result_shapes() {
             .is_some()
     );
 
-    // Empty tools array and empty/non-array stop remain representable.
+    // An empty tools array and a null stop remain representable (both absent).
     let empty_tools = json!({
         "model": "gemini-1.5-flash",
         "stream": true,
         "tools": [],
-        "stop": 7,
+        "stop": null,
         "messages": [{"role": "user", "content": "hi"}]
     });
     let parsed = translate_gemini_body(&plugin, &empty_tools)
         .await
-        .expect("empty tools + odd stop");
+        .expect("empty tools + null stop");
     assert!(parsed.get("tools").is_none());
-    assert_eq!(parsed["generationConfig"]["stopSequences"], json!([]));
+    assert!(parsed["generationConfig"].get("stopSequences").is_none());
+
+    // A mistyped stop is refused, never silently dropped (issue #7124).
+    let odd_stop = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "stop": 7,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let error = translate_gemini_body(&plugin, &odd_stop)
+        .await
+        .expect_err("a numeric stop must be rejected");
+    assert!(error.contains("stop must be"), "{error}");
 }
 
 #[tokio::test]
@@ -9316,6 +9697,61 @@ async fn test_gemini_claim_fail_closed_roles_tools_and_legacy_pairing() {
             .is_none(),
         "unknown tool_call_id must not produce a provider body"
     );
+}
+
+/// Anthropic routes validate `tools` whether or not `tool_choice` is present
+/// (issue #7126): the translator never drops a declaration, so a malformed
+/// list is refused at claim time with an OpenAI-shaped `400` naming `tools`,
+/// exactly as the Gemini route refuses it.
+#[tokio::test]
+async fn test_anthropic_claim_fail_closed_on_malformed_tools_without_tool_choice() {
+    let anthropic = build(openai_and_anthropic_config());
+    let gemini = build(gemini_config());
+    let malformed_tools = [
+        json!({"not": "an-array"}),
+        json!([{"type": "function", "function": {"description": "no name"}}]),
+        json!([{"type": "function", "function": {"name": "bad name!"}}]),
+        json!([{"type": "web_search", "function": {"name": "lookup"}}]),
+        json!([{"name": "lookup", "parameters": {"type": "object"}}]),
+        json!([
+            {"type": "function", "function": {"name": "lookup"}},
+            "not-an-object"
+        ]),
+    ];
+    for tools in malformed_tools {
+        for (plugin, model) in [
+            (&anthropic, "claude-3-5-sonnet"),
+            (&gemini, "gemini-1.5-flash"),
+        ] {
+            let body = json!({
+                "model": model,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": tools,
+            });
+            let mut ctx = post_ctx(&body);
+            let mut headers = json_headers();
+            let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+            assert_eq!(reject_status(&result), Some(400), "{model}: {tools}");
+            assert_eq!(
+                rejected_param(&result).as_deref(),
+                Some("tools"),
+                "{model}: the 400 must name `tools`, not `tool_choice`: {tools}"
+            );
+        }
+    }
+
+    // A well-formed list without `tool_choice` is still translated in full.
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": weather_tools(),
+    });
+    let parsed = translate_anthropic_body(&body)
+        .await
+        .expect("well-formed tools translate");
+    assert_eq!(parsed["tools"][0]["name"], json!("get_weather"));
 }
 
 #[tokio::test]
@@ -9657,7 +10093,11 @@ async fn test_gemini_gzip_brotli_and_buffered_normalization() {
             .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
             .expect("gzip gemini inspector");
         let encoded = gzip_bytes(GEMINI_SSE.as_bytes());
-        let mut collected = forwarded(inspector.on_chunk(&encoded).await);
+        let mut collected = forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(&encoded))
+                .await,
+        );
         collected.extend_from_slice(&forwarded(inspector.on_end().await));
         let out = String::from_utf8(collected).unwrap();
         assert!(out.contains("\"content\":\"Hello\""), "{out}");
@@ -9948,6 +10388,56 @@ async fn test_explicit_anthropic_version_is_forwarded_unchanged() {
     );
 }
 
+/// `anthropic_version` is only sent to `anthropic` providers, so a value on any
+/// other provider type is refused like `default_max_tokens` (issue #7128);
+/// an explicit `null` still means omission.
+#[test]
+fn test_config_rejects_anthropic_version_on_other_provider_types() {
+    for (provider_type, endpoint, pattern) in [
+        (
+            "openai",
+            "https://api.openai.com/v1/chat/completions",
+            "gpt-*",
+        ),
+        (
+            "openai_compatible",
+            "https://llm.example.com/v1/chat/completions",
+            "llama-*",
+        ),
+        (
+            "azure_openai",
+            "https://example.openai.azure.com/openai/deployments/d/chat/completions",
+            "gpt-*",
+        ),
+        (
+            "google_gemini",
+            "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent",
+            "gemini-*",
+        ),
+    ] {
+        let provider = |anthropic_version: Value| {
+            anthropic_provider(json!({
+                "provider_type": provider_type,
+                "endpoint": endpoint,
+                "model_patterns": [pattern],
+                "anthropic_version": anthropic_version,
+            }))
+        };
+        let err = AiStreamRouter::new(&provider(json!("2023-06-01")), http_client())
+            .err()
+            .expect("anthropic_version on a non-anthropic provider must fail admission");
+        assert!(err.contains("anthropic_version"), "{provider_type}: {err}");
+        assert!(
+            err.contains("only supported for `anthropic` providers"),
+            "{provider_type}: {err}"
+        );
+        assert!(
+            AiStreamRouter::new(&provider(Value::Null), http_client()).is_ok(),
+            "{provider_type}: an explicit null is omission"
+        );
+    }
+}
+
 #[test]
 fn test_config_rejects_wrong_typed_optional_provider_fields() {
     for (field, value) in [
@@ -10035,7 +10525,11 @@ async fn run_anthropic_normalizer_body(chunk_size: usize, body: &str) -> String 
     let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
     let mut collected = Vec::new();
     for chunk in body.as_bytes().chunks(chunk_size.max(1)) {
-        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
     }
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     String::from_utf8(collected).unwrap()
@@ -10333,5 +10827,1501 @@ async fn test_gemini_usage_without_extended_categories_is_unchanged() {
     assert!(
         !out.contains("completion_tokens_details"),
         "no reasoning detail without a reported thoughts count: {out}"
+    );
+}
+
+/// Issue #6623: Anthropic reports prompt-cache writes and reads beside
+/// `input_tokens`, not inside it. The normalized OpenAI usage must charge the
+/// whole billed input (`input + cache_creation + cache_read`).
+#[tokio::test]
+async fn test_anthropic_normalized_usage_includes_prompt_cache_tokens() {
+    let sse = ANTHROPIC_SSE.replace(
+        "\"usage\":{\"input_tokens\":10,\"output_tokens\":1}",
+        "\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":200,\"cache_read_input_tokens\":3000,\"output_tokens\":1}",
+    );
+    assert_ne!(sse, ANTHROPIC_SSE, "fixture substitution must apply");
+
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector should be created");
+    let mut collected = Vec::new();
+    for chunk in sse.as_bytes().chunks(4096) {
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+
+    assert!(out.contains("\"prompt_tokens\":3210"), "{out}");
+    assert!(out.contains("\"completion_tokens\":5"), "{out}");
+    assert!(out.contains("\"total_tokens\":3215"), "{out}");
+}
+
+#[tokio::test]
+async fn test_anthropic_normalized_usage_keeps_cache_categories_across_partial_delta() {
+    let sse = ANTHROPIC_SSE
+        .replace(
+            "\"usage\":{\"input_tokens\":10,\"output_tokens\":1}",
+            "\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":100,\"output_tokens\":1}",
+        )
+        .replace(
+            "\"usage\":{\"output_tokens\":5}",
+            "\"usage\":{\"input_tokens\":20,\"output_tokens\":5}",
+        );
+    assert_ne!(sse, ANTHROPIC_SSE, "fixture substitution must apply");
+
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector should be created");
+    let mut collected = Vec::new();
+    for chunk in sse.as_bytes().chunks(4096) {
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+
+    assert!(out.contains("\"prompt_tokens\":120"), "{out}");
+    assert!(out.contains("\"total_tokens\":125"), "{out}");
+}
+
+#[tokio::test]
+async fn test_anthropic_normalizer_fails_closed_on_malformed_usage() {
+    let sse = ANTHROPIC_SSE.replace(
+        "\"usage\":{\"output_tokens\":5}",
+        "\"usage\":{\"cache_read_input_tokens\":\"bad\",\"output_tokens\":5}",
+    );
+    assert_ne!(sse, ANTHROPIC_SSE, "fixture substitution must apply");
+
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector should be created");
+    let mut collected = Vec::new();
+    for chunk in sse.as_bytes().chunks(4096) {
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+
+    assert!(
+        out.contains("malformed or overflowing Anthropic usage"),
+        "{out}"
+    );
+    assert!(!out.contains("\"prompt_tokens\""), "{out}");
+}
+
+#[tokio::test]
+async fn test_gemini_normalizer_publishes_one_sided_usage_with_its_total() {
+    let one_sided = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"\"}]},\"finishReason\":\"SAFETY\"}],\"usageMetadata\":{\"promptTokenCount\":10000,\"totalTokenCount\":10000}}\n\n";
+    let out = run_gemini_normalizer(4096, one_sided, "text/event-stream").await;
+    assert!(out.contains("\"prompt_tokens\":10000"), "{out}");
+    assert!(out.contains("\"total_tokens\":10000"), "{out}");
+    assert!(!out.contains("\"completion_tokens\""), "{out}");
+
+    let total_only = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"totalTokenCount\":77}}\n\n";
+    let out = run_gemini_normalizer(4096, total_only, "text/event-stream").await;
+    assert!(out.contains("\"total_tokens\":77"), "{out}");
+    assert!(!out.contains("\"prompt_tokens\""), "{out}");
+}
+
+#[tokio::test]
+async fn test_anthropic_normalizer_ignores_the_start_output_placeholder() {
+    // A terminal delta without an output counter leaves completion (and so the
+    // total) unreported rather than taking `message_start`'s placeholder.
+    let sse = ANTHROPIC_SSE.replace(",\"usage\":{\"output_tokens\":5}", "");
+    assert_ne!(sse, ANTHROPIC_SSE, "fixture substitution must apply");
+
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector should be created");
+    let mut collected = Vec::new();
+    for chunk in sse.as_bytes().chunks(4096) {
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+
+    assert!(out.contains("\"prompt_tokens\":10"), "{out}");
+    assert!(out.contains("\"completion_tokens\":null"), "{out}");
+    assert!(out.contains("\"total_tokens\":null"), "{out}");
+}
+
+#[tokio::test]
+async fn test_gemini_normalizer_treats_null_counters_as_absent() {
+    let sse = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":null,\"thoughtsTokenCount\":40,\"toolUsePromptTokenCount\":null,\"totalTokenCount\":50}}\n\n";
+    let out = run_gemini_normalizer(4096, sse, "text/event-stream").await;
+    assert!(!out.contains("upstream_error"), "{out}");
+    assert!(out.contains("\"prompt_tokens\":10"), "{out}");
+    assert!(out.contains("\"completion_tokens\":40"), "{out}");
+    assert!(out.contains("\"total_tokens\":50"), "{out}");
+}
+
+async fn run_anthropic_normalizer_on(sse: &str) -> String {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector should be created");
+    let mut collected = Vec::new();
+    for chunk in sse.as_bytes().chunks(4096) {
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    String::from_utf8(collected).unwrap()
+}
+
+#[tokio::test]
+async fn test_anthropic_normalizer_merges_terminal_invocation_metrics() {
+    let with_metrics = ANTHROPIC_SSE.replace(
+        "data: {\"type\":\"message_stop\"}",
+        "data: {\"type\":\"message_stop\",\"amazon-bedrock-invocationMetrics\":{\"inputTokenCount\":10,\"outputTokenCount\":5,\"cacheReadInputTokenCount\":1000}}",
+    );
+    assert_ne!(
+        with_metrics, ANTHROPIC_SSE,
+        "fixture substitution must apply"
+    );
+    let out = run_anthropic_normalizer_on(&with_metrics).await;
+    assert!(out.contains("\"prompt_tokens\":1010"), "{out}");
+    assert!(out.contains("\"total_tokens\":1015"), "{out}");
+
+    let malformed = ANTHROPIC_SSE.replace(
+        "data: {\"type\":\"message_stop\"}",
+        "data: {\"type\":\"message_stop\",\"amazon-bedrock-invocationMetrics\":{\"cacheReadInputTokenCount\":\"bad\"}}",
+    );
+    let out = run_anthropic_normalizer_on(&malformed).await;
+    assert!(
+        out.contains("malformed Bedrock invocation metrics"),
+        "{out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Production-launch review hardening (ai_stream_router-SOL-* / -CLAUDE-*)
+// ---------------------------------------------------------------------------
+
+/// `error.param` of an OpenAI-shaped reject body.
+fn reject_param(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    value["error"]["param"].as_str().map(str::to_string)
+}
+
+/// `error.param` of a `PluginResult::Reject`.
+fn rejected_param(result: &PluginResult) -> Option<String> {
+    match result {
+        PluginResult::Reject { body, .. } => reject_param(body),
+        _ => None,
+    }
+}
+
+/// Every JSON `data:` payload of normalized OpenAI SSE output.
+fn sse_payloads(out: &str) -> Vec<Value> {
+    out.split("\n\n")
+        .filter_map(|frame| frame.trim_start().strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .filter_map(|data| serde_json::from_str(data).ok())
+        .collect()
+}
+
+/// Every `choices[0].delta.tool_calls[]` entry, in emission order.
+fn emitted_tool_calls(out: &str) -> Vec<Value> {
+    sse_payloads(out)
+        .into_iter()
+        .filter_map(|payload| {
+            payload["choices"][0]["delta"]["tool_calls"]
+                .as_array()
+                .cloned()
+        })
+        .flatten()
+        .collect()
+}
+
+/// Drive a response inspector over `body` in `chunk`-byte pieces.
+async fn drive_review_inspector(
+    inspector: &mut dyn ResponseStreamInspector,
+    body: &[u8],
+    chunk: usize,
+) -> String {
+    let mut collected = Vec::new();
+    for piece in body.chunks(chunk) {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(piece))
+            .await
+        {
+            ResponseStreamAction::Forward(bytes) => collected.extend_from_slice(&bytes),
+            ResponseStreamAction::Terminate(bytes) => {
+                if let Some(bytes) = bytes {
+                    collected.extend_from_slice(&bytes);
+                }
+                return String::from_utf8(collected).unwrap();
+            }
+        }
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    String::from_utf8(collected).unwrap()
+}
+
+/// Claim `body` on `plugin`, asserting the claim succeeded.
+async fn claim_review_request(
+    plugin: &AiStreamRouter,
+    body: &Value,
+) -> (RequestContext, HashMap<String, String>) {
+    let mut ctx = post_ctx(body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    (ctx, headers)
+}
+
+// --- ai_stream_router-SOL-2: Gemini thought signatures -----------------------
+
+const GEMINI_SIGNED_TOOL_SSE: &str = concat!(
+    "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[",
+    "{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":\"x\"}},\"thoughtSignature\":\"c2lnbmF0dXJlLUE=\"},",
+    "{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":\"y\"}}}",
+    "]}}]}\n\n",
+    "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[",
+    "{\"text\":\"\",\"thoughtSignature\":\"c2lnbmF0dXJlLUI=\"},",
+    "{\"thoughtSignature\":\"c2lnbmF0dXJlLUM=\"}",
+    "]},\"finishReason\":\"STOP\"}]}\n\n",
+);
+
+fn assert_signed_tool_stream(out: &str) {
+    assert!(!out.contains("upstream_error"), "{out}");
+    let calls = emitted_tool_calls(out);
+    assert_eq!(calls.len(), 2, "{out}");
+    assert_eq!(
+        calls[0]["extra_content"]["google"]["thought_signature"],
+        json!("c2lnbmF0dXJlLUE="),
+        "{out}"
+    );
+    assert!(calls[1].get("extra_content").is_none(), "{out}");
+    assert!(out.contains("\"finish_reason\":\"tool_calls\""), "{out}");
+    assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+}
+
+#[tokio::test]
+async fn gemini_thought_signatures_complete_streams_and_surface_on_tool_calls() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-3-pro",
+        "stream": true,
+        "messages": [{"role": "user", "content": "look it up"}]
+    });
+    let (mut ctx, _) = claim_review_request(&plugin, &body).await;
+    for chunk in [1, 7, 4096] {
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("gemini inspector");
+        let out =
+            drive_review_inspector(&mut *inspector, GEMINI_SIGNED_TOOL_SSE.as_bytes(), chunk).await;
+        assert_signed_tool_stream(&out);
+    }
+    let buffered = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            GEMINI_SIGNED_TOOL_SSE.as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("buffered gemini normalization");
+    assert_signed_tool_stream(&String::from_utf8(buffered).unwrap());
+}
+
+#[tokio::test]
+async fn gemini_malformed_thought_signatures_still_fail_closed() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-3-pro",
+        "stream": true,
+        "messages": [{"role": "user", "content": "look it up"}]
+    });
+    let (ctx, _) = claim_review_request(&plugin, &body).await;
+    for signature in ["7", "\"\"", "\"not base64!\"", "{\"a\":1}"] {
+        let sse = format!(
+            "data: {{\"candidates\":[{{\"index\":0,\"content\":{{\"role\":\"model\",\"parts\":[{{\"functionCall\":{{\"name\":\"lookup\",\"args\":{{}}}},\"thoughtSignature\":{signature}}}]}},\"finishReason\":\"STOP\"}}]}}\n\n"
+        );
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("gemini inspector");
+        let out = drive_review_inspector(&mut *inspector, sse.as_bytes(), 4096).await;
+        assert!(out.contains("upstream_error"), "{signature}: {out}");
+        assert!(emitted_tool_calls(&out).is_empty(), "{signature}: {out}");
+        assert!(!out.contains("not base64"), "{signature}: {out}");
+    }
+}
+
+#[tokio::test]
+async fn gemini_round_trips_client_thought_signatures_onto_function_call_parts() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-3-pro",
+        "stream": true,
+        "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+        "messages": [
+            {"role": "user", "content": "look it up"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {
+                    "id": "call_a",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"},
+                    "extra_content": {"google": {"thought_signature": "c2lnbmF0dXJlLUE="}}
+                },
+                {
+                    "id": "call_b",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"y\"}"}
+                }
+            ]},
+            {"role": "tool", "tool_call_id": "call_a", "content": "{\"ok\":true}"},
+            {"role": "tool", "tool_call_id": "call_b", "content": "{\"ok\":false}"}
+        ]
+    });
+    let parsed = translate_gemini_body(&plugin, &body)
+        .await
+        .expect("signed tool history must translate");
+    let parts = &parsed["contents"][1]["parts"];
+    assert_eq!(parts[0]["functionCall"]["name"], json!("lookup"));
+    assert_eq!(parts[0]["thoughtSignature"], json!("c2lnbmF0dXJlLUE="));
+    assert!(parts[1].get("thoughtSignature").is_none(), "{parsed}");
+
+    for malformed in [json!(7), json!(""), json!("has spaces"), json!({"x": 1})] {
+        let mut bad = body.clone();
+        bad["messages"][1]["tool_calls"][0]["extra_content"]["google"]["thought_signature"] =
+            malformed.clone();
+        let error = translate_gemini_body(&plugin, &bad)
+            .await
+            .expect_err("a malformed round-tripped signature must be refused");
+        assert!(error.contains("thought_signature"), "{malformed}: {error}");
+        assert!(!error.contains("has spaces"), "{malformed}: {error}");
+    }
+}
+
+// --- ai_stream_router-SOL-3: manual thinking + tool continuation -------------
+
+#[tokio::test]
+async fn thinking_tool_result_continuation_is_refused_up_front() {
+    let plugin = build(openai_and_anthropic_config());
+    let continuation = |thinking: Value| {
+        json!({
+            "model": "claude-3-5-sonnet",
+            "stream": true,
+            "max_tokens": 4096,
+            "thinking": thinking,
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "toolu_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "toolu_1", "content": "sunny"}
+            ]
+        })
+    };
+    let mut ctx = post_ctx(&continuation(
+        json!({"type": "enabled", "budget_tokens": 1024}),
+    ));
+    let mut headers = json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_status(&result), Some(400));
+    assert_eq!(rejected_param(&result).as_deref(), Some("thinking"));
+
+    // Adaptive thinking would silently drop the same signed blocks, so its
+    // continuation is refused too.
+    let mut ctx = post_ctx(&continuation(json!({"type": "adaptive"})));
+    let mut headers = json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_status(&result), Some(400));
+    assert_eq!(rejected_param(&result).as_deref(), Some("thinking"));
+
+    // Disabled thinking keeps the tool loop working.
+    let parsed = translate_anthropic_body(&continuation(json!({"type": "disabled"})))
+        .await
+        .expect("a continuation without thinking must translate");
+    assert_eq!(parsed["thinking"], json!({"type": "disabled"}));
+}
+
+// --- ai_stream_router-SOL-4 / -CLAUDE-4: request parameter fidelity ----------
+
+#[tokio::test]
+async fn gemini_maps_response_format_to_native_structured_output() {
+    let plugin = build(gemini_config());
+    let schema = json!({
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": false
+    });
+    let with_format = |format: Value| {
+        json!({
+            "model": "gemini-1.5-flash",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": format
+        })
+    };
+
+    let parsed = translate_gemini_body(
+        &plugin,
+        &with_format(json!({
+            "type": "json_schema",
+            "json_schema": {"name": "result", "strict": true, "schema": schema.clone()}
+        })),
+    )
+    .await
+    .expect("json_schema must translate");
+    assert_eq!(
+        parsed["generationConfig"]["responseMimeType"],
+        json!("application/json")
+    );
+    assert_eq!(parsed["generationConfig"]["responseJsonSchema"], schema);
+
+    let parsed = translate_gemini_body(&plugin, &with_format(json!({"type": "json_object"})))
+        .await
+        .expect("json_object must translate");
+    assert_eq!(
+        parsed["generationConfig"]["responseMimeType"],
+        json!("application/json")
+    );
+    assert!(
+        parsed["generationConfig"]
+            .get("responseJsonSchema")
+            .is_none()
+    );
+
+    let parsed = translate_gemini_body(&plugin, &with_format(json!({"type": "text"})))
+        .await
+        .expect("text must translate");
+    assert!(parsed.get("generationConfig").is_none(), "{parsed}");
+
+    for invalid in [
+        json!({"type": "json_schema"}),
+        json!({"type": "json_schema", "json_schema": {"name": "r", "schema": "not-an-object"}}),
+        json!({"type": "json_schema", "json_schema": {"schema": {"type": "object"}}}),
+        json!({"type": "json_schema", "json_schema": {"name": "r", "schema": {}, "extra": 1}}),
+        json!({"type": "xml"}),
+        json!("json_object"),
+    ] {
+        let error = translate_gemini_body(&plugin, &with_format(invalid.clone()))
+            .await
+            .expect_err("an unrepresentable response_format must be refused");
+        assert_eq!(
+            reject_param(&error).as_deref(),
+            Some("response_format"),
+            "{invalid}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gemini_maps_exact_generation_parameters_and_refuses_the_rest() {
+    let plugin = build(gemini_config());
+    let base = || {
+        json!({
+            "model": "gemini-1.5-flash",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+    };
+    let mut body = base();
+    body["n"] = json!(2);
+    body["presence_penalty"] = json!(0.5);
+    body["frequency_penalty"] = json!(-0.25);
+    body["seed"] = json!(42);
+    body["max_tokens"] = json!(128);
+    body["logit_bias"] = json!({});
+    body["logprobs"] = json!(false);
+    let parsed = translate_gemini_body(&plugin, &body)
+        .await
+        .expect("exact equivalents must translate");
+    let config = &parsed["generationConfig"];
+    assert_eq!(config["candidateCount"], json!(2));
+    assert_eq!(config["presencePenalty"], json!(0.5));
+    assert_eq!(config["frequencyPenalty"], json!(-0.25));
+    assert_eq!(config["seed"], json!(42));
+    assert_eq!(config["maxOutputTokens"], json!(128));
+
+    for (field, value, param) in [
+        ("n", json!(0), "n"),
+        ("seed", json!("x"), "seed"),
+        ("presence_penalty", json!("high"), "presence_penalty"),
+        ("logit_bias", json!({"50256": -100}), "logit_bias"),
+        ("logprobs", json!(true), "logprobs"),
+        ("top_logprobs", json!(2), "top_logprobs"),
+        ("max_tokens", json!("8192"), "max_tokens"),
+    ] {
+        let mut body = base();
+        body[field] = value;
+        let error = translate_gemini_body(&plugin, &body)
+            .await
+            .expect_err("an unrepresentable or malformed parameter must be refused");
+        assert_eq!(
+            reject_param(&error).as_deref(),
+            Some(param),
+            "{field}: {error}"
+        );
+    }
+
+    // `parallel_tool_calls: false` cannot be honored for callable tools.
+    let mut body = base();
+    body["tools"] = json!([{"type": "function", "function": {"name": "lookup"}}]);
+    body["parallel_tool_calls"] = json!(false);
+    let error = translate_gemini_body(&plugin, &body)
+        .await
+        .expect_err("parallel_tool_calls false has no Gemini switch");
+    assert_eq!(reject_param(&error).as_deref(), Some("parallel_tool_calls"));
+    body["parallel_tool_calls"] = json!(true);
+    assert!(translate_gemini_body(&plugin, &body).await.is_ok());
+    let mut body = base();
+    body["parallel_tool_calls"] = json!(false);
+    assert!(
+        translate_gemini_body(&plugin, &body).await.is_ok(),
+        "without callable tools the flag constrains nothing"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_maps_parallel_tool_calls_and_refuses_unrepresentable_parameters() {
+    let plugin = build(openai_and_anthropic_config());
+    let base = || {
+        json!({
+            "model": "claude-3-5-sonnet",
+            "stream": true,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": weather_tools()
+        })
+    };
+
+    let mut body = base();
+    body["parallel_tool_calls"] = json!(false);
+    let parsed = translate_anthropic_body(&body)
+        .await
+        .expect("must translate");
+    assert_eq!(
+        parsed["tool_choice"],
+        json!({"type": "auto", "disable_parallel_tool_use": true})
+    );
+    body["tool_choice"] = json!("required");
+    let parsed = translate_anthropic_body(&body)
+        .await
+        .expect("must translate");
+    assert_eq!(
+        parsed["tool_choice"],
+        json!({"type": "any", "disable_parallel_tool_use": true})
+    );
+    body["tool_choice"] = json!("none");
+    let parsed = translate_anthropic_body(&body)
+        .await
+        .expect("must translate");
+    assert_eq!(parsed["tool_choice"], json!({"type": "none"}));
+    let mut body = base();
+    body["parallel_tool_calls"] = json!(true);
+    let parsed = translate_anthropic_body(&body)
+        .await
+        .expect("must translate");
+    assert!(parsed.get("tool_choice").is_none(), "{parsed}");
+
+    // Harmless defaults are still admitted.
+    let mut body = base();
+    body["n"] = json!(1);
+    body["presence_penalty"] = json!(0);
+    body["frequency_penalty"] = json!(0.0);
+    body["logit_bias"] = json!({});
+    body["logprobs"] = json!(false);
+    body["response_format"] = json!({"type": "text"});
+    assert!(translate_anthropic_body(&body).await.is_some());
+
+    for (field, value, param) in [
+        ("n", json!(2), "n"),
+        ("presence_penalty", json!(0.5), "presence_penalty"),
+        ("frequency_penalty", json!(1), "frequency_penalty"),
+        ("seed", json!(7), "seed"),
+        ("logit_bias", json!({"50256": -100}), "logit_bias"),
+        ("logprobs", json!(true), "logprobs"),
+        (
+            "response_format",
+            json!({"type": "json_object"}),
+            "response_format",
+        ),
+        ("parallel_tool_calls", json!("no"), "parallel_tool_calls"),
+    ] {
+        let mut body = base();
+        body[field] = value;
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(reject_status(&result), Some(400), "{field}");
+        assert_eq!(rejected_param(&result).as_deref(), Some(param), "{field}");
+        assert!(ctx.route_override_backend_host.is_none(), "{field}");
+    }
+}
+
+// --- ai_stream_router-CLAUDE-1: canonical + route credential headers ---------
+
+#[tokio::test]
+async fn canonical_and_route_credential_headers_never_reach_the_provider() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = streaming_request("claude-3-5-sonnet");
+    let mut ctx = post_ctx(&body);
+    ferrum_edge::_test_support::set_request_headers_to_redact_for_test(
+        &mut ctx,
+        vec!["x-tenant-credential".to_string()],
+    );
+    let mut headers = json_headers();
+    let secrets = [
+        ("x-auth-token", "secret-auth-token"),
+        ("x-access-token", "secret-access-token"),
+        ("x-amz-security-token", "secret-aws-session"),
+        ("apikey", "secret-apikey"),
+        ("x-forwarded-authorization", "Bearer secret-forwarded"),
+        ("x_api_key", "secret-underscore"),
+        ("X_Auth_Token", "secret-underscore-case"),
+        ("x-tenant-credential", "secret-route-location"),
+        ("x_tenant_credential", "secret-route-underscore"),
+    ];
+    for (name, value) in secrets {
+        headers.insert(name.to_string(), value.to_string());
+    }
+    headers.insert("x-request-label".to_string(), "keep-me".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    for (_, value) in secrets {
+        assert_no_value_anywhere(&headers, value);
+    }
+    assert_eq!(
+        headers.get("x-request-label").map(String::as_str),
+        Some("keep-me")
+    );
+    assert_eq!(
+        headers.get("x-api-key").map(String::as_str),
+        Some("sk-ant-secret")
+    );
+
+    // A later rule re-adding any of them is undone by the final policy.
+    headers.insert("x-auth-token".to_string(), "secret-late-token".to_string());
+    headers.insert(
+        "X-Tenant-Credential".to_string(),
+        "secret-late-route".to_string(),
+    );
+    headers.insert(
+        "x_amz_security_token".to_string(),
+        "secret-late-aws".to_string(),
+    );
+    plugin.enforce_final_backend_header_policy(&ctx, &mut headers);
+    for needle in ["secret-late-token", "secret-late-route", "secret-late-aws"] {
+        assert_no_value_anywhere(&headers, needle);
+    }
+    assert_eq!(
+        headers.get("x-api-key").map(String::as_str),
+        Some("sk-ant-secret")
+    );
+}
+
+// --- ai_stream_router-CLAUDE-2: buffered ceiling refusal fails closed --------
+
+#[tokio::test]
+async fn buffered_normalization_over_the_retained_ceiling_never_returns_raw_provider_bytes() {
+    let plugin = build(openai_and_anthropic_config());
+    let (mut ctx, _) = claim_review_request(&plugin, &streaming_request("claude-3-5-sonnet")).await;
+    let full = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            ANTHROPIC_SSE.as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("normalized");
+    assert!(
+        full.len() > 400,
+        "fixture must normalize past the error envelope"
+    );
+
+    // The raw provider body still fits; its OpenAI-shaped expansion does not.
+    ctx.max_response_body_size_bytes = full.len() - 1;
+    let refused = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            ANTHROPIC_SSE.as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("a refused normalization must still replace the provider body");
+    assert!(refused.len() < full.len());
+    let text = String::from_utf8(refused).unwrap();
+    assert!(text.contains("upstream_error"), "{text}");
+    assert!(text.contains("retained response size limit"), "{text}");
+    assert!(
+        !text.contains("content_block_delta") && !text.contains("message_start"),
+        "raw provider framing must never be delivered: {text}"
+    );
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+
+    // A ceiling too small even for the fixed envelope yields an empty
+    // replacement, still never the raw provider bytes.
+    ctx.max_response_body_size_bytes = 16;
+    let tiny = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            ANTHROPIC_SSE.as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("an unfittable refusal must still replace the provider body");
+    assert!(tiny.is_empty());
+}
+
+// --- ai_stream_router-CLAUDE-3: Anthropic 2xx non-SSE fails closed -----------
+
+#[tokio::test]
+async fn anthropic_2xx_non_sse_responses_fail_closed_on_every_hook() {
+    let plugin = build(openai_and_anthropic_config());
+    let raw = br#"{"id":"msg_raw_body","content":[{"type":"tool_use","name":"secret_tool"}]}"#;
+    for content_type in [None, Some("application/json"), Some("text/plain")] {
+        let (mut ctx, _) =
+            claim_review_request(&plugin, &streaming_request("claude-3-5-sonnet")).await;
+        let mut resp_headers = HashMap::new();
+        if let Some(content_type) = content_type {
+            resp_headers.insert("content-type".to_string(), content_type.to_string());
+        }
+        let reject = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        assert_eq!(reject_status(&reject), Some(502), "{content_type:?}");
+        if let PluginResult::Reject { body, .. } = &reject {
+            assert!(body.contains("unsupported_content_type"), "{body}");
+        }
+
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, content_type)
+            .expect("a fail-closed inspector must be installed");
+        let out = drive_review_inspector(&mut *inspector, raw, 4096).await;
+        assert!(out.contains("upstream_error"), "{content_type:?}: {out}");
+        assert!(!out.contains("msg_raw_body") && !out.contains("secret_tool"));
+
+        let buffered = plugin
+            .normalize_response_body_with_context(&mut ctx, 200, raw, content_type, &resp_headers)
+            .await
+            .expect("buffered must replace the raw provider body");
+        let buffered = String::from_utf8(buffered).unwrap();
+        assert!(buffered.contains("upstream_error"), "{buffered}");
+        assert!(!buffered.contains("msg_raw_body") && !buffered.contains("secret_tool"));
+    }
+}
+
+// --- ai_stream_router-CLAUDE-5: Anthropic max_tokens --------------------------
+
+#[tokio::test]
+async fn anthropic_max_tokens_default_is_configurable_and_mistyped_values_are_rejected() {
+    let parsed = translate_anthropic_body(&streaming_request("claude-3-5-sonnet"))
+        .await
+        .expect("must translate");
+    assert_eq!(parsed["max_tokens"], json!(4096));
+
+    let plugin = build(json!({
+        "providers": [{
+            "name": "anthropic",
+            "provider_type": "anthropic",
+            "endpoint": "https://api.anthropic.com/v1/messages",
+            "api_key": "sk-ant-secret",
+            "model_patterns": ["claude-*"],
+            "default_max_tokens": 32000
+        }]
+    }));
+    for (client_bound, expected) in [(None, 32000), (Some(1200), 1200)] {
+        let mut body = streaming_request("claude-3-5-sonnet");
+        if let Some(bound) = client_bound {
+            body["max_completion_tokens"] = json!(bound);
+        }
+        let (mut ctx, headers) = claim_review_request(&plugin, &body).await;
+        let raw = serde_json::to_vec(&body).unwrap();
+        let out = plugin
+            .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+            .await
+            .expect("must translate");
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed["max_tokens"], json!(expected));
+    }
+
+    for field in ["max_tokens", "max_completion_tokens"] {
+        for value in [
+            json!("8192"),
+            json!(8192.5),
+            json!(0),
+            json!(-1),
+            json!(true),
+        ] {
+            let mut body = streaming_request("claude-3-5-sonnet");
+            body[field] = value.clone();
+            let mut ctx = post_ctx(&body);
+            let mut headers = json_headers();
+            let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+            assert_eq!(reject_status(&result), Some(400), "{field}={value}");
+            assert_eq!(
+                rejected_param(&result).as_deref(),
+                Some("max_tokens"),
+                "{field}={value}"
+            );
+        }
+    }
+
+    for (provider_type, endpoint, value) in [
+        (
+            "openai",
+            "https://api.openai.com/v1/chat/completions",
+            json!(100),
+        ),
+        (
+            "anthropic",
+            "https://api.anthropic.com/v1/messages",
+            json!(0),
+        ),
+        (
+            "anthropic",
+            "https://api.anthropic.com/v1/messages",
+            json!("100"),
+        ),
+    ] {
+        let error = AiStreamRouter::new(
+            &json!({
+                "providers": [{
+                    "name": "p",
+                    "provider_type": provider_type,
+                    "endpoint": endpoint,
+                    "api_key": "k",
+                    "model_patterns": ["m-*"],
+                    "default_max_tokens": value
+                }]
+            }),
+            http_client(),
+        )
+        .err()
+        .expect("invalid default_max_tokens must be refused");
+        assert!(error.contains("default_max_tokens"), "{error}");
+    }
+}
+
+// --- ai_stream_router-CLAUDE-6: parsed-body reuse stays exact ----------------
+
+#[tokio::test]
+async fn transform_revalidates_a_body_rewritten_after_the_claim() {
+    let plugin = build(openai_and_anthropic_config());
+    let claimed = streaming_request("claude-3-5-sonnet");
+    let (mut ctx, headers) = claim_review_request(&plugin, &claimed).await;
+    // An earlier transform reshaped the body into an unrepresentable history.
+    let rewritten = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "tool", "tool_call_id": "orphan", "content": "x"}]
+    });
+    let raw = serde_json::to_vec(&rewritten).unwrap();
+    assert!(
+        plugin
+            .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+            .await
+            .is_none(),
+        "a body that is not the claimed bytes must be validated afresh"
+    );
+    assert_eq!(
+        reject_status(
+            &plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, &raw)
+                .await
+        ),
+        Some(400)
+    );
+
+    // The unchanged claimed body translates, its untouched translation passes
+    // the final hook, and a later model rewrite of it is still refused.
+    let (mut ctx, headers) = claim_review_request(&plugin, &claimed).await;
+    let raw = serde_json::to_vec(&claimed).unwrap();
+    let translated = plugin
+        .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+        .await
+        .expect("must translate");
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &translated)
+            .await,
+        PluginResult::Continue
+    ));
+    let mut rewritten: Value = serde_json::from_slice(&translated).unwrap();
+    rewritten["model"] = json!("claude-3-opus");
+    let rewritten = serde_json::to_vec(&rewritten).unwrap();
+    assert_eq!(
+        reject_status(
+            &plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, &rewritten)
+                .await
+        ),
+        Some(400)
+    );
+}
+
+// --- ai_stream_router-CLAUDE-7 / -CLAUDE-8: config admission -----------------
+
+fn single_provider(provider: Value) -> Value {
+    json!({ "providers": [provider] })
+}
+
+#[test]
+fn gemini_fixed_model_endpoints_require_exact_model_patterns() {
+    let fixed = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent";
+    let error = AiStreamRouter::new(
+        &single_provider(json!({
+            "name": "g", "provider_type": "google_gemini", "endpoint": fixed,
+            "api_key": "k", "model_patterns": ["gemini-*"]
+        })),
+        http_client(),
+    )
+    .err()
+    .expect("a wildcard pattern behind a fixed-model Gemini endpoint must be refused");
+    assert!(error.contains("{model}"), "{error}");
+    // Exact names are refused too unless they are exactly the one model the
+    // fixed URL names: two names, or one different name, would mislabel the
+    // endpoint's generation.
+    for patterns in [
+        json!(["gemini-2.5-flash", "gemini-2.5-pro"]),
+        json!(["gemini-2.5-pro"]),
+        json!(["gemini-2.5"]),
+    ] {
+        let error = AiStreamRouter::new(
+            &single_provider(json!({
+                "name": "g", "provider_type": "google_gemini", "endpoint": fixed,
+                "api_key": "k", "model_patterns": patterns.clone()
+            })),
+            http_client(),
+        )
+        .err()
+        .expect("model_patterns that differ from the fixed URL model must be refused");
+        assert!(error.contains("{model}"), "{patterns}: {error}");
+    }
+    assert!(
+        AiStreamRouter::new(
+            &single_provider(json!({
+                "name": "g", "provider_type": "google_gemini", "endpoint": fixed,
+                "api_key": "k", "model_patterns": ["gemini-2.5-flash"]
+            })),
+            http_client(),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn empty_anthropic_version_and_endpoint_userinfo_or_fragment_are_refused() {
+    let error = AiStreamRouter::new(
+        &single_provider(json!({
+            "name": "a", "provider_type": "anthropic",
+            "endpoint": "https://api.anthropic.com/v1/messages",
+            "api_key": "k", "model_patterns": ["claude-*"], "anthropic_version": ""
+        })),
+        http_client(),
+    )
+    .err()
+    .expect("an empty anthropic_version must be refused");
+    assert!(error.contains("anthropic_version"), "{error}");
+
+    for endpoint in [
+        "https://operator:hunter2@api.anthropic.com/v1/messages",
+        "https://operator@api.anthropic.com/v1/messages",
+        "https://api.anthropic.com/v1/messages#hunter2",
+    ] {
+        let error = AiStreamRouter::new(
+            &single_provider(json!({
+                "name": "a", "provider_type": "anthropic", "endpoint": endpoint,
+                "api_key": "k", "model_patterns": ["claude-*"]
+            })),
+            http_client(),
+        )
+        .err()
+        .expect("userinfo / fragment endpoints must be refused");
+        assert!(error.contains("endpoint"), "{error}");
+        assert!(!error.contains("hunter2"), "{error}");
+    }
+}
+
+// --- ai_stream_router-CLAUDE-9: configurable normalized-stream bounds --------
+
+fn anthropic_config_with(extra: Value) -> Value {
+    let mut config = openai_and_anthropic_config();
+    if let Some(extra) = extra.as_object() {
+        for (key, value) in extra {
+            config[key.as_str()] = value.clone();
+        }
+    }
+    config
+}
+
+fn output_tail(out: &str) -> &str {
+    out.get(out.len().saturating_sub(400)..).unwrap_or(out)
+}
+
+async fn run_anthropic_stream_with(config: Value, sse: &str) -> String {
+    let plugin = build(config);
+    let (ctx, _) = claim_review_request(&plugin, &streaming_request("claude-3-5-sonnet")).await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    drive_review_inspector(&mut *inspector, sse.as_bytes(), 64 * 1024).await
+}
+
+#[tokio::test]
+async fn normalized_stream_bounds_are_configurable_and_still_fail_closed() {
+    for (field, value) in [
+        ("max_stream_events", json!(10)),
+        ("max_stream_events", json!(10_000_001u64)),
+        ("max_stream_events", json!("1000")),
+        ("max_stream_bytes", json!(1)),
+        ("max_stream_bytes", json!(268_435_457u64)),
+        ("max_normalized_stream_bytes", json!(0)),
+    ] {
+        let error = AiStreamRouter::new(
+            &anthropic_config_with(json!({ field: value })),
+            http_client(),
+        )
+        .err()
+        .expect("an out-of-range stream bound must be refused");
+        assert!(error.contains(field), "{error}");
+    }
+
+    let events = long_anthropic_sse(1_100);
+    let out = run_anthropic_stream_with(openai_and_anthropic_config(), &events).await;
+    assert!(
+        !out.contains("upstream_error"),
+        "default bounds admit the stream"
+    );
+    let out = run_anthropic_stream_with(
+        anthropic_config_with(json!({"max_stream_events": 1000})),
+        &events,
+    )
+    .await;
+    assert!(out.contains("event count limit"), "{}", output_tail(&out));
+
+    // ~1.3 MiB of provider plaintext and ~2 MiB of normalized output.
+    let large = long_anthropic_sse(9_000);
+    assert!(large.len() > 1024 * 1024);
+    let out = run_anthropic_stream_with(openai_and_anthropic_config(), &large).await;
+    assert!(
+        !out.contains("upstream_error"),
+        "default bounds admit the stream"
+    );
+    let out = run_anthropic_stream_with(
+        anthropic_config_with(json!({"max_stream_bytes": 1024 * 1024})),
+        &large,
+    )
+    .await;
+    assert!(
+        out.contains("cumulative size limit"),
+        "{}",
+        output_tail(&out)
+    );
+    let out = run_anthropic_stream_with(
+        anthropic_config_with(json!({"max_normalized_stream_bytes": 1024 * 1024})),
+        &large,
+    )
+    .await;
+    assert!(
+        out.contains("cumulative normalized size limit"),
+        "{}",
+        output_tail(&out)
+    );
+    assert!(out.len() <= 1024 * 1024);
+}
+
+// --- ai_stream_router-CLAUDE-10: Azure OpenAI api-key auth --------------------
+
+#[tokio::test]
+async fn azure_openai_provider_installs_the_api_key_header_on_every_pass() {
+    let plugin = build(json!({
+        "providers": [{
+            "name": "azure",
+            "provider_type": "azure_openai",
+            "endpoint": "https://contoso.openai.azure.com/openai/deployments/gpt4o/chat/completions?api-version=2024-10-21",
+            "api_key": "azure-secret-key",
+            "model_patterns": ["gpt-*"]
+        }]
+    }));
+    let body = streaming_request("gpt-4o");
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer client-token".to_string(),
+    );
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        headers.get("api-key").map(String::as_str),
+        Some("azure-secret-key")
+    );
+    assert!(!headers.contains_key("authorization"));
+    assert_no_value_anywhere(&headers, "client-token");
+    assert!(
+        ctx.route_override_path
+            .as_deref()
+            .is_some_and(|path| path.contains("api-version=2024-10-21"))
+    );
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .is_none(),
+        "Azure SSE is already OpenAI-shaped"
+    );
+
+    let raw = serde_json::to_vec(&body).unwrap();
+    let out = plugin
+        .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+        .await
+        .expect("usage injection");
+    let parsed: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(parsed["stream_options"]["include_usage"], json!(true));
+
+    headers.remove("api-key");
+    headers.insert("authorization".to_string(), "Bearer late".to_string());
+    plugin.enforce_final_backend_header_policy(&ctx, &mut headers);
+    assert_eq!(
+        headers.get("api-key").map(String::as_str),
+        Some("azure-secret-key")
+    );
+    assert!(!headers.contains_key("authorization"));
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &out)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+// --- ai_stream_router-CLAUDE-11: base64 data-URL images -----------------------
+
+const PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgo=";
+
+fn image_request(model: &str, url: &str) -> Value {
+    json!({
+        "model": model,
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": url, "detail": "high"}}
+            ]
+        }]
+    })
+}
+
+#[tokio::test]
+async fn data_url_images_translate_to_native_image_parts() {
+    let parsed = translate_anthropic_body(&image_request("claude-3-5-sonnet", PNG_DATA_URL))
+        .await
+        .expect("a base64 image must translate for Anthropic");
+    assert_eq!(
+        parsed["messages"][0]["content"],
+        json!([
+            {"type": "text", "text": "what is this?"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+        ])
+    );
+
+    let plugin = build(gemini_config());
+    let parsed = translate_gemini_body(&plugin, &image_request("gemini-1.5-flash", PNG_DATA_URL))
+        .await
+        .expect("a base64 image must translate for Gemini");
+    assert_eq!(
+        parsed["contents"][0]["parts"],
+        json!([
+            {"text": "what is this?"},
+            {"inlineData": {"mimeType": "image/png", "data": "iVBORw0KGgo="}}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn unsupported_image_parts_are_rejected_without_echoing_them() {
+    let plugin = build(openai_and_anthropic_config());
+    for url in [
+        "data:image/svg+xml;base64,PHN2ZyBzZWNyZXQ+",
+        "data:image/png;base64,not base64 secretpayload",
+        "data:image/png,secretpayload",
+        "https://example.invalid/secretpayload.png",
+        "file:///etc/secretpayload",
+    ] {
+        let body = image_request("claude-3-5-sonnet", url);
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400, "{url}");
+                assert!(body.contains("content"), "{url}: {body}");
+                assert!(!body.contains("secretpayload"), "{url}: {body}");
+                assert!(!body.contains("PHN2Z"), "{url}: {body}");
+            }
+            other => panic!("{url} must be rejected: {other:?}"),
+        }
+    }
+
+    // Images stay user-only: a system message cannot carry one.
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "system", "content": [{"type": "image_url", "image_url": {"url": PNG_DATA_URL}}]},
+            {"role": "user", "content": "hi"}
+        ]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert_eq!(
+        reject_status(&plugin.before_proxy(&mut ctx, &mut headers).await),
+        Some(400)
+    );
+}
+
+// --- PR #6824 review round 1 -------------------------------------------------
+
+fn route_override_destination_digest(tls: Option<BackendTlsConfig>) -> [u8; 32] {
+    use ferrum_edge::plugins::utils::replay_partition::{
+        PartitionHasher, append_destination_partition,
+    };
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx.route_override_resolved_tls = tls.map(Arc::new);
+    let mut hasher = PartitionHasher::new("ai_stream_router_review");
+    append_destination_partition(&mut hasher, &ctx);
+    hasher.digest()
+}
+
+#[test]
+fn replay_partitions_bind_the_provider_client_identity_isolation() {
+    let isolated = BackendTlsConfig::isolated_public_verify();
+    let inheriting = BackendTlsConfig {
+        suppress_global_client_identity: false,
+        ..BackendTlsConfig::isolated_public_verify()
+    };
+    assert_ne!(
+        route_override_destination_digest(Some(isolated.clone())),
+        route_override_destination_digest(Some(inheriting.clone())),
+        "a destination that may present the gateway client identity must not share \
+         a replay partition with one that never does"
+    );
+    // The marker is bound only when set, so existing digests are stable.
+    assert_eq!(
+        route_override_destination_digest(Some(inheriting.clone())),
+        route_override_destination_digest(Some(inheriting))
+    );
+    assert_eq!(
+        route_override_destination_digest(Some(isolated.clone())),
+        route_override_destination_digest(Some(isolated))
+    );
+}
+
+#[tokio::test]
+async fn gemini_strict_json_schema_must_be_representable() {
+    let plugin = build(gemini_config());
+    let strict_request = |schema: Value, strict: bool| {
+        json!({
+            "model": "gemini-1.5-flash",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "result", "strict": strict, "schema": schema}
+            }
+        })
+    };
+    // A representable control with nesting, refs, and arrays still translates.
+    let representable = json!({
+        "type": "object",
+        "$defs": {"item": {"type": "string", "enum": ["a", "b"]}},
+        "properties": {
+            "when": {"type": "string", "format": "date-time"},
+            "items": {"type": "array", "items": {"$ref": "#/$defs/item"}, "minItems": 1},
+            "choice": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]}
+        },
+        "required": ["when"],
+        "additionalProperties": false
+    });
+    let parsed = translate_gemini_body(&plugin, &strict_request(representable.clone(), true))
+        .await
+        .expect("a representable strict schema must translate");
+    assert_eq!(
+        parsed["generationConfig"]["responseJsonSchema"],
+        representable
+    );
+
+    for unsupported in [
+        json!({"type": "object", "properties": {"id": {"type": "string", "minLength": 8}}}),
+        json!({"type": "array", "uniqueItems": true, "items": {"type": "string"}}),
+        json!({"type": "object", "properties": {"deep": {"type": "object", "properties": {"x": {"type": "string", "pattern": "^a"}}}}}),
+        json!({"oneOf": [{"type": "string"}, {"type": "integer"}]}),
+        json!({"type": "string", "format": "email"}),
+        json!({"type": "object", "properties": {"r": {"$ref": "#/$defs/x", "minItems": 1}}, "$defs": {"x": {"type": "array"}}}),
+        json!({"$ref": "https://schemas.example.invalid/remote.json"}),
+        json!({"type": "object", "properties": {"x": 7}}),
+        // Issue #7070: the ai_federation reference rules apply here too.
+        json!({"type": "array", "items": {"$ref": "#/$defs/item", "description": "x"}, "$defs": {"item": {"type": "string"}}}),
+        json!({"type": "object", "properties": {"x": {"$ref": "#/$defs/missing"}}}),
+        json!({"type": "object", "properties": {"x": {"type": "object", "$defs": {"y": {"type": "string"}}}}}),
+        json!({"$ref": "#/$defs/a", "$defs": {"a": {"type": "array", "items": {"$ref": "#/$defs/a"}}}}),
+    ] {
+        let error = translate_gemini_body(&plugin, &strict_request(unsupported.clone(), true))
+            .await
+            .expect_err("an unenforceable strict schema must be refused");
+        assert_eq!(
+            reject_param(&error).as_deref(),
+            Some("response_format"),
+            "{unsupported}: {error}"
+        );
+        assert!(!error.contains("schemas.example.invalid"), "{error}");
+    }
+
+    // A root `$ref` beside its `$defs` is a supported self-contained schema
+    // (PR6824-SOL-7): `$defs` is definition metadata, not a sibling constraint.
+    let referenced = json!({
+        "$defs": {
+            "Result": {
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+                "additionalProperties": false
+            }
+        },
+        "$ref": "#/$defs/Result"
+    });
+    let parsed = translate_gemini_body(&plugin, &strict_request(referenced.clone(), true))
+        .await
+        .expect("a root $ref with its $defs must translate");
+    assert_eq!(parsed["generationConfig"]["responseJsonSchema"], referenced);
+    // The definitions beside that `$ref` are still screened, and a real
+    // sibling constraint is still refused.
+    for refused in [
+        json!({
+            "$defs": {"Result": {"type": "string", "minLength": 3}},
+            "$ref": "#/$defs/Result"
+        }),
+        json!({
+            "$defs": {"Result": {"type": "array"}},
+            "$ref": "#/$defs/Result",
+            "maxItems": 2
+        }),
+    ] {
+        let error = translate_gemini_body(&plugin, &strict_request(refused.clone(), true))
+            .await
+            .expect_err("a nested unenforced or sibling constraint must be refused");
+        assert_eq!(
+            reject_param(&error).as_deref(),
+            Some("response_format"),
+            "{refused}: {error}"
+        );
+    }
+
+    // A non-strict schema is best-effort by OpenAI's own contract.
+    let loose = json!({"type": "object", "properties": {"id": {"type": "string", "minLength": 8}}});
+    let parsed = translate_gemini_body(&plugin, &strict_request(loose.clone(), false))
+        .await
+        .expect("a non-strict schema is forwarded as-is");
+    assert_eq!(parsed["generationConfig"]["responseJsonSchema"], loose);
+}
+
+#[tokio::test]
+async fn structurally_invalid_base64_images_are_refused_for_both_providers() {
+    let anthropic = build(openai_and_anthropic_config());
+    let gemini = build(gemini_config());
+    for payload in [
+        "=",
+        "AA=A",
+        "A",
+        "AAAAA",
+        "iVBORw0KGgo=====",
+        "iV-ORw0KGgo=",
+    ] {
+        let url = format!("data:image/png;base64,{payload}");
+        for (plugin, model) in [
+            (&anthropic, "claude-3-5-sonnet"),
+            (&gemini, "gemini-1.5-flash"),
+        ] {
+            let body = image_request(model, &url);
+            let mut ctx = post_ctx(&body);
+            let mut headers = json_headers();
+            match plugin.before_proxy(&mut ctx, &mut headers).await {
+                PluginResult::Reject {
+                    status_code, body, ..
+                } => {
+                    assert_eq!(status_code, 400, "{model} {payload}");
+                    assert!(
+                        body.contains("not valid base64"),
+                        "{model} {payload}: {body}"
+                    );
+                }
+                other => panic!("{model} must refuse {payload:?}: {other:?}"),
+            }
+        }
+    }
+    // Unpadded canonical base64 is still accepted.
+    assert!(
+        translate_anthropic_body(&image_request(
+            "claude-3-5-sonnet",
+            "data:image/png;base64,iVBORw0KGgo"
+        ))
+        .await
+        .is_some()
     );
 }

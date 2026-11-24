@@ -3,6 +3,7 @@
 //! Run with: cargo build --bin ferrum-edge && cargo test --test functional_tests \
 //!   functional_ai_stream_router -- --ignored --nocapture
 
+use crate::common::GatewayChildGuard;
 use crate::scaffolding::port_registry::TestSocket;
 
 use std::io::Write;
@@ -18,11 +19,17 @@ fn start_gateway(
     proxy_port: u16,
     admin_port: u16,
     identity: &crate::common::SpawnedGatewayIdentity,
-) -> std::process::Child {
+) -> GatewayChildGuard {
     let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
+    crate::common::configure_coverage_gateway_command(&mut cmd);
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
+        // Keep any managed-TLS/ACME/event store inside the config's temp dir.
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            std::path::Path::new(config_path).with_file_name("managed-tls"),
+        )
         .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
@@ -31,7 +38,7 @@ fn start_gateway(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     identity.apply_to_command(&mut cmd);
-    cmd.spawn().expect("start ferrum-edge")
+    GatewayChildGuard::new(cmd.spawn().expect("start ferrum-edge"))
 }
 
 async fn wait_for_owned_gateway(
@@ -49,22 +56,22 @@ async fn wait_for_owned_gateway(
     .is_ok()
 }
 
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+async fn start_gateway_with_retry(config_path: &str) -> (GatewayChildGuard, u16, u16) {
     for attempt in 1..=3 {
-        let proxy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
-        let admin_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
+        // Fresh handoff ports per attempt, outside the ephemeral source range.
+        let proxy_port = crate::scaffolding::ports::unbound_port()
+            .await
+            .expect("reserve gateway proxy port");
+        let admin_port = crate::scaffolding::ports::unbound_port()
+            .await
+            .expect("reserve gateway admin port");
 
         let identity = crate::common::SpawnedGatewayIdentity::mint("ai-stream-router");
         let mut child = start_gateway(config_path, proxy_port, admin_port, &identity);
-        if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
+        if wait_for_owned_gateway(child.child_mut(), admin_port, &identity).await {
             return (child, proxy_port, admin_port);
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        child.shutdown();
         if attempt < 3 {
             sleep(Duration::from_secs(1)).await;
         }
@@ -283,8 +290,7 @@ async fn test_ai_stream_router_normalizes_anthropic_sse_and_requests_identity_en
         captured.raw
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.shutdown();
     provider_task.abort();
 }
 
@@ -324,8 +330,7 @@ async fn test_ai_stream_router_premature_provider_eof_is_not_success() {
     assert!(body.contains("before message_stop") || body.contains("truncated"));
     assert_eq!(body.matches("data: [DONE]").count(), 1);
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.shutdown();
     provider_task.abort();
 }
 

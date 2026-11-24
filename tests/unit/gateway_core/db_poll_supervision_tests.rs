@@ -568,12 +568,15 @@ fn control_plane_poll_tick_records_on_every_normal_exit_without_async_wrapper() 
     assert_fallthrough_records_completion(tick, "control_plane");
 
     let continue_count = tick.lines().filter(|l| l.trim() == "continue;").count();
-    // 11 in base main, plus the two exits per-namespace isolation added
-    // (#2983/#2984), minus two redundant end-of-tick failover migration-gate
-    // continues unified into `attempt_cp_failover_full_reload` (which fall
-    // straight through to the end-of-tick `record_poll_completed()`).
+    // 11 in base main, plus the exit per-namespace isolation added
+    // (#2983/#2984) for a delta whose namespaces all rejected. It still records
+    // completion, which `assert_every_continue_records_completion` above proves.
+    // The "partitioned to no attributable namespace" exit was unreachable and
+    // is gone (#7252). Two redundant end-of-tick failover migration-gate
+    // continues were unified into `attempt_cp_failover_full_reload`, which
+    // falls straight through to the end-of-tick `record_poll_completed()`.
     assert_eq!(
-        continue_count, 11,
+        continue_count, 10,
         "control-plane poll tick handled-continue exit count drifted"
     );
     let record_count = tick.matches("record_poll_completed()").count();
@@ -615,7 +618,7 @@ fn gateway_trust_drift_escalates_into_the_same_tick_full_reload() {
             .find("detect_gateway_trust_drift(")
             .unwrap_or_else(|| panic!("{label}: poll tick must run the trust drift check"));
         let decision_at = tick[drift_at..]
-            .find("if force_full_reload {")
+            .find("if let Some(full_reload_reason) = force_full_reload {")
             .map(|offset| offset + drift_at)
             .unwrap_or_else(|| {
                 panic!("{label}: the drift check must precede the full-reload decision")
@@ -625,12 +628,13 @@ fn gateway_trust_drift_escalates_into_the_same_tick_full_reload() {
         // does not pay for a second authoritative read, and that guard must be
         // the negated one — not the reload branch itself.
         let guard_at = tick[..drift_at]
-            .rfind("if !force_full_reload {")
+            .rfind("if force_full_reload.is_none() {")
             .unwrap_or_else(|| {
                 panic!("{label}: the drift check must be skipped when a reload is already pending")
             });
         assert!(
-            !tick[guard_at..drift_at].contains("if force_full_reload {"),
+            !tick[guard_at..drift_at]
+                .contains("if let Some(full_reload_reason) = force_full_reload {"),
             "{label}: the drift check must run outside the full-reload branch"
         );
 
@@ -718,9 +722,10 @@ fn poll_loop_availability_writes_go_through_the_counting_helper() {
         .expect("attempt_cp_failover_full_reload");
     let helper_body = &cp_source[helper_start..helper_start + 3500];
     assert!(
-        helper_body.contains("*force_full_reload = true;")
+        helper_body.contains("*force_full_reload = Some(FullReloadReason::DatabaseFailover);")
             && helper_body.contains("cp_full_reload_covers_all_namespaces(")
-            && helper_body.contains("*force_full_reload = !complete;"),
+            && helper_body
+                .contains("if complete {\n                        *force_full_reload = None;"),
         "CP failover helper must keep force_full_reload armed until every namespace refreshes cleanly"
     );
 }

@@ -6,7 +6,6 @@
 //! admission and OpenSSL-independent policy checks; see
 //! `tests/service_integration/README.md`.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -39,6 +38,7 @@ fn summary(path: &str, client_ip: &str) -> TransactionSummary {
         timestamp_received: Utc::now().to_rfc3339(),
         client_ip: client_ip.to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: path.to_string(),
@@ -60,12 +60,13 @@ fn summary(path: &str, client_ip: &str) -> TransactionSummary {
         error_class: None,
         body_error_class: None,
         body_completed: true,
+        response_delivery: Default::default(),
         bytes_sent: 0,
         bytes_received: 0,
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -681,7 +682,8 @@ async fn kafka_logging_real_broker_generation_isolation_and_reload_disposal() {
     plugin_b.finalize().await;
 
     // Reload/old-generation disposal: drop a generation with a stuck pending
-    // record on the multi-thread runtime (ordered finalize from Drop). Pause
+    // record on the multi-thread runtime (Drop defers the ordered finalize to a
+    // tracked background task, kafka_logging-SOL-1). Pause
     // the broker after producer construction — Redpanda cannot express
     // under-replicated acks=all via topic `min.insync.replicas`.
     let pending_topic = "ferrum-reload-pending";

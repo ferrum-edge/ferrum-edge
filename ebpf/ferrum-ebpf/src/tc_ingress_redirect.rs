@@ -139,11 +139,13 @@ pub fn ferrum_tc_ingress_redirect(ctx: TcContext) -> i32 {
 /// Resolved, armed redirect settings. Constructed only when the operator has
 /// opted the node in; its existence is the proof the datapath is live.
 ///
-/// The decision predicates themselves live in `ferrum-ebpf-common`
-/// (`BpfCaptureConfig::ingress_redirect_{armed,bypass}` and
-/// `ingress_redirect_action`) so the host-side unit tests exercise the very same
-/// truth table this program evaluates — the kernel side only parses packets and
-/// looks maps up.
+/// The shared predicates live in `ferrum-ebpf-common`:
+/// `BpfCaptureConfig::ingress_redirect_{armed,bypass}` and `ipv4_is_fragment`
+/// are called here and by the host-side unit tests. The gate ORDER and the
+/// TCP / pod-opt-in / port-declared checks are open-coded below in
+/// `redirect_ipv4` / `redirect_ipv6`; `ingress_redirect_action` in the common
+/// crate is a host-side reference model of that order which this program does
+/// not call, so its tests do not catch a regression in the gates here.
 #[derive(Clone, Copy)]
 struct RedirectConfig {
     config: BpfCaptureConfig,
@@ -172,9 +174,10 @@ fn redirect_config() -> Option<RedirectConfig> {
     })
 }
 
-/// The three loop / self-capture guards. `true` means "leave this packet
+/// The four loop / self-capture guards. `true` means "leave this packet
 /// alone" — it is either already relayed, already redirected, or addressed to
-/// the relay listener itself. Delegates to the shared, unit-tested predicate.
+/// the capture or HBONE listener itself. Delegates to the shared, unit-tested
+/// predicate.
 #[inline(always)]
 fn is_already_owned_by_the_relay(mark: u32, dst_port: u16, config: &RedirectConfig) -> bool {
     config.config.ingress_redirect_bypass(mark, dst_port)

@@ -63,6 +63,13 @@ pub struct CachedAuthorizationError {
 /// extend a relative `expires_in` bound. `not_before_unix` is the other end of
 /// the same window, retained so every cache hit re-checks it rather than
 /// trusting the one evaluation made when the response arrived (issue #5523).
+///
+/// `identity_realm_authority` is the verifying-authority digest committed with
+/// the identity. It is per credential, not per provider, because a provider
+/// that pins no issuer binds the response's `iss` into it; a cache hit must
+/// commit the same realm the miss did. `certificate_thumbprint` is the RFC 8705
+/// `cnf."x5t#S256"` binding of a certificate-bound token, re-verified against
+/// the presenting connection on every use.
 pub struct CachedAuthorization {
     pub authorization_error: Option<CachedAuthorizationError>,
     pub identity: Option<Box<str>>,
@@ -70,12 +77,15 @@ pub struct CachedAuthorization {
     pub claim_headers: Box<[CachedClaimHeader]>,
     pub expires_at_unix: Option<i64>,
     pub not_before_unix: Option<i64>,
+    pub identity_realm_authority: [u8; 32],
+    pub certificate_thumbprint: Option<Box<str>>,
 }
 
 impl CachedAuthorization {
     pub fn retained_bytes(&self) -> usize {
         let identity_bytes = self.identity.as_deref().map_or(0, str::len);
         let identity_header_bytes = self.identity_header.as_deref().map_or(0, str::len);
+        let thumbprint_bytes = self.certificate_thumbprint.as_deref().map_or(0, str::len);
         let error_bytes = self
             .authorization_error
             .as_ref()
@@ -87,6 +97,7 @@ impl CachedAuthorization {
             .saturating_add(ARC_ALLOCATION_OVERHEAD)
             .saturating_add(identity_bytes)
             .saturating_add(identity_header_bytes)
+            .saturating_add(thumbprint_bytes)
             .saturating_add(error_bytes)
             .saturating_add(
                 self.claim_headers
@@ -663,6 +674,8 @@ mod tests {
             claim_headers: Box::default(),
             expires_at_unix: None,
             not_before_unix: None,
+            identity_realm_authority: [0; 32],
+            certificate_thumbprint: None,
         })
     }
 

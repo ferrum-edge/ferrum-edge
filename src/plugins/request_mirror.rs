@@ -50,8 +50,13 @@
 //! `X-Api-Key`, …),
 //! contains a built-in credential substring (so vendor variants like
 //! `x-openai-api-key`, `x-amz-security-token`, `x-vendor-auth-token` are also
-//! caught), or matches an operator `sensitive_header_patterns` entry is stripped
-//! before the distinct mirror origin. Because native gRPC metadata is carried as
+//! caught), is credential-shaped (a separator-delimited segment is a
+//! credential-class word such as `auth`, `jwt`, `session`, `sid`, `key`, `pwd`,
+//! contains a credential stem such as `session`/`token`/`secret`, or contains
+//! `key`/`pass` outside a few ordinary words; continuation cursors,
+//! authorship/authority names and
+//! `Idempotency-Key` excepted), or matches an operator `sensitive_header_patterns` entry is
+//! stripped before the distinct mirror origin. Because native gRPC metadata is carried as
 //! HTTP/2 headers, the same predicate covers gRPC credential metadata. Forwarding
 //! any denied header requires the high-friction, fail-closed pair
 //! `forward_sensitive_headers=true` plus an exact-name
@@ -67,7 +72,8 @@
 //! match that funnel. Cross-origin **query** credential forwarding is the same
 //! deny-by-default posture as headers: built-in credential names/substrings
 //! (plus operator `sensitive_query_patterns`) are dropped from the mirror
-//! request-target only. Classification percent-decodes the name in bounded
+//! request-target only. The same credential-shaped class rule applies to
+//! decoded query names (`session_id`, `jwt`, `access_key`, `key`, `sid`). Classification percent-decodes the name in bounded
 //! stages (every layer through a hard cap of 4) and
 //! fails closed on residual valid `%XX` escapes, malformed percents, or
 //! control-bearing/invalid-UTF-8 forms; the retained pair is never rewritten.
@@ -85,6 +91,10 @@
 //! 3. else the backend-effective authorized path when backend-path policy is
 //!    active
 //! 4. else the original request path
+//!
+//! The mirror method is the backend-effective one: a plugin-selected backend
+//! method (`mcp_gateway`'s OpenAPI bridge) wins over the client method, so the
+//! shadow replays the same operation the primary backend receives.
 //!
 //! The mirror request uses the gateway's shared `PluginHttpClient`, which means
 //! it inherits the gateway's DNS cache, connection pool keepalive, TLS
@@ -218,7 +228,8 @@
 //! |-------|------|---------|-------------|
 //! | `mirror_host` | string | **(required)** | Hostname or IP of the mirror target |
 //! | `mirror_port` | u16 | 80 (http) / 443 (https) | Port of the mirror target |
-//! | `mirror_protocol` | string | `"http"` | `"http"` or `"https"` |
+//! | `mirror_protocol` | string | `"http"` | `"http"` or `"https"`. `http` is accepted without `allow_plaintext` only when `mirror_host` is a loopback IP literal (`127.0.0.0/8`, `::1`) |
+//! | `allow_plaintext` | bool | `false` | Explicit opt-in to mirror over cleartext `http` to a `mirror_host` that is not a loopback IP literal. The mirror request carries the backend-visible request (body included by default, plus any allowlisted credentials), so leave it `false` and use `https` unless the mirror path is otherwise protected |
 //! | `mirror_path` | string | (none) | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. When unset, prefers the mesh route rewrite path when present; otherwise the backend-effective authorized path if backend-path policy is active; otherwise the original request path |
 //! | `percentage` | f64 | `100.0` | Percentage of requests to mirror (0.0–100.0). Deterministic evenly spaced sampling at 0.1% granularity (see sampling notes below) |
 //! | `mirror_request_body` | bool | `true` | Whether to include the request body in the mirror request |
@@ -273,7 +284,7 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 use async_trait::async_trait;
 use bytes::Bytes;
 use percent_encoding::percent_decode_str;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -288,12 +299,12 @@ use super::utils::query::OrderedQuery;
 use super::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, parse_max_response_body_bytes,
 };
+use super::utils::socket_host::is_loopback_ip_literal_host;
 use super::{MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::proxy::headers::{
     SecondaryRequestHostPolicy, filter_secondary_request_headers,
     synthesize_grpc_te_trailers_if_needed,
 };
-use crate::util::unknown_keys::suggest_key;
 
 /// Authoritative closed set of top-level `request_mirror` configuration keys.
 ///
@@ -301,6 +312,7 @@ use crate::util::unknown_keys::suggest_key;
 /// stay in lockstep with this list so misspelled sampling, body, protocol, or
 /// endpoint controls cannot silently fall back to security-sensitive defaults.
 pub const REQUEST_MIRROR_CONFIG_KEYS: &[&str] = &[
+    "allow_plaintext",
     "forward_sensitive_header_allowlist",
     "forward_sensitive_headers",
     "forward_sensitive_query",
@@ -434,11 +446,10 @@ const MIRROR_SENSITIVE_HEADER_NAMES: &[&str] = &[
 /// Built-in credential/session substrings applied to lowercased header names so
 /// vendor-prefixed variants (`x-openai-api-key`, `x-amz-security-token`,
 /// `x-vendor-auth-token`) are stripped without an exact-name allowlist. Chosen
-/// to match credential families only: bare `token`/`key`/`session`/`auth`
-/// substrings are deliberately excluded because they also match benign headers
-/// such as pagination cursors (`x-continuation-token`). `authenticate` is
-/// included so `Proxy-Authenticate` / `WWW-Authenticate` variants are covered
-/// without a bare `auth` match. Operators extend this with
+/// to match credential families. The broader fail-closed class rule
+/// ([`name_has_credential_class`]) covers bare `token`/`key`/`session`/`auth`
+/// segments and stems, with narrow exceptions for pagination cursors
+/// (`x-continuation-token`). Operators extend this with
 /// `sensitive_header_patterns`. gRPC metadata is carried as HTTP/2 headers,
 /// so the same predicate covers native gRPC credential metadata.
 const MIRROR_SENSITIVE_HEADER_SUBSTRINGS: &[&str] = &[
@@ -475,8 +486,9 @@ const MIRROR_SENSITIVE_QUERY_CREDENTIAL_SEGMENTS: &[&str] = &["token", "sig", "s
 /// query parameter names. Seeded from [`MIRROR_SENSITIVE_HEADER_SUBSTRINGS`]
 /// with `_` variants of hyphenated families so `access_token` / `api_key`
 /// match the same secret classes the header policy already denies. Bare
-/// `token`/`key`/`session`/`auth`/`sig` substrings are excluded; those families
-/// are handled by [`query_name_has_built_in_credential_segment`].
+/// `token`/`key`/`session`/`auth`/`sig` families are handled by
+/// [`query_name_has_built_in_credential_segment`] and the class rule
+/// [`name_has_credential_class`].
 const MIRROR_SENSITIVE_QUERY_SUBSTRINGS: &[&str] = &[
     "authorization",
     "cookie",
@@ -504,6 +516,234 @@ const MIRROR_SENSITIVE_QUERY_SUBSTRINGS: &[&str] = &[
     "secret",
     "credential",
 ];
+
+/// Credential-class words. A header or decoded query name is credential-shaped
+/// when any of its alphanumeric segments (split on every non-alphanumeric byte)
+/// equals one of these words, so `x-session-id`, `jwt`, `x-private-key`,
+/// `auth`, `sid`, or `pwd` fail closed without an exact-name entry.
+const MIRROR_CREDENTIAL_CLASS_SEGMENTS: &[&str] = &[
+    "auth",
+    "authn",
+    "authz",
+    "oauth",
+    "jwt",
+    "jws",
+    "jwe",
+    "saml",
+    "token",
+    "tokens",
+    "session",
+    "sessions",
+    "sess",
+    "sessid",
+    "sid",
+    "ssid",
+    "key",
+    "keys",
+    "secret",
+    "secrets",
+    "password",
+    "passwd",
+    "passphrase",
+    "passcode",
+    "pass",
+    "pwd",
+    "pw",
+    "credential",
+    "credentials",
+    "cred",
+    "creds",
+    "cookie",
+    "cookies",
+    "bearer",
+    "sig",
+    "signature",
+    "hmac",
+    "otp",
+    "totp",
+    "hotp",
+    "csrf",
+    "xsrf",
+    "ticket",
+    "assertion",
+];
+
+/// Credential-class stems matched inside a single segment, so concatenated
+/// and spelled-out forms (`sessionid`, `accesstoken`, `clientsecret`,
+/// `authorization`, `jwtassertion`, `clientpwd`, `totpcode`, `codeverifier`)
+/// fail closed too. A segment containing `key` or `pass` (`accesskey`,
+/// `privatekeypem`, `clientpass`) is also treated as a credential unless it is
+/// a listed benign word; see [`segment_is_credential_shaped`].
+const MIRROR_CREDENTIAL_CLASS_STEMS: &[&str] = &[
+    "auth",
+    "token",
+    "session",
+    "sessid",
+    "secret",
+    "passw",
+    "passphrase",
+    "passcode",
+    "credential",
+    "cookie",
+    "bearer",
+    "signature",
+    "jwt",
+    "saml",
+    "csrf",
+    "xsrf",
+    "ticket",
+    "assertion",
+    "hmac",
+    "pwd",
+    "otp",
+    "mfa",
+    "verifier",
+    "jws",
+    "jwe",
+    "dpop",
+    "pincode",
+];
+
+/// Short credential aliases matched as a segment suffix, plural included, so
+/// compounds such as `clientsid`, `userpw`, `clientcred` and `sids` fail
+/// closed. Too short to match as a substring anywhere in a segment.
+const MIRROR_CREDENTIAL_CLASS_SUFFIXES: &[&str] = &[
+    "sid", "sids", "pw", "pws", "cred", "creds", "sig", "sigs", "pin", "pins",
+];
+
+/// Whole segments that contain `key` or `pass` without naming a credential.
+/// Everything else containing either (`privatekeypem`, `keyid`, `clientpass`)
+/// fails closed.
+const MIRROR_BENIGN_KEY_PASS_SEGMENTS: &[&str] = &[
+    "keyword",
+    "keywords",
+    "keyboard",
+    "keystroke",
+    "keystrokes",
+    "keynote",
+    "monkey",
+    "donkey",
+    "turkey",
+    "hockey",
+    "jockey",
+    "whiskey",
+    "passenger",
+    "passengers",
+    "passage",
+    "passive",
+    "compass",
+    "sacred",
+    "spin",
+    "spins",
+];
+
+/// Names that are credentials when they are the name's only alphanumeric
+/// segment. `code` is the OAuth authorization-code callback parameter; next to
+/// other segments it is too common (`country_code`, `zip-code`) to treat as a
+/// credential.
+const MIRROR_CREDENTIAL_WHOLE_NAMES: &[&str] = &["code"];
+
+/// Whole segments that contain the `auth` stem but name authorship or a URI
+/// authority rather than a credential.
+const MIRROR_BENIGN_AUTH_SEGMENTS: &[&str] =
+    &["author", "authors", "authored", "authority", "authorities"];
+
+/// Qualifiers that turn `token` into a pagination cursor rather than a
+/// credential, either as the preceding segment (`continuation_token`,
+/// `x-continuation-token`) or as a concatenated prefix (`continuationtoken`).
+/// Kept to the one cursor family the query policy already exempted, so the
+/// class rule never loosens it.
+const MIRROR_BENIGN_TOKEN_QUALIFIERS: &[&str] = &["continuation"];
+
+/// Qualifiers that make `code` an authorization or one-time code rather than an
+/// ordinary code (`country_code`): as the preceding segment (`user_code`,
+/// `x-device-code`) or as a concatenated prefix (`devicecode`).
+const MIRROR_CREDENTIAL_CODE_QUALIFIERS: &[&str] = &[
+    "user",
+    "device",
+    "verification",
+    "access",
+    "recovery",
+    "backup",
+    "login",
+    "reset",
+    "security",
+    "activation",
+    "confirmation",
+    "magic",
+];
+
+/// Credential-class test for one lowercased alphanumeric segment, given the
+/// previous segment of the same name (if any).
+fn segment_is_credential_shaped(segment: &str, previous: Option<&str>) -> bool {
+    if segment == "code" || segment == "codes" {
+        return previous.is_some_and(|prev| MIRROR_CREDENTIAL_CODE_QUALIFIERS.contains(&prev));
+    }
+    if let Some(prefix) = segment
+        .strip_suffix("codes")
+        .or_else(|| segment.strip_suffix("code"))
+        && MIRROR_CREDENTIAL_CODE_QUALIFIERS.contains(&prefix)
+    {
+        return true;
+    }
+    if MIRROR_BENIGN_AUTH_SEGMENTS.contains(&segment) {
+        return false;
+    }
+    if segment == "token" || segment == "tokens" {
+        return !previous.is_some_and(|prev| MIRROR_BENIGN_TOKEN_QUALIFIERS.contains(&prev));
+    }
+    if let Some(prefix) = segment
+        .strip_suffix("tokens")
+        .or_else(|| segment.strip_suffix("token"))
+        && MIRROR_BENIGN_TOKEN_QUALIFIERS.contains(&prefix)
+    {
+        return false;
+    }
+    if (segment == "key" || segment == "keys") && previous == Some("idempotency") {
+        return false;
+    }
+    if segment == "idempotencykey" {
+        return false;
+    }
+    MIRROR_CREDENTIAL_CLASS_SEGMENTS.contains(&segment)
+        || MIRROR_CREDENTIAL_CLASS_STEMS
+            .iter()
+            .any(|stem| segment.contains(stem))
+        || ((segment.contains("key")
+            || segment.contains("pass")
+            || MIRROR_CREDENTIAL_CLASS_SUFFIXES
+                .iter()
+                .any(|suffix| segment.ends_with(suffix)))
+            && !MIRROR_BENIGN_KEY_PASS_SEGMENTS.contains(&segment))
+}
+
+/// Fail-closed credential-class test shared by the header and query policies.
+/// `name_lower` must already be ASCII-lowercased (and, for query names,
+/// percent-decoded). Splitting on every non-alphanumeric byte means `-`, `_`,
+/// `.`, `+`, space and any other separator spelling yield the same segments.
+fn name_has_credential_class(name_lower: &str) -> bool {
+    // A whole-name credential also matches when separators surround it
+    // (` code`, `+code`, `code[]`): form decoders strip or normalise those.
+    let mut segments = name_lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty());
+    if let (Some(only), None) = (segments.next(), segments.next())
+        && MIRROR_CREDENTIAL_WHOLE_NAMES.contains(&only)
+    {
+        return true;
+    }
+    let mut previous = None;
+    for segment in name_lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+    {
+        if segment_is_credential_shaped(segment, previous) {
+            return true;
+        }
+        previous = Some(segment);
+    }
+    false
+}
 
 /// Sampling period for percentage decisions: threshold is tenths of a percent
 /// in `0..=SAMPLE_PERIOD`, so each complete cycle of `SAMPLE_PERIOD` requests
@@ -534,16 +774,13 @@ fn is_numeric_port(port: &str) -> bool {
     !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn is_port_suffix(rest: &str) -> bool {
-    matches!(rest.strip_prefix(':'), Some(port) if is_numeric_port(port))
-}
-
 /// Deny-by-default sensitivity test for a lowercased header name. A header is
 /// sensitive if it is a well-known credential name, contains a built-in
 /// credential substring, or contains any operator-configured
 /// `sensitive_header_patterns` substring.
 fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) -> bool {
     MIRROR_SENSITIVE_HEADER_NAMES.contains(&name_lower)
+        || name_has_credential_class(name_lower)
         || MIRROR_SENSITIVE_HEADER_SUBSTRINGS
             .iter()
             .any(|substr| name_lower.contains(substr))
@@ -557,6 +794,16 @@ fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) ->
 /// built-in substrings, and operator `sensitive_query_patterns` all deny.
 /// Never logs the name.
 fn is_mirror_sensitive_query_name(name_lower: &str, operator_patterns: &[String]) -> bool {
+    is_mirror_sensitive_query_name_staged(name_lower, operator_patterns)
+        || name_has_credential_class(name_lower)
+}
+
+/// The list-based part of [`is_mirror_sensitive_query_name`], applied to every
+/// staged decode layer. The class rule ([`name_has_credential_class`]) runs
+/// only on the fully decoded name, because a raw `%XX` escape splits segments
+/// (`continuation%5Ftoken` would read as `continuation` + `5ftoken`) and would
+/// defeat its narrow exceptions.
+fn is_mirror_sensitive_query_name_staged(name_lower: &str, operator_patterns: &[String]) -> bool {
     query_name_has_built_in_credential_segment(name_lower)
         || query_name_has_adjacent_segments(name_lower, "api", "key")
         || MIRROR_SENSITIVE_QUERY_SUBSTRINGS
@@ -719,6 +966,7 @@ enum MirrorQueryNameDecision {
 fn classify_mirror_query_name(
     raw_name: &str,
     operator_patterns: &[String],
+    route_credentials: &[String],
 ) -> MirrorQueryNameDecision {
     if raw_name.len() > MAX_MIRROR_QUERY_NAME_CLASSIFY_BYTES {
         return MirrorQueryNameDecision::FailClosed;
@@ -745,7 +993,18 @@ fn classify_mirror_query_name(
             } else {
                 Cow::Owned(current.to_ascii_lowercase())
             };
-            if is_mirror_sensitive_query_name(lower.as_ref(), operator_patterns) {
+            // The class rule runs once, on the fully decoded layer (see
+            // `is_mirror_sensitive_query_name_staged`).
+            // Route credential names are compared at every decode layer: an
+            // auth plugin may match a name that still carries an escape
+            // (`proof%31`) after the single decode the request parser applies.
+            if is_mirror_sensitive_query_name_staged(lower.as_ref(), operator_patterns)
+                || route_credentials
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(lower.as_ref()))
+                || (!name_has_valid_percent_escape(current.as_ref())
+                    && name_has_credential_class(lower.as_ref()))
+            {
                 sensitive = true;
             }
         }
@@ -794,17 +1053,10 @@ pub(crate) fn append_shadow_host_suffix(authority: &str) -> String {
         return String::new();
     }
 
+    // A bracketed IPv6 literal (with or without a port) has no host label to
+    // suffix, and a malformed bracketed authority is not rewritten either:
+    // both are kept as-is.
     if authority.starts_with('[') {
-        let Some(close) = authority.find(']') else {
-            return authority.to_string();
-        };
-        let inner = &authority[1..close];
-        let rest = &authority[close + 1..];
-        if inner.parse::<std::net::Ipv6Addr>().is_ok() && (rest.is_empty() || is_port_suffix(rest))
-        {
-            // Bracketed IPv6 (+ optional port): keep a valid authority as-is.
-            return authority.to_string();
-        }
         return authority.to_string();
     }
 
@@ -854,6 +1106,242 @@ pub(crate) fn resolve_mirror_timeout_ms(
     raw.clamp(1, MAX_MIRROR_TIMEOUT_MS)
 }
 
+/// Credential provenance for one mirrored request, gathered from the request
+/// context rather than from the outbound names, so a credential renamed by a
+/// later plugin (`request_transformer` header/query `rename`, route overlays)
+/// is still recognised.
+#[derive(Default)]
+struct MirrorRouteCredentials {
+    /// Query parameter names an authentication plugin marked as credential
+    /// locations on this request (whether or not it strips them from the
+    /// primary request).
+    query_names: Vec<String>,
+    /// Route-registered credential header names plus every name a header
+    /// rename gave to a credential (replayed from the request's rename
+    /// lineage against this mirror's classifiers and patterns).
+    header_names: Vec<String>,
+    /// SHA-256 digests of the credential values the client presented: every
+    /// value of a built-in credential header or a route-registered credential
+    /// header on the inbound request, plus the recorded query credential
+    /// digests. Any outbound header or query value with one of these digests
+    /// is treated as a credential, whatever it is now called. A set, so
+    /// collecting many client-controlled `;` sub-pair values stays linear.
+    value_digests: std::collections::HashSet<[u8; 32]>,
+}
+
+impl MirrorRouteCredentials {
+    /// Query names marked as credential locations on this request, plus
+    /// names a rename gave to a credential query parameter.
+    fn marked_query_names(ctx: &RequestContext) -> Vec<String> {
+        use crate::plugins::utils::token_extract::{
+            QUERY_CREDENTIAL_METADATA_PREFIX, STRIP_QUERY_PARAM_METADATA_PREFIX,
+        };
+        let mut names: Vec<String> = Vec::new();
+        let mut add = |name: &str| {
+            if !names.iter().any(|known| known == name) {
+                names.push(name.to_string());
+            }
+        };
+        for (name, _) in ctx.query_credential_partition_digests() {
+            add(name);
+        }
+        for key in ctx.metadata.keys() {
+            if let Some(name) = key
+                .strip_prefix(QUERY_CREDENTIAL_METADATA_PREFIX)
+                .or_else(|| key.strip_prefix(STRIP_QUERY_PARAM_METADATA_PREFIX))
+            {
+                add(name);
+            }
+        }
+        names
+    }
+
+    /// Gather provenance from every place a credential value is visible
+    /// before renames can hide it: the pristine inbound headers, the
+    /// materialised request headers, the final outbound headers (values a
+    /// plugin such as `mcp_gateway` installed under a credential name), the
+    /// original raw query and the outbound query. A header or query name
+    /// counts when the mirror's own classifiers deny it (built-in classes,
+    /// operator patterns, route registry, marked query locations). Every
+    /// occurrence of a repeated name contributes its own digest.
+    fn collect(
+        ctx: &RequestContext,
+        outbound_headers: &HashMap<String, String>,
+        header_patterns: &[String],
+        query_patterns: &[String],
+    ) -> Self {
+        use crate::fips::approved::Sha256;
+        use crate::plugins::utils::replay_partition::is_credential_context_header;
+
+        let mut query_names = Self::marked_query_names(ctx);
+        // Replay the rename lineage: a destination is a credential when its
+        // source was one, under this mirror's classifiers and patterns.
+        for (source, destination) in ctx.request_query_rename_lineage() {
+            let source_is_credential = query_names.iter().any(|known| known == source)
+                || !matches!(
+                    classify_mirror_query_name(source, query_patterns, &query_names),
+                    MirrorQueryNameDecision::NonSensitive
+                );
+            if source_is_credential && !query_names.iter().any(|known| known == destination) {
+                query_names.push(destination.clone());
+            }
+        }
+        let mut header_names: Vec<String> = ctx.request_headers_requiring_redaction().to_vec();
+        for (source, destination) in ctx.request_header_rename_lineage() {
+            let lower = source.to_ascii_lowercase();
+            let source_is_credential = is_mirror_sensitive_header(&lower, header_patterns)
+                || is_credential_context_header(&lower)
+                || header_names
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&lower));
+            if source_is_credential
+                && !header_names
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(destination))
+            {
+                header_names.push(destination.to_ascii_lowercase());
+            }
+        }
+        let mut value_digests: std::collections::HashSet<[u8; 32]> =
+            std::collections::HashSet::new();
+        for (_, digest) in ctx.query_credential_partition_digests() {
+            value_digests.insert(*digest);
+        }
+
+        fn push(digests: &mut std::collections::HashSet<[u8; 32]>, bytes: &[u8]) {
+            if bytes.is_empty() {
+                return;
+            }
+            let digest: [u8; 32] = Sha256::digest(bytes);
+            digests.insert(digest);
+        }
+        let header_is_credential = |name: &str| {
+            let lower = name.to_ascii_lowercase();
+            is_mirror_sensitive_header(&lower, header_patterns)
+                || is_credential_context_header(&lower)
+                || header_names
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&lower))
+        };
+        if let Some(raw) = ctx.raw_headers_snapshot() {
+            for (name, value) in raw.iter() {
+                if header_is_credential(name.as_str()) {
+                    push(&mut value_digests, value.as_bytes());
+                }
+            }
+        }
+        for (name, value) in ctx.headers.iter().chain(outbound_headers.iter()) {
+            if header_is_credential(name) {
+                push(&mut value_digests, value.as_bytes());
+            }
+        }
+
+        let raw_query = ctx.raw_query_string();
+        // An outbound query byte-identical to the raw query yields exactly the
+        // same names and digests, so classify it only when it differs.
+        let outbound_query = ctx
+            .outbound_query_string()
+            .filter(|outbound| Some(*outbound) != raw_query);
+        fn push_query_value(digests: &mut std::collections::HashSet<[u8; 32]>, raw_value: &str) {
+            push(digests, raw_value.as_bytes());
+            // Without a `%` the percent-decoded form is the raw bytes, and
+            // without a `+` the form-decoded form is the percent-decoded one,
+            // so those digests would only repeat an earlier one.
+            if raw_value.contains('%') {
+                let decoded: Vec<u8> = percent_decode_str(raw_value).collect();
+                push(digests, &decoded);
+            }
+            if raw_value.contains('+') {
+                let form = raw_value.replace('+', " ");
+                let form_decoded: Vec<u8> = percent_decode_str(&form).collect();
+                push(digests, &form_decoded);
+            }
+        }
+        {
+            // Marked names also match under the outbound strip's raw /
+            // percent-decoded / form-decoded rule (GHSA-c259-vchc-3vgr).
+            let marked: std::collections::HashSet<&str> =
+                query_names.iter().map(String::as_str).collect();
+            let name_is_credential = |raw_name: &str| {
+                crate::plugins::utils::query::query_name_matches_any(raw_name, &marked)
+                    || !matches!(
+                        classify_mirror_query_name(raw_name, query_patterns, &query_names),
+                        MirrorQueryNameDecision::NonSensitive
+                    )
+            };
+            for query in [raw_query, outbound_query].into_iter().flatten() {
+                for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+                    let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+                    if name_is_credential(raw_name) {
+                        push_query_value(&mut value_digests, raw_value);
+                    }
+                    // A `;`-splitting backend reads each sub-pair as a
+                    // parameter of its own (issue #6579): a credential that
+                    // rides behind a `;` supplies value provenance too, so a
+                    // copy under a benign name is still withheld.
+                    if pair.contains(';') {
+                        for sub_pair in pair.split(';') {
+                            let (sub_name, sub_value) =
+                                sub_pair.split_once('=').unwrap_or((sub_pair, ""));
+                            if name_is_credential(sub_name) {
+                                push_query_value(&mut value_digests, sub_value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Self {
+            query_names,
+            header_names,
+            value_digests,
+        }
+    }
+
+    /// Whether `value` (or, for a query value, its percent- or form-decoded
+    /// form) is a presented credential value.
+    fn carries_credential_value(&self, value: &[u8]) -> bool {
+        use crate::fips::approved::Sha256;
+        if value.is_empty() || self.value_digests.is_empty() {
+            return false;
+        }
+        if self.value_digests.contains(&Sha256::digest(value)) {
+            return true;
+        }
+        // A later `add` can append to a renamed credential (`secret,marker`):
+        // check each comma-separated member as well.
+        value.contains(&b',')
+            && value.split(|byte| *byte == b',').any(|member| {
+                let member = member.trim_ascii();
+                !member.is_empty() && self.value_digests.contains(&Sha256::digest(member))
+            })
+    }
+
+    fn query_value_carries_credential(&self, raw_value: &str) -> bool {
+        if self.value_digests.is_empty() || raw_value.is_empty() {
+            return false;
+        }
+        if self.carries_credential_value(raw_value.as_bytes()) {
+            return true;
+        }
+        // Skip decoded forms that are byte-identical to one already checked:
+        // no `%` means percent-decoding is the identity, and no `+` means the
+        // form-decoded value equals the percent-decoded one.
+        if raw_value.contains('%') {
+            let decoded: Vec<u8> = percent_decode_str(raw_value).collect();
+            if self.carries_credential_value(&decoded) {
+                return true;
+            }
+        }
+        if raw_value.contains('+') {
+            let form = raw_value.replace('+', " ");
+            let form_decoded: Vec<u8> = percent_decode_str(&form).collect();
+            return self.carries_credential_value(&form_decoded);
+        }
+        false
+    }
+}
+
 /// Strip origin-bound credentials before a distinct mirror origin. Deny by
 /// default: a sensitive header survives only when `forward_sensitive_headers`
 /// is set and the exact lowercased name is in the fail-closed allowlist.
@@ -862,10 +1350,17 @@ fn apply_mirror_credential_policy(
     forward_sensitive_headers: bool,
     allowlist: &[String],
     operator_patterns: &[String],
+    route_credentials: &[String],
+    presented: &MirrorRouteCredentials,
 ) {
-    headers.retain(|(name, _)| {
+    headers.retain(|(name, value)| {
         let lower = name.to_ascii_lowercase();
-        if !is_mirror_sensitive_header(&lower, operator_patterns) {
+        if !is_mirror_sensitive_header(&lower, operator_patterns)
+            && !route_credentials
+                .iter()
+                .any(|credential| credential.eq_ignore_ascii_case(&lower))
+            && !presented.carries_credential_value(value.as_bytes())
+        {
             return true;
         }
         forward_sensitive_headers && allowlist.iter().any(|allowed| allowed == &lower)
@@ -880,6 +1375,7 @@ fn mirror_query_pair_allowed(
     forward_sensitive_query: bool,
     allowlist: &[String],
     operator_patterns: &[String],
+    route: &MirrorRouteCredentials,
 ) -> bool {
     // Some application query parsers still accept `;` as a parameter
     // separator. Ferrum's canonical query uses `&`, so forwarding a raw
@@ -889,8 +1385,21 @@ fn mirror_query_pair_allowed(
     if pair.contains(';') {
         return false;
     }
-    let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
-    match classify_mirror_query_name(raw_name, operator_patterns) {
+    let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+    match classify_mirror_query_name(raw_name, operator_patterns, &route.query_names) {
+        // A presented credential value under a name that is no longer a
+        // credential location (renamed by a later plugin) is still one.
+        MirrorQueryNameDecision::NonSensitive
+            if route.query_value_carries_credential(raw_value) =>
+        {
+            forward_sensitive_query
+                && percent_decode_str(raw_name)
+                    .decode_utf8()
+                    .is_ok_and(|decoded| {
+                        let decoded_lower = decoded.to_ascii_lowercase();
+                        allowlist.iter().any(|allowed| allowed == &decoded_lower)
+                    })
+        }
         MirrorQueryNameDecision::NonSensitive => true,
         MirrorQueryNameDecision::FailClosed => false,
         MirrorQueryNameDecision::Sensitive { decoded_lower } => {
@@ -910,6 +1419,7 @@ fn apply_mirror_query_credential_policy<'a>(
     forward_sensitive_query: bool,
     allowlist: &[String],
     operator_patterns: &[String],
+    route: &MirrorRouteCredentials,
 ) -> Cow<'a, str> {
     if query.is_empty() {
         return Cow::Borrowed(query);
@@ -917,38 +1427,50 @@ fn apply_mirror_query_credential_policy<'a>(
 
     // Retain-all is the common path: classify names in place and borrow the
     // original bytes so a query with no sensitive pairs is not copied, decoded,
-    // or re-encoded. Rebuild only after a pair is actually dropped.
-    let needs_strip = query.split('&').any(|pair| {
-        !pair.is_empty()
-            && !mirror_query_pair_allowed(
-                pair,
-                forward_sensitive_query,
-                allowlist,
-                operator_patterns,
-            )
-    });
-    if !needs_strip {
-        return Cow::Borrowed(query);
-    }
-
-    let mut kept = String::with_capacity(query.len());
+    // or re-encoded. Each pair is classified exactly once: the rebuild starts
+    // at the first dropped pair, copying the already-allowed prefix (minus
+    // empty segments) without re-deciding it.
+    let mut kept: Option<String> = None;
+    let mut pair_start = 0usize;
     for pair in query.split('&') {
-        if pair.is_empty()
-            || !mirror_query_pair_allowed(
-                pair,
-                forward_sensitive_query,
-                allowlist,
-                operator_patterns,
-            )
-        {
+        let start = pair_start;
+        // `&` is one ASCII byte, so this always lands on a pair boundary.
+        pair_start = pair_start.saturating_add(pair.len() + 1);
+        if pair.is_empty() {
             continue;
         }
-        if !kept.is_empty() {
-            kept.push('&');
+        let allowed = mirror_query_pair_allowed(
+            pair,
+            forward_sensitive_query,
+            allowlist,
+            operator_patterns,
+            route,
+        );
+        if let Some(out) = kept.as_mut() {
+            if allowed {
+                if !out.is_empty() {
+                    out.push('&');
+                }
+                out.push_str(pair);
+            }
+            continue;
         }
-        kept.push_str(pair);
+        if allowed {
+            continue;
+        }
+        // First dropped pair: every earlier non-empty pair was allowed, so
+        // copy them in order and keep rebuilding from here.
+        let mut rebuilt = String::with_capacity(query.len());
+        let prefix = query.get(..start).unwrap_or_default();
+        for prior in prefix.split('&').filter(|prior| !prior.is_empty()) {
+            if !rebuilt.is_empty() {
+                rebuilt.push('&');
+            }
+            rebuilt.push_str(prior);
+        }
+        kept = Some(rebuilt);
     }
-    Cow::Owned(kept)
+    kept.map_or(Cow::Borrowed(query), Cow::Owned)
 }
 
 #[derive(Debug)]
@@ -1281,6 +1803,14 @@ struct MirrorMetrics {
     /// exceeded the per-request `max_mirrored_request_body_bytes` ceiling. The
     /// published `mirror_error` names which of the two refused the attempt.
     budget_drops: AtomicU64,
+    /// Attempts that passed every admission refusal (sampling, `max_in_flight`,
+    /// the per-request ceiling, and the aggregate byte budget) and then paid
+    /// the synchronous egress preparation: credential provenance, mirror
+    /// query policy, header sanitization, and the owned body copy. Every
+    /// prepared attempt is dispatched, so this always equals `dispatched`; it
+    /// is kept per instance only (not exported to Prometheus) so tests can pin
+    /// that a refused attempt never pays that work on the primary request path.
+    egress_preparations: AtomicU64,
 }
 
 /// Plain-`u64` snapshot of [`MirrorMetrics`] for external assertion in tests.
@@ -1296,6 +1826,7 @@ pub struct MirrorMetricsSnapshot {
     pub cancellations: u64,
     pub concurrency_drops: u64,
     pub budget_drops: u64,
+    pub egress_preparations: u64,
 }
 
 impl MirrorMetrics {
@@ -1311,6 +1842,7 @@ impl MirrorMetrics {
             cancellations: self.cancellations.load(Ordering::Relaxed),
             concurrency_drops: self.concurrency_drops.load(Ordering::Relaxed),
             budget_drops: self.budget_drops.load(Ordering::Relaxed),
+            egress_preparations: self.egress_preparations.load(Ordering::Relaxed),
         }
     }
 
@@ -1327,6 +1859,10 @@ impl MirrorMetrics {
     fn bump_budget_drop(&self) {
         self.budget_drops.fetch_add(1, Ordering::Relaxed);
         super::prometheus_metrics::global_registry().record_request_mirror_budget_drop();
+    }
+
+    fn bump_egress_preparation(&self) {
+        self.egress_preparations.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1565,7 +2101,7 @@ pub struct RequestMirror {
     mirror_hostname: Option<String>,
     /// Bresenham phase accumulator in `0..SAMPLE_PERIOD` for evenly spaced
     /// deterministic percentage sampling. Reset to `0` on construction/reload.
-    sample_phase: AtomicU64,
+    sample_phase: crossbeam_utils::CachePadded<AtomicU64>,
     /// Bounds concurrent mirror tasks to prevent unbounded background work.
     mirror_in_flight: Arc<tokio::sync::Semaphore>,
     /// Aggregate retained request-body bytes across in-flight mirror tasks.
@@ -1578,7 +2114,6 @@ pub struct RequestMirror {
 }
 
 impl RequestMirror {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, None)
     }
@@ -1594,7 +2129,12 @@ impl RequestMirror {
                 REQUEST_MIRROR_CONFIG_KEYS.join("`, `")
             )
         })?;
-        reject_unknown_request_mirror_keys(config_obj)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_obj,
+            "config",
+            REQUEST_MIRROR_CONFIG_KEYS,
+            "request_mirror: `config`: ",
+        )?;
 
         let raw_mirror_host = optional_string(config, "mirror_host")?
             .filter(|s| !s.is_empty())
@@ -1611,6 +2151,23 @@ impl RequestMirror {
                 "request_mirror: `mirror_protocol` must be `http` or `https` (got {:?})",
                 mirror_protocol
             ));
+        }
+
+        // The mirror request replays the backend-visible request — its body
+        // by default and any allowlisted credential headers or query names —
+        // to a second origin. Cleartext is admitted without an explicit opt-in
+        // only to a loopback IP literal (a co-located shadow service), the
+        // same rule every other plugin egress follows. The judgement uses the
+        // canonical host the mirror URL is built from.
+        let allow_plaintext = optional_bool(config, "allow_plaintext")?.unwrap_or(false);
+        if mirror_protocol == "http"
+            && !allow_plaintext
+            && !is_loopback_ip_literal_host(&mirror_host)
+        {
+            return Err(
+                "request_mirror: `mirror_protocol` is `http` (the default) to a `mirror_host` that is not a loopback IP literal, which is rejected by default; set `mirror_protocol: https` or `allow_plaintext: true`"
+                    .to_string(),
+            );
         }
 
         let default_port: u16 = if mirror_protocol == "https" { 443 } else { 80 };
@@ -1803,7 +2360,7 @@ impl RequestMirror {
             mirror_hostname,
             // Phase 0 defers the first selection until the accumulator crosses
             // SAMPLE_PERIOD — construction/reload never opens with a mirrored prefix.
-            sample_phase: AtomicU64::new(0),
+            sample_phase: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
             // `max_in_flight` is range-checked above, so `Semaphore::new` cannot
             // panic on an out-of-range permit count.
             mirror_in_flight: Arc::new(tokio::sync::Semaphore::new(max_in_flight)),
@@ -1816,7 +2373,6 @@ impl RequestMirror {
     /// Effective sampling threshold in tenths of a percent (`0..=1000`).
     // This accessor exists for the external sampling contract tests. The
     // production request path reads the field directly in `should_mirror`.
-    #[allow(dead_code)]
     pub(crate) fn sample_threshold_for_test(&self) -> u64 {
         self.sample_threshold
     }
@@ -1824,31 +2380,22 @@ impl RequestMirror {
     /// Current Bresenham phase in `0..SAMPLE_PERIOD`.
     // This accessor exists for the external sampling contract tests. The
     // production request path updates the atomic directly in `should_mirror`.
-    #[allow(dead_code)]
     pub(crate) fn sample_phase_for_test(&self) -> u64 {
-        self.sample_phase.load(Ordering::Relaxed)
-    }
-
-    /// Configured mirror timeout override when present.
-    #[allow(dead_code)]
-    pub(crate) fn mirror_timeout_ms_for_test(&self) -> Option<u64> {
-        self.mirror_timeout_ms
+        let count = self.sample_phase.load(Ordering::Relaxed);
+        ((u128::from(count) * u128::from(self.sample_threshold)) % u128::from(SAMPLE_PERIOD)) as u64
     }
 
     /// Current retained request-body budget usage for external tests.
-    #[allow(dead_code)]
     pub(crate) fn retained_request_body_bytes_for_test(&self) -> u64 {
         self.body_budget.used_for_test()
     }
 
     /// Configured retained-body ceiling for external tests.
-    #[allow(dead_code)]
     pub(crate) fn max_retained_request_body_bytes_for_test(&self) -> u64 {
         self.body_budget.max_bytes
     }
 
     /// Configured plugin-local per-request body ceiling for external tests.
-    #[allow(dead_code)]
     pub(crate) fn max_mirrored_request_body_bytes_for_test(&self) -> u64 {
         self.max_mirrored_request_body_bytes
     }
@@ -1896,7 +2443,6 @@ impl RequestMirror {
     /// tests. Process-wide authenticated `/metrics` also exports the same
     /// aggregate tallies as `ferrum_request_mirror_*_total` (monotonic across
     /// reloads); this hook asserts the per-instance, reload-reset view.
-    #[allow(dead_code)]
     pub(crate) fn mirror_metrics_snapshot_for_test(&self) -> MirrorMetricsSnapshot {
         self.metrics.snapshot()
     }
@@ -1929,12 +2475,24 @@ impl RequestMirror {
     /// available (tests / already-decoded contexts); that fallback still applies
     /// the same deny-by-default query policy and does not round-trip remaining
     /// pairs through `application/x-www-form-urlencoded`.
+    #[cfg(test)]
     fn build_mirror_url(
         &self,
         original_path: &str,
         raw_query: Option<&str>,
         query_params: &HashMap<String, String>,
+        route: &MirrorRouteCredentials,
     ) -> String {
+        let mut url = self.mirror_url_base(original_path);
+        self.append_mirror_query(&mut url, raw_query, query_params, route);
+        url
+    }
+
+    /// `protocol://host:port` plus the configured or gateway-selected path,
+    /// with no query. Cheap enough to build before admission so every refusal
+    /// can publish its attributable (query-free) target without paying the
+    /// query credential policy.
+    fn mirror_url_base(&self, original_path: &str) -> String {
         let path = self.mirror_path.as_deref().unwrap_or(original_path);
 
         let mut url = String::with_capacity(
@@ -1946,7 +2504,19 @@ impl RequestMirror {
         url.push(':');
         let _ = write!(&mut url, "{}", self.mirror_port);
         url.push_str(path);
+        url
+    }
 
+    /// Append the credential-filtered mirror query to a URL built by
+    /// [`Self::mirror_url_base`]. The query source precedence is the one
+    /// described on `build_mirror_url` (the test-only composition of the two).
+    fn append_mirror_query(
+        &self,
+        url: &mut String,
+        raw_query: Option<&str>,
+        query_params: &HashMap<String, String>,
+        route: &MirrorRouteCredentials,
+    ) {
         if let Some(query) = raw_query {
             // `Some("")` is authoritative: an auth strip may have removed the
             // entire raw query, so falling back to the materialised map here
@@ -1956,6 +2526,7 @@ impl RequestMirror {
                 self.forward_sensitive_query,
                 &self.forward_sensitive_query_allowlist,
                 &self.sensitive_query_patterns,
+                route,
             );
             if !filtered.is_empty() {
                 url.push('?');
@@ -1968,14 +2539,13 @@ impl RequestMirror {
                 self.forward_sensitive_query,
                 &self.forward_sensitive_query_allowlist,
                 &self.sensitive_query_patterns,
+                route,
             );
             if !filtered.is_empty() {
                 url.push('?');
                 url.push_str(&filtered);
             }
         }
-
-        url
     }
 
     /// Should this request be mirrored (deterministic evenly spaced sampling)?
@@ -1991,60 +2561,21 @@ impl RequestMirror {
             return true;
         }
 
-        // Lock-free Bresenham: keep phase in [0, SAMPLE_PERIOD). Successful
-        // updates always store `next < SAMPLE_PERIOD`, and `threshold` is at
-        // most 999, so `current + threshold` stays far below u64::MAX and
-        // cannot overflow or panic.
-        let mut current = self.sample_phase.load(Ordering::Relaxed);
-        loop {
-            let sum = current + threshold;
-            let (selected, next) = if sum >= SAMPLE_PERIOD {
-                (true, sum - SAMPLE_PERIOD)
-            } else {
-                (false, sum)
-            };
-            match self.sample_phase.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return selected,
-                Err(observed) => current = observed,
-            }
-        }
+        // Wait-free Bresenham via monotonic `fetch_add(1)` on a cache-line-padded
+        // counter: `phase(n) = (n * threshold) % SAMPLE_PERIOD`, so sample `n`
+        // fires iff `phase(n) + threshold >= SAMPLE_PERIOD`. Produces the exact
+        // same deterministic periodic sequence as the CAS accumulator with zero
+        // retry loops under multi-core contention.
+        let n = self.sample_phase.fetch_add(1, Ordering::Relaxed);
+        let phase = ((u128::from(n) * u128::from(threshold)) % u128::from(SAMPLE_PERIOD)) as u64;
+        phase + threshold >= SAMPLE_PERIOD
     }
 
     /// External-test probe for the real state-advancing sampler without
     /// widening the production API surface.
-    #[allow(dead_code)]
     pub(crate) fn should_mirror_for_test(&self) -> bool {
         self.should_mirror()
     }
-}
-
-fn reject_unknown_request_mirror_keys(object: &Map<String, Value>) -> Result<(), String> {
-    let mut unknown: Vec<&str> = object
-        .keys()
-        .filter(|key| !REQUEST_MIRROR_CONFIG_KEYS.contains(&key.as_str()))
-        .map(String::as_str)
-        .collect();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort_unstable();
-    let details: Vec<String> = unknown
-        .into_iter()
-        .map(|key| match suggest_key(key, REQUEST_MIRROR_CONFIG_KEYS) {
-            Some(suggestion) => format!("{key:?} (did you mean `{suggestion}`?)"),
-            None => format!("{key:?}"),
-        })
-        .collect();
-    Err(format!(
-        "request_mirror: unknown configuration key(s): {}; allowed keys: `{}`",
-        details.join(", "),
-        REQUEST_MIRROR_CONFIG_KEYS.join("`, `")
-    ))
 }
 
 fn parse_mirror_host(raw_host: &str) -> Result<(String, Option<String>), String> {
@@ -2288,11 +2819,12 @@ fn parse_forward_sensitive_query_allowlist(
                         "request_mirror: `forward_sensitive_query_allowlist[{idx}]` exceeds maximum length of {MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST_ITEM_LEN} bytes"
                     ));
                 }
-                if trimmed
-                    .bytes()
-                    .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
-                    || trimmed.contains(['=', '&', '?', '#', '/', '@'])
-                    || http::HeaderName::from_bytes(trimmed.as_bytes()).is_err()
+                // Query names are not header names: brackets (`filter[key]`,
+                // `key[]`) and other visible ASCII are valid. Entries match
+                // the decoded name, so `%` and the query delimiters are refused.
+                if trimmed.len() != name.len()
+                    || !trimmed.bytes().all(|b| b.is_ascii_graphic())
+                    || trimmed.contains(['=', '&', '?', '#', '/', '@', ';', '%', '+'])
                 {
                     return Err(format!(
                         "request_mirror: `forward_sensitive_query_allowlist[{idx}]` is not a valid query parameter name"
@@ -2380,6 +2912,10 @@ impl Plugin for RequestMirror {
 
     fn priority(&self) -> u16 {
         super::priority::REQUEST_MIRROR
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -2577,91 +3113,36 @@ impl Plugin for RequestMirror {
 
         // Mirror the final route-selected path without consuming the override
         // that primary dispatch still needs. An explicit operator mirror_path
-        // remains authoritative.
+        // remains authoritative. Only the query-free base is built here: every
+        // admission refusal below publishes this attributable target, and logs
+        // omit the query anyway, so a refused attempt never pays the query
+        // credential policy.
         let mirror_path = self.select_mirror_path(ctx);
-        // Snapshot the canonical backend-visible query through the same
-        // funnel as primary dispatch. `build_mirror_url` copies retained pair
-        // bytes into the owned mirror URL immediately, before any later plugin
-        // mutation of `ctx` can change the request-target. Sensitive pairs are
-        // dropped from this URL only; the primary backend target is never
-        // rewritten. Borrow the funnel `Cow` so a query that needs no strip is
-        // not cloned before that copy.
-        let effective_query =
-            if ctx.outbound_query_string().is_some() || ctx.raw_query_string().is_some() {
-                Some(crate::proxy::effective_backend_query_string(ctx))
-            } else {
-                None
-            };
-        let mirror_url =
-            self.build_mirror_url(mirror_path, effective_query.as_deref(), &ctx.query_params);
-        let method = ctx.method.clone();
-
-        // Mirror destinations are an egress boundary just like the primary
-        // backend. Apply the canonical secondary-request sanitizer (hop-by-hop,
-        // Connection-listed, framing, proxy-owned forwarding identity, Host
-        // strip) before any mirror-specific exclusions.
-        let mesh_shadow_host = if ctx.mesh_route_dispatch_matched {
-            ctx.route_override_authority
-                .as_deref()
-                .or_else(|| request_host_header(headers))
-                .filter(|authority| !authority.is_empty())
-                .map(append_shadow_host_suffix)
-        } else {
-            None
-        };
-        let mut mirror_headers = filter_secondary_request_headers(
-            headers,
-            SecondaryRequestHostPolicy::Strip,
-            // A mirror target must never be told a forged source address. The
-            // primary backend request already refuses an untrusted peer's
-            // `X-Real-IP`; pass the same verdict so the shadow destination sees
-            // the identical client-identity boundary (issue #4164).
-            ctx.forwarding_peer_trusted,
-            &[HEADER_TRIGGER_KEY, HEADER_FANOUT],
-        );
-        apply_mirror_credential_policy(
-            &mut mirror_headers,
-            self.forward_sensitive_headers,
-            &self.forward_sensitive_header_allowlist,
-            &self.sensitive_header_patterns,
-        );
-        if let Some(shadow_host) = mesh_shadow_host {
-            // Keep the configured mirror URL as the dial/TLS identity. Only
-            // the application Host/:authority follows Envoy's route-local
-            // shadow contract.
-            mirror_headers.push(("host".to_string(), shadow_host));
-        }
-        // gRPC mirrors need `te: trailers` after the generic strip removes `te`.
-        synthesize_grpc_te_trailers_if_needed(&mut mirror_headers);
-        let is_native_grpc = mirror_headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("content-type")
-                && crate::proxy::backend_dispatch::is_native_grpc_content_type(value.as_bytes())
-        });
-
-        // Apply the operator-configured baggage strip
-        // (`FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`) so mesh-internal identity
-        // claims like `source.principal` don't leak to mirror analytics /
-        // auditing services that the operator considers off-mesh.
-        self.http_client
-            .strip_egress_baggage_in_vec(&mut mirror_headers);
-        // The mirror carries the gateway's own hop count, never the copied
-        // outbound field: on a mesh inbound route that copy holds the RECEIVED
-        // count, so a mirror target that resolves back to the gateway would
-        // otherwise loop without bound (issue #6128).
-        let proxy_hops = crate::proxy::hop_limit::plugin_call_proxy_hops(ctx);
-        crate::proxy::hop_limit::strip_copied_proxy_hops(&mut mirror_headers, proxy_hops);
-
-        // Omit the query from every log/metrics URL. The dispatched URL has
-        // already dropped deny-by-default sensitive pairs; logging still
-        // omits the entire query so remaining application parameters are not
-        // echoed either. Computed here, before the permit-exhaustion drop
-        // path, so every log site uses the stripped form.
+        let mut mirror_url = self.mirror_url_base(mirror_path);
+        // Omit the query from every log/metrics URL. The dispatched URL drops
+        // deny-by-default sensitive pairs; logging still omits the entire
+        // query so remaining application parameters are not echoed either.
+        // Computed before the drop paths, so every log site uses the stripped
+        // form.
         let mirror_url_for_log = strip_query_params(&mirror_url).to_string();
+        // Replay the method the primary backend receives, not the client's.
+        // `mcp_gateway`'s OpenAPI bridge turns a `POST` MCP `tools/call` into,
+        // for example, `GET /pets/7`; mirroring the client `POST` with the
+        // bridge's finalized REST body would shadow a different operation.
+        // `ctx.method` keeps the client method for policy and logging.
+        let method = ctx
+            .backend_method_override
+            .map_or_else(|| ctx.method.clone(), |backend| backend.to_owned());
 
-        // Resolve the concurrency permit and any pre-buffer byte reservation.
-        // An admitted request already owns both from the authorize phase; the
-        // legacy path (body mirroring disabled or a direct invocation) acquires
-        // the permit here exactly as before.
+        // Decide capacity BEFORE any per-request egress preparation. A
+        // saturated or over-budget mirror is exactly when the gateway is
+        // shedding mirror work, so the refusal must not first pay credential
+        // provenance, query policy, header sanitization, or a body copy on the
+        // primary request path.
+        //
+        // An admitted request already owns the permit and a pre-buffer byte
+        // reservation from the authorize phase; the legacy path (body
+        // mirroring disabled or a direct invocation) acquires the permit here.
         let (permit, prereserved_lease) = match staged_state {
             Some(MirrorAdmissionState::Admitted { permit, lease }) => (permit, Some(lease)),
             Some(MirrorAdmissionState::Dropped(reason)) => {
@@ -2705,17 +3186,15 @@ impl Plugin for RequestMirror {
             },
         };
 
-        // The finalized backend-visible body, not `ctx.request_body_bytes` /
-        // `ctx.metadata["request_body"]` — those hold the PRE-transform client
-        // body, and replaying them is exactly the disclosure this advisory
-        // describes. One `Bytes` allocation for the detached task; the primary
-        // buffer is untouched.
-        let body_bytes: Option<Bytes> = if self.mirror_request_body {
-            Some(Bytes::copy_from_slice(body))
+        // Measure the finalized body from the borrowed slice; the owned copy is
+        // taken only after both byte refusals below have passed, so a body the
+        // ceiling rejects (for example one request decompression inflated) is
+        // never allocated and copied a second time.
+        let observed_body_bytes = if self.mirror_request_body {
+            body.len() as u64
         } else {
-            None
+            0
         };
-        let observed_body_bytes = body_bytes.as_ref().map_or(0, |body| body.len() as u64);
         // Reconcile the pre-buffer reservation with the real length: shrink the
         // full-ceiling admission charge back into the budget, and refuse rather
         // than retain unbudgeted bytes if the body somehow exceeds what was
@@ -2767,6 +3246,111 @@ impl Plugin for RequestMirror {
                 return PluginResult::Continue;
             }
         };
+
+        // Admitted past every refusal: from here on the attempt is always
+        // dispatched, so the synchronous preparation below is paid only for
+        // work that will actually reach the shadow destination.
+        self.metrics.bump_egress_preparation();
+
+        // Snapshot the canonical backend-visible query through the same
+        // funnel as primary dispatch. `append_mirror_query` copies retained
+        // pair bytes into the owned mirror URL immediately, before any later
+        // plugin mutation of `ctx` can change the request-target. Sensitive
+        // pairs are dropped from this URL only; the primary backend target is
+        // never rewritten. Borrow the funnel `Cow` so a query that needs no
+        // strip is not cloned before that copy.
+        let effective_query =
+            if ctx.outbound_query_string().is_some() || ctx.raw_query_string().is_some() {
+                Some(crate::proxy::effective_backend_query_string(ctx))
+            } else {
+                None
+            };
+        // Query names an auth plugin used as a credential location on this
+        // request are credentials whatever they are called.
+        // Credential provenance comes from the request context, so a
+        // credential renamed by a later plugin is still recognised by value.
+        let route_credentials = MirrorRouteCredentials::collect(
+            ctx,
+            headers,
+            &self.sensitive_header_patterns,
+            &self.sensitive_query_patterns,
+        );
+        self.append_mirror_query(
+            &mut mirror_url,
+            effective_query.as_deref(),
+            &ctx.query_params,
+            &route_credentials,
+        );
+
+        // Mirror destinations are an egress boundary just like the primary
+        // backend. Apply the canonical secondary-request sanitizer (hop-by-hop,
+        // Connection-listed, framing, proxy-owned forwarding identity, Host
+        // strip) before any mirror-specific exclusions.
+        let mesh_shadow_host = if ctx.mesh_route_dispatch_matched {
+            ctx.route_override_authority
+                .as_deref()
+                .or_else(|| request_host_header(headers))
+                .filter(|authority| !authority.is_empty())
+                .map(append_shadow_host_suffix)
+        } else {
+            None
+        };
+        let mut mirror_headers = filter_secondary_request_headers(
+            headers,
+            SecondaryRequestHostPolicy::Strip,
+            // A mirror target must never be told a forged source address. The
+            // primary backend request already refuses an untrusted peer's
+            // `X-Real-IP`; pass the same verdict so the shadow destination sees
+            // the identical client-identity boundary (issue #4164).
+            ctx.forwarding_peer_trusted,
+            &[HEADER_TRIGGER_KEY, HEADER_FANOUT],
+        );
+        // Header names configured as credential locations on this route
+        // (`key_auth` `header:x-proof`, custom JWT headers, ...) are
+        // credentials too, even when the authenticating plugin keeps them.
+        apply_mirror_credential_policy(
+            &mut mirror_headers,
+            self.forward_sensitive_headers,
+            &self.forward_sensitive_header_allowlist,
+            &self.sensitive_header_patterns,
+            &route_credentials.header_names,
+            &route_credentials,
+        );
+        if let Some(shadow_host) = mesh_shadow_host {
+            // Keep the configured mirror URL as the dial/TLS identity. Only
+            // the application Host/:authority follows Envoy's route-local
+            // shadow contract.
+            mirror_headers.push(("host".to_string(), shadow_host));
+        }
+        // gRPC mirrors need `te: trailers` after the generic strip removes `te`.
+        synthesize_grpc_te_trailers_if_needed(&mut mirror_headers);
+        let is_native_grpc = mirror_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                && crate::proxy::backend_dispatch::is_native_grpc_content_type(value.as_bytes())
+        });
+
+        // Apply the operator-configured baggage strip
+        // (`FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`) so mesh-internal identity
+        // claims like `source.principal` don't leak to mirror analytics /
+        // auditing services that the operator considers off-mesh.
+        self.http_client
+            .strip_egress_baggage_in_vec(&mut mirror_headers);
+        // The mirror carries the gateway's own hop count, never the copied
+        // outbound field: on a mesh inbound route that copy holds the RECEIVED
+        // count, so a mirror target that resolves back to the gateway would
+        // otherwise loop without bound (issue #6128).
+        let proxy_hops = crate::proxy::hop_limit::plugin_call_proxy_hops(ctx);
+        crate::proxy::hop_limit::strip_copied_proxy_hops(&mut mirror_headers, proxy_hops);
+
+        // The finalized backend-visible body, not `ctx.request_body_bytes` /
+        // `ctx.metadata["request_body"]` — those hold the PRE-transform client
+        // body, and replaying them is exactly the disclosure this advisory
+        // describes. One `Bytes` allocation for the detached task, taken only
+        // now that the body is admitted and budgeted; the primary buffer is
+        // untouched.
+        let body_bytes: Option<Bytes> = self
+            .mirror_request_body
+            .then(|| Bytes::copy_from_slice(body));
 
         let backend_timeout_ms = ctx
             .matched_proxy
@@ -3053,11 +3637,16 @@ mod tests {
         query_params.insert("page".to_string(), "1".to_string());
 
         assert_eq!(
-            plugin.build_mirror_url("/shadow", None, &query_params),
+            plugin.build_mirror_url("/shadow", None, &query_params, &Default::default()),
             "https://[2001:db8::10]:8443/shadow?page=1"
         );
         assert_eq!(
-            plugin.build_mirror_url("/shadow", Some("tag=red&tag=blue&q=a+b"), &query_params),
+            plugin.build_mirror_url(
+                "/shadow",
+                Some("tag=red&tag=blue&q=a+b"),
+                &query_params,
+                &Default::default()
+            ),
             "https://[2001:db8::10]:8443/shadow?tag=red&tag=blue&q=a+b"
         );
     }
@@ -3065,7 +3654,7 @@ mod tests {
     #[test]
     fn build_mirror_url_preserves_raw_query_edge_cases_byte_for_byte() {
         let plugin = RequestMirror::new(
-            &json!({ "mirror_host": "mirror.example", "mirror_port": 8080 }),
+            &json!({ "mirror_host": "mirror.example", "mirror_port": 8080, "allow_plaintext": true }),
             PluginHttpClient::default(),
         )
         .unwrap();
@@ -3079,11 +3668,11 @@ mod tests {
             "a=1&&b=2",
             "flag&",
             "path=%2Froot&k=a%26b",
-            "key=a%2Fb",
+            "dir=a%2Fb",
             "name=%E2%9C%93&q=%C3%A9",
-            "tag=red&tag=blue&q=a+b&flag&empty=&path=%2Froot&key=a%2Fb&name=%E2%9C%93",
+            "tag=red&tag=blue&q=a+b&flag&empty=&path=%2Froot&dir=a%2Fb&name=%E2%9C%93",
         ] {
-            let url = plugin.build_mirror_url("/api", Some(raw), &collapsed);
+            let url = plugin.build_mirror_url("/api", Some(raw), &collapsed, &Default::default());
             assert!(
                 url.ends_with(&format!("?{raw}")),
                 "raw query must be preserved exactly: got {url}"

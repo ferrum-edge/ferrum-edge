@@ -84,10 +84,9 @@ pub fn send_rpc(
     decode_body::<CniRpcResponse>(&body).map_err(CniError::IpcFailed)
 }
 
-/// Non-Unix stub so the crate compiles on macOS/Windows for tests.
-/// The CNI binary is Linux-only by design (CNI is a Linux concept), but
-/// keeping this stub means contributors on a Mac can still run the
-/// library tests without conditional compilation rippling through the
+/// Non-Unix stub so the crate compiles on non-Unix (Windows) targets for
+/// tests. The CNI binary is Linux-only by design (CNI is a Linux concept),
+/// but keeping this stub avoids conditional compilation rippling through the
 /// rest of the codebase.
 #[cfg(not(unix))]
 pub fn send_rpc(
@@ -104,7 +103,6 @@ pub fn send_rpc(
 mod tests {
     use super::*;
     use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
-    use std::collections::HashMap;
     use std::os::unix::net::UnixListener;
     use std::thread;
 
@@ -144,8 +142,8 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: None,
             netns_path: Some("/var/run/netns/cni-1".to_string()),
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let resp =
             send_rpc(&socket_path_str, &req, Duration::from_secs(2)).expect("send_rpc succeeds");
@@ -166,8 +164,8 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let err = send_rpc(
             &socket_path.to_string_lossy(),

@@ -9,8 +9,8 @@ license = "PolyForm-Noncommercial-1.0.0"
 publish = false
 
 [dependencies]
-aya-ebpf = "0.1"
-aya-log-ebpf = "0.1"
+aya-ebpf = "0.2"
+aya-log-ebpf = "0.2"
 ferrum-ebpf-common = { path = "../ferrum-ebpf-common" }
 
 [[bin]]

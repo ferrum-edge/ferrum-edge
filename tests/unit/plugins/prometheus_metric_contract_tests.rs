@@ -567,6 +567,7 @@ fn make_summary(proxy_id: &str) -> TransactionSummary {
         timestamp_received: "2025-01-01T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/contract".to_string(),
@@ -588,12 +589,13 @@ fn make_summary(proxy_id: &str) -> TransactionSummary {
         error_class: None,
         body_error_class: None,
         body_completed: true,
+        response_delivery: Default::default(),
         bytes_sent: 32,
         bytes_received: 64,
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -608,6 +610,7 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
         proxy_name: Some("Stream".to_string()),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: "127.0.0.1:9000".to_string(),
         backend_resolved_ip: None,
@@ -623,7 +626,7 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
         timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
         timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 
@@ -639,6 +642,9 @@ fn representative_exposition() -> String {
     let registry = MetricsRegistry::new();
     registry.configure(60, 3600, 0, 10_000, "contract-ns");
     registry.record(&make_summary("contract-proxy"));
+    for decision in ferrum_edge::plugins::prometheus_metrics::AdaptiveConcurrencyDecision::ALL {
+        registry.record_adaptive_concurrency_decision("contract-proxy", decision);
+    }
     let mut grpc_summary = make_summary("contract-grpc-proxy");
     grpc_summary
         .metadata
@@ -727,12 +733,16 @@ fn representative_exposition() -> String {
     ]);
     registry.finalize_mesh_tcp_opened(&mut tcp_meta, "mesh-tcp", Some("db"));
     let mut tcp_summary = make_stream_summary("mesh-tcp", "tcp");
-    tcp_summary.metadata = tcp_meta;
+    tcp_summary.metadata = tcp_meta.into_iter().collect();
     tcp_summary.bytes_sent = 1024;
     tcp_summary.bytes_received = 2048;
     registry.record_stream(&tcp_summary);
 
+    // Pre-routing rejections never reach a plugin; seeding one route miss pins
+    // the family's HELP/TYPE/label keys.
+    registry.record_unmatched_request(ferrum_edge::diagnostic_ref::ROUTE_NOT_FOUND_PHASE, 404);
     registry.record_rate_limit_exceeded();
+    registry.record_tcp_connection_throttle_rejection("contract-tcp-proxy");
     registry.record_rate_limit_local_fallback_decision();
     registry.record_rate_limit_enforcement_unavailable();
     registry.record_request_mirror_dispatched();
@@ -984,6 +994,13 @@ fn prometheus_metric_contract_is_sorted_unique_and_well_formed() {
             "DOC-10 required family missing from contract: {required}"
         );
     }
+    // Retired families must not be re-listed. `ferrum_xds_warming_partial_
+    // applies_total` was removed in #7027: the xDS DP only builds coherent
+    // slices, so a skewed apply (the only thing it counted) cannot happen.
+    assert!(
+        !contract.contains_key("ferrum_xds_warming_partial_applies_total"),
+        "retired family must not be in the contract: ferrum_xds_warming_partial_applies_total"
+    );
     for required in API_CHARGEBACK_FAMILIES {
         let fam = contract
             .get(*required)
@@ -1124,6 +1141,10 @@ fn representative_metrics_exposition_matches_contract() {
 
     for required in [
         "ferrum_database_delta_consecutive_identical_rejections",
+        "ferrum_request_body_bytes_total",
+        "ferrum_response_body_bytes_total",
+        "ferrum_unmatched_requests_total",
+        "ferrum_tcp_connection_throttle_rejections_total",
         "ferrum_mesh_tcp_egress_connections_total",
         "ferrum_mesh_hbone_inner_pool_events_total",
         "ferrum_mesh_remote_discovery_poll_failures_total",
@@ -1141,6 +1162,7 @@ fn representative_metrics_exposition_matches_contract() {
         "ferrum_k8s_controller_istio_status_retries_total",
         "ferrum_k8s_controller_reconciliations_total",
         "ferrum_k8s_controller_watch_idle_relists_total",
+        "ferrum_k8s_controller_watch_evidence_refresh_relists_total",
         "ferrum_k8s_controller_watch_deletes_total",
         "ferrum_k8s_controller_watch_errors_total",
         "ferrum_k8s_controller_watch_relist_missed_deletes_total",
@@ -1539,4 +1561,53 @@ fn database_outage_is_visible_on_metrics_while_poll_freshness_still_advances() {
         recovered.config_source_connected(),
         "recovery on the shared flag must be observable without a metrics call site"
     );
+}
+
+/// Each mesh freshness family is one group — HELP, TYPE, then every sample —
+/// with no other family's sample between (issue #7145). The federation and
+/// remote-discovery blocks used to interleave a timestamp and an age sample
+/// per key, which strict OpenMetrics parsers reject.
+#[test]
+fn mesh_freshness_families_render_as_contiguous_groups() {
+    let suffix = format!("{}-{}", std::process::id(), line!());
+    for index in 0..2 {
+        prometheus_helpers::record_mesh_federation_poll_success(
+            format!("fed-{index}-{suffix}.example"),
+            1_700_000_000,
+        );
+        prometheus_helpers::record_mesh_remote_discovery_poll_success(
+            format!("remote-{index}-{suffix}"),
+            format!("td-{index}-{suffix}.example"),
+            1_700_000_000,
+        );
+    }
+    let mut output = String::new();
+    prometheus_helpers::render_mesh_observability_metrics(&mut output);
+    let lines: Vec<&str> = output.lines().collect();
+
+    for family in [
+        "ferrum_mesh_federation_last_success_timestamp_seconds",
+        "ferrum_mesh_federation_bundle_age_seconds",
+        "ferrum_mesh_remote_discovery_last_success_timestamp_seconds",
+        "ferrum_mesh_remote_discovery_endpoint_age_seconds",
+    ] {
+        let type_line = format!("# TYPE {family} gauge");
+        let type_index = lines
+            .iter()
+            .position(|line| *line == type_line)
+            .unwrap_or_else(|| panic!("missing {type_line}:\n{output}"));
+        let sample_prefix = format!("{family}{{");
+        let samples: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.starts_with(&sample_prefix))
+            .map(|(index, _)| index)
+            .collect();
+        assert!(samples.len() >= 2, "{family} samples missing:\n{output}");
+        let expected: Vec<usize> = (type_index + 1..type_index + 1 + samples.len()).collect();
+        assert_eq!(
+            samples, expected,
+            "{family} samples must directly follow its TYPE line:\n{output}"
+        );
+    }
 }

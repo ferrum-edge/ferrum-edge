@@ -96,6 +96,9 @@ use super::file_source::{
     mark_mesh_local_reload_rejected, normalized_mesh_gateway_config, read_mesh_config_document,
     run_mesh_local_reload_loop,
 };
+use super::pending_generation::{
+    PendingGeneration, PendingGenerationAction, PendingGenerationEvent,
+};
 use super::stock_xds_credential::{
     StockBearerCredential, StockCredentialInvalidReason, StockCredentialObservation,
     StockCredentialReadEpoch, StockCredentialState, StockCredentialWatch, StockXdsCredentialSource,
@@ -125,8 +128,6 @@ use crate::xds::translator::{
 /// are subscribed later, by name, once their dependencies land.
 const STOCK_INITIAL_TYPE_URL_ORDER: [&str; 2] = [CDS_TYPE_URL, LDS_TYPE_URL];
 
-const STOCK_APPLY_DEBOUNCE: Duration = Duration::from_millis(25);
-const STOCK_APPLY_MAX_DELAY: Duration = Duration::from_millis(500);
 const STOCK_CONSECUTIVE_NACK_LIMIT: u32 = 5;
 /// Maximum distinct refusals logged per apply. Refusals are bounded input from
 /// the control plane, so the log line is capped rather than unbounded.
@@ -780,7 +781,7 @@ pub async fn start_stock_xds_client_with_shutdown(
     state: MeshRuntimeState,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut tls_config: Option<DpGrpcTlsConfig>,
-    mut tls_reload: Option<DpGrpcTlsReload>,
+    tls_reload: Option<DpGrpcTlsReload>,
     policy_rx: tokio::sync::watch::Receiver<StockPolicySnapshot>,
     recovery: Arc<MeshLocalSourceRecovery>,
     credential_watch: StockCredentialWatch,
@@ -847,7 +848,8 @@ pub async fn start_stock_xds_client_with_shutdown(
             tls_reload.as_ref(),
             &xds_urls,
             &mut last_tls_revision,
-        );
+        )
+        .await;
 
         // ── issue #3852: fail-closed credential gate ──
         // An invalid source must PREVENT reconnection, not merely fail the next
@@ -1002,19 +1004,10 @@ pub async fn start_stock_xds_client_with_shutdown(
             reset_discovery_state,
             delivered_usable_state,
         } = outcome;
-        // A TLS revision that was already published is applied at the top of
-        // the next loop via `refresh_dp_grpc_tls_config_if_changed`. Mark it
-        // seen here so a credential retirement that won the simultaneous
-        // select does not get immediately cancelled by the same TLS event.
-        if (reset_discovery_state
-            || matches!(
-                attempt,
-                MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload)
-            ))
-            && let Some(reload) = tls_reload.as_mut()
-        {
-            let _ = reload.revision_rx.borrow_and_update();
-        }
+        // A TLS revision published while this attempt ran is applied at the
+        // top of the next loop: `refresh_dp_grpc_tls_config_if_changed`
+        // advances `last_tls_revision`, the value every TLS-reload wait compares
+        // against, so the next attempt is never cancelled by the same event.
         // Endpoint identity stays out of these lines: the configured URL is
         // operator-authored but unbounded, so the index plus the closed-set
         // outcome and reason are what the operator gets here and on `/metrics`.
@@ -1488,9 +1481,9 @@ async fn run_stock_ads_stream(
 
     let debounce = tokio::time::sleep(Duration::from_secs(60 * 60 * 24));
     tokio::pin!(debounce);
-    let mut debounce_active = false;
-    let mut pending_since: Option<tokio::time::Instant> = None;
-    let mut pending: Option<Box<PendingStockSlice>> = None;
+    // Owns the debounce arming: the timer is polled only while a complete,
+    // ACKed (or policy-rebuilt) generation is staged.
+    let mut pending: PendingGeneration<Box<PendingStockSlice>> = PendingGeneration::NoPending;
     let mut last_logged_refusals: Option<Vec<StockRefusal>> = None;
     let mut policy_watch_open = true;
 
@@ -1571,36 +1564,39 @@ async fn run_stock_ads_stream(
                     break MeshStreamAttempt::FirstSliceTimeout;
                 }
             }
-            _ = &mut debounce, if debounce_active => {
-                debounce_active = false;
-                pending_since = None;
-                if let Some(next) = pending.take() {
-                    // Re-check immediately before the commit, holding the watch
-                    // observation across the synchronous install so a concurrent
-                    // publish cannot land a retired generation between the
-                    // check and `install_slice`.
-                    match commit_pending(
-                        &fence,
-                        config,
-                        state,
-                        next,
-                        &mut last_logged_refusals,
-                        &recovery,
-                    ) {
-                        Ok(()) => {}
-                        Err(StockCommitFailure::Retirement(retirement)) => {
-                            break MeshStreamAttempt::LocalRetirement(retirement);
+            _ = &mut debounce, if pending.is_staged() => {
+                match pending.transition(PendingGenerationEvent::Commit) {
+                    PendingGenerationAction::Commit(next) => {
+                        // Re-check immediately before the commit, holding the watch
+                        // observation across the synchronous install so a concurrent
+                        // publish cannot land a retired generation between the
+                        // check and `install_slice`.
+                        match commit_pending(
+                            &fence,
+                            config,
+                            state,
+                            next,
+                            &mut last_logged_refusals,
+                            &recovery,
+                        ) {
+                            Ok(()) => {}
+                            Err(StockCommitFailure::Retirement(retirement)) => {
+                                break MeshStreamAttempt::LocalRetirement(retirement);
+                            }
+                            Err(StockCommitFailure::Policy(reason)) => {
+                                return Err(StockStreamError::Policy(reason));
+                            }
                         }
-                        Err(StockCommitFailure::Policy(reason)) => {
-                            return Err(StockStreamError::Policy(reason));
-                        }
+                        *delivered_usable_state = true;
+                        awaiting_first_slice = false;
+                        // This exact stream installed usable state: clear the
+                        // consecutive-failure run and the sticky liveness flag.
+                        tracker.record_usable_state();
+                        state.set_config_stream_status(tracker.status(state.has_first_slice()));
                     }
-                    *delivered_usable_state = true;
-                    awaiting_first_slice = false;
-                    // This exact stream installed usable state: clear the
-                    // consecutive-failure run and the sticky liveness flag.
-                    tracker.record_usable_state();
-                    state.set_config_stream_status(tracker.status(state.has_first_slice()));
+                    // `Commit` never re-arms; `None` means nothing was staged.
+                    PendingGenerationAction::None
+                    | PendingGenerationAction::ArmDebounce { .. } => {}
                 }
             }
             response = response_stream.message() => {
@@ -1613,7 +1609,7 @@ async fn run_stock_ads_stream(
                     break MeshStreamAttempt::RemoteEof;
                 };
                 awaiting_first_frame = false;
-                match handle_stock_response(
+                let handled = handle_stock_response(
                     response,
                     config,
                     baseline.mesh(),
@@ -1627,38 +1623,53 @@ async fn run_stock_ads_stream(
                     },
                     accumulator,
                     stream_state,
-                ).await.map_err(StockResponseError::into_stream_error)? {
+                ).await;
+                let outcome = match handled {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        // Publish the already-ACKed staged slice before the
+                        // stream closes, as the Ferrum `xds` client does —
+                        // including when the NACK circuit breaker tripped on a
+                        // later response (issue #7029). State-of-the-world does
+                        // not resend an ACKed version, so dropping it would
+                        // leave the previous slice serving.
+                        return flush_pending_stock_slice_before_error(
+                            &fence,
+                            config,
+                            state,
+                            &mut pending,
+                            &mut last_logged_refusals,
+                            &recovery,
+                            tracker,
+                            delivered_usable_state,
+                            error.into_stream_error(),
+                        );
+                    }
+                };
+                match outcome {
                     StockResponseOutcome::Pending(next) => {
-                        pending = Some(next);
-                        let now = tokio::time::Instant::now();
-                        let first_pending_at = *pending_since.get_or_insert(now);
-                        debounce.as_mut().reset(std::cmp::min(
-                            now + STOCK_APPLY_DEBOUNCE,
-                            first_pending_at + STOCK_APPLY_MAX_DELAY,
-                        ));
-                        debounce_active = true;
+                        let action = pending.transition(PendingGenerationEvent::Stage {
+                            generation: next,
+                            now: tokio::time::Instant::now(),
+                        });
+                        arm_stock_debounce(debounce.as_mut(), action, config.timings);
                     }
                     StockResponseOutcome::Acked => {}
                     StockResponseOutcome::Nacked => {
-                        // A NACK rolled the accumulator back, so a slice built
-                        // from the pre-NACK view is no longer the state this
-                        // client has acknowledged. Drop it rather than publish
-                        // a view the control plane will now contradict.
-                        if pending.take().is_some() {
-                            warn!(
-                                node_id = %crate::startup::sanitize_startup_cause(
-                                    format!("{:?}", config.node_id.to_string()),
-                                    &[]
-                                ),
-                                namespace = %crate::startup::sanitize_startup_cause(
-                                    format!("{:?}", config.namespace.to_string()),
-                                    &[]
-                                ),
-                                "Discarded debounced stock xDS slice after NACK"
+                        // The NACK rollback excludes only the NACKed response;
+                        // the staged slice (or policy rebuild) remains a
+                        // complete ACKed view and keeps its deadline. Dropping
+                        // it would leave the previous slice serving until the
+                        // next unrelated discovery push.
+                        let action = pending.transition(PendingGenerationEvent::ResponseNacked);
+                        arm_stock_debounce(debounce.as_mut(), action, config.timings);
+                        if pending.is_staged() {
+                            debug!(
+                                node_id = %sanitize_startup_scalar(config.node_id.as_str()),
+                                "Retaining the debounced stock xDS slice after a NACK of a \
+                                 later response"
                             );
                         }
-                        debounce_active = false;
-                        pending_since = None;
                     }
                 }
                 state.set_xds_convergence(convergence_snapshot(accumulator));
@@ -1686,31 +1697,41 @@ async fn run_stock_ads_stream(
                         &accumulator.composite_version(),
                     ) {
                         Ok(slice) => {
-                            pending = Some(Box::new(PendingStockSlice {
-                                slice,
-                                type_url: "policy-reload".to_string(),
-                                refusals: discovery.refusals,
-                                policy_recovery_epoch: baseline.recovery_epoch,
-                            }));
-                            let now = tokio::time::Instant::now();
-                            let first_pending_at = *pending_since.get_or_insert(now);
-                            debounce.as_mut().reset(std::cmp::min(
-                                now + STOCK_APPLY_DEBOUNCE,
-                                first_pending_at + STOCK_APPLY_MAX_DELAY,
-                            ));
-                            debounce_active = true;
+                            let action = pending.transition(PendingGenerationEvent::Stage {
+                                generation: Box::new(PendingStockSlice {
+                                    slice,
+                                    type_url: "policy-reload".to_string(),
+                                    refusals: discovery.refusals,
+                                    policy_recovery_epoch: baseline.recovery_epoch,
+                                }),
+                                now: tokio::time::Instant::now(),
+                            });
+                            arm_stock_debounce(debounce.as_mut(), action, config.timings);
                         }
                         Err(_) => {
+                            // Epoch-checked: a newer reload may have begun its
+                            // own recovery while this older baseline was being
+                            // rebuilt, and this failure must not cancel it.
+                            // A baseline without an epoch is not a recovery
+                            // candidate, so the failure is rejected outright.
+                            let config_rejected_raised = match baseline.recovery_epoch {
+                                Some(epoch) => recovery.mark_rejected_for_epoch(epoch),
+                                None => {
+                                    recovery.mark_rejected();
+                                    true
+                                }
+                            };
                             warn!(
                                 node_id = %crate::startup::sanitize_startup_cause(
                                     format!("{:?}", config.node_id.to_string()),
                                     &[]
                                 ),
                                 type_url = stock_log_type_label("policy-reload"),
+                                config_rejected_raised,
                                 "Reloaded mesh policy document failed slice construction; keeping \
-                                 the last good slice and raising config_rejected"
+                                 the last good slice (config_rejected is left to a newer pending \
+                                 policy recovery when this baseline is stale)"
                             );
-                            recovery.mark_rejected();
                         }
                     }
                 }
@@ -1731,7 +1752,8 @@ async fn run_stock_ads_stream(
     // publishing anything it staged (issue #3852). The already-installed
     // last-good runtime slice is the only thing that survives.
     if matches!(ended, MeshStreamAttempt::RemoteEof)
-        && let Some(next) = pending.take()
+        && let PendingGenerationAction::Commit(next) =
+            pending.transition(PendingGenerationEvent::Commit)
     {
         match commit_pending(
             &fence,
@@ -1760,6 +1782,78 @@ async fn run_stock_ads_stream(
         }
     }
     Ok(ended)
+}
+
+/// Publish an already-complete debounced slice before surfacing a stream
+/// error, then fail the attempt with that error (issue #7029).
+///
+/// Mirrors the Ferrum `xds` client's flush-before-close, with the stock
+/// client's credential fence on top:
+///
+/// * a credential retirement error publishes NOTHING it staged — the slice was
+///   produced under a credential that is no longer current (issue #3852);
+/// * the flush is a COMMIT, so it goes through `commit_pending` and its final
+///   fence admission. A credential that rotated, was invalidated, or hit its
+///   deadline while the slice sat in the debounce window retires the stream
+///   instead (and resets discovery state), exactly like the end-of-stream
+///   flush;
+/// * a successful flush is real progress: the outer loop sees
+///   `delivered_usable_state` and the tracker records the usable install, but
+///   the original error still classifies the attempt — a refused stream is
+///   never turned into success.
+#[allow(clippy::too_many_arguments)]
+fn flush_pending_stock_slice_before_error(
+    fence: &StockCredentialFence,
+    config: &StockXdsClientConfig,
+    state: &MeshRuntimeState,
+    pending: &mut PendingGeneration<Box<PendingStockSlice>>,
+    last_logged_refusals: &mut Option<Vec<StockRefusal>>,
+    recovery: &MeshLocalSourceRecovery,
+    tracker: &mut MeshStreamTracker,
+    delivered_usable_state: &mut bool,
+    error: StockStreamError,
+) -> Result<MeshStreamAttempt, StockStreamError> {
+    if matches!(error, StockStreamError::Retirement(_)) {
+        return Err(error);
+    }
+    if let PendingGenerationAction::Commit(next) =
+        pending.transition(PendingGenerationEvent::Commit)
+    {
+        match commit_pending(fence, config, state, next, last_logged_refusals, recovery) {
+            Ok(()) => {
+                *delivered_usable_state = true;
+                tracker.record_usable_state();
+                state.set_config_stream_status(tracker.status(state.has_first_slice()));
+            }
+            Err(StockCommitFailure::Retirement(retirement)) => {
+                warn!(
+                    outcome = retirement.as_metric_label(),
+                    "Discarding a staged stock xDS slice before closing the stream: the \
+                     credential that produced it is no longer current"
+                );
+                return Ok(MeshStreamAttempt::LocalRetirement(retirement));
+            }
+            Err(StockCommitFailure::Policy(reason)) => {
+                return Err(StockStreamError::Policy(reason));
+            }
+        }
+    }
+    Err(error)
+}
+
+/// Re-arm the stock debounce timer when a transition asks for it.
+fn arm_stock_debounce(
+    debounce: std::pin::Pin<&mut tokio::time::Sleep>,
+    action: PendingGenerationAction<Box<PendingStockSlice>>,
+    timings: MeshStreamTimings,
+) {
+    match action {
+        PendingGenerationAction::ArmDebounce {
+            now,
+            first_staged_at,
+        } => debounce.reset(timings.apply_deadline(now, first_staged_at)),
+        PendingGenerationAction::None | PendingGenerationAction::Commit(_) => {}
+    }
 }
 
 enum StockResponseOutcome {

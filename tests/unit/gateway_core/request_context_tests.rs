@@ -458,82 +458,6 @@ fn set_raw_query_string_empty_clears_materialized_params() {
     assert!(ctx.query_params.is_empty());
 }
 
-#[test]
-fn materialize_query_params_raw_no_decoding() {
-    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
-    ctx.set_raw_query_string("key%20name=val%26ue".into());
-
-    ctx.materialize_query_params_raw();
-
-    // Raw materialization should NOT percent-decode
-    assert_eq!(ctx.query_params.get("key%20name").unwrap(), "val%26ue");
-}
-
-#[test]
-fn materialize_query_params_raw_keeps_valueless_flag() {
-    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
-    ctx.set_raw_query_string("flag&key=val".into());
-
-    ctx.materialize_query_params_raw();
-
-    // A valueless flag (no '=') is stored with an empty value, matching the
-    // decoded path, so plugins that presence-test a query param see it on
-    // HTTP/3 (raw) just as they would on HTTP/1.1 and HTTP/2 (decoded).
-    assert_eq!(ctx.query_params.len(), 2);
-    assert_eq!(ctx.query_params.get("flag").unwrap(), "");
-    assert!(ctx.query_params.contains_key("flag"));
-    assert_eq!(ctx.query_params.get("key").unwrap(), "val");
-}
-
-#[test]
-fn materialize_query_params_raw_skips_empty_segments() {
-    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
-    ctx.set_raw_query_string("&&a=1&&flag&&".into());
-
-    ctx.materialize_query_params_raw();
-
-    // Empty segments are skipped (so a trailing/leading `&` does not create a
-    // bare empty-string key), matching the decoded variant.
-    assert_eq!(ctx.query_params.len(), 2);
-    assert_eq!(ctx.query_params.get("a").unwrap(), "1");
-    assert_eq!(ctx.query_params.get("flag").unwrap(), "");
-    assert!(!ctx.query_params.contains_key(""));
-}
-
-#[test]
-fn materialize_query_params_raw_and_decoded_expose_same_keys_for_valueless_flag() {
-    // Cross-protocol parity: the raw (HTTP/3 default) and decoded (HTTP/1.1 /
-    // HTTP/2) paths must expose the same key set for a valueless flag so a
-    // security/admission plugin presence-testing `ctx.query_params` sees the
-    // same params regardless of protocol. The only intended difference is
-    // percent-decoding, which a plain ASCII flag does not exercise.
-    let raw_query = "admin&debug=&user=alice";
-
-    let mut decoded = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
-    decoded.set_raw_query_string(raw_query.into());
-    decoded.materialize_query_params();
-
-    let mut raw = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
-    raw.set_raw_query_string(raw_query.into());
-    raw.materialize_query_params_raw();
-
-    let mut decoded_keys: Vec<&str> = decoded.query_params.keys().map(String::as_str).collect();
-    let mut raw_keys: Vec<&str> = raw.query_params.keys().map(String::as_str).collect();
-    decoded_keys.sort_unstable();
-    raw_keys.sort_unstable();
-    assert_eq!(
-        decoded_keys, raw_keys,
-        "raw and decoded query-param materialization must expose the same key set"
-    );
-
-    // The valueless flag and the empty-valued param are both present with empty
-    // values on both paths.
-    assert_eq!(decoded.query_params.get("admin").unwrap(), "");
-    assert_eq!(raw.query_params.get("admin").unwrap(), "");
-    assert_eq!(decoded.query_params.get("debug").unwrap(), "");
-    assert_eq!(raw.query_params.get("debug").unwrap(), "");
-}
-
 // -- Direct mutation tests ----------------------------------------------------
 
 #[test]
@@ -679,10 +603,32 @@ const PLUGIN_STATE_MUT_CALL_SITES: &[(&str, Option<&str>, &str)] = &[
          the live context has no state and all four adopted families are empty",
     ),
     (
+        "stage_published_rate_limit_header",
+        None,
+        "reached only from `rate_limiting`'s `store_metadata`, which returns \
+         before staging unless that configured instance has `expose_headers: \
+         true` and an admitted outcome to publish",
+    ),
+    (
+        "stage_gateway_minted_traceparent",
+        None,
+        "reached only from a configured `otel_tracing` or `workload_metrics` \
+         instance after it minted a fresh gateway span into `traceparent`",
+    ),
+    (
         "stage_response_cache_request_header_delta",
         Some("if delta.is_empty() {"),
         "a configured `response_caching` instance stages a delta only when the \
          backend-visible header map actually differs from the inbound one",
+    ),
+    (
+        "set_request_assertion_state",
+        None,
+        "reached only from an admitted owner's own install or clear of a \
+         gateway-asserted request header (an authenticating `jwks_auth` / \
+         `oauth2_introspection` / `oidc_relying_party` claim destination, an \
+         `opa` decision header, a `spiffe_identity` `forward_identity` \
+         identity), so a plugin-free request never calls it",
     ),
     (
         "mark_query_credential_partition_digest",
@@ -778,4 +724,93 @@ fn every_plugin_state_mut_call_site_is_behind_a_documented_gate() {
              materializes per-plugin state ({rationale})"
         );
     }
+}
+
+// ── Issue #7161: one hand-back for every final-request-body hook context ─────
+//
+// The H1/H2 final-request-body hooks run on a compatibility clone. The terminal
+// `final_body_before_backend_dispatch` path used to hand that clone back without
+// the gateway-deadline mark and the typed `ai_usage_export`, while its four
+// siblings carried both. Every path now goes through one shared helper, which
+// `run_buffered_request_body_hook_round_trip_for_test` executes.
+
+struct FinalHookStagesDeadlineAndUsage;
+
+#[async_trait::async_trait]
+impl ferrum_edge::plugins::Plugin for FinalHookStagesDeadlineAndUsage {
+    fn name(&self) -> &str {
+        "final_hook_stages_deadline_and_usage"
+    }
+
+    fn needs_final_request_body_context(&self) -> bool {
+        true
+    }
+
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &std::collections::HashMap<String, String>,
+        _body: &[u8],
+    ) -> ferrum_edge::plugins::PluginResult {
+        ferrum_edge::_test_support::mark_gateway_deadline_response_selected_for_test(ctx);
+        ferrum_edge::_test_support::stage_ai_usage_export_for_test(
+            ctx,
+            ferrum_edge::plugins::AiUsageExport {
+                prefix: std::sync::Arc::from("ai"),
+                provider: "openai",
+                prompt_tokens: Some(3),
+                completion_tokens: Some(4),
+                total_tokens: Some(7),
+                cost: None,
+            },
+        );
+        ctx.metadata
+            .insert("final_hook.seen".to_string(), "true".to_string());
+        ferrum_edge::plugins::PluginResult::Continue
+    }
+}
+
+#[tokio::test]
+async fn final_request_body_hook_hand_back_adopts_deadline_and_ai_usage() {
+    let plugins: Vec<std::sync::Arc<dyn ferrum_edge::plugins::Plugin>> =
+        vec![std::sync::Arc::new(FinalHookStagesDeadlineAndUsage)];
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), "/chat".into());
+    ctx.metadata
+        .insert("request_body".to_string(), "original".to_string());
+    assert!(!ferrum_edge::_test_support::gateway_deadline_response_selected_for_test(&ctx));
+    assert!(ctx.authoritative_ai_usage_export().is_none());
+
+    let headers = std::collections::HashMap::new();
+    let (_body, result) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &plugins,
+            &mut ctx,
+            &headers,
+            b"{}".to_vec(),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+    assert!(
+        ferrum_edge::_test_support::gateway_deadline_response_selected_for_test(&ctx),
+        "a deadline the hook selected must mark the live context"
+    );
+    let export = ctx
+        .authoritative_ai_usage_export()
+        .expect("the hook's typed usage snapshot must reach the live context");
+    assert_eq!(export.provider, "openai");
+    assert_eq!(export.total_tokens, Some(7));
+    assert_eq!(
+        ctx.metadata.get("final_hook.seen").map(String::as_str),
+        Some("true"),
+        "hook metadata replaces the live metadata"
+    );
+    assert_eq!(
+        ctx.metadata.get("request_body").map(String::as_str),
+        Some("original"),
+        "the live request_body survives the metadata swap"
+    );
 }

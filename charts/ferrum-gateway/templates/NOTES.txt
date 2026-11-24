@@ -2,7 +2,7 @@ Ferrum Edge core gateway installed as release "{{ .Release.Name }}" in namespace
 
 Mode:     {{ .Values.mode }}
 Image:    {{ include "ferrum-gateway.image" . }}
-Replicas: {{ if .Values.autoscaling.enabled }}{{ .Values.autoscaling.minReplicas }}-{{ .Values.autoscaling.maxReplicas }} (HPA){{ else }}{{ .Values.replicaCount }}{{ end }}
+Replicas: {{ if .Values.autoscaling.enabled }}{{ if kindIs "invalid" .Values.autoscaling.minReplicas }}1{{ else }}{{ .Values.autoscaling.minReplicas }}{{ end }}-{{ .Values.autoscaling.maxReplicas }} (HPA){{ else }}{{ .Values.replicaCount }}{{ end }}
 
 Check rollout:
   kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "ferrum-gateway.fullname" . }}

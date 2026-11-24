@@ -68,7 +68,7 @@ risking disagreement with the backend:
 | `encoded_backslash`      | `/a%5Cb`         | Several backend stacks treat `\` as a path separator. |
 | `literal_backslash`      | `/a\b`           | The Rust `url` parser — which parses the backend URL on the reqwest dispatch paths — treats `\` as a path separator for special HTTP(S) URLs, as do several backend stacks. A literal `\` is the same route-structure mismatch an encoded one is. |
 | `encoded_control`        | `/a%00`, `/a%0A` | A NUL truncates the path in several runtimes; other C0 controls and `DEL` are equally divergent. |
-| `unrepresentable_escape` | `/a%20b`, `/a%7Bb`, `/caf%C3%A9`, `/caf%C3%28` | The escaped byte is outside the `pchar` decode set (space, `"`, `<`, `>`, `[`, `]`, `^`, `` ` ``, `{`, `\|`, `}`, and every non-ASCII byte, valid UTF-8 sequence or not). Keeping it escaped would put a different string on the wire than the one policy read; decoding it would emit a byte the backend URL parser cannot carry (space, controls) or percent-encodes again (`"`, `{`, `}`, non-ASCII), so the forwarded request line would not be the canonical string. Neither is a single coordinate, so the target is refused. This rule governs *escapes*; see [Literal non-`pchar` bytes](#literal-non-pchar-bytes) for the same bytes sent literally. |
+| `unrepresentable_escape` | `/a%20b`, `/a%7Bb`, `/caf%C3%A9`, `/caf%C3%28` | The escaped byte is outside the `pchar` decode set (space, `"`, `<`, `>`, `[`, `]`, `^`, `` ` ``, `{`, `\|`, `}`, and every non-ASCII byte, valid UTF-8 sequence or not). Keeping it escaped would put a different string on the wire than the one policy read; decoding it would emit a byte the backend URL parser cannot carry (space, controls) or percent-encodes again (`"`, `^`, `{`, `}`, non-ASCII), so the forwarded request line would not be the canonical string. Neither is a single coordinate, so the target is refused. This rule governs *escapes*; see [Literal non-`pchar` bytes](#literal-non-pchar-bytes) for the same bytes sent literally. |
 | `ambiguous_dot_segment`  | `/a/%2e%2e/b`, `/a/%2e%2e;/b`, `/a/..%3B/b` | A percent escape produced a `.` or `..` segment, or the `;` that makes one a path-parameter dot segment. |
 | `literal_dot_segment`    | `/a/../b`, `/a/./b`, `/a/..`, `/a/..;/b`, `/a/.;x/b` | A `.` or `..` segment written literally, with or without a `;` path parameter. See below. |
 | `empty_segment`          | `//a`, `/a//b`, `/;x/a`, `/a/%3Bx/b` | A non-final empty segment, or a non-final segment that is empty before its first `;`. See below. |
@@ -370,9 +370,11 @@ That is deliberate — refusing an escape the gateway cannot forward as one
 coordinate does not require also refusing a byte a client may legally send
 literally — but it bounds what the invariants below claim. The `url` crate's
 path percent-encode set covers controls, space, `"`, `<`, `>`, `` ` ``, `#`,
-`?`, `{`, `}`, and every non-ASCII byte, so when a canonical path carrying a
+`?`, `^`, `{`, `}`, and every non-ASCII byte, so when a canonical path carrying a
 literal one of those is parsed into the backend URL, the forwarded request line
-carries the percent-encoded spelling rather than the canonical bytes.
+carries the percent-encoded spelling rather than the canonical bytes (for example,
+a literal `^` in the path is forwarded to the backend as `%5E`, matching the
+reqwest path).
 Percent-encoding only ever expands one byte into `%XX`; it can never synthesize
 a `/`, `?`, or `#`, and a decoding backend resolves it straight back to the
 canonical byte. Segment structure is therefore still preserved and policy still
@@ -490,46 +492,25 @@ Transaction logs record the canonical path.
 
 ## Operational impact
 
-Six shapes of traffic are refused with `400`. Clients and APIs that send them
-must change:
+Six shapes of traffic are refused with `400` (reasons in the
+[rejection table](#the-contract)). Clients and APIs that send them must change:
 
-- Targets with encoded separators (`%2F`, `%252F`). Folding them into `/` would
-  change segment structure and could still disagree with a backend that does
-  not decode; refusing cannot. APIs that carry an encoded `/` inside a path
-  parameter must move that value into the query string or a header.
-- Targets with a `.` or `..` segment, whether the segment was
-  written literally (`/a/../b`, `literal_dot_segment`) or produced by a percent
-  escape (`/a/%2e%2e/b`, `ambiguous_dot_segment`), and whether or not it carries
-  a `;` path parameter (`/a/..;/b`, `/a/.;x/b`). Clients that relied on the
-  gateway forwarding a relative target must send the resolved path. A `.` inside
-  a segment (`/v1.0/users`, `/a/.hidden`) is unaffected.
-- Targets with a literal backslash (`literal_backslash`), alongside the
-  encoded `%5C` form.
-- Targets carrying an escape of a byte outside the `pchar` decode set — `%20`
-  for space, `%7B`/`%5B` for brackets, and any percent-encoded non-ASCII text
-  such as `/caf%C3%A9` (`unrepresentable_escape`). This is the broadest of the
-  four: **percent-encoded spaces and percent-encoded non-ASCII path segments
-  are not accepted at all**, for the reasons given in the rejection table. APIs that need spaces or
-  non-ASCII text in a resource identifier should carry that value in the query
-  string, a header, or a body field, or use a `pchar`-legal identifier in the
-  path. Note that this is a rule about escapes: a client that sends non-ASCII
-  path bytes *literally* — `/café` rather than `/caf%C3%A9` — is still served,
-  because `http`'s request-target parser accepts valid UTF-8 literally. See
-  [Literal non-`pchar` bytes](#literal-non-pchar-bytes). Standard HTTP clients
-  percent-encode such paths, so most callers will see the `400`.
-- Targets with a non-final empty segment or a segment that is empty before its
-  first `;` (`//a`, `/a//b`, `/;x/a`, `empty_segment`). Clients must send the
-  collapsed path. A trailing slash is unaffected.
-- Targets with a `;` path parameter (`/a;x/b`, `/a%3Bx/b`, `path_parameter`)
-  on a proxy that has not set `allow_path_parameters: true` (in mesh mode, on
-  a service that has not opted in). This is the only rule with a switch, and
-  the switch is per proxy (or per mesh service) rather than per deployment:
-  it keeps the `;` in the one canonical path instead of computing policy
-  differently, and the structural rules above still apply with it on.
+| Traffic | Reason token(s) | What the client must change |
+| --- | --- | --- |
+| Encoded separators (`%2F`, `%252F`) | `encoded_separator`, `double_encoding` | Move a value that contains an encoded `/` into the query string or a header |
+| `.` or `..` segments, literal or escaped, with or without `;` | `literal_dot_segment`, `ambiguous_dot_segment` | Send the resolved path. A `.` inside a segment (`/v1.0/users`, `/a/.hidden`) is unaffected |
+| Backslashes (`\`, `%5C`) | `literal_backslash`, `encoded_backslash` | Send `/`, not `\` |
+| Escapes outside the `pchar` decode set (`%20`, `%7B`, `/caf%C3%A9`) | `unrepresentable_escape` | Carry spaces or non-ASCII text in the query string, a header, or a body field, or use a `pchar`-legal identifier |
+| Non-final empty segments (`//a`, `/a//b`, `/;x/a`) | `empty_segment` | Send the collapsed path. A trailing slash is unaffected |
+| `;` path parameters (`/a;x/b`, `/a%3Bx/b`) | `path_parameter` | Set `allow_path_parameters: true` on that proxy (in mesh mode, that service). The parameter-stripped path must not route to a different proxy (same proxy or no proxy is accepted; see [Path parameters](#path-parameters-require-a-per-proxy-opt-in) for the literal-`;` `listen_path` exception), and the other rules still apply |
 
-There is no configuration switch for the other five. A per-deployment opt-out
-would mean policy is computed differently depending on config, which is the
-class of divergence this representation exists to eliminate.
+`unrepresentable_escape` is the broadest of the six: percent-encoded spaces and
+percent-encoded non-ASCII path segments are not accepted at all. Non-ASCII bytes
+sent literally (`/café`) are still served (see
+[Literal non-`pchar` bytes](#literal-non-pchar-bytes)), but standard HTTP clients
+percent-encode such paths, so most callers will see the `400`.
+
+There is no configuration switch for the other five.
 
 ## Related
 

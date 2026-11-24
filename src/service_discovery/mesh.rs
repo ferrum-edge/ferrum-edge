@@ -14,7 +14,7 @@
 
 use crate::config::types::{MeshSdTopology, UpstreamTarget};
 use crate::modes::mesh::config::{
-    AppProtocol, MeshService, ServiceTargetPort, Workload, resolve_target_port,
+    AppProtocol, MeshService, ServiceTargetPort, Workload, resolve_service_backend_port,
 };
 use crate::request_epoch::RequestEpochStore;
 use std::collections::{HashMap, HashSet};
@@ -160,50 +160,45 @@ impl MeshServiceDiscoverer {
         workload: &Workload,
     ) -> Option<SelectedPort> {
         if let Some(selected) = selected_service_port {
-            // A DECLARED Service `targetPort` is Kubernetes' authoritative
-            // service-port→container-port binding, so honor it exclusively: a
-            // numeric targetPort needs no matching `containerPort` (so this also
-            // covers a workload that declares no `ports[]`), and a named one
-            // resolves against the workload's container-port names. FAIL CLOSED —
-            // return `None` to drop the target — when a NAMED targetPort does not
-            // resolve, rather than fall back to the Service port (a rollout skew
-            // or typo like `port: 80, targetPort: "http"` with no matching
-            // container port would otherwise silently dial 80). Only an ABSENT
-            // targetPort uses the heuristics below.
-            if selected.target_port.is_some() {
-                return match resolve_target_port(selected.target_port.as_ref(), &workload.ports) {
-                    Some(backend) if backend != 0 => Some(SelectedPort {
-                        port: backend,
-                        service_port: selected.service_port,
-                        name: selected.name.clone(),
-                        protocol: selected.protocol,
-                        target_port: None,
-                    }),
-                    _ => None,
-                };
-            }
-
-            if workload.ports.is_empty() {
-                return Some(selected.clone());
-            }
-
-            if let Some(workload_port) = workload
-                .ports
-                .iter()
-                .find(|port| port.port == selected.port)
+            // The ONE Kubernetes rule every mesh path shares
+            // (`resolve_service_backend_port`, issue #7236). A DECLARED Service
+            // `targetPort` is authoritative: a numeric one needs no matching
+            // `containerPort` (so this also covers a workload that declares no
+            // `ports[]`), and a named one resolves against the workload's
+            // container-port names. FAIL CLOSED — return `None` to drop the
+            // target — when a NAMED targetPort does not resolve, rather than fall
+            // back to the Service port (a rollout skew or typo like `port: 80,
+            // targetPort: "http"` with no matching container port would otherwise
+            // silently dial 80). An ABSENT targetPort means the Service port,
+            // whatever container ports the workload declares.
+            let backend = resolve_service_backend_port(
+                selected.port,
+                selected.target_port.as_ref(),
+                &workload.ports,
+            )?;
+            // An unnamed, protocol-less Service port borrows the name/protocol of
+            // the container port it lands on (metadata only; the dial port is
+            // already decided above).
+            if selected.target_port.is_none()
+                && selected.protocol == AppProtocol::Unknown
+                && selected.name.is_none()
+                && let Some(workload_port) = workload.ports.iter().find(|port| port.port == backend)
             {
-                if selected.protocol == AppProtocol::Unknown && selected.name.is_none() {
-                    return Some(SelectedPort {
-                        port: workload_port.port,
-                        service_port: selected.service_port,
-                        name: workload_port.name.clone(),
-                        protocol: workload_port.protocol,
-                        target_port: None,
-                    });
-                }
-                return Some(selected.clone());
+                return Some(SelectedPort {
+                    port: backend,
+                    service_port: selected.service_port,
+                    name: workload_port.name.clone(),
+                    protocol: workload_port.protocol,
+                    target_port: None,
+                });
             }
-            return None;
+            return Some(SelectedPort {
+                port: backend,
+                service_port: selected.service_port,
+                name: selected.name.clone(),
+                protocol: selected.protocol,
+                target_port: None,
+            });
         }
 
         workload.ports.first().map(|port| SelectedPort {
@@ -1211,6 +1206,35 @@ mod tests {
             targets.is_empty(),
             "an unresolved named targetPort must drop the target, not dial the Service port"
         );
+    }
+
+    #[tokio::test]
+    async fn absent_target_port_dials_service_port_whatever_the_container_ports() {
+        // Issue #7236: an ABSENT targetPort means the Service port (the
+        // Kubernetes default), even when the workload declares other container
+        // ports. The workload's port names/numbers are never consulted.
+        let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+        let mesh = MeshConfig {
+            services: vec![service("api", vec![api_id], vec![80])],
+            workloads: vec![workload(api_id, "api", vec!["10.0.0.1"], vec![8080])],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            None,
+            1,
+            MeshSdTopology::Ambient,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].port, 80,
+            "an absent targetPort dials the Service port, not the same-named container port"
+        );
+        assert_eq!(targets[0].service_port_policy_key, Some(80));
     }
 
     #[tokio::test]

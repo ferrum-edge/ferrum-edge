@@ -21,7 +21,7 @@ Ferrum Edge enforces configurable size limits on request headers, request bodies
 | `FERRUM_TLS_MANAGED_MAX_RECORDS` | `usize` | `1024` | Logical create ceiling for managed-TLS records; overwrite/delete remain available. |
 | `FERRUM_TLS_ACME_MAX_CERTIFICATES` | `usize` | `1024` | Logical create ceiling for ACME certificates. |
 | `FERRUM_TLS_ACME_MAX_ACCOUNTS` | `usize` | `256` | Logical create ceiling for ACME accounts. |
-| `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` | `usize` | `16` | Per-certificate terminal ACME order history retention; active/recoverable orders are never pruned. |
+| `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` | `usize` | `16` | Per-certificate terminal ACME order history retention; active orders are never pruned. |
 | `FERRUM_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES` | `usize` | `4194304` (4MB) | Per-response Kubernetes/Consul discovery success-body ceiling. Hard maximum 16 MiB; `0` is rejected (not unlimited). See [Service Discovery Response Body Ceilings](#service-discovery-response-body-ceilings). |
 | `FERRUM_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES` | `usize` | `4096` (4KB) | Independent discovery error-body ceiling. Hard maximum 64 KiB; must be `<=` the success ceiling; `0` is rejected. |
 | `FERRUM_SERVICE_DISCOVERY_BODY_BUDGET_BYTES` | `usize` | `33554432` (32MB) | Concurrent discovery-body budget across pollers. Hard maximum 256 MiB; must be `>=` the success ceiling; `0` is rejected. |
@@ -54,9 +54,22 @@ Ferrum answers `Expect: 100-continue` itself and never forwards the expectation
 to the origin.
 
 The gateway's own HTTP/1.1 server (hyper) writes the interim `100 Continue`
-response when the request body is first polled — on Ferrum's paths that is at
-backend dispatch, after the authentication and authorization plugin phases have
-run. `expect` is therefore part of the canonical backend-request strip set
+response when the request body is first polled. On most paths that is at
+backend dispatch, or when a `before_proxy` body plugin buffers the body — both
+after the authentication and authorization plugin phases have run. Two
+earlier collection points exist:
+
+- an authentication plugin that verifies the request body at authenticate
+  time (for example `hmac_auth` or `soap_ws_security`) has the body buffered
+  *before* the authentication phase, so `100 Continue` goes out before the
+  request is authenticated;
+- an authorization plugin that reads the body (for example `opa` with
+  `include_body: true`) has it buffered after authentication but *before*
+  authorization, so `100 Continue` goes out before the authorization
+  decision.
+
+A client must therefore not treat `100 Continue` as proof that authentication
+or authorization succeeded; the final status is the only answer. `expect` is therefore part of the canonical backend-request strip set
 (`is_backend_request_strip_header` in `src/proxy/headers.rs`), so it is removed
 on every backend transport: reqwest HTTP/1.1, direct HTTP/2, gRPC, native
 HTTP/3, and HBONE.
@@ -92,6 +105,7 @@ When `response_body_mode: stream` is configured (the default), the gateway can f
 | Buffer mode / plugin buffering | Any nonzero | Any | Collect with a running counter; overrun returns the pre-commit rejection above |
 
 - **Without a backend-observed `Content-Length`**: unknown-length bodies keep streaming. Every collector and streaming adapter uses the **effective route ceiling** (the strictest active bound of per-route `response_size_limiting` and `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`), not the global limit alone. The size-limited adapter yields an error once the running count exceeds that ceiling; clients that already observed the backend status will see a truncated/reset body rather than a rewritten JSON `502`. Adapter selection uses the canonical length captured before `after_proxy`, so a hook-authored `Content-Length` cannot skip this path.
+- **Rewritten streams**: a streaming rewrite that changes the byte count — a response stream inspector/normalizer, incremental gRPC-Web translation (base64 text and the generated trailer frame), or the gateway-generated `mcp_gateway` aggregate SSE listener — is also charged on the bytes the client receives, so an in-limit source cannot expand past the effective ceiling. The crossing frame is withheld and the committed body ends with the same post-commit `ResponseBodyTooLarge` termination.
 - **`response_size_limiting` plugin**: publishes a per-route ceiling that always bounds unknown-length streaming responses frame by frame through the core adapters above. `require_buffered_check` controls only whether the complete final post-transform size must be proven before response headers are committed — it does not decide whether the route ceiling applies. See [`response_size_limiting`](plugins.md#response_size_limiting) for operator-facing configuration; the plugin module doc in `src/plugins/response_size_limiting.rs` is the authoritative enforcement reference.
 
 See [Response Body Streaming — Interaction with Response Size Limits](response_body_streaming.md#interaction-with-response-size-limits) for the streaming decision table and adapter constructors.
@@ -169,7 +183,7 @@ Enforcement rules:
 
 - **Reads.** Metadata length is a fast reject only. Authoritative reads always use a bounded reader through `limit + 1`, so growth/TOCTOU and non-regular files cannot force an unbounded buffer.
 - **Writes.** Candidates are serialized and size-checked **before** atomic rename. Rejection leaves the previous authoritative document and in-process cache intact.
-- **Logical retention.** Managed/ACME creates stop at their configured record ceilings. Terminal ACME order history is pruned under the exclusive mutation lock and never removes pending/ready/processing orders, `valid` orders that still carry finalization material, current certificates, or active account credentials. Leases keep their existing expiry retention; the byte ceiling is corruption defense only.
+- **Logical retention.** Managed/ACME creates stop at their configured record ceilings. Terminal ACME order history is pruned under the exclusive mutation lock and never removes pending/ready/processing orders, current certificates, or active account credentials. Terminal (`valid`/`failed`/`cancelled`) orders cannot be finalized or resumed, so they are pruned as history whatever finalization material they carry. Leases keep their existing expiry retention; the byte ceiling is corruption defense only.
 - **Event log.** `tls-events.json` is bounded before buffering/parsing. Valid logs are compacted atomically to the configured entry capacity; oversized/malformed input fails closed with a fixed diagnostic.
 - **Observability.** Fixed-cardinality metrics expose document bytes, record counts, oversized refusals (by store/direction), admission refusals (by store/reason), and pruned terminal-order totals. Labels never carry record IDs, domains, paths, or account identifiers.
 - **Admin surface.** A logical create ceiling is caller-facing and returns `409 Conflict` (overwrite and delete remain available). An authoritative whole-document read refusal returns `500 Internal Server Error`: `GET`, list, and `DELETE` encounter unreachable server state the caller never sent. A candidate write that would cross the document ceiling returns `413 Payload Too Large` before rename, as does bounded admitted material; the previous authoritative document remains intact.
@@ -229,11 +243,60 @@ Pre-commit gateway rejections below are JSON with `Content-Type: application/jso
 |-----------|------------------|---------------|
 | Single header too large | `431 Request Header Fields Too Large` | `{"error":"Request header '{name}' exceeds maximum size of {n} bytes"}` |
 | Total headers too large | `431 Request Header Fields Too Large` | `{"error":"Total request headers exceed maximum size"}` |
+| Too many headers | `431 Request Header Fields Too Large` | `{"error":"Request header count ({count}) exceeds maximum of {n}"}` |
+| URL too long | `414 URI Too Long` | `{"error":"Request URL length ({len} bytes) exceeds maximum of {n} bytes"}` |
+| Too many query parameters | `400 Bad Request` | `{"error":"Query parameter count ({count}) exceeds maximum of {n}"}` |
 | Request body too large (Content-Length) | `413 Content Too Large` | `{"error":"Request body exceeds maximum size"}` |
 | Request body too large (streaming) | `413 Content Too Large` | `{"error":"Request body exceeds maximum size"}` |
+| Request body too large (`request_size_limiting` route ceiling, any enforcement point) | `413 Content Too Large` | `{"error":"Request body exceeds maximum size"}` (the same body; the limit is recorded in request metadata, not the body) |
 | Admin API body too large | `413 Payload Too Large` | Request rejected by body size middleware |
 | Response body too large (declared `Content-Length` or buffered collection, pre-commit) | `502 Bad Gateway` (HTTP); trailers-only `RESOURCE_EXHAUSTED` (native gRPC buffered) | HTTP: `{"error":"Backend response body exceeds maximum size"}` |
 | Response body too large (unknown-length streaming, post-commit) | Committed backend status, then the body/stream terminates (`ResponseBodyTooLarge`); the gateway yields once before the error so the frontend can flush the head and the bytes accepted within the limit (deterministic on HTTP/1.1 once the socket accepts the write, best effort on HTTP/2 and HTTP/3, where the flush runs on the connection task) | No JSON `502` replacement after headers are committed |
+
+### gRPC and gRPC-Web framing of pre-routing refusals
+
+The header, URL-length, and query-parameter limits run before routing, next
+to the protocol-header guard, the Host/`:authority` checks, the TRACE /
+unsupported CONNECT method refusal, the 0-RTT early-data method refusal, the
+retired Gateway listener refusal, and the per-IP concurrent-request limit.
+Every one of these refusals is framed for the client the same way on HTTP/1.1,
+HTTP/2, and HTTP/3:
+
+| Client | Response |
+|--------|----------|
+| Ordinary HTTP | The HTTP status and JSON body listed above |
+| Native gRPC (`application/grpc…`) | HTTP `200`, Trailers-Only `grpc-status` and `grpc-message`, no DATA |
+| gRPC-Web (`application/grpc-web…`) | HTTP `200` with the negotiated gRPC-Web `Content-Type`; `grpc-status` and `grpc-message` in the body trailer frame |
+| WebSocket Upgrade / Extended CONNECT | The HTTP status and JSON body, even when the handshake carries a gRPC or gRPC-Web `Content-Type` |
+| Any other CONNECT (plain CONNECT, CONNECT-UDP, or another registered `:protocol`) | The HTTP status and JSON body, whatever its `Content-Type`: a `2xx` answer to CONNECT means the tunnel is established (RFC 9110 §9.3.6), so a gRPC-framed HTTP `200` cannot refuse one. On HTTP/3 an unregistered `:protocol` token never reaches the gateway: the HTTP/3 layer resets the stream with `H3_MESSAGE_ERROR` |
+
+| Refusal | `grpc-status` | `grpc-message` |
+|---------|---------------|----------------|
+| Single header too large | `8` (`RESOURCE_EXHAUSTED`) | `Request header exceeds maximum size` |
+| Total headers too large | `8` (`RESOURCE_EXHAUSTED`) | `Total request headers exceed maximum size` |
+| Too many headers | `8` (`RESOURCE_EXHAUSTED`) | `Request header count exceeds maximum` |
+| URL too long | `8` (`RESOURCE_EXHAUSTED`) | `Request URL too long` |
+| Too many query parameters | `3` (`INVALID_ARGUMENT`) | `Too many query parameters` |
+| Protocol-header guard violation that reaches the handler (HTTP/1.1 parse-layer rejects keep their `400`; see [error classification](error_classification.md#http11-parse-layer-400-contract)) | `3` (`INVALID_ARGUMENT`) | `Protocol header violation` |
+| HTTP/2 / HTTP/3 Host and `:authority` disagreement | `3` (`INVALID_ARGUMENT`) | `Invalid :authority or Host` |
+| Malformed Host or `:authority` value (`400`) | `3` (`INVALID_ARGUMENT`) | `Malformed Host or authority` |
+| TRACE (`405`, with `Allow`; the gRPC and gRPC-Web answers keep `Allow`) | `12` (`UNIMPLEMENTED`) | `TRACE method is not allowed` |
+| Unsupported CONNECT | None: every client gets the JSON `405` `{"error":"CONNECT method is not allowed"}` with `Allow` | — |
+| Per-IP concurrent-request limit (`429`) | `8` (`RESOURCE_EXHAUSTED`) | `Too many concurrent requests from this IP` |
+| Method not allowed in 0-RTT early data (`425`) | `14` (`UNAVAILABLE`) | `Method not allowed in 0-RTT early data` |
+| Retired Gateway listener (`421`) | `14` (`UNAVAILABLE`) | `Gateway listener retired; retry on a new connection` |
+
+The three header limits are the exception for gRPC-Web: they are enforced
+before the gateway negotiates a gRPC-Web response media type from request
+headers, so that parsing never runs on unbounded headers, and gRPC-Web
+receives the JSON `431` there. Native gRPC needs no negotiation and gets the
+Trailers-Only status. The HTTP/1.1 and HTTP/2 connection-level admission
+fences (overload, stale configuration, withdrawn client-certificate trust) run
+before the header limits, so gRPC-Web also gets their plain HTTP answer. The
+proxy hop limit runs right after the header limits and keeps the plain HTTP
+answer for gRPC-Web by contract; see [Proxy hop limit](routing.md#proxy-hop-limit).
+A WebSocket handshake gets the plain HTTP answer from every one of them. No refused request reaches a
+plugin or a backend.
 
 **Why 502 for pre-commit response overruns?** The backend sent a response that violates the gateway's configured limits before the gateway committed a downstream response. The client is not at fault — the backend is misbehaving. This matches HTTP semantics: 502 indicates the gateway received an invalid response from the upstream server. Once streaming has begun, that replacement is no longer possible; clients must treat mid-body termination / stream reset as the overrun signal.
 
@@ -300,7 +363,6 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | `pool_http2_initial_connection_window_size` | 65,535–134,217,728 | HTTP/2 connection window (64 KiB – 128 MiB) |
 | `pool_http2_max_frame_size` | 16,384–1,048,576 | HTTP/2 frame size (16 KiB – 1 MiB) |
 | `pool_http2_max_concurrent_streams` | 1–2,147,483,647 | HTTP/2 max concurrent streams |
-| `pool_max_requests_per_connection` | 0–2,147,483,647 | Reserved Istio max requests per connection (0 = unlimited) |
 | `pool_http3_connections_per_backend` | 1–256 | QUIC connections per backend |
 | `backend_tls_client_cert_path` | 4096 chars | mTLS client certificate path |
 | `backend_tls_client_key_path` | 4096 chars | mTLS client key path |
@@ -316,7 +378,7 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | `custom_id` | 255 chars | Optional custom identifier |
 | `credentials` (total JSON) | 64 KiB | Total serialized size of credentials object |
 | `credentials` (per value) | 4096 chars | Individual credential string values |
-| `credentials.jwt.secret` | min 32 chars | JWT secrets must be at least 32 characters |
+| `credentials.jwt.secret` | min 32 non-whitespace chars | JWT secrets must contain at least 32 non-whitespace characters |
 | Credential type key | 64 chars | Credential type name (e.g., `keyauth`, `basicauth`) |
 
 ### Upstream Fields

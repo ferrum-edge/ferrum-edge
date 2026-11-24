@@ -43,8 +43,13 @@ const PROBE_PATH: &str = "/grpc.Destination/Probe";
 // ───────────────────────────────────────────────────────────────────────────
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_destination_active_requests_grpc_unary_holds_until_trailers() {
+#[test]
+fn functional_destination_active_requests_grpc_unary_holds_until_trailers() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_destination_active_requests_grpc_unary_holds_until_trailers_inner());
+}
+
+async fn functional_destination_active_requests_grpc_unary_holds_until_trailers_inner() {
     let reservation = reserve_port().await.expect("reserve gRPC backend port");
     let backend_port = reservation.port;
     let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
@@ -152,8 +157,13 @@ async fn functional_destination_active_requests_grpc_unary_holds_until_trailers(
 // ───────────────────────────────────────────────────────────────────────────
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_destination_active_requests_grpc_streaming_release_on_cancel() {
+#[test]
+fn functional_destination_active_requests_grpc_streaming_release_on_cancel() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_destination_active_requests_grpc_streaming_release_on_cancel_inner());
+}
+
+async fn functional_destination_active_requests_grpc_streaming_release_on_cancel_inner() {
     let reservation = reserve_port().await.expect("reserve gRPC backend port");
     let backend_port = reservation.port;
     let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())

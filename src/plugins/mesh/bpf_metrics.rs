@@ -97,11 +97,6 @@ impl MeshBpfMetricsExporter {
         self.prefix.as_ref()
     }
 
-    /// Shared counter store read on each scrape.
-    pub fn metrics_state(&self) -> Arc<BpfMetricsState> {
-        self.state.clone()
-    }
-
     /// Render the BPF metrics in Prometheus text exposition format.
     ///
     /// Cold path — called once per authenticated `/metrics` scrape. Emits
@@ -390,8 +385,16 @@ impl Plugin for MeshBpfMetrics {
         PLUGIN_NAME
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         priority::MESH_BPF_METRICS
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {

@@ -1,6 +1,6 @@
 //! Tests for CP gRPC server public API (DpNodeRegistry).
 
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use ferrum_edge::grpc::cp_server::{DpNodeInfo, DpNodeRegistry};
 
 fn make_node(id: &str) -> DpNodeInfo {
@@ -109,20 +109,6 @@ fn registry_remove_stream_is_idempotent() {
     registry.remove_stream(&key);
     registry.remove_stream(&key);
     assert!(registry.is_empty());
-}
-
-#[test]
-fn registry_touch_all_updates_last_update_at() {
-    let registry = DpNodeRegistry::new();
-    let mut node = make_node("node-1");
-    let old_time = Utc::now() - Duration::hours(1);
-    node.last_update_at = old_time;
-    registry.register_stream("node-1", node);
-
-    registry.touch_all();
-
-    let snap = registry.snapshot();
-    assert!(snap[0].last_update_at > old_time);
 }
 
 #[test]

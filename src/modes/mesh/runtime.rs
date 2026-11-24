@@ -2,7 +2,6 @@
 //!
 //! Phase C keeps the live per-node [`MeshSlice`] in an `ArcSwap` slot so
 //! listener and plugin paths can read the latest mesh view without locks.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -351,10 +350,24 @@ pub struct MeshSliceRuntimeVerdict {
     pub outcome: MeshSliceRuntimeOutcome,
 }
 
+/// The content identity `install_slice` computed for the slice it installed.
+///
+/// Holds the installed `Arc` itself, so a pointer match against it can never be
+/// a later allocation reusing a freed address: a caller handing back a
+/// reference into this exact slice gets the identity without re-digesting it.
+struct InstalledSliceContent {
+    slice: Arc<Option<MeshSlice>>,
+    content: MeshRevisionContentIdentity,
+}
+
 /// Lock-free holder for the current Layer 2 mesh slice.
 #[derive(Clone)]
 pub struct MeshRuntimeState {
     current: Arc<ArcSwap<Option<MeshSlice>>>,
+    /// Content identity of the slice in `current`, computed once at install
+    /// (clone + canonical JSON + SHA-256) and reused by apply begin, commit and
+    /// rollback for that same slice.
+    installed_content: Arc<ArcSwap<Option<InstalledSliceContent>>>,
     applied: Arc<ArcSwap<Option<MeshSlice>>>,
     /// Wall-clock timestamp of the most recent `install_slice` call. Stays in lock-step
     /// with `record_mesh_config_received` (the Prometheus metric backing the
@@ -428,6 +441,7 @@ impl MeshRuntimeState {
         let (runtime_verdict_tx, _) = watch::channel(None);
         Self {
             current: Arc::new(ArcSwap::new(Arc::new(None))),
+            installed_content: Arc::new(ArcSwap::new(Arc::new(None))),
             applied: Arc::new(ArcSwap::new(Arc::new(None))),
             last_install_at: Arc::new(ArcSwap::new(Arc::new(None))),
             last_applied_at: Arc::new(ArcSwap::new(Arc::new(None))),
@@ -612,7 +626,13 @@ impl MeshRuntimeState {
             return MeshSliceInstall::Quarantined(rejection);
         }
         crate::plugins::mesh::prometheus_helpers::record_mesh_config_received(&slice.namespace);
-        self.current.store(Arc::new(Some(slice)));
+        let installed = Arc::new(Some(slice));
+        self.current.store(Arc::clone(&installed));
+        self.installed_content
+            .store(Arc::new(Some(InstalledSliceContent {
+                slice: installed,
+                content,
+            })));
         // Stamp the receive timestamp before publishing the revision bump so
         // any observer that reacts to the revision sees a fresh
         // `last_install_at` rather than the stale one.
@@ -630,7 +650,21 @@ impl MeshRuntimeState {
     /// so completion of pre-reset work cannot restore the cleared watermark.
     pub fn begin_revision_apply(&self, slice: &MeshSlice) -> Option<MeshRevisionApplyToken> {
         self.revision_gate
-            .begin_apply(slice.revision.as_ref(), slice_content_identity(slice))
+            .begin_apply(slice.revision.as_ref(), self.content_identity_of(slice))
+    }
+
+    /// `slice`'s semantic content identity: the one computed at install when
+    /// `slice` IS the installed allocation, otherwise a fresh digest. A slice
+    /// behind a shared reference cannot change, so the pointer match is exact.
+    fn content_identity_of(&self, slice: &MeshSlice) -> MeshRevisionContentIdentity {
+        let installed = self.installed_content.load();
+        if let Some(installed) = installed.as_ref()
+            && let Some(installed_slice) = installed.slice.as_ref().as_ref()
+            && std::ptr::eq(installed_slice, slice)
+        {
+            return installed.content;
+        }
+        slice_content_identity(slice)
     }
 
     /// Commit a runtime-accepted slice with the capability captured before its
@@ -651,7 +685,7 @@ impl MeshRuntimeState {
                 .reject_missing_apply_token(slice.revision.as_ref());
             return false;
         };
-        let content = slice_content_identity(slice);
+        let content = self.content_identity_of(slice);
         let _ = self
             .revision_gate
             .commit_applied(slice.revision.as_ref(), content, token);
@@ -733,7 +767,7 @@ impl MeshRuntimeState {
             return false;
         }
         self.revision_gate
-            .rollback_rejected(slice.revision.as_ref(), slice_content_identity(slice))
+            .rollback_rejected(slice.revision.as_ref(), self.content_identity_of(slice))
     }
 
     /// Begin a downstream stage's evaluation of the RECEIVED candidate.
@@ -884,6 +918,40 @@ mod tests {
 
     fn install_slice_for_test(state: &MeshRuntimeState, slice: MeshSlice) {
         state.install_slice(slice);
+    }
+
+    /// The identity reused for the installed allocation equals a fresh digest,
+    /// and any other allocation (a clone, a later install) is digested anew.
+    #[test]
+    fn installed_slice_content_identity_is_reused_only_for_that_allocation() {
+        let state = MeshRuntimeState::new();
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            version: "v1".to_string(),
+            ..MeshSlice::default()
+        };
+        install_slice_for_test(&state, slice.clone());
+        let snapshot = state.snapshot();
+        let installed = snapshot.as_ref().as_ref().expect("installed slice");
+        assert!(matches!(
+            state.content_identity_of(installed),
+            MeshRevisionContentIdentity::Digest(_)
+        ));
+        assert_eq!(
+            state.content_identity_of(installed),
+            slice_content_identity(installed)
+        );
+
+        let mut changed = installed.clone();
+        changed.namespace = "other".to_string();
+        assert_eq!(
+            state.content_identity_of(&changed),
+            slice_content_identity(&changed)
+        );
+        assert_ne!(
+            state.content_identity_of(&changed),
+            state.content_identity_of(installed)
+        );
     }
 
     #[test]

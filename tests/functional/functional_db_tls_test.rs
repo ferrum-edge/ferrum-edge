@@ -115,7 +115,7 @@ impl DbTlsTestHarness {
         });
 
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
-        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
+        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes()).unwrap();
         Ok(encode(&header, &claims, &key)?)
     }
 }
@@ -477,7 +477,10 @@ async fn run_crud_and_proxy_tests(
     // --- Cleanup: delete resources ---
     println!("  [{db_label}] Cleaning up resources...");
     let _ = client
-        .delete(format!("{}/plugins/config/{}", admin_base_url, plugin_id))
+        .delete(format!(
+            "{}/plugins/config/{}?expected_proxy_ids={}",
+            admin_base_url, plugin_id, proxy_id
+        ))
         .header("Authorization", auth_header)
         .send()
         .await;

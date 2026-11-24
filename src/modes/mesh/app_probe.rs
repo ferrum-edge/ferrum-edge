@@ -113,8 +113,8 @@ pub const DEFAULT_APP_PROBE_MAX_ACTIVE_PROBES: usize = 16;
 
 /// Body returned when the active-probe budget is exhausted. Fixed, tiny, and
 /// carries nothing request-derived. Named for the budget, not for process
-/// overload: this listener is deliberately not overload-gated (see
-/// [`AppProbeAdmission`]).
+/// overload: overload is shed earlier, in the accept loop
+/// ([`AppProbeAdmission::try_admit`]), and never reaches this response.
 const PROBE_BUDGET_EXHAUSTED_BODY: &str = "app probe budget exhausted\n";
 
 // ── Wire types (injector producer ⇄ sidecar consumer) ────────────────────
@@ -829,14 +829,9 @@ pub struct AppProbeServer {
 }
 
 impl AppProbeServer {
-    /// Build with the default admission budgets.
-    ///
-    /// `#[allow(dead_code)]` for the same reason `ConnLimiter::unlimited`
-    /// carries it: the binary target compiles this module tree separately from
-    /// the library, and only the external test suites reach this constructor —
-    /// the running sidecar always goes through
+    /// Build with the default admission budgets. Only the external test
+    /// suites reach this constructor — the running sidecar always goes through
     /// [`AppProbeServer::from_env_with_admission`] with configured budgets.
-    #[allow(dead_code)]
     pub fn new(targets: BTreeMap<String, AppProbeSpec>) -> Self {
         Self::with_admission(targets, Arc::new(AppProbeAdmission::default()))
     }
@@ -883,12 +878,9 @@ impl AppProbeServer {
         Some((container, probe_field, spec))
     }
 
-    /// Serve one kubelet request, returning only the status.
-    ///
-    /// `#[allow(dead_code)]` for the binary-target reason above: the served
+    /// Serve one kubelet request, returning only the status. The served
     /// connection needs the body and the close disposition, so production goes
     /// through [`AppProbeServer::handle_request_detailed`].
-    #[allow(dead_code)]
     pub async fn handle_request(&self, method: &Method, path: &str) -> StatusCode {
         self.handle_request_detailed(method, path).await.status
     }
@@ -1213,6 +1205,7 @@ where
     if let Ok(value) = hyper::header::HeaderValue::from_str(default_host) {
         builder = builder.header(hyper::header::HOST, value);
     }
+    let mut host_overridden = false;
     for header in &action.http_headers {
         let (Ok(name), Ok(value)) = (
             hyper::header::HeaderName::from_bytes(header.name.as_bytes()),
@@ -1224,7 +1217,22 @@ where
             );
             continue;
         };
-        // Kubelet lets `httpHeaders` override `Host`; keep that behaviour.
+        if name == hyper::header::HOST {
+            // Kubelet lets `httpHeaders` override `Host`: the first recorded
+            // `Host` entry wins (Go's `Header.Get`), and an empty one leaves the
+            // default. Replace the default rather than append: a request with
+            // two `Host` fields is one RFC 9112 §3.2 requires the server to
+            // reject with 400.
+            if !host_overridden {
+                host_overridden = true;
+                if !value.is_empty()
+                    && let Some(headers) = builder.headers_mut()
+                {
+                    headers.insert(hyper::header::HOST, value);
+                }
+            }
+            continue;
+        }
         builder = builder.header(name, value);
     }
     let request = match builder.body(Empty::<Bytes>::new()) {
@@ -1311,14 +1319,14 @@ fn loopback_tls_connector() -> Option<&'static tokio_rustls::TlsConnector> {
     static CONNECTOR: OnceLock<Option<tokio_rustls::TlsConnector>> = OnceLock::new();
     CONNECTOR
         .get_or_init(|| {
-            let builder = rustls::ClientConfig::builder_with_provider(
-                rustls::crypto::CryptoProvider::get_default()?.clone(),
-            )
-            .with_safe_default_protocol_versions()
-            .ok()?;
+            let provider = rustls::crypto::CryptoProvider::get_default()?.clone();
+            let verifier = LoopbackNoVerifier::for_provider(&provider);
+            let builder = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .ok()?;
             let config = builder
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(LoopbackNoVerifier))
+                .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth();
             Some(tokio_rustls::TlsConnector::from(Arc::new(config)))
         })
@@ -1331,8 +1339,27 @@ fn loopback_tls_connector() -> Option<&'static tokio_rustls::TlsConnector> {
 /// no name and no trust anchor to check, and kubelet's own HTTPS probe does
 /// not verify either. This verifier is reachable ONLY from
 /// [`probe_http_get`] and is never installed on any mesh data path.
+///
+/// It advertises exactly the signature schemes of the provider the probe
+/// client is built from (issue #7075), like `crate::tls::NoVerifier` does for
+/// the base provider, so a FIPS build never offers a scheme outside its
+/// provider. The list is what ClientHello offers, so it still decides
+/// negotiation: an application whose only certificate needs a scheme the
+/// provider lacks (ECDSA P-521 under ring) fails the probe handshake.
 #[derive(Debug)]
-struct LoopbackNoVerifier;
+pub(crate) struct LoopbackNoVerifier {
+    schemes: Vec<rustls::SignatureScheme>,
+}
+
+impl LoopbackNoVerifier {
+    pub(crate) fn for_provider(provider: &rustls::crypto::CryptoProvider) -> Self {
+        Self {
+            schemes: provider
+                .signature_verification_algorithms
+                .supported_schemes(),
+        }
+    }
+}
 
 impl rustls::client::danger::ServerCertVerifier for LoopbackNoVerifier {
     fn verify_server_cert(
@@ -1365,17 +1392,6 @@ impl rustls::client::danger::ServerCertVerifier for LoopbackNoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-        ]
+        self.schemes.clone()
     }
 }

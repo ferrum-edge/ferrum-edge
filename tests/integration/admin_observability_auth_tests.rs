@@ -66,7 +66,7 @@ fn admin_token_with_additional_claims(additional: Value) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()).unwrap(),
     )
     .unwrap()
 }
@@ -150,7 +150,7 @@ fn token_with_secret(role: &str, secret: &str) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).unwrap(),
     )
     .unwrap()
 }
@@ -723,4 +723,61 @@ async fn trust_generation_requires_admin_jwt_not_metrics_only_auth() {
         Some(64),
         "an Admin API JWT retains the replica convergence identifier: {body}"
     );
+
+    // GHSA-crqx-mp2f-v8c8: a fleet-wide token verified by
+    // FERRUM_ADMIN_JWT_VIEWER_SECRET keeps the rest of the detail tier but
+    // never receives a value keyed by FERRUM_ADMIN_JWT_SECRET. A primary-key
+    // `viewer` role token already is a MAC under that secret and keeps it.
+    let mut viewer_key_state = admin_state(MetricsAuthPolicy {
+        allowed_cidrs: TrustedProxies::none(),
+        bearer_token: None,
+    });
+    viewer_key_state.jwt_manager = jwt_manager()
+        .with_viewer_secret(VIEWER_SECRET.to_string())
+        .expect("distinct viewer secret");
+    let (viewer_base, _viewer_sd) = start_admin(viewer_key_state).await;
+    for path in ["/health", "/status"] {
+        for (label, token, expected_len) in [
+            (
+                "viewer-key admin role claim",
+                token_with_secret("admin", VIEWER_SECRET),
+                None,
+            ),
+            (
+                "viewer-key viewer role",
+                token_with_secret("viewer", VIEWER_SECRET),
+                None,
+            ),
+            (
+                "primary-key viewer role",
+                token_with_secret("viewer", JWT_SECRET),
+                Some(64),
+            ),
+        ] {
+            let body: Value = client
+                .get(format!("{viewer_base}{path}"))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(
+                body.get("timestamp").is_some(),
+                "{label} on {path}: a fleet-wide token keeps the detail tier"
+            );
+            assert!(
+                body["cp_dp_trust"].is_object(),
+                "{label} on {path}: trust diagnostics stay visible"
+            );
+            assert_eq!(
+                body["cp_dp_trust"]["active_generation"]
+                    .as_str()
+                    .map(str::len),
+                expected_len,
+                "{label} on {path}: unexpected active_generation exposure"
+            );
+        }
+    }
 }

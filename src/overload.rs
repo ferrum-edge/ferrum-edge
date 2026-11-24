@@ -9,7 +9,7 @@
 //! connections and waits up to a configurable drain period for them to complete.
 
 use crossbeam_utils::CachePadded;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Once, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -104,6 +104,72 @@ pub enum OverloadLevel {
     Critical,
 }
 
+/// Why new requests/streams are refused, as ONE atomic bitset (OV-1).
+///
+/// Request admission has two independent owners: shutdown drain, which is
+/// one-way, and the overload monitor's request-pressure verdict, which comes
+/// and goes. With a single shared `bool` the monitor computed
+/// `draining || pressure` from a load, then stored the result; a
+/// `begin_drain` landing between that load and that store was overwritten
+/// with `false`, so a draining gateway kept admitting requests until the next
+/// monitor tick. Each owner now sets only its own bit through
+/// [`Self::apply`], so the monitor can never clear the drain bit, and the hot
+/// path still decides with a single load.
+pub struct RequestAdmissionGate(AtomicU8);
+
+/// One input to the [`RequestAdmissionGate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestAdmissionEvent {
+    /// Shutdown drain began. Latches; nothing clears it.
+    DrainBegun,
+    /// The overload monitor's request-pressure verdict for this sample.
+    RequestPressure { reject: bool },
+}
+
+impl RequestAdmissionGate {
+    const DRAIN: u8 = 1 << 0;
+    const PRESSURE: u8 = 1 << 1;
+
+    pub const fn new() -> Self {
+        Self(AtomicU8::new(0))
+    }
+
+    /// Whether new requests/streams must be rejected (drain OR pressure).
+    /// `Acquire` pairs with the `Release` half of [`Self::apply`], so an
+    /// admission that observes the drain bit also observes every store
+    /// `begin_drain` made before it.
+    #[inline]
+    pub fn rejects(&self) -> bool {
+        self.0.load(Ordering::Acquire) != 0
+    }
+
+    /// Apply one event, touching only the bit its owner holds. Returns whether
+    /// requests were rejected before and after the event (for transition logs).
+    pub fn apply(&self, event: RequestAdmissionEvent) -> (bool, bool) {
+        let (previous, now) = match event {
+            RequestAdmissionEvent::DrainBegun => {
+                let previous = self.0.fetch_or(Self::DRAIN, Ordering::AcqRel);
+                (previous, previous | Self::DRAIN)
+            }
+            RequestAdmissionEvent::RequestPressure { reject: true } => {
+                let previous = self.0.fetch_or(Self::PRESSURE, Ordering::AcqRel);
+                (previous, previous | Self::PRESSURE)
+            }
+            RequestAdmissionEvent::RequestPressure { reject: false } => {
+                let previous = self.0.fetch_and(!Self::PRESSURE, Ordering::AcqRel);
+                (previous, previous & !Self::PRESSURE)
+            }
+        };
+        (previous != 0, now != 0)
+    }
+}
+
+impl Default for RequestAdmissionGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Atomic overload state read by the proxy hot path.
 ///
 /// The background monitor writes these flags; request threads only read.
@@ -111,7 +177,7 @@ pub enum OverloadLevel {
 /// for overload signals (a few ms of stale state is harmless).
 ///
 /// Hot-path atomics (`disable_keepalive`, `reject_new_connections`,
-/// `reject_new_requests`, `active_connections`, `active_requests`,
+/// `request_admission`, `active_connections`, `active_requests`,
 /// `red_drop_probability`, `red_request_counter`) are wrapped in
 /// [`CachePadded`] to prevent false sharing across cores: at 1M conn/sec
 /// churn, an unpadded layout puts the read-mostly action flags on the same
@@ -130,14 +196,24 @@ pub struct OverloadState {
     pub disable_keepalive: CachePadded<AtomicBool>,
     /// When true, new connections are rejected with 503 before routing.
     pub reject_new_connections: CachePadded<AtomicBool>,
-    /// When true, new requests/streams are rejected with 503 before processing.
-    /// Independent of `reject_new_connections` — connections track sockets,
-    /// requests track multiplexed H2/H3/gRPC streams.
-    pub reject_new_requests: CachePadded<AtomicBool>,
+    /// When it [`rejects`](RequestAdmissionGate::rejects), new requests/streams
+    /// are rejected with 503 before processing. Independent of
+    /// `reject_new_connections` — connections track sockets, requests track
+    /// multiplexed H2/H3/gRPC streams. Drain and request pressure each own one
+    /// bit (OV-1), so the monitor cannot clear a drain.
+    pub request_admission: CachePadded<RequestAdmissionGate>,
 
     // ── Graceful shutdown drain ────────────────────────────────────────
     /// Set to true when SIGTERM/SIGINT is received to begin the drain phase.
     pub draining: AtomicBool,
+    /// Set once the serving mode stops waiting for in-flight work: the drain
+    /// wait ended, timed out, or was disabled. Anything still pending after
+    /// this is torn down by the gateway, so a dropped request handler is not
+    /// evidence that its client cancelled (issue #6768).
+    pub drain_wait_ended: AtomicBool,
+    /// Event form of [`Self::drain_wait_ended`] for the H1/H2 connection tasks
+    /// that are still serving in-flight requests when the wait ends.
+    drain_wait_ended_token: CancellationToken,
     /// Cold one-shot broadcast for work that must stop as soon as drain starts.
     /// The atomic remains the authoritative state and fast path; cancellation
     /// supplies race-free event delivery to waiters already parked on drain.
@@ -152,6 +228,9 @@ pub struct OverloadState {
     /// Notified each time `active_connections` or `active_requests` reaches zero
     /// during drain. The drain waiter re-checks both counters in a loop.
     pub drain_complete: tokio::sync::Notify,
+    /// The shutdown broadcaster's absolute deadline. Attached before listeners
+    /// start; retirement drains only read it and can never publish it.
+    shutdown_deadline: OnceLock<Arc<ShutdownDeadline>>,
 
     /// Edge-triggered publication of the binary keepalive-pressure flag
     /// (issue #4542).
@@ -216,16 +295,29 @@ impl Default for OverloadState {
 }
 
 impl OverloadState {
+    /// Attach the runtime's shutdown deadline before spawning listeners.
+    pub(crate) fn attach_shutdown(&self, shutdown: &ShutdownSender) {
+        self.shutdown_deadline
+            .get_or_init(|| shutdown.inner.deadline.clone());
+    }
+
+    pub(crate) fn shutdown_deadline(&self) -> Option<&ShutdownDeadline> {
+        self.shutdown_deadline.get().map(Arc::as_ref)
+    }
+
     pub fn new() -> Self {
         Self {
             disable_keepalive: CachePadded::new(AtomicBool::new(false)),
             reject_new_connections: CachePadded::new(AtomicBool::new(false)),
-            reject_new_requests: CachePadded::new(AtomicBool::new(false)),
+            request_admission: CachePadded::new(RequestAdmissionGate::new()),
             draining: AtomicBool::new(false),
+            drain_wait_ended: AtomicBool::new(false),
+            drain_wait_ended_token: CancellationToken::new(),
             drain_started: CancellationToken::new(),
             active_connections: CachePadded::new(AtomicU64::new(0)),
             active_requests: CachePadded::new(AtomicU64::new(0)),
             drain_complete: tokio::sync::Notify::new(),
+            shutdown_deadline: OnceLock::new(),
             keepalive_pressure_tx: tokio::sync::watch::channel(false).0,
             red_drop_probability: CachePadded::new(AtomicU32::new(0)),
             red_request_counter: CachePadded::new(AtomicU64::new(0)),
@@ -248,9 +340,7 @@ impl OverloadState {
 
     /// Current overload level derived from the action flags.
     pub fn level(&self) -> OverloadLevel {
-        if self.reject_new_connections.load(Ordering::Relaxed)
-            || self.reject_new_requests.load(Ordering::Relaxed)
-        {
+        if self.reject_new_connections.load(Ordering::Relaxed) || self.request_admission.rejects() {
             OverloadLevel::Critical
         } else if self.disable_keepalive.load(Ordering::Relaxed) {
             OverloadLevel::Pressure
@@ -300,13 +390,8 @@ impl OverloadState {
     /// Cost: one AtomicU32::load + one AtomicU64::fetch_add(Relaxed) + one multiply + one comparison.
     ///
     /// **This ONLY signals RED-probability shedding — NOT the binary "pressure-mode active"
-    /// signal.** Callers that want the full "should we close this HTTP/1.1 keepalive?"
-    /// decision must also OR with `self.disable_keepalive.load(Relaxed)`. Two reasons:
-    /// (1) at the exact pressure threshold the linear ramp produces probability 0 while
-    /// the binary flag is set; (2) the monitor loop writes `disable_keepalive` and
-    /// `red_drop_probability` as independent `Relaxed` stores, so a reader can transiently
-    /// observe the new flag with the prior cycle's probability. The hot-path response
-    /// builder in `proxy::mod` performs that OR — see `connection: close` decision.
+    /// signal.** The full "should we close this HTTP/1.1 keepalive?" decision is
+    /// [`Self::should_close_keepalive`].
     pub fn should_disable_keepalive_red(&self) -> bool {
         let prob = self.red_drop_probability.load(Ordering::Relaxed);
         if prob == 0 {
@@ -326,6 +411,27 @@ impl OverloadState {
         (hash as u32) < prob
     }
 
+    /// Whether this HTTP/1.1 response should carry `Connection: close`.
+    ///
+    /// ORs three signals: graceful drain, the binary pressure-mode flag
+    /// `disable_keepalive`, and RED probabilistic shedding. The binary flag
+    /// must be honored on its own: at the exact pressure threshold the linear
+    /// ramp produces probability 0 while the flag is set, and the monitor loop
+    /// writes `disable_keepalive` and `red_drop_probability` as independent
+    /// `Relaxed` stores, so a reader can observe the new flag with the prior
+    /// cycle's probability of 0.
+    ///
+    /// Cost: `draining` is one `AtomicBool::load(Acquire)` (it synchronizes
+    /// with the Release store in `begin_drain`), `disable_keepalive` one
+    /// `Relaxed` load, and the RED check one `AtomicU32` load plus, only
+    /// inside the ramp, one counter `fetch_add` and a multiply.
+    #[inline]
+    pub fn should_close_keepalive(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+            || self.disable_keepalive.load(Ordering::Relaxed)
+            || self.should_disable_keepalive_red()
+    }
+
     /// Wait until graceful drain begins.
     ///
     /// [`CancellationToken`] retains cancellation state, so a concurrent
@@ -334,6 +440,14 @@ impl OverloadState {
     /// immediately.
     pub(crate) async fn wait_for_drain_start(&self) {
         self.drain_started.cancelled().await;
+    }
+
+    /// Resolves once shutdown stops waiting for in-flight work
+    /// ([`end_shutdown_drain_wait`]). An H1/H2 connection still serving a
+    /// request then closes, so its handlers settle their terminal records
+    /// while observability delivery is still open (issue #6768).
+    pub(crate) async fn wait_for_drain_wait_end(&self) {
+        self.drain_wait_ended_token.cancelled().await;
     }
 
     /// Record an ephemeral port exhaustion event (EADDRNOTAVAIL).
@@ -409,7 +523,7 @@ impl OverloadState {
             actions: ActionSnapshot {
                 disable_keepalive: self.disable_keepalive.load(Ordering::Relaxed),
                 reject_new_connections: self.reject_new_connections.load(Ordering::Relaxed),
-                reject_new_requests: self.reject_new_requests.load(Ordering::Relaxed),
+                reject_new_requests: self.request_admission.rejects(),
             },
         }
     }
@@ -677,12 +791,21 @@ pub(crate) fn count_open_fds() -> u64 {
     count_open_fds_linux("/proc/self/fd")
 }
 
+/// Count open file descriptors with `proc_pidinfo(PROC_PIDLISTFDS)`.
+///
+/// A NULL-buffer call returns the size to allocate (fd-table capacity plus
+/// slack), not the open count, so it only sizes the buffer; the count comes
+/// from the bytes the second call actually writes. Descriptors opened between
+/// the two calls beyond the slack are missed, which is fine for a sample.
+///
+/// Fail closed like the Linux path: if either call fails, return `u64::MAX`
+/// so FD pressure is forced critical.
 #[cfg(target_os = "macos")]
 pub(crate) fn count_open_fds() -> u64 {
-    // On macOS, use proc_pidinfo via the libc FFI constants.
-    // PROC_PIDLISTFDS = 1, sizeof(proc_fdinfo) = 8
+    // <sys/proc_info.h>: PROC_PIDLISTFDS = 1; struct proc_fdinfo is
+    // { int32_t proc_fd; uint32_t proc_fdtype; } (8 bytes, 4-byte aligned).
     const PROC_PIDLISTFDS: i32 = 1;
-    const PROC_FDINFO_SIZE: u64 = 8; // sizeof(proc_fdinfo) = u32 + u32
+    const PROC_FDINFO_SIZE: usize = 8;
     let pid = std::process::id() as i32;
     unsafe extern "C" {
         fn proc_pidinfo(
@@ -693,11 +816,28 @@ pub(crate) fn count_open_fds() -> u64 {
             buffersize: i32,
         ) -> i32;
     }
-    let buffer_size = unsafe { proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-    if buffer_size <= 0 {
-        return 0;
+    let size_hint = unsafe { proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if size_hint <= 0 {
+        return u64::MAX;
     }
-    (buffer_size as u64) / PROC_FDINFO_SIZE
+    let entries = (size_hint as usize).div_ceil(PROC_FDINFO_SIZE);
+    let Ok(buffer_bytes) = i32::try_from(entries * PROC_FDINFO_SIZE) else {
+        return u64::MAX;
+    };
+    let mut buffer = vec![[0u32; 2]; entries];
+    let written = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDLISTFDS,
+            0,
+            buffer.as_mut_ptr().cast::<std::ffi::c_void>(),
+            buffer_bytes,
+        )
+    };
+    if written < 0 {
+        return u64::MAX;
+    }
+    (written as u64) / PROC_FDINFO_SIZE as u64
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -966,9 +1106,10 @@ pub fn raise_fd_limit() -> RaiseFdLimitResult {
 /// On `current_thread` runtimes (or any runtime where `num_workers()` returns 0
 /// or 1, e.g. tokio's `LocalSet`-based tests), this falls back to the original
 /// single-task probe.
-async fn measure_event_loop_latency() -> Duration {
-    const EVENT_LOOP_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
-    const EVENT_LOOP_TIMEOUT_FAIL_CLOSED_LATENCY: Duration = Duration::from_micros(500_000);
+///
+/// `budget` bounds how long the probes are awaited (see
+/// [`event_loop_probe_budget`] and [`drain_event_loop_probes`]).
+async fn measure_event_loop_latency(budget: Duration) -> Duration {
     let num_workers = tokio::runtime::Handle::current().metrics().num_workers();
 
     // Single-threaded fallback: just measure our own reschedule.
@@ -986,9 +1127,23 @@ async fn measure_event_loop_latency() -> Duration {
             start.elapsed()
         });
     }
+    drain_event_loop_probes(probes, budget).await
+}
 
+/// Waits up to `budget` for the probe tasks and returns the largest latency
+/// they report.
+///
+/// A probe still queued when the budget expires has waited at least `budget`,
+/// so the result is then at least `budget`, and the probes still running are
+/// aborted. With the budget equal to `loop_critical_us`, a stall that reaches
+/// the critical threshold reports at least the threshold and trips it (fail
+/// closed), and shorter stalls report their measured latency (issue #7197).
+async fn drain_event_loop_probes(
+    mut probes: tokio::task::JoinSet<Duration>,
+    budget: Duration,
+) -> Duration {
     let mut max_latency = Duration::ZERO;
-    let drain_result = tokio::time::timeout(EVENT_LOOP_PROBE_TIMEOUT, async {
+    let drain_result = tokio::time::timeout(budget, async {
         while let Some(result) = probes.join_next().await {
             // A probe task panicking is unexpected (yield_now never panics) but if
             // it ever happens, prefer continuing over aborting the monitor cycle.
@@ -1003,9 +1158,18 @@ async fn measure_event_loop_latency() -> Duration {
 
     if drain_result.is_err() {
         probes.abort_all();
-        return max_latency.max(EVENT_LOOP_TIMEOUT_FAIL_CLOSED_LATENCY);
+        return max_latency.max(budget);
     }
     max_latency
+}
+
+/// How long one monitor tick waits for the event-loop probes: the configured
+/// critical threshold, bounded by the check interval so one stalled worker
+/// cannot hold the monitor (and every other shedding flag) longer than one
+/// interval. A `loop_critical_us` above the check interval therefore cannot
+/// be reached; `docs/overload_manager.md` states this.
+fn event_loop_probe_budget(loop_critical_us: u64, check_interval: Duration) -> Duration {
+    Duration::from_micros(loop_critical_us).min(check_interval)
 }
 
 /// Monitor ticks between repeats of the FD-count timeout warning.
@@ -1240,7 +1404,11 @@ pub fn start_monitor(
             let req_ratio = pressure_ratio(req_used, max_requests as u64);
 
             // ── Event loop latency ──
-            let loop_latency = measure_event_loop_latency().await;
+            let loop_latency = measure_event_loop_latency(event_loop_probe_budget(
+                config.loop_critical_us,
+                interval,
+            ))
+            .await;
             let loop_us = loop_latency.as_micros() as u64;
             state.loop_latency_us.store(loop_us, Ordering::Relaxed);
 
@@ -1255,14 +1423,10 @@ pub fn start_monitor(
 
             // Request-level overload rejection only triggers when
             // FERRUM_MAX_REQUESTS is configured (non-zero). Shutdown drain is
-            // also a request-admission rejection source: once begin_drain()
-            // has published draining=true with Release ordering, the monitor
-            // must preserve that state instead of clearing reject_new_requests
-            // during a low-pressure sample.
+            // the other request-admission rejection source; it owns its own bit
+            // in `request_admission`, which the monitor never writes (OV-1).
             let should_reject_requests_due_to_pressure =
                 max_requests > 0 && req_ratio >= config.req_critical_threshold;
-            let should_reject_requests =
-                state.draining.load(Ordering::Acquire) || should_reject_requests_due_to_pressure;
 
             // ── RED-style smooth ramp between pressure and critical thresholds ──
             // For BOTH fd and connection pressure, compute probability independently
@@ -1294,7 +1458,6 @@ pub fn start_monitor(
 
             // Transition logging — only log when state changes
             let was_rejecting = state.reject_new_connections.load(Ordering::Relaxed);
-            let was_rejecting_requests = state.reject_new_requests.load(Ordering::Acquire);
             let was_keepalive_disabled = state.disable_keepalive.load(Ordering::Relaxed);
 
             // Issue #4542: one call writes the hot-path atomic H1/H2 reads and
@@ -1305,9 +1468,14 @@ pub fn start_monitor(
             state
                 .reject_new_connections
                 .store(should_reject, Ordering::Relaxed);
-            state
-                .reject_new_requests
-                .store(should_reject_requests, Ordering::Release);
+            // Only the pressure bit is written: a concurrent `begin_drain`
+            // cannot be overwritten (OV-1).
+            let (was_rejecting_requests, should_reject_requests) =
+                state
+                    .request_admission
+                    .apply(RequestAdmissionEvent::RequestPressure {
+                        reject: should_reject_requests_due_to_pressure,
+                    });
 
             if should_reject && !was_rejecting {
                 warn!(
@@ -1413,6 +1581,183 @@ pub fn start_monitor(
     })
 }
 
+/// A runtime's one absolute drain deadline and its race-free publication event.
+/// The broadcaster publishes it at the shutdown watch transition. Listener
+/// retirements and readiness announcements never start it.
+#[derive(Debug)]
+pub(crate) struct ShutdownDeadline {
+    at: OnceLock<tokio::time::Instant>,
+    published: CancellationToken,
+}
+
+impl ShutdownDeadline {
+    fn publish(&self, budget: Duration) {
+        self.at.get_or_init(|| {
+            let now = tokio::time::Instant::now();
+            match now.checked_add(budget) {
+                Some(at) => at,
+                None => {
+                    warn!("Shutdown drain deadline exceeds clock range; skipping peer waits");
+                    now
+                }
+            }
+        });
+        self.published.cancel();
+    }
+}
+
+/// The process shutdown broadcaster. Its raw watch sender is private, so every
+/// trigger (signals, listener failures and startup rollback) publishes the same
+/// deadline before waking listeners. Clones share the first publication; a
+/// second trigger cannot grant more time. Separate in-process runtimes own
+/// independent deadlines.
+#[derive(Clone, Debug)]
+pub struct ShutdownSender {
+    inner: Arc<ShutdownBroadcast>,
+}
+
+#[derive(Debug)]
+struct ShutdownBroadcast {
+    tx: tokio::sync::watch::Sender<bool>,
+    deadline: Arc<ShutdownDeadline>,
+    budget: Duration,
+}
+
+impl ShutdownBroadcast {
+    fn shutdown(&self) {
+        let first = self.tx.send_if_modified(|requested| {
+            if *requested {
+                return false;
+            }
+            // Publish while holding the watch's write lock, at the actual
+            // false -> true transition. No pre-drain or watch-lock wait is
+            // billed to the budget. The deadline is visible before receivers
+            // wake, including retirement waiters using the publication token.
+            self.deadline.publish(self.budget);
+            *requested = true;
+            true
+        });
+        if !first {
+            // Repeat notifications must still wake subscribers that attached
+            // after the first transition and await `changed()` (e.g. the
+            // k8s controller watchers subscribed during a racing startup);
+            // the first deadline stands untouched.
+            let _ = self.tx.send(true);
+        }
+    }
+}
+
+impl Drop for ShutdownBroadcast {
+    fn drop(&mut self) {
+        // Accept loops treat watch closure as shutdown too. Publish before the
+        // raw sender drops, without trying to write the watch: a receiver may
+        // still hold a read guard while its last sender is being dropped.
+        self.deadline.publish(self.budget);
+    }
+}
+
+impl ShutdownSender {
+    pub fn new(budget: Duration) -> Self {
+        Self {
+            inner: Arc::new(ShutdownBroadcast {
+                tx: tokio::sync::watch::channel(false).0,
+                deadline: Arc::new(ShutdownDeadline {
+                    at: OnceLock::new(),
+                    published: CancellationToken::new(),
+                }),
+                budget,
+            }),
+        }
+    }
+
+    pub fn channel(budget: Duration) -> (Self, tokio::sync::watch::Receiver<bool>) {
+        let sender = Self::new(budget);
+        let receiver = sender.subscribe();
+        (sender, receiver)
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.inner.tx.subscribe()
+    }
+
+    pub fn borrow(&self) -> tokio::sync::watch::Ref<'_, bool> {
+        self.inner.tx.borrow()
+    }
+
+    /// Publish exactly once, then broadcast shutdown even with no subscribers.
+    /// No await separates these operations, and the deadline is visible before
+    /// any listener can observe the shutdown watch firing.
+    pub fn shutdown(&self) {
+        self.inner.shutdown();
+    }
+
+    /// The signal sequencer calls this after announcing readiness withdrawal.
+    /// A retirement during this window cannot start the process drain clock.
+    pub async fn shutdown_after_predrain(
+        &self,
+        predrain: Duration,
+        escalation: &CancellationToken,
+    ) {
+        if !predrain.is_zero() {
+            info!(
+                predrain_seconds = predrain.as_secs(),
+                "Pre-drain: reporting not-ready while listeners keep accepting"
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(predrain) => {}
+                _ = escalation.cancelled() => {
+                    warn!("Pre-drain window cut short by a repeated shutdown signal");
+                }
+            }
+        }
+        self.shutdown();
+    }
+}
+
+/// Result of a wait bounded by the retirement/local deadline, the process
+/// shutdown deadline (including one published during the wait), and escalation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DrainWait<T> {
+    Complete(T),
+    TimedOut,
+    Escalated,
+}
+
+pub(crate) async fn wait_with_shutdown_deadline<F: std::future::Future>(
+    deadline: Option<&ShutdownDeadline>,
+    local_deadline: tokio::time::Instant,
+    escalation: &CancellationToken,
+    work: F,
+) -> DrainWait<F::Output> {
+    let effective_deadline = || {
+        deadline
+            .and_then(|deadline| deadline.at.get().copied())
+            .map_or(local_deadline, |at| at.min(local_deadline))
+    };
+    let timer = tokio::time::sleep_until(effective_deadline());
+    tokio::pin!(timer, work);
+    let publication = async {
+        match deadline {
+            Some(deadline) => deadline.published.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(publication);
+    let mut observed_publication = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = escalation.cancelled() => return DrainWait::Escalated,
+            _ = &mut publication, if !observed_publication => {
+                observed_publication = true;
+                timer.as_mut().reset(effective_deadline());
+            }
+            _ = &mut timer => return DrainWait::TimedOut,
+            result = &mut work => return DrainWait::Complete(result),
+        }
+    }
+}
+
 /// Process-wide shutdown announcement latch (issue #4154).
 ///
 /// Every serving mode drives its drain from the same `watch` channel its
@@ -1489,11 +1834,6 @@ pub fn shutdown_escalation_token() -> &'static CancellationToken {
     SHUTDOWN_ESCALATION.get_or_init(CancellationToken::new)
 }
 
-/// Read the escalation latch without waiting.
-pub fn shutdown_escalated() -> bool {
-    shutdown_escalation_token().is_cancelled()
-}
-
 /// Publish the escalation. Idempotent and one-way; returns `true` when this
 /// call is the one that escalated.
 ///
@@ -1538,11 +1878,13 @@ pub fn classify_shutdown_signal(observed_count: u32) -> ShutdownSignalAction {
 
 /// Mark the overload state as draining and refuse new request admission.
 ///
-/// Sets both `draining` and `reject_new_requests` together so they are observed
-/// atomically with respect to each other from the shutdown trigger task. Stores
-/// use `Ordering::Release` so any loader that does an `Acquire` load (proxy hot
-/// path keepalive-close decision, request admission control, guard drop drain
-/// notification) sees the post-shutdown state in a happens-before relationship.
+/// Sets `draining`, then the drain bit of `request_admission`. Both writes
+/// release, so any loader that does an `Acquire` load (proxy hot path
+/// keepalive-close decision, request admission control, guard drop drain
+/// notification) sees the post-shutdown state in a happens-before
+/// relationship. The drain bit is owned here alone: the overload monitor writes
+/// only the pressure bit, so a monitor sample racing this call cannot re-admit
+/// requests (OV-1).
 ///
 /// Called by every serving mode at the START of the post-listener-exit phase,
 /// regardless of `FERRUM_SHUTDOWN_DRAIN_SECONDS`.
@@ -1555,7 +1897,7 @@ pub fn classify_shutdown_signal(observed_count: u32) -> ShutdownSignalAction {
 /// join is deliberate and must not be collapsed by setting these flags ahead
 /// of the broadcast: the HTTP/3 listener runs its own bounded GOAWAY drain
 /// before its handle returns, and during that window accepted H3 streams and
-/// CONNECT-UDP tunnels keep being served. Setting `reject_new_requests` and
+/// CONNECT-UDP tunnels keep being served. Setting the drain admission bit and
 /// `drain_started` earlier would reject those streams and end those tunnels
 /// (see `docs/http3.md`). In the gap, HTTP/1.1 keep-alive is already off
 /// through hyper's `graceful_shutdown()`. [`begin_shutdown_drain`] logs
@@ -1567,7 +1909,7 @@ pub fn classify_shutdown_signal(observed_count: u32) -> ShutdownSignalAction {
 /// 1. **`draining=true`** — `Connection: close` is injected on HTTP/1.1 responses
 ///    so keepalive clients release connections instead of holding them open
 ///    until process exit. Also gates the guard-drop `drain_complete` notify.
-/// 2. **`reject_new_requests=true`** — new requests/streams arriving on
+/// 2. **`request_admission` drain bit** — new requests/streams arriving on
 ///    EXISTING connections (especially H2/H3 multiplexed streams that have no
 ///    `Connection: close` analogue and keepalive H1 streams that race the
 ///    close hint) are rejected with 503 / gRPC UNAVAILABLE before processing.
@@ -1581,8 +1923,50 @@ pub fn classify_shutdown_signal(observed_count: u32) -> ShutdownSignalAction {
 /// [PR #569]: https://github.com/ferrum-edge/ferrum-edge/pull/569
 pub fn begin_drain(state: &Arc<OverloadState>) {
     state.draining.store(true, Ordering::Release);
-    state.reject_new_requests.store(true, Ordering::Release);
+    state
+        .request_admission
+        .apply(RequestAdmissionEvent::DrainBegun);
     state.drain_started.cancel();
+}
+
+/// Upper bound on how long [`end_shutdown_drain_wait`] waits for the H1/H2
+/// connections it closes to release their requests.
+const DRAIN_WAIT_END_SETTLE: Duration = Duration::from_millis(250);
+
+/// Record that the serving mode stopped waiting for in-flight work after
+/// [`begin_shutdown_drain`]: the drain wait completed, timed out, was cut short,
+/// or is disabled (`FERRUM_SHUTDOWN_DRAIN_SECONDS=0`). From here, a request
+/// handler that is dropped was torn down by the gateway's shutdown, not
+/// cancelled by its client (issue #6768).
+///
+/// The H1/H2 connections still serving a request close their transport now,
+/// and this waits — at most [`DRAIN_WAIT_END_SETTLE`] — until those requests
+/// are released, so each one's terminal record reaches observability delivery
+/// before the serving mode closes it. With nothing in flight it returns at
+/// once, so the `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget and the cleanup phase
+/// that follows are unchanged.
+pub async fn end_shutdown_drain_wait(state: &Arc<OverloadState>) {
+    state.drain_wait_ended.store(true, Ordering::Release);
+    state.drain_wait_ended_token.cancel();
+    let released = async {
+        while state.active_requests.load(Ordering::Relaxed) != 0 {
+            // `notify_one` keeps a permit, so a release between the load and
+            // this await is not lost; a bounded wait covers anything else.
+            let _ =
+                tokio::time::timeout(Duration::from_millis(50), state.drain_complete.notified())
+                    .await;
+        }
+    };
+    if tokio::time::timeout(DRAIN_WAIT_END_SETTLE, released)
+        .await
+        .is_err()
+    {
+        warn!(
+            phase = "drain",
+            active_requests = state.active_requests.load(Ordering::Relaxed),
+            "In-flight requests were still held after shutdown closed their connections"
+        );
+    }
 }
 
 /// Serving-mode shutdown entry point: [`begin_drain`] plus cancellation of any
@@ -1622,7 +2006,11 @@ pub const SHUTDOWN_DRAIN_BEGUN_LOG: &str =
 /// been invoked. Returns `true` if all connections and requests drained within
 /// the timeout, `false` if the timeout expired.
 ///
-/// This function does NOT toggle `draining` / `reject_new_requests` — that is
+/// `timeout` is capped by the absolute deadline published by the runtime's
+/// [`ShutdownSender`], so time spent joining listeners (including H3's drain
+/// and endpoint close) is never granted again.
+///
+/// This function does NOT toggle `draining` / the drain admission bit — that is
 /// [`begin_drain`]'s job, run unconditionally on shutdown so the close hint
 /// fires even when the operator has set `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` to
 /// disable the wait loop.
@@ -1672,15 +2060,15 @@ pub async fn wait_for_drain_with_escalation(
     // as "not drained" — the caller's contract is "did everything finish?",
     // and it did not — so the force-close and the fixed cleanup phases after
     // this call run exactly as they do on a timeout.
-    match tokio::time::timeout(timeout, async {
-        tokio::select! {
-            _ = drained => true,
-            _ = escalation.cancelled() => false,
-        }
-    })
+    match wait_with_shutdown_deadline(
+        state.shutdown_deadline(),
+        tokio::time::Instant::now() + timeout,
+        &escalation,
+        drained,
+    )
     .await
     {
-        Ok(true) => {
+        DrainWait::Complete(()) => {
             info!(
                 phase = "drain",
                 result = "complete",
@@ -1688,7 +2076,7 @@ pub async fn wait_for_drain_with_escalation(
             );
             true
         }
-        Ok(false) => {
+        DrainWait::Escalated => {
             warn!(
                 phase = "drain",
                 result = "escalated",
@@ -1698,7 +2086,7 @@ pub async fn wait_for_drain_with_escalation(
             );
             false
         }
-        Err(_) => {
+        DrainWait::TimedOut => {
             let remaining_conns = state.active_connections.load(Ordering::Relaxed);
             let remaining_reqs = state.active_requests.load(Ordering::Relaxed);
             warn!(
@@ -1728,6 +2116,28 @@ mod tests {
     fn fd_count_is_nonzero() {
         let count = count_open_fds();
         assert!(count > 0, "Process should have at least some open FDs");
+    }
+
+    /// Issue #7212: the macOS count must be the open descriptors, not the
+    /// fd-table capacity plus slack that a NULL-buffer `proc_pidinfo` returns.
+    /// `/dev/fd` lists the open descriptors; take the closest of a few pairs
+    /// because other tests open and close descriptors concurrently.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fd_count_matches_open_descriptors_on_macos() {
+        let mut best = u64::MAX;
+        for _ in 0..8 {
+            let counted = count_open_fds();
+            assert_ne!(counted, u64::MAX, "proc_pidinfo must succeed for self");
+            let listed = std::fs::read_dir("/dev/fd")
+                .expect("/dev/fd is readable")
+                .count() as u64;
+            best = best.min(counted.abs_diff(listed));
+            if best <= 2 {
+                break;
+            }
+        }
+        assert!(best <= 2, "count_open_fds drifted {best} from /dev/fd");
     }
 
     #[cfg(target_os = "linux")]
@@ -1906,74 +2316,6 @@ mod tests {
         }
     }
 
-    /// Simulate the monitor loop's tick counter and verify a changed
-    /// `fd_limit` is picked up exactly on the refresh boundary, not before
-    /// and not skipped after. Mirrors the in-loop logic at the top of the
-    /// `start_monitor` task body without needing a full tokio harness.
-    #[test]
-    fn fd_limit_refresh_boundary_picks_up_changes() {
-        // Stand-in for `get_fd_limit()` whose return value flips after the
-        // first refresh boundary, modeling an operator running `setrlimit(2)`
-        // partway through the gateway's lifetime.
-        let mut probe_calls = 0u64;
-        let mut probe = |tick: u64| -> u64 {
-            probe_calls += 1;
-            // First boundary returns the original limit; subsequent
-            // boundaries return the raised limit.
-            if tick < FD_LIMIT_REFRESH_INTERVAL_TICKS {
-                1024
-            } else {
-                65_536
-            }
-        };
-
-        // Initial value (read once at task start).
-        let mut fd_limit = probe(0);
-        assert_eq!(fd_limit, 1024);
-
-        // Walk through enough ticks to cross two refresh boundaries.
-        let total_ticks = FD_LIMIT_REFRESH_INTERVAL_TICKS * 2 + 5;
-        let mut refresh_observations = 0u64;
-        let mut tick: u64 = 0;
-        while tick < total_ticks {
-            tick = tick.wrapping_add(1);
-            if tick.is_multiple_of(FD_LIMIT_REFRESH_INTERVAL_TICKS) {
-                refresh_observations += 1;
-                let new_limit = probe(tick);
-                if new_limit != fd_limit {
-                    fd_limit = new_limit;
-                }
-            }
-        }
-
-        // Two boundaries crossed → two probes (plus the initial one).
-        assert_eq!(refresh_observations, 2);
-        assert_eq!(probe_calls, 3);
-        // After crossing the first boundary, the raised limit must be visible.
-        assert_eq!(
-            fd_limit, 65_536,
-            "raised RLIMIT_NOFILE should be picked up at the refresh boundary"
-        );
-    }
-
-    /// The `fd_limit == 0` warn must fire only once even if the periodic
-    /// refresh continues to observe 0 (Windows / unsupported platforms).
-    /// `Once::call_once` provides this guarantee — verify the latch behaves
-    /// correctly when invoked repeatedly.
-    #[test]
-    fn fd_pressure_disabled_warn_latches_once() {
-        // Use a private latch so this test doesn't poison the production
-        // `FD_PRESSURE_DISABLED_WARN` for any other test in the same binary.
-        let local_latch = Once::new();
-        let mut fired = 0u32;
-        for _ in 0..10 {
-            local_latch.call_once(|| {
-                fired += 1;
-            });
-        }
-        assert_eq!(fired, 1, "warn-once latch must fire exactly once");
-    }
-
     #[test]
     fn pressure_ratio_handles_unbounded_max() {
         assert_eq!(pressure_ratio(5, 0), 0.0);
@@ -2044,128 +2386,138 @@ mod tests {
         );
     }
 
-    /// `should_disable_keepalive_red()` ONLY signals RED-probability shedding.
-    /// The HTTP/1.1 keepalive-close decision in `proxy::mod` must OR this
-    /// with `disable_keepalive`, otherwise pressure-mode is silently ignored
-    /// at the exact threshold (where ramp produces probability 0) or during
-    /// the inter-store window where the monitor has flipped the binary flag
-    /// but `red_drop_probability` still reflects the previous cycle's value.
-    ///
-    /// This test pins down the contract for the three combinations the hot
-    /// path must handle correctly. Because the hot path inlines the OR
-    /// expression (`draining || disable_keepalive || should_disable_keepalive_red`),
-    /// we assert each AtomicBool / AtomicU32 source independently. A future
-    /// regression that drops one of those terms will be caught here.
+    /// The production budget at the default thresholds (500 ms critical, 1 s
+    /// check interval).
+    const DEFAULT_PROBE_BUDGET: Duration = Duration::from_millis(500);
+
+    /// Issue #7197: the probe budget, and with it the fail-closed value on a
+    /// timeout, follows `loop_critical_us` instead of fixed 250 ms / 500 ms
+    /// constants, so thresholds between 500 ms and the check interval are
+    /// reachable; it never exceeds one check interval.
     #[test]
-    fn keepalive_close_decision_honors_binary_flag_independently_of_red_probability() {
-        let state = OverloadState::new();
-
-        // Case 1: pressure-mode active, RED probability 0 (the regression case).
-        // The binary flag MUST cause Connection: close; the RED helper alone
-        // returns false because the linear ramp produced 0 at the exact
-        // pressure threshold, or because the cross-cycle inter-store window
-        // hasn't advanced `red_drop_probability` yet.
-        state.disable_keepalive.store(true, Ordering::Relaxed);
-        state.red_drop_probability.store(0, Ordering::Relaxed);
-        assert!(
-            state.disable_keepalive.load(Ordering::Relaxed),
-            "binary flag must surface true for the hot-path OR"
+    fn event_loop_probe_budget_follows_critical_threshold_bounded_by_interval() {
+        let interval = Duration::from_millis(1000);
+        assert_eq!(
+            event_loop_probe_budget(500_000, interval),
+            DEFAULT_PROBE_BUDGET
         );
-        assert!(
-            !state.should_disable_keepalive_red(),
-            "RED helper alone returns false at probability 0 — \
-             pressure-mode would be ignored without the OR"
+        assert_eq!(
+            event_loop_probe_budget(300_000, interval),
+            Duration::from_millis(300)
         );
-
-        // Case 2: both signals quiet — connection should be reused.
-        state.disable_keepalive.store(false, Ordering::Relaxed);
-        state.red_drop_probability.store(0, Ordering::Relaxed);
-        assert!(
-            !state.disable_keepalive.load(Ordering::Relaxed),
-            "binary flag clear when no pressure"
+        assert_eq!(
+            event_loop_probe_budget(750_000, interval),
+            Duration::from_millis(750)
         );
-        assert!(
-            !state.should_disable_keepalive_red(),
-            "RED helper clear at probability 0"
-        );
-
-        // Case 3: binary flag clear but RED probability saturated (between
-        // pressure and critical thresholds, deep in the ramp). RED helper
-        // alone should still drive Connection: close.
-        state.disable_keepalive.store(false, Ordering::Relaxed);
-        state
-            .red_drop_probability
-            .store(RED_PROBABILITY_SCALE, Ordering::Relaxed);
-        assert!(
-            !state.disable_keepalive.load(Ordering::Relaxed),
-            "binary flag still clear in this regime"
-        );
-        assert!(
-            state.should_disable_keepalive_red(),
-            "RED helper must return true at saturation (1024/1024 == 100%)"
+        assert_eq!(event_loop_probe_budget(5_000_000, interval), interval);
+        assert_eq!(
+            event_loop_probe_budget(2_000_000, Duration::from_millis(5000)),
+            Duration::from_secs(2)
         );
     }
 
-    /// Sanity check: under no load, the all-worker probe should still return a
-    /// small latency, well under the 10 ms warn threshold. This guards against
-    /// regressions where the probe accidentally serializes on something that
-    /// would inflate idle-runtime readings.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn measure_event_loop_latency_idle_is_small() {
-        let latency = measure_event_loop_latency().await;
-        assert!(
-            latency < Duration::from_millis(10),
-            "idle multi-worker probe should be <10ms, got {:?}",
-            latency
-        );
-    }
+    /// How long a fixture step may take before the test fails instead of
+    /// hanging.
+    const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
-    /// Sanity check: on a single-threaded runtime the function falls back to
-    /// the original single-task probe and still returns quickly.
-    #[tokio::test(flavor = "current_thread")]
-    async fn measure_event_loop_latency_current_thread_fallback() {
-        let latency = measure_event_loop_latency().await;
-        assert!(
-            latency < Duration::from_millis(10),
-            "current-thread probe should be <10ms, got {:?}",
-            latency
-        );
-    }
+    /// How often the fixture repeats the scheduler's wake-up while it waits for
+    /// a blocker to reach a worker.
+    const WAKE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
-    /// Keep every worker occupied until the production probe has actually
-    /// queued its tasks. A start counter followed by fixed sleeps only proved
-    /// historical saturation: CI could delay the probe until all sleeps ended.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn measure_event_loop_latency_detects_saturated_workers() {
-        let handle = tokio::runtime::Handle::current();
-        let num_workers = handle.metrics().num_workers();
-        const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
-        const BLOCKED_AFTER_QUEUE: Duration = Duration::from_millis(50);
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+    /// Parks one blocking task on every runtime worker and returns, once each
+    /// worker is inside its blocker, the senders that release them and the
+    /// blockers' join handles.
+    ///
+    /// Call it from the test body, which `#[tokio::test]` runs on the test
+    /// thread and not on a worker. tokio assumes a task does not block its
+    /// worker, so it does not promise that a queued task reaches an idle
+    /// worker while another worker is blocked. Two things make that happen
+    /// here; without either, a blocker has been left unstarted for the whole
+    /// fixture timeout ("every runtime worker must be occupied").
+    ///
+    /// The blockers are spawned one at a time, each only after the previous
+    /// one has reported from its worker. A blocker signals and then blocks
+    /// with no await in between, so a worker that has reported cannot poll
+    /// anything else, and no worker can ever hold two blockers. Spawned
+    /// together, two blockers can be taken by one worker: tasks spawned from
+    /// outside a worker go to the injection queue, and a worker with nothing
+    /// local can take a batch of up to `len / workers + 1` from it, run the
+    /// first and keep the second in its local queue, where only another
+    /// worker's steal can reach it.
+    ///
+    /// While it waits for a blocker to report, the fixture spawns an empty
+    /// task every [`WAKE_RETRY_INTERVAL`], because one spawn does not always
+    /// get a queued task to the free worker. A spawn wakes a worker only if
+    /// one is counted as parked and none is searching. A worker that gave up
+    /// looking for work while the other worker was still searching is counted
+    /// as awake until it has parked, and it parks without looking at the
+    /// queues again: only the last searching worker does that. If the other
+    /// worker has taken the previous blocker in the meantime, the blocker
+    /// spawned next wakes nobody and stays in the injection queue with the
+    /// free worker asleep. A retry made after that worker is recorded as
+    /// parked wakes it, and the fixture keeps retrying until the blocker
+    /// reports or the fixture timeout runs out.
+    fn occupy_every_worker(
+        num_workers: usize,
+    ) -> (
+        Vec<std::sync::mpsc::Sender<()>>,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
         let mut releases = Vec::with_capacity(num_workers);
         let mut blockers = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             releases.push(release_tx);
-            let started_tx = started_tx.clone();
             blockers.push(tokio::spawn(async move {
-                started_tx.send(()).expect("probe observes worker entry");
+                started_tx.send(()).expect("fixture observes worker entry");
                 // No await between the signal and this blocking receive: the
                 // worker cannot poll another task until it is released.
                 release_rx
                     .recv_timeout(FIXTURE_TIMEOUT)
                     .expect("fixture releases every worker");
             }));
+            let deadline = std::time::Instant::now() + FIXTURE_TIMEOUT;
+            loop {
+                match started_rx.recv_timeout(WAKE_RETRY_INTERVAL) {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if std::time::Instant::now() < deadline =>
+                    {
+                        // Still queued: repeat the wake-up. The empty task runs
+                        // on whichever worker is free, now or after release.
+                        tokio::spawn(async {});
+                    }
+                    // Out of time, or the blocker was dropped before it
+                    // reported: this blocker holds the only sender.
+                    Err(error) => panic!("every runtime worker must be occupied: {error:?}"),
+                }
+            }
         }
-        drop(started_tx);
+        (releases, blockers)
+    }
+
+    /// Runs the production probe with `budget` while every runtime worker is
+    /// blocked, keeps the workers blocked for `blocked_after_queue` after the
+    /// probe has queued its tasks, and returns the latency the probe reports.
+    ///
+    /// The hold is counted from the probe's first poll, not from before the
+    /// probe ran. A start counter followed by fixed sleeps only proved
+    /// historical saturation: CI could delay the probe until all sleeps ended.
+    async fn probe_latency_with_every_worker_blocked(
+        budget: Duration,
+        blocked_after_queue: Duration,
+    ) -> Duration {
+        let handle = tokio::runtime::Handle::current();
+        let (releases, blockers) = occupy_every_worker(handle.metrics().num_workers());
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
 
         let release_thread = std::thread::spawn(move || {
             // Release even if the probe panics or fails to queue, so cleanup
             // never relies on a blocked runtime making forward progress.
             let queued = queued_rx.recv_timeout(FIXTURE_TIMEOUT);
             if queued.is_ok() {
-                std::thread::sleep(BLOCKED_AFTER_QUEUE);
+                std::thread::sleep(blocked_after_queue);
             }
             for release in releases {
                 let _ = release.send(());
@@ -2173,13 +2525,8 @@ mod tests {
             queued.expect("production probe must queue before worker release");
         });
         let probe_thread = std::thread::spawn(move || {
-            for _ in 0..num_workers {
-                started_rx
-                    .recv_timeout(FIXTURE_TIMEOUT)
-                    .expect("every runtime worker must be occupied");
-            }
             handle.block_on(async move {
-                let mut probe = std::pin::pin!(measure_event_loop_latency());
+                let mut probe = std::pin::pin!(measure_event_loop_latency(budget));
                 let mut queued_tx = Some(queued_tx);
                 std::future::poll_fn(|cx| {
                     let result = std::future::Future::poll(probe.as_mut(), cx);
@@ -2200,6 +2547,116 @@ mod tests {
         release_thread
             .join()
             .expect("worker release should not panic");
+        latency
+    }
+
+    /// A probe that cannot be scheduled within its budget reports at least
+    /// the budget, so the critical threshold it was sized from trips.
+    ///
+    /// This checks the value the probe reports, not which branch produced it.
+    /// With every worker blocked nothing drives the runtime's timer, so the
+    /// budget timer can fire only once the workers are released, and the
+    /// probe tasks may finish first with their own, larger, measurement. The
+    /// expiry itself is covered by the `drain_event_loop_probes_*` tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn measure_event_loop_latency_reports_at_least_the_budget_on_timeout() {
+        let budget = Duration::from_millis(40);
+        // The workers stay blocked for five budgets after the probe queues, so
+        // its tasks wait well past the budget before any worker can run them.
+        let latency = probe_latency_with_every_worker_blocked(budget, 5 * budget).await;
+        assert!(
+            latency >= budget,
+            "a probe starved past its budget must report at least the budget, got {latency:?}"
+        );
+    }
+
+    /// When the budget expires with a probe still running, the drain reports
+    /// at least the budget, or the larger latency a finished probe measured.
+    /// The finished probes here report fixed values and one never finishes,
+    /// so only the expiry can produce the budget. On the paused clock the
+    /// runtime is idle while that probe waits, and the clock moves straight
+    /// to the deadline: nothing depends on how the threads are scheduled.
+    #[tokio::test(start_paused = true)]
+    async fn drain_event_loop_probes_reports_at_least_the_budget_when_it_expires() {
+        let budget = Duration::from_millis(40);
+        for (finished, expected) in [
+            (Duration::from_millis(3), budget),
+            (Duration::from_millis(60), Duration::from_millis(60)),
+        ] {
+            let mut probes = tokio::task::JoinSet::new();
+            probes.spawn(async move { finished });
+            probes.spawn(std::future::pending::<Duration>());
+            let started = tokio::time::Instant::now();
+            // Bounded, so a drain that never gives up fails instead of hanging.
+            let latency =
+                tokio::time::timeout(10 * budget, drain_event_loop_probes(probes, budget))
+                    .await
+                    .expect("the drain must give up on a running probe at its budget");
+            assert!(
+                started.elapsed() >= budget,
+                "the drain must wait out the budget before giving up on a running probe"
+            );
+            assert_eq!(
+                latency, expected,
+                "a probe that finished in {finished:?} and one still running past the \
+                 {budget:?} budget must report {expected:?}"
+            );
+        }
+    }
+
+    /// When every probe finishes within the budget, the drain reports the
+    /// largest latency they measured, not the budget.
+    #[tokio::test(start_paused = true)]
+    async fn drain_event_loop_probes_reports_the_largest_measurement_when_all_finish() {
+        let budget = Duration::from_millis(40);
+        let mut probes = tokio::task::JoinSet::new();
+        for millis in [3, 17, 9] {
+            probes.spawn(async move { Duration::from_millis(millis) });
+        }
+        let started = tokio::time::Instant::now();
+        let latency = drain_event_loop_probes(probes, budget).await;
+        assert_eq!(latency, Duration::from_millis(17));
+        assert!(
+            started.elapsed() < budget,
+            "finished probes must not wait for the budget"
+        );
+    }
+
+    /// Sanity check: under no load, the all-worker probe should still return a
+    /// small latency, well under the 10 ms warn threshold. This guards against
+    /// regressions where the probe accidentally serializes on something that
+    /// would inflate idle-runtime readings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn measure_event_loop_latency_idle_is_small() {
+        let latency = measure_event_loop_latency(DEFAULT_PROBE_BUDGET).await;
+        assert!(
+            latency < Duration::from_millis(10),
+            "idle multi-worker probe should be <10ms, got {:?}",
+            latency
+        );
+    }
+
+    /// Sanity check: on a single-threaded runtime the function falls back to
+    /// the original single-task probe and still returns quickly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn measure_event_loop_latency_current_thread_fallback() {
+        let latency = measure_event_loop_latency(DEFAULT_PROBE_BUDGET).await;
+        assert!(
+            latency < Duration::from_millis(10),
+            "current-thread probe should be <10ms, got {:?}",
+            latency
+        );
+    }
+
+    /// Every worker stays occupied until the production probe has actually
+    /// queued its tasks, and for a while after: the probe must report that
+    /// wait even though it is well inside the budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn measure_event_loop_latency_detects_saturated_workers() {
+        const BLOCKED_AFTER_QUEUE: Duration = Duration::from_millis(50);
+        let latency =
+            probe_latency_with_every_worker_blocked(DEFAULT_PROBE_BUDGET, BLOCKED_AFTER_QUEUE)
+                .await;
         assert!(
             latency >= Duration::from_millis(25),
             "expected probe to surface ≥25ms saturation, got {:?} \

@@ -5,13 +5,8 @@
 //! the canonical Layer 2 mesh model instead of reading any config source
 //! directly.
 
-// Phase B exposes xDS pieces before every runtime path consumes them. Keep the
-// allowance scoped to dead code only; unused imports should still be caught.
-#![allow(dead_code)]
-
 pub mod admission;
 pub mod carrier;
-pub mod conformance;
 pub mod nonce;
 pub mod server;
 pub mod snapshot;
@@ -111,7 +106,7 @@ pub use carrier::{
     FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL, FERRUM_ECDS_WORKLOADS_TYPE_URL,
     MAX_SERVICE_WAYPOINT_BOUND_REF_LEN, MAX_SERVICE_WAYPOINT_BOUND_SERVICES_CARRIER_BYTES,
     MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES, MAX_WAYPOINT_GATEWAY_CLASS_LEN, MeshSliceCarrier,
-    apply_carrier, build_slice_carriers,
+    build_slice_carriers,
 };
 #[allow(unused_imports)]
 pub use nonce::{AckOutcome, XdsNonceTracker};
@@ -120,9 +115,8 @@ pub use server::XdsAdsServer;
 pub use snapshot::{XdsResource, XdsSnapshot, XdsSnapshotCache};
 #[allow(unused_imports)]
 pub use stock::{
-    STOCK_REQUIRED_TYPE_URLS, STOCK_XDS_TYPE_URLS, StockDiscovery, StockRefusal,
-    StockXdsAccumulator, StockXdsLimits, parse_istio_cluster_name, parse_kubernetes_service_host,
-    refuse_stock_secret,
+    STOCK_XDS_TYPE_URLS, StockDiscovery, StockRefusal, StockXdsAccumulator, StockXdsLimits,
+    parse_istio_cluster_name, parse_kubernetes_service_host, refuse_stock_secret,
 };
 #[allow(unused_imports)]
 pub use translator::{

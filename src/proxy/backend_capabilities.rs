@@ -158,7 +158,6 @@ impl BackendCapabilitySnapshot {
     }
 
     /// Whether the key was vacant when the snapshot was taken.
-    #[allow(dead_code)] // Used by tests and external lib callers.
     #[inline]
     pub fn was_vacant(&self) -> bool {
         self.previous.is_none()
@@ -183,7 +182,6 @@ pub enum CapabilityCommitOutcome {
 }
 
 impl CapabilityCommitOutcome {
-    #[allow(dead_code)] // Used by tests and external lib callers.
     #[inline]
     pub fn is_committed(&self) -> bool {
         matches!(self, Self::Committed(_))
@@ -197,6 +195,133 @@ impl CapabilityCommitOutcome {
             Self::RejectedStale => "stale_snapshot",
             Self::RejectedEvicted => "entry_evicted",
         }
+    }
+}
+
+/// Why a [`StagedProbeCommit`] stopped accepting stages.
+#[derive(Debug, Clone, Copy)]
+enum StagedCommitLoss {
+    Stale,
+    Evicted,
+}
+
+impl StagedCommitLoss {
+    #[inline]
+    fn outcome(self) -> CapabilityCommitOutcome {
+        match self {
+            Self::Stale => CapabilityCommitOutcome::RejectedStale,
+            Self::Evicted => CapabilityCommitOutcome::RejectedEvicted,
+        }
+    }
+}
+
+/// Chained compare-and-commit for one probe target whose result is published
+/// in stages, opened by [`BackendCapabilityRegistry::begin_probe_commit`].
+///
+/// An HTTPS target is classified by two independent probes: HTTP/2 over TLS
+/// (TCP) and HTTP/3 (QUIC). Against a backend with no QUIC listener the
+/// HTTP/3 probe ends only when it times out, seconds after the HTTP/2 probe
+/// answered. Holding the whole record until both finish kept every request
+/// to that target on the `Unknown` path — reqwest instead of the direct
+/// HTTP/2 or HTTP/1.1 pools — for that long after every start and reload. So
+/// the refresh publishes the HTTP/2 verdict as soon as it has one (HTTP/3
+/// left at its pre-probe value) and merges the HTTP/3 verdict in a second
+/// commit.
+///
+/// Each stage is the same compare-and-commit as
+/// [`BackendCapabilityRegistry::commit_probe`]; what the chain adds is the
+/// expectation each stage is compared against:
+///
+/// - the first stage must replace exactly the pre-probe snapshot, which is
+///   also the merge input the probes classified against;
+/// - every later stage must replace exactly the record the previous stage
+///   published.
+///
+/// A request-path downgrade (`mark_h3_unsupported`, `mark_h2_tls_unsupported`,
+/// `mark_hbone_unsupported`), a concurrent refresh, or a `retain_keys`
+/// eviction that lands anywhere between the pre-probe snapshot and the last
+/// stage therefore breaks the chain exactly as it breaks a single
+/// `commit_probe`: the newer record wins whichever field it touched.
+///
+/// "Exactly as" includes `commit_probe`'s one blind spot: an absent key has
+/// no version. A first stage whose expectation is "vacant" commits whenever
+/// the key is vacant at that moment, even if the target was inserted and
+/// pruned, or simply left the config, during the probe; the next refresh's
+/// `retain_keys` removes such an entry. Staging narrows that window (the
+/// first stage commits as soon as HTTP/2 answers) but does not close it.
+///
+/// A lost stage is final. Every later stage reports the same rejection
+/// without touching the registry — it does not fall back to comparing
+/// against an older expectation. That matters for a first probe: its opening
+/// expectation is "vacant", so if a live insert beat the first stage and a
+/// reload then pruned the key, a second stage compared against "vacant"
+/// would re-add a target the config no longer references.
+///
+/// The cost of the stricter rule is deliberate and small: when a live
+/// downgrade lands between the stages, the HTTP/3 verdict of this refresh is
+/// dropped even if the downgrade touched only HTTP/2. HTTP/3 then keeps its
+/// pre-probe value (`Unknown` on a first probe) until the next refresh, which
+/// can only withhold native HTTP/3 dispatch, never grant it.
+pub struct StagedProbeCommit<'a> {
+    registry: &'a BackendCapabilityRegistry,
+    key: &'a str,
+    /// The record the next stage must replace. Holding this strong `Arc`
+    /// keeps the allocation alive, so its address cannot be reused by a newer
+    /// record while a stage is pending (see [`BackendCapabilitySnapshot`]).
+    expected: BackendCapabilitySnapshot,
+    lost: Option<StagedCommitLoss>,
+    published_stages: u32,
+}
+
+impl StagedProbeCommit<'_> {
+    /// The record the next stage is compared against: the pre-probe snapshot
+    /// until a stage is published, then the record that stage published.
+    ///
+    /// Before the first stage this is also the probe's merge input, so the
+    /// probe classifies against the very observation its first commit is
+    /// compared with.
+    #[inline]
+    pub fn expected(&self) -> &BackendCapabilitySnapshot {
+        &self.expected
+    }
+
+    /// How many stages this chain has published so far.
+    #[inline]
+    pub fn published_stages(&self) -> u32 {
+        self.published_stages
+    }
+
+    /// Publish one stage.
+    ///
+    /// Commits `record` only while the entry is still the version
+    /// [`Self::expected`] names; on success that expectation advances to the
+    /// record just published. After any rejection the chain is closed and
+    /// every later call returns the same rejection without reading or writing
+    /// the registry.
+    ///
+    /// Cold path only, like [`BackendCapabilityRegistry::commit_probe`].
+    pub fn commit(&mut self, record: BackendCapabilityRecord) -> CapabilityCommitOutcome {
+        if let Some(lost) = self.lost {
+            return lost.outcome();
+        }
+        let outcome = self
+            .registry
+            .commit_probe(self.key.to_string(), &self.expected, record);
+        match &outcome {
+            CapabilityCommitOutcome::Committed(published) => {
+                self.expected = BackendCapabilitySnapshot {
+                    previous: Some(Arc::clone(published)),
+                };
+                self.published_stages = self.published_stages.saturating_add(1);
+            }
+            CapabilityCommitOutcome::RejectedStale => {
+                self.lost = Some(StagedCommitLoss::Stale);
+            }
+            CapabilityCommitOutcome::RejectedEvicted => {
+                self.lost = Some(StagedCommitLoss::Evicted);
+            }
+        }
+        outcome
     }
 }
 
@@ -324,7 +449,6 @@ impl Default for BackendCapabilityRegistry {
 }
 
 impl BackendCapabilityRegistry {
-    #[allow(dead_code)] // Used by tests and external lib callers; binary uses sharded constructor.
     pub fn new() -> Self {
         Self::default()
     }
@@ -359,8 +483,8 @@ impl BackendCapabilityRegistry {
     /// The periodic/startup capability refresh must **not** use this: its
     /// read → probe → write sequence spans an await, so a blind write can
     /// overwrite a request-path downgrade learned during the probe. Use
-    /// [`Self::snapshot_for_probe`] + [`Self::commit_probe`] there.
-    #[allow(dead_code)] // Used by tests and external lib callers; the refresh path commits.
+    /// [`Self::begin_probe_commit`] there (or, for a single write-back,
+    /// [`Self::snapshot_for_probe`] + [`Self::commit_probe`]).
     pub fn upsert(&self, key: String, record: BackendCapabilityRecord) {
         self.entries
             .entry(key)
@@ -437,7 +561,24 @@ impl BackendCapabilityRegistry {
         }
     }
 
-    #[allow(dead_code)] // Used by tests and external lib callers; the refresh path snapshots.
+    /// Open the staged write-back for one probe target.
+    ///
+    /// Takes the single pre-probe observation ([`Self::snapshot_for_probe`])
+    /// and binds it to `key`, so the probe's merge input and the first
+    /// stage's compare expectation cannot be two different reads. See
+    /// [`StagedProbeCommit`] for how later stages are compared.
+    ///
+    /// Cold path (once per target per refresh cycle).
+    pub fn begin_probe_commit<'a>(&'a self, key: &'a str) -> StagedProbeCommit<'a> {
+        StagedProbeCommit {
+            registry: self,
+            key,
+            expected: self.snapshot_for_probe(key),
+            lost: None,
+            published_stages: 0,
+        }
+    }
+
     pub fn get_by_key(&self, key: &str) -> Option<Arc<BackendCapabilityRecord>> {
         self.entries.get(key).map(|entry| entry.value().clone())
     }
@@ -586,7 +727,6 @@ pub fn capability_key_for_proxy_target(proxy: &Proxy, target: Option<&UpstreamTa
 
 /// Compute an owned capability key from a proxy that already reflects its
 /// target's host/port (i.e., a `BackendCapabilityProbeTarget.proxy`).
-#[allow(dead_code)] // Used by tests and library callers; binary hot paths use target-aware lookup.
 pub fn capability_key(proxy: &Proxy) -> String {
     capability_key_for_proxy_target(proxy, None)
 }
@@ -621,21 +761,20 @@ fn write_capability_key(buf: &mut String, proxy: &Proxy, target: Option<&Upstrea
                         .get(crate::proxy::hbone_pool::HBONE_DIAL_HOST_TAG)
                         .map(String::as_str)
                 });
-            let hbone_peer_spiffe = crate::proxy::hbone_pool::target_expected_peer_spiffe(target)
-                .ok()
-                .flatten()
-                .map(|spiffe| spiffe.to_string())
+            // The raw tag, borrowed: a valid SPIFFE ID renders exactly as the
+            // tag it was parsed from, and an invalid one is keyed by its raw
+            // value anyway, so parsing and re-rendering it here would only add
+            // per-request allocations (issue #7166). Same precedence as
+            // `hbone_pool::target_expected_peer_spiffe`.
+            let hbone_peer_spiffe = target
+                .tags
+                .get(crate::proxy::hbone_pool::HBONE_PEER_SPIFFE_ID_TAG)
                 .or_else(|| {
                     target
                         .tags
-                        .get(crate::proxy::hbone_pool::HBONE_PEER_SPIFFE_ID_TAG)
-                        .or_else(|| {
-                            target
-                                .tags
-                                .get(crate::proxy::hbone_pool::MESH_SPIFFE_ID_TAG)
-                        })
-                        .cloned()
-                });
+                        .get(crate::proxy::hbone_pool::MESH_SPIFFE_ID_TAG)
+                })
+                .map(String::as_str);
             (hbone_port, hbone_dial_host, hbone_peer_spiffe)
         });
     buf.push_str(scheme.to_scheme_str());
@@ -658,7 +797,7 @@ fn write_capability_key(buf: &mut String, proxy: &Proxy, target: Option<&Upstrea
         buf.push('|');
         append_optional_pool_key_component(buf, dial_host);
         buf.push('|');
-        append_optional_pool_key_component(buf, peer_spiffe.as_deref());
+        append_optional_pool_key_component(buf, peer_spiffe);
     }
 }
 
@@ -750,7 +889,6 @@ impl fmt::Debug for RefreshRole {
 }
 
 impl RefreshRole {
-    #[allow(dead_code)] // Public library/test inspection API; the binary target matches variants directly.
     pub fn is_runner(&self) -> bool {
         matches!(self, Self::Runner(_))
     }
@@ -837,7 +975,6 @@ fn observe_idle_wait_registered() {
 /// proxy hot path; the extra thread-local load is a no-op unless a test
 /// armed a hook.
 #[doc(hidden)]
-#[allow(dead_code)] // External library tests install this seam; the binary target never does.
 pub fn install_idle_wait_observe_hook(hook: Option<Arc<dyn Fn() + 'static>>) {
     AFTER_IDLE_WAIT_REGISTERED.with(|cell| {
         *cell.borrow_mut() = hook;
@@ -1030,7 +1167,6 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
-            pool_max_requests_per_connection: None,
             pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,

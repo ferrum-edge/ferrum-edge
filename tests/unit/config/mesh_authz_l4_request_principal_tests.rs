@@ -23,9 +23,8 @@
 use ferrum_edge::identity::spiffe::SpiffeId;
 use ferrum_edge::modes::mesh::config::{MeshPolicy, MeshRule, PolicyAction, PolicyScope};
 use ferrum_edge::modes::mesh::policy::{
-    MeshAuthzDecision, MeshAuthzProtocol, MeshAuthzRequest, evaluate_mesh_authorization,
+    MeshAuthzDecision, MeshAuthzProtocol, MeshAuthzRequest, evaluate_mesh_authorization_policies,
 };
-use ferrum_edge::modes::mesh::slice::MeshSlice;
 
 const NS: &str = "default";
 const ISSUER_PATTERN: &str = "https://issuer.example.com/*";
@@ -76,18 +75,8 @@ fn policy(name: &str, action: PolicyAction, rule: MeshRule) -> MeshPolicy {
     }
 }
 
-fn slice(policies: Vec<MeshPolicy>) -> MeshSlice {
-    MeshSlice {
-        node_id: "node".to_string(),
-        namespace: NS.to_string(),
-        mesh_policies: policies,
-        version: "v1".to_string(),
-        ..MeshSlice::default()
-    }
-}
-
 fn evaluate(policies: Vec<MeshPolicy>, request: &MeshAuthzRequest) -> MeshAuthzDecision {
-    evaluate_mesh_authorization(&slice(policies), request)
+    evaluate_mesh_authorization_policies(&policies, request)
 }
 
 fn deny(policy: &str) -> MeshAuthzDecision {

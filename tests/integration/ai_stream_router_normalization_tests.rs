@@ -208,7 +208,10 @@ async fn gzip_residual_encoding_repairs_headers_and_normalizes_stream() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let mut out = Vec::new();
-    match inspector.on_chunk(&encoded).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&encoded))
+        .await
+    {
         ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
             out.extend_from_slice(&b)
         }
@@ -293,7 +296,10 @@ async fn gemini_sse_and_json_streams_normalize() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("gemini inspector");
     let mut out = Vec::new();
-    match inspector.on_chunk(sse.as_bytes()).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(sse.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
             out.extend_from_slice(&b)
         }
@@ -366,7 +372,10 @@ async fn layered_gzip_br_residual_encoding_normalizes_without_leaking_frames() {
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("chain inspector");
-    match inspector.on_chunk(&layered).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&layered))
+        .await
+    {
         ResponseStreamAction::Forward(b) => {
             assert!(b.is_empty(), "must hold encoded chain frames until EOF")
         }
@@ -479,7 +488,10 @@ fn tool_governor() -> AiToolGovernor {
 async fn drive(inspector: &mut Box<dyn ResponseStreamInspector>, body: &[u8]) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     let mut terminated = false;
-    match inspector.on_chunk(body).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(body))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
         ResponseStreamAction::Terminate(bytes) => {
             if let Some(bytes) = bytes {

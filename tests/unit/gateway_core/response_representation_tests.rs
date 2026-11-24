@@ -22,7 +22,7 @@ use std::sync::{
 };
 
 use ferrum_edge::_test_support::{
-    apply_synthetic_response_body_hooks_for_test, clone_log_metadata_for_test,
+    apply_synthetic_response_body_hooks_for_test, clone_log_metadata,
     discard_grpc_application_trailers_after_body_rewrite_for_test,
     finalize_selected_buffered_grpc_terminal_response_for_test,
     refresh_grpc_status_metadata_for_test, representation_rejection_reason_for_test,
@@ -700,11 +700,13 @@ async fn unprotected_responses_are_never_rejected_by_the_gate() {
     }
 }
 
-/// Regression: the gate must parse exactly the way the enforcer does. A body the
-/// gate accepts but `apply_body_rules` cannot parse would return `None` from the
+/// Regression: the gate must never be more lenient than an enforcer. A body the
+/// gate accepts but an enforcer cannot parse would return `Unchanged` from the
 /// transform, be read as "no rule matched", and forward the protected bytes —
 /// the same conflation this whole gate exists to close. A UTF-8 BOM is the
-/// concrete case: `serde_json` rejects it, so the gate must too.
+/// concrete case: `apply_body_rules_bounded` now strips one
+/// (GHSA-pq95-952r-2x32), but other claimants' enforcers do not, so the gate
+/// keeps refusing it.
 #[tokio::test]
 async fn bom_prefixed_json_is_rejected_rather_than_leniently_accepted() {
     let mut body = vec![0xef, 0xbb, 0xbf];
@@ -727,7 +729,7 @@ async fn bom_prefixed_json_is_rejected_rather_than_leniently_accepted() {
 // Absent `Content-Type`: the claim predicate must match the enforcer exactly.
 //
 // `transform_response_body` treats `None` as JSON — it only declines on a
-// *present* non-JSON type — and calls `apply_body_rules`. A claim predicate that
+// *present* non-JSON type — and calls `apply_body_rules_bounded`. A claim predicate that
 // declined `None` would leave untyped bodies un-inspected by the gate while the
 // enforcer still tried (and silently failed) to parse them, which is the exact
 // `None`-conflation bypass the gate exists to close.
@@ -756,7 +758,7 @@ async fn untyped_encoded_body_is_claimed_decoded_and_redacted() {
 }
 
 /// An untyped body the enforcer cannot parse must be rejected, not forwarded.
-/// Forwarding is what made this a bypass: `apply_body_rules` returns `None`, the
+/// Forwarding is what made this a bypass: `apply_body_rules_bounded` returns `Unchanged`, the
 /// lifecycle reads "no rule matched", and the protected value ships.
 #[tokio::test]
 async fn untyped_unparseable_body_is_rejected_not_forwarded() {
@@ -3068,7 +3070,7 @@ fn origin_fragment_marker_is_stripped_from_transaction_metadata() {
             "{case}: the gate must have stamped its fragment evidence"
         );
 
-        let metadata = clone_log_metadata_for_test(&ctx);
+        let metadata = clone_log_metadata(&ctx);
 
         assert!(
             !metadata.contains_key("ferrum:origin_fragment_response"),
@@ -3095,7 +3097,7 @@ fn no_internal_origin_response_stamp_reaches_transaction_metadata() {
     headers.insert("content-length".to_string(), "128".to_string());
     stamp_original_response_metadata_for_test(&mut ctx, 206, &headers);
 
-    let metadata = clone_log_metadata_for_test(&ctx);
+    let metadata = clone_log_metadata(&ctx);
 
     let leaked: Vec<&String> = metadata
         .keys()

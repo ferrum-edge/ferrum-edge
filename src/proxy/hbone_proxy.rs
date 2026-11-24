@@ -337,16 +337,56 @@ impl HboneUdpRelayEnd {
 /// refusal is not evidence about the backend. Real DNS and connection failures
 /// record a failure with their `status`. This is the ONE settlement site for a
 /// failed connect; callers invoke it exactly once per connect attempt.
+/// Report the inbound byte-stream relay's backend connect outcome to passive
+/// health for the selected upstream target: success once the relay socket is
+/// connected, and a connection failure when the dial failed (issue #7183), so
+/// DestinationRule `outlierDetection` can eject a dead target through this
+/// path. No-op for a relay with no upstream target.
+fn report_hbone_backend_connect_to_passive_health(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    target: Option<&UpstreamTarget>,
+    status: StatusCode,
+    connection_error: bool,
+) {
+    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, target)
+        && let Some(upstream) = LoadBalancerCache::get_upstream_from(
+            &epoch.load_balancer,
+            &proxy.namespace,
+            upstream_id,
+        )
+    {
+        let passive = backend_dispatch::passive_health_for_target(proxy, &upstream, target);
+        state.health_checker.report_response(
+            &proxy.namespace,
+            &proxy.id,
+            upstream_id,
+            target,
+            status.as_u16(),
+            connection_error,
+            passive,
+        );
+    }
+}
+
 pub(crate) fn settle_hbone_backend_connect_circuit_breaker_outcome(
     cb: &crate::circuit_breaker::CircuitBreaker,
     status: StatusCode,
     policy_refusal: bool,
-    is_half_open_probe: bool,
+    ticket: crate::circuit_breaker::ProbeTicket,
 ) {
+    use crate::circuit_breaker::BreakerOutcome;
     if policy_refusal {
-        cb.record_neutral(is_half_open_probe);
+        cb.settle(ticket, BreakerOutcome::Neutral);
     } else {
-        cb.record_failure(status.as_u16(), true, is_half_open_probe);
+        cb.settle(
+            ticket,
+            BreakerOutcome::Failure {
+                status_code: status.as_u16(),
+                connection_error: true,
+            },
+        );
     }
 }
 
@@ -492,24 +532,25 @@ pub(crate) fn backend_write_timeout(proxy: &Proxy) -> Option<Duration> {
     relay_timeout_millis(proxy.backend_write_timeout_ms)
 }
 
+/// `(body_completed, client_disconnected, body_error_class)` for a finished
+/// HBONE byte relay, read from the same typed relay ending the raw TCP proxy
+/// classifies its relays with ([`tcp_proxy::RelayEndReason`], #7030).
 fn hbone_relay_body_outcome(
     first_failure: Option<&tcp_proxy::StreamFirstFailure>,
 ) -> (bool, bool, Option<retry::ErrorClass>) {
-    let Some((direction, class, side, _message)) = first_failure else {
+    let end_reason = tcp_proxy::RelayEndReason::from_first_failure(first_failure);
+    if end_reason == tcp_proxy::RelayEndReason::Graceful {
         return (true, false, None);
-    };
-    let client_disconnected = matches!(
-        tcp_proxy::disconnect_cause_for_failure(*direction, class, *side),
-        DisconnectCause::RecvError
-    );
-    (false, client_disconnected, Some(*class))
+    }
+    let client_disconnected = matches!(end_reason.disconnect_cause(), DisconnectCause::RecvError);
+    (false, client_disconnected, end_reason.error_class())
 }
 
 /// Whether the byte-stream relay's first failure resets the CONNECT stream
 /// with `RST_STREAM(CONNECT_ERROR)` (issues #5781, #5858).
 ///
 /// Only the idle window ends the stream cleanly
-/// ([`tcp_proxy::relay_failure_is_idle_expiry`]): nothing moved in either
+/// ([`tcp_proxy::RelayEndReason::resets_hbone_stream`]): nothing moved in either
 /// direction for the whole window, so the tunnel went quiet rather than being
 /// cut. Every other failure cut the byte stream short, and a clean
 /// `END_STREAM` would read as a complete response: a socket error on either
@@ -522,7 +563,7 @@ fn hbone_relay_body_outcome(
 fn hbone_relay_failure_resets_stream(
     first_failure: Option<&tcp_proxy::StreamFirstFailure>,
 ) -> bool {
-    first_failure.is_some_and(|failure| !tcp_proxy::relay_failure_is_idle_expiry(failure))
+    tcp_proxy::RelayEndReason::from_first_failure(first_failure).resets_hbone_stream()
 }
 
 /// End an HBONE tunnel's upgraded CONNECT stream once its relay is over (issue
@@ -572,6 +613,7 @@ fn build_hbone_relay_summary(
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
         consumer_username: ctx.effective_identity().map(str::to_owned),
+        principal_origin: ctx.principal_origin(),
         auth_method: ctx.auth_method,
         http_method: method.to_string(),
         request_path: ctx.path.clone(),
@@ -609,6 +651,9 @@ fn build_hbone_relay_summary(
             .load(std::sync::atomic::Ordering::Acquire),
         metadata: crate::proxy::clone_log_metadata(ctx),
         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
+        // Built after the relay ended: `body_completed` / `client_disconnected`
+        // describe what the tunnel transport observed (issue #6769).
+        response_delivery: crate::plugins::ResponseDelivery::Observed,
         ..TransactionSummary::default()
     }
 }
@@ -717,8 +762,12 @@ async fn connect_backend(
             Ok(candidates) => candidates,
             Err(denial) => return Err(HboneConnectFailure::RelayDenied(denial.as_str())),
         };
+    // The NodeWaypoint topology, resolved once at startup: the mesh runtime
+    // installs the identity resolver for exactly that topology, so its
+    // presence is the topology bit without a per-CONNECT environment read and
+    // re-parse (issue #7166).
     let socket_mark = (proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID
-        && node_waypoint_inbound_relay_mark_enabled())
+        && state.node_waypoint_identity_resolver.is_some())
     .then_some(NODE_WAYPOINT_INBOUND_AUTH_MARK);
     let timeout = Duration::from_millis(effective_connect_timeout_ms);
     let (stream, addr) = match crate::dns::connect_candidates(&candidates, port, timeout, |addr| {
@@ -735,9 +784,24 @@ async fn connect_backend(
             if class == retry::ErrorClass::PortExhaustion {
                 state.overload.record_port_exhaustion();
             }
+            // A kernel `ETIMEDOUT` (connect budget longer than the OS TCP
+            // timeout) is the same cause as the gateway's own connect timer
+            // below, so it gets the same 504 (#6770).
+            let (status, body): (StatusCode, &'static [u8]) =
+                if class == retry::ErrorClass::ConnectionTimeout {
+                    (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        &br#"{"error":"Backend HBONE connection timed out"}"#[..],
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        &br#"{"error":"Backend HBONE connection failed"}"#[..],
+                    )
+                };
             return Err(HboneConnectFailure::Backend(HboneConnectError {
-                status: StatusCode::BAD_GATEWAY,
-                body: br#"{"error":"Backend HBONE connection failed"}"#,
+                status,
+                body,
                 phase: "hbone_connect",
                 class,
                 message: err.to_string(),
@@ -899,23 +963,14 @@ pub(super) fn inbound_ingress_relay_effective_destination_allowed(
     mesh.sidecar_ingress_connect_relay_endpoint_matches(listener_port, app_host, app_port)
 }
 
-fn node_waypoint_inbound_relay_mark_enabled() -> bool {
-    crate::config::conf_file::resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").is_some_and(|topology| {
-        matches!(
-            topology.trim().to_ascii_lowercase().as_str(),
-            "node_waypoint" | "node-waypoint"
-        )
-    })
-}
-
 /// What the request path resolved the admitting plugin view with, plus the
 /// admission fence's sweep counter as captured BEFORE that resolution (issue
 /// #5042 step 1).
 ///
-/// The authorize chain is protocol-scoped and the protocol is peer-selectable
-/// (`content-type: application/grpc` on the CONNECT classifies as gRPC), so a
-/// sweep must re-resolve the SAME view rather than assume plain HTTP. The
-/// counter is what turns a publication that raced this admission into a fresh
+/// The authorize chain is protocol-scoped. The request path refuses an HBONE
+/// CONNECT declaring a gRPC or gRPC-Web content type, so the view is plain HTTP
+/// in practice, but a sweep must re-resolve the SAME view the request path
+/// recorded rather than assume plain HTTP. The counter is what turns a publication that raced this admission into a fresh
 /// sweep; see [`super::hbone_admission_fence::HboneAdmissionFence::admit`].
 #[derive(Debug, Clone, Copy)]
 pub(super) struct HboneAdmissionView {
@@ -1139,6 +1194,7 @@ pub(super) async fn handle_hbone_request(
             mismatch,
             is_tls,
             false,
+            None,
             start_time,
             plugin_execution_ns,
             "hbone_peer_auth_transport_mismatch",
@@ -1226,8 +1282,8 @@ pub(super) async fn handle_hbone_request(
 
     // HBONE records the circuit-breaker outcome at header time (its `StreamingH2`
     // responses are excluded from the deferred-dispatch path, #1649); the
-    // admission generation only binds the probe guard's neutral release (#6177).
-    let (cb_target_key, cb_is_half_open_probe, cb_admission_generation) =
+    // admission's probe ticket binds every settlement to its cycle (#6177, CB-1).
+    let (cb_target_key, cb_admitted, cb_probe_ticket, _cb_admission_generation) =
         match backend_dispatch::check_circuit_breaker(proxy, state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
@@ -1264,13 +1320,7 @@ pub(super) async fn handle_hbone_request(
     // client's upgrade handle and the backend dial, and a peer that vanishes in
     // that window drops this future without running either settle site. Dropping
     // the guard releases the slot NEUTRALLY instead of wedging the breaker.
-    let cb_probe = crate::proxy::HalfOpenProbeGuard::new(
-        state,
-        proxy,
-        cb_target_key.as_deref(),
-        cb_is_half_open_probe,
-        cb_admission_generation,
-    );
+    let cb_probe = crate::proxy::HalfOpenProbeGuard::new(cb_admitted.as_ref(), cb_probe_ticket);
 
     let hbone_on_upgrade = match client_request_body {
         ClientRequestBody::Streaming(request) => {
@@ -1383,18 +1433,31 @@ pub(super) async fn handle_hbone_request(
                     (err.status, err.body, err.phase, err.class, false)
                 }
             };
-            if let Some(cb_config) = &proxy.circuit_breaker {
-                let cb = state.circuit_breaker_cache.get_or_create(
-                    &proxy.namespace,
-                    &proxy.id,
-                    cb_target_key.as_deref(),
-                    cb_config,
-                );
+            if let Some(cb) = cb_probe.current_breaker(
+                &state.circuit_breaker_cache,
+                &proxy.namespace,
+                &proxy.id,
+                cb_target_key.as_deref(),
+            ) {
                 settle_hbone_backend_connect_circuit_breaker_outcome(
                     &cb,
                     status,
                     policy_refusal,
                     cb_probe.take_slot(),
+                );
+            }
+            // Passive health / DestinationRule `outlierDetection` sees the
+            // backend connect failure, symmetric with the success report below
+            // (issue #7183). A relay-destination refusal never dialed, and a
+            // gateway-side class says nothing about the target.
+            if !policy_refusal && !backend_dispatch::client_side_no_backend_signal(Some(class)) {
+                report_hbone_backend_connect_to_passive_health(
+                    state,
+                    epoch,
+                    proxy,
+                    upstream_target.as_deref(),
+                    status,
+                    true,
                 );
             }
             ctx.metadata
@@ -1423,33 +1486,25 @@ pub(super) async fn handle_hbone_request(
     };
     let backend_elapsed = backend_start.elapsed();
 
-    if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state.circuit_breaker_cache.get_or_create(
-            &proxy.namespace,
-            &proxy.id,
-            cb_target_key.as_deref(),
-            cb_config,
-        );
-        cb.record_success(cb_probe.take_slot());
-    }
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target.as_deref())
-        && let Some(upstream) = LoadBalancerCache::get_upstream_from(
-            &epoch.load_balancer,
-            &proxy.namespace,
-            upstream_id,
-        )
-    {
-        let passive = backend_dispatch::passive_health_for_target(proxy, &upstream, target);
-        state.health_checker.report_response(
-            &proxy.namespace,
-            &proxy.id,
-            upstream_id,
-            target,
-            StatusCode::OK.as_u16(),
-            false,
-            passive,
+    if let Some(cb) = cb_probe.current_breaker(
+        &state.circuit_breaker_cache,
+        &proxy.namespace,
+        &proxy.id,
+        cb_target_key.as_deref(),
+    ) {
+        cb.settle(
+            cb_probe.take_slot(),
+            crate::circuit_breaker::BreakerOutcome::Success,
         );
     }
+    report_hbone_backend_connect_to_passive_health(
+        state,
+        epoch,
+        proxy,
+        upstream_target.as_deref(),
+        StatusCode::OK,
+        false,
+    );
 
     let backend_target = backend.target_url.clone();
     let backend_resolved_ip = backend.resolved_ip.clone();
@@ -1897,6 +1952,7 @@ pub(super) async fn handle_hbone_udp_request(
             mismatch,
             is_tls,
             false,
+            None,
             start_time,
             plugin_execution_ns,
             "hbone_udp_peer_auth_transport_mismatch",
@@ -2459,7 +2515,21 @@ async fn open_hbone_udp_relay_socket(
     state: &ProxyState,
     dest_addr: SocketAddr,
 ) -> Result<tokio::net::UdpSocket, HboneUdpSocketOpenError> {
-    if let Some(std_socket) = maybe_bind_pod_netns_udp_relay_socket(state, dest_addr)? {
+    // Finding the destination pod reads every registry entry, and binding
+    // inside its netns spawns and joins a `setns` thread: both block, so they
+    // run on the blocking pool rather than this request's runtime worker
+    // (issue #7170).
+    let registry_dir = state.env_config.mesh_node_waypoint_pod_registry_dir.clone();
+    let pod_netns_socket = tokio::task::spawn_blocking(move || {
+        maybe_bind_pod_netns_udp_relay_socket(&registry_dir, dest_addr)
+    })
+    .await
+    .map_err(|e| HboneUdpSocketOpenError {
+        phase: "hbone_udp_bind",
+        body: br#"{"error":"HBONE UDP pod-netns local socket failed"}"#,
+        message: e.to_string(),
+    })??;
+    if let Some(std_socket) = pod_netns_socket {
         return tokio::net::UdpSocket::from_std(std_socket).map_err(|e| HboneUdpSocketOpenError {
             phase: "hbone_udp_bind",
             body: br#"{"error":"HBONE UDP pod-netns socket adoption failed"}"#,
@@ -2492,13 +2562,11 @@ async fn open_hbone_udp_relay_socket(
 
 #[cfg(target_os = "linux")]
 fn maybe_bind_pod_netns_udp_relay_socket(
-    state: &ProxyState,
+    registry_dir: &str,
     dest_addr: SocketAddr,
 ) -> Result<Option<std::net::UdpSocket>, HboneUdpSocketOpenError> {
-    let Some(target) = registered_pod_target_for_udp_destination(
-        &state.env_config.mesh_node_waypoint_pod_registry_dir,
-        dest_addr.ip(),
-    ) else {
+    let Some(target) = registered_pod_target_for_udp_destination(registry_dir, dest_addr.ip())
+    else {
         return Ok(None);
     };
 
@@ -2513,7 +2581,7 @@ fn maybe_bind_pod_netns_udp_relay_socket(
 
 #[cfg(not(target_os = "linux"))]
 fn maybe_bind_pod_netns_udp_relay_socket(
-    _state: &ProxyState,
+    _registry_dir: &str,
     _dest_addr: SocketAddr,
 ) -> Result<Option<std::net::UdpSocket>, HboneUdpSocketOpenError> {
     Ok(None)
@@ -3302,6 +3370,34 @@ mod tests {
             Some("hbone")
         );
         assert_eq!(summary.request_user_agent.as_deref(), Some("hbone-client"));
+        // Issue #6769: built after the relay ended, so the delivery boundary is
+        // observed for an interrupted relay and a completed one alike.
+        assert_eq!(
+            summary.response_delivery,
+            crate::plugins::ResponseDelivery::Observed
+        );
+        let completed = build_hbone_relay_summary(
+            &proxy,
+            &ctx,
+            "CONNECT",
+            "tcp://backend.example:15008".to_string(),
+            None,
+            Instant::now(),
+            Instant::now(),
+            3.5,
+            0,
+            1,
+            1,
+            true,
+            false,
+            None,
+        );
+        assert!(completed.body_completed);
+        assert!(!completed.client_disconnected);
+        assert_eq!(
+            completed.response_delivery,
+            crate::plugins::ResponseDelivery::Observed
+        );
     }
 
     // Issue #5765: the datagram relay reports WHY it ended. These drive the

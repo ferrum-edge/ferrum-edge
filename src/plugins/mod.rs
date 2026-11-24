@@ -69,6 +69,7 @@ pub mod builtin_parity;
 pub mod chargeback;
 pub(crate) mod charged_decode;
 pub mod compression;
+pub mod config_contract;
 pub mod correlation_id;
 pub mod cors;
 #[doc(hidden)]
@@ -139,6 +140,7 @@ pub use builtin_parity::{
     BUILTIN_PLUGIN_PARITY_META, BUILTIN_WEBSOCKET_FRAMING_PLUGINS, BuiltinPluginClassification,
     BuiltinPluginParityMeta, builtin_plugin_parity_meta,
 };
+pub use config_contract::PluginConfigContract;
 pub use utils::PluginHttpClient;
 
 use async_trait::async_trait;
@@ -149,6 +151,16 @@ use serde::ser::{Serialize, SerializeMap};
 use serde_json::Value;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
+
+/// String-keyed metadata attached to a request, a stream session, or their
+/// transaction summaries.
+///
+/// Keyed with `ahash`'s randomly seeded hasher rather than std's SipHash-1-3:
+/// mesh telemetry stamps and reads a few dozen of these keys on every request,
+/// and SipHash was about 5% of a mesh sidecar's CPU. The per-process random
+/// seed keeps keys a peer can influence from being turned into collision
+/// floods, as for the UDP session maps.
+pub type MetadataMap = HashMap<String, String, ahash::RandomState>;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
@@ -271,19 +283,44 @@ pub const REQUEST_ID_METADATA_KEY: &str = "request_id";
 /// (health-neutral).
 pub const ROUTE_REQUEST_TIMEOUT_METADATA_KEY: &str = "route_request_timeout";
 
-/// Parser-level limits contributed by a WebSocket size-policy plugin.
-///
-/// The relay combines every applicable instance before either peer is read,
-/// so the strictest frame and reassembled-message ceilings are enforced by
-/// tungstenite itself rather than by a post-reassembly `on_ws_frame` hook.
+/// Parser-level limits for one WebSocket relay direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WebSocketSizeLimits {
+pub struct WebSocketDirectionSizeLimits {
     /// Maximum payload bytes accepted in any one wire frame.
     pub max_frame_bytes: usize,
     /// Maximum payload bytes accepted after continuation reassembly.
     pub max_message_bytes: usize,
     /// RFC 6455 Close reason paired with code 1009 on either violation.
     pub close_reason: Arc<str>,
+}
+
+/// Parser-level limits contributed by a WebSocket size-policy plugin.
+///
+/// The relay combines every applicable instance before either peer is read,
+/// so the strictest frame and reassembled-message ceilings are enforced by
+/// tungstenite itself rather than by a post-reassembly `on_ws_frame` hook.
+/// Each direction is combined independently: `client_to_backend` bounds the
+/// client-side framer (frames the client sends), `backend_to_client` bounds
+/// the backend-side framer (frames the backend sends).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketSizeLimits {
+    /// Limits applied to frames read from the client.
+    pub client_to_backend: WebSocketDirectionSizeLimits,
+    /// Limits applied to frames read from the backend.
+    pub backend_to_client: WebSocketDirectionSizeLimits,
+}
+
+impl WebSocketSizeLimits {
+    /// The limits that bound frames travelling in `direction`.
+    pub fn for_direction(
+        &self,
+        direction: WebSocketFrameDirection,
+    ) -> &WebSocketDirectionSizeLimits {
+        match direction {
+            WebSocketFrameDirection::ClientToBackend => &self.client_to_backend,
+            WebSocketFrameDirection::BackendToClient => &self.backend_to_client,
+        }
+    }
 }
 
 /// gRPC-only (single protocol).
@@ -1343,11 +1380,15 @@ pub enum UdpDatagramDirection {
 /// on the proxy opts in via `requires_udp_datagram_hooks()`. Fired in both
 /// directions: client→backend (before forwarding) and backend→client (before
 /// relaying the response to the client).
-#[allow(dead_code)]
 pub struct UdpDatagramContext<'a> {
     /// Canonical client IP identity. IPv4-mapped IPv6 is normalized once when
     /// the UDP/DTLS session is created so per-datagram hooks only clone this Arc.
     pub client_ip: Arc<str>,
+    /// The same canonical client identity as a typed address, computed once
+    /// per session alongside [`Self::client_ip`], so a hook that keys or masks
+    /// by address (for example `udp_rate_limiting`'s IPv6 prefix grouping)
+    /// never re-parses or re-allocates per datagram.
+    pub client_ip_addr: std::net::IpAddr,
     pub proxy_id: Arc<str>,
     pub proxy_name: Option<Arc<str>>,
     pub listen_port: u16,
@@ -1369,6 +1410,16 @@ pub struct UdpDatagramContext<'a> {
     /// that `build_udp_stream_summary` / `build_dtls_stream_summary` read at
     /// disconnect. `None` when there is no session map to attach to (or in tests).
     pub metadata_sink: Option<UdpMetadataSink<'a>>,
+    /// `true` only for the first client→backend datagram of a session whose
+    /// `on_stream_connect` admission chain already ran for it: the packet that
+    /// opened a plain-UDP session (the proxy runs this hook on it during
+    /// session setup, after admission evaluated the same packet), and the first
+    /// decrypted application datagram of a terminating-DTLS session (admitted
+    /// at handshake accept). A plugin that makes one first-contact decision in
+    /// both hooks (for example a fault-injection abort roll) must not decide it
+    /// a second time here. `false` for every later datagram and for every
+    /// backend→client datagram.
+    pub admission_datagram: bool,
 }
 
 /// Sink for recording session-scoped metadata from the per-datagram UDP/DTLS
@@ -1382,12 +1433,12 @@ pub struct UdpDatagramContext<'a> {
 /// `log_to_stdout`, matching the TCP behavior.
 #[derive(Clone, Copy)]
 pub struct UdpMetadataSink<'a> {
-    map: &'a std::sync::Mutex<HashMap<String, String>>,
+    map: &'a std::sync::Mutex<MetadataMap>,
 }
 
 impl<'a> UdpMetadataSink<'a> {
     /// Wrap a session metadata map as a sink.
-    pub fn new(map: &'a std::sync::Mutex<HashMap<String, String>>) -> Self {
+    pub fn new(map: &'a std::sync::Mutex<MetadataMap>) -> Self {
         Self { map }
     }
 
@@ -1399,7 +1450,7 @@ impl<'a> UdpMetadataSink<'a> {
     /// cannot erase earlier hits (last-write-wins). Holding the lock across the
     /// whole read-modify-write also keeps the concurrent bidirectional datagram
     /// tasks from racing on the same key.
-    pub fn update<F: FnOnce(&mut HashMap<String, String>)>(&self, f: F) {
+    pub fn update<F: FnOnce(&mut MetadataMap)>(&self, f: F) {
         let mut map = self
             .map
             .lock()
@@ -1570,15 +1621,85 @@ pub struct WsDisconnectContext {
     /// Consumer identity associated with the upgrade (copied from
     /// the originating `RequestContext`).
     pub consumer_username: Option<String>,
+    /// Namespace (mapped Consumer or external principal and its realm) of
+    /// `consumer_username`, from the originating `RequestContext`. Billing
+    /// keys on it rather than on the display string (GHSA-q9vj-rf66-3j58).
+    #[doc(hidden)]
+    pub principal_origin: Option<utils::principal::PrincipalOrigin>,
     /// Authentication mechanism that succeeded for the upgrade request.
     pub auth_method: Option<&'static str>,
     /// Correlation ID / tracing metadata inherited from the upgrade request.
-    pub metadata: HashMap<String, String>,
+    pub metadata: MetadataMap,
     /// Ownership generation captured at WebSocket upgrade admission. Not
     /// serialized; used by `proxy_alerts` to reject stale disconnect samples
     /// after delete→recreate of the same proxy ID.
     #[doc(hidden)]
     pub proxy_lifecycle_generation: Option<u64>,
+}
+
+/// Metadata key the projected WebSocket session-end record carries so the
+/// record is locatable at the time the session ended, not only when it was
+/// admitted.
+pub const WS_SESSION_END_TIMESTAMP_METADATA_KEY: &str = "websocket.timestamp_disconnected";
+
+impl WsDisconnectContext {
+    /// Project a WebSocket session end into the HTTP-family access-log record
+    /// (`TransactionSummary`).
+    ///
+    /// This is the one session-end record shape every `TransactionSummary`
+    /// log sink (`stdout_logging`, `http_logging`, `tcp_logging`,
+    /// `udp_logging`, `kafka_logging`, `loki_logging`) emits from
+    /// `on_ws_disconnect` (issue #7144), so a sink choice never decides whether
+    /// in-session WebSocket failures are visible.
+    ///
+    /// The handshake `log()` already emitted the upgrade row (usually without
+    /// `error_class`). In-session faults live on this context; the projection
+    /// lets operators grep the same `error_class` key. Method, path, and status
+    /// are the values captured at upgrade admission (`GET`/`101` for HTTP/1.1,
+    /// `CONNECT`/`200` for RFC 8441/9220 Extended CONNECT) so a rewritten
+    /// backend target cannot corrupt those fields. BASE schema only — this is
+    /// not the `websocket_disconnect` capability family `ws_logging` emits.
+    ///
+    /// `timestamp_received` stays the admission time and `latency_total_ms` the
+    /// session duration. A session has no request/response phase split, so
+    /// every other latency is the [`LATENCY_UNKNOWN_MS`] "not observed"
+    /// sentinel rather than a fabricated `0.0` or the session duration
+    /// relabelled as gateway processing; the end of the session is carried in
+    /// [`WS_SESSION_END_TIMESTAMP_METADATA_KEY`].
+    pub fn session_end_summary(&self) -> TransactionSummary {
+        let mut metadata = self.metadata.clone();
+        metadata.insert(
+            WS_SESSION_END_TIMESTAMP_METADATA_KEY.to_string(),
+            self.timestamp_disconnected.clone(),
+        );
+        TransactionSummary {
+            namespace: self.namespace.clone(),
+            timestamp_received: self.timestamp_connected.clone(),
+            client_ip: self.client_ip.clone(),
+            consumer_username: self.consumer_username.clone(),
+            principal_origin: self.principal_origin,
+            auth_method: self.auth_method,
+            http_method: self.http_method.clone(),
+            request_path: self.request_path.clone(),
+            proxy_id: Some(self.proxy_id.clone()),
+            proxy_name: self.proxy_name.clone(),
+            backend_target: Some(self.backend_target.clone()),
+            response_status_code: self.handshake_status_code,
+            latency_total_ms: self.duration_ms,
+            latency_gateway_processing_ms: LATENCY_UNKNOWN_MS,
+            latency_backend_ttfb_ms: LATENCY_UNKNOWN_MS,
+            latency_backend_total_ms: LATENCY_UNKNOWN_MS,
+            latency_plugin_execution_ms: LATENCY_UNKNOWN_MS,
+            latency_plugin_external_io_ms: LATENCY_UNKNOWN_MS,
+            latency_gateway_overhead_ms: LATENCY_UNKNOWN_MS,
+            bytes_sent: self.bytes_client_to_backend,
+            bytes_received: self.bytes_backend_to_client,
+            error_class: self.error_class,
+            metadata,
+            proxy_lifecycle_generation: self.proxy_lifecycle_generation,
+            ..TransactionSummary::default()
+        }
+    }
 }
 
 /// One-request/session cache for the authoritative, canonical client IP.
@@ -1619,8 +1740,6 @@ impl CorrelationIdState {
         generated: bool,
     ) -> bool {
         let publish_canonical = self.canonical.is_none();
-        self.instances
-            .insert(instance_key.to_string(), request_id.clone());
         self.generated_headers
             .retain(|(existing, _)| !existing.eq_ignore_ascii_case(header_name));
         if generated {
@@ -1628,8 +1747,11 @@ impl CorrelationIdState {
                 .push((header_name.to_string(), request_id.clone()));
         }
         if publish_canonical {
-            self.canonical = Some(request_id);
+            self.canonical = Some(request_id.clone());
         }
+        // The instance slot takes ownership of the caller's value, so only the
+        // canonical and generated-provenance copies allocate.
+        self.instances.insert(instance_key.to_string(), request_id);
         publish_canonical
     }
 
@@ -1654,7 +1776,10 @@ impl CorrelationIdState {
         })
     }
 
-    pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+    pub(crate) fn project_correlation_ids<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &mut HashMap<String, String, MS>,
+    ) {
         for (key, value) in &self.instances {
             metadata.insert(key.clone(), value.clone());
         }
@@ -1716,7 +1841,10 @@ impl CanonicalClientIpCache {
         self.correlation_ids.is_correlation_header(name)
     }
 
-    fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+    fn project_correlation_ids<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &mut HashMap<String, String, MS>,
+    ) {
         self.correlation_ids.project_correlation_ids(metadata);
     }
 }
@@ -2009,6 +2137,15 @@ pub trait PeerConnectionWatch: Send + Sync {
 
     /// Non-blocking check for an already-closed transport.
     fn is_closed(&self) -> bool;
+
+    /// Whether an already-closed transport was ended by the client (a close it
+    /// sent, or a stateless reset) rather than by the gateway. An idle-timeout
+    /// expiry is local and never counts.
+    /// Only this proves a client abort (issue #6772); the default, for a
+    /// transport that cannot tell, is `false`.
+    fn closed_by_peer(&self) -> bool {
+        false
+    }
 }
 
 /// Cloneable handle to a [`PeerConnectionWatch`].
@@ -2028,6 +2165,11 @@ impl PeerConnectionSignal {
     /// See [`PeerConnectionWatch::is_closed`].
     pub fn is_closed(&self) -> bool {
         self.0.is_closed()
+    }
+
+    /// See [`PeerConnectionWatch::closed_by_peer`].
+    pub fn closed_by_peer(&self) -> bool {
+        self.0.closed_by_peer()
     }
 }
 
@@ -2175,6 +2317,12 @@ pub(crate) struct A2aGatewayClaim {
     /// Detected binding (`jsonrpc`, `rest`, or `grpc`).
     pub(crate) binding: &'static str,
     pub(crate) is_agent_card: bool,
+    /// Whether the owning instance rewrites Agent Card URLs
+    /// (`discovery.rewrite_agent_card_urls`). A sibling instance that rewrites
+    /// cards refuses a card call this owner would answer un-rewritten, because
+    /// first-wins ownership means only the owner's response handling applies
+    /// (GHSA-q25c-76f4-fp7h).
+    pub(crate) rewrites_agent_card: bool,
     pub(crate) streaming: bool,
     /// `AgentCard` wire layout the matched gRPC service is CONFIGURED to carry,
     /// resolved once at detection so the response path never re-derives a
@@ -2201,6 +2349,22 @@ pub(crate) struct A2aGatewayClaim {
     /// mutable header map. The ordinary transform path needs no such flag: the
     /// core already runs the shared invalidation for it.
     pub(crate) card_body_replaced: bool,
+    /// The exact JSON-RPC request bytes the arrival-time classification above
+    /// was decided over, when the context held them as [`bytes::Bytes`].
+    ///
+    /// A refcounted handle, not a copy. The final backend-visible request-body
+    /// hook compares the finalized body against it: byte-identical bytes are
+    /// provably classified exactly as they were at arrival, so the hook skips
+    /// re-parsing them, while any difference re-runs the full classification
+    /// and refuses a change of response-shaping operation class the response
+    /// phase above was not set up for.
+    pub(crate) classified_request_body: Option<bytes::Bytes>,
+    /// Whether the configured A2A version header was present when that
+    /// JSON-RPC classification was decided. An unknown method is classifiable
+    /// only with it, so the byte-identity shortcut above also requires the
+    /// finalized headers to still carry it when it was present at arrival
+    /// (GHSA-q25c-76f4-fp7h).
+    pub(crate) classified_with_version_header: bool,
 }
 
 /// Lifecycle of an Agent Card rewrite `a2a_gateway` claimed on the response path
@@ -2290,6 +2454,41 @@ impl From<&RequestContext> for HboneReuseContext {
     }
 }
 
+/// Lazily-allocated shared handle (`OnceLock<T>`).
+///
+/// Hot-path requests that never touch an `Arc`-backed latch pay zero heap
+/// allocations, while cloning initializes the cell on `&self` first so both
+/// the original and every clone share the exact same handle (preserving
+/// `T::clone` sharing semantics).
+#[derive(Debug)]
+pub(crate) struct LazyShared<T>(std::sync::OnceLock<T>);
+
+impl<T> LazyShared<T> {
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+
+    #[inline]
+    pub(crate) fn get(&self) -> Option<&T> {
+        self.0.get()
+    }
+
+    #[inline]
+    pub(crate) fn get_or_init(&self, f: impl FnOnce() -> T) -> &T {
+        self.0.get_or_init(f)
+    }
+}
+
+impl<T: Clone + Default> Clone for LazyShared<T> {
+    fn clone(&self) -> Self {
+        let value = self.0.get_or_init(T::default).clone();
+        let out = std::sync::OnceLock::new();
+        let _ = out.set(value);
+        Self(out)
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -2336,6 +2535,17 @@ pub struct RequestContext {
     /// wrapper. Its wire signature binds the literal bytes the client signed.
     /// Never route, authorize, or log this value.
     raw_path: Option<hmac_auth::HmacWirePath>,
+    /// The client's wire method, retained only when a frontend rewrote
+    /// [`Self::method`] (HTTP/2 and HTTP/3 WebSocket Extended CONNECT become
+    /// `GET`). Private to `hmac_auth`'s RFC 9421 `@method` derivation; route,
+    /// policy, and backend semantics keep reading [`Self::method`].
+    hmac_wire_method: Option<String>,
+    /// The client's request-target, retained only when it cannot be
+    /// reconstructed from the path and query (an HTTP/1.1 absolute-form
+    /// target, an authority-form CONNECT, or a present-but-empty query).
+    /// Private to `hmac_auth`'s RFC 9421 `@request-target` derivation through
+    /// the debug-redacted wrapper.
+    hmac_wire_request_target: Option<hmac_auth::HmacWirePath>,
     /// Canonical client-request authority for authentication mechanisms that
     /// bind signatures to the selected virtual host. Hostnames are
     /// ASCII-lowercased with a trailing DNS dot removed; an explicit
@@ -2400,6 +2610,13 @@ pub struct RequestContext {
     /// from `raw_headers`. Keeps materialization one-shot while preserving the
     /// raw map for policy evaluation (mirrors query-param materialization).
     headers_materialized: bool,
+    /// Request-header passthrough state (issue #6671). `Some` only on a routed
+    /// request no plugin can observe, whose wire block projects 1:1 onto the
+    /// materialized map: `headers` then stays empty and unmaterialized, and
+    /// backend dispatch reads [`Self::request_headers_view`] instead.
+    /// [`Self::materialize_headers`] ends passthrough and builds the exact map
+    /// the eager path would have held.
+    request_header_passthrough: Option<crate::proxy::request_headers::RequestHeaderPassthrough>,
     /// Raw query string stored for lazy parsing. `None` when empty. Preserved
     /// after query-param materialization so security plugins can inspect raw
     /// duplicate pairs. Unmodified when no query mutation/strip applies.
@@ -2422,16 +2639,15 @@ pub struct RequestContext {
     /// or framing headers. Kept out of public metadata so a client or plugin
     /// cannot forge cache eligibility.
     replay_request_body_empty_proven: bool,
-    /// Whether either decoded or raw query-param materialization has already
-    /// populated `query_params`. Keeps materialization one-shot while preserving
+    /// Whether query-param materialization has already populated
+    /// `query_params`. Keeps materialization one-shot while preserving
     /// `raw_query_string` for inspection.
     query_params_materialized: bool,
-    /// Parsed query parameters. Empty until `materialize_query_params()` or
-    /// `materialize_query_params_raw()` is called.
+    /// Parsed query parameters. Empty until `materialize_query_params()` is
+    /// called.
     ///
-    /// HTTP/1.1 and HTTP/2 materialize percent-decoded query params for
-    /// historical compatibility. HTTP/3 materializes raw query params unless
-    /// an active plugin explicitly requires the decoded representation.
+    /// HTTP/1.1, HTTP/2, and HTTP/3 all materialize percent-decoded query
+    /// params, so a plugin sees the same map on every frontend (#6580).
     /// After a query transform, this map is rebuilt from the ordered outbound
     /// representation (last occurrence wins) so later plugins see coherent
     /// state without re-parsing the wire query.
@@ -2492,7 +2708,7 @@ pub struct RequestContext {
     /// request path reads it back to decide the pre-commitment terminal.
     /// Carries the bounded class only, never credential material.
     pub(crate) authorization_termination_latch:
-        crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        LazyShared<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
     /// Transport-level close signal for the client connection this request
     /// arrived on (issue #3815).
     ///
@@ -2527,6 +2743,15 @@ pub struct RequestContext {
     /// metadata. Keeping a credential/body-derived digest here also prevents
     /// transaction-log serialization.
     soap_ws_security_authenticated_body_digest: Option<[u8; 32]>,
+    /// The validated request trailer block the `grpc_web` translation owner
+    /// split off a gRPC-Web request body. Request-private typed state rather
+    /// than `metadata`: the trailer frame is already gone from the body, so a
+    /// plugin deleting or rewriting a metadata entry must not be able to make
+    /// dispatch silently drop (or forge) these trailers. Only `grpc_web` can
+    /// populate it; every gRPC dispatch path (H1/H2, H3, retry replay) reads it,
+    /// and the H1/H2 body-hook context hands it back to the live context in
+    /// [`Self::adopt_final_request_body_hook_terminals`].
+    pub(crate) grpc_web_request_trailers: grpc_web::StagedRequestTrailers,
     pub timestamp_received: DateTime<Utc>,
     /// Whether the request's gRPC deadline state has been initialized from the
     /// inbound `grpc-timeout` value. Initialization happens once, immediately
@@ -2536,17 +2761,33 @@ pub struct RequestContext {
     /// Keep this source fact separate from the effective budget so an earlier
     /// default policy cannot satisfy a later `reject_no_deadline` policy.
     pub(crate) grpc_deadline_had_valid_client_timeout: bool,
+    /// Set by every enabled `request_transformer` with body rules that ran
+    /// `before_proxy` for this request. Proxy core then inspects the FINAL
+    /// outbound headers for content-integrity fields (`Content-Digest`,
+    /// `Repr-Digest`, `Digest`, `Content-MD5`) and retires them when the body
+    /// rules may rewrite the request
+    /// (`crate::proxy::retire_stale_request_integrity_headers`). A plain bool
+    /// so the enrollment itself never allocates.
+    pub(crate) request_body_integrity_retirement: bool,
     /// Monotonic receipt instant captured with the request context. Effective
     /// budgets are added to this exact anchor, independent of wall-clock jumps.
     pub(crate) grpc_deadline_received_at: tokio::time::Instant,
-    /// Whether the gateway's full ordered deadline-policy preflight completed.
-    /// Direct plugin callers that skip the preflight still apply each instance
-    /// from `before_proxy` for backward-compatible composition.
-    pub(crate) grpc_deadline_preflight_complete: bool,
     /// Effective receipt-anchored gRPC budget after every `grpc_deadline`
     /// policy has applied its default/cap decision. Kept separate from the
     /// relative header forwarded upstream so retries never re-arm the budget.
     pub(crate) grpc_deadline_budget_ms: Option<u64>,
+    /// The policy budget BEFORE any `headroom_ms` reservation: the client
+    /// deadline (or injected default) after every cap applied so far. Each
+    /// `grpc_deadline` instance recomputes from this value, so the headroom is
+    /// reserved exactly once and composition does not depend on instance order.
+    pub(crate) grpc_deadline_policy_budget_ms: Option<u64>,
+    /// The tightest `max_deadline_ms` any `grpc_deadline` instance has applied
+    /// to this request. Kept in typed state so a default injected by a LATER
+    /// instance is still clamped by an earlier instance's ceiling.
+    pub(crate) grpc_deadline_ceiling_ms: Option<u64>,
+    /// The largest `headroom_ms` any `grpc_deadline` instance requested for
+    /// this request. Reserved once from a client-supplied deadline.
+    pub(crate) grpc_deadline_headroom_ms: u64,
     /// Single monotonic absolute deadline shared by request phases, backend
     /// attempts, retry backoff, and streaming response bodies.
     pub(crate) grpc_deadline_at: Option<tokio::time::Instant>,
@@ -2608,6 +2849,13 @@ pub struct RequestContext {
     /// Latest dispatch outcome, retaining possible execution across retries.
     /// Only trusted transport code may set this; it is not serialized.
     backend_dispatch_state: BackendDispatchState,
+    /// Error class of the LATEST dispatch attempt (`None` when it produced a
+    /// backend response or nothing was dispatched). Written beside
+    /// `backend_dispatch_state` by the same trusted transport call, so a
+    /// response-phase plugin can tell a gateway-authored transport-failure
+    /// response (timeout, reset, refused) from a real origin status without
+    /// reading plugin-writable metadata. Not serialized.
+    last_backend_dispatch_error_class: Option<crate::retry::ErrorClass>,
     /// Diagnostic-reference slot of this request (issue #5767). `None` unless
     /// `FERRUM_DIAGNOSTIC_REFS` enabled the store. Set only by the HTTP
     /// frontends; the terminal transaction log records the request's detail
@@ -2617,6 +2865,12 @@ pub struct RequestContext {
     /// unless an exporting `otel_tracing` instance sampled this request. Not
     /// visible to plugins and not serialized.
     backend_attempt_trace: Option<Arc<crate::plugins::otel_tracing::BackendAttemptTrace>>,
+    /// The tracing plugin that established this request's gateway `SERVER`
+    /// span (`trace_id` / `span_id` / `traceparent` in `metadata`). First
+    /// claim wins; a sibling tracing plugin then reuses that identity instead
+    /// of re-deriving it. Typed so a plugin-written metadata value can neither
+    /// claim nor release it. Not serialized.
+    gateway_trace_owner: Option<crate::plugins::otel_tracing::GatewayTraceOwner>,
     /// Whether the gateway selected the health-neutral retained-response
     /// capacity terminal (`503` / gRPC `RESOURCE_EXHAUSTED`) or its deterministic
     /// JSON output-policy counterpart (`502`) for this request.
@@ -2702,7 +2956,7 @@ pub struct RequestContext {
     /// triggered instances on the published chain.
     plugin_trigger_decisions: Vec<(u64, bool)>,
     /// Extra metadata plugins can attach
-    pub metadata: HashMap<String, String>,
+    pub metadata: MetadataMap,
     /// Most complete built-in AI usage snapshot for Prometheus export.
     /// Kept outside public metadata so backend/operator metadata cannot mint or
     /// overwrite trusted token and cost series.
@@ -2734,6 +2988,14 @@ pub struct RequestContext {
     /// diagnostics and policy calls. Kept outside public metadata so plugin
     /// configuration details do not enter transaction logs.
     request_headers_to_redact: Option<Arc<Vec<String>>>,
+    /// Names every late request-trailer boundary strips for this route: the
+    /// credential locations above plus every owned gateway-assertion header
+    /// (`claim_headers` destinations), precomputed by the plugin cache.
+    request_trailer_strip_headers: Option<Arc<Vec<String>>>,
+    /// Every gateway-assertion request header a plugin on the matched route
+    /// owns, whatever any trigger decides (plugin cache view). `None` when the
+    /// route owns none.
+    route_owned_request_assertion_headers: Option<Arc<Vec<String>>>,
     /// Buffered response policy provenance, present only while the ordered
     /// `after_proxy` chain is processing a merged gRPC header+trailer view.
     /// Shared through `Arc` so the rare hook-preflight context clone remains
@@ -2771,6 +3033,13 @@ pub struct RequestContext {
     /// the shared reject finalizer can remove transport-owned handshake fields
     /// after every ordered response hook without reclassifying or allocating.
     websocket_response_boundary: bool,
+    /// Set by the process-global `prometheus_metrics` request hook when it
+    /// observed this transaction. Gates the gRPC message scanners (see
+    /// [`crate::plugins::mesh::prometheus_helpers::request_observes_grpc_messages`]).
+    ///
+    /// A typed bit rather than a `metadata` marker so the per-request hook
+    /// allocates nothing; it never reaches transaction logs.
+    prometheus_metrics_observed: bool,
     /// Per-request memo of duplicate-object-member screens over governed JSON
     /// bodies (advisory `GHSA-c78j-5w9p-cpq6`). `openapi_validator`,
     /// `body_validator`, and `ai_tool_governor` can all inspect the same
@@ -2862,6 +3131,24 @@ pub struct RequestContext {
     /// of public metadata so a custom plugin cannot opt an unrelated rejection
     /// into that contract.
     pub(crate) serverless_terminate_response: bool,
+    /// Set when a plugin whose short-circuit is an origin-authored
+    /// representation ([`Plugin::rejects_with_origin_response`]) rejected
+    /// this request. Noted through `&self` by the rejection funnel. Gateway
+    /// response repairs that apply only to gateway-authored errors — the
+    /// `WWW-Authenticate` challenge guarantee (issue #6774) — skip such a
+    /// response. Kept private so request metadata cannot forge it.
+    pub(crate) origin_rejection: std::sync::OnceLock<()>,
+    /// Set when gateway policy replaced the response this request was about
+    /// to send — a body-policy, size, representation, header-policy, or
+    /// `after_proxy` rejection — so an origin short-circuit that was replaced
+    /// is no longer treated as origin-authored (issue #6774).
+    pub(crate) gateway_response_replacement: std::sync::OnceLock<()>,
+    /// `WWW-Authenticate` challenge for re-authenticating the committed
+    /// principal, recorded by the committing mechanism when the mechanism name
+    /// alone does not decide it — a `jwks_auth` principal authenticated with a
+    /// DPoP-bound token answers `DPoP error="invalid_token"` (RFC 9449 §7.1).
+    /// Read by the authorization-expiry terminals (issue #6774).
+    pub(crate) reauthentication_challenge: Option<&'static str>,
     /// The framed unary DATA payload and terminal trailers a validated
     /// `serverless_function` terminate invocation authored for this request.
     ///
@@ -2892,6 +3179,24 @@ pub struct RequestContext {
     /// cannot safely produce bounded provider-visible bytes. Kept private so
     /// request metadata cannot spoof or clear the fail-closed decision.
     pub(crate) ai_prompt_compressor_marker_reject_status: Option<u16>,
+    /// Final-hook rejection staged by `request_transformer` when its JSON body
+    /// rules met a document they cannot evaluate faithfully (duplicate object
+    /// member names, an invalid surrogate escape, an exhausted duplicate-key
+    /// screen budget, or a well-formed document `serde_json` could not
+    /// materialize; GHSA-pq95-952r-2x32). `transform_request_body*` has no
+    /// rejection channel, so it records the PRODUCING instance's private id
+    /// here and only that instance's `on_final_request_body_with_context`
+    /// consumes it and refuses the request: a header-only or disabled sibling
+    /// can neither issue nor swallow another instance's refusal. The first
+    /// producer owns it. Kept private so request metadata cannot spoof or clear
+    /// the fail-closed decision.
+    pub(crate) request_transformer_ambiguous_body_refusal: Option<u64>,
+    /// Response counterpart of `request_transformer_ambiguous_body_refusal`:
+    /// the producing `response_transformer` instance's id, recorded by its body
+    /// transform and consumed (and turned into a `502`) by the same instance's
+    /// `finalize_client_visible_response_body`, so the ambiguous backend bytes
+    /// are never published (GHSA-pq95-952r-2x32).
+    pub(crate) response_transformer_ambiguous_body_refusal: Option<u64>,
     /// Encoding selected by the built-in compression plugin for the response it
     /// will create at the gateway. This is authoritative ownership state for
     /// distinguishing planned gateway compression from an already-encoded
@@ -2943,6 +3248,9 @@ pub struct RequestContext {
     /// owning transform must emit these bytes so the backend never sees a
     /// compressed body without `Content-Encoding`.
     compression_staged_request_plaintext: Option<Vec<u8>>,
+    /// The request-decode charge that covers the staged plaintext until the
+    /// owning transform emits it.
+    compression_staged_decode_charge: crate::proxy::response_buffer_budget::DecodeChargeHold,
     /// Set when the response-encode owner cannot produce bytes that match a
     /// previously committed gateway `Content-Encoding`. Shared transform loops
     /// must restore an identity representation (or otherwise fail closed)
@@ -3163,6 +3471,10 @@ pub struct RequestContext {
     /// times these hooks inline. Clone-safe via Arc; stays 0 on the H3 path
     /// (which never calls the finalizer), so it never double-counts there.
     pub reject_hook_execution_ns: Arc<std::sync::atomic::AtomicU64>,
+    /// Set once a sidecar mesh-mTLS, HBONE, or Unix-socket dispatcher proved
+    /// the client abandoned its upload before the backend response head
+    /// (issue #6776). Read into the terminal summary's `client_disconnected`.
+    pub(crate) proven_client_upload_abort: crate::proxy::upload_pump::ProvenClientUploadAbort,
     /// Receivers for mirror response metadata from every dispatched
     /// `request_mirror` instance on this request.
     ///
@@ -3218,6 +3530,23 @@ pub struct RequestContext {
     /// H3 request handlers; a default-constructed context leaves it `0`, which
     /// falls back to the gate's own hard ceiling.
     pub max_response_body_size_bytes: usize,
+    /// Transport evidence about whether request DATA may follow the head,
+    /// recorded once by the frontend that built this context.
+    ///
+    /// * `Some(false)` — the transport PROVED the request ends with its head:
+    ///   an HTTP/1.1 request with no body framing (or `Content-Length: 0`), or
+    ///   an HTTP/2 HEADERS frame carrying END_STREAM.
+    /// * `Some(true)` — a body may follow: declared HTTP/1.1 framing, an
+    ///   HTTP/2 stream left open after HEADERS, and every HTTP/3 request (the
+    ///   `h3` request stream exposes no end-of-stream signal before the first
+    ///   read).
+    /// * `None` — no transport evidence (synthetic and test contexts); body
+    ///   governance falls back to the declared `Content-Length` /
+    ///   `Transfer-Encoding` framing.
+    ///
+    /// Read by request-body policies that must not let an omitted
+    /// `Content-Length` / `Content-Type` stand in for proof of an empty body.
+    pub(crate) inbound_request_body_may_follow: Option<bool>,
     /// Strictest active *route-scoped* request-body ceiling enforced by this
     /// request's matched plugin set (`Plugin::enforced_request_body_limit`),
     /// or `None` when no matched plugin enforces one.
@@ -3235,17 +3564,28 @@ pub struct RequestContext {
     /// or `None` when no matched plugin enforces one. Same fold-at-use contract
     /// as [`Self::route_request_body_limit_bytes`].
     pub route_response_body_limit_bytes: Option<u64>,
+    /// Whether this request's matched plugin view can attach a streaming
+    /// response inspector that rewrites the client-visible bytes after
+    /// `after_proxy` (`PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS`, e.g. an
+    /// `sse` `retry_ms` prefix or an `ai_*` stream inspector). Precomputed at
+    /// plugin-cache build and stamped with the route body ceilings by
+    /// `PluginCacheRequestView::stamp_route_body_policy`. `None` means the
+    /// context was never stamped and must be read as "may rewrite": a strict
+    /// whole-body policy then cannot treat a backend `Content-Length` as a
+    /// proof of the final size.
+    pub route_may_rewrite_response_stream: Option<bool>,
     /// Shared counter for request body bytes received from the client,
     /// populated by proxy body handlers and read by the summary builders.
     ///
     /// Populated at four points in the request path:
     /// 1. Buffered-collect sites (`Incoming::collect().await`): written once
     ///    with the final `body_bytes.len()` after collection completes.
-    /// 2. Streaming forward with size limit (`SizeLimitedIncoming`): written
-    ///    once after the backend request completes, from the cloned counter
-    ///    handle obtained via `SizeLimitedIncoming::bytes_seen_handle()`.
+    /// 2. Streaming forward with size limit (`SizeLimitedIncoming`): updated
+    ///    per polled frame through the counter shared at construction
+    ///    (`SizeLimitedIncoming::new_with_counter`).
     /// 3. Streaming forward without size limit (`CountingIncoming` wrapping
-    ///    the `Incoming` body): same handle-capture pattern.
+    ///    the `Incoming` body): same shared-counter pattern
+    ///    (`CountingIncoming::new_with_counter`).
     /// 4. Prebuffered bodies (populated earlier by plugins like
     ///    `request_mirror`): copied from the buffered `Bytes::len()`.
     ///
@@ -3316,7 +3656,13 @@ pub struct RequestContext {
     /// re-resolves this from the upstream snapshot automatically. Plugins that
     /// override a direct backend host/port can set this field explicitly when
     /// the destination uses different mTLS materials.
-    pub route_override_resolved_tls: Option<BackendTlsConfig>,
+    ///
+    /// Shared (`Arc`) so a producer that precomputed its TLS policy at config
+    /// load (`mesh_route_dispatch` per-rule `backend_tls`) publishes it with a
+    /// refcount bump instead of deep-cloning the SAN allow-list and paths on
+    /// every matched request. Equality is by value, so claim witnesses that
+    /// compare it keep their exact-configuration semantics.
+    pub route_override_resolved_tls: Option<Arc<BackendTlsConfig>>,
     /// Plugin-set override for the proxy's backend response/read timeout.
     /// Used by mesh L7 route dispatch so route-local policy follows the
     /// matched predicate even when the hot router selected a later fallback
@@ -3363,8 +3709,9 @@ pub struct RequestContext {
     pub route_override_backend_connect_timeout_ms: Option<u64>,
     /// Plugin-set override for the proxy's retry policy. Outer `None` means
     /// no override; `Some(None)` intentionally clears the selected proxy's
-    /// retry policy for this route.
-    pub route_override_retry: Option<Option<RetryConfig>>,
+    /// retry policy for this route. Shared (`Arc`) so a route-local policy
+    /// compiled at config load is published without a per-request deep clone.
+    pub route_override_retry: Option<Option<Arc<RetryConfig>>>,
     /// Per-rule request header transforms published by `mesh_route_dispatch`
     /// when a matching rule carries `request_transform` rules (Istio
     /// `VirtualService.http[].headers.request.{set,add,remove}`). Enabled
@@ -3465,6 +3812,16 @@ pub struct RequestContext {
     /// the shared listener carries no single proxy identity that fits
     /// the slice-level filter that other topologies use.
     pub node_waypoint_policy_scope: Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    /// Per-destination authorization verdicts `mesh_authz` records for a
+    /// carried NodeWaypoint VirtualService route whose `mesh_route_dispatch`
+    /// rules can select a destination other than the route's own (issue
+    /// #7383). Private and typed, never metadata: route dispatch and proxy
+    /// core admit the destination the request finally reaches only on its own
+    /// verdict
+    /// (`plugins::mesh::authz::admit_node_waypoint_route_branch_for_effective_destination`).
+    /// `None` on every other route and topology.
+    pub(crate) node_waypoint_route_branch_authz:
+        Option<crate::plugins::mesh::authz::NodeWaypointRouteBranchAuthz>,
     /// Mesh traffic direction stamped by the listener that accepted this
     /// request. `Some(Inbound)` for mesh inbound mTLS / HBONE termination
     /// listeners; `Some(Outbound)` for the outbound capture listener;
@@ -3552,6 +3909,79 @@ pub struct RequestContext {
     /// preparation); this flag keeps an irreversible external side effect
     /// exactly-once across all of them.
     pub finalized_request_egress_dispatched: bool,
+    /// Set once this request's terminal transaction record has started: the
+    /// shared log funnel ([`log_with_mirror`]) or a detached delivery of it
+    /// took the request's terminal summary (issue #6768). The H1/H2 frontend's
+    /// [`crate::proxy::client_abort_scope::ClientAbortScope`] reads it when hyper
+    /// drops the handler future, so a request cancelled while its own terminal
+    /// log is in flight never also gets a client-abort record.
+    pub(crate) terminal_record: TerminalRecordLatch,
+    /// Typed copy of the `mesh.source.*` / `mesh.destination.*` label
+    /// projection that `workload_metrics` and the gateway's mesh dispatch
+    /// overlay produced for this request (issue #6793). Allocated by the first
+    /// stamp or dispatch overlay, so its presence does not mean a stamp ran.
+    /// Private, so no plugin can author it; metric emission builds its key from
+    /// it.
+    pub(crate) mesh_labels: Option<Box<crate::plugins::mesh::telemetry_facts::MeshLabelShadow>>,
+    /// Whether `workload_metrics` may leave the label keys out of `metadata`
+    /// for this request. Set by the dispatcher from the request's plugin view
+    /// before any plugin runs, and only when no plugin in that view can
+    /// observe the labels (`Plugin::observes_mesh_label_metadata`); defaults
+    /// to the eager, always-projected behavior.
+    pub(crate) mesh_label_projection_deferred: bool,
+}
+
+/// Latch recording how far a request's terminal transaction record has got
+/// (see [`TerminalRecordState`]): the logged status and a "started" bit set when
+/// the shared log funnel takes the summary, a "finished" bit once every inline
+/// sink and the runtime counters are settled, and a "counted" bit set when the
+/// handler counts the request in the gateway's request/status counters.
+///
+/// Atomic only because the log funnel holds the context by shared reference;
+/// a request's handler, its funnel, and the client-abort scope all run on the
+/// request's own task. A clone starts UNSET: a cloned context is never the
+/// authoritative request, so whatever it logs cannot stand in for the
+/// request's own terminal record.
+#[derive(Debug, Default)]
+pub(crate) struct TerminalRecordLatch(std::sync::atomic::AtomicU32);
+
+const TERMINAL_RECORD_STARTED: u32 = 1 << 16;
+const TERMINAL_RECORD_FINISHED: u32 = 1 << 17;
+const TERMINAL_STATUS_COUNTED: u32 = 1 << 18;
+
+impl TerminalRecordLatch {
+    /// Note that the handler has counted this request in the gateway's
+    /// request/status counters, so a client abort never counts it again
+    /// (issue #6768). Called at every H1/H2 handler counting site.
+    #[inline]
+    pub(crate) fn mark_counted(&self) {
+        self.0.fetch_or(
+            TERMINAL_STATUS_COUNTED,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// How far a request's own terminal transaction record has got when its
+/// handler stops (issue #6768).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalRecordState {
+    /// No terminal summary was handed to the log funnel.
+    NotStarted,
+    /// The funnel took a summary with this status, and its inline delivery had
+    /// not finished. A cancellation now leaves the remaining sinks to detached
+    /// delivery, but the handler's own status count, which follows the log, is
+    /// still owed.
+    InFlight { status: u16 },
+    /// The summary's inline delivery finished, or it was handed to detached
+    /// delivery whole.
+    Finished,
+}
+
+impl Clone for TerminalRecordLatch {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 /// Request-scoped working state owned by individual plugin families.
@@ -3572,6 +4002,23 @@ pub(crate) struct PluginRequestState {
     /// `metadata` so authorization-phase rejection logging can never serialize
     /// raw claim values.
     pub(crate) pending_claim_headers: HashMap<String, String>,
+    /// `mesh_authz` CUSTOM `headersToUpstreamOnAllow` results, staged on an
+    /// allowed check and consumed by the SAME instance's `before_proxy`.
+    /// Keyed by the staging instance's process-unique id, so two effective
+    /// `mesh_authz` instances on one request (an operator global beside the
+    /// force-injected `__mesh_authz`, say) can never overwrite or consume each
+    /// other's provider-owned names. Each entry is one pair per provider-owned
+    /// name: `Some(value)` installs the provider's value, `None` only strips
+    /// the client's copy. Kept out of `metadata` so a provider-minted token can
+    /// never be serialized into a transaction log.
+    pub(crate) mesh_ext_authz_upstream_headers:
+        HashMap<u64, crate::plugins::mesh::ext_authz::StagedUpstreamHeaders>,
+    /// `mesh_authz` CUSTOM `headersToDownstreamOnAllow` results, keyed the same
+    /// way, applied to the client-visible response by the staging instance's
+    /// own `after_proxy` / WebSocket handshake hook. Same out-of-`metadata`
+    /// reasoning (it routinely carries `Set-Cookie`).
+    pub(crate) mesh_ext_authz_downstream_headers:
+        HashMap<u64, crate::plugins::mesh::ext_authz::StagedDownstreamHeaders>,
     /// Lowercase `claim_headers` destinations already sanitized for this
     /// request. Gateway-owned destinations are stripped exactly once, by the
     /// first plugin instance that owns them, so a later instance sharing a
@@ -3579,6 +4026,22 @@ pub(crate) struct PluginRequestState {
     /// installed. Empty (and non-allocating) unless a `claim_headers` mapping is
     /// configured.
     pub(crate) sanitized_claim_header_destinations: HashSet<String>,
+    /// CURRENT authorized state of every gateway-asserted request header an
+    /// admitted owner decided on for this request, keyed by its
+    /// backend-equivalent name (ASCII lowercase, `_` folded to `-`):
+    /// `Some((wire_name, value))` when the latest admitted owner installed
+    /// `value` under the header-map key `wire_name`, `None` when it cleared the
+    /// destination (a missing claim, an OPA allow without that obligation, a
+    /// forwarding identity with no peer identity). A later decision replaces
+    /// an earlier one, so a withdrawn value can never be resurrected on stale
+    /// provenance. The final gateway-assertion pass reduces each owned
+    /// backend-equivalence class to at most the one `wire_name: value` entry;
+    /// a trigger-skipped owner never writes here.
+    pub(crate) request_assertion_state: Vec<(String, Option<(String, String)>)>,
+    /// Set by the `grpc_web` translation owner's own `before_proxy` once it
+    /// rewrote this request to native gRPC. A request whose final outbound
+    /// `content-type` is gRPC-Web without this marker was not translated.
+    pub(crate) grpc_web_translated: bool,
     /// Digests of credential-bearing query parameters that were present before
     /// authentication and request transformation. Kept outside public metadata
     /// so neither reusable credentials nor correlatable digests enter logs.
@@ -3586,6 +4049,13 @@ pub(crate) struct PluginRequestState {
     /// authentication strip may remove the parameter before a retained-result
     /// plugin builds its key.
     pub(crate) query_credential_partition_digests: Vec<(String, [u8; 32])>,
+    /// Every `(source, destination)` header and query rename a request
+    /// transformer applied, in order (header names lowercased). Secondary
+    /// egress such as `request_mirror` replays this lineage against its own
+    /// classifiers and operator patterns, so a rename (across chained
+    /// instances) cannot launder a credential name. Empty unless a rename ran.
+    pub(crate) request_header_rename_lineage: Vec<(String, String)>,
+    pub(crate) request_query_rename_lineage: Vec<(String, String)>,
     /// Deltas from the original request-header view to the complete
     /// backend-visible view, staged by `response_caching` instances during
     /// lookup and consumed when the origin supplies its final `Vary`
@@ -3602,6 +4072,35 @@ pub(crate) struct PluginRequestState {
     /// by configured `response_caching` instances.
     pub(crate) response_cache_request_header_deltas:
         HashMap<u64, Arc<HashMap<String, Option<String>>>>,
+    /// The exact `x-ratelimit-*` values the `rate_limiting` instance that owns
+    /// this request's public header set staged for publication (at most the
+    /// three exposed names), replaced whenever ownership changes.
+    ///
+    /// `rate_limiting` with `expose_headers: true` forwards these values to the
+    /// backend, and `x-ratelimit-remaining` changes on every admitted request.
+    /// The retained-result plugins (`response_caching`,
+    /// `request_deduplication`, `ai_semantic_cache`) omit a request header from
+    /// their partition only while its LIVE value still equals the value staged
+    /// here — the same private-provenance rule as a gateway-minted correlation
+    /// id. A client-supplied value, a value a later plugin rewrote, and a value
+    /// laundered through the plugin-writable `ratelimit_*` metadata keys stay
+    /// bound unless they are byte-identical to the staged value. A later
+    /// writer that happens to produce exactly that value leaves the backend
+    /// with exactly the request the limiter alone would have produced, so
+    /// omitting it loses no backend-visible distinction. Typed and outside
+    /// `metadata` so plugin-writable state cannot move the comparison target.
+    pub(crate) published_rate_limit_headers: Vec<(&'static str, String)>,
+    /// The exact W3C `traceparent` the gateway trace owner (`otel_tracing`, or
+    /// a trace-enabled `workload_metrics`) minted for this request: a fresh
+    /// root, or the trusted caller's trace id under a fresh gateway span id.
+    /// Either way its span id is new on every request, so a retained-result
+    /// partition (`response_caching`, `ai_semantic_cache`) that bound it would
+    /// never hit (issue #7130). Same private-provenance rule as
+    /// `published_rate_limit_headers`: the forwarded field is omitted only
+    /// while its live value equals this, and a caller's `traceparent`
+    /// forwarded unchanged stays bound. Typed and outside `metadata` so a
+    /// plugin-writable `traceparent` metadata value cannot move the target.
+    pub(crate) gateway_minted_traceparent: Option<String>,
     /// Per-`ai_semantic_cache`-instance embedding vectors staged between
     /// `before_proxy` and `on_final_response_body`. Kept out of `metadata` so
     /// high-dimensional vectors cannot enter transaction logs. The outer key is
@@ -3611,10 +4110,19 @@ pub(crate) struct PluginRequestState {
     /// Per-instance semantic-cache scope keys paired with
     /// `ai_semantic_cache_embeddings`.
     pub(crate) ai_semantic_cache_scope_keys: HashMap<u64, String>,
+    /// Per-`ai_semantic_cache`-instance provider-backed synthetic responses
+    /// staged by its final-response-body hook and published (or dropped) by
+    /// its committed-response hook, once the synthetic path's late reject
+    /// `after_proxy` header hooks have produced the final client-visible
+    /// headers. Dropped with the request when no committed hook runs.
+    pub(crate) ai_semantic_cache_pending_stores:
+        HashMap<u64, crate::plugins::ai_semantic_cache::PendingSemanticCacheStore>,
     /// OpenAPI validator operation matches staged between `before_proxy` and
-    /// final body hooks. Kept out of public metadata so per-instance state does
-    /// not leak into transaction logs.
-    pub(crate) openapi_validator_matches: HashMap<usize, (String, String)>,
+    /// final body hooks, as the `(method bucket, entry)` index into the owning
+    /// instance's immutable operation table, so later predicates index the
+    /// pinned operation instead of re-matching. Kept out of public metadata so
+    /// per-instance state does not leak into transaction logs.
+    pub(crate) openapi_validator_matches: HashMap<usize, (usize, usize)>,
     /// OpenAPI validator instances whose CLIENT-contract decision has already
     /// been made on the original client representation in
     /// `validate_client_request_body_contract`.
@@ -3662,6 +4170,12 @@ pub(crate) struct PluginRequestState {
     /// its media type. Only byte-identical output may reuse the verification;
     /// later semantic changes still require a fresh detection pass. Never logged.
     pub(crate) ai_response_guard_verified_redactions: HashMap<u64, [u8; 32]>,
+    /// Per-instance digest of the exact representation (status, media type,
+    /// gRPC message encoding, bytes) `ai_response_guard` inspected in
+    /// `on_response_body` and decided completely, with no deferral and no
+    /// pending redaction. The final client-visible phase skips a second parse
+    /// and scan only for that identical representation. Never logged.
+    pub(crate) ai_response_guard_inspected_clean: HashMap<u64, [u8; 32]>,
     /// `ai_tool_governor` equivalent of
     /// `ai_response_guard_replay_redactions`. Instance scoping prevents one
     /// governor from consuming another instance's transform requirement.
@@ -3680,6 +4194,17 @@ pub(crate) struct PluginRequestState {
     /// Typed rather than `metadata`: a digest of a client query document must not
     /// enter a transaction log, and no plugin may forge one to skip the recheck.
     pub(crate) graphql_request_envelope_hashes: HashMap<u64, [u8; 32]>,
+    /// Per-`body_validator`-instance digest of the `Content-Type` and request
+    /// body that instance validated and PASSED in `before_proxy`.
+    ///
+    /// The final request-body hook re-validates the exact backend-visible
+    /// bytes; when they (and the media type) are byte-identical to what the
+    /// early hook already accepted, the verdict is the same pure function of
+    /// the same input, so the second JSON parse and schema evaluation are
+    /// skipped. Any transform, relabel, or decode changes the digest and is
+    /// re-validated. Typed rather than `metadata` so no plugin can forge a
+    /// digest to skip the final check, and a body digest never reaches a log.
+    pub(crate) body_validator_early_request_digests: HashMap<u64, [u8; 32]>,
     /// Rate-limit buckets one `graphql` instance already charged for this
     /// request, as `(instance id, bucket key)`.
     ///
@@ -3720,6 +4245,15 @@ pub(crate) struct PluginRequestState {
     /// markers (a hash over the raw request body including tool-call arguments),
     /// so they remain off `metadata` too.
     pub(crate) ai_tool_governor_request_hashes: HashMap<u64, String>,
+    /// Per-`ai_request_guard`-instance SHA-256 digest of `(path, body)` validated
+    /// in `before_proxy` (when no token mutation occurred), allowing
+    /// `on_final_request_body_with_context` to skip re-parsing an unchanged body.
+    pub(crate) ai_request_guard_validated_hashes: HashMap<u64, [u8; 32]>,
+    /// Per-`ai_prompt_shield`-instance `(SHA-256 digest, is_streaming)`
+    /// witness for a clean request body scanned in `before_proxy`, allowing
+    /// `on_final_request_body_with_context` to skip re-parsing and re-scanning
+    /// an unchanged body while preserving the `ai_request_streaming` hint.
+    pub(crate) ai_prompt_shield_clean_hashes: HashMap<u64, ([u8; 32], bool)>,
     /// Per-instance buffered `redact_args` rewrites computed during governance
     /// amplification preflight and consumed by the response-body transform.
     /// Keys are digests of `(tool name, raw args)`; aggregate value bytes are
@@ -3735,6 +4269,17 @@ pub(crate) struct PluginRequestState {
     /// re-evaluate transformed client-visible representations. Also private for
     /// the same prompt/response confidentiality reason.
     pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
+    /// Each `ai_semantic_firewall` instance's latest decision per metadata
+    /// scope (`""` unscoped, `"request"`, `"response"`), keyed by
+    /// `(scope, instance id)`. An instance replaces only its own record; the
+    /// published decision metadata is derived from every live record, so one
+    /// instance's later or re-evaluated clean decision cannot erase another
+    /// instance's warn/reject audit. Ordered so the derived lists are
+    /// deterministic; bounded by three scopes times the attached instances.
+    pub(crate) ai_semantic_firewall_decision_records: std::collections::BTreeMap<
+        (&'static str, u64),
+        ai_semantic_firewall::FirewallDecisionRecord,
+    >,
     /// Per-`request_deduplication`-instance completion state acquired during
     /// `before_proxy`. Keeping this out of public metadata prevents internal
     /// cache keys and lock tokens from entering transaction logs. The map is
@@ -3767,6 +4312,32 @@ pub(crate) struct PluginRequestState {
     /// isolation. Bounded by the number of attached WAF instances (operator
     /// configuration), never by request content.
     pub(crate) waf_instance_scores: HashMap<u64, WafInstanceScoreState>,
+    /// Forwarded `Host` value that was live immediately before the first
+    /// `mesh_route_dispatch` authority rewrite on this request. `Some` exactly
+    /// while a dispatcher-owned `Host` rewrite is in the shared header map;
+    /// the inner `None` records that no `Host` was present. A later matching
+    /// instance without an authority rewrite restores this value (undoing
+    /// only the dispatcher's own rewrite) and never touches a `Host` another
+    /// plugin set before the dispatch block.
+    pub(crate) mesh_route_dispatch_host_before_rewrite: Option<Option<String>>,
+    /// `grpc-encoding` framing witness `ai_transcript_audit` records from the
+    /// LIVE `before_proxy` header map for a native-gRPC request on a
+    /// `grpc`-enrolled instance, before the backend-effective method is known.
+    /// A call enrolled only at the backend-path boundary has no other
+    /// authoritative framing source when a deferred `before_proxy` hook
+    /// short-circuits it (no final request-body hook runs), and
+    /// `RequestContext::headers` may be the original inbound map rather than the
+    /// backend-visible one. Kept out of public metadata so no other plugin can
+    /// rewrite it and it never reaches a transaction log.
+    pub(crate) ai_transcript_audit_grpc_request_encoding:
+        Option<ai_transcript_audit::GrpcMessageEncoding>,
+    /// Per-`transaction_debugger`-instance record that a body-capture record
+    /// was already emitted for each direction, so the header-phase and
+    /// final-body hooks emit exactly one record between them. Content-free
+    /// flags keyed by the process-unique instance id; bounded by the attached
+    /// debugger instances.
+    pub(crate) transaction_debugger_capture_records:
+        HashMap<u64, transaction_debugger::CaptureRecordState>,
 }
 
 /// Return an identity only when it contains a meaningful non-whitespace value.
@@ -3776,7 +4347,11 @@ pub(crate) fn meaningful_identity(identity: Option<&str>) -> Option<&str> {
     identity.filter(|identity| !identity.trim().is_empty())
 }
 
-fn merge_metadata_value(metadata: &mut HashMap<String, String>, key: &str, value: &str) {
+fn merge_metadata_value<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+    key: &str,
+    value: &str,
+) {
     metadata
         .entry(key.to_string())
         .and_modify(|existing| {
@@ -3796,6 +4371,7 @@ impl RequestContext {
         error_class: Option<crate::retry::ErrorClass>,
         request_on_wire: bool,
     ) {
+        self.last_backend_dispatch_error_class = error_class;
         self.backend_dispatch_state = if error_class.is_none() {
             BackendDispatchState::BackendResponse
         } else if request_on_wire
@@ -3812,6 +4388,82 @@ impl RequestContext {
 
     pub(crate) fn backend_dispatch_state(&self) -> BackendDispatchState {
         self.backend_dispatch_state
+    }
+
+    /// Error class of the latest dispatch attempt; `None` when that attempt
+    /// produced a backend response or nothing was dispatched.
+    pub(crate) fn last_backend_dispatch_error_class(&self) -> Option<crate::retry::ErrorClass> {
+        self.last_backend_dispatch_error_class
+    }
+
+    /// Note that this request's terminal transaction record, logged with
+    /// `status`, has started (issue #6768). Called by the shared terminal log
+    /// funnel before it can first suspend, so the H1/H2 client-abort scope never
+    /// records a second terminal for a request whose own record is in flight. A
+    /// record that already finished stays finished.
+    #[inline]
+    pub(crate) fn mark_terminal_record_started(&self, status: u16) {
+        let latch = &self.terminal_record.0;
+        let mut current = latch.load(std::sync::atomic::Ordering::Relaxed);
+        while current & TERMINAL_RECORD_FINISHED == 0 {
+            let next =
+                (current & TERMINAL_STATUS_COUNTED) | TERMINAL_RECORD_STARTED | u32::from(status);
+            match latch.compare_exchange_weak(
+                current,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Note that this request's terminal record is settled: every inline sink
+    /// ran and the runtime counters were recorded, or the whole summary went to
+    /// detached delivery.
+    #[inline]
+    pub(crate) fn mark_terminal_record_finished(&self) {
+        self.terminal_record.0.fetch_or(
+            TERMINAL_RECORD_STARTED | TERMINAL_RECORD_FINISHED,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// How far this context's own terminal record has got.
+    pub fn terminal_record_state(&self) -> TerminalRecordState {
+        let state = self
+            .terminal_record
+            .0
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if state & TERMINAL_RECORD_FINISHED != 0 {
+            TerminalRecordState::Finished
+        } else if state & TERMINAL_RECORD_STARTED != 0 {
+            TerminalRecordState::InFlight {
+                status: (state & 0xFFFF) as u16,
+            }
+        } else {
+            TerminalRecordState::NotStarted
+        }
+    }
+
+    /// Whether this context's terminal transaction record has started: the
+    /// shared terminal log funnel has taken it (issue #6768). Always `false` on
+    /// a clone.
+    #[inline]
+    pub fn terminal_record_started(&self) -> bool {
+        self.terminal_record_state() != TerminalRecordState::NotStarted
+    }
+
+    /// Whether the H1/H2 handler already counted this request in the gateway's
+    /// request/status counters (issue #6768). Always `false` on a clone.
+    pub fn terminal_status_counted(&self) -> bool {
+        self.terminal_record
+            .0
+            .load(std::sync::atomic::Ordering::Relaxed)
+            & TERMINAL_STATUS_COUNTED
+            != 0
     }
 
     /// Record one completed backend attempt in the request's diagnostic
@@ -3843,6 +4495,39 @@ impl RequestContext {
         self.diagnostic_slot.is_some() || self.backend_attempt_trace.is_some()
     }
 
+    /// The tracing plugin that established this request's gateway `SERVER`
+    /// span, if one has.
+    pub fn gateway_trace_owner(&self) -> Option<crate::plugins::otel_tracing::GatewayTraceOwner> {
+        self.gateway_trace_owner
+    }
+
+    /// Record `owner` as the plugin that established this request's gateway
+    /// `SERVER` span unless another plugin already did. Returns whether
+    /// `owner` owns it after the call.
+    pub(crate) fn claim_gateway_trace_owner(
+        &mut self,
+        owner: crate::plugins::otel_tracing::GatewayTraceOwner,
+    ) -> bool {
+        match self.gateway_trace_owner {
+            Some(existing) => existing == owner,
+            None => {
+                self.gateway_trace_owner = Some(owner);
+                true
+            }
+        }
+    }
+
+    /// Make `owner` the owner of this request's gateway `SERVER` span even
+    /// if another plugin established it. Used when a plugin forwards the
+    /// established span and freezes it (into a backend-attempt recorder), so
+    /// the establishing sibling must no longer re-derive it.
+    pub(crate) fn adopt_gateway_trace_owner(
+        &mut self,
+        owner: crate::plugins::otel_tracing::GatewayTraceOwner,
+    ) {
+        self.gateway_trace_owner = Some(owner);
+    }
+
     /// Install (or clear) the `otel_tracing` per-attempt span recorder.
     pub(crate) fn set_backend_attempt_trace(
         &mut self,
@@ -3863,6 +4548,19 @@ impl RequestContext {
     ) -> crate::plugins::otel_tracing::BackendAttemptSpan {
         match self.backend_attempt_trace.as_ref() {
             Some(trace) => trace.begin(backend_url, headers),
+            None => crate::plugins::otel_tracing::BackendAttemptSpan::INACTIVE,
+        }
+    }
+
+    /// [`Self::begin_backend_attempt_span`] over a dispatch header view. Only a
+    /// traced attempt needs the map; an untraced one materializes nothing.
+    pub(crate) fn begin_backend_attempt_span_for_view(
+        &self,
+        backend_url: &str,
+        headers: crate::proxy::request_headers::RequestHeaders<'_>,
+    ) -> crate::plugins::otel_tracing::BackendAttemptSpan {
+        match self.backend_attempt_trace.as_ref() {
+            Some(trace) => trace.begin(backend_url, &headers.to_map()),
             None => crate::plugins::otel_tracing::BackendAttemptSpan::INACTIVE,
         }
     }
@@ -3894,6 +4592,37 @@ impl RequestContext {
             || self.serverless_grpc_terminate_frame.is_some()
     }
 
+    /// Record that the rejecting plugin answered with an origin-authored
+    /// representation ([`Plugin::rejects_with_origin_response`]).
+    pub(crate) fn note_origin_rejection(&self) {
+        let _ = self.origin_rejection.set(());
+    }
+
+    /// Whether the response this request is about to send was authored by an
+    /// origin (a replayed or relayed backend, provider, or function response)
+    /// rather than by the gateway: an origin short-circuit that no gateway
+    /// policy has since replaced. Such a response is carried as authored: the
+    /// gateway never adds a `WWW-Authenticate` challenge to an origin `401`
+    /// (issue #6774).
+    pub(crate) fn response_is_origin_authored(&self) -> bool {
+        (self.serves_origin_representation() || self.origin_rejection.get().is_some())
+            && self.gateway_response_replacement.get().is_none()
+    }
+
+    /// Record that gateway policy replaced the response this request was
+    /// about to send. The replacement is gateway-authored whatever the
+    /// request's short-circuit was.
+    pub(crate) fn note_gateway_response_replacement(&self) {
+        let _ = self.gateway_response_replacement.set(());
+    }
+
+    /// Whether gateway policy replaced the response this request is about to
+    /// send. On a backend-path response this is what makes it gateway-authored:
+    /// an accepted backend response is never replaced.
+    pub(crate) fn response_replaced_by_gateway(&self) -> bool {
+        self.gateway_response_replacement.get().is_some()
+    }
+
     /// Phase of the matched route rule's total request deadline that produced
     /// this request's gateway-authored `504`, when one did.
     pub(crate) fn route_request_timeout_phase(&self) -> Option<&'static str> {
@@ -3903,6 +4632,73 @@ impl RequestContext {
     /// This request's diagnostic-reference slot (issue #5767).
     pub(crate) fn diagnostic_slot(&self) -> Option<&Arc<crate::diagnostic_ref::DiagnosticSlot>> {
         self.diagnostic_slot.as_ref()
+    }
+
+    /// The context a detached delivery of one already-final terminal summary
+    /// needs, instead of a deep copy of the whole request (issue #6793).
+    ///
+    /// Plugins' `log` hooks see only the summary, so terminal delivery reads
+    /// just these fields from the context: the trigger decisions and HTTP
+    /// flavor it stamps onto the summary, the method its `HEAD` byte rule
+    /// checks, the response-policy and dispatch state behind the diagnostic
+    /// detail, the typed mesh label projection behind the metric key, the RPC
+    /// deadline, and the mirror receivers. Every other field keeps the value
+    /// [`RequestContext::new`] gives it. Must stay in step with what
+    /// `log_with_mirror` and its cancellation guard read.
+    pub(crate) fn clone_for_detached_terminal_log(&self) -> Self {
+        let mut ctx = Self::new(String::new(), self.method.clone(), String::new());
+        ctx.plugin_trigger_decisions = self.plugin_trigger_decisions.clone();
+        ctx.request_http_flavor = self.request_http_flavor;
+        ctx.response_transform_size_refusal_selected =
+            self.response_transform_size_refusal_selected;
+        ctx.route_request_timeout_phase = self.route_request_timeout_phase;
+        ctx.backend_dispatch_state = self.backend_dispatch_state;
+        ctx.last_backend_dispatch_error_class = self.last_backend_dispatch_error_class;
+        ctx.diagnostic_slot = self.diagnostic_slot.clone();
+        ctx.grpc_deadline_at = self.grpc_deadline_at;
+        ctx.mesh_labels = self.mesh_labels.clone();
+        ctx.mesh_label_projection_deferred = self.mesh_label_projection_deferred;
+        ctx.mirror_result_rxs = self.mirror_result_rxs.clone();
+        ctx
+    }
+
+    /// The typed mesh label projection for this request (issue #6793), once a
+    /// `workload_metrics` stamp or the gateway's mesh dispatch overlay has
+    /// written it. Read-only observability state; public only for external
+    /// contract tests.
+    #[doc(hidden)]
+    pub fn mesh_label_shadow(
+        &self,
+    ) -> Option<&crate::plugins::mesh::telemetry_facts::MeshLabelShadow> {
+        self.mesh_labels.as_deref()
+    }
+
+    /// Whether this request's plugin view lets `workload_metrics` leave the
+    /// mesh label keys out of `metadata` (issue #6793).
+    #[doc(hidden)]
+    pub fn mesh_label_projection_deferred(&self) -> bool {
+        self.mesh_label_projection_deferred
+    }
+
+    /// Record whether the request's plugin view lets the mesh label projection
+    /// be deferred. Called once per request on the protocol entry paths,
+    /// before any plugin runs.
+    pub(crate) fn set_mesh_label_projection_deferred(&mut self, deferred: bool) {
+        self.mesh_label_projection_deferred = deferred;
+    }
+
+    /// Apply the gateway's outbound mesh-dispatch destination overlay
+    /// (`mesh.destination.*` from the selected target's tags) to the typed
+    /// label projection, matching the metadata keys an eager request carries.
+    /// Allocates the projection when the overlay lands before the first
+    /// `workload_metrics` stamp, so a later stamp keeps the overlay exactly as
+    /// it keeps the metadata keys.
+    pub(crate) fn record_mesh_gateway_destination_overlay<MS: std::hash::BuildHasher>(
+        &mut self,
+        tags: &HashMap<String, String, MS>,
+    ) {
+        let shadow = self.mesh_labels.get_or_insert_with(Default::default);
+        crate::plugins::mesh::telemetry_facts::apply_gateway_destination_overlay(shadow, tags);
     }
 
     /// Attach the frontend's diagnostic-reference slot (issue #5767).
@@ -3916,16 +4712,17 @@ impl RequestContext {
     /// Carry a final-request-body hook context's plugin state back onto the
     /// live request context.
     ///
-    /// Exactly the four families the handler has always written back field by
-    /// field: WAF-owned metadata and per-instance scores, plus
+    /// Transfer WAF-owned metadata and per-instance scores, plus
     /// `ai_semantic_cache`'s staged scope key and embedding — its store hook
     /// runs later against the live context, so without these a semantic miss
-    /// would silently store as exact-only. Everything else the compatibility
-    /// context staged is discarded with it, exactly as before.
+    /// would silently store as exact-only. Merge `ai_semantic_firewall`'s latest
+    /// per-instance decisions so later response hooks aggregate the final
+    /// request verdicts. Other compatibility-context plugin state is discarded.
     ///
-    /// A donor that materialized no plugin state means all four are empty, and
-    /// the live context's copies are cleared to match, which is what the
-    /// unconditional field moves produced.
+    /// A donor that materialized no plugin state clears the four transferred
+    /// families, matching the original unconditional field moves. Firewall
+    /// decisions already on the live context remain unless the donor replaces
+    /// that instance's record in the same scope.
     pub(crate) fn adopt_final_request_body_hook_plugin_state(&mut self, donor: &mut Self) {
         let Some(donor_state) = donor.plugin_state.as_deref_mut() else {
             if let Some(state) = self.plugin_state.as_deref_mut() {
@@ -3942,14 +4739,17 @@ impl RequestContext {
             std::mem::take(&mut donor_state.ai_semantic_cache_embeddings);
         let ai_semantic_cache_scope_keys =
             std::mem::take(&mut donor_state.ai_semantic_cache_scope_keys);
+        let ai_semantic_firewall_decision_records =
+            std::mem::take(&mut donor_state.ai_semantic_firewall_decision_records);
         if self.plugin_state.is_none()
             && waf_owned_metadata.is_empty()
             && waf_instance_scores.is_empty()
             && ai_semantic_cache_embeddings.is_empty()
             && ai_semantic_cache_scope_keys.is_empty()
+            && ai_semantic_firewall_decision_records.is_empty()
         {
             // Nothing to carry and nothing to clear: do not materialize live
-            // state just to hold four empty collections.
+            // state just to hold empty collections.
             return;
         }
         let state = self.plugin_state_mut();
@@ -3957,6 +4757,40 @@ impl RequestContext {
         state.waf_instance_scores = waf_instance_scores;
         state.ai_semantic_cache_embeddings = ai_semantic_cache_embeddings;
         state.ai_semantic_cache_scope_keys = ai_semantic_cache_scope_keys;
+        if state.ai_semantic_firewall_decision_records.is_empty() {
+            state.ai_semantic_firewall_decision_records = ai_semantic_firewall_decision_records;
+        } else {
+            state
+                .ai_semantic_firewall_decision_records
+                .extend(ai_semantic_firewall_decision_records);
+        }
+    }
+
+    /// Hand a final-request-body hook context's state back to this live
+    /// context once the `on_final_request_body` hooks have run on it.
+    ///
+    /// Adopts the gateway deadline selection and the gateway terminals first,
+    /// so the finalizer on the live context knows it is publishing a
+    /// gateway-authored error payload, then the transferred plugin state, then
+    /// swaps in the hook context's `metadata` while keeping the live
+    /// `request_body` (the clone omits it and no final hook touches it), and
+    /// finally `ai_usage_export` and `waf_metadata_initialized`. Every proxy
+    /// dispatch path (the terminal-body arm included) and the `_test_support`
+    /// round-trip seam call this one function so the hand-back cannot diverge
+    /// between them (issues #7161, #7223).
+    pub(crate) fn adopt_final_request_body_hook_context(&mut self, mut hook_ctx: RequestContext) {
+        if hook_ctx.gateway_deadline_response_selected() {
+            self.mark_gateway_deadline_response_selected();
+        }
+        self.adopt_final_request_body_hook_terminals(&hook_ctx);
+        self.adopt_final_request_body_hook_plugin_state(&mut hook_ctx);
+        let request_body = self.metadata.remove("request_body");
+        self.metadata = hook_ctx.metadata;
+        if let Some(body) = request_body {
+            self.metadata.insert("request_body".to_string(), body);
+        }
+        self.ai_usage_export = hook_ctx.ai_usage_export;
+        self.waf_metadata_initialized = hook_ctx.waf_metadata_initialized;
     }
 
     /// Release the request-scoped leases a deferred terminal never owned.
@@ -4019,6 +4853,8 @@ impl RequestContext {
             method,
             path,
             raw_path: None,
+            hmac_wire_method: None,
+            hmac_wire_request_target: None,
             request_authority: None,
             request_is_secure: false,
             outbound_proxy_hops: None,
@@ -4030,6 +4866,7 @@ impl RequestContext {
             raw_headers: None,
             headers: HashMap::new(),
             headers_materialized: false,
+            request_header_passthrough: None,
             raw_query_string: None,
             outbound_query_string: None,
             replay_request_body_empty_proven: false,
@@ -4045,18 +4882,21 @@ impl RequestContext {
             auth_method: None,
             credential_deadline_at: None,
             authorization_termination: None,
-            authorization_termination_latch:
-                crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default(),
+            authorization_termination_latch: LazyShared::new(),
             authorization_connection_closer: None,
             websocket_shutdown_rx: None,
             client_trust_session: None,
             soap_ws_security_authenticated_body_digest: None,
+            grpc_web_request_trailers: grpc_web::StagedRequestTrailers::default(),
             timestamp_received: Utc::now(),
             grpc_deadline_initialized: false,
             grpc_deadline_had_valid_client_timeout: false,
+            request_body_integrity_retirement: false,
             grpc_deadline_received_at: tokio::time::Instant::now(),
-            grpc_deadline_preflight_complete: false,
             grpc_deadline_budget_ms: None,
+            grpc_deadline_policy_budget_ms: None,
+            grpc_deadline_ceiling_ms: None,
+            grpc_deadline_headroom_ms: 0,
             grpc_deadline_at: None,
             route_request_deadline_at: None,
             route_attempt_timeout: None,
@@ -4067,8 +4907,10 @@ impl RequestContext {
             charged_backend_deadline_terminal: false,
             route_request_timeout_phase: None,
             backend_dispatch_state: BackendDispatchState::NotDispatched,
+            last_backend_dispatch_error_class: None,
             diagnostic_slot: None,
             backend_attempt_trace: None,
+            gateway_trace_owner: None,
             gateway_capacity_response_selected: false,
             gateway_representation_response_selected: false,
             final_body_policy_terminal_replacement: false,
@@ -4081,19 +4923,22 @@ impl RequestContext {
             request_is_grpc_web: false,
             request_is_grpc_web_text: false,
             plugin_trigger_decisions: Vec::new(),
-            metadata: HashMap::new(),
+            metadata: MetadataMap::default(),
             ai_usage_export: None,
             ai_usage_export_token_prefix: None,
             ai_usage_export_cost_prefix: None,
             cors_state: cors::CorsRequestState::default(),
             plugin_state: None,
             request_headers_to_redact: None,
+            request_trailer_strip_headers: None,
+            route_owned_request_assertion_headers: None,
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: HttpFlavor::Plain,
             h3_response_upstream_is_fallback: false,
             original_accept_encoding: None,
             websocket_response_boundary: false,
+            prometheus_metrics_observed: false,
             json_scan_memo: crate::util::json_dup_keys::JsonScanMemo::default(),
             governed_request_body_plaintext: None,
             finalized_response_replay: false,
@@ -4101,11 +4946,16 @@ impl RequestContext {
             response_policy_stamp: None,
             response_presentation_policy_digest: None,
             serverless_terminate_response: false,
+            origin_rejection: std::sync::OnceLock::new(),
+            gateway_response_replacement: std::sync::OnceLock::new(),
+            reauthentication_challenge: None,
             serverless_grpc_terminate_frame: None,
             serverless_owned_dedup_publication: None,
             ai_prompt_compressor_classification_path: None,
             ai_prompt_compressor_wire_stats_started: false,
             ai_prompt_compressor_marker_reject_status: None,
+            request_transformer_ambiguous_body_refusal: None,
+            response_transformer_ambiguous_body_refusal: None,
             gateway_response_compression_algorithm: None,
             compression_request_decode_owner: None,
             compression_response_encode_owner: None,
@@ -4114,6 +4964,7 @@ impl RequestContext {
             compression_response_decisions_pending: 0,
             compression_response_buffer_permit: HeldResponseBufferPermit::default(),
             compression_staged_request_plaintext: None,
+            compression_staged_decode_charge: Default::default(),
             compression_response_encode_aborted: false,
             response_stream_id: None,
             response_stream_completion: None,
@@ -4142,6 +4993,8 @@ impl RequestContext {
             peer_spiffe_certificate_principal: false,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            proven_client_upload_abort: crate::proxy::upload_pump::ProvenClientUploadAbort::default(
+            ),
             mirror_result_rxs: Vec::new(),
             request_mirror_admissions: request_mirror::RequestMirrorAdmissions::default(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
@@ -4149,8 +5002,10 @@ impl RequestContext {
             request_body_sha256: None,
             request_body_sha512: None,
             max_response_body_size_bytes: 0,
+            inbound_request_body_may_follow: None,
             route_request_body_limit_bytes: None,
             route_response_body_limit_bytes: None,
+            route_may_rewrite_response_stream: None,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grpc_request_messages_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grpc_response_messages_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -4179,6 +5034,7 @@ impl RequestContext {
             ai_stream_router_claim: None,
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
+            node_waypoint_route_branch_authz: None,
             mesh_direction: None,
             orig_dst: None,
             destination_ip: None,
@@ -4187,6 +5043,9 @@ impl RequestContext {
             mesh_inbound_terminator_ip: None,
             hbone_connect_relay: false,
             finalized_request_egress_dispatched: false,
+            terminal_record: TerminalRecordLatch::default(),
+            mesh_labels: None,
+            mesh_label_projection_deferred: false,
         }
     }
 
@@ -4221,12 +5080,14 @@ impl RequestContext {
             request_id.clone(),
             generated,
         );
-        self.metadata
-            .insert(instance_key.to_string(), request_id.clone());
         if publish_canonical {
             self.metadata
-                .insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
+                .insert(REQUEST_ID_METADATA_KEY.to_string(), request_id.clone());
         }
+        // The instance projection takes ownership of the caller's value; the
+        // instance key never equals `REQUEST_ID_METADATA_KEY`, so the insert
+        // order is not observable.
+        self.metadata.insert(instance_key.to_string(), request_id);
     }
 
     /// Whether `name` currently carries a gateway-minted correlation value.
@@ -4239,6 +5100,125 @@ impl RequestContext {
     /// partitions.
     pub(crate) fn is_gateway_generated_correlation_header(&self, name: &str, value: &str) -> bool {
         self.canonical_client_ip.is_generated_header(name, value)
+    }
+
+    /// Replace the staged `x-ratelimit-*` publication with nothing.
+    ///
+    /// Called when a `rate_limiting` instance takes ownership of the public
+    /// header set, before it stages its own values. Never allocates the
+    /// per-plugin state just to clear it.
+    pub(crate) fn clear_published_rate_limit_headers(&mut self) {
+        if let Some(state) = self.plugin_state_opt_mut() {
+            state.published_rate_limit_headers.clear();
+        }
+    }
+
+    /// Record one exact `x-ratelimit-*` value the owning limiter publishes.
+    pub(crate) fn stage_published_rate_limit_header(&mut self, name: &'static str, value: String) {
+        let staged = &mut self.plugin_state_mut().published_rate_limit_headers;
+        if let Some(entry) = staged.iter_mut().find(|(known, _)| *known == name) {
+            entry.1 = value;
+        } else {
+            staged.push((name, value));
+        }
+    }
+
+    /// Whether `name` currently carries the exact rate-limit telemetry value
+    /// the owning `rate_limiting` instance staged for this request.
+    ///
+    /// The comparison target is private typed state, so neither a client nor
+    /// a plugin that rewrites the header (or the public `ratelimit_*` metadata
+    /// it is rendered from) can choose which value is omitted. A live value
+    /// equal to the target is byte-identical to the limiter's own forwarded
+    /// value whoever wrote it, so the backend cannot tell the two apart and
+    /// omitting it hides nothing. Replay partitions use it to omit the
+    /// per-request budget counter — which changes on every admitted request —
+    /// while binding every other value of the same field.
+    ///
+    /// `name` must be a key of `headers` (the backend-visible map being
+    /// partitioned) and is compared EXACTLY against the lowercase name the
+    /// limiter wrote. The exemption also requires that field to be a single
+    /// line: when `headers` holds any case-variant duplicate key (for example
+    /// a rename onto `X-RateLimit-Limit`), the egress path folds every line
+    /// into one combined value the limiter never staged, so EVERY line of that
+    /// field stays bound — including the limiter's own — and the complete
+    /// field reaches the partition. The duplicate scan runs only after an
+    /// exact provenance match, i.e. for at most the three published names.
+    pub(crate) fn is_gateway_published_rate_limit_header(
+        &self,
+        headers: &HashMap<String, String>,
+        name: &str,
+        value: &str,
+    ) -> bool {
+        let Some(state) = self.plugin_state() else {
+            return false;
+        };
+        let Some((staged_name, _)) = state
+            .published_rate_limit_headers
+            .iter()
+            .find(|(staged_name, staged_value)| name == *staged_name && value == staged_value)
+        else {
+            return false;
+        };
+        let lines = headers
+            .keys()
+            .filter(|key| key.eq_ignore_ascii_case(staged_name))
+            .count();
+        lines == 1
+    }
+
+    /// Record the exact `traceparent` the gateway trace owner minted for this
+    /// request (see `PluginRequestState::gateway_minted_traceparent`). A later
+    /// mint (a sibling re-deriving the span) replaces it.
+    pub(crate) fn stage_gateway_minted_traceparent(&mut self, traceparent: String) {
+        self.plugin_state_mut().gateway_minted_traceparent = Some(traceparent);
+    }
+
+    /// Whether `name` is the request's single `traceparent` field and its
+    /// live value is exactly the one the gateway trace owner minted.
+    ///
+    /// Same shape as [`Self::is_gateway_published_rate_limit_header`]: the
+    /// name must be the exact lowercase key, and a case-variant duplicate
+    /// (which folds into one combined field on egress) keeps every line
+    /// bound. A caller's own `traceparent` forwarded unchanged never matches,
+    /// because the gateway always mints a fresh span id.
+    pub(crate) fn is_gateway_minted_traceparent_header(
+        &self,
+        headers: &HashMap<String, String>,
+        name: &str,
+        value: &str,
+    ) -> bool {
+        const TRACEPARENT: &str = "traceparent";
+        if name != TRACEPARENT {
+            return false;
+        }
+        let Some(staged) = self
+            .plugin_state()
+            .and_then(|state| state.gateway_minted_traceparent.as_deref())
+        else {
+            return false;
+        };
+        staged == value
+            && headers
+                .keys()
+                .filter(|key| key.eq_ignore_ascii_case(TRACEPARENT))
+                .count()
+                == 1
+    }
+
+    /// Whether `name`/`value` in `headers` is gateway-minted per-request state
+    /// that a retained-result partition must not bind: a generated correlation
+    /// id, published rate-limit telemetry, or the gateway trace owner's minted
+    /// `traceparent`, each proven by private provenance.
+    pub(crate) fn is_gateway_minted_request_header(
+        &self,
+        headers: &HashMap<String, String>,
+        name: &str,
+        value: &str,
+    ) -> bool {
+        self.is_gateway_generated_correlation_header(name, value)
+            || self.is_gateway_published_rate_limit_header(headers, name, value)
+            || self.is_gateway_minted_traceparent_header(headers, name, value)
     }
 
     pub(crate) fn correlation_id(&self, instance_key: &str) -> Option<&str> {
@@ -4256,7 +5236,10 @@ impl RequestContext {
         self.canonical_client_ip.canonical_correlation_id()
     }
 
-    pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+    pub(crate) fn project_correlation_ids<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &mut HashMap<String, String, MS>,
+    ) {
         self.canonical_client_ip.project_correlation_ids(metadata);
     }
 
@@ -4421,9 +5404,22 @@ impl RequestContext {
     ) -> bool {
         let won = self
             .authorization_termination_latch
+            .get_or_init(crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default)
             .record_once(termination, family);
         self.latch_authorization_termination(termination);
         won
+    }
+
+    /// Observe whether an authorization termination has already been recorded on
+    /// this request's latch without allocating a latch on unauthenticated
+    /// requests.
+    #[inline]
+    pub(crate) fn observed_authorization_termination(
+        &self,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        self.authorization_termination_latch
+            .get()
+            .and_then(crate::proxy::auth_lifetime::StreamAuthTerminationLatch::observed)
     }
 
     /// Clone this request's shared authorization-lifetime termination latch for
@@ -4431,7 +5427,24 @@ impl RequestContext {
     pub(crate) fn authorization_termination_latch(
         &self,
     ) -> crate::proxy::auth_lifetime::StreamAuthTerminationLatch {
-        self.authorization_termination_latch.clone()
+        self.authorization_termination_latch
+            .get_or_init(crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default)
+            .clone()
+    }
+
+    /// Record that a dispatcher proved the client abandoned its upload before
+    /// the backend response head (issue #6776).
+    pub(crate) fn record_proven_client_upload_abort(&self) {
+        self.proven_client_upload_abort.record();
+    }
+
+    /// Whether a dispatcher proved the client abandoned its upload before the
+    /// backend response head (issue #6776). Not derived from the
+    /// `ClientDisconnect` class, which authorization and client-deadline
+    /// terminals also carry.
+    #[inline]
+    pub(crate) fn proven_client_upload_abort(&self) -> bool {
+        self.proven_client_upload_abort.observed()
     }
 
     /// The latched authorization-lifetime termination class, if this request's
@@ -4491,6 +5504,12 @@ impl RequestContext {
     /// late transport encoding of a decoded cache hit. These private decisions
     /// are only ever set, never cleared, when adopting the hook stage's state.
     pub(crate) fn adopt_final_request_body_hook_terminals(&mut self, hook_ctx: &RequestContext) {
+        // The `grpc_web` request-body transform runs on this hook context on
+        // H1/H2 and stages the split trailer block here as typed state; it must
+        // reach the live context that dispatch reads, or the stripped trailers
+        // would be lost. The hook context was cloned from this one, so taking
+        // its value is a no-op when no trailer frame was split.
+        self.grpc_web_request_trailers = hook_ctx.grpc_web_request_trailers.clone();
         self.semantic_cache_response_replay |= hook_ctx.semantic_cache_response_replay;
         if hook_ctx.gateway_capacity_response_selected() {
             self.mark_gateway_capacity_response_selected();
@@ -4557,6 +5576,7 @@ impl RequestContext {
         }
         self.grpc_deadline_initialized = true;
         self.grpc_deadline_had_valid_client_timeout = budget_ms.is_some();
+        self.grpc_deadline_policy_budget_ms = budget_ms;
         self.set_grpc_deadline_budget(budget_ms);
     }
 
@@ -4761,9 +5781,11 @@ impl RequestContext {
     }
 
     /// Correlation id for the concrete response-stream inspector chain, when
-    /// one attached to this request. Streaming plugins can key bounded shared
-    /// state by this id in `response_stream_inspector`, then remove and fold it
-    /// into `ctx.metadata` from `on_response_stream_terminated`.
+    /// one attached to this request. To pass inspector state to
+    /// `on_response_stream_terminated`, use [`Self::response_stream_handoff`]
+    /// with a per-instance key rather than a plugin-owned map keyed by this
+    /// id: the handoff drops with the request even when the terminal hook is
+    /// cancelled.
     pub fn response_stream_id(&self) -> Option<u64> {
         self.response_stream_id
     }
@@ -4962,12 +5984,25 @@ impl RequestContext {
         self.compression_response_buffer_permit.take()
     }
 
-    pub(crate) fn set_compression_staged_request_plaintext(&mut self, plaintext: Vec<u8>) {
+    pub(crate) fn set_compression_staged_request_plaintext(
+        &mut self,
+        plaintext: Vec<u8>,
+        decode_charge: crate::proxy::response_buffer_budget::DecodeChargeHold,
+    ) {
         self.compression_staged_request_plaintext = Some(plaintext);
+        self.compression_staged_decode_charge = decode_charge;
     }
 
-    pub(crate) fn take_compression_staged_request_plaintext(&mut self) -> Option<Vec<u8>> {
-        self.compression_staged_request_plaintext.take()
+    /// The staged plaintext together with the decode charge that covers it.
+    pub(crate) fn take_compression_staged_request_plaintext(
+        &mut self,
+    ) -> Option<(
+        Vec<u8>,
+        crate::proxy::response_buffer_budget::DecodeChargeHold,
+    )> {
+        let plaintext = self.compression_staged_request_plaintext.take()?;
+        let decode_charge = std::mem::take(&mut self.compression_staged_decode_charge);
+        Some((plaintext, decode_charge))
     }
 
     pub(crate) fn mark_compression_response_encode_aborted(&mut self) {
@@ -4985,7 +6020,6 @@ impl RequestContext {
         let _ = self.compression_response_buffer_permit.take();
     }
 
-    #[allow(dead_code)] // Used by external tests; dead code in the separately compiled bin target.
     pub(crate) fn compression_ownership_for_test(&self) -> (Option<u64>, Option<u64>) {
         (
             self.compression_request_decode_owner,
@@ -5437,12 +6471,9 @@ impl RequestContext {
     /// Whether the final request-body representation was decoded from a content
     /// coding rather than received as plaintext.
     ///
-    /// `#[allow(dead_code)]`: claiming plugins now take the owned handle above
-    /// (which answers the same question by returning `None`), so the only
-    /// remaining callers are external tests (through `_test_support`), and a
-    /// `pub` item reachable solely from `tests/` is dead in the separately
-    /// compiled binary unit.
-    #[allow(dead_code)]
+    /// Claiming plugins now take the owned handle above (which answers the
+    /// same question by returning `None`), so the only remaining callers are
+    /// external tests (through `_test_support`).
     pub fn final_request_body_was_decoded(&self) -> bool {
         self.governed_request_body_plaintext.is_some()
     }
@@ -5502,6 +6533,8 @@ impl RequestContext {
     /// by replay partitioning, but deliberately skips prebuffered body bytes and
     /// mirror receivers.
     pub(crate) fn clone_for_final_request_body_hooks(&mut self) -> Self {
+        // The clone is marked materialized, so it must carry the real map.
+        self.end_request_header_passthrough();
         Self {
             client_ip: self.client_ip.clone(),
             direct_client_ip: self.direct_client_ip.clone(),
@@ -5510,6 +6543,8 @@ impl RequestContext {
             method: self.method.clone(),
             path: self.path.clone(),
             raw_path: self.raw_path.clone(),
+            hmac_wire_method: self.hmac_wire_method.clone(),
+            hmac_wire_request_target: self.hmac_wire_request_target.clone(),
             request_authority: self.request_authority.clone(),
             outbound_proxy_hops: self.outbound_proxy_hops,
             request_is_secure: self.request_is_secure,
@@ -5528,6 +6563,7 @@ impl RequestContext {
             raw_headers: self.raw_headers.clone(),
             headers: self.headers.clone(),
             headers_materialized: true,
+            request_header_passthrough: None,
             raw_query_string: self.raw_query_string.clone(),
             outbound_query_string: self.outbound_query_string.clone(),
             replay_request_body_empty_proven: self.replay_request_body_empty_proven,
@@ -5556,12 +6592,18 @@ impl RequestContext {
             client_trust_session: self.client_trust_session.clone(),
             soap_ws_security_authenticated_body_digest: self
                 .soap_ws_security_authenticated_body_digest,
+            // Carried so a hook run that splits no trailer frame keeps an
+            // already-staged block, and adopted back afterwards.
+            grpc_web_request_trailers: self.grpc_web_request_trailers.clone(),
             timestamp_received: self.timestamp_received,
             grpc_deadline_initialized: self.grpc_deadline_initialized,
             grpc_deadline_had_valid_client_timeout: self.grpc_deadline_had_valid_client_timeout,
+            request_body_integrity_retirement: self.request_body_integrity_retirement,
             grpc_deadline_received_at: self.grpc_deadline_received_at,
-            grpc_deadline_preflight_complete: self.grpc_deadline_preflight_complete,
             grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,
+            grpc_deadline_policy_budget_ms: self.grpc_deadline_policy_budget_ms,
+            grpc_deadline_ceiling_ms: self.grpc_deadline_ceiling_ms,
+            grpc_deadline_headroom_ms: self.grpc_deadline_headroom_ms,
             grpc_deadline_at: self.grpc_deadline_at,
             route_request_deadline_at: self.route_request_deadline_at,
             route_attempt_timeout: self.route_attempt_timeout,
@@ -5572,8 +6614,10 @@ impl RequestContext {
             charged_backend_deadline_terminal: self.charged_backend_deadline_terminal,
             route_request_timeout_phase: self.route_request_timeout_phase,
             backend_dispatch_state: self.backend_dispatch_state,
+            last_backend_dispatch_error_class: self.last_backend_dispatch_error_class,
             diagnostic_slot: self.diagnostic_slot.clone(),
             backend_attempt_trace: self.backend_attempt_trace.clone(),
+            gateway_trace_owner: self.gateway_trace_owner,
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
             gateway_representation_response_selected: self.gateway_representation_response_selected,
             final_body_policy_terminal_replacement: self.final_body_policy_terminal_replacement,
@@ -5615,6 +6659,10 @@ impl RequestContext {
             // back from this compatibility context.
             cors_state: cors::CorsRequestState::default(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
+            request_trailer_strip_headers: self.request_trailer_strip_headers.clone(),
+            route_owned_request_assertion_headers: self
+                .route_owned_request_assertion_headers
+                .clone(),
             // Per-plugin working state. The split into `PluginRequestState`
             // did not change any family's lifecycle here: most are CLONED, the
             // claim-header staging and the `response_caching` header delta stay
@@ -5637,6 +6685,11 @@ impl RequestContext {
                 // compatibility clone would extend their lifetime unnecessarily.
                 hook_state.pending_claim_headers = HashMap::new();
                 hook_state.sanitized_claim_header_destinations = HashSet::new();
+                // Same for the `mesh_authz` ext-authz allow-header staging: it
+                // is consumed only by `before_proxy` / `after_proxy` on the
+                // live context, and may carry a provider-minted credential.
+                hook_state.mesh_ext_authz_upstream_headers = HashMap::new();
+                hook_state.mesh_ext_authz_downstream_headers = HashMap::new();
                 // Response caching has no final request-body hook. Its private
                 // backend-header delta remains on the live donor context for the
                 // eventual response store rather than extending raw values into
@@ -5650,6 +6703,7 @@ impl RequestContext {
             h3_response_upstream_is_fallback: self.h3_response_upstream_is_fallback,
             original_accept_encoding: self.original_accept_encoding.clone(),
             websocket_response_boundary: self.websocket_response_boundary,
+            prometheus_metrics_observed: self.prometheus_metrics_observed,
             json_scan_memo: self.json_scan_memo.clone(),
             // Deliberately NOT carried: the shared request representation gate
             // stages this view from the exact `(headers, body)` pair the final
@@ -5662,6 +6716,9 @@ impl RequestContext {
             response_policy_stamp: self.response_policy_stamp.clone(),
             response_presentation_policy_digest: self.response_presentation_policy_digest,
             serverless_terminate_response: self.serverless_terminate_response,
+            origin_rejection: self.origin_rejection.clone(),
+            gateway_response_replacement: self.gateway_response_replacement.clone(),
+            reauthentication_challenge: self.reauthentication_challenge,
             serverless_grpc_terminate_frame: self.serverless_grpc_terminate_frame.clone(),
             serverless_owned_dedup_publication: self.serverless_owned_dedup_publication,
             ai_prompt_compressor_classification_path: std::mem::take(
@@ -5673,6 +6730,15 @@ impl RequestContext {
             ai_prompt_compressor_marker_reject_status: std::mem::take(
                 &mut self.ai_prompt_compressor_marker_reject_status,
             ),
+            // Transferred like the compressor's staged rejection: the body
+            // transform and the final hook that consumes it run on this clone.
+            request_transformer_ambiguous_body_refusal: std::mem::take(
+                &mut self.request_transformer_ambiguous_body_refusal,
+            ),
+            // Response-side state; the response lifecycle runs on the live
+            // context, never on this request-body clone.
+            response_transformer_ambiguous_body_refusal: self
+                .response_transformer_ambiguous_body_refusal,
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             compression_request_decode_owner: self.compression_request_decode_owner,
             compression_response_encode_owner: self.compression_response_encode_owner,
@@ -5691,6 +6757,9 @@ impl RequestContext {
             compression_response_buffer_permit: HeldResponseBufferPermit::default(),
             compression_staged_request_plaintext: std::mem::take(
                 &mut self.compression_staged_request_plaintext,
+            ),
+            compression_staged_decode_charge: std::mem::take(
+                &mut self.compression_staged_decode_charge,
             ),
             compression_response_encode_aborted: std::mem::take(
                 &mut self.compression_response_encode_aborted,
@@ -5738,6 +6807,7 @@ impl RequestContext {
             peer_spiffe_certificate_principal: self.peer_spiffe_certificate_principal,
             plugin_http_call_ns: Arc::clone(&self.plugin_http_call_ns),
             reject_hook_execution_ns: Arc::clone(&self.reject_hook_execution_ns),
+            proven_client_upload_abort: self.proven_client_upload_abort.clone(),
             // Watch receivers are clone-safe. Preserve them so the detached
             // gRPC-deadline logging path (which intentionally clones the
             // context before spawning cleanup) still emits every dispatched
@@ -5752,12 +6822,14 @@ impl RequestContext {
             request_body_sha256: None,
             request_body_sha512: None,
             max_response_body_size_bytes: self.max_response_body_size_bytes,
+            inbound_request_body_may_follow: self.inbound_request_body_may_follow,
             // Route ceilings are request-scoped policy, not per-phase state:
             // the final-body hooks must hold the same bound the streaming and
             // buffering paths were admitted under, so a post-transform check
             // cannot silently fall back to the global allowance.
             route_request_body_limit_bytes: self.route_request_body_limit_bytes,
             route_response_body_limit_bytes: self.route_response_body_limit_bytes,
+            route_may_rewrite_response_stream: self.route_may_rewrite_response_stream,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
             grpc_request_messages_observed: Arc::clone(&self.grpc_request_messages_observed),
             grpc_response_messages_observed: Arc::clone(&self.grpc_response_messages_observed),
@@ -5796,6 +6868,7 @@ impl RequestContext {
             ai_stream_router_claim: self.ai_stream_router_claim.clone(),
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
+            node_waypoint_route_branch_authz: self.node_waypoint_route_branch_authz.clone(),
             mesh_direction: self.mesh_direction,
             orig_dst: self.orig_dst,
             destination_ip: self.destination_ip,
@@ -5810,6 +6883,10 @@ impl RequestContext {
             // Carrying the flag keeps a hook that reads it on this clone
             // consistent with the live request.
             finalized_request_egress_dispatched: self.finalized_request_egress_dispatched,
+            // A compatibility clone never logs the request's terminal record.
+            terminal_record: TerminalRecordLatch::default(),
+            mesh_labels: self.mesh_labels.clone(),
+            mesh_label_projection_deferred: self.mesh_label_projection_deferred,
         }
     }
 
@@ -5889,6 +6966,103 @@ impl RequestContext {
             .unwrap_or(&[])
     }
 
+    /// Install the route's request-trailer strip list (credential locations
+    /// plus owned gateway-assertion headers) and the route's owned
+    /// gateway-assertion headers, from the plugin cache view.
+    pub(crate) fn set_request_trailer_strip_headers(
+        &mut self,
+        headers: Arc<Vec<String>>,
+        owned_assertion_headers: Arc<Vec<String>>,
+    ) {
+        if !owned_assertion_headers.is_empty() {
+            self.route_owned_request_assertion_headers = Some(owned_assertion_headers);
+        }
+        if !headers.is_empty() {
+            self.request_trailer_strip_headers = Some(headers);
+        }
+    }
+
+    /// Whether a plugin on the matched route owns any gateway-assertion
+    /// request header (`Plugin::owned_request_assertion_header_names`).
+    pub(crate) fn route_owns_request_assertion_headers(&self) -> bool {
+        self.route_owned_request_assertion_headers.is_some()
+    }
+
+    /// Every gateway-assertion request header a plugin on the matched route
+    /// owns, or `None` when it owns none.
+    pub(crate) fn route_owned_request_assertion_headers(&self) -> Option<&[String]> {
+        self.route_owned_request_assertion_headers
+            .as_deref()
+            .map(Vec::as_slice)
+    }
+
+    /// Replace the current authorized state of the gateway-asserted header a
+    /// backend reads as `name`: `Some(value)` for an install under the
+    /// header-map key `name`, `None` for a clear. The final gateway-assertion
+    /// pass (`proxy::enforce_route_owned_request_assertions`) and the
+    /// trigger-skip sanitizers keep, per backend-equivalence class, only the
+    /// one entry `name: value` of the current install.
+    ///
+    /// Gated by its callers: only an admitted owner's own decision reaches it
+    /// (a claim install, an OPA allow, a forwarded SPIFFE identity), so a route
+    /// that owns no asserted header (and the plugin-free request path) never
+    /// materializes per-plugin state here.
+    fn set_request_assertion_state(&mut self, name: &str, value: Option<&str>) {
+        let folded = name.to_ascii_lowercase().replace('_', "-");
+        let value = value.map(|value| (name.to_string(), value.to_string()));
+        let state = &mut self.plugin_state_mut().request_assertion_state;
+        match state.iter_mut().find(|(owned, _)| *owned == folded) {
+            Some((_, current)) => *current = value,
+            None => state.push((folded, value)),
+        }
+    }
+
+    /// An admitted owner installed `name: value` for this request; it replaces
+    /// any earlier decision for that destination.
+    pub(crate) fn record_installed_request_assertion(&mut self, name: &str, value: &str) {
+        self.set_request_assertion_state(name, Some(value));
+    }
+
+    /// An admitted owner cleared `name` for this request (it sanitized the
+    /// destination and installed nothing); any earlier owner's value is
+    /// retired, so nothing can bring it back.
+    pub(crate) fn record_cleared_request_assertion(&mut self, name: &str) {
+        self.set_request_assertion_state(name, None);
+    }
+
+    /// Shared handle to the route's request-trailer strip list, for the late
+    /// request-trailer boundaries that outlive this context (streaming
+    /// request-body adapters and HTTP/3 upload pumps): every configured
+    /// credential header location plus every header a plugin on the route
+    /// owns as a gateway assertion (`claim_headers` / `output_claim_headers`
+    /// destinations, whatever any trigger decides). One reference-count
+    /// increment, and `None` when the route configures neither, so an
+    /// unauthenticated route carries nothing into its body adapter. A context
+    /// that never received the strip list falls back to the credential list.
+    pub(crate) fn request_trailer_credential_header_names(&self) -> Option<Arc<Vec<String>>> {
+        self.request_trailer_strip_headers
+            .clone()
+            .or_else(|| self.request_headers_to_redact.clone())
+    }
+
+    /// Whether a request trailer named `name` must be dropped at a late
+    /// request-trailer boundary on this route (gRPC-Web trailer staging).
+    /// Matched as a CGI-style backend reads names (ASCII case-insensitive,
+    /// `_` read as `-`), like
+    /// [`crate::proxy::headers::strip_configured_credential_request_trailers`].
+    pub(crate) fn request_trailer_must_be_stripped(&self, name: &str) -> bool {
+        use crate::proxy::headers::field_names_equivalent_for_backends;
+
+        self.request_trailer_strip_headers
+            .as_ref()
+            .or(self.request_headers_to_redact.as_ref())
+            .is_some_and(|headers| {
+                headers
+                    .iter()
+                    .any(|header| field_names_equivalent_for_backends(name, header))
+            })
+    }
+
     /// Retain one credential-query digest outside public metadata.
     pub(crate) fn mark_query_credential_partition_digest(&mut self, name: &str, digest: [u8; 32]) {
         let digests = &mut self.plugin_state_mut().query_credential_partition_digests;
@@ -5900,6 +7074,20 @@ impl RequestContext {
             return;
         }
         digests.push((name.to_string(), digest));
+    }
+
+    /// Header renames applied to this request, in order.
+    pub(crate) fn request_header_rename_lineage(&self) -> &[(String, String)] {
+        self.plugin_state()
+            .map(|state| state.request_header_rename_lineage.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Query renames applied to this request, in order.
+    pub(crate) fn request_query_rename_lineage(&self) -> &[(String, String)] {
+        self.plugin_state()
+            .map(|state| state.request_query_rename_lineage.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Credential-query digests captured before authentication stripping.
@@ -6025,6 +7213,17 @@ impl RequestContext {
         self.websocket_response_boundary
     }
 
+    /// Record that the `prometheus_metrics` request hook observed this
+    /// transaction. Idempotent and allocation-free.
+    pub fn mark_prometheus_metrics_observed(&mut self) {
+        self.prometheus_metrics_observed = true;
+    }
+
+    /// Whether the `prometheus_metrics` request hook observed this transaction.
+    pub fn prometheus_metrics_observed(&self) -> bool {
+        self.prometheus_metrics_observed
+    }
+
     pub(crate) fn request_header_requires_redaction(&self, header_name: &str) -> bool {
         self.request_headers_to_redact
             .as_ref()
@@ -6122,7 +7321,10 @@ impl RequestContext {
             .map(String::as_str)
     }
 
-    pub(crate) fn apply_waf_owned_log_metadata(&self, metadata: &mut HashMap<String, String>) {
+    pub(crate) fn apply_waf_owned_log_metadata<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &mut HashMap<String, String, MS>,
+    ) {
         metadata.retain(|key, _| !key.starts_with("waf."));
         let Some(state) = self.plugin_state() else {
             return;
@@ -6298,7 +7500,8 @@ impl RequestContext {
             };
         let resolved_tls_override = self
             .route_override_resolved_tls
-            .clone()
+            .as_deref()
+            .cloned()
             .or(upstream_tls_override)
             .or(direct_backend_tls_override);
         let resolved_tls_changed = resolved_tls_override
@@ -6377,7 +7580,7 @@ impl RequestContext {
         let retry_changed = self
             .route_override_retry
             .as_ref()
-            .is_some_and(|retry| proxy.retry != *retry);
+            .is_some_and(|retry| proxy.retry.as_ref() != retry.as_deref());
         // An Istio `rewrite.authority` rebases the `Host`/`:authority` forwarded
         // to the backend. The plugin already wrote the new authority into the
         // request `host` header; flipping `preserve_host_header` on the
@@ -6452,7 +7655,7 @@ impl RequestContext {
             overridden.backend_connect_timeout_ms = timeout;
         }
         if let Some(retry) = &self.route_override_retry {
-            overridden.retry = retry.clone();
+            overridden.retry = retry.as_deref().cloned();
         }
         if preserve_host_changed {
             overridden.preserve_host_header = true;
@@ -6474,7 +7677,136 @@ impl RequestContext {
     #[inline]
     pub fn set_raw_headers(&mut self, headers: HeaderMap) {
         self.headers_materialized = false;
+        self.request_header_passthrough = None;
         self.raw_headers = Some(Arc::new(headers));
+    }
+
+    /// Enter the request-header passthrough lane (issue #6671) instead of
+    /// materializing `headers`. Call only for a routed request whose resolved
+    /// plugin chain is empty; `authority` is the request URI authority used for
+    /// the HTTP/2 `Host` backfill. Returns `false`, leaving the context
+    /// untouched, when the headers are already materialized or the wire block
+    /// is not a 1:1 projection of the materialized map; the caller must then
+    /// materialize as usual.
+    pub(crate) fn try_begin_request_header_passthrough(&mut self, authority: Option<&str>) -> bool {
+        if self.headers_materialized
+            || !self.headers.is_empty()
+            || self.request_header_passthrough.is_some()
+        {
+            return false;
+        }
+        let Some(raw) = self.raw_headers.as_deref() else {
+            return false;
+        };
+        let Some(passthrough) =
+            crate::proxy::request_headers::RequestHeaderPassthrough::begin(raw, authority)
+        else {
+            return false;
+        };
+        self.request_header_passthrough = Some(passthrough);
+        true
+    }
+
+    /// Whether this request dispatches from its wire headers (issue #6671).
+    #[inline]
+    pub(crate) fn request_header_passthrough_active(&self) -> bool {
+        self.request_header_passthrough.is_some()
+    }
+
+    /// Leave the passthrough lane, materializing the exact map the eager path
+    /// would hold at this point. No-op otherwise.
+    #[inline]
+    pub(crate) fn end_request_header_passthrough(&mut self) {
+        if self.request_header_passthrough.is_some() {
+            self.materialize_headers();
+        }
+    }
+
+    /// Record the `X-Ferrum-Hops` count re-asserted before dispatch on a
+    /// passthrough request, where there is no map to write it into.
+    #[inline]
+    pub(crate) fn set_request_header_passthrough_proxy_hops(&mut self, hops: Option<u8>) {
+        if let Some(passthrough) = self.request_header_passthrough.as_mut() {
+            passthrough.set_proxy_hops(hops);
+        }
+    }
+
+    /// Record wire credential header names stripped by passthrough-safe auth
+    /// plugins (`hide_credentials`) on a passthrough request.
+    #[inline]
+    pub(crate) fn set_request_header_passthrough_stripped_headers(
+        &mut self,
+        stripped: Arc<Vec<String>>,
+    ) {
+        if let Some(passthrough) = self.request_header_passthrough.as_mut() {
+            passthrough.set_stripped_headers(stripped);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_set_request_header_passthrough_gateway_assertions(
+        &mut self,
+        username: Option<&str>,
+        custom_id: Option<&str>,
+        identity: Option<&str>,
+        geo_country: Option<&str>,
+    ) -> bool {
+        match self.request_header_passthrough.as_mut() {
+            Some(passthrough) => {
+                passthrough.try_set_gateway_assertions(username, custom_id, identity, geo_country)
+            }
+            None => false,
+        }
+    }
+
+    /// Apply gateway-asserted headers (`x-consumer-username`,
+    /// `x-consumer-custom-id`, `x-authenticated-identity`, `x-geo-country`)
+    /// directly onto the active passthrough overlay without materializing
+    /// `ctx.headers`. Returns `false` if any value is not representable as an
+    /// unchanged wire `HeaderValue`, signaling the caller to fall back to
+    /// `end_request_header_passthrough()`.
+    #[inline]
+    pub(crate) fn try_apply_request_header_passthrough_gateway_assertions(&mut self) -> bool {
+        let username = self.backend_consumer_username().map(str::to_owned);
+        let custom_id = self.backend_consumer_custom_id().map(str::to_owned);
+        let identity = self.backend_authenticated_identity().map(str::to_owned);
+        let geo_country = self.backend_geo_country().map(str::to_owned);
+        match self.request_header_passthrough.as_mut() {
+            Some(passthrough) => passthrough.try_set_gateway_assertions(
+                username.as_deref(),
+                custom_id.as_deref(),
+                identity.as_deref(),
+                geo_country.as_deref(),
+            ),
+            None => false,
+        }
+    }
+
+    /// The request headers backend dispatch forwards: `owned` when a plugin
+    /// produced a backend-specific map, the passthrough view of the wire block,
+    /// or the materialized `headers`.
+    pub(crate) fn request_headers_view<'a>(
+        &'a self,
+        owned: Option<&'a HashMap<String, String>>,
+    ) -> crate::proxy::request_headers::RequestHeaders<'a> {
+        use crate::proxy::request_headers::RequestHeaders;
+        if let Some(owned) = owned {
+            return RequestHeaders::Materialized(owned);
+        }
+        match (
+            self.request_header_passthrough.as_ref(),
+            self.raw_headers.as_deref(),
+        ) {
+            (Some(passthrough), Some(raw)) => RequestHeaders::Passthrough(passthrough.view(raw)),
+            _ => RequestHeaders::Materialized(&self.headers),
+        }
+    }
+
+    /// One request header as the materialized map holds it, also on a
+    /// passthrough request.
+    #[inline]
+    pub(crate) fn effective_request_header(&self, name: &str) -> Option<&str> {
+        self.request_headers_view(None).get(name)
     }
 
     /// Whether the pristine wire `HeaderMap` is still available for
@@ -6484,6 +7816,15 @@ impl RequestContext {
         self.raw_headers.is_some()
     }
 
+    /// Whether [`Self::materialize_headers`] has populated `headers` from the
+    /// raw map. Once it has, `headers` is the AUTHORITATIVE request view: a
+    /// name absent from it was removed (or never sent), and policy readers
+    /// must not resurrect it from the retained raw block.
+    #[inline]
+    pub fn headers_are_materialized(&self) -> bool {
+        self.headers_materialized
+    }
+
     /// Share the pristine request header block with a retry planner without
     /// cloning the `HeaderMap` on every retry-enabled request. The selected
     /// transport clones it only when an actual secured-mesh retry needs a
@@ -6491,6 +7832,32 @@ impl RequestContext {
     #[inline]
     pub(crate) fn raw_headers_snapshot(&self) -> Option<Arc<HeaderMap>> {
         self.raw_headers.clone()
+    }
+
+    /// Drop every retained client field line for the route's owned
+    /// gateway-assertion headers from the pristine wire view, after the final
+    /// assertion pass. Every later consumer that rebuilds a backend or mirror
+    /// request from it (the secured-mesh retry replay through
+    /// [`Self::raw_headers_snapshot`], request mirroring) then inherits the
+    /// strip, so a retry can never restore the client's lines for an owned
+    /// name. Copies the map only when a line actually matches.
+    pub(crate) fn strip_route_owned_assertion_raw_lines(&mut self) {
+        use crate::proxy::headers::field_names_equivalent_for_backends;
+
+        let Some(owned) = self.route_owned_request_assertion_headers.clone() else {
+            return;
+        };
+        let Some(raw) = self.raw_headers.as_mut() else {
+            return;
+        };
+        let matches = raw.keys().any(|name| {
+            owned
+                .iter()
+                .any(|owned| field_names_equivalent_for_backends(name.as_str(), owned))
+        });
+        if matches {
+            crate::proxy::remove_owned_assertion_field_lines(Arc::make_mut(raw), &owned);
+        }
     }
 
     /// Look up a single header from the raw `HeaderMap` without materializing
@@ -6583,7 +7950,8 @@ impl RequestContext {
     }
 
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
-    /// String>`). This is a one-time operation — subsequent calls are no-ops.
+    /// String>`). Raw fields are copied once; subsequent calls only fold any
+    /// duplicate case variants a plugin has since inserted into the map.
     /// The raw map is retained so plugins can evaluate multi-value and
     /// non-UTF-8 field lines.
     ///
@@ -6611,6 +7979,8 @@ impl RequestContext {
     /// deletes raw headers. It also means the non-UTF-8 values omitted above are
     /// dropped on those outbound paths rather than forwarded byte-exact.
     pub fn materialize_headers(&mut self) {
+        let passthrough = self.request_header_passthrough.take();
+        crate::proxy::headers::canonicalize_request_header_map(&mut self.headers);
         if self.headers_materialized {
             return;
         }
@@ -6643,6 +8013,12 @@ impl RequestContext {
                     })
                     .or_insert_with(|| v.to_owned());
             }
+        }
+        crate::proxy::headers::canonicalize_request_header_map(&mut self.headers);
+        // A passthrough request carries its Host backfill and re-asserted hop
+        // count outside the map; fold them in so the map matches the eager one.
+        if let Some(passthrough) = passthrough {
+            passthrough.apply_to_materialized(&mut self.headers);
         }
     }
 
@@ -6704,13 +8080,21 @@ impl RequestContext {
     /// normal-backend secret to the third-party provider URL. `None` is the
     /// ordinary unclaimed hot path: one `Option` test, no allocation.
     ///
+    /// An aggregate `mcp_gateway` admission whose selected upstream must not
+    /// receive client credentials commits `Some("")` the same way, so neither
+    /// a client query credential nor a later query transform reaches the
+    /// tool-selected MCP upstream (`McpAdmissionRecord::committed_query`).
+    ///
     /// Never log this value. It is a query string, so a transform could have
     /// relocated a credential into it.
     #[inline]
     pub(crate) fn committed_provider_query(&self) -> Option<&str> {
-        self.ai_stream_router_claim
+        if let Some(claim) = self.ai_stream_router_claim.as_deref() {
+            return Some(claim.committed_query());
+        }
+        self.mcp_admission
             .as_deref()
-            .map(ai_stream_router::AiStreamRouterClaim::committed_query)
+            .and_then(mcp_gateway::McpAdmissionRecord::committed_query)
     }
 
     /// Whether an `ai_stream_router` instance successfully claimed this request
@@ -6764,6 +8148,32 @@ impl RequestContext {
         self.raw_path = Some(hmac_auth::HmacWirePath::new(raw_path));
     }
 
+    /// Record the client's wire method when a frontend rewrites
+    /// [`Self::method`] (WebSocket Extended CONNECT → `GET`), so RFC 9421
+    /// `@method` covers the method the client actually signed.
+    #[inline]
+    pub(crate) fn set_wire_method_for_hmac(&mut self, wire_method: String) {
+        self.hmac_wire_method = Some(wire_method);
+    }
+
+    /// Record the frontend request line for RFC 9421 derivation: the wire
+    /// method when it differs from [`Self::method`], and the request-target
+    /// when [`hmac_auth::unreconstructible_request_target`] says the path and
+    /// query cannot reproduce it. Allocates nothing for an ordinary request.
+    pub(crate) fn record_wire_request_line_for_hmac(
+        &mut self,
+        wire_method: &str,
+        version: http::Version,
+        uri: &http::Uri,
+    ) {
+        if wire_method != self.method {
+            self.hmac_wire_method = Some(wire_method.to_owned());
+        }
+        if let Some(target) = hmac_auth::unreconstructible_request_target(version, uri) {
+            self.hmac_wire_request_target = Some(hmac_auth::HmacWirePath::new(target));
+        }
+    }
+
     /// Parse the raw query string into `self.query_params`. Keys and values are
     /// percent-decoded so plugins see human-readable strings. Parameters without
     /// `=` (e.g., `?flag`) are stored with an empty-string value.
@@ -6788,32 +8198,6 @@ impl RequestContext {
                 let decoded_v = percent_decode_str(v).decode_utf8_lossy();
                 self.query_params
                     .insert(decoded_k.into_owned(), decoded_v.into_owned());
-            }
-        }
-        self.query_params_materialized = true;
-    }
-
-    /// Materialize the raw query string into `self.query_params` without
-    /// percent-decoding. Empty pairs are skipped and parameters without `=`
-    /// (e.g., `?flag`) are stored with an empty-string value, matching the
-    /// decoded variant so the only plugin-visible difference between the two is
-    /// percent-decoding (and duplicate-pair collapse via the retained raw
-    /// query string).
-    ///
-    /// HTTP/3 uses this by default to preserve its legacy plugin-visible query
-    /// representation unless an active plugin explicitly opts into decoded
-    /// query params.
-    pub fn materialize_query_params_raw(&mut self) {
-        if self.query_params_materialized {
-            return;
-        }
-        if let Some(raw) = self.raw_query_string.as_deref() {
-            for pair in raw.split('&') {
-                if pair.is_empty() {
-                    continue;
-                }
-                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-                self.query_params.insert(k.to_string(), v.to_string());
             }
         }
         self.query_params_materialized = true;
@@ -6898,6 +8282,24 @@ impl RequestContext {
             .as_ref()
             .map(|consumer| consumer.username.as_str())
             .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
+    }
+
+    /// Namespace of [`Self::effective_identity`]: a mapped Consumer, or an
+    /// unmapped external principal with its committed realm. Transaction
+    /// summaries record it beside `consumer_username` so billing never keys on
+    /// the collapsed display string (GHSA-q9vj-rf66-3j58).
+    pub fn principal_origin(&self) -> Option<utils::principal::PrincipalOrigin> {
+        utils::principal::PrincipalOrigin::of_request(self)
+    }
+
+    /// The summary's `(consumer_username, principal_origin)` pair, taken
+    /// together so a builder that binds them to locals cannot carry one
+    /// without the other.
+    pub fn summary_identity(&self) -> (Option<String>, Option<utils::principal::PrincipalOrigin>) {
+        (
+            self.effective_identity().map(str::to_owned),
+            self.principal_origin(),
+        )
     }
 
     /// Verified realm of the committed external identity, if one was committed
@@ -7264,6 +8666,26 @@ where
     }
 }
 
+/// The result [`await_precommit_response_phase`] would give a hook that a
+/// dispatcher skipped because the plugin does not implement it
+/// ([`Plugin::lifecycle_hooks`], issue #6615), computed without a boxed future
+/// or a timer.
+///
+/// The skipped default completes immediately with `value`, but
+/// [`await_deadline_first`] refuses an elapsed bound before polling, so an
+/// undeclared hook still observes expiry exactly as calling the no-op did.
+pub(crate) fn skipped_precommit_response_phase<T>(
+    bound: PrecommitResponsePhaseBound,
+    value: T,
+) -> PrecommitPhaseResult<T> {
+    match bound.deadline() {
+        Some(deadline) if tokio::time::Instant::now() >= deadline => {
+            PrecommitPhaseResult::Expired(bound.expired_authorization())
+        }
+        _ => PrecommitPhaseResult::Completed(value),
+    }
+}
+
 impl PrecommitPhaseResult<PluginResult> {
     /// Resolve an awaited plugin phase into the result the caller must act on.
     ///
@@ -7442,7 +8864,10 @@ pub trait ResponseStreamInspector: Send {
     }
 
     /// Inspect the next decoded chunk of the response body.
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction;
+    ///
+    /// The chunk is a shared buffer: an inspector that forwards it unchanged
+    /// returns `Forward(chunk.clone())`, a reference-count bump, not a copy.
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction;
 
     /// Flush / inspect the trailing partial window at end of stream. The default
     /// forwards nothing.
@@ -7644,7 +9069,7 @@ impl ResponseStreamInspector for CompletionNotifyingInspector {
         self.inner.stage()
     }
 
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
         self.inner.on_chunk(chunk).await
     }
 
@@ -7696,10 +9121,7 @@ impl Drop for CompletionNotifyingInspector {
 /// scan) is now used only by external test crates; every gateway hot path resolves
 /// the capability through the `PluginCache` and calls
 /// [`create_response_stream_inspector_for_enabled_plugins`] directly.
-/// `#[allow(dead_code)]` because the binary target recompiles the source without
-/// those test crates, so it sees no caller.
 #[doc(hidden)]
-#[allow(dead_code)] // used only by tests/, dead code in the bin target
 pub fn create_response_stream_inspector(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -8119,7 +9541,7 @@ impl ChainFlushEnd {
 
 #[async_trait]
 impl ResponseStreamInspector for ChainedResponseStreamInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
         let action = self.chunk_through(chunk).await;
         self.note_sent(&action);
         action
@@ -8143,17 +9565,21 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
 }
 
 impl ChainedResponseStreamInspector {
-    async fn chunk_through(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-        let mut buf = bytes::Bytes::copy_from_slice(chunk);
+    async fn chunk_through(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
+        // The first inspector reads the caller's chunk; each later one reads
+        // what the previous inspector released. Both are shared buffers, so
+        // handing them on never copies bytes.
+        let mut released: Option<bytes::Bytes> = None;
         for index in 0..self.inspectors.len() {
-            if buf.is_empty() {
+            let input: &bytes::Bytes = released.as_ref().unwrap_or(chunk);
+            if input.is_empty() {
                 // An upstream inspector is holding this window; nothing yet for
                 // the rest of the chain to see.
                 return ResponseStreamAction::Forward(bytes::Bytes::new());
             }
             self.prime(index);
-            match self.inspectors[index].on_chunk(&buf).await {
-                ResponseStreamAction::Forward(out) => buf = out,
+            match self.inspectors[index].on_chunk(input).await {
+                ResponseStreamAction::Forward(out) => released = Some(out),
                 ResponseStreamAction::Terminate(final_bytes)
                     if self.inspectors[index].stage()
                         == ResponseStreamInspectorStage::Normalize =>
@@ -8171,12 +9597,14 @@ impl ChainedResponseStreamInspector {
             }
             if self.inspectors[index].has_deferred_cut() {
                 self.notify_prior_downstream_terminated(index);
+                let carry = released.take().unwrap_or_default();
                 return self
-                    .flush_from(index + 1, buf, ChainFlushEnd::Cut(index))
+                    .flush_from(index + 1, carry, ChainFlushEnd::Cut(index))
                     .await;
             }
         }
-        ResponseStreamAction::Forward(buf)
+        // A chain always holds at least one inspector, so `released` is set.
+        ResponseStreamAction::Forward(released.unwrap_or_else(|| chunk.clone()))
     }
 
     /// Flush inspectors `from..` as the end of the stream: each receives
@@ -8345,8 +9773,8 @@ mod chained_inspector_tests {
     }
     #[async_trait]
     impl ResponseStreamInspector for TagAtEnd {
-        async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-            ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
+            ResponseStreamAction::Forward(chunk.clone())
         }
         async fn on_end(&mut self) -> ResponseStreamAction {
             ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(self.tag.as_bytes()))
@@ -8357,7 +9785,7 @@ mod chained_inspector_tests {
     struct CutNow;
     #[async_trait]
     impl ResponseStreamInspector for CutNow {
-        async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+        async fn on_chunk(&mut self, _chunk: &bytes::Bytes) -> ResponseStreamAction {
             ResponseStreamAction::Terminate(Some(bytes::Bytes::from_static(b"CUT")))
         }
     }
@@ -8370,7 +9798,7 @@ mod chained_inspector_tests {
             ResponseStreamInspectorStage::Normalize
         }
 
-        async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+        async fn on_chunk(&mut self, _chunk: &bytes::Bytes) -> ResponseStreamAction {
             ResponseStreamAction::Terminate(Some(bytes::Bytes::from_static(b"FINAL")))
         }
     }
@@ -8381,8 +9809,8 @@ mod chained_inspector_tests {
     }
     #[async_trait]
     impl ResponseStreamInspector for CutAtEnd {
-        async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-            ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
+            ResponseStreamAction::Forward(chunk.clone())
         }
         async fn on_end(&mut self) -> ResponseStreamAction {
             ResponseStreamAction::Terminate(self.payload.map(bytes::Bytes::from_static))
@@ -8393,7 +9821,7 @@ mod chained_inspector_tests {
     struct HoldAll;
     #[async_trait]
     impl ResponseStreamInspector for HoldAll {
-        async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+        async fn on_chunk(&mut self, _chunk: &bytes::Bytes) -> ResponseStreamAction {
             ResponseStreamAction::Forward(bytes::Bytes::new())
         }
     }
@@ -8421,7 +9849,10 @@ mod chained_inspector_tests {
         ])
         .expect("two inspectors chain");
         // A chunk passes through both unchanged.
-        assert_eq!(&forwarded(chain.on_chunk(b"hi").await)[..], b"hi");
+        assert_eq!(
+            &forwarded(chain.on_chunk(&bytes::Bytes::from_static(b"hi")).await)[..],
+            b"hi"
+        );
         // on_end: A flushes "A" -> fed through B.on_chunk ("A") -> then B flushes
         // "B"; result is "A" ++ "B".
         assert_eq!(&forwarded(chain.on_end().await)[..], b"AB");
@@ -8435,7 +9866,7 @@ mod chained_inspector_tests {
         ])
         .expect("chain");
         assert!(matches!(
-            chain.on_chunk(b"x").await,
+            chain.on_chunk(&bytes::Bytes::from_static(b"x")).await,
             ResponseStreamAction::Terminate(Some(_))
         ));
     }
@@ -8447,7 +9878,10 @@ mod chained_inspector_tests {
             Box::new(NormalizeAndCut),
         ])
         .expect("chain");
-        match chain.on_chunk(b"provider-native").await {
+        match chain
+            .on_chunk(&bytes::Bytes::from_static(b"provider-native"))
+            .await
+        {
             ResponseStreamAction::Terminate(Some(bytes)) => {
                 assert_eq!(bytes.as_ref(), b"FINALB");
             }
@@ -8504,7 +9938,7 @@ mod chained_inspector_tests {
         ])
         .expect("chain");
         // First inspector holds → nothing reaches the second this chunk.
-        assert!(forwarded(chain.on_chunk(b"x").await).is_empty());
+        assert!(forwarded(chain.on_chunk(&bytes::Bytes::from_static(b"x")).await).is_empty());
     }
 }
 
@@ -8594,6 +10028,53 @@ pub enum DisconnectCause {
 /// still emit the sentinel so consumers can distinguish "unknown" from
 /// "zero".
 pub const LATENCY_UNKNOWN_MS: f64 = -1.0;
+
+/// What a [`TransactionSummary`] observed of its response's delivery to the
+/// client (issue #6769). Serialized as `response_delivery` on every HTTP-family
+/// transaction record.
+///
+/// The value names the boundary at which the record was finalized, which is
+/// what bounds the meaning of [`TransactionSummary::client_disconnected`] and
+/// [`TransactionSummary::body_completed`]:
+///
+/// * [`Self::NotObserved`] — the record was finalized before the frontend
+///   transport took the response: every buffered H1/H2 response, H1/H2
+///   gateway rejections and Trailers-Only gRPC errors, a streamed H1/H2
+///   response whose builder failed before hyper saw it, and any record built
+///   before an HTTP/3 send (HTTP/3 records built after the send settled are
+///   [`Self::Observed`]). A
+///   `false` `client_disconnected` then means only that no disconnect was seen
+///   before the hand-off. It is not evidence that the response reached the
+///   client, and a client that leaves while the transport writes the response
+///   is not reflected.
+/// * [`Self::Observed`] — the record was finalized at the response's terminal
+///   transport boundary: a streamed body ended, failed, or was dropped by the
+///   transport (`DeferredTransactionLogger`), an HTTP/3 send (buffered,
+///   streamed, or a rejection) settled, an HBONE relay ended, or the transport
+///   ended an H1/H2 request
+///   before any response was produced (the client-abort `499`, the
+///   protocol-reset `400`, or the gateway-close `444`).
+///   `client_disconnected` and `body_completed` describe
+///   that boundary. Even then the gateway only knows what the transport
+///   accepted: bytes the transport accepted can still be lost before the client
+///   reads them, so `Observed` is not proof of end-to-end receipt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseDelivery {
+    #[default]
+    NotObserved,
+    Observed,
+}
+
+impl ResponseDelivery {
+    /// The serialized spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotObserved => "not_observed",
+            Self::Observed => "observed",
+        }
+    }
+}
 
 /// Transaction summary for logging plugins.
 ///
@@ -8693,16 +10174,21 @@ pub struct TransactionSummary {
     pub response_streamed: bool,
     /// True when the client disconnected before receiving the full response.
     ///
-    /// Semantics by response type:
-    /// * **Streaming responses**: accurate — set by the deferred-logging path
-    ///   when the response body wrapper (`ProxyBody`) observes a disconnect
-    ///   error frame, or when the wrapper is dropped before reaching
-    ///   end-of-stream (see `deferred_log::DeferredTransactionLogger`).
-    /// * **Buffered responses**: best-effort. Hyper only signals client
-    ///   send failures at the connection-error handler, which fires after
-    ///   the handler function has already constructed and emitted the
-    ///   summary. Consumers should treat `false` on a buffered response
-    ///   as "not known to have disconnected," not as a positive assertion.
+    /// Read it together with [`Self::response_delivery`]:
+    /// * **Streaming responses** (`response_delivery: observed`): set by the
+    ///   deferred-logging path when the response body wrapper (`ProxyBody`)
+    ///   observes a disconnect error frame, or when the wrapper is dropped
+    ///   before reaching end-of-stream (see
+    ///   `deferred_log::DeferredTransactionLogger`).
+    /// * **Client abort before any response** (`response_delivery: observed`):
+    ///   `true`, with the `499` status and `client_disconnect` error class, when
+    ///   an H1/H2 client reset the stream or closed the connection while the
+    ///   handler was still pending (`proxy::client_abort_scope`).
+    /// * **Buffered responses and rejections** (`response_delivery:
+    ///   not_observed`): the summary is emitted before the transport takes the
+    ///   response, so a disconnect while the transport writes it is not
+    ///   observable here. `false` means "no disconnect seen before the
+    ///   hand-off", never "delivered".
     pub client_disconnected: bool,
     /// Human-friendly classification of the error when the gateway itself
     /// failed to communicate with the backend. `None` for successful requests
@@ -8720,6 +10206,9 @@ pub struct TransactionSummary {
     /// False when streaming was interrupted (client disconnect, backend RST,
     /// body size limit exceeded) or when no streaming occurred.
     pub body_completed: bool,
+    /// Which delivery boundary this record observed; see [`ResponseDelivery`].
+    /// Always serialized as `response_delivery`.
+    pub response_delivery: ResponseDelivery,
     /// Bytes of the request body relayed from the client to the backend
     /// (gateway-perspective: bytes it sent onward on the client's behalf).
     /// Same JSON key as `StreamTransactionSummary.bytes_sent`.
@@ -8727,8 +10216,8 @@ pub struct TransactionSummary {
     /// Accuracy by request type:
     /// * **Buffered requests** (plugins required the body, or retries were
     ///   configured): exact — populated from the collected body length after
-    ///   `Incoming::collect().await` (optionally via `SizeLimitedIncoming::bytes_seen()`
-    ///   when a size limit is in force).
+    ///   `Incoming::collect().await` (or through the counter shared with
+    ///   `SizeLimitedIncoming` when a size limit is in force).
     /// * **Streaming requests** (body forwarded frame-by-frame without
     ///   collection): exact — populated via `CountingIncoming`, which shares
     ///   an `Arc<AtomicU64>` between the forwarded body and the summary
@@ -8768,13 +10257,21 @@ pub struct TransactionSummary {
     /// plus operator extras from `FERRUM_LOG_REDACT_METADATA_KEYS`) are
     /// replaced with `[REDACTED]` at serialize time. The in-memory value is
     /// untouched so other plugin phases can still read the original.
-    pub metadata: HashMap<String, String>,
+    pub metadata: MetadataMap,
     /// Built-in AI usage provenance for Prometheus. This is intentionally not
     /// serialized into transaction logs; the operator-visible usage metadata
     /// remains in `metadata` while trust stays typed and private to the request
     /// pipeline.
     #[doc(hidden)]
     pub ai_usage_export: Option<AiUsageExport>,
+    /// Namespace of `consumer_username`: a mapped Consumer, or an unmapped
+    /// external principal with the realm that verified it. `None` when the
+    /// summary has no principal (or a builder did not record one, which
+    /// billing treats as an external principal with no realm). Not serialized,
+    /// so log output and schemas are unchanged; `api_chargeback` and
+    /// `api_chargeback_sink` key billing rows on it (GHSA-q9vj-rf66-3j58).
+    #[doc(hidden)]
+    pub principal_origin: Option<utils::principal::PrincipalOrigin>,
     /// Ownership generation captured at HTTP/gRPC/WebSocket admission. Not
     /// serialized; used by `proxy_alerts` to reject samples from a prior
     /// delete→recreate incarnation of the same proxy ID.
@@ -8866,6 +10363,7 @@ impl Serialize for TransactionSummary {
         if self.body_completed {
             map.serialize_entry("body_completed", &true)?;
         }
+        map.serialize_entry("response_delivery", &self.response_delivery)?;
         if self.bytes_sent != 0 {
             map.serialize_entry("bytes_sent", &self.bytes_sent)?;
         }
@@ -9027,6 +10525,7 @@ impl TransactionSummary {
         mirror.error_class = None;
         mirror.body_error_class = None;
         mirror.body_completed = false;
+        mirror.response_delivery = ResponseDelivery::NotObserved;
         // The cloned metadata describes the primary response. Clear every
         // response-only key that participates in terminal classification or
         // mirror serialization before applying the mirror task's own outcome.
@@ -9090,6 +10589,31 @@ pub async fn log_with_mirror(
     summary: &TransactionSummary,
     ctx: &RequestContext,
 ) {
+    log_with_mirror_inner(plugins, summary, ctx, true).await;
+}
+
+/// [`log_with_mirror`] for detached delivery that already runs under its own
+/// finite cleanup timeout. When that timeout cancels a blocked sink, the
+/// summary must not be resumed in further, unbounded detached work.
+pub(crate) async fn log_with_mirror_bounded(
+    plugins: &[Arc<dyn Plugin>],
+    summary: &TransactionSummary,
+    ctx: &RequestContext,
+) {
+    log_with_mirror_inner(plugins, summary, ctx, false).await;
+}
+
+async fn log_with_mirror_inner(
+    plugins: &[Arc<dyn Plugin>],
+    summary: &TransactionSummary,
+    ctx: &RequestContext,
+    resume_on_cancel: bool,
+) {
+    // The request's terminal record is now in flight. Latch it before the
+    // first suspension point so a client abort that drops the handler while a
+    // logging plugin awaits cannot add a second, client-abort record for the
+    // same request (issue #6768).
+    ctx.mark_terminal_record_started(summary.response_status_code);
     // Copy the memoized per-instance execution-trigger decisions from the
     // authoritative request context onto the terminal summary, so `log` /
     // `log_with_mesh_key` decide exactly as the instance's request and response
@@ -9100,7 +10624,8 @@ pub async fn log_with_mirror(
     // upgrade summary — so no call site has to remember to carry it.
     //
     // Clone only to stamp a missing trigger carrier, detected WebSocket flavor,
-    // or a gateway output-policy refusal. Ordinary HTTP stays allocation-free.
+    // a gateway output-policy refusal, or the delivered bytes of a `HEAD`
+    // response. Ordinary HTTP stays allocation-free.
     // Keep the conditional clone out of this async future's inline state. A
     // `TransactionSummary` is deliberately broad; storing it inline here grows
     // every request future (including the allocation-free, untriggered case)
@@ -9112,13 +10637,24 @@ pub async fn log_with_mirror(
     let stamp_websocket = matches!(ctx.request_http_flavor(), HttpFlavor::WebSocket);
     let policy_error_class = ctx.response_policy_error_class(summary.error_class);
     let stamp_policy = policy_error_class != summary.error_class;
-    let mut stamped = if stamp_triggers || stamp_websocket || stamp_policy {
+    // A response to `HEAD` delivers no body bytes (RFC 9110 §9.3.2): every
+    // frontend omits them at its final boundary, which can run after a path
+    // built this summary from the representation it was about to send. Decide
+    // delivered bytes here, from the trusted client method, for every path.
+    // Exact match: methods are case-sensitive (RFC 9110 §9.1), and the wire
+    // boundaries omit the body only for exactly `HEAD`; an extension method
+    // such as `head` still delivers its body and keeps its accounting.
+    let stamp_head_bytes = summary.bytes_received != 0 && ctx.method == "HEAD";
+    let mut stamped = if stamp_triggers || stamp_websocket || stamp_policy || stamp_head_bytes {
         Some(Box::new(summary.clone()))
     } else {
         None
     };
     if let Some(stamped) = stamped.as_deref_mut() {
         stamped.error_class = policy_error_class;
+        if stamp_head_bytes {
+            stamped.bytes_received = 0;
+        }
         if stamp_triggers {
             stamped.plugin_trigger_decisions = ctx.plugin_trigger_decisions();
         }
@@ -9140,11 +10676,12 @@ pub async fn log_with_mirror(
     {
         crate::diagnostic_ref::record_request_detail(slot, summary, ctx);
     }
-    let precompute_mesh_key = plugins
-        .iter()
-        .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));
+    let precompute_mesh_key = plugins.iter().any(|plugin| plugin.uses_mesh_request_key());
+    // Built from the request's typed mesh label projection when it is
+    // authoritative for this summary (issue #6793); parsed from the metadata
+    // strings otherwise.
     let mesh_key = if precompute_mesh_key {
-        crate::plugins::mesh::prometheus_helpers::mesh_request_key(summary)
+        crate::plugins::mesh::prometheus_helpers::mesh_request_key_for_request(summary, ctx)
     } else {
         None
     };
@@ -9157,13 +10694,44 @@ pub async fn log_with_mirror(
             mesh_key.as_ref(),
         );
     }
-    for plugin in plugins {
+    // Cancellation-safe delivery (issue #6768): when the request task is
+    // dropped while a sink awaits — hyper drops an H1/H2 handler whose client
+    // reset or disconnected during an awaited buffered log — the guard hands
+    // this summary to detached terminal delivery so the remaining sinks, the
+    // runtime transaction counters, and the mirror collectors still run once.
+    let mut delivery = TerminalDeliveryGuard {
+        plugins,
+        summary,
+        ctx,
+        next: 0,
+        armed: resume_on_cancel,
+    };
+    for (index, plugin) in plugins.iter().enumerate() {
+        // This sink's invocation starts now. If it is cancelled mid-call it is
+        // NOT invoked again: it may already have persisted or enqueued the
+        // record, and a dropped record beats a duplicate audit entry.
+        delivery.next = index + 1;
         // Transaction logging is gateway cleanup after the client-visible
         // outcome is final. A client RPC deadline must bound request handling,
         // but it must not suppress the audit/transaction record for the
         // deadline outcome itself.
-        plugin.log_with_mesh_key(summary, mesh_key.as_ref()).await;
+        if plugin.lifecycle_hooks().contains(PluginHooks::LOG) {
+            plugin.log_with_mesh_key(summary, mesh_key.as_ref()).await;
+        }
     }
+    delivery.armed = false;
+    finish_terminal_delivery(plugins, summary, ctx, precompute_mesh_key);
+    ctx.mark_terminal_record_finished();
+}
+
+/// Settle what follows the primary sinks of one terminal summary: the runtime
+/// transaction counters and the detached mirror collectors.
+fn finish_terminal_delivery(
+    plugins: &[Arc<dyn Plugin>],
+    summary: &TransactionSummary,
+    ctx: &RequestContext,
+    precompute_mesh_key: bool,
+) {
     crate::runtime_metrics::global_ref().record_transaction(summary);
 
     // Mirror completion and mirror-summary logging stay detached from the
@@ -9192,10 +10760,58 @@ pub async fn log_with_mirror(
                 None
             };
             for plugin in plugins.iter() {
+                if !plugin.lifecycle_hooks().contains(PluginHooks::LOG) {
+                    continue;
+                }
                 plugin
                     .log_with_mesh_key(&mirror_summary, mirror_mesh_key.as_ref())
                     .await;
             }
+        });
+    }
+}
+
+/// Continues one terminal summary's delivery if [`log_with_mirror`] is
+/// cancelled mid-way (issue #6768).
+///
+/// Holds only borrows on the normal path, so it costs nothing until it fires.
+/// On drop while armed it clones the summary, context, and plugin list into a
+/// detached terminal-delivery task that invokes only the sinks whose `log` had
+/// not started (at most once per sink: the interrupted sink is never invoked
+/// again), then settles the runtime counters and mirrors exactly as the inline
+/// path does.
+struct TerminalDeliveryGuard<'a> {
+    plugins: &'a [Arc<dyn Plugin>],
+    summary: &'a TransactionSummary,
+    ctx: &'a RequestContext,
+    next: usize,
+    armed: bool,
+}
+
+impl Drop for TerminalDeliveryGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed || std::thread::panicking() {
+            return;
+        }
+        let plugins: Vec<Arc<dyn Plugin>> = self.plugins.to_vec();
+        let next = self.next.min(plugins.len());
+        let summary = self.summary.clone();
+        let ctx = self.ctx.clone();
+        let _ = crate::observability_delivery::spawn_terminal(async move {
+            let precompute_mesh_key = plugins.iter().any(|plugin| plugin.uses_mesh_request_key());
+            let mesh_key = if precompute_mesh_key {
+                crate::plugins::mesh::prometheus_helpers::mesh_request_key_for_request(
+                    &summary, &ctx,
+                )
+            } else {
+                None
+            };
+            for plugin in plugins.iter().skip(next) {
+                if plugin.lifecycle_hooks().contains(PluginHooks::LOG) {
+                    plugin.log_with_mesh_key(&summary, mesh_key.as_ref()).await;
+                }
+            }
+            finish_terminal_delivery(&plugins, &summary, &ctx, precompute_mesh_key);
         });
     }
 }
@@ -9249,6 +10865,11 @@ pub fn spawn_bounded_terminal_summary_log(
     summary: TransactionSummary,
     ctx: &RequestContext,
 ) {
+    // The detached task logs a clone, so latch the authoritative context here:
+    // this summary is the request's terminal record, handed off whole, and the
+    // caller counts it synchronously next (issue #6768).
+    ctx.mark_terminal_record_started(summary.response_status_code);
+    ctx.mark_terminal_record_finished();
     // Gateway diagnostic reference (issue #5767): record the detail on the
     // request task, before admission, so a delivery refused by
     // `FERRUM_LOG_DELIVERY_MAX_TASKS` cannot leave the client's reference
@@ -9257,11 +10878,11 @@ pub fn spawn_bounded_terminal_summary_log(
         crate::diagnostic_ref::record_request_detail(slot, &summary, ctx);
     }
     let plugins = plugins.to_vec();
-    let ctx = ctx.clone();
+    let ctx = ctx.clone_for_detached_terminal_log();
     let _ = crate::observability_delivery::spawn_deadline_cleanup(async move {
         if tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            log_with_mirror(&plugins, &summary, &ctx),
+            log_with_mirror_bounded(&plugins, &summary, &ctx),
         )
         .await
         .is_err()
@@ -9410,7 +11031,7 @@ pub struct StreamConnectionContext {
     peer_spiffe_certificate_principal: bool,
     /// Plugin metadata. Lazily allocated on first write to avoid a HashMap allocation
     /// for stream connections that have no metadata-writing plugins configured.
-    pub metadata: Option<HashMap<String, String>>,
+    pub metadata: Option<MetadataMap>,
     /// Core-owned admission permits. External plugins should leave this empty
     /// and use metadata for their own connection state. Built-in admission
     /// plugins attach opaque permits through `add_admission_permit()` so state
@@ -9577,11 +11198,11 @@ impl StreamConnectionContext {
             request_id.clone(),
             generated,
         );
-        let metadata = self.metadata.get_or_insert_with(HashMap::new);
-        metadata.insert(instance_key.to_string(), request_id.clone());
+        let metadata = self.metadata.get_or_insert_with(MetadataMap::default);
         if publish_canonical {
-            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
+            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id.clone());
         }
+        metadata.insert(instance_key.to_string(), request_id);
     }
 
     /// Previously memoized execution-trigger decision for `token`, if any.
@@ -9622,6 +11243,22 @@ impl StreamConnectionContext {
             .as_ref()
             .map(|consumer| consumer.username.as_str())
             .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
+    }
+
+    /// Namespace of [`Self::effective_identity`] (see
+    /// [`RequestContext::principal_origin`]); stream connections carry no
+    /// committed realm.
+    pub fn principal_origin(&self) -> Option<utils::principal::PrincipalOrigin> {
+        utils::principal::PrincipalOrigin::of_stream(self)
+    }
+
+    /// The stream summary's `(consumer_username, principal_origin)` pair (see
+    /// [`RequestContext::summary_identity`]).
+    pub fn summary_identity(&self) -> (Option<String>, Option<utils::principal::PrincipalOrigin>) {
+        (
+            self.effective_identity().map(str::to_owned),
+            self.principal_origin(),
+        )
     }
 
     /// Contribute an authorization deadline observed by an admitting stream
@@ -9686,12 +11323,12 @@ impl StreamConnectionContext {
     /// Insert a metadata value, lazily allocating the map on first write.
     pub fn insert_metadata(&mut self, key: String, value: String) {
         self.metadata
-            .get_or_insert_with(HashMap::new)
+            .get_or_insert_with(MetadataMap::default)
             .insert(key, value);
     }
 
     /// Take the metadata map, returning an empty map if never allocated.
-    pub fn take_metadata(&mut self) -> HashMap<String, String> {
+    pub fn take_metadata(&mut self) -> MetadataMap {
         let mut metadata = self.metadata.take().unwrap_or_default();
         self.correlation_ids.project_correlation_ids(&mut metadata);
         metadata
@@ -9706,7 +11343,7 @@ impl StreamConnectionContext {
     /// replacing the authoritative terminal values.
     pub(crate) fn take_metadata_with_correlation_ids(
         &mut self,
-    ) -> (HashMap<String, String>, CorrelationIdState) {
+    ) -> (MetadataMap, CorrelationIdState) {
         (
             self.metadata.take().unwrap_or_default(),
             std::mem::take(&mut self.correlation_ids),
@@ -9719,7 +11356,7 @@ impl StreamConnectionContext {
     ///
     /// Used by setup-failure paths that must describe an admitted-but-never-
     /// published stream while the context is still owned by the setup chain.
-    pub(crate) fn snapshot_summary_metadata(&self) -> HashMap<String, String> {
+    pub(crate) fn snapshot_summary_metadata(&self) -> MetadataMap {
         let mut metadata = self.metadata.clone().unwrap_or_default();
         self.correlation_ids.project_correlation_ids(&mut metadata);
         metadata
@@ -9856,6 +11493,12 @@ pub struct StreamTransactionSummary {
     /// `None` when no authentication plugin identified the client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consumer_username: Option<String>,
+    /// Namespace of `consumer_username` (mapped Consumer or external
+    /// principal); see `TransactionSummary::principal_origin`. Not serialized
+    /// (GHSA-q9vj-rf66-3j58).
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub principal_origin: Option<utils::principal::PrincipalOrigin>,
     /// Authentication mechanism that succeeded for this stream connection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<&'static str>,
@@ -9903,7 +11546,7 @@ pub struct StreamTransactionSummary {
         skip_serializing_if = "HashMap::is_empty",
         serialize_with = "crate::plugins::utils::metadata_redaction::serialize_redacted_metadata"
     )]
-    pub metadata: HashMap<String, String>,
+    pub metadata: MetadataMap,
     /// Ownership generation captured at stream admission. Not serialized;
     /// used by `proxy_alerts` to reject samples from a prior delete→recreate
     /// incarnation of the same proxy ID.
@@ -9931,12 +11574,12 @@ pub struct StreamTransactionSummary {
 ///
 /// | Band      | Range       | Purpose                                   | Plugins |
 /// |-----------|-------------|-------------------------------------------|---------|
-/// | Early     | 0–949       | Matched-request tracing and preflight     | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
+/// | Early     | 0–949       | Matched-request tracing and preflight     | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), geo_restriction (175), bot_detection (200), spec_expose (210), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), ai_transcript_audit (2740), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993), mesh_route_dispatch (2995) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), ai_transcript_audit (2740), request_size_limiting (2800), ws_message_size_limiting (2810), graphql (2850), rate_limiting (2900), ws_rate_limiting (2910), udp_rate_limiting (2915), ai_prompt_shield (2925), waf (2930), fault_injection (2940), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993), mesh_route_dispatch (2995) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), request_deduplication (3010), serverless_function (3025), response_mock (3030), grpc_deadline (3050), load_testing (3070), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
-/// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_semantic_cache (4057), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
-/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), transaction_log_schema (9999, config-only) |
+/// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_semantic_cache (4057), ai_federation (4060), ai_token_metrics (4070), ai_response_guard (4075), security_headers (4080), ai_rate_limiter (4200) |
+/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), proxy_alerts (9250), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), transaction_log_schema (9999, config-only) |
 #[allow(dead_code)]
 pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
@@ -10055,13 +11698,20 @@ pub mod priority {
     ///   hit short-circuits before that later external side effect.
     pub const AI_SEMANTIC_CACHE: u16 = 4057;
     pub const AI_FEDERATION: u16 = 4060;
+    /// `ai_token_metrics`: observability-only usage extraction. Pinned after
+    /// `ai_federation` (4060), which stages its typed usage first, and BEFORE
+    /// `ai_response_guard` (4075): a guard rejection breaks the
+    /// `on_response_body` loop and replaces a provider-consumed 2xx body, and
+    /// on a stream a guard cut stops later inspectors from seeing the terminal
+    /// usage event. Observing first keeps the billed generation's tokens and
+    /// cost in metadata and Prometheus even when policy then refuses it.
+    pub const AI_TOKEN_METRICS: u16 = 4070;
     pub const AI_RESPONSE_GUARD: u16 = 4075;
     /// `security_headers`: injects response security headers and strips
     /// fingerprinting headers in `after_proxy`. Runs late in the response band
     /// so it is authoritative over `response_transformer` (4000) and
     /// `compression` (4050) header changes.
     pub const SECURITY_HEADERS: u16 = 4080;
-    pub const AI_TOKEN_METRICS: u16 = 4100;
     pub const AI_RATE_LIMITER: u16 = 4200;
     pub const STDOUT_LOGGING: u16 = 9000;
     pub const STATSD_LOGGING: u16 = 9075;
@@ -10178,6 +11828,122 @@ pub enum BackendAdmissionDecision {
     },
 }
 
+/// The always-dispatched request lifecycle hooks a plugin implements, returned
+/// by [`Plugin::lifecycle_hooks`] (issue #6615).
+///
+/// These four hooks have no other participation predicate, so without this
+/// declaration every request awaits a boxed `async_trait` no-op for every
+/// plugin in each phase. A dispatcher skips the call for a plugin whose
+/// declaration omits the hook and substitutes the result the skipped default
+/// would have produced (`Continue`, or nothing for `log`).
+///
+/// Skipping is sound only because an omitted hook is the trait's default
+/// no-op. Declaring a hook the plugin does not override costs one wasted
+/// call; omitting one it does override silently disables it, which for
+/// `before_proxy` / `after_proxy` can be a security hook. The default is
+/// therefore [`PluginHooks::ALL`], and
+/// `tests/unit/plugins/plugin_lifecycle_hooks_tests.rs` requires every
+/// built-in `impl Plugin` block to declare exactly the hooks it overrides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PluginHooks(u8);
+
+impl PluginHooks {
+    /// No always-dispatched hook.
+    pub const NONE: Self = Self(0);
+    /// [`Plugin::on_request_received`].
+    pub const ON_REQUEST_RECEIVED: Self = Self(1 << 0);
+    /// [`Plugin::before_proxy`].
+    pub const BEFORE_PROXY: Self = Self(1 << 1);
+    /// [`Plugin::after_proxy`].
+    pub const AFTER_PROXY: Self = Self(1 << 2);
+    /// [`Plugin::log`] or [`Plugin::log_with_mesh_key`] (whose default calls
+    /// `log`).
+    pub const LOG: Self = Self(1 << 3);
+    /// [`Plugin::on_response_stream_terminated`].
+    pub const ON_RESPONSE_STREAM_TERMINATED: Self = Self(1 << 4);
+    /// Every hook: the default for custom and undeclared plugins.
+    pub const ALL: Self = Self(
+        Self::ON_REQUEST_RECEIVED.0
+            | Self::BEFORE_PROXY.0
+            | Self::AFTER_PROXY.0
+            | Self::LOG.0
+            | Self::ON_RESPONSE_STREAM_TERMINATED.0,
+    );
+
+    /// The union of two declarations, usable in `const` context.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Whether every hook in `hooks` is declared.
+    #[inline]
+    pub const fn contains(self, hooks: Self) -> bool {
+        self.0 & hooks.0 == hooks.0
+    }
+}
+
+impl std::ops::BitOr for PluginHooks {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        self.union(rhs)
+    }
+}
+
+impl std::ops::BitOrAssign for PluginHooks {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = self.union(rhs);
+    }
+}
+
+/// Reduce every backend-equivalence class (ASCII case-insensitive, `_` read
+/// as `-`) of the owned request header `names` in `headers` to at most ONE
+/// entry: the current install of an admitted owning instance
+/// ([`RequestContext::record_installed_request_assertion`]), under the exact
+/// header-map key that owner wrote. Every other entry of the class is removed,
+/// including an equal-valued copy under another spelling (a later writer such
+/// as `correlation_id` preserving a client `x_app_user`), because the backend
+/// boundaries would emit each spelling as its own field line. A class whose
+/// owner's entry was dropped or rewritten, or that was cleared or never
+/// decided for this request, is removed entirely.
+///
+/// The final gateway-assertion pass over the outbound map
+/// (`proxy::enforce_route_owned_request_assertions`) applies it to the
+/// route's whole owned set; the claim plugins, `opa` and `spiffe_identity`
+/// apply it to their own names when their trigger skips a request. It never
+/// allocates.
+pub(crate) fn strip_uninstalled_request_assertions<N: AsRef<str>>(
+    ctx: &RequestContext,
+    headers: &mut HashMap<String, String>,
+    names: &[N],
+) {
+    use crate::proxy::headers::field_names_equivalent_for_backends;
+
+    let is_owned = |header: &str| {
+        let mut owned = names.iter().map(|name| name.as_ref());
+        owned.any(|name| field_names_equivalent_for_backends(header, name))
+    };
+    if !headers.keys().any(|header| is_owned(header.as_str())) {
+        return;
+    }
+    let state = ctx
+        .plugin_state()
+        .map(|state| state.request_assertion_state.as_slice())
+        .unwrap_or_default();
+    // Header-map keys are unique, so keeping only the owner's exact key leaves
+    // at most one entry per class.
+    headers.retain(|header, value| {
+        if !is_owned(header.as_str()) {
+            return true;
+        }
+        state
+            .iter()
+            .find(|(folded, _)| field_names_equivalent_for_backends(folded, header))
+            .and_then(|(_, current)| current.as_ref())
+            .is_some_and(|(wire_name, installed)| header == wire_name && *value == *installed)
+    });
+}
+
 /// Plugin lifecycle hooks.
 ///
 /// `Any` is a supertrait so built-in trust can be keyed on the concrete type a
@@ -10267,6 +12033,14 @@ pub trait Plugin: Any + Send + Sync {
         false
     }
 
+    /// Whether this plugin's terminal logging reads the precomputed mesh RED
+    /// key that [`Self::log_with_mesh_key`] receives. Terminal delivery builds
+    /// the key once per transaction only when a plugin in the chain says so,
+    /// instead of discovering consumers by name. Wrappers must forward it.
+    fn uses_mesh_request_key(&self) -> bool {
+        false
+    }
+
     /// Cold-path custom trace tag names used to bound effective mesh chains.
     fn workload_custom_trace_attributes(&self) -> Option<&str> {
         None
@@ -10326,6 +12100,22 @@ pub trait Plugin: Any + Send + Sync {
     /// See [`priority`] module for standard bands and assignments.
     fn priority(&self) -> u16 {
         priority::DEFAULT
+    }
+
+    /// The always-dispatched lifecycle hooks this plugin overrides
+    /// (`on_request_received`, `before_proxy`, `after_proxy`, `log` /
+    /// `log_with_mesh_key`). Dispatchers skip the hooks it omits (issue #6615).
+    ///
+    /// The default, [`PluginHooks::ALL`], keeps every hook running, so a custom
+    /// plugin does not need to override this. A plugin that does override it
+    /// must include every one of those hooks it implements: the ordinary
+    /// request dispatchers never call an omitted hook. (The rarer rejection,
+    /// charged-terminal, and cache-replay `after_proxy` passes still call
+    /// every eligible plugin, so an omission there is inconsistent, not
+    /// safe.) Wrappers must report the hooks their own implementation needs,
+    /// not only the wrapped plugin's.
+    fn lifecycle_hooks(&self) -> PluginHooks {
+        PluginHooks::ALL
     }
 
     /// Apply a request-receipt gRPC deadline policy synchronously, before any
@@ -10425,6 +12215,18 @@ pub trait Plugin: Any + Send + Sync {
     /// `authenticate`, `authorize`, or the pre-`before_proxy` body
     /// normalization must be declared too (issue #6008).
     fn modifies_request_headers(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this built-in plugin never reads `ctx.headers`
+    /// (inspecting `ctx.raw_headers` / `ctx.effective_request_header` instead),
+    /// does not mutate query parameters, and has no `BEFORE_PROXY` hook (with
+    /// the sole exception of registered built-in `key_auth`, whose
+    /// `before_proxy` only strips `request_headers_to_redact()`, elided into
+    /// the passthrough strip overlay). `PluginCache` honors this only for
+    /// registered built-in plugins (`is_builtin_plugin`); custom plugins always
+    /// run on the materialized path.
+    fn supports_request_header_passthrough(&self) -> bool {
         false
     }
 
@@ -10839,6 +12641,23 @@ pub trait Plugin: Any + Send + Sync {
         None
     }
 
+    /// Whole-body response ceiling this plugin must PROVE before an
+    /// indefinite-length, gateway-generated response stream commits, in bytes.
+    /// `None` (the default) means the plugin accepts such a stream under the
+    /// incremental ceiling it publishes through
+    /// [`Plugin::enforced_response_body_limit`].
+    ///
+    /// The aggregate MCP SSE listener is staged behind an empty `200`
+    /// placeholder, so neither the backend `after_proxy` refusal of a genuine
+    /// event stream nor the synthetic byte check can see its body. The core
+    /// asks this predicate at that one adoption boundary, before either the
+    /// H1/H2 or the native H3 writer commits the stream, and refuses the
+    /// listener with a `502` naming the returned limit when any active
+    /// instance answers `Some`.
+    fn refuses_unprovable_response_stream(&self, _ctx: &RequestContext) -> Option<u64> {
+        None
+    }
+
     /// Returns `true` if this plugin may require the request body to be
     /// buffered instead of streamed for at least some requests.
     ///
@@ -10859,6 +12678,54 @@ pub trait Plugin: Any + Send + Sync {
         _headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Remove client-supplied copies of the request headers this instance owns
+    /// as gateway assertions, without installing anything.
+    ///
+    /// The per-instance execution-trigger wrapper calls this in place of
+    /// [`Plugin::before_proxy`] when the instance's trigger skips the request.
+    /// It is deliberately outside the trigger boundary, like credential-redaction
+    /// discovery: a skipped instance installs no assertion, but a header it
+    /// documents as always sanitized must still never reach the backend carrying
+    /// a client-chosen value. Implementations must strip exactly what
+    /// `before_proxy` strips unconditionally, must not undo a value a sibling
+    /// instance already installed, must be synchronous and allocation-light, and
+    /// must never log header values. The default owns nothing.
+    fn sanitize_owned_request_headers(
+        &self,
+        _ctx: &mut RequestContext,
+        _headers: &mut HashMap<String, String>,
+    ) {
+    }
+
+    /// Request header names this instance owns as gateway assertions on every
+    /// request, whatever its trigger decides (`claim_headers` and
+    /// `output_claim_headers` destinations). Collected once when the plugin
+    /// cache is built and folded into the route's request-trailer strip list,
+    /// so a client can never restate one of them in request trailers, which
+    /// are read after the initial header block was sanitized. The default owns
+    /// nothing.
+    ///
+    /// Built-in only for now: the final gateway-assertion pass keeps an owned
+    /// header only as a value recorded through the crate-private
+    /// `RequestContext::record_installed_request_assertion`, which an
+    /// out-of-tree plugin cannot call. A custom plugin that declares names here
+    /// therefore has its own installs of them removed before dispatch; leave
+    /// this at the default.
+    fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Request headers this instance's static configuration writes, as
+    /// `(lowercase destination name, literal value)` pairs. The value is
+    /// `None` when it is request-derived at runtime (a `$(...)` template, or a
+    /// rename that moves a client value). Removals are not writes. Collected
+    /// only at plugin-cache publication, to refuse a write that would
+    /// re-author a header another plugin on the route owns as a gateway
+    /// assertion. The default writes nothing.
+    fn configured_request_header_writes(&self) -> Vec<(String, Option<String>)> {
+        Vec::new()
     }
 
     /// Returns `true` when `before_proxy` can dispatch external work or
@@ -10908,6 +12775,30 @@ pub trait Plugin: Any + Send + Sync {
     /// standalone behavior while coordinating multiple cached instances.
     fn enable_deferred_unmatched_rejection(&self) {}
 
+    /// The weighted-split leg tables this instance resolves
+    /// (`mesh_route_dispatch` `weighted_splits`, issue #7387). The plugin
+    /// cache hands them to the dispatch finalizer it installs after the last
+    /// `mesh_route_dispatch` instance, which picks a leg once the group's
+    /// destination is final. `None` (the default) for every other plugin.
+    #[doc(hidden)]
+    fn mesh_route_weighted_splits(
+        &self,
+    ) -> Option<Arc<mesh_route_dispatch::MeshRouteWeightedSplits>> {
+        None
+    }
+
+    /// The weighted-split tables this instance resolves for THIS request:
+    /// `None` when the instance did not run for it (its execution trigger
+    /// skipped it), so a skipped instance never selects a leg. Read by the
+    /// dispatch finalizer only; allocation-free.
+    #[doc(hidden)]
+    fn mesh_route_weighted_splits_for_request(
+        &self,
+        _ctx: &RequestContext,
+    ) -> Option<&mesh_route_dispatch::MeshRouteWeightedSplits> {
+        None
+    }
+
     /// Pure preview of the route total deadline this instance would publish
     /// in `before_proxy`, for the body collectors that run before it (issue
     /// #6008). Never runs a hook or mutates the request. `None` (the default)
@@ -10929,6 +12820,16 @@ pub trait Plugin: Any + Send + Sync {
     /// down. Consulted only by the early route-total preview (issue #6008).
     #[doc(hidden)]
     fn may_inject_route_fault(&self) -> bool {
+        false
+    }
+
+    /// Whether this instance's execution trigger reads a `query` field.
+    /// Only the plugin cache's trigger wrapper (and wrappers around it)
+    /// return `true`; plugins never override it. The dispatchers refuse a
+    /// query with an unencoded `;` before any phase runs on a chain that
+    /// carries such a trigger (issue #6655).
+    #[doc(hidden)]
+    fn execution_trigger_reads_query(&self) -> bool {
         false
     }
 
@@ -11245,6 +13146,43 @@ pub trait Plugin: Any + Send + Sync {
         false
     }
 
+    /// Returns `true` when this instance may publish
+    /// [`RequestContext::route_override_request_transform`] from
+    /// `before_proxy` (a `mesh_route_dispatch` instance whose rules carry
+    /// `request_transform`).
+    ///
+    /// Plugin cache composition refuses such a producer with no configured
+    /// `request_transformer` on the same effective chain. Where the list is
+    /// applied is decided by [`Self::replaces_route_request_header_transforms`].
+    fn publishes_route_request_header_transforms(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this instance's `before_proxy` may replace (publish
+    /// OR clear) [`RequestContext::route_override_request_transform`] — every
+    /// `mesh_route_dispatch` instance, because a matching rule replaces the
+    /// whole route decision, including the staged request header list, even
+    /// when its own rules carry no `request_transform`.
+    ///
+    /// Proxy core applies the staged list after the LATER of the last
+    /// eligible consumer and the last such instance. A consumer that a
+    /// priority override placed before the dispatch block therefore neither
+    /// finalizes an empty slot (dropping a list published afterwards) nor
+    /// applies a list a later dispatch instance would have superseded — and
+    /// no later dispatch predicate observes route headers early.
+    fn replaces_route_request_header_transforms(&self) -> bool {
+        false
+    }
+
+    /// Response-side counterpart to
+    /// [`Self::publishes_route_request_header_transforms`] for
+    /// [`RequestContext::route_override_response_transform`]. Plugin cache
+    /// composition refuses a producer with no configured
+    /// `response_transformer` on the same effective chain.
+    fn publishes_route_response_header_transforms(&self) -> bool {
+        false
+    }
+
     /// Applies this plugin's deterministic `after_proxy` response-header
     /// mutations to a simulated header map.
     ///
@@ -11310,7 +13248,9 @@ pub trait Plugin: Any + Send + Sync {
     ///
     /// Proxy core records the status on [`RequestContext`] as private typed
     /// provenance and then invokes this hook for every plugin in configured
-    /// order. Default is a no-op. Plugins whose success-boundary side effects
+    /// order during the `after_proxy` phase (plugins overriding this must
+    /// declare [`PluginHooks::AFTER_PROXY`] in [`Self::lifecycle_hooks`]).
+    /// Default is a no-op. Plugins whose success-boundary side effects
     /// must not depend on later hooks presenting the origin status to the
     /// client (for example cache invalidation) override this.
     fn observe_origin_http_response_status(&self, _ctx: &mut RequestContext, _status: u16) {}
@@ -11318,7 +13258,9 @@ pub trait Plugin: Any + Send + Sync {
     /// Returns `true` when this plugin bounds what the ORIGIN contributed to the
     /// response header map for this request.
     ///
-    /// Checked once per response before the first `after_proxy` hook runs, so a
+    /// Checked once per response before the first `after_proxy` hook runs
+    /// (plugins overriding this must declare [`PluginHooks::AFTER_PROXY`] in
+    /// [`Self::lifecycle_hooks`]), so a
     /// plugin that repointed the request at a third-party destination can reduce
     /// that destination's metadata without also discarding gateway decorations
     /// (CORS, tracing, correlation, rate-limit headers) that later hooks add.
@@ -11711,13 +13653,16 @@ pub trait Plugin: Any + Send + Sync {
     /// can override this hook and the proxy will call it instead.
     ///
     /// **Contract on the H1/H2 path**: `ctx` is a lightweight clone built by
-    /// [`RequestContext::clone_for_final_request_body_hooks`]; only
-    /// `ctx.metadata` is copied back to the real request context after the
-    /// hook returns. Mutations to other fields (`ctx.headers`,
-    /// `ctx.query_params`, `ctx.route_override_*`, …) on H1/H2 are dropped.
+    /// [`RequestContext::clone_for_final_request_body_hooks`]. `ctx.metadata`
+    /// and the typed state explicitly carried by
+    /// [`RequestContext::adopt_final_request_body_hook_terminals`] and
+    /// [`RequestContext::adopt_final_request_body_hook_plugin_state`] are
+    /// written back after the hook returns. Mutations to other fields
+    /// (`ctx.headers`, `ctx.query_params`, `ctx.route_override_*`, …) on H1/H2
+    /// are dropped.
     /// On the H3 path the hook receives the real `&mut RequestContext`, so
-    /// implementations MUST limit observable side effects to `ctx.metadata`
-    /// if they want consistent behavior across protocols.
+    /// implementations MUST limit observable side effects to this handback
+    /// contract for consistent behavior across protocols.
     async fn on_final_request_body_with_context(
         &self,
         _ctx: &mut RequestContext,
@@ -11988,6 +13933,24 @@ pub trait Plugin: Any + Send + Sync {
         false
     }
 
+    /// Returns `true` when THIS plugin's own `transform_response_body*` staged
+    /// a refusal for the current response that only its
+    /// [`Plugin::finalize_client_visible_response_body`] can discharge.
+    ///
+    /// The ordinary final client-visible phase is skipped once a
+    /// gateway-authored terminal owns the response (an inspection-hook
+    /// rejection, for example), so that no policy re-decides the gateway's own
+    /// error payload. Transforms still run over such a terminal, though, and a
+    /// transform that declined to rewrite bytes it could not evaluate must not
+    /// have them published merely because the sweep was skipped. On those paths
+    /// the lifecycle invokes `finalize_client_visible_response_body` for exactly
+    /// the plugins answering `true` here — no other policy is reopened.
+    /// `response_transformer` uses it for its ambiguous-JSON refusal
+    /// (GHSA-pq95-952r-2x32). The default is `false`.
+    fn has_staged_response_body_transform_refusal(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
     /// Decide semantic response policy over the EXACT representation the client
     /// will receive.
     ///
@@ -12228,6 +14191,15 @@ pub trait Plugin: Any + Send + Sync {
         false
     }
 
+    /// Cache-build diagnostic: whether this authentication instance already
+    /// lets a request without any credential through (for example the mesh
+    /// RequestAuthentication `jwks_auth`, which is permissive by design). A
+    /// trigger that skips such an instance cannot leave a request less
+    /// authenticated than the instance itself would.
+    fn admits_missing_credential(&self) -> bool {
+        false
+    }
+
     /// Whether this authentication instance applies to the current request.
     ///
     /// Ordinary authentication plugins are always applicable. Instance
@@ -12239,10 +14211,19 @@ pub trait Plugin: Any + Send + Sync {
         self.is_auth_plugin()
     }
 
-    /// Returns the challenge advertised when the full authentication chain
-    /// completes without a credential or identity. The first configured auth
-    /// plugin that supplies a challenge wins; direct plugin rejections retain
-    /// their own response headers.
+    /// Returns the `WWW-Authenticate` challenge (RFC 9110 §11.6.1) this
+    /// authentication mechanism advertises.
+    ///
+    /// Every gateway-generated `401` carries at least one applicable challenge
+    /// (RFC 9110 §15.5.2, issue #6774). When the authentication phase ends in a
+    /// `401` — whether no credential was presented or a mechanism rejected one
+    /// — the response lists the rejecting mechanisms' own challenges first and
+    /// then the challenge of every other applicable auth plugin in configured
+    /// priority order, one per auth-scheme. Every built-in authentication
+    /// plugin returns `Some`; `None` (the default, and what non-auth plugins
+    /// keep) contributes nothing, and a `401` that would otherwise carry no
+    /// challenge gets the generic `ferrum-edge` challenge. Must be a fixed,
+    /// header-valid value.
     fn authentication_challenge(&self) -> Option<&'static str> {
         None
     }
@@ -12379,6 +14360,25 @@ pub trait Plugin: Any + Send + Sync {
         self.allows_hbone_inner_reuse()
     }
 
+    /// Whether this plugin can observe the `mesh.source.*` /
+    /// `mesh.destination.*` workload labels that `workload_metrics` projects
+    /// into `RequestContext::metadata` and `TransactionSummary::metadata`
+    /// (issue #6793).
+    ///
+    /// When every plugin in a request's view answers `false`, nothing can read
+    /// those keys, so `workload_metrics` keeps them only in typed request state
+    /// and the built-in metric and service-graph emitters build their keys
+    /// from it. One `true` anywhere in the view keeps the string projection
+    /// exactly as it has always been, for every plugin in that view.
+    ///
+    /// The default is `true`, so every custom plugin — and every built-in not
+    /// explicitly audited — sees the labels. Answer `false` only for a plugin
+    /// that never reads those keys from either map, never iterates, clones,
+    /// serializes or forwards either whole map, and never writes them.
+    fn observes_mesh_label_metadata(&self) -> bool {
+        true
+    }
+
     /// Returns hostnames that this plugin will send traffic to.
     ///
     /// Used during DNS warmup to pre-resolve plugin endpoint hostnames
@@ -12458,16 +14458,48 @@ pub trait Plugin: Any + Send + Sync {
     /// Returns `true` when this plugin only observes WebSocket frame decisions
     /// and never mutates or rejects them.
     ///
-    /// After an earlier admission/mutating `on_ws_frame` hook returns a
-    /// terminal `Message::Close`, the shared H1/H2/H3 relay keeps invoking
-    /// observational hooks with that already-final Close so they can record
-    /// the decision, while skipping later mutating plugins so they neither
-    /// charge budget nor replace the Close code/reason.
-    /// The relay ignores the return value from an observational hook for every
-    /// frame, enforcing the observe-only contract even if an implementation
-    /// accidentally returns a replacement.
+    /// Observational plugins still receive [`Plugin::on_ws_frame`] for each
+    /// message at their configured priority position, but the relay ignores
+    /// their return value (enforcing the observe-only contract even if an
+    /// implementation accidentally returns a replacement) and skips them in
+    /// [`Plugin::on_ws_reassembly_frames`]. Once any admission/mutating hook
+    /// returns a terminal `Message::Close`, the rest of the chain — observers
+    /// included — is skipped for that message, so later mutating plugins
+    /// neither charge budget nor replace the Close code/reason.
+    ///
+    /// The final decision is instead delivered exactly once, independent of
+    /// priority order, through [`Plugin::on_ws_policy_close`].
     fn observes_ws_frame_decisions(&self) -> bool {
         false
+    }
+
+    /// Observe one gateway-published WebSocket policy Close.
+    ///
+    /// Called only on plugins whose [`Plugin::observes_ws_frame_decisions`]
+    /// returns `true`, exactly once per relay-half policy decision and AFTER
+    /// the full decision is known, so the record does not depend on where the
+    /// observer sits in priority order. Sources: a terminal Close returned by
+    /// the `on_ws_frame` chain (after the control-frame guard), a fragment
+    /// budget Close from [`Plugin::on_ws_reassembly_frames`], and the relay's
+    /// parser rejections of an inbound message (plugin or global
+    /// frame/message size ceilings, incomplete-message bounds, and terminated
+    /// `permessage-deflate` faults). `direction` is the direction of the
+    /// rejected input. Session-level stops (idle timeout, drain, maximum
+    /// lifetime, credential expiry, trust withdrawal) and relay transport
+    /// faults are not policy Closes; they surface on `on_ws_disconnect` through
+    /// the bounded `websocket.termination_reason` metadata and the failure
+    /// attribution fields.
+    ///
+    /// This is a decision record, not a delivery record: it fires before the
+    /// bounded Close write and regardless of whether that write succeeds.
+    /// Must not block or mutate protocol state.
+    fn on_ws_policy_close(
+        &self,
+        _proxy_id: &str,
+        _connection_id: u64,
+        _direction: WebSocketFrameDirection,
+        _close: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+    ) {
     }
 
     /// Optional parser-level WebSocket size policy.
@@ -12553,10 +14585,11 @@ pub trait Plugin: Any + Send + Sync {
     /// hook. Plugins that require actual wire-frame enforcement must contribute
     /// parser policy through [`Plugin::websocket_size_limits`] instead.
     ///
-    /// The gateway never negotiates `permessage-deflate` (the client's
-    /// extension offer is stripped before the backend handshake and no
-    /// negotiated extension is echoed to the client), so payloads reaching this
-    /// hook are complete, uncompressed application messages.
+    /// Payloads reaching this hook are complete, uncompressed application
+    /// messages: under the default `websocket_permessage_deflate: strip` no
+    /// extension is negotiated end to end, `terminate` inflates every message
+    /// before the relay parses it, and `passthrough` is refused at config
+    /// validation on any proxy with a plugin that requires the parsed relay.
     ///
     /// `connection_id` is a unique per-connection identifier (monotonic counter) that
     /// stateful plugins (e.g., ws_rate_limiting) can use to track per-connection state.
@@ -12565,9 +14598,10 @@ pub trait Plugin: Any + Send + Sync {
     /// Returning `Some(Message::Close(...))` will close the WebSocket in both directions.
     ///
     /// The first terminal Close from a priority-ordered admission/mutating hook
-    /// is preserved for the rest of the chain: later mutating plugins are not
-    /// invoked for that frame, and observational hooks
-    /// ([`Plugin::observes_ws_frame_decisions`]) may still see the final Close.
+    /// is preserved for the rest of the chain: no later plugin is invoked for
+    /// that frame, and observational hooks
+    /// ([`Plugin::observes_ws_frame_decisions`]) receive the final Close once
+    /// through [`Plugin::on_ws_policy_close`] instead.
     ///
     /// Delivery-accurate frame logging must use
     /// [`Plugin::prepare_ws_frame_delivery`] /
@@ -12626,9 +14660,14 @@ pub trait Plugin: Any + Send + Sync {
     /// Return `Some` only when this plugin will emit after a successful sink
     /// accept. The relay discards prepared observations on cancel/write failure
     /// so frame logs share the success-only boundary with `frames_*` /
-    /// `bytes_*` counters. Default: no observation.
+    /// `bytes_*` counters. `connection_id` and `direction` are the same values
+    /// the matching [`Plugin::emit_ws_frame_delivery`] call receives, so a
+    /// plugin can apply per-session or per-direction selection before doing
+    /// any per-message work. Default: no observation.
     fn prepare_ws_frame_delivery(
         &self,
+        _connection_id: u64,
+        _direction: WebSocketFrameDirection,
         _message: &tokio_tungstenite::tungstenite::Message,
     ) -> Option<WsFrameDeliveryObservation> {
         None
@@ -12779,10 +14818,14 @@ pub trait Plugin: Any + Send + Sync {
     /// override this and set `requires_ws_disconnect_hooks()` to `true`.
     async fn on_ws_disconnect(&self, _ctx: &WsDisconnectContext) {}
 
-    /// Returns `true` when this plugin requires HTTP/3 query params to use the
-    /// percent-decoded representation. HTTP/3 historically exposed raw query
-    /// params to plugins, so this opt-in is intentionally narrow: enabling it
-    /// affects the shared `ctx.query_params` map for all plugins on the proxy.
+    /// Returns `true` when this plugin decides on query parameters.
+    ///
+    /// Every frontend (HTTP/1.1, HTTP/2, and HTTP/3) materializes the same
+    /// percent-decoded `ctx.query_params`, so a plugin does not need this to
+    /// see decoded values (#6580). It is a planning hint: early route-total
+    /// selection builds the canonical query view only when a step declares it.
+    /// Security decisions on the query must still use
+    /// `utils::query::canonical_query_for_policy`, not the lossy shared map.
     fn requires_decoded_query_params(&self) -> bool {
         false
     }
@@ -12828,12 +14871,15 @@ pub trait Plugin: Any + Send + Sync {
 /// [`create_plugin_with_http_client_and_config_id`] with the stable plugin-config
 /// resource id. Direct construction here uses a validation-only default
 /// identity.
-#[allow(dead_code)]
 pub fn create_plugin(name: &str, config: &Value) -> Result<Option<Arc<dyn Plugin>>, String> {
+    let compression_policy = crate::config::CompressionAdmissionPolicy::from_process_env()?;
     create_plugin_with_http_client(
         name,
         config,
-        PluginHttpClient::default().with_process_compression_admission_policy(),
+        PluginHttpClient::default_with_backend_allow_ips(
+            crate::config::BackendEgressPolicy::unrestricted(),
+        )
+        .with_compression_admission_policy(compression_policy),
     )
 }
 
@@ -12871,8 +14917,10 @@ pub fn create_plugin_with_http_client(
 /// it so reload generations inherit prior claims, `waf` instances isolate
 /// anomaly-score accumulators / ownership metadata, and `api_chargeback_sink`
 /// instances publish accepted-generation
-/// status/metrics under that stable identity, while `request_mirror` records
-/// attribute each shadow destination. Pass `None` for config-validation and
+/// status/metrics under that stable identity, `proxy_alerts` scopes its
+/// `${incident_key}` receiver correlation key to it, while `request_mirror`
+/// records attribute each shadow destination, and `request_size_limiting` names
+/// the rejecting instance in its rejection metadata (a blank id is refused). Pass `None` for config-validation and
 /// direct/test construction that does not need sibling isolation or attribution
 /// (uses the plugin's standalone default id). Blank ids fail closed when
 /// supplied.
@@ -12955,9 +15003,12 @@ pub fn create_plugin_with_http_client_and_config_id(
         "jwt_auth" => Ok(Some(Arc::new(jwt_auth::JwtAuth::new(config)?))),
         "key_auth" => Ok(Some(Arc::new(key_auth::KeyAuth::new(config)?))),
         "basic_auth" => Ok(Some(Arc::new(basic_auth::BasicAuth::new(config)?))),
-        "ldap_auth" => Ok(Some(Arc::new(ldap_auth::LdapAuth::new(
+        // The stable plugin-config id owns the rejected-credential cache and the
+        // per-username failure backoff, so a compatible reload inherits them.
+        "ldap_auth" => Ok(Some(Arc::new(ldap_auth::LdapAuth::new_with_config_id(
             config,
             http_client,
+            plugin_config_id,
         )?))),
         // Same reasoning as `jwks_auth`: the stable plugin-config id is the
         // `ferrum-hmac-v2` nonce protection domain.
@@ -12982,6 +15033,12 @@ pub fn create_plugin_with_http_client_and_config_id(
                 brotli_enabled,
                 max_request_body_size_bytes,
             )?;
+            // Serving clients carry the process response limit; validation-only
+            // clients do not, and stay silent rather than warning about a
+            // limit they never resolved.
+            if let Some(max_response_body_size_bytes) = http_client.max_response_body_size_bytes() {
+                compression::warn_if_response_limit_gates_compression(max_response_body_size_bytes);
+            }
             Ok(Some(Arc::new(plugin)))
         }
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)?))),
@@ -13083,7 +15140,10 @@ pub fn create_plugin_with_http_client_and_config_id(
             Ok(Some(Arc::new(plugin)))
         }
         "request_size_limiting" => Ok(Some(Arc::new(
-            request_size_limiting::RequestSizeLimiting::new(config)?,
+            request_size_limiting::RequestSizeLimiting::new_with_config_id(
+                config,
+                plugin_config_id,
+            )?,
         ))),
         "waf" => Ok(Some(Arc::new(waf::Waf::new_with_config_id(
             config,
@@ -13127,10 +15187,16 @@ pub fn create_plugin_with_http_client_and_config_id(
             config,
             http_client.namespace(),
         )?))),
-        "proxy_alerts" => Ok(Some(Arc::new(proxy_alerts::ProxyAlerts::new(
-            config,
-            http_client.clone(),
-        )?))),
+        // The stable plugin-config id scopes `${incident_key}`, so two
+        // instances that reuse a rule name on one proxy never share a
+        // receiver incident.
+        "proxy_alerts" => Ok(Some(Arc::new(
+            proxy_alerts::ProxyAlerts::new_with_config_id(
+                config,
+                http_client.clone(),
+                plugin_config_id,
+            )?,
+        ))),
         "api_chargeback" => Ok(Some(Arc::new(
             api_chargeback::ApiChargeback::new_with_shard_amount(
                 config,
@@ -13203,9 +15269,12 @@ pub fn create_plugin_with_http_client_and_config_id(
         "ws_message_size_limiting" => Ok(Some(Arc::new(
             ws_message_size_limiting::WsMessageSizeLimiting::new(config)?,
         ))),
-        "ws_frame_logging" => Ok(Some(Arc::new(ws_frame_logging::WsFrameLogging::new(
-            config,
-        )?))),
+        // The stable plugin-config id is stamped on every record as
+        // `plugin_id`, so two effective instances on one proxy stay
+        // distinguishable in `ws_frame_log` output.
+        "ws_frame_logging" => Ok(Some(Arc::new(
+            ws_frame_logging::WsFrameLogging::new_with_config_id(config, plugin_config_id)?,
+        ))),
         "ws_rate_limiting" => {
             let plugin = ws_rate_limiting::WsRateLimiting::new_with_config_id(
                 config,
@@ -13284,16 +15353,18 @@ pub fn create_plugin_with_http_client_and_config_id(
 /// are screened against the configured backend egress policy. This bare
 /// variant remains a `pub` entrypoint for external test crates that only need
 /// shape validation of endpoint-less plugins (e.g. `cors`,
-/// `transaction_log_schema`). `#[allow(dead_code)]` because the binary target
-/// recompiles the source without those test crates, so it sees no caller.
+/// `transaction_log_schema`).
 ///
 /// Returns `Ok(())` if the config is valid, `Err(msg)` if validation fails.
-#[allow(dead_code)]
 pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> {
+    let compression_policy = crate::config::CompressionAdmissionPolicy::from_process_env()?;
     validate_plugin_config_with_http_client(
         name,
         config,
-        PluginHttpClient::default().with_process_compression_admission_policy(),
+        PluginHttpClient::default_with_backend_allow_ips(
+            crate::config::BackendEgressPolicy::unrestricted(),
+        )
+        .with_compression_admission_policy(compression_policy),
     )
 }
 
@@ -13342,6 +15413,14 @@ pub(crate) fn validate_plugin_config_with_http_client(
         // explicitly inside an open reload bracket.
         return transaction_log_schema::TransactionLogSchema::validate_config(config);
     }
+    if name == "api_chargeback" {
+        // Shape-only: construction resolves the process-global `/charges`
+        // registry, and the validation client's auto shard count must never
+        // be the one that sizes it. Every config check still runs here; an
+        // accepted generation constructs with the node's configured shard
+        // count (issue #7109).
+        return api_chargeback::ApiChargeback::validate_config(config);
+    }
     if name == "serverless_function" {
         // Shape-only: CP/admin admission must not require the AWS / Azure / GCP
         // credentials that intentionally resolve only from a data plane's
@@ -13367,7 +15446,7 @@ pub fn validate_plugin_config_with_policy(
     config: &Value,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
-    let http_client = plugin_config_validation_http_client(backend_allow_ips);
+    let http_client = plugin_config_validation_http_client(backend_allow_ips)?;
     validate_plugin_config_with_policy_and_client(name, config, backend_allow_ips, http_client)
 }
 
@@ -13385,10 +15464,13 @@ pub fn validate_plugin_config_with_policy(
 /// saturated change batch, so the fallback never converged (issue #4116).
 pub(crate) fn plugin_config_validation_http_client(
     backend_allow_ips: &crate::config::BackendEgressPolicy,
-) -> PluginHttpClient {
-    PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
-        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-        .with_process_compression_admission_policy()
+) -> Result<PluginHttpClient, String> {
+    let compression_policy = crate::config::CompressionAdmissionPolicy::from_process_env()?;
+    Ok(
+        PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
+            .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
+            .with_compression_admission_policy(compression_policy),
+    )
 }
 
 /// [`validate_plugin_config_with_policy`] over a caller-built validation
@@ -13438,10 +15520,6 @@ pub(crate) fn validate_plugin_config_policy_only(
     Ok(())
 }
 
-/// Screen a `mesh_route_dispatch` plugin's per-rule `destination.backend_host`
-/// literal IPs against the backend egress policy. A route override can point a
-/// matched request at an arbitrary backend, so a denied address (e.g.
-/// `169.254.169.254`) must be rejected at config-admission time — not only in
 /// Screen a Redis-backed plugin's `redis_url` literal-IP host against the egress
 /// policy at config-load. Redis-backed plugins (`rate_limit`,
 /// `request_deduplication`, `ai_semantic_cache`, `soap_ws_security` with
@@ -13487,8 +15565,10 @@ pub(crate) fn screen_redis_endpoint_egress(
 /// LDAP and `ws_logging` hostnames are freshly resolved and screened
 /// immediately before every connection/reconnection, and only screened
 /// addresses are dialed. `kafka_logging` cannot reach that bar with the pinned
-/// librdkafka client and is therefore refused outright under any policy that
-/// can deny an address (see `kafka_logging::screen_kafka_broker_list_egress`).
+/// librdkafka client and is therefore refused under any policy that can deny
+/// an address unless the node operator attests every bootstrap broker in
+/// `FERRUM_KAFKA_ALLOWED_BROKERS` (see
+/// `kafka_logging::screen_kafka_broker_list_egress`).
 /// JWKS hostname resolution keeps the shared client's runtime policy backstop.
 pub(crate) fn screen_direct_client_endpoint_egress(
     name: &str,
@@ -13520,7 +15600,8 @@ pub(crate) fn screen_direct_client_endpoint_egress(
                 }
             }
         }
-        // ldap_url is a single ldap:// / ldaps:// URL.
+        // ldap_url is a single ldap:// / ldaps:// URL; failover_ldap_urls
+        // lists further endpoints dialed the same way.
         "ldap_auth" => {
             if let Some(url) = config.get("ldap_url").and_then(|v| v.as_str())
                 && let Ok(parsed) = url::Url::parse(url.trim())
@@ -13532,13 +15613,28 @@ pub(crate) fn screen_direct_client_endpoint_egress(
                     "ldap_url IP {ip} denied by backend egress policy: {reason}"
                 ));
             }
+            if let Some(urls) = config.get("failover_ldap_urls").and_then(Value::as_array) {
+                for (index, url) in urls.iter().enumerate() {
+                    if let Some(url) = url.as_str()
+                        && let Ok(parsed) = url::Url::parse(url.trim())
+                        && let Some(host) = parsed.host_str()
+                        && let Some(ip) = crate::config::types::egress_literal_ip(host)
+                        && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+                    {
+                        return Err(format!(
+                            "failover_ldap_urls[{index}] IP {ip} denied by backend egress policy: {reason}"
+                        ));
+                    }
+                }
+            }
         }
         // broker_list is parsed with the pinned librdkafka grammar
         // (`[proto://]host[:port]`, comma separated) so protocol-prefixed
-        // literals are screened too, and kafka_logging is refused outright when
-        // the policy can deny addresses librdkafka would dial without Ferrum
-        // ever seeing them (bootstrap hostname resolution, metadata-advertised
-        // brokers). See `kafka_logging::screen_kafka_broker_list_egress`.
+        // literals are screened too, and kafka_logging is refused when the
+        // policy can deny addresses librdkafka would dial without Ferrum ever
+        // seeing them (bootstrap hostname resolution, metadata-advertised
+        // brokers), unless FERRUM_KAFKA_ALLOWED_BROKERS attests every bootstrap
+        // broker. See `kafka_logging::screen_kafka_broker_list_egress`.
         "kafka_logging" => {
             kafka_logging::screen_kafka_broker_list_egress(config, backend_allow_ips)?;
         }
@@ -13561,6 +15657,10 @@ pub(crate) fn screen_direct_client_endpoint_egress(
     Ok(())
 }
 
+/// Screen a `mesh_route_dispatch` plugin's per-rule `destination.backend_host`
+/// literal IPs against the backend egress policy. A route override can point a
+/// matched request at an arbitrary backend, so a denied address (e.g.
+/// `169.254.169.254`) must be rejected at config-admission time — not only in
 /// whole-config validation but on direct/batch admin plugin writes too.
 /// Returns prefix-free messages; no-op for configs that don't parse as
 /// mesh_route_dispatch (shape errors are surfaced by the constructor).
@@ -13595,6 +15695,15 @@ pub fn screen_mesh_route_dispatch_egress(
 ///
 /// These names are intentionally fail-closed during config load so upgrades
 /// cannot silently drop authentication/authorization protections.
+///
+/// Deliberately kept (issue #7113): this is not a legacy shim. The list is a
+/// published contract surface: the ferrum-contracts `plugin-catalog`
+/// carries it as `removed_plugins`, promising that Edge refuses a config
+/// naming one of them. It also reserves the names `oauth2_auth` and
+/// `semantic_ai_firewall`, so a custom plugin cannot register under a retired
+/// security plugin's name (see the reservation in
+/// `create_plugin_with_http_client_and_config_id`). Removing or renaming an
+/// entry needs a coordinated ferrum-contracts release.
 pub const REMOVED_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("oauth2_auth", PluginFailurePolicy::FailClosed),
     builtin_plugin("semantic_ai_firewall", PluginFailurePolicy::FailClosed),
@@ -13606,8 +15715,13 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
         "transaction_log_schema",
         PluginFailurePolicy::KeepLastKnownGood,
     ),
-    builtin_plugin("stdout_logging", PluginFailurePolicy::OptionalFailOpen),
-    builtin_plugin("http_logging", PluginFailurePolicy::OptionalFailOpen),
+    // Log sinks share one contract (issue #7144): an access log is an audit
+    // trail, so a reload that cannot construct any log sink keeps the previous
+    // generation instead of publishing one that silently stops logging. Every
+    // log sink (`stdout`, `http`, `tcp`, `udp`, `kafka`, `loki`, `statsd`,
+    // `ws`, `ws_frame`) is `KeepLastKnownGood`.
+    builtin_plugin("stdout_logging", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("http_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("tcp_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("kafka_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("ws_logging", PluginFailurePolicy::KeepLastKnownGood),
@@ -13692,12 +15806,12 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("mcp_gateway", PluginFailurePolicy::FailClosed),
     builtin_plugin("a2a_gateway", PluginFailurePolicy::FailClosed),
     builtin_plugin("ws_message_size_limiting", PluginFailurePolicy::FailClosed),
-    builtin_plugin("ws_frame_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("ws_frame_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("ws_rate_limiting", PluginFailurePolicy::FailClosed),
     builtin_plugin("udp_rate_limiting", PluginFailurePolicy::FailClosed),
-    builtin_plugin("udp_logging", PluginFailurePolicy::OptionalFailOpen),
-    builtin_plugin("statsd_logging", PluginFailurePolicy::OptionalFailOpen),
-    builtin_plugin("loki_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("udp_logging", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("statsd_logging", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("loki_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("sse", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("request_mirror", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("load_testing", PluginFailurePolicy::KeepLastKnownGood),
@@ -13715,9 +15829,8 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("fault_injection", PluginFailurePolicy::KeepLastKnownGood),
 ];
 
-// Keep documentation/parity inventory linked in both the library crate (consumed
-// by integration tests) and the binary crate (same sources, separate compilation).
-// Length equality is a cheap compile-time guard; name set-equality remains in tests.
+// Keep documentation/parity inventory linked in the library crate (consumed by
+// integration tests). Length equality is a cheap compile-time guard; name set-equality remains in tests.
 const _: () = {
     assert!(BUILTIN_PLUGIN_PARITY_META.len() == BUILTIN_PLUGIN_REGISTRATIONS.len());
     let _: fn(&str) -> Option<&'static BuiltinPluginParityMeta> = builtin_plugin_parity_meta;
@@ -13899,6 +16012,7 @@ mod tests {
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
             tls_refused: false,
+            suppress_global_client_identity: false,
         };
 
         let canary: Upstream = serde_json::from_value(json!({

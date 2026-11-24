@@ -18,6 +18,9 @@ enum ValidationStep<'a> {
     AllFieldsWithIpPolicy {
         cert_expiry_warning_days: u64,
         backend_allow_ips: &'a BackendEgressPolicy,
+        /// `false` for operator admission (restore): same errors, without the
+        /// #5454 `allowed_ws_origins` grandfathering warning.
+        warn_legacy_allowed_ws_origins: bool,
         action: ValidationAction<'a>,
     },
     UniqueResourceIds {
@@ -124,29 +127,65 @@ pub(crate) struct RejectedPluginConfig {
 /// limiter, so it needs no special case.
 pub(crate) fn collect_rejecting_plugin_config_errors(
     config: &GatewayConfig,
+    http_client: &crate::plugins::PluginHttpClient,
 ) -> Vec<RejectedPluginConfig> {
-    collect_plugin_config_errors(config, false)
+    collect_plugin_config_errors(config, false, http_client)
+}
+
+/// The one plugin-construction client a validation sweep uses.
+///
+/// Backend egress policy is node-local environment configuration. An
+/// admitting CP whose `FERRUM_BACKEND_ALLOW_IPS` differs from the serving
+/// node's must not refuse a row over an address policy it does not own, so
+/// validation screens SCHEMA and construction only; the serving mode still
+/// applies its own egress screen when it builds the cache. Construction
+/// still routes through the policy-carrying DNS resolver instead of the
+/// cache-less OS-DNS client (#6651): constructor side-effect fetches get the
+/// same screened resolution as the runtime client. It carries the real-IP
+/// header like the runtime client, so every validator in the sweep sees the
+/// same construction inputs.
+///
+/// Built once per sweep and shared by the transaction-log graph validator,
+/// the construction gate and the composition check (issue #7209): each
+/// client owns its own DNS cache, and CP delta admission runs the sweep per
+/// namespace per accepted batch.
+fn validation_http_client(
+    compression_policy: crate::config::CompressionAdmissionPolicy,
+) -> crate::plugins::PluginHttpClient {
+    crate::plugins::PluginHttpClient::default_with_backend_allow_ips(
+        BackendEgressPolicy::unrestricted(),
+    )
+    .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
+    .with_compression_admission_policy(compression_policy)
 }
 
 fn collect_plugin_config_errors(
     config: &GatewayConfig,
     optional_fail_open_only: bool,
+    http_client: &crate::plugins::PluginHttpClient,
 ) -> Vec<RejectedPluginConfig> {
-    // Backend egress policy is node-local environment configuration. An
-    // admitting CP whose `FERRUM_BACKEND_ALLOW_IPS` differs from the serving
-    // node's must not refuse a row over an address policy it does not own, so
-    // this gate screens SCHEMA and construction only; the serving mode still
-    // applies its own egress screen when it builds the cache.
+    // Unrestricted for the reason on `validation_http_client`.
     let backend_allow_ips = BackendEgressPolicy::unrestricted();
-    // Built once for the whole sweep: `validate_plugin_config_with_policy`
-    // would construct a fresh validation client (and its DNS cache) per plugin
-    // config, and CP delta admission runs this on every accepted batch.
-    let http_client = crate::plugins::PluginHttpClient::default()
-        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-        .with_process_compression_admission_policy();
 
     let mut rejected = Vec::new();
     for (index, plugin_config) in config.plugin_configs.iter().enumerate() {
+        // Disabled rows skip construction, but a native librdkafka key is
+        // refused on them too (issue #6539). Never quarantined: it rejects.
+        if !optional_fail_open_only
+            && let Some(error) = crate::plugins::kafka_logging::disabled_config_native_key_refusal(
+                &plugin_config.plugin_name,
+                &plugin_config.config,
+            )
+        {
+            rejected.push(RejectedPluginConfig {
+                index,
+                message: format!(
+                    "Plugin {:?} (`id`={:?}): {error}",
+                    plugin_config.plugin_name, plugin_config.id
+                ),
+            });
+            continue;
+        }
         if !plugin_config.enabled {
             continue;
         }
@@ -209,7 +248,15 @@ fn collect_plugin_config_errors(
 /// unknown/retired plugins are never quarantined: they must continue to reject
 /// publication rather than silently removing a security control.
 pub(crate) fn quarantine_unconstructible_plugin_configs(config: &mut GatewayConfig) -> Vec<String> {
-    let rejected = collect_plugin_config_errors(config, true);
+    let compression_policy = match crate::config::CompressionAdmissionPolicy::from_process_env() {
+        Ok(policy) => policy,
+        // A broken process compression gate must not quarantine anything:
+        // refuse the sweep (cache staging still fails closed downstream)
+        // and surface the configuration error instead.
+        Err(error) => return vec![error],
+    };
+    let rejected =
+        collect_plugin_config_errors(config, true, &validation_http_client(compression_policy));
     if rejected.is_empty() {
         return Vec::new();
     }
@@ -230,6 +277,18 @@ pub(crate) fn quarantine_unconstructible_plugin_configs(config: &mut GatewayConf
 /// identity collisions) remains mode-specific and is intentionally excluded.
 pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) -> Vec<String> {
     let mut errors = Vec::new();
+
+    // The typed compression admission policy is process configuration: a
+    // typo'd gate/ceiling refuses the load here, exactly as `EnvConfig`
+    // refuses it at startup, instead of validating compression rows
+    // against silent defaults (issue #6651 item 3).
+    let compression_policy = match crate::config::CompressionAdmissionPolicy::from_process_env() {
+        Ok(policy) => policy,
+        Err(error) => {
+            errors.push(error);
+            return errors;
+        }
+    };
 
     // FIPS gateway-document admission must be part of the same rejecting
     // contract used by database full loads and CP full/delta composition.
@@ -266,11 +325,10 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     if let Err(found) = config.validate_plugin_references() {
         errors.extend(found);
     }
-    if let Err(found) = crate::plugins::transaction_log_schema::validate_config_graph(
-        config,
-        &crate::plugins::PluginHttpClient::default().with_process_compression_admission_policy(),
-        false,
-    ) {
+    let http_client = validation_http_client(compression_policy);
+    if let Err(found) =
+        crate::plugins::transaction_log_schema::validate_config_graph(config, &http_client, false)
+    {
         errors.extend(found);
     }
     // Serving modes reject malformed fail-closed plugins while staging the
@@ -281,22 +339,23 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     // freezes every DP on its last-known-good cache — with no acknowledgement
     // on the server-streaming `ConfigSync.Subscribe` to show it.
     errors.extend(
-        collect_rejecting_plugin_config_errors(config)
+        collect_rejecting_plugin_config_errors(config, &http_client)
             .into_iter()
             .map(|rejected| rejected.message),
     );
-    if let Err(found) = crate::plugin_cache::validate_plugin_security_composition_candidate(
-        config,
-        &crate::plugins::PluginHttpClient::default()
-            .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-            .with_process_compression_admission_policy(),
-    ) {
+    if let Err(found) =
+        crate::plugin_cache::validate_plugin_security_composition_candidate(config, &http_client)
+    {
         errors.push(found);
     }
     if let Err(found) = crate::plugin_cache::validate_tcp_connection_throttle_attachments(config) {
         errors.extend(found);
     }
     if let Err(found) = config.validate_unique_mtls_dns_identities() {
+        errors.extend(found);
+    }
+    // One credential must never map to two Consumers (issue #6572).
+    if let Err(found) = config.validate_unique_consumer_auth_credentials() {
         errors.extend(found);
     }
     if let Err(found) = crate::proxy::validate_mesh_route_dispatch_upstream_references(config) {
@@ -401,6 +460,27 @@ impl<'a> ValidationPipeline<'a> {
         self.steps.push(ValidationStep::AllFieldsWithIpPolicy {
             cert_expiry_warning_days,
             backend_allow_ips,
+            warn_legacy_allowed_ws_origins: true,
+            action,
+        });
+        self
+    }
+
+    /// [`Self::validate_all_fields_with_ip_policy`] for operator admission
+    /// paths (Admin API restore) that refuse `*` / non-origin
+    /// `allowed_ws_origins` themselves. Collects the same errors but skips the
+    /// #5454 grandfathering warning, which would claim a refused candidate is
+    /// "still loaded".
+    pub(crate) fn validate_all_fields_for_admission_with_ip_policy(
+        mut self,
+        cert_expiry_warning_days: u64,
+        backend_allow_ips: &'a BackendEgressPolicy,
+        action: ValidationAction<'a>,
+    ) -> Self {
+        self.steps.push(ValidationStep::AllFieldsWithIpPolicy {
+            cert_expiry_warning_days,
+            backend_allow_ips,
+            warn_legacy_allowed_ws_origins: false,
             action,
         });
         self
@@ -532,12 +612,21 @@ impl<'a> ValidationPipeline<'a> {
                 ValidationStep::AllFieldsWithIpPolicy {
                     cert_expiry_warning_days,
                     backend_allow_ips,
+                    warn_legacy_allowed_ws_origins,
                     action,
                 } => {
-                    if let Err(errors) = config.validate_all_fields_with_ip_policy(
-                        cert_expiry_warning_days,
-                        backend_allow_ips,
-                    ) {
+                    let result = if warn_legacy_allowed_ws_origins {
+                        config.validate_all_fields_with_ip_policy(
+                            cert_expiry_warning_days,
+                            backend_allow_ips,
+                        )
+                    } else {
+                        config.validate_all_fields_for_admission_with_ip_policy(
+                            cert_expiry_warning_days,
+                            backend_allow_ips,
+                        )
+                    };
+                    if let Err(errors) = result {
                         handle_validation_errors(action, errors, &mut collected_errors)?;
                     }
                 }
@@ -608,11 +697,20 @@ impl<'a> ValidationPipeline<'a> {
                     action,
                 } => {
                     let mut errors = Vec::new();
+                    let compression_policy =
+                        match crate::config::CompressionAdmissionPolicy::from_process_env() {
+                            Ok(policy) => policy,
+                            Err(error) => {
+                                errors.push(error);
+                                handle_validation_errors(action, errors, &mut collected_errors)?;
+                                continue;
+                            }
+                        };
                     let graph_http_client =
                         crate::plugins::PluginHttpClient::default_with_backend_allow_ips(
                             backend_allow_ips.clone(),
                         )
-                        .with_process_compression_admission_policy();
+                        .with_compression_admission_policy(compression_policy);
                     // Built ONCE for the whole sweep (issue #4116). Every
                     // enabled plugin config in the namespace is screened here,
                     // and constructing the two-client validation stack plus its
@@ -623,7 +721,16 @@ impl<'a> ValidationPipeline<'a> {
                     // of converging. Same shape as the single-config
                     // `validate_plugin_config_with_policy` entry point.
                     let plugin_http_client =
-                        crate::plugins::plugin_config_validation_http_client(backend_allow_ips);
+                        match crate::plugins::plugin_config_validation_http_client(
+                            backend_allow_ips,
+                        ) {
+                            Ok(client) => client,
+                            Err(error) => {
+                                errors.push(error);
+                                handle_validation_errors(action, errors, &mut collected_errors)?;
+                                continue;
+                            }
+                        };
                     if let Err(graph_errors) =
                         crate::plugins::transaction_log_schema::validate_config_graph(
                             config,
@@ -634,6 +741,19 @@ impl<'a> ValidationPipeline<'a> {
                         errors.extend(graph_errors);
                     }
                     for plugin_config in &config.plugin_configs {
+                        // Refused on disabled rows too (issue #6539).
+                        if let Some(error) =
+                            crate::plugins::kafka_logging::disabled_config_native_key_refusal(
+                                &plugin_config.plugin_name,
+                                &plugin_config.config,
+                            )
+                        {
+                            errors.push(format!(
+                                "Plugin {:?} (`id`={:?}): {}",
+                                plugin_config.plugin_name, plugin_config.id, error
+                            ));
+                            continue;
+                        }
                         if !plugin_config.enabled {
                             continue;
                         }
@@ -650,7 +770,7 @@ impl<'a> ValidationPipeline<'a> {
                                 backend_allow_ips,
                             ) {
                                 let message = format!(
-                                    "Plugin {:?} (id={:?}): {}",
+                                    "Plugin {:?} (`id`={:?}): {}",
                                     plugin_config.plugin_name, plugin_config.id, err
                                 );
                                 if !matches!(&action, ValidationAction::Collect)
@@ -679,7 +799,7 @@ impl<'a> ValidationPipeline<'a> {
                             )
                         {
                             let message = format!(
-                                "Plugin {:?} (id={:?}): {}",
+                                "Plugin {:?} (`id`={:?}): {}",
                                 plugin_config.plugin_name, plugin_config.id, err
                             );
                             if !matches!(&action, ValidationAction::Collect)
@@ -961,7 +1081,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_single_rejecting_error(config, "unknown configuration field \"alow\"");
+        assert_single_rejecting_error(config, "unknown configuration key(s): \"config.alow\"");
     }
 
     #[test]
@@ -1088,9 +1208,9 @@ mod tests {
             version: "1".to_string(),
             plugin_configs: vec![PluginConfig {
                 labels: Default::default(),
-                id: "bad-stdout".to_string(),
+                id: "bad-debugger".to_string(),
                 namespace: default_namespace(),
-                plugin_name: "stdout_logging".to_string(),
+                plugin_name: "transaction_debugger".to_string(),
                 config: json!("bad-config"),
                 scope: PluginScope::Global,
                 proxy_id: None,
@@ -1113,7 +1233,7 @@ mod tests {
             .expect("collect validation should return accumulated errors");
 
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("stdout_logging"), "{errors:?}");
-        assert!(errors[0].contains("bad-stdout"), "{errors:?}");
+        assert!(errors[0].contains("transaction_debugger"), "{errors:?}");
+        assert!(errors[0].contains("bad-debugger"), "{errors:?}");
     }
 }

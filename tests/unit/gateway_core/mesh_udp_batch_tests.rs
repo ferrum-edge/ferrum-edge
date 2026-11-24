@@ -11,8 +11,8 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use ferrum_edge::proxy::mesh_udp_capture::{QueueDrain, drain_queued_datagrams};
 use ferrum_edge::proxy::mesh_udp_frame::{
-    BatchWriteFailureKind, FrameBatch, MAX_BATCH_DATAGRAMS, MAX_BATCH_WIRE_BYTES,
-    MAX_FRAME_PAYLOAD, read_datagram,
+    BatchWriteFailureKind, FrameBatch, MAX_BATCH_BUFFER_BYTES, MAX_BATCH_DATAGRAMS,
+    MAX_BATCH_WIRE_BYTES, MAX_FRAME_PAYLOAD, read_datagram,
 };
 use tokio::io::AsyncWrite;
 
@@ -124,6 +124,28 @@ fn frame_batch_respects_wire_byte_bound_exactly() {
         .expect("push");
     assert!(batch.accepts(0));
     assert!(!batch.accepts(1));
+}
+
+/// Issue #7191: the batch buffer is reserved for the largest wire size a batch
+/// can actually reach — one maximal first datagram, or following datagrams up
+/// to the wire bound — not their sum (~16 KiB of never-used capacity per
+/// captured UDP session).
+#[test]
+fn frame_batch_buffer_reservation_is_the_largest_reachable_wire_size() {
+    // Shape 1: one maximal datagram; nothing joins it afterwards.
+    let mut single = FrameBatch::new();
+    single
+        .push(&vec![0u8; MAX_FRAME_PAYLOAD])
+        .expect("max datagram");
+    assert!(!single.accepts(0));
+    // Shape 2: a batch filled to the wire bound with small datagrams.
+    let mut full = FrameBatch::new();
+    let payload = vec![1u8; 1022];
+    while full.accepts(payload.len()) {
+        full.push(&payload).expect("push");
+    }
+    let reachable = single.wire_bytes().max(full.wire_bytes());
+    assert_eq!(MAX_BATCH_BUFFER_BYTES, reachable);
 }
 
 #[test]

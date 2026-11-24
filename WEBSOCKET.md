@@ -1,6 +1,6 @@
 # WebSocket Proxying
 
-Ferrum Edge supports bidirectional WebSocket proxying for `ws://` and `wss://` backend protocols.
+Ferrum Edge supports bidirectional WebSocket proxying for `ws://` and `wss://` backend protocols. WebSocket is detected per request on any HTTP-family proxy, not configured as a scheme: `backend_scheme: http` dials `ws://` and `https` dials `wss://`.
 
 ## Architecture
 
@@ -57,15 +57,47 @@ Client request headers are forwarded to the backend WebSocket server during the 
 - `x-geo-country` — stripped so a client cannot forge gateway-asserted geography; the gateway re-injects the lookup result from `geo_restriction` when configured
 - `host`, `proxy-authorization`, `proxy-connection`
 
+The client `host` field is not copied as an ordinary header. The upgrade request's `Host` is the
+selected target's authority, or, with `preserve_host_header: true`, the client's validated Host
+(issue #7392); see [Outbound Host header](docs/routing.md#outbound-host-header).
+
 All other headers (including `authorization`, `cookie`, `sec-websocket-protocol`, custom headers, etc.) are forwarded to the backend. The same reserved-header strip set applies across HTTP, gRPC, and WebSocket backend boundaries; see [Plugin Execution Order — Backend Request Trailers](docs/plugin_execution_order.md#backend-request-trailers) for the full cross-protocol list.
+
+## Handshake Responses
+
+The client handshake response (`101` on HTTP/1.1, `200` on HTTP/2 and HTTP/3 Extended CONNECT)
+carries the backend's end-to-end handshake response headers, such as `Set-Cookie` (each cookie on
+its own line), cache or diagnostic headers (issue #7391). They are collected with the same backend
+response strip as an HTTP response (hop-by-hop, `Connection`-listed, and the gateway-owned
+`X-Gateway-Error` / `X-Gateway-Upstream-Status` / `X-Ferrum-Diagnostic-Ref`), response policy
+plugins then govern them, and the gateway still owns the transport fields: `Upgrade`, `Connection`,
+`Sec-WebSocket-Accept`, `Content-Length`, the negotiated `Sec-WebSocket-Protocol` /
+`Sec-WebSocket-Extensions`, and its sticky-session cookie.
+
+When the backend declines the upgrade with its own `3xx`, `4xx` or `5xx` (its own authentication,
+an Origin check, `404`, `429`, a redirect), the gateway relays that status on every backend
+transport: a direct or Unix-socket upgrade, the inner handshake through an Ambient HBONE tunnel, and
+a Sidecar mesh-mTLS peer's answer to the Extended CONNECT. A bare HBONE CONNECT rejection is the mesh
+transport's own admission decision and stays a gateway `502`, as on the HTTP HBONE path. It relays the backend's headers
+under the same strip and response policy (`WWW-Authenticate`, `Retry-After`, `Location`), and the
+backend's body when it arrived complete with the response head (up to 64 KiB; otherwise an empty
+body without `Content-Type`). The relayed answer carries no `X-Gateway-Error`, has no
+`error_class` in the transaction log, and is charged to the circuit breaker and backend admission
+exactly as the same status is on the HTTP path: a `4xx` refusal never counts as a backend failure,
+so unauthenticated upgrades cannot open a route's breaker (GHSA-7x2j-3389-2h35). A `2xx` answer
+other than `101`, a missing or invalid `Sec-WebSocket-Accept`, and a malformed response remain a
+gateway `502`.
 
 ## Timeouts and Limits
 
 - **Connect timeout**: Uses the proxy's `backend_connect_timeout_ms` setting (default: 5000ms) for the backend WebSocket connection
 - **Active connection cap**: `FERRUM_WEBSOCKET_MAX_CONNECTIONS` limits concurrently upgraded WebSocket connections (default: 20,000). Upgrades beyond the cap are rejected with `503 Service Unavailable`
 - **Per-source session cap**: `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP` limits concurrently upgraded sessions per resolved client IP (default: 0 = disabled). Source identity is the socket peer, or a forwarding header only when the direct peer is in `FERRUM_TRUSTED_PROXIES`. The per-IP *request* guard is released at upgrade time so a long-lived session does not block ordinary HTTP from that IP; this session bound replaces it. Same `503` rejection as the global budget. The slot is held by an RAII guard for the session lifetime and released on every disconnect path.
+- **Idle timeout**: per-proxy `websocket_idle_timeout_seconds` (0–86400; `0` disables), else `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS` (default: 300)
+- **Incomplete-message bounds**: `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES` (default: 1024) and `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS` (default: 60) bound a fragmented message
 - **Max frame size**: `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` (default: 16 MiB / 16,777,216 bytes) per WebSocket frame
 - **Max message size**: 4× the frame limit (default: 64 MiB / 67,108,864 bytes); a message can span multiple frames. Plugins with tighter `ws_message_size_limiting` rules may lower the effective ceiling
+- **Write buffer and permessage-deflate inflate ceiling**: `FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE` and `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES`; see [Configuration — Size Limits](docs/configuration.md#size-limits)
 - **Upgrade flood protection**: WebSocket requests go through the normal plugin pipeline before upgrade, so `rate_limiting` and `ip_restriction` can throttle abusive upgrade bursts
 - **Absolute authorization lifetime**: `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS` (default: 3600, valid range: 1–86400) bounds every session from request receipt. When JWT, JWKS, OIDC, or OAuth2 introspection supplies an authoritative expiry, the earlier validated credential deadline wins. JWT/OIDC leeway is included exactly once using the provider's existing validation setting. Traffic, Ping/Pong, and low-rate bidirectional streams never extend this deadline. Credentials without expiry remain bounded by the configured maximum.
 
@@ -116,4 +148,3 @@ WebSocket backend URLs are built using the same path logic as HTTP proxying:
 | `src/http3/websocket.rs` | H3 Extended CONNECT (RFC 9220) frontend and bridge to the shared relay |
 | `tests/functional/functional_websocket_test.rs` | Functional tests |
 | `tests/unit/gateway_core/websocket_auth_tests.rs` | Auth integration tests |
-| `tests/helpers/bin/websocket_echo_server.rs` | Echo server for testing |

@@ -21,11 +21,13 @@ When you submit a spec, Ferrum Edge:
 | `swagger: "2.0"` | Swagger / OpenAPI 2.0 |
 | `openapi: "3.0.x"` | OpenAPI 3.0.x (any patch) |
 | `openapi: "3.1.x"` | OpenAPI 3.1.x |
-| `openapi: "3.2.x"` | OpenAPI 3.2.x |
+| `openapi: "3.2.x"` | OpenAPI 3.2.x, except the 3.2 Path Item fields `query` and `additionalOperations` (see below) |
 
 Pre-release suffixes are supported: `openapi: "3.2.0-rc1"` is accepted.
 
 Detection rule: `swagger: "2.0"` at the document root → Swagger 2.0. `openapi: "3.MINOR.PATCH[-suffix]"` → OpenAPI 3.x. Any other string (including `openapi: "4.0.0"`) → 400 `UnknownVersion`.
+
+The importer handles the `get`, `put`, `post`, `delete`, `options`, `head`, `patch`, and `trace` operations of a Path Item. A Path Item (under `paths`, under `components.pathItems`, or reached through a `$ref`) that declares the OpenAPI 3.2 `query` operation or `additionalOperations` is refused with HTTP 422 `UnsupportedOperationField`, naming the field (for example `paths./search.query`). Those operations are not silently ignored: the generated validator, the MCP bridge, schema indexing, and `operation_count` cannot represent them.
 
 ## Submission formats
 
@@ -127,7 +129,7 @@ An array of `PluginConfig` objects. Fields follow the same schema as `POST /plug
 
 ### `x-ferrum-validate` (optional)
 
-Set `x-ferrum-validate: true` to generate a proxy-scoped `openapi_validator` plugin from the spec's operation schemas. The generated plugin config embeds the resolved request and response schemas plus their media types; the gateway runtime never reads the `api_specs` row on the request path.
+Set `x-ferrum-validate: true` to generate a proxy-scoped `openapi_validator` plugin from the spec's operation schemas. The generated plugin config embeds the resolved request and response schemas plus their media types, and each operation's path / query / header / cookie parameter descriptors (an optional parameter whose serialization the validator cannot deserialize is omitted; a required one refuses the import — see [openapi_validator.md](openapi_validator.md#request-parameters)); the gateway runtime never reads the `api_specs` row on the request path.
 
 Operation matching uses the full canonical inbound path (`ctx.path`, without the query string), before backend listen-path stripping. Generated `path_template` / `path_regex` include the literal `x-ferrum-proxy.listen_path` prefix followed by the effective server/`basePath` pathname and Paths key. For example, listen path `/p2/oas2` plus Paths key `/items` matches `/p2/oas2/items`; a server pathname `/v1` makes that `/p2/oas2/v1/items`. Do not repeat the listen prefix in Paths keys or server/basePath unless the intended inbound path contains it twice.
 
@@ -164,7 +166,7 @@ x-ferrum-validate:
     methods: [OPTIONS]
     consumers: [emergency-bypass]
     header_present:
-      x-bypass-validator: null
+      x-bypass-validator: replace-with-a-long-random-secret
 ```
 
 `x-ferrum-validate` accepts:
@@ -173,7 +175,9 @@ x-ferrum-validate:
 - `false` or `null` — do not generate the plugin.
 - object — generate the plugin and apply the listed settings.
 
-The object form is a **closed** fixed-field object. Accepted keys are exactly `mode`, `request`, `response`, `validate_request`, `validate_response`, `bypass`, `fail_on_unknown_operation`, `fail_on_missing_response_schema`, `max_body_bytes`, `error_response`, and `error_truncate_chars`; `request` and `response` accept only `enabled` and `content_types`, and `bypass` accepts only `paths`, `methods`, `consumers`, and `header_present`. Any other key — including `operations`, which is always regenerated from the document — is rejected with HTTP 400 and a spelling suggestion, so a misspelled enforcement control cannot silently fall back to a weaker default. The generated plugin config itself is closed the same way at construction; see [openapi_validator.md](openapi_validator.md#strict-config-admission).
+The object form is a **closed** fixed-field object. Accepted keys are exactly `mode`, `request`, `response`, `validate_request`, `validate_response`, `bypass`, `fail_on_unknown_operation`, `fail_on_missing_response_schema`, `reject_unsupported_parameters`, `max_body_bytes`, `error_response`, and `error_truncate_chars`; `request` and `response` accept only `enabled` and `content_types`, and `bypass` accepts only `paths`, `methods`, `consumers`, and `header_present`. Any other key — including `operations`, which is always regenerated from the document — is rejected with HTTP 400 and a spelling suggestion, so a misspelled enforcement control cannot silently fall back to a weaker default. The generated plugin config itself is closed the same way at construction; see [openapi_validator.md](openapi_validator.md#strict-config-admission).
+
+Set the import-only boolean `reject_unsupported_parameters: true` to refuse effective optional parameters the validator cannot deserialize, including unsupported styles, `content`-form parameters, nested collections, and Swagger collection formats. Both POST and PUT return HTTP 400 `MalformedExtension` naming the first affected operation, parameter, and reason. The default `false` preserves warning and dropping unsupported optional parameters; unsupported required parameters always refuse import. Non-booleans, including `null`, are rejected. This admission check applies after reference resolution and operation overrides regardless of runtime enforcement mode; OpenAPI-ignored headers stay ignored. The flag is not copied into the generated plugin config.
 
 The importer walks `paths.{path}`, resolves local Path Item `$ref`s first, then enumerates HTTP methods and resolves local schema `$ref`s inside request/response content:
 
@@ -262,9 +266,9 @@ paths:
 
 **Rejected (HTTP 400 `MalformedExtension`, naming the operation — exclude it to proceed):** header parameters named after a hop-by-hop or framing field, `Host`, `Authorization`, `Cookie`, `Proxy-*`, `X-Forwarded-*`, `Forwarded`, a client-address field (`X-Real-IP`, `True-Client-IP`, `CF-Connecting-IP`, `X-Client-IP`), a method or URL override (`X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`, `X-Original-URL`, `X-Rewrite-URL`, `X-Original-URI`), `Range` / `If-Range`, trace context (`traceparent`, `tracestate`, `baggage`), `Early-Data`, `HTTP2-Settings`, an MCP transport field (`Mcp-*`, `Last-Event-ID`), a service-mesh control field (`X-Envoy-*`, `X-Istio-*`, `L5d-*`), or a Ferrum-internal field (`X-Ferrum-*`, `Ferrum-*`, `X-Gateway-*`, `X-Consumer-*`), compared case-insensitively with `_` treated as `-`; a selected operation whose method `allowed_methods` does not allow; `in: cookie` parameters; parameters described by `content`; non-default `style`; query `explode: false`; `allowReserved: true`; a parameter with no `schema`; object-typed parameters and array path parameters (the plugin rejects those at load); a path template expression that does not occupy a whole segment; a *required* request body with no JSON media type (an optional one is simply not offered); and any Swagger 2.0 document. The same header-name rule is enforced again when the generated plugin loads (which also refuses the configured `FERRUM_REAL_IP_HEADER` and the MCP session headers) and when each call is built (which also refuses the request's `correlation_id` header).
 
-**Generated plugin.** The generated config sets `discovery.on_new_tool` / `on_schema_change` to `allow` and `policy.default_action` to `allow` (publishing the document is the decision to expose these operations), turns resource and prompt aggregation off, and stays **proxy-scoped** like every spec plugin. If `x-ferrum-plugins` already embeds one `mcp_gateway`, the generated config is merged into it: the operator's blocks win (for example `policy` with `default_action: deny` plus per-tool `allowed_groups`), `servers` are merged (the `openapi` id is reserved), and `mode` must stay `aggregate_router`. The embedded config is still walked for forbidden credential/consumer keys like every `x-ferrum-plugins` entry; the generated tool schemas are not (a schema property named `consumer` is ordinary document data). Generated configs (any `mcp_gateway` with an `openapi` server) share the `openapi_validator` budget (14 MiB, nesting depth 64); each tool definition is bounded at 256 KiB.
+**Generated plugin.** The generated config sets `discovery.on_new_tool` / `on_schema_change` to `allow` and `policy.default_action` to `allow` (publishing the document is the decision to expose these operations), turns resource and prompt aggregation off, and stays **proxy-scoped** like every spec plugin. If `x-ferrum-plugins` already embeds one `mcp_gateway`, the generated config is merged into it: the operator's blocks win (for example `policy` with `default_action: deny` plus per-tool `allowed_groups`), `servers` are merged (the `openapi` id is reserved), `endpoint` is merged key by key (`protocol_versions` may be set there, but an `endpoint.path` other than the generated one is rejected with HTTP 400: move the endpoint with `x-ferrum-mcp.endpoint.path`, which the constraints below check), and `mode` must stay `aggregate_router`. The embedded config is still walked for forbidden credential/consumer keys like every `x-ferrum-plugins` entry; the generated tool schemas are not (a schema property named `consumer` is ordinary document data). Generated configs (any `mcp_gateway` with an `openapi` server) share the `openapi_validator` budget (14 MiB, nesting depth 64); each tool definition is bounded at 256 KiB.
 
-**Constraints.** `x-ferrum-mcp` requires an OpenAPI 3.x document and a literal-prefix `x-ferrum-proxy.listen_path` (or none). The endpoint must sit under that prefix and must not overlap a bridged operation path (the MCP endpoint reserves its whole subtree). It cannot be combined with `x-ferrum-validate` in one document in this version: the client request targets the MCP endpoint while the backend receives the operation's path, so the generated validator would refuse the endpoint as an unknown operation. Argument validation for bridged calls is the gateway's own `validation.validate_tool_arguments` against the generated `inputSchema`.
+**Constraints.** `x-ferrum-mcp` requires an OpenAPI 3.x document and a literal-prefix `x-ferrum-proxy.listen_path` (or none). The endpoint must sit under that prefix and must not overlap any operation path of the document, bridged or not, under ANY of its effective server bases (root, Path Item, or operation `servers`; the bridge dispatches under the first): the MCP endpoint reserves its whole subtree the way the running gateway claims it — on the canonical request path, ASCII case-insensitively — and answers 404 there. Each literal run of a Paths key is percent-decoded the way the request path is. A whole-segment `{name}` stands for any non-empty value, and repeats of one name take the same value, so `/{id}/{id}` cannot spell `/one/two`. An expression inside a segment (`v{n}`, `mcp{suffix}`) is conservatively treated as able to match any text, including none, because a direct client of an unbridged operation may send it empty. So `/MCP`, `/Mcp/status`, `/%6d%63p` (canonically `/mcp`), `/mcp%2Fitems`, `/mcp{suffix}`, and `/{name}/status` all overlap an endpoint at `/mcp` and are rejected with HTTP 400 (`/mcpx` and `/v{n}` do not); choose an endpoint path no operation can produce, for example one segment deeper than every templated path. Because every operation is checked under every effective server base, a document whose operations × bases exceed 65,536 paths (or 16 MiB of path text) is refused with HTTP 400. It cannot be combined with `x-ferrum-validate` in one document in this version: the client request targets the MCP endpoint while the backend receives the operation's path, so the generated validator would refuse the endpoint as an unknown operation. Argument validation for bridged calls is the gateway's own `validation.validate_tool_arguments` against the generated `inputSchema`.
 
 ## What is NOT allowed in specs
 
@@ -275,10 +279,11 @@ The following are rejected with HTTP 422 (the `code` field of the error body is 
 - **Plugin `proxy_id` mismatch** (`PluginProxyIdMismatch`) — if `proxy_id` is set on a plugin, it must match the spec's proxy ID.
 - **Forbidden keys in plugin `config`** (`PluginContainsCredentials`) — the plugin `config` object is walked recursively. Any of the following keys at any nesting depth is rejected: `credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`, `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`. The one exception is an `openapi_validator` plugin's `bypass.consumers` (see [openapi_validator.md](openapi_validator.md)): those entries are configured identity selectors, not embedded consumer resources, so the root-level `consumers` list inside the `bypass` object is allowed while the walk still rejects the forbidden keys in the bypass object's other fields, inside the selector entries themselves, and everywhere else in the config.
 - **External `$ref`s without opt-in policy** — when process policy or `x-ferrum-external-refs` leave resolution disabled, external Path Item and schema `$ref`s fail closed with HTTP 422 `UnsupportedExternalRef`.
+- **OpenAPI 3.2 `query` / `additionalOperations`** (`UnsupportedOperationField`) — a Path Item declaring either field is refused; see [Supported OpenAPI versions](#supported-openapi-versions).
 
 The credential-key check walks the plugin's `config` *value*, not the plugin metadata, so a plugin named `jwt` is fine. A JWT plugin with `config: { secret_lookup: env, validation: { validate_exp: true } }` passes; one with `config: { jwt: { secret: "abc" } }` fails.
 
-### External `$ref` policy {#external-ref-policy}
+### External `$ref` policy
 
 External and cross-document `$ref` resolution is **explicitly opt-in** and runs only at API-spec admission (POST/PUT). Runtime validation never performs network or filesystem I/O for `$ref`s: schemas and Path Items are materialized into the generated `openapi_validator` config, and an immutable external-document snapshot (plus digest) is stored on the `api_specs` row.
 
@@ -361,23 +366,7 @@ All resources created by a spec submission are tagged with `api_spec_id = <spec 
 
 ## Dependency-fenced deployment recovery (#6010)
 
-Use admin-only `GET /deployment-snapshot` for complete original spec metadata,
-stored-document digests, one base64 copy of the stored spec bytes
-(`api_spec_contents`), plugin and raw dependency evidence. Send its original
-deployment token to
-`DELETE /proxies/{id}?conditional=true&cleanup_orphaned_upstream=false` or
-`PUT /api-specs/{id}?conditional=true`. These opt-in operations compare and
-partially mutate inside one owner-fenced transaction on all four supported
-stores (MongoDB requires a replica set). Stale evidence is `412`; invalid modes
-or headers refuse without fallback. Ordinary row deletion, spec replacement,
-backup and restore profiles retain their supported behavior.
-
-Only an acknowledgement with `durable: "committed"`, `live: "applied"` and
-`recovery_cleanup_authorized: true` authorizes automatic journal removal.
-Durable-only CP/unserved results explicitly return `false`. Preserve the original
-encrypted journal after every refusal or uncertain outcome. See the
-[consumer adoption guide](deployment_mutations.md) for exact evidence, query,
-ownership, preservation and acknowledgement rules.
+For exact-owner proxy removal and spec replacement fenced by `GET /deployment-snapshot`, see [deployment_mutations.md](deployment_mutations.md) and [admin_api.md](admin_api.md#dependency-fenced-deployment-recovery-6010).
 
 ## Atomicity and retries
 

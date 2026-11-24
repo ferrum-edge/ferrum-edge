@@ -256,6 +256,7 @@ fn capp_subscribe_request(namespace: &str) -> MeshSubscribeRequest {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     }
 }
 

@@ -269,12 +269,23 @@ async fn the_shared_body_scan_engine_serves_both_directions() {
         decode_sites, 1,
         "the wide-charset decode must have exactly one call site, shared by both directions"
     );
+    // Compared with all whitespace and trailing argument commas removed, so
+    // rustfmt line breaking cannot change the result. The request side
+    // forwards the caller's body extent (prefix scans are not judged as
+    // refused JSON); the response side has no JSON-path rules and always
+    // scans as complete. Neither carries a gRPC message split (`None`): only
+    // the HTTP final-body hooks pass one.
+    let compact = scan
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .replace(",)", ")");
     for entry in [
-        "self.scan_body_rules(subject, body, content_type, BodyDirection::Request)",
-        "self.scan_body_rules(subject, body, content_type, BodyDirection::Response)",
+        "self.scan_body_rules(subject,body,content_type,BodyDirection::Request,extent,None)",
+        "self.scan_body_rules(subject,body,content_type,BodyDirection::Response,BodyExtent::Complete,None)",
     ] {
         assert!(
-            scan.contains(entry),
+            compact.contains(entry),
             "both directions must enter the shared body scan: missing `{entry}`"
         );
     }

@@ -21,11 +21,23 @@ fn peer_auth(
     mode: MtlsMode,
     port_overrides: HashMap<u16, MtlsMode>,
 ) -> PeerAuthentication {
+    // The namespace default without a selector, otherwise those labels in
+    // `namespace` (or the selector's own namespace when it names one).
+    let scope = match selector {
+        Some(selector) => PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                namespace: selector.namespace.or_else(|| Some(namespace.to_string())),
+                labels: selector.labels,
+            },
+        },
+        None => PolicyScope::Namespace {
+            namespace: namespace.to_string(),
+        },
+    };
     PeerAuthentication {
         name: name.to_string(),
         namespace: namespace.to_string(),
-        scope: None,
-        selector,
+        scope,
         mtls_mode: mode,
         port_overrides,
     }
@@ -37,17 +49,10 @@ fn peer_auth_with_scope(
     scope: PolicyScope,
     mode: MtlsMode,
 ) -> PeerAuthentication {
-    let selector = match &scope {
-        PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
-        PolicyScope::MeshWide | PolicyScope::Namespace { .. } | PolicyScope::TargetRefs { .. } => {
-            None
-        }
-    };
     PeerAuthentication {
         name: name.to_string(),
         namespace: namespace.to_string(),
-        scope: Some(scope),
-        selector,
+        scope,
         mtls_mode: mode,
         port_overrides: HashMap::new(),
     }

@@ -1408,3 +1408,68 @@ fn authz_source_service_account_and_trust_domain_grammars_fail_closed_at_transla
         MeshAuthzDecision::Allow
     );
 }
+
+fn spiffe_source_request(spiffe_id: &str) -> MeshAuthzRequest {
+    MeshAuthzRequest {
+        source_principal: Some(
+            ferrum_edge::identity::SpiffeId::new(spiffe_id).expect("valid spiffe id"),
+        ),
+        protocol: MeshAuthzProtocol::Http,
+        ..MeshAuthzRequest::default()
+    }
+}
+
+/// `from.source.namespaces` / `notNamespaces` read the namespace from the
+/// SPIFFE path (`/ns/<namespace>/...`), never from the trust domain. A peer
+/// whose trust domain is literally `ns` (`spiffe://ns/ns/prod/sa/x`) is in
+/// namespace `prod` (GHSA-ccmw-4j34-w5vm).
+#[test]
+fn authz_source_namespaces_ignore_a_trust_domain_named_ns() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "from.source.namespaces / notNamespaces read the SPIFFE path namespace",
+        status = Status::Supported,
+        notes = "Namespace predicates use SpiffeId::namespace() (path segments only), the same \
+                 parse as `when: source.namespace`, so a trust domain spelled `ns` is never \
+                 mistaken for the source namespace.",
+    );
+    let peer = spiffe_source_request("spiffe://ns/ns/prod/sa/x");
+    let other_peer = spiffe_source_request("spiffe://ns/ns/other/sa/x");
+
+    let deny_prod = translated(json!({
+        "action": "DENY",
+        "rules": [{"from": [{"source": {"namespaces": ["prod"]}}]}]
+    }));
+    assert_eq!(
+        evaluate_mesh_authorization_policies(std::slice::from_ref(&deny_prod), &peer),
+        denied(),
+        "a DENY on namespace prod must match a prod workload in trust domain `ns`"
+    );
+
+    let allow_ns = translated(json!({
+        "action": "ALLOW",
+        "rules": [{"from": [{"source": {"namespaces": ["ns"]}}]}]
+    }));
+    assert_eq!(
+        evaluate_mesh_authorization_policies(std::slice::from_ref(&allow_ns), &peer),
+        MeshAuthzDecision::Deny {
+            policy: "implicit-deny".to_string()
+        },
+        "an ALLOW on namespace `ns` must not admit a prod workload of trust domain `ns`"
+    );
+
+    let deny_not_prod = translated(json!({
+        "action": "DENY",
+        "rules": [{"from": [{"source": {"notNamespaces": ["prod"]}}]}]
+    }));
+    assert_eq!(
+        evaluate_mesh_authorization_policies(std::slice::from_ref(&deny_not_prod), &peer),
+        MeshAuthzDecision::Allow,
+        "notNamespaces [prod] must exclude a prod workload of trust domain `ns`"
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(std::slice::from_ref(&deny_not_prod), &other_peer),
+        denied(),
+        "notNamespaces [prod] must still deny a workload outside prod"
+    );
+}

@@ -138,7 +138,6 @@ fn proxy_numeric_bounds_match_runtime_including_nullable_pool_overrides() {
                 ("/pool_http2_max_frame_size", 16384, 1048576, true),
                 ("/pool_http2_max_concurrent_streams", 1, 2147483647, true),
                 ("/pool_http3_connections_per_backend", 1, 256, true),
-                ("/pool_max_requests_per_connection", 0, 2147483647, true),
                 ("/tcp_idle_timeout_seconds", 0, 86400, true),
                 ("/websocket_idle_timeout_seconds", 0, 86400, true),
                 ("/udp_idle_timeout_seconds", 1, 3600, false),

@@ -335,6 +335,35 @@ fn vs_cors_policy_uncompilable_regex_origin_not_projected() {
     }
 }
 
+/// A credentialed regex that passes the reserved-name probe screen but cannot
+/// prove a pinned host is still projected, so the route keeps CORS ownership.
+/// `cors` construction then refuses it, and because `cors` is fail-closed the
+/// reload is rejected and the last published policy keeps serving.
+#[test]
+fn vs_cors_policy_credentialed_unprovable_regex_fails_closed_at_construction() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "http[].corsPolicy credentialed unprovable regex",
+        status = Status::Supported,
+        notes = "Projected, then refused by fail-closed cors construction (reload rejected, last published policy retained) instead of being deferred, which would leave the route without CORS ownership.",
+    );
+    let projected = cors_plugin_for(&[virtual_service(json!({
+        "hosts": ["api.example.com"],
+        "http": [{
+            "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
+            "corsPolicy": {
+                "allowOrigins": [{"regex": "^https://[a-z]{2,}\\.com$"}],
+                "allowCredentials": true
+            }
+        }]
+    }))])
+    .expect("an unprovable credentialed regex must still be projected");
+    let err = ferrum_edge::plugins::cors::CorsPlugin::new(&projected.config)
+        .err()
+        .expect("cors construction must refuse it");
+    assert!(err.contains("effectively universal"), "{err}");
+}
+
 /// Credentialed opaque `null` and effectively universal prefix/regex origin
 /// matchers cannot be projected: they would reflect an arbitrary origin with
 /// credentials. Exact `*` keeps the documented deferral; these matchers are
@@ -1425,6 +1454,44 @@ fn vs_malformed_header_transform_fails_closed() {
             "diagnostic should name the field, got: {error}"
         );
     }
+}
+
+/// PR #6858: request-side writes into the gateway-owned `x-path-param-*` and
+/// `x-consumer-*` namespaces are refused on the VirtualService at translation,
+/// rather than emitting a `mesh_route_dispatch` config that fails at plugin
+/// construction. `remove` stays admitted.
+#[test]
+fn vs_request_header_writes_into_gateway_owned_namespaces_fail_closed() {
+    let vs = |headers: serde_json::Value| {
+        virtual_service(json!({
+            "hosts": ["api.example.com"],
+            "http": [{
+                "match": [{"uri": {"prefix": "/api"}}],
+                "headers": headers,
+                "route": [{"destination": {
+                    "host": "echo.default.svc.cluster.local",
+                    "port": {"number": 8080}
+                }}]
+            }]
+        }))
+    };
+    for headers in [
+        json!({"request": {"set": {"x-path-param-account": "other"}}}),
+        json!({"request": {"add": {"X_Path_Param_Id": "7"}}}),
+        json!({"request": {"set": {"x-consumer-role": "admin"}}}),
+    ] {
+        let error = translate_k8s_objects(&[vs(headers.clone())], options())
+            .expect_err("a gateway-owned request header write must fail closed");
+        assert!(
+            error.to_string().contains("gateway-owned request header"),
+            "{headers}: {error}"
+        );
+    }
+    translate_k8s_objects(
+        &[vs(json!({"request": {"remove": ["x-path-param-account"]}}))],
+        options(),
+    )
+    .expect("removing a path-capture header stays admitted");
 }
 
 #[test]

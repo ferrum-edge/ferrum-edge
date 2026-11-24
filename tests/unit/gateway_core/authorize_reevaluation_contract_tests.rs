@@ -131,11 +131,11 @@ fn the_fence_sweep_filters_the_authorize_chain_by_the_opt_in() {
     );
 }
 
-/// The authorize chain is protocol-scoped and the protocol is peer-selectable:
-/// an HBONE CONNECT carrying `content-type: application/grpc` classifies as
-/// gRPC, and a gRPC-Web request resolves an entirely separate view. A sweep that
-/// hardcoded `ProxyProtocol::Http` would judge a chain the CONNECT was never
-/// admitted against — in either direction.
+/// The authorize chain is protocol-scoped: a gRPC request and a gRPC-Web
+/// request each resolve a separate view. The request path refuses an HBONE
+/// CONNECT declaring either content type, but a sweep that hardcoded
+/// `ProxyProtocol::Http` would judge a chain the CONNECT was never admitted
+/// against if that gate ever moved — in either direction.
 #[test]
 fn the_fence_sweep_resolves_the_admitting_plugin_view() {
     let src = include_str!("../../../src/proxy/hbone_admission_fence.rs");

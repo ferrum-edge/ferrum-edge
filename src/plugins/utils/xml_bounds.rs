@@ -5,14 +5,17 @@
 //! that work takes three layers, because no single one is sufficient:
 //!
 //! 1. **Pre-parse nesting-depth screen** — [`xml_nesting_depth_within_limit`],
-//!    applied to the raw bytes *before* `roxmltree` sees them. `roxmltree`'s
-//!    tokenizer recurses once per open element (`parse_element` ->
-//!    `parse_content` -> `parse_element`), so the recursion happens *inside*
-//!    `Document::parse_with_options`. A node-count budget cannot stop it: the
-//!    parser blows the tokio worker stack before it ever returns a
-//!    `NodesLimitReached` error, and under `panic = "abort"` a stack overflow is
-//!    a process kill on the request path. The screen must therefore run first,
-//!    on the bytes, never on a parsed tree.
+//!    applied to the raw bytes *before* `roxmltree` sees them. Before 0.21.2,
+//!    `roxmltree`'s tokenizer recursed once per open element, so a deeply
+//!    nested document overflowed the tokio worker stack *inside*
+//!    `Document::parse_with_options`, before any `NodesLimitReached` error,
+//!    and under `panic = "abort"` that is a process kill on the request path.
+//!    Since 0.21.2 it parses element content iteratively, so the parser no
+//!    longer spends stack per nesting level. The screen stays anyway: it
+//!    refuses a hostile document before any tree is allocated, it caps the
+//!    depth the consumers' recursive post-parse walkers can be handed, and
+//!    it keeps the request path stack-safe if a later parser change
+//!    reintroduces recursion. It runs on the bytes, never on a parsed tree.
 //! 2. **Parser node limit** (`ParsingOptions::nodes_limit`) — bounds the arena a
 //!    pathologically *wide* document can allocate. Each consumer keeps its own
 //!    value.
@@ -26,18 +29,18 @@
 /// Maximum element nesting depth accepted by the pre-parse screen.
 ///
 /// Real SOAP, SAML, and schema-described documents stay far below this; the
-/// value exists only to keep `roxmltree`'s per-level tokenizer recursion inside
-/// the worker stack.
+/// value is a fixed ceiling on the nesting a consumer and its recursive
+/// post-parse walkers ever see, applied before the parser runs.
 pub const XML_MAX_NESTING_DEPTH: usize = 256;
 
 /// Single pass over the raw document bytes rejecting element nesting deeper
-/// than `max_depth`, run *before* the document reaches `roxmltree`, whose
-/// tokenizer recurses once per nesting level. Every delimiter inspected is
-/// ASCII, so byte indexing cannot split a UTF-8 sequence. Constructs that may
-/// legally contain a bare `<` or `>` (comments, CDATA, processing
-/// instructions, DOCTYPE, quoted attribute values) are skipped rather than
-/// counted, so a legitimate document is never rejected. An unterminated
-/// construct simply ends the scan; `roxmltree` rejects such a document itself.
+/// than `max_depth`, run *before* the document reaches `roxmltree`. Every
+/// delimiter inspected is ASCII, so byte indexing cannot split a UTF-8
+/// sequence. Constructs that may legally contain a bare `<` or `>` (comments,
+/// CDATA, processing instructions, DOCTYPE, quoted attribute values) are
+/// skipped rather than counted, so a legitimate document is never rejected.
+/// An unterminated construct simply ends the scan; `roxmltree` rejects such a
+/// document itself.
 pub fn xml_nesting_depth_within_limit(body: &str, max_depth: usize) -> bool {
     let bytes = body.as_bytes();
     let mut index = 0usize;
@@ -141,4 +144,27 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// Unqualified attribute lookup for `roxmltree` nodes.
+///
+/// Since roxmltree 0.21, `Node::attribute("name")` (and `has_attribute` /
+/// `attribute_node`) match the local name in *any* namespace and return the
+/// first match, so `attribute("ID")` also returns a prefixed `x:ID` that
+/// precedes the unqualified `ID`. XML attributes never inherit a default
+/// namespace, and WS-Security, SAML, and XML-Signature define the attributes
+/// read here (`ID`, `URI`, `Algorithm`, ...) as unqualified, so a prefixed
+/// look-alike must not be read in their place. Use a `(namespace, local)`
+/// tuple with `attribute` for a namespaced attribute.
+pub trait UnqualifiedAttribute<'a> {
+    /// Value of the attribute named `local` that has no namespace.
+    fn unqualified_attribute(&self, local: &str) -> Option<&'a str>;
+}
+
+impl<'a, 'input: 'a> UnqualifiedAttribute<'a> for roxmltree::Node<'a, 'input> {
+    fn unqualified_attribute(&self, local: &str) -> Option<&'a str> {
+        self.attributes()
+            .find(|attribute| attribute.namespace().is_none() && attribute.name() == local)
+            .map(|attribute| attribute.value())
+    }
 }

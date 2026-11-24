@@ -207,23 +207,23 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
     );
 
     let oversize = mesh_collection
-        .split("Ok(None)")
+        .split("RetainRejection::TooLarge")
         .nth(1)
-        .expect("missing mesh collection branch: Ok(None)")
+        .expect("missing mesh collection branch: TooLarge")
         .split("H3RequestBodyReadError::DeadlineExceeded")
         .next()
-        .expect("bounded mesh collection Ok(None) branch");
+        .expect("bounded mesh collection TooLarge branch");
     let oversize_release = oversize
         .find("cb_probe.release_neutral()")
-        .expect("Ok(None) must release HALF_OPEN probe");
+        .expect("TooLarge must release HALF_OPEN probe");
     // The oversize refusal commits through the shared reject path, so the
     // reject hooks and the transaction log run (issue #6022).
     let oversize_write = oversize
         .find("write_bridge_upload_refusal(")
-        .expect("Ok(None) must refuse through the shared bridge reject path");
+        .expect("TooLarge must refuse through the shared bridge reject path");
     assert!(
         oversize_release < oversize_write,
-        "Ok(None) must release probe before terminal write"
+        "TooLarge must release probe before terminal write"
     );
 
     // Bind the exact force-buffer DeadlineExceeded arm, including the typed
@@ -496,15 +496,15 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
         .expect("H3 terminal provider dispatch must remain bounded");
     assert!(terminal_dispatch.contains("collect_h3_request_body_under_authorization("));
     assert!(terminal_dispatch.contains("drain_h3_request_body("));
-    // Ok(None): idle recv after a completed oversize drain — the flavor-aware
+    // TooLarge: idle recv after a completed oversize drain — the flavor-aware
     // writer already halts after HEADERS; do not duplicate STOP_SENDING.
     // Read: client gone — halt, finalize cleanup, no response write.
     // TimedOut: mid-recv_data cancel — write under post-deadline grace with
     // halt_recv=false, then let the wrapper halt through the vendored transport.
     let oversize = terminal_dispatch
-        .split("Ok(None)")
+        .split("RetainRejection::TooLarge")
         .nth(1)
-        .expect("missing terminal upload branch: Ok(None)")
+        .expect("missing terminal upload branch: TooLarge")
         .split("H3RequestBodyReadError::Read(error)")
         .next()
         .expect("bounded terminal upload branch");
@@ -881,7 +881,22 @@ fn native_h3_client_deadlines_remain_health_neutral() {
         "_ = &mut grpc_deadline_sleep, if grpc_deadline_active && !stream_done =>",
         "fault = &mut upload_fault_wait =>",
     );
-    assert_h3_arm_health_neutral(body_deadline, 3, "native H3 gRPC body-deadline arm");
+    assert!(
+        body_deadline.contains("settle_client_grpc_deadline!();"),
+        "the body-deadline arm must settle through the shared client-deadline terminal"
+    );
+    // That terminal is shared with a backend failure observed at/after the
+    // deadline before its sleep fired (issue #6022), so its classifications are
+    // asserted once, on the macro body.
+    let deadline_terminal = native_h3_grpc_select_arm(
+        "macro_rules! settle_client_grpc_deadline {",
+        "'outer: loop {",
+    );
+    assert_h3_arm_health_neutral(
+        deadline_terminal,
+        3,
+        "native H3 gRPC client-deadline terminal",
+    );
 
     // The terminating request-upload fault arm is client-caused too (client
     // abort, malformed trailing metadata, oversized upload), so it obeys the
@@ -1484,12 +1499,20 @@ fn h1_h2_request_plugin_awaits_and_body_hook_clones_preserve_deadline_provenance
         !proxy.contains("await_request_plugin_deadline("),
         "proxy request hooks must retain typed timeout provenance until conversion with the live context"
     );
+    // Every final-body compatibility-clone merge goes through the one shared
+    // `RequestContext` hand-back, which propagates terminal deadline ownership
+    // (issues #7161, #7223);
+    // `run_buffered_request_body_hook_round_trip_for_test` executes it.
     assert!(
         proxy
-            .matches("body_hook_ctx.gateway_deadline_response_selected()")
+            .matches("ctx.adopt_final_request_body_hook_context(*body_hook_ctx)")
             .count()
-            >= 4,
-        "every final-body compatibility-clone merge must propagate terminal deadline ownership"
+            >= 5,
+        "every final-body compatibility-clone merge must use the shared hand-back"
+    );
+    assert!(
+        !proxy.contains("ctx.metadata = body_hook_ctx.metadata"),
+        "no dispatch path may hand the hook context back field by field"
     );
 }
 
@@ -1529,8 +1552,15 @@ fn buffered_http3_backend_upload_honors_client_grpc_deadline() {
     );
     assert_eq!(
         buffering.matches(".collect()").count(),
+        0,
+        "an HTTP/3 upload buffering collect bypassed the charged collector"
+    );
+    assert_eq!(
+        buffering
+            .matches("collect_charged_request_body(gated, collector)")
+            .count(),
         deadline_aware,
-        "an HTTP/3 upload buffering collect bypassed the deadline-aware collector"
+        "an HTTP/3 upload buffering collect bypassed the charged collector"
     );
     assert!(
         !buffering.contains("collect_request_body_with_deadline("),
@@ -1538,9 +1568,9 @@ fn buffered_http3_backend_upload_honors_client_grpc_deadline() {
          authorization bound, not only the client deadline"
     );
     // And the surviving branch is never run unbounded: the retained ceiling is
-    // fail-closed and the collect is wrapped in `Limited`.
+    // fail-closed and the collect is charged by what it retains under it.
     assert!(buffering.contains("buffered_request_body_ceiling("));
-    assert!(buffering.contains("http_body_util::Limited::new("));
+    assert!(buffering.contains("ChargedRequestCollector::new(retained_ceiling)"));
     // Each terminal the deadline-aware collect can yield, once per collect site.
     assert_eq!(
         buffering
@@ -1588,7 +1618,7 @@ fn h3_send_only_terminal_rejection_write_is_deadline_bounded() {
         .split("async fn write_final_grpc_body_reject_send<S>(")
         .nth(1)
         .expect("send-only terminal gRPC rejection writer")
-        .split("fn reject_body_as_h3_grpc_message(")
+        .split("async fn acquire_cross_protocol_pool_client(")
         .next()
         .expect("bounded send-only terminal gRPC rejection writer");
     assert!(writer.contains("ctx.gateway_deadline_response_selected()"));
@@ -2217,7 +2247,7 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
         .expect("bounded H3 upload-deadline finalizer");
     assert!(helper.contains("apply_reject_after_proxy_and_synthetic_body_hooks("));
     assert!(helper.contains("run_h3_reject_response_committed_hooks("));
-    assert!(helper.contains("log_rejected_request("));
+    assert!(helper.contains("log_rejected_request_with_path("));
     assert!(helper.contains("send_h3_plugin_reject_flavor_aware_with_recv_halt("));
     // Upload-deadline rejection is already selected; the terminal write must use
     // the shared post-deadline grace (via the plugin reject writer) rather than
@@ -2236,7 +2266,7 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
             .count(),
         1
     );
-    assert_eq!(helper.matches("log_rejected_request(").count(), 1);
+    assert_eq!(helper.matches("log_rejected_request_with_path(").count(), 1);
     assert_eq!(helper.matches("record_request(state,").count(), 1);
     assert_eq!(
         helper
@@ -2251,7 +2281,7 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
         .find("run_h3_reject_response_committed_hooks(")
         .expect("upload deadline commit");
     let log = helper
-        .find("log_rejected_request(")
+        .find("log_rejected_request_with_path(")
         .expect("upload deadline log");
     let metric = helper
         .find("record_request(state,")
@@ -2587,8 +2617,10 @@ fn plain_h3_streaming_body_and_trailer_faults_downgrade_capability() {
         "refined streaming must exclude graceful close from the downgrade signal"
     );
 
-    // Buffered-request streaming body fault (second "during streaming" after
-    // the inline path — use the proxy_to_backend_h3_streaming function scope).
+    // The buffered-request streaming path keeps no relay copy of its own
+    // (issue #7190): it hands the committed response to the shared relay whose
+    // body and trailer downgrades are pinned above, and downgrades only its own
+    // pre-header dispatch failure.
     let buffered_req = src
         .split("async fn proxy_to_backend_h3_streaming(")
         .nth(1)
@@ -2597,17 +2629,19 @@ fn plain_h3_streaming_body_and_trailer_faults_downgrade_capability() {
         .next()
         .expect("bounded buffered-request streaming body");
     assert!(
-        buffered_req.contains("is_h3_transport_error_class(class)")
-            && buffered_req
-                .matches("mark_h3_unsupported(proxy, upstream_target)")
-                .count()
-                >= 2,
-        "buffered-request streaming body and trailer transport faults must downgrade"
+        buffered_req.contains("stream_h3_open_response_to_client("),
+        "buffered-request streaming must relay through the shared committed-response relay"
     );
     assert!(
-        buffered_req.matches("is_h3_graceful_close(&").count() >= 3,
-        "buffered-request streaming must exclude graceful close at the body \
-         recovery check and at both downgrade sites"
+        !buffered_req.contains("recv_data()") && !buffered_req.contains("recv_trailers"),
+        "buffered-request streaming must not keep its own body or trailer relay"
+    );
+    assert_eq!(
+        buffered_req
+            .matches("mark_h3_unsupported(proxy, upstream_target)")
+            .count(),
+        1,
+        "only the pre-header dispatch failure downgrades in the buffered-request path"
     );
 }
 
@@ -2761,19 +2795,20 @@ fn streaming_h3_relays_reconcile_backend_trailers_with_response_policy() {
         "streaming H3 must keep the hop-by-hop trailer strip"
     );
 
-    // This file holds FOUR streaming relays that cross the response-header
+    // This file holds THREE streaming relays that cross the response-header
     // policy boundary, and every one of them must capture pre-policy evidence:
-    // the three plain native/refined relays (the inline stream, the refined
-    // stream, and the buffered-request streaming helper) plus the native gRPC
-    // relay, which inlines its own trailer finish and is pinned separately
-    // below. Counting the total — not just the plain subset — is what makes a
-    // silently added fifth relay fail here instead of shipping ungoverned.
+    // the two plain native relays (the inline stream, and the committed-response
+    // relay the refined and buffered-request streaming paths share since issue
+    // #7190) plus the native gRPC relay, which inlines its own trailer finish
+    // and is pinned separately below. Counting the total — not just the plain
+    // subset — is what makes a silently added fourth relay fail here instead of
+    // shipping ungoverned.
     assert_eq!(
         src.matches("PrePolicyResponseHeaders::capture_for_streaming(")
             .count(),
-        4,
+        3,
         "every H3 streaming relay must capture its pre-policy response headers: \
-         three plain native/refined relays plus the native gRPC relay"
+         two plain native relays plus the native gRPC relay"
     );
     // The two families are told apart by the binding they produce, never by
     // position, so adding a relay of either kind moves exactly one count.
@@ -2784,15 +2819,15 @@ fn streaming_h3_relays_reconcile_backend_trailers_with_response_policy() {
     );
     assert_eq!(
         src.matches("H3StreamingTrailerPolicy {").count(),
-        3,
-        "every plain native/refined H3 streaming relay must bind the response \
+        2,
+        "every plain native H3 streaming relay must bind the response \
          trailer policy at its trailer frame"
     );
     let captures: Vec<&str> = src.split(PLAIN_STREAMING_CAPTURE).skip(1).collect();
     assert_eq!(
         captures.len(),
-        3,
-        "every plain native/refined H3 streaming relay must capture its \
+        2,
+        "every plain native H3 streaming relay must capture its \
          pre-policy response headers"
     );
     for region in captures {
@@ -2978,11 +3013,7 @@ fn streaming_h3_relays_put_the_default_content_type_on_the_final_header_map() {
                 .expect("bounded streaming relay region")
         })
         .collect();
-    assert_eq!(
-        relays.len(),
-        3,
-        "three plain native/refined streaming relays"
-    );
+    assert_eq!(relays.len(), 2, "two plain native streaming relays");
     for relay in &relays {
         let map_write = relay
             .find(r#".entry("content-type".to_string())"#)
@@ -3034,7 +3065,7 @@ fn streaming_h3_relays_put_the_default_content_type_on_the_final_header_map() {
         .collect();
     assert_eq!(
         flags.len(),
-        3,
+        2,
         "each streaming relay decides the synthesis for itself"
     );
     for tail in flags {
@@ -3143,8 +3174,9 @@ fn h3_stamps_a_connection_close_watch_so_injected_delays_cannot_outlive_the_peer
         "the watch must observe QUIC connection close"
     );
     assert!(
-        watch_body.contains("self.connection.close_reason().is_some()"),
-        "the watch must offer a non-blocking already-closed check"
+        watch_body.contains("self.observe_close().is_some()")
+            && watch_body.contains("self.connection\n                .close_reason()"),
+        "the watch must offer a non-blocking already-closed check over the latched close"
     );
     // Ownership guard: the watch must never touch the request stream. Reading
     // or polling it from a detached watcher would race the proxy path for
@@ -3249,11 +3281,11 @@ fn h3_plain_header_wait_races_per_stream_stop_sending_not_only_connection_close(
         .next()
         .expect("bounded dispatch_plain");
     assert!(
-        dispatch.contains("crate::http3::stream_util::peer_response_cancelled(stream)"),
+        dispatch.contains("crate::http3::stream_util::peer_response_cancelled("),
         "the prebuffered/no-body header wait must watch per-stream STOP_SENDING"
     );
     assert!(
-        dispatch.matches("peer_response_cancelled(stream)").count() >= 2,
+        dispatch.matches("peer_response_cancelled(").count() >= 2,
         "both prebuffered and streaming-upload header waits must watch per-stream STOP_SENDING"
     );
     assert!(
@@ -3353,20 +3385,35 @@ fn h3_quinn_vendored_send_stream_stopped_is_shared_and_static() {
         .next()
         .expect("bounded peer_response_cancelled");
     assert!(
-        watch.contains("impl Future<Output = ()> + Send + 'static"),
-        "peer_response_cancelled must return a statically dispatched 'static future: {watch}"
+        watch.contains("impl Future<Output = ()> + Send + 'a")
+            && watch.contains("F: Future<Output = bool> + Send + 'static,"),
+        "peer_response_cancelled must take the already-built 'static stopped future and \
+         return a statically dispatched future that never borrows the stream: {watch}"
     );
     assert!(
         !watch.contains("Box::pin") && !watch.contains("Pin<Box") && !watch.contains("dyn Future"),
         "peer_response_cancelled must not box a trait-object future: {watch}"
     );
     assert!(
-        watch.contains("Ok(Some(_)) | Err(_) => {}"),
-        "STOP_SENDING and connection loss must complete the cancel watch: {watch}"
+        watch.contains("if stopped.await {")
+            && watch.contains("stop_sending.store(true, std::sync::atomic::Ordering::Release);"),
+        "the cancel watch must record a typed STOP_SENDING (issue #6772): {watch}"
+    );
+    let stopped = util
+        .split("pub(crate) fn peer_response_stopped<")
+        .nth(1)
+        .expect("peer_response_stopped must exist")
+        .split("pub(crate) fn peer_response_cancelled<")
+        .next()
+        .expect("bounded peer_response_stopped");
+    assert!(stopped.contains("impl Future<Output = bool> + Send + 'static"));
+    assert!(
+        stopped.contains("Ok(Some(_)) => true,") && stopped.contains("Err(_) => false,"),
+        "STOP_SENDING and connection loss must complete the watch, typed apart: {stopped}"
     );
     assert!(
-        watch.contains("Ok(None) => std::future::pending::<()>().await"),
-        "a local finish acknowledgement must not be treated as cancellation: {watch}"
+        stopped.contains("Ok(None) => std::future::pending::<bool>().await"),
+        "a local finish acknowledgement must not be treated as cancellation: {stopped}"
     );
 }
 
@@ -4260,8 +4307,21 @@ fn h3_native_grpc_upload_fault_signalling_matches_the_h2_bridge() {
         "undecodable trailing metadata is INVALID_ARGUMENT, not a server outage"
     );
     assert_eq!(
+        h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::MalformedBody),
+        Some((3, "Malformed request body")),
+        "a request DATA read the gateway refused is INVALID_ARGUMENT, not a client abort"
+    );
+    // Issue #6772: a client that reset or lost its upload cancelled the RPC; it
+    // is never reported as a service outage (UNAVAILABLE / 14).
+    assert_eq!(
         h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::ClientAbort),
-        Some((14, "Service unavailable")),
+        Some((1, "Client disconnected")),
+    );
+    // A stream the gateway ended itself is never laundered into a client
+    // cancellation: it is the gateway's own UNAVAILABLE.
+    assert_eq!(
+        h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::GatewayTerminated),
+        Some((14, "Request stream closed by the gateway")),
     );
     assert_eq!(
         h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::AuthorizationExpired),
@@ -4272,6 +4332,8 @@ fn h3_native_grpc_upload_fault_signalling_matches_the_h2_bridge() {
     for terminating in [
         H3GrpcUploadFaultKind::ClientAbort,
         H3GrpcUploadFaultKind::MalformedTrailers,
+        H3GrpcUploadFaultKind::MalformedBody,
+        H3GrpcUploadFaultKind::GatewayTerminated,
         H3GrpcUploadFaultKind::Oversize,
         H3GrpcUploadFaultKind::AuthorizationExpired,
     ] {
@@ -5190,18 +5252,19 @@ fn committed_native_h3_streaming_responses_reset_unless_a_finish_landed() {
     );
 }
 
-/// Issue #4125. The same fail-closed terminal, for the two H3 streaming relays
-/// that only BORROW their send half.
+/// Issue #4125. The same fail-closed terminal, for the H3 streaming relay that
+/// only BORROWS its send half.
 ///
-/// `stream_h3_open_response_to_client` and `proxy_to_backend_h3_streaming`
-/// receive `h3_stream: &mut RequestStream<..>` from the H3 request handler, so
-/// they cannot move it into the owning `CommittedH3ResponseStream` #4112 added.
-/// They get `BorrowedCommittedH3ResponseStream` instead: same inverted
+/// `stream_h3_open_response_to_client` receives
+/// `h3_stream: &mut RequestStream<..>` from the H3 request handler, so it
+/// cannot move it into the owning `CommittedH3ResponseStream` #4112 added. The
+/// refined and buffered-request streaming paths both relay through it (issue
+/// #7190). It gets `BorrowedCommittedH3ResponseStream` instead: same inverted
 /// predicate (reset UNLESS a `finish()` proved it returned `Ok`), same `Drop`
 /// backstop for a task dropped while parked in `send_data`, and the same
 /// explicit settle after the relay loop.
 ///
-/// Each relay has two authorized FIN-success sites: ordinary completion via
+/// The relay has two authorized FIN-success sites: ordinary completion via
 /// `finish_h3_response_with_backend_trailers` and the bodyless response branch.
 /// Both must pair their successful finish with a clean-completion latch; all
 /// failure, expiry and cancellation exits retain the fail-closed reset.
@@ -5271,23 +5334,19 @@ fn committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed() {
     // The guard has to be armed BEFORE the HEADERS commit, not after it: the
     // commit's own `ClientWriteFailed` / expiry arms are inside the region a
     // partially written HEADERS frame can already have committed.
-    for relay_fn in [
-        "async fn stream_h3_open_response_to_client(",
-        "async fn proxy_to_backend_h3_streaming(",
-    ] {
-        let body = server
-            .split(relay_fn)
-            .nth(1)
-            .expect("both borrowing H3 streaming relays must still exist");
-        let pre_commit = body
-            .split("commit_authorized_streaming_response_headers(")
-            .next()
-            .expect("each relay must still commit its streaming response headers");
-        assert!(
-            pre_commit.contains("BorrowedCommittedH3ResponseStream::new(h3_stream)"),
-            "{relay_fn} must arm the fail-closed terminal before it commits response headers"
-        );
-    }
+    let relay_fn = "async fn stream_h3_open_response_to_client(";
+    let body = server
+        .split(relay_fn)
+        .nth(1)
+        .expect("the borrowing H3 streaming relay must still exist");
+    let pre_commit = body
+        .split("commit_authorized_streaming_response_headers(")
+        .next()
+        .expect("the relay must still commit its streaming response headers");
+    assert!(
+        pre_commit.contains("BorrowedCommittedH3ResponseStream::new(h3_stream)"),
+        "{relay_fn} must arm the fail-closed terminal before it commits response headers"
+    );
 
     let guarded_relays: Vec<&str> = server
         .split("BorrowedCommittedH3ResponseStream::new(h3_stream)")
@@ -5295,8 +5354,21 @@ fn committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed() {
         .collect();
     assert_eq!(
         guarded_relays.len(),
-        2,
-        "exactly the two borrowing H3 streaming relays may guard a committed send half"
+        1,
+        "exactly the one borrowing H3 streaming relay may guard a committed send half"
+    );
+    // The buffered-request streaming path keeps no relay copy (issue #7190).
+    let buffered_request_streaming = server
+        .split("async fn proxy_to_backend_h3_streaming(")
+        .nth(1)
+        .expect("buffered-request streaming function")
+        .split("\n}\n")
+        .next()
+        .expect("bounded buffered-request streaming function");
+    assert!(
+        buffered_request_streaming.contains("stream_h3_open_response_to_client(")
+            && !buffered_request_streaming.contains("BorrowedCommittedH3ResponseStream::new("),
+        "the buffered-request streaming path must relay through the shared guarded relay"
     );
     for relay in guarded_relays {
         let guarded = relay
@@ -5811,11 +5883,10 @@ fn native_plain_h3_streaming_relays_are_authorization_first_at_backend_eos() {
         .collect();
     assert_eq!(
         borrowed.len(),
-        2,
-        "exactly the two borrowing H3 streaming relays may guard a committed send half"
+        1,
+        "exactly the one borrowing H3 streaming relay may guard a committed send half"
     );
     assert_plain_relay_authorization_first(borrowed[0], "recv_stream.recv_data()");
-    assert_plain_relay_authorization_first(borrowed[1], "h3_resp.recv_stream.recv_data()");
 }
 
 fn assert_plain_relay_authorization_first(relay: &str, recv_data: &str) {
@@ -5938,6 +6009,71 @@ fn h3_request_handler_boxes_its_largest_dispatch_relays() {
     assert!(
         streaming_factory.contains("Box::pin(async move {"),
         "boxed_dispatch_grpc_streaming must box an async trampoline"
+    );
+
+    // The charged request-body phases (the normalizer chain and the transform
+    // chain, each with its decode-charge handoff scope) are entered through
+    // boxing factories from the handler and the bridge, never inline.
+    const NORMALIZE: &str = "apply_buffered_request_body_normalization_before_before_proxy(";
+    const TRANSFORM: &str = "apply_request_body_plugins_with_context(";
+    for (relay, source) in [
+        (NORMALIZE, handler),
+        (TRANSFORM, handler),
+        (TRANSFORM, bridge),
+    ] {
+        let factory_call = format!("boxed_{relay}");
+        assert!(
+            source.contains(factory_call.as_str()),
+            "{relay} must be entered through its boxing factory"
+        );
+        assert_eq!(
+            source.matches(relay).count(),
+            source.matches(factory_call.as_str()).count(),
+            "{relay} must not be awaited inline on an H3 request path"
+        );
+    }
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    for relay in [NORMALIZE, TRANSFORM] {
+        let name = relay.trim_end_matches('(');
+        let attributed = format!("#[inline(never)]\npub(crate) fn boxed_{name}<");
+        assert!(
+            proxy.contains(attributed.as_str()),
+            "boxed_{name} must stay an out-of-line boxing factory"
+        );
+        let signature = format!("fn boxed_{name}<");
+        let body = proxy
+            .split(signature.as_str())
+            .nth(1)
+            .expect("request-body phase factory")
+            .split("\n}\n")
+            .next()
+            .expect("bounded request-body phase factory");
+        assert!(
+            body.contains("Box::pin(async move {"),
+            "boxed_{name} must box an async trampoline"
+        );
+    }
+
+    // Every bridge upload refusal goes through its boxing factory, so no
+    // bridge dispatcher carries the reject pipeline as a frame slot.
+    assert!(
+        !bridge.contains("Box::pin(write_bridge_upload_refusal("),
+        "a call-site Box::pin still materializes the refusal on the caller's stack"
+    );
+    assert!(
+        bridge.contains("#[inline(never)]\nfn boxed_write_bridge_upload_refusal<"),
+        "boxed_write_bridge_upload_refusal must stay an out-of-line boxing factory"
+    );
+    let refusal_factory = bridge
+        .split("fn boxed_write_bridge_upload_refusal<")
+        .nth(1)
+        .expect("bridge refusal boxing factory")
+        .split("\n}\n")
+        .next()
+        .expect("bounded bridge refusal boxing factory");
+    assert!(
+        refusal_factory.contains("Box::pin(async move {"),
+        "boxed_write_bridge_upload_refusal must box an async trampoline"
     );
 }
 
@@ -6063,4 +6199,202 @@ fn h3_plain_authorization_failure_write_is_bounded_before_guard_settlement() {
         .expect("actual summary");
     assert!(latch < write && write < permits && permits < connections && connections < summary);
     assert!(branch.contains("body_completed: reject_sent"));
+}
+
+/// Issue #7157: the inline native-H3 streaming path's oversized-upload `413`
+/// and oversized declared-response `502` exits emit a `TransactionSummary`
+/// (access logs and log-sink plugins) and count once, after the log, like the
+/// dispatch-failure arm beside them.
+#[test]
+fn h3_native_streaming_oversize_exits_log_a_transaction_summary() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let streaming = source
+        .split("// ===== STREAMING REQUEST + RESPONSE PATH =====")
+        .nth(1)
+        .expect("native streaming dispatch");
+
+    let upload = streaming
+        .split(
+            "== Some(crate::http3::client::H3ClientRequestFault::BodyTooLarge)\n                {",
+        )
+        .nth(1)
+        .expect("oversized upload arm")
+        .split("return Ok(());")
+        .next()
+        .expect("bounded oversized upload arm");
+    let write = upload
+        .find("StatusCode::PAYLOAD_TOO_LARGE")
+        .expect("413 write");
+    let summary = upload
+        .find("response_status_code: 413,")
+        .expect("413 transaction summary");
+    let log = upload
+        .find("crate::plugins::log_with_mirror(")
+        .expect("413 summary is logged");
+    let count = upload
+        .find("record_request(&state, 413);")
+        .expect("413 is counted");
+    assert!(write < summary && summary < log && log < count);
+    assert_eq!(upload.matches("record_request(").count(), 1);
+
+    let response = streaming
+        .split("\"HTTP/3 backend response body exceeds configured size limit\"")
+        .nth(1)
+        .expect("oversized declared response arm")
+        .split("return Ok(());")
+        .next()
+        .expect("bounded oversized declared response arm");
+    let write = response
+        .find("send_h3_response_too_large(")
+        .expect("502 write");
+    let summary = response
+        .find("response_status_code: 502,")
+        .expect("502 transaction summary");
+    let log = response
+        .find("crate::plugins::log_with_mirror(")
+        .expect("502 summary is logged");
+    let count = response
+        .find("record_request(&state, 502);")
+        .expect("502 is counted");
+    assert!(write < summary && summary < log && log < count);
+    assert!(response.contains("error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge)"));
+}
+
+/// Issues #7156 / #7157: the H3 invalid-backend-path exit and the native-H3
+/// "mesh transport dispatch required" `502` write a rejection log under their
+/// own compiled-in phase (the same phase H1/H2 uses for the invalid path), with
+/// the client's original path, before the request is counted.
+#[test]
+fn h3_internal_reject_exits_log_their_phase_before_counting() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let handler = server
+        .split("async fn handle_h3_request(")
+        .nth(1)
+        .expect("H3 request handler")
+        .split("\nfn h3_grpc_intended_refusal_exempts(")
+        .next()
+        .expect("bounded H3 request handler");
+
+    let invalid_path = handler
+        .split("let backend_url = match build_h3_backend_url_for_flavor(")
+        .nth(1)
+        .expect("H3 backend URL build")
+        .split("return Ok(());")
+        .next()
+        .expect("bounded invalid backend path arm");
+    let mesh_dispatch = handler
+        .split(
+            "\"native H3 dispatch: refusing direct dial to a target requiring another transport\"",
+        )
+        .nth(1)
+        .expect("native-H3 mesh dispatch refusal")
+        .split("return Ok(());")
+        .next()
+        .expect("bounded mesh dispatch refusal");
+
+    for (arm, phase) in [
+        (
+            invalid_path,
+            "crate::diagnostic_ref::INVALID_BACKEND_PATH_PHASE",
+        ),
+        (
+            mesh_dispatch,
+            "crate::diagnostic_ref::MESH_TRANSPORT_DISPATCH_REQUIRED_PHASE",
+        ),
+    ] {
+        let log = arm
+            .find("crate::proxy::boxed_log_rejected_request_with_path(")
+            .expect("the exit is logged out of line");
+        let logged_phase = arm.find(phase).expect("the exit logs its own phase");
+        let original_path = arm
+            .find("Some(&original_request_path)")
+            .expect("the exit logs the client's original path");
+        let count = arm.find("record_request(").expect("the exit is counted");
+        assert!(log < logged_phase && logged_phase < original_path && original_path < count);
+        assert_eq!(arm.matches("record_request(").count(), 1);
+    }
+}
+
+/// Issue #7158: once `handle_h3_request` rebases `path` for an Istio
+/// `rewrite.uri` / `mesh_route_dispatch` override, every rejection and
+/// transaction summary records the client's original path, as H1/H2 does. The
+/// rejection-log funnel falls back to the rewritten `ctx.path` when no path is
+/// passed, so no post-rewrite site may use the path-less entry points, and the
+/// two shared reject helpers carry the original path into their log.
+#[test]
+fn h3_post_rewrite_rejections_log_the_original_request_path() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let handler = server
+        .split("async fn handle_h3_request(")
+        .nth(1)
+        .expect("H3 request handler")
+        .split("\nfn h3_grpc_intended_refusal_exempts(")
+        .next()
+        .expect("bounded H3 request handler");
+    let after_rewrite = handler
+        .split("let original_request_path = path.clone();")
+        .nth(1)
+        .expect("the handler captures the original path before the rewrite");
+    assert!(
+        after_rewrite.contains("crate::proxy::rebase_route_override_path("),
+        "the capture must precede the route-override rebase"
+    );
+    for path_less in [
+        "log_rejected_request(",
+        "log_pre_backend_rejected_request(",
+        "request_path: path.clone()",
+    ] {
+        assert!(
+            !after_rewrite.contains(path_less),
+            "a post-rewrite H3 rejection must not record the rewritten path via `{path_less}`"
+        );
+    }
+    assert_eq!(
+        after_rewrite
+            .matches("run_h3_backend_admission_or_send_reject(")
+            .count(),
+        after_rewrite
+            .split("run_h3_backend_admission_or_send_reject(")
+            .skip(1)
+            .filter(|call| {
+                call.split(".await?")
+                    .next()
+                    .is_some_and(|args| args.contains("Some(&original_request_path)"))
+            })
+            .count(),
+        "every post-rewrite backend-admission reject must pass the original path"
+    );
+    assert_eq!(
+        after_rewrite
+            .matches("finalize_h3_upload_deadline_rejection(")
+            .count(),
+        after_rewrite
+            .split("finalize_h3_upload_deadline_rejection(")
+            .skip(1)
+            .filter(|call| {
+                call.split(".await?")
+                    .next()
+                    .is_some_and(|args| args.contains("Some(&original_request_path)"))
+            })
+            .count(),
+        "every post-rewrite upload-deadline reject must pass the original path"
+    );
+    for helper in [
+        "async fn run_h3_backend_admission_or_send_reject(",
+        "async fn finalize_h3_upload_deadline_rejection(",
+    ] {
+        let body = server
+            .split(helper)
+            .nth(1)
+            .expect("shared H3 reject helper")
+            .split("\n}\n")
+            .next()
+            .expect("bounded helper");
+        assert!(
+            body.contains("original_request_path: Option<&str>,")
+                && body.contains("log_rejected_request_with_path(")
+                && !body.contains("log_rejected_request("),
+            "{helper} must log the caller's original path"
+        );
+    }
 }

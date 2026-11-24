@@ -835,7 +835,7 @@ async fn load_trust_bundle_reload_candidate_detached(
     path: String,
     fleet_secret: Option<String>,
     permit: tokio::sync::OwnedSemaphorePermit,
-) -> Result<CpDpVerifier, TrustBundleReloadError> {
+) -> Result<CpDpTrustBundle, TrustBundleReloadError> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let join_handle = std::thread::Builder::new()
         .name("ferrum-cp-trust-reload".to_string())
@@ -848,9 +848,7 @@ async fn load_trust_bundle_reload_candidate_detached(
             // cannot prove one source generation is classified and dropped;
             // the active verifier is retained in full.
             let loaded = CpDpTrustBundle::load_coherent_from_path(&path, fleet_secret.as_deref());
-            let candidate = loaded
-                .map(CpDpVerifier::TrustBundle)
-                .map_err(|e| TrustBundleReloadError::Rejected(e.reason()));
+            let candidate = loaded.map_err(|e| TrustBundleReloadError::Rejected(e.reason()));
             let _ = sender.send(candidate);
         })
         .map_err(|_| TrustBundleReloadError::ReaderFailed)?;
@@ -866,7 +864,7 @@ async fn load_trust_bundle_reload_candidate_detached(
 async fn load_trust_bundle_reload_candidate(
     path: String,
     fleet_secret: Option<String>,
-) -> Result<CpDpVerifier, TrustBundleReloadError> {
+) -> Result<CpDpTrustBundle, TrustBundleReloadError> {
     load_trust_bundle_reload_candidate_with_timeout(
         path,
         fleet_secret,
@@ -879,7 +877,7 @@ async fn load_trust_bundle_reload_candidate_with_timeout(
     path: String,
     fleet_secret: Option<String>,
     timeout: std::time::Duration,
-) -> Result<CpDpVerifier, TrustBundleReloadError> {
+) -> Result<CpDpTrustBundle, TrustBundleReloadError> {
     let read = async {
         let permit = trust_bundle_reload_read_limit()
             .acquire_owned()
@@ -894,7 +892,6 @@ async fn load_trust_bundle_reload_candidate_with_timeout(
 }
 
 #[doc(hidden)]
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) async fn load_trust_bundle_reload_candidate_for_test(
     path: String,
     timeout: std::time::Duration,
@@ -956,7 +953,6 @@ impl TenantAuthRejectReason {
     /// Kept available (and pinned by tests) even where no metric consumes it
     /// yet: the point of the closed set is that any future audit/metric sink
     /// has a bounded label to reach for instead of interpolating token data.
-    #[allow(dead_code)]
     pub const fn as_metric_label(self) -> &'static str {
         match self {
             Self::MalformedHeader => "malformed_header",
@@ -1051,9 +1047,7 @@ pub struct CpGrpcConnectInfo {
     /// Preserved from tonic's `TcpConnectInfo`, which this type replaces, so
     /// swapping the connect-info type does not silently drop addresses a
     /// future handler or access log needs.
-    #[allow(dead_code)]
     pub local_addr: Option<SocketAddr>,
-    #[allow(dead_code)]
     pub remote_addr: Option<SocketAddr>,
     pub peer_namespace_scope: Option<PeerNamespaceScope>,
 }
@@ -1141,6 +1135,9 @@ fn algorithm_identity_label(algorithm: Algorithm) -> &'static [u8] {
         Algorithm::PS384 => b"PS384",
         Algorithm::PS512 => b"PS512",
         Algorithm::EdDSA => b"EdDSA",
+        // `Algorithm` is non-exhaustive since jsonwebtoken 11. Bundle loading
+        // refuses any other algorithm before an identity is derived.
+        _ => b"unsupported",
     }
 }
 
@@ -1234,7 +1231,6 @@ impl CpDpTrustBundle {
     ///
     /// The document carries no pinned generation here, so every `secret_path` /
     /// `public_key_path` it names must be bound by `material_sha256`.
-    #[allow(dead_code)] // Public library API exercised by the external integration-test crate.
     pub fn from_document_str(
         raw: &str,
         origin: &str,
@@ -1358,12 +1354,24 @@ impl CpDpTrustBundle {
         hasher.finalize()
     }
 
-    /// Every namespace any trusted credential may reach. Startup uses this to
-    /// warn about served namespaces no credential can subscribe to.
-    pub fn bound_namespaces(&self) -> HashSet<&str> {
+    /// Every namespace any trusted credential may reach.
+    fn bound_namespaces(&self) -> HashSet<&str> {
         self.keys
             .values()
             .flat_map(|key| key.namespaces.iter().map(String::as_str))
+            .collect()
+    }
+
+    /// Served namespaces (in input order) that no credential in this bundle
+    /// binds. Startup and every accepted reload warn on a non-empty result:
+    /// data planes in those namespaces cannot subscribe. It is a warning, not
+    /// a refusal, so adding a tenant is not a two-step outage.
+    pub fn unbound_served_namespaces<'a>(&self, served: &'a [String]) -> Vec<&'a str> {
+        let bound = self.bound_namespaces();
+        served
+            .iter()
+            .map(String::as_str)
+            .filter(|namespace| !bound.contains(namespace))
             .collect()
     }
 
@@ -1516,7 +1524,8 @@ impl CpDpVerifier {
                 if secret.is_empty() {
                     return Err(TenantAuthRejectReason::TokenValidation);
                 }
-                let key = DecodingKey::from_secret(secret.as_bytes());
+                let key = DecodingKey::from_secret(secret.as_bytes())
+                    .map_err(|_| TenantAuthRejectReason::TokenValidation)?;
                 let identity = credential_identity(None, Algorithm::HS256, secret.as_bytes());
                 Ok(f(&key, Algorithm::HS256, None, &identity))
             }
@@ -1719,6 +1728,22 @@ impl CpDpVerifierStore {
     }
 }
 
+/// Warn when `bundle` binds no verification credential to some served
+/// namespace. Shared by startup and the reload worker so both say the same
+/// thing about the same condition.
+pub fn warn_unbound_served_namespaces(bundle: &CpDpTrustBundle, served: &[String]) {
+    let unbound = bundle.unbound_served_namespaces(served);
+    if !unbound.is_empty() {
+        tracing::warn!(
+            "CP/DP trust bundle binds no verification credential to {} served namespace(s): \
+             [{}]. Data planes in those namespaces cannot subscribe until a credential is bound \
+             to them.",
+            unbound.len(),
+            crate::startup::sanitize_startup_scalar(unbound.join(", "))
+        );
+    }
+}
+
 /// Watch a file-backed namespace trust bundle and atomically publish valid
 /// replacements. Invalid or unreadable candidates never replace the last
 /// accepted verifier. Semantic fingerprints include resolved referenced key
@@ -1735,7 +1760,7 @@ pub fn spawn_trust_bundle_reload(
     path: String,
     fleet_secret: Option<String>,
     verifier: Arc<CpDpVerifierStore>,
-    multi_namespace: bool,
+    served_namespaces: Option<Vec<String>>,
     interval: std::time::Duration,
     status: Arc<CpDpTrustReloadStatus>,
     shutdown: watch::Receiver<bool>,
@@ -1744,7 +1769,7 @@ pub fn spawn_trust_bundle_reload(
         path,
         fleet_secret,
         verifier,
-        multi_namespace,
+        served_namespaces,
         interval,
         Arc::clone(&status),
         shutdown,
@@ -1764,7 +1789,7 @@ async fn trust_bundle_reload_worker(
     path: String,
     fleet_secret: Option<String>,
     verifier: Arc<CpDpVerifierStore>,
-    multi_namespace: bool,
+    served_namespaces: Option<Vec<String>>,
     interval: std::time::Duration,
     status: Arc<CpDpTrustReloadStatus>,
     mut shutdown: watch::Receiver<bool>,
@@ -1809,17 +1834,23 @@ async fn trust_bundle_reload_worker(
                 continue;
             }
         };
-        if candidate.validate_for_scope(multi_namespace).is_err() {
-            status.record_rejected(TrustReloadFailure::ScopeValidationFailed);
-            continue;
-        }
+        // The reload loader only ever yields a trust bundle, which always
+        // carries namespace binding, so the startup multi-namespace refusal of
+        // the fleet-wide secret (`CpDpVerifier::validate_for_scope`) cannot
+        // apply here; the type rules it out.
+        //
         // The fingerprint never leaves this loop in the clear: it is a change
         // detector, and the only external form is the keyed HMAC identifier
         // published on authenticated health (never logs, metrics, or errors).
         let fingerprint = candidate.configuration_fingerprint();
         let changed = accepted_fingerprint != fingerprint;
         if changed {
-            verifier.replace(candidate);
+            // Same advisory startup gives (issue #7203): a served namespace
+            // no credential binds is a rollout gap, not a refusal.
+            if let Some(served) = served_namespaces.as_deref() {
+                warn_unbound_served_namespaces(&candidate, served);
+            }
+            verifier.replace(CpDpVerifier::TrustBundle(candidate));
             accepted_fingerprint = fingerprint;
             tracing::info!(
                 audit.event = "cp_dp_trust_bundle_reloaded",
@@ -2122,8 +2153,16 @@ impl TrustBundleKeyDocument {
             if fleet_secret.is_some_and(|fleet| !fleet.is_empty() && fleet == secret.as_str()) {
                 return Err(fleet_secret_reuse_error(origin, &kid));
             }
+            // Unreachable for an empty secret (the length floor above), but
+            // jsonwebtoken 12 makes the constructor fallible.
+            let decoding_key = DecodingKey::from_secret(secret.as_bytes()).map_err(|_| {
+                format!(
+                    "CP/DP trust bundle {origin:?}: key {kid:?} symmetric secret is not a \
+                     usable HMAC key"
+                )
+            })?;
             (
-                DecodingKey::from_secret(secret.as_bytes()),
+                decoding_key,
                 credential_identity(Some(&kid), algorithm, secret.as_bytes()),
             )
         } else {
@@ -2161,6 +2200,14 @@ impl TrustBundleKeyDocument {
                         "CP/DP trust bundle {origin:?}: key {kid:?} algorithm/material mismatch"
                     ));
                 }
+                // `Algorithm` is non-exhaustive since jsonwebtoken 11: refuse an
+                // algorithm this loader does not know rather than guess its key type.
+                _ => {
+                    return Err(format!(
+                        "CP/DP trust bundle {origin:?}: key {kid:?} algorithm \"{algorithm:?}\" \
+                         is not supported"
+                    ));
+                }
             };
             let decoding_key = parsed.map_err(|_| {
                 format!(
@@ -2168,6 +2215,29 @@ impl TrustBundleKeyDocument {
                      \"{algorithm:?}\""
                 )
             })?;
+            // The JWT backend verifies RS*/PS* only with 2048-8192-bit RSA
+            // keys. Refuse an out-of-range key here, so a startup load or a
+            // reload fails with the size named (and a reload keeps the
+            // previous verifier) instead of admitting a key every token would
+            // then fail against.
+            if matches!(
+                algorithm,
+                Algorithm::RS256
+                    | Algorithm::RS384
+                    | Algorithm::RS512
+                    | Algorithm::PS256
+                    | Algorithm::PS384
+                    | Algorithm::PS512
+            ) {
+                let der = decoding_key.try_get_as_bytes().map_err(|_| {
+                    format!(
+                        "CP/DP trust bundle {origin:?}: key {kid:?} public key is not valid PEM \
+                         for \"{algorithm:?}\""
+                    )
+                })?;
+                crate::fips::keys::check_jwt_rsa_verification_pkcs1_der(der, "RSA public key")
+                    .map_err(|e| format!("CP/DP trust bundle {origin:?}: key {kid:?}: {e}"))?;
+            }
             let identity_material = canonical_public_key_identity_material(bytes);
             let identity = credential_identity(Some(&kid), algorithm, &identity_material);
             (decoding_key, identity)

@@ -5,8 +5,8 @@
 //! alone are half of that, so they are split alphabetically by test-file
 //! name (`a`–`j` in `unit_plugins_a_tests`, `k`–`z` in
 //! `unit_plugins_b_tests`) and compiled in parallel by the Unit Tests matrix.
-//! Shared helper modules the other half depends on are declared here too;
-//! the few helper modules that also carry tests run in both halves.
+//! Test-free helper modules shared with the other half are declared here too;
+//! no test file runs in both halves.
 //!
 //! Run with: cargo test --test unit_plugins_a_tests [filter]
 
@@ -36,12 +36,15 @@ mod unit {
         mod ai_token_metrics_tests;
         mod ai_tool_governor_tests;
         mod ai_transcript_audit_tests;
+        mod ai_translation_parity_tests;
         mod ai_usage_stream_tests;
         mod ambient_cloud_credentials_tests;
         mod api_chargeback_sink_tests;
         mod api_chargeback_tests;
+        mod auth_challenge_tests;
         mod auth_flow_credential_deadline_tests;
         mod authenticated_identity_bounds_tests;
+        mod aws_refreshing_credentials_tests;
         mod basic_auth_tests;
         mod batching_logger_tests;
         mod body_transform_tests;
@@ -71,10 +74,13 @@ mod unit {
         mod http_batch_response_drain_tests;
         mod http_logging_tests;
         mod ip_restriction_tests;
+        mod jwks_auth_algorithm_tests;
         mod jwks_auth_custom_token_location_tests;
         mod jwks_auth_inline_keys_tests;
+        mod jwks_auth_managed_source_tests;
         mod jwks_auth_multi_audience_tests;
         mod jwks_auth_output_claim_header_tests;
+        mod jwks_auth_provider_bound_tests;
         #[allow(dead_code, unused_imports)] // consumed by the k–z half
         mod jwks_auth_support;
         mod jwks_auth_tests;

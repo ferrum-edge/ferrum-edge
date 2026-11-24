@@ -77,6 +77,27 @@ fn headers(content_type: &str) -> HashMap<String, String> {
     HashMap::from([("content-type".into(), content_type.into())])
 }
 
+/// The final client-visible body decision as the proxy makes it: a plugin that
+/// enforces the authoritative phase decides there, every other plugin through
+/// the legacy `on_final_response_body` hook.
+async fn final_body_decision(
+    plugin: &dyn Plugin,
+    ctx: &mut RequestContext,
+    status: u16,
+    response_headers: &HashMap<String, String>,
+    body: &[u8],
+) -> PluginResult {
+    if plugin.enforces_final_client_visible_response_body(ctx) {
+        plugin
+            .finalize_client_visible_response_body(ctx, status, response_headers, body)
+            .await
+    } else {
+        plugin
+            .on_final_response_body(ctx, status, response_headers, body)
+            .await
+    }
+}
+
 async fn assert_no_content_matrix(plugin: &dyn Plugin) {
     for method in ["HEAD", "GET"] {
         for status in [100, 101, 103, 199, 200, 204, 205, 304] {
@@ -122,9 +143,7 @@ async fn assert_no_content_matrix(plugin: &dyn Plugin) {
                 );
                 assert!(
                     matches!(
-                        plugin
-                            .on_final_response_body(&mut ctx, status, &response_headers, b"")
-                            .await,
+                        final_body_decision(plugin, &mut ctx, status, &response_headers, b"").await,
                         PluginResult::Continue
                     ),
                     "{} rejected the empty final body",
@@ -195,9 +214,7 @@ async fn body_bearing_responses_still_enforce_final_body_policy() {
             b"forbidden".to_vec()
         };
         assert!(matches!(
-            plugin
-                .on_final_response_body(&mut ctx, 200, &response_headers, &body)
-                .await,
+            final_body_decision(plugin.as_ref(), &mut ctx, 200, &response_headers, &body).await,
             PluginResult::Reject { .. }
         ));
     }
@@ -226,8 +243,7 @@ async fn composed_policies_preserve_no_content_status_and_header_hooks() {
         );
         for plugin in &plugins {
             assert!(matches!(
-                plugin
-                    .on_final_response_body(&mut ctx, status, &response_headers, b"")
+                final_body_decision(plugin.as_ref(), &mut ctx, status, &response_headers, b"")
                     .await,
                 PluginResult::Continue
             ));

@@ -19,7 +19,7 @@ use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
@@ -27,7 +27,7 @@ use url::Url;
 
 use crate::config::types::{BackendScheme, BackendTlsConfig, Consumer};
 use crate::plugins::utils::auth_flow::ExternalIdentityRealm;
-use crate::plugins::utils::mcp_jsonrpc;
+use crate::plugins::utils::{mcp_jsonrpc, redacted_endpoint_url_str};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::mcp_aggregate_sse::{
@@ -86,10 +86,12 @@ const MCP_BATCH_NOTIFICATION_FAILED: i64 = -32011;
 /// JSON-RPC application error: a `tools/call` result failed declared
 /// `outputSchema` validation (or could not be decoded for validation).
 const MCP_INVALID_TOOL_RESULT: i64 = -32012;
-/// JSON-RPC application error: `initialize` could not admit the paired
-/// aggregate SSE broker session, so the minted MCP session would have been
-/// usable for POST JSON but never able to attach its event stream. Admission
-/// fails closed instead of returning a half-working session.
+/// JSON-RPC application error: `initialize` could not admit a new MCP
+/// session — the session store is at `sessions.max_sessions`, or (with
+/// `sse_multiplexing`) the paired aggregate SSE broker session could not be
+/// admitted, so the minted session would have been usable for POST JSON but
+/// never able to attach its event stream. Admission fails closed instead of
+/// returning a half-working session.
 const MCP_SSE_SESSION_UNAVAILABLE: i64 = -32013;
 /// JSON-RPC application error: the final backend-visible request no longer
 /// matches what the aggregate router admitted (method, selected upstream,
@@ -130,7 +132,6 @@ const MCP_DISCOVERY_KEYS: &[&str] = &[
     "aggregate_resources",
     "aggregate_tools",
     "cache_ttl_seconds",
-    "hide_denied_items",
     "namespace_separator",
     "on_new_tool",
     "on_schema_change",
@@ -162,8 +163,18 @@ const MCP_CAPABILITIES_KEYS: &[&str] = &[
     "advertise_tools",
     "passthrough_unknown_methods",
 ];
-const MCP_POLICY_KEYS: &[&str] = &["default_action", "hide_denied_tools", "tools"];
+const MCP_POLICY_KEYS: &[&str] = &[
+    "default_action",
+    "default_prompt_action",
+    "default_resource_action",
+    "hide_denied_tools",
+    "prompts",
+    "resources",
+    "tools",
+];
 const MCP_POLICY_TOOL_KEYS: &[&str] = &["action", "allowed_groups", "denied_groups"];
+/// Closed key set of one `policy.prompts.*` / `policy.resources.*` entry.
+const MCP_POLICY_ITEM_KEYS: &[&str] = &["action"];
 const MCP_VALIDATION_KEYS: &[&str] = &[
     "max_batch_bytes",
     "max_batch_item_bytes",
@@ -175,6 +186,19 @@ const MCP_VALIDATION_KEYS: &[&str] = &[
     "validate_tool_arguments",
     "validate_tool_results",
 ];
+/// Largest `mcp.arguments` value `observability.log_raw_arguments` copies into
+/// request metadata. Longer serialized arguments are cut at a UTF-8 boundary
+/// and flagged with `mcp.arguments_truncated`, so one call cannot put an
+/// arbitrarily large value into every transaction log line.
+const MAX_LOGGED_RAW_ARGUMENTS_BYTES: usize = 4096;
+/// Largest client-supplied identifier copied verbatim into log-allowlisted
+/// request metadata: `mcp.method`, `mcp.protocol_version`,
+/// `mcp.public_tool_name` / `mcp.item_name` (written before the catalog
+/// lookup), and `mcp.resource_uri` / `mcp.upstream_resource_uri`. A longer value
+/// is recorded by [`bounded_metadata_identifier`] as its prefix plus the
+/// SHA-256 of the whole value, so one request cannot write a multiple of its
+/// body size into every log sink (`GHSA-f5px-j9pq-7cxm`).
+const MAX_LOGGED_IDENTIFIER_BYTES: usize = 1024;
 const MCP_OBSERVABILITY_KEYS: &[&str] =
     &["emit_metadata", "log_argument_hash", "log_raw_arguments"];
 const MCP_SERVER_KEYS: &[&str] = &[
@@ -182,11 +206,33 @@ const MCP_SERVER_KEYS: &[&str] = &[
     "expose_prompts",
     "expose_resources",
     "expose_tools",
+    "forward_client_credentials",
+    "headers",
     "initialize_strategy",
     "namespace",
     "openapi",
     "upstream_url",
 ];
+/// Most `servers.*.headers` entries one server may configure.
+const MAX_MCP_SERVER_HEADERS: usize = 32;
+/// Request headers the gateway owns on every upstream MCP request, so a
+/// `servers.*.headers` entry may not set them: framing, content negotiation,
+/// the MCP protocol version, stream resumption, and the gateway hop count.
+/// Hop-by-hop, proxy-regenerated forwarding, gateway-assertion, and the
+/// configured session header names are refused alongside these.
+const MCP_SERVER_HEADER_RESERVED: &[&str] = &[
+    "accept",
+    "content-type",
+    "forwarded",
+    "host",
+    "last-event-id",
+    "mcp-protocol-version",
+    crate::proxy::hop_limit::PROXY_HOPS_HEADER,
+];
+/// Client credential headers an aggregate-routed request does NOT carry to the
+/// tool-selected upstream unless `servers.*.forward_client_credentials` is set.
+/// The route's configured credential-header registry is stripped alongside.
+const MCP_CLIENT_CREDENTIAL_HEADERS: &[&str] = &["authorization", "cookie", "proxy-authorization"];
 const MCP_STDIO_TRANSPORT_KEYS: &[&str] = &["args", "command", "stdio"];
 /// Maximum recursion depth admitted for the *schema* walk that resolves local
 /// `$ref` / `$dynamicRef` targets.
@@ -269,7 +315,6 @@ impl McpGatewayMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitializeStrategy {
     Lazy,
-    Startup,
     Passthrough,
 }
 
@@ -277,10 +322,9 @@ impl InitializeStrategy {
     fn parse(value: &str, field: &str) -> Result<Self, String> {
         match value {
             "lazy" => Ok(Self::Lazy),
-            "startup" => Ok(Self::Startup),
             "passthrough" => Ok(Self::Passthrough),
             other => Err(format!(
-                "mcp_gateway: `{field}` must be `lazy`, `startup`, or `passthrough`, got {other:?}"
+                "mcp_gateway: `{field}` must be `lazy` or `passthrough`, got {other:?}"
             )),
         }
     }
@@ -332,7 +376,7 @@ enum DiscoveryBehavior {
 impl DiscoveryBehavior {
     fn parse(value: &str, field: &str) -> Result<Self, String> {
         match value {
-            "allow" | "allow_immediately" | "expose" => Ok(Self::Allow),
+            "allow" => Ok(Self::Allow),
             "hide_until_configured" => Ok(Self::HideUntilConfigured),
             other => Err(format!(
                 "mcp_gateway: `{field}` must be `allow` or `hide_until_configured`, got {other:?}"
@@ -355,7 +399,6 @@ struct McpDiscoveryConfig {
     aggregate_prompts: bool,
     namespace_separator: String,
     cache_ttl: Duration,
-    hide_denied_items: bool,
     on_new_tool: DiscoveryBehavior,
     on_schema_change: DiscoveryBehavior,
 }
@@ -405,6 +448,29 @@ struct McpPolicy {
     default_action: PolicyAction,
     hide_denied_tools: bool,
     tools: HashMap<String, McpToolPolicy>,
+    /// Fallback action for a prompt with no `policy.prompts` entry
+    /// (`policy.default_prompt_action`, else `policy.default_action`).
+    default_prompt_action: PolicyAction,
+    /// Fallback action for a resource or resource template with no
+    /// `policy.resources` entry (`policy.default_resource_action`, else
+    /// `policy.default_action`).
+    default_resource_action: PolicyAction,
+    /// Public namespaced prompt name to its action (`allow` / `deny`).
+    prompts: HashMap<String, PolicyAction>,
+    /// Public `mcp://` resource URI, or public resource-template URI, to its
+    /// action (`allow` / `deny`).
+    resources: HashMap<String, PolicyAction>,
+    /// Every configured exact-resource deny (`policy.resources` key without a
+    /// `{...}` expression, in `mcp://{server_id}/...` form) decoded to its
+    /// `(server_id, upstream URI)` identity at load. Reads and lists compare
+    /// it directly against the resolved upstream URI, so a deny never depends
+    /// on that resource having been discovered in this session.
+    exact_resource_denies: HashSet<(String, String)>,
+    /// Every configured resource-template deny (`policy.resources` key with a
+    /// `{...}` expression) compiled at load to `(server_id, upstream URI
+    /// template matcher)`, the same matcher discovered templates use. Like
+    /// exact denies, it decides without the session's template catalog.
+    template_resource_denies: Vec<(String, Arc<Regex>)>,
     /// Every ACL group name referenced by a `policy.tools.*.allowed_groups` or
     /// `denied_groups` list, interned at config load to its bit position in an
     /// [`McpGroupSet`]. Empty when no tool entry carries a group condition, in
@@ -418,6 +484,37 @@ impl McpPolicy {
             .get(public_name)
             .map(|tool| tool.action)
             .unwrap_or(self.default_action)
+    }
+
+    /// The action for one public namespaced prompt name.
+    fn action_for_prompt(&self, public_name: &str) -> PolicyAction {
+        self.prompts
+            .get(public_name)
+            .copied()
+            .unwrap_or(self.default_prompt_action)
+    }
+
+    /// The action for one public resource URI or public resource-template URI.
+    fn action_for_resource(&self, public_key: &str) -> PolicyAction {
+        self.resources
+            .get(public_key)
+            .copied()
+            .unwrap_or(self.default_resource_action)
+    }
+
+    /// Whether a configured exact or template deny covers this upstream
+    /// resource of `server_id`, decided from configuration alone.
+    fn configured_resource_deny(&self, server_id: &str, upstream_uri: &str) -> bool {
+        (!self.exact_resource_denies.is_empty()
+            && self
+                .exact_resource_denies
+                .contains(&(server_id.to_string(), upstream_uri.to_string())))
+            || self
+                .template_resource_denies
+                .iter()
+                .any(|(deny_server, matcher)| {
+                    deny_server == server_id && matcher.is_match(upstream_uri)
+                })
     }
 
     /// Whether any tool entry carries a per-consumer group condition.
@@ -616,6 +713,71 @@ struct McpServerConfig {
     expose_resources: bool,
     expose_prompts: bool,
     initialize_strategy: InitializeStrategy,
+    /// Operator-configured upstream request headers (`servers.*.headers`),
+    /// sent on every gateway-originated request to this server and on every
+    /// routed call to it.
+    headers: McpUpstreamHeaders,
+    /// `servers.*.forward_client_credentials`: whether an aggregate-routed
+    /// call keeps the client's `Authorization` / `Cookie` /
+    /// `Proxy-Authorization` and route credential headers. Off by default.
+    forward_client_credentials: bool,
+}
+
+/// Resolved `servers.*.headers`: lowercase name and final value pairs.
+///
+/// Values may come from `${FERRUM_PLUGIN_SECRET_<NAME>}` references, so the
+/// `Debug` form lists names only and never a value.
+#[derive(Clone)]
+struct McpUpstreamHeaders(Arc<[(String, String)]>);
+
+impl std::fmt::Debug for McpUpstreamHeaders {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_list()
+            .entries(self.0.iter().map(|(name, _)| name))
+            .finish()
+    }
+}
+
+impl McpUpstreamHeaders {
+    fn empty() -> Self {
+        Self(Arc::from(Vec::new()))
+    }
+
+    fn names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.0.iter().map(|(name, _)| name.as_str())
+    }
+
+    /// Add every configured header to a gateway-originated upstream request.
+    fn apply_to_request(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for (name, value) in self.0.iter() {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        request
+    }
+
+    /// Replace every spelling of each configured header on a routed call's
+    /// backend header map with the configured value.
+    ///
+    /// Idempotent and allocation-free when the map already carries exactly
+    /// the configured value under the canonical name, because the final
+    /// backend-header policy re-applies it on every pass.
+    fn apply_to_map(&self, headers: &mut HashMap<String, String>) {
+        for (name, value) in self.0.iter() {
+            let intact = {
+                let mut spellings = headers.keys().filter(|key| key.eq_ignore_ascii_case(name));
+                matches!(
+                    (spellings.next(), spellings.next()),
+                    (Some(key), None) if key == name
+                ) && headers.get(name) == Some(value)
+            };
+            if intact {
+                continue;
+            }
+            remove_header(headers, name);
+            headers.insert(name.clone(), value.clone());
+        }
+    }
 }
 
 /// Where a configured server's catalog comes from and where its calls go.
@@ -680,10 +842,6 @@ struct McpEnvelope {
     raw_cancel_id: Option<Box<RawValue>>,
     method: Option<String>,
     params: Option<Value>,
-    #[allow(dead_code)] // Kept in the parsed envelope shape for response classification.
-    result: Option<Value>,
-    #[allow(dead_code)] // Kept in the parsed envelope shape for error-response classification.
-    error: Option<Value>,
     message_kind: McpMessageKind,
 }
 
@@ -743,7 +901,7 @@ fn raw_json_rpc_correlation_ids(body: &[u8]) -> (Option<Box<RawValue>>, Option<B
 /// refusal has no such budget: without this bound a multi-megabyte id would be
 /// mirrored back at request size. An id past the bound is refused with a fixed
 /// `-32600` that does not echo it.
-const MCP_MAX_REFLECTED_ID_BYTES: usize = 4096;
+const MCP_MAX_REFLECTED_ID_BYTES: usize = mcp_jsonrpc::MAX_REFLECTED_ID_BYTES;
 
 /// Keep the original id token while serializing a mediated envelope. This is
 /// deliberately local to MCP; all other JSON values retain their existing
@@ -886,6 +1044,11 @@ struct ToolCatalogEntry {
     // until an operator reconfigures/reloads — including explicitly-configured
     // tools, which the per-refresh schema check would otherwise re-enable.
     hidden_by_schema_change: bool,
+    /// The instance-wide quarantine flag of this tool's schema baseline, read
+    /// live on every list, call, and final admission. `None` until the entry
+    /// survives collision handling and is baselined, or when
+    /// `on_schema_change` is `allow`.
+    schema_quarantine: Option<Arc<AtomicBool>>,
     input_validator: Arc<jsonschema::Validator>,
     /// Compiled `outputSchema` when the tool declared one that passed admission.
     output_validator: Option<Arc<jsonschema::Validator>>,
@@ -893,8 +1056,26 @@ struct ToolCatalogEntry {
     /// catalog read reports it.
     discovered_at: DateTime<Utc>,
     schema_hash: String,
-    #[allow(dead_code)] // Stored for description-only drift detection extensions.
-    description_hash: String,
+}
+
+impl ToolCatalogEntry {
+    /// Whether this tool is quarantined by a schema change: sticky in this
+    /// session's catalog, or set on the instance-wide baseline by any session.
+    fn schema_quarantined(&self) -> bool {
+        self.hidden_by_schema_change
+            || self
+                .schema_quarantine
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
+    /// Hide and disable this entry exactly like a schema-changed tool.
+    fn mark_schema_quarantined(&mut self) {
+        self.hidden_by_schema_change = true;
+        self.hidden_by_discovery = true;
+        self.hidden_from_discovery = true;
+        self.enabled = false;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -917,11 +1098,6 @@ struct PromptCatalogEntry {
     /// Nonstandard upstream-declared `argumentsSchema`, carried through
     /// unchanged for upstreams that publish one alongside `arguments`.
     arguments_schema: Option<Value>,
-    enabled: bool,
-    #[allow(dead_code)] // Stored for drift/operational metadata extensions.
-    discovered_at: DateTime<Utc>,
-    #[allow(dead_code)] // Stored for prompt schema drift metadata extensions.
-    schema_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -933,11 +1109,6 @@ struct ResourceCatalogEntry {
     name: Option<String>,
     description: Option<String>,
     mime_type: Option<String>,
-    enabled: bool,
-    #[allow(dead_code)] // Stored for drift/operational metadata extensions.
-    discovered_at: DateTime<Utc>,
-    #[allow(dead_code)] // Stored for resource drift metadata extensions.
-    uri_hash: String,
 }
 
 #[derive(Clone)]
@@ -951,9 +1122,6 @@ struct ResourceTemplateCatalogEntry {
     mime_type: Option<String>,
     annotations: Option<Value>,
     icons: Option<Value>,
-    enabled: bool,
-    #[allow(dead_code)] // Stored for drift/operational metadata extensions.
-    discovered_at: DateTime<Utc>,
     uri_template_regex: Arc<Regex>,
 }
 
@@ -1030,6 +1198,20 @@ impl McpCatalog {
             None => true,
         }
     }
+}
+
+/// Most servers whose catalog lists one refresh fetches concurrently.
+const MAX_CONCURRENT_SERVER_DISCOVERY: usize = 8;
+
+/// One server's fetched resource-template list for a template refresh pass.
+type ServerTemplateListing<'a> = (&'a McpServerConfig, Result<Vec<Value>, String>);
+
+/// One server's fetched catalog families for a refresh pass; `None` for a
+/// family that was not attempted.
+struct ServerFamilyListings {
+    tools: Option<Result<Vec<ToolCatalogEntry>, String>>,
+    prompts: Option<Result<Vec<Value>, String>>,
+    resources: Option<Result<Vec<Value>, String>>,
 }
 
 /// Per-family success/failure accounting for one catalog refresh pass. A
@@ -1118,6 +1300,24 @@ pub(crate) struct McpAdmissionRecord {
     /// present the final request is a REST call, not a JSON-RPC envelope, and
     /// it is re-checked against this claim instead.
     bridge: Option<Arc<McpBridgeClaim>>,
+    /// Whether the selected MCP upstream must NOT receive the client's
+    /// credentials (`servers.*.forward_client_credentials` off). When set the
+    /// canonical backend query funnel commits an empty query for this
+    /// request, so neither a client query credential nor a later query
+    /// transform reaches the tool-selected upstream.
+    isolate_client_credentials: bool,
+}
+
+impl McpAdmissionRecord {
+    /// The backend-visible query this admission commits, `None` to leave the
+    /// ordinary query funnel in charge (transparent forwarding, an OpenAPI
+    /// bridge call, or a server opted in to client credential forwarding).
+    ///
+    /// The configured `upstream_url` carries no query (admission refuses
+    /// one), so the committed empty query appends nothing to it.
+    pub(crate) fn committed_query(&self) -> Option<&str> {
+        self.isolate_client_credentials.then_some("")
+    }
 }
 
 impl std::fmt::Debug for McpAdmissionRecord {
@@ -1144,7 +1344,7 @@ struct McpAdmittedDestination {
     path: Option<String>,
     path_is_absolute: bool,
     authority: Option<String>,
-    resolved_tls: Option<BackendTlsConfig>,
+    resolved_tls: Option<Arc<BackendTlsConfig>>,
 }
 
 impl McpAdmittedDestination {
@@ -1191,6 +1391,10 @@ struct McpAdmittedTarget {
     /// context at that point. `None` for an ungated tool, a prompt, or a
     /// resource.
     grant: Option<McpToolGrant>,
+    /// The admitted tool's instance-wide schema quarantine flag, re-read in
+    /// the final request-body hook so a quarantine set by another session
+    /// after `before_proxy` still stops the call before egress.
+    schema_quarantine: Option<Arc<AtomicBool>>,
 }
 
 impl McpAdmittedTarget {
@@ -1205,6 +1409,7 @@ impl McpAdmittedTarget {
                 .and_then(|params| params.get("arguments"))
                 .cloned(),
             grant: None,
+            schema_quarantine: None,
         }
     }
 
@@ -1215,11 +1420,17 @@ impl McpAdmittedTarget {
             binds_arguments: false,
             arguments: None,
             grant: None,
+            schema_quarantine: None,
         }
     }
 
     fn with_grant(mut self, grant: Option<McpToolGrant>) -> Self {
         self.grant = grant;
+        self
+    }
+
+    fn with_schema_quarantine(mut self, flag: Option<Arc<AtomicBool>>) -> Self {
+        self.schema_quarantine = flag;
         self
     }
 }
@@ -1314,10 +1525,12 @@ enum McpSessionQuotaKey {
     Anonymous(String),
 }
 
+/// A session's catalog and its refresh lock, projected together so callers can
+/// await without holding the session store's shard guard.
+type SessionCatalogLocks = (Arc<RwLock<McpCatalog>>, Arc<Mutex<()>>);
+
 #[derive(Clone)]
 struct DownstreamMcpSession {
-    #[allow(dead_code)] // Useful in snapshots/debug views; map key is used for lookup.
-    downstream_session_id: String,
     protocol_version: String,
     client_info: Option<Value>,
     client_capabilities: Option<Value>,
@@ -1336,10 +1549,28 @@ struct DownstreamMcpSession {
     last_seen: Instant,
 }
 
+/// Instance-wide schema baseline of one `(server_id, public tool name)`.
+///
+/// Per-session catalogs keep catalog CONTENTS isolated, but a schema-change
+/// quarantine is an operator gate, not session state: it must survive a new
+/// session for any principal, so it lives here, on the plugin instance, and
+/// clears only when the configuration changes (a new instance).
+#[derive(Debug, Clone)]
+struct ToolSchemaBaseline {
+    /// The first schema hash this instance published for the tool, updated to
+    /// the latest observed hash after a change.
+    schema_hash: String,
+    /// Sticky: set when the schema changed under
+    /// `discovery.on_schema_change: hide_until_configured`. Shared with every
+    /// session's catalog entry for the tool (and every call admitted from
+    /// one), so a quarantine detected in one session stops the tool in every
+    /// already-cached session too, including last-good entries carried
+    /// through a degraded refresh.
+    quarantined: Arc<AtomicBool>,
+}
+
 #[derive(Debug, Clone)]
 struct UpstreamMcpSession {
-    #[allow(dead_code)] // Useful in snapshots/debug views; map key is used for lookup.
-    server_id: String,
     upstream_session_id: Option<String>,
     protocol_version: Option<String>,
     initialized: bool,
@@ -1360,6 +1591,11 @@ pub struct McpGateway {
     supported_protocol_versions: Vec<String>,
     discovery: McpDiscoveryConfig,
     sessions: McpSessionConfig,
+    /// Lowercased, deduplicated downstream and upstream session header names.
+    /// Session IDs are bearer-like, so these names join the route's
+    /// credential-header registry (redaction, secondary egress such as
+    /// `request_mirror`), whatever the operator calls them.
+    session_header_names: Vec<String>,
     capabilities: McpCapabilitiesConfig,
     servers: HashMap<String, McpServerConfig>,
     primary_server_id: String,
@@ -1383,6 +1619,20 @@ pub struct McpGateway {
     validation: McpValidationConfig,
     observability: McpObservabilityConfig,
     http_client: PluginHttpClient,
+    /// Schema baseline and quarantine state per `(server_id, public tool
+    /// name)`, shared by every session of this instance (see
+    /// [`ToolSchemaBaseline`]).
+    tool_schema_baselines: DashMap<(String, String), ToolSchemaBaseline>,
+    /// Bound on `tool_schema_baselines`: the number of tools one fully
+    /// authoritative refresh of every configured server can return.
+    max_tool_schema_baselines: usize,
+    /// Background expiry sweep for this instance's sessions, aborted when the
+    /// instance is dropped (reload / update / delete). Started by
+    /// `commit_background_tasks`, never by the constructor: config validation
+    /// constructs and drops instances, so construction must not spawn (issue
+    /// #6616). Stays empty outside a Tokio runtime and for transparent or
+    /// disabled instances.
+    session_reaper: OnceLock<McpSessionReaperGuard>,
     /// Catalog parts of each OpenAPI bridge server's tools, by server id,
     /// built once at load and shared by every session's catalog.
     bridge_tools: HashMap<String, Arc<[ToolDefinitionParts]>>,
@@ -1457,7 +1707,15 @@ impl McpGateway {
             for (section, fields) in [
                 (
                     "policy",
-                    &["default_action", "tools", "hide_denied_tools"][..],
+                    &[
+                        "default_action",
+                        "default_prompt_action",
+                        "default_resource_action",
+                        "tools",
+                        "prompts",
+                        "resources",
+                        "hide_denied_tools",
+                    ][..],
                 ),
                 (
                     "discovery",
@@ -1466,7 +1724,6 @@ impl McpGateway {
                         "aggregate_resources",
                         "aggregate_tools",
                         "cache_ttl_seconds",
-                        "hide_denied_items",
                         "namespace_separator",
                         "on_new_tool",
                         "on_schema_change",
@@ -1484,9 +1741,22 @@ impl McpGateway {
                 }
             }
         }
-        let servers = parse_servers(object, sessions.initialize_upstreams)?;
+        let servers = parse_servers(object, sessions.initialize_upstreams, mode)?;
         if servers.is_empty() {
             return Err("mcp_gateway: `servers` must not be empty".to_string());
+        }
+        // The session headers are gateway-mediated on every upstream request,
+        // so a configured header may not set either of them.
+        for server in servers.values() {
+            if server.headers.names().any(|name| {
+                name.eq_ignore_ascii_case(&sessions.downstream_session_header)
+                    || name.eq_ignore_ascii_case(&sessions.upstream_session_header)
+            }) {
+                return Err(format!(
+                    "mcp_gateway: server {:?} `headers` may not set an MCP session header (`sessions.downstream_session_header` / `sessions.upstream_session_header`)",
+                    server.server_id
+                ));
+            }
         }
         // Screen each upstream's literal-IP URL against the egress policy at
         // config-load: these are dialed through the shared client, but reqwest
@@ -1510,6 +1780,7 @@ impl McpGateway {
         let real_ip_header = http_client.real_ip_header().map(str::to_ascii_lowercase);
         validate_bridge_servers(
             mode,
+            &endpoint_path,
             &servers,
             &sessions,
             &validation,
@@ -1520,15 +1791,6 @@ impl McpGateway {
             &discovery.namespace_separator,
             validation.validate_tool_results,
         );
-        if sessions.initialize_upstreams == InitializeStrategy::Startup
-            || servers
-                .values()
-                .any(|server| server.initialize_strategy == InitializeStrategy::Startup)
-        {
-            warn!(
-                "mcp_gateway startup upstream initialization is treated as lazy in V1 because MCP initialize requires a downstream session"
-            );
-        }
         let mut enabled_server_ids: Vec<String> = servers
             .values()
             .filter(|server| server.enabled)
@@ -1614,6 +1876,33 @@ impl McpGateway {
         // public-URI mapping this plugin writes into response bodies comes from
         // the live per-session `McpCatalog`, not from `config`; see
         // `response_presentation_policy`.
+        let mut session_header_names =
+            vec![sessions.downstream_session_header.to_ascii_lowercase()];
+        let upstream_session_header = sessions.upstream_session_header.to_ascii_lowercase();
+        if !session_header_names.contains(&upstream_session_header) {
+            session_header_names.push(upstream_session_header);
+        }
+        session_header_names.retain(|name| !name.is_empty());
+        // Configured upstream headers usually carry a service credential, so
+        // they join the same credential-header registry (redaction, secondary
+        // egress withholding). A routed call also strips a client-supplied copy
+        // of any of them before the configured value is installed.
+        for server in servers.values() {
+            for name in server.headers.names() {
+                if !session_header_names.iter().any(|known| known == name) {
+                    session_header_names.push(name.to_string());
+                }
+            }
+        }
+        let max_tool_schema_baselines = servers
+            .len()
+            .saturating_mul(validation.max_catalog_items_per_list)
+            .max(1);
+
+        let session_store: Arc<DashMap<String, DownstreamMcpSession>> =
+            Arc::new(DashMap::with_shard_amount(session_shard_amount));
+        let session_catalogs_by_hash: Arc<DashMap<String, Arc<RwLock<McpCatalog>>>> =
+            Arc::new(DashMap::with_shard_amount(session_shard_amount));
         Ok(Self {
             instance_id: MCP_GATEWAY_INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
             enabled,
@@ -1622,17 +1911,21 @@ impl McpGateway {
             supported_protocol_versions,
             discovery,
             sessions,
+            session_header_names,
             capabilities,
             servers,
             primary_server_id,
             session_admission_lock: Arc::new(Mutex::new(())),
-            session_store: Arc::new(DashMap::with_shard_amount(session_shard_amount)),
-            session_catalogs_by_hash: Arc::new(DashMap::with_shard_amount(session_shard_amount)),
+            session_store,
+            session_catalogs_by_hash,
             sse_broker,
             policy,
             validation,
             observability,
             http_client,
+            tool_schema_baselines: DashMap::with_shard_amount(session_shard_amount),
+            max_tool_schema_baselines,
+            session_reaper: OnceLock::new(),
             bridge_tools,
             real_ip_header,
         })
@@ -1650,7 +1943,7 @@ impl McpGateway {
         // Case variants and encoded suffixes are reserved only for rejection,
         // never for endpoint matching. The HTTP frontend already refuses
         // encoded separators; keep direct plugin dispatch fail-closed too.
-        ctx.path.eq_ignore_ascii_case(scope) || endpoint_scope_contains(scope, &ctx.path)
+        endpoint_scope_reserves(scope, &ctx.path)
     }
 
     /// Claim this request for this instance. Called once, from the same
@@ -1752,8 +2045,10 @@ impl McpGateway {
         ctx.metadata
             .insert("mcp.jsonrpc".to_string(), envelope.jsonrpc.clone());
         if let Some(method) = envelope.method.as_deref() {
-            ctx.metadata
-                .insert("mcp.method".to_string(), method.to_string());
+            ctx.metadata.insert(
+                "mcp.method".to_string(),
+                bounded_metadata_identifier(method),
+            );
         }
     }
 
@@ -1774,9 +2069,13 @@ impl McpGateway {
                         .map(ToOwned::to_owned)
                 })
             });
-        if let Some(version) = version.as_deref() {
-            ctx.metadata
-                .insert("mcp.protocol_version".to_string(), version.to_string());
+        if self.observability.emit_metadata
+            && let Some(version) = version.as_deref()
+        {
+            ctx.metadata.insert(
+                "mcp.protocol_version".to_string(),
+                bounded_metadata_identifier(version),
+            );
         }
         version
     }
@@ -1804,8 +2103,7 @@ impl McpGateway {
         {
             return None;
         }
-        ctx.metadata
-            .insert("mcp.route_decision".to_string(), "deny".to_string());
+        self.note_route_decision(ctx, "deny");
         Some(json_response(
             400,
             json!({
@@ -1828,13 +2126,12 @@ impl McpGateway {
     }
 
     fn upstream_session_id(&self, downstream_id: &str, server_id: &str) -> Option<String> {
-        self.downstream_session_clone(downstream_id)
-            .and_then(|session| {
-                session
-                    .upstream_sessions
-                    .get(server_id)
-                    .and_then(|upstream| upstream.upstream_session_id.clone())
-            })
+        self.session_store.get(downstream_id).and_then(|session| {
+            session
+                .upstream_sessions
+                .get(server_id)
+                .and_then(|upstream| upstream.upstream_session_id.clone())
+        })
     }
 
     fn set_route_to_server(
@@ -1854,11 +2151,23 @@ impl McpGateway {
         ctx.route_override_backend_scheme = Some(target.scheme);
         ctx.route_override_backend_host = Some(target.host.clone());
         ctx.route_override_backend_port = Some(target.port);
-        ctx.route_override_resolved_tls = Some(BackendTlsConfig::default_verify());
+        ctx.route_override_resolved_tls = Some(Arc::clone(&DEFAULT_UPSTREAM_TLS));
         ctx.route_override_path = Some(target.path.clone());
         ctx.route_override_path_is_absolute = true;
         ctx.route_override_authority = Some(target.authority.clone());
         headers.insert("host".to_string(), target.authority.clone());
+        if self.mode == McpGatewayMode::AggregateRouter && !server.forward_client_credentials {
+            // The CLIENT chose this upstream by naming a tool, prompt, or
+            // resource, so its credentials for Ferrum (or for another upstream)
+            // must not follow it there (MCP "token passthrough"). Strip the
+            // standard client credential headers and every name in the route's
+            // credential-header registry; a deployment that deliberately
+            // propagates end-user tokens to a same-trust upstream opts in per
+            // server. Configured `servers.*.headers` are installed below either
+            // way.
+            strip_client_credential_headers(ctx, headers);
+        }
+        server.headers.apply_to_map(headers);
         if self.mode == McpGatewayMode::AggregateRouter {
             // Session headers and the protocol version are gateway-owned in aggregate
             // mode. Strip any client-supplied session value — the synthetic downstream
@@ -1927,6 +2236,10 @@ impl McpGateway {
             upstream_session_drift: AtomicBool::new(false),
             target,
             bridge: None,
+            isolate_client_credentials: self
+                .servers
+                .get(server_id)
+                .is_none_or(|server| !server.forward_client_credentials),
         }));
     }
 
@@ -1983,6 +2296,25 @@ impl McpGateway {
                     return json_rpc_error(envelope.id.clone(), -32602, error.message(), None);
                 }
             };
+        // Admission already refuses an operation template that can spell a
+        // path inside the endpoint scope; re-check the substituted path so a
+        // bridged call can never reach a backend path that a direct client of
+        // this route is refused (defense in depth, #7406).
+        if endpoint_scope_reserves(
+            self.endpoint_path.trim_end_matches('/'),
+            &request.public_path,
+        ) {
+            if self.observability.emit_metadata {
+                ctx.metadata
+                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+            }
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32602,
+                "OpenAPI bridge path arguments resolve inside the MCP endpoint scope",
+                None,
+            );
+        }
         let Some(backend_path) = bridge_backend_path(ctx, &request.public_path) else {
             if self.observability.emit_metadata {
                 ctx.metadata
@@ -2139,6 +2471,7 @@ impl McpGateway {
                 McpAdmittedTarget::without_arguments("name", upstream_name).with_grant(grant),
             ),
             bridge: Some(claim),
+            isolate_client_credentials: false,
         }));
     }
 
@@ -2531,9 +2864,25 @@ impl McpGateway {
             .map(|session| session.clone())
     }
 
+    /// The session's catalog and its refresh lock, cloned as two `Arc`s under
+    /// the shard guard so callers can await without deep-cloning the session.
+    fn session_catalog_locks(&self, downstream_session_id: &str) -> Option<SessionCatalogLocks> {
+        self.session_store
+            .get(downstream_session_id)
+            .map(|session| {
+                (
+                    Arc::clone(&session.catalog),
+                    Arc::clone(&session.catalog_refresh_lock),
+                )
+            })
+    }
+
     fn catalog_for_session(&self, downstream_session_id: &str) -> Option<Arc<RwLock<McpCatalog>>> {
-        self.downstream_session_clone(downstream_session_id)
-            .map(|session| session.catalog)
+        // Project the one field under the shard guard instead of deep-cloning
+        // the whole session (upstream-session map, client info) per call.
+        self.session_store
+            .get(downstream_session_id)
+            .map(|session| Arc::clone(&session.catalog))
     }
 
     async fn require_live_downstream_session(
@@ -2634,7 +2983,6 @@ impl McpGateway {
                         (
                             server.server_id.clone(),
                             UpstreamMcpSession {
-                                server_id: server.server_id.clone(),
                                 upstream_session_id: None,
                                 protocol_version: None,
                                 initialized: false,
@@ -2647,7 +2995,6 @@ impl McpGateway {
                 self.session_store.insert(
                     downstream_session_id.clone(),
                     DownstreamMcpSession {
-                        downstream_session_id: downstream_session_id.clone(),
                         protocol_version,
                         client_info,
                         client_capabilities,
@@ -2712,7 +3059,8 @@ impl McpGateway {
         // here, so concurrent first-touch of different sessions/servers proceeds
         // in parallel and a slow upstream does not block unrelated initializes.
         let init_lock = self
-            .downstream_session_clone(downstream_session_id)
+            .session_store
+            .get(downstream_session_id)
             .and_then(|session| {
                 session
                     .upstream_sessions
@@ -2721,15 +3069,16 @@ impl McpGateway {
             })
             .ok_or_else(|| "downstream MCP session is not initialized".to_string())?;
         let _guard = init_lock.lock().await;
-        if let Some(upstream_session_id) = self
-            .downstream_session_clone(downstream_session_id)
-            .and_then(|session| {
-                session
-                    .upstream_sessions
-                    .get(server_id)
-                    .filter(|upstream| upstream.initialized)
-                    .map(|upstream| upstream.upstream_session_id.clone())
-            })
+        if let Some(upstream_session_id) =
+            self.session_store
+                .get(downstream_session_id)
+                .and_then(|session| {
+                    session
+                        .upstream_sessions
+                        .get(server_id)
+                        .filter(|upstream| upstream.initialized)
+                        .map(|upstream| upstream.upstream_session_id.clone())
+                })
         {
             return Ok(upstream_session_id);
         }
@@ -2762,13 +3111,19 @@ impl McpGateway {
                 self.protocol_version_for_session(downstream_session_id),
             )
             .json(&body);
+        let request = server.headers.apply_to_request(request);
         // Every upstream MCP call carries the request's gateway hop count, so
         // an upstream that resolves back to the gateway is refused at the proxy
         // hop limit like a looping route (issue #6128).
         let request = stamp_upstream_proxy_hops(request, ctx);
         let response = self
             .http_client
-            .execute_tracked(request, "mcp_gateway.initialize", &ctx.plugin_http_call_ns)
+            .execute_redacted_tracked(
+                request,
+                "mcp_gateway.initialize",
+                &redacted_endpoint_url_str(upstream_url),
+                &ctx.plugin_http_call_ns,
+            )
             .await
             .map_err(|error| {
                 warn!(
@@ -2796,6 +3151,26 @@ impl McpGateway {
             .get(&self.sessions.upstream_session_header)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
+        // From the moment the upstream has minted a session id, this call owns
+        // it until it is committed to the downstream session. Every early
+        // error return below (body, JSON-RPC error, protocol version, a failed
+        // `notifications/initialized`) and a cancellation of this future drop
+        // the guard, which hands the id to independent best-effort cleanup;
+        // only a successful commit disarms it.
+        let mut pending_upstream =
+            PendingUpstreamSession::new(upstream_session_id.as_deref().map(|upstream_id| {
+                PendingUpstreamCleanup {
+                    http_client: self.http_client.clone(),
+                    server: server.clone(),
+                    upstream_session_header: self.sessions.upstream_session_header.clone(),
+                    teardown: UpstreamSessionTeardown {
+                        server_id: server.server_id.clone(),
+                        upstream_session_id: upstream_id.to_string(),
+                        protocol_version: session.protocol_version.clone(),
+                    },
+                    hops: crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+                }
+            }));
         let response_body = upstream_response_json(
             response,
             &server.server_id,
@@ -2848,6 +3223,7 @@ impl McpGateway {
             ));
         }
 
+        pending_upstream.set_protocol_version(&negotiated_protocol_version);
         self.send_upstream_initialized_notification(
             ctx,
             server,
@@ -2856,14 +3232,35 @@ impl McpGateway {
         )
         .await?;
 
-        if let Some(mut session) = self.session_store.get_mut(downstream_session_id) {
-            session.last_seen = Instant::now();
-            if let Some(upstream) = session.upstream_sessions.get_mut(server_id) {
-                upstream.initialized = true;
-                upstream.upstream_session_id = upstream_session_id.clone();
-                upstream.protocol_version = Some(negotiated_protocol_version);
+        // Commit under the session's shard lock. Expiry (request path or the
+        // background reaper), `DELETE`, and cap eviction remove the session
+        // under the same lock, so exactly one side owns the new upstream
+        // session: either the commit lands first and the removal tears it down,
+        // or the removal won and this initialize — whose result arrived after
+        // its downstream owner was gone — deletes it here instead of orphaning
+        // it upstream.
+        let committed = match self.session_store.get_mut(downstream_session_id) {
+            Some(mut session) => {
+                session.last_seen = Instant::now();
+                match session.upstream_sessions.get_mut(server_id) {
+                    Some(upstream) => {
+                        upstream.initialized = true;
+                        upstream.upstream_session_id = upstream_session_id.clone();
+                        upstream.protocol_version = Some(negotiated_protocol_version);
+                        true
+                    }
+                    None => false,
+                }
             }
+            None => false,
+        };
+        if !committed {
+            pending_upstream
+                .clean_up_now(&ctx.plugin_http_call_ns)
+                .await;
+            return Err("downstream MCP session ended during upstream initialization".to_string());
         }
+        pending_upstream.disarm();
         Ok(upstream_session_id)
     }
 
@@ -2895,12 +3292,14 @@ impl McpGateway {
         if let Some(session_id) = upstream_session_id {
             request = request.header(&self.sessions.upstream_session_header, session_id);
         }
+        request = server.headers.apply_to_request(request);
         request = stamp_upstream_proxy_hops(request, ctx);
         let response = self
             .http_client
-            .execute_tracked(
+            .execute_redacted_tracked(
                 request.json(&body),
                 "mcp_gateway.initialized_notification",
+                &redacted_endpoint_url_str(upstream_url),
                 &ctx.plugin_http_call_ns,
             )
             .await
@@ -2938,7 +3337,8 @@ impl McpGateway {
     }
 
     fn protocol_version_for_session(&self, downstream_session_id: &str) -> String {
-        self.downstream_session_clone(downstream_session_id)
+        self.session_store
+            .get(downstream_session_id)
             .map(|session| session.protocol_version.clone())
             .unwrap_or_else(|| self.preferred_protocol_version().to_string())
     }
@@ -2948,13 +3348,14 @@ impl McpGateway {
         downstream_session_id: &str,
         server_id: &str,
     ) -> String {
-        self.downstream_session_clone(downstream_session_id)
+        self.session_store
+            .get(downstream_session_id)
             .and_then(|session| {
                 session
                     .upstream_sessions
                     .get(server_id)
                     .and_then(|upstream| upstream.protocol_version.clone())
-                    .or(Some(session.protocol_version))
+                    .or_else(|| Some(session.protocol_version.clone()))
             })
             .unwrap_or_else(|| self.preferred_protocol_version().to_string())
     }
@@ -2982,59 +3383,15 @@ impl McpGateway {
     /// Issue the upstream `DELETE` for each initialized upstream session of an
     /// already-removed downstream session. Failures are logged, not fatal.
     async fn delete_upstream_sessions(&self, session: DownstreamMcpSession, ctx: &RequestContext) {
-        let Ok(client) = self.http_client.get() else {
-            return;
-        };
-        for (server_id, upstream) in session.upstream_sessions {
-            let Some(upstream_session_id) = upstream.upstream_session_id.clone() else {
-                continue;
-            };
-            if !upstream.initialized {
-                continue;
-            }
-            let Some(server) = self.servers.get(&server_id) else {
-                continue;
-            };
-            let Some((upstream_url, _)) = server.upstream() else {
-                continue;
-            };
-            let request = client
-                .delete(upstream_url)
-                .header(&self.sessions.upstream_session_header, upstream_session_id)
-                .header(
-                    "mcp-protocol-version",
-                    upstream
-                        .protocol_version
-                        .as_deref()
-                        .unwrap_or(session.protocol_version.as_str()),
-                );
-            let request = stamp_upstream_proxy_hops(request, ctx);
-            match self
-                .http_client
-                .execute_tracked(
-                    request,
-                    "mcp_gateway.session_delete",
-                    &ctx.plugin_http_call_ns,
-                )
-                .await
-            {
-                Ok(response) if response.status().is_success() => {}
-                Ok(response) => {
-                    warn!(
-                        server_id = %server.server_id,
-                        status = %response.status(),
-                        "MCP upstream session delete returned non-success status"
-                    );
-                }
-                Err(error) => {
-                    warn!(
-                        server_id = %server.server_id,
-                        error = %error,
-                        "MCP upstream session delete failed"
-                    );
-                }
-            }
-        }
+        delete_upstream_session_set(
+            &self.http_client,
+            &self.servers,
+            &self.sessions.upstream_session_header,
+            session,
+            crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+            &ctx.plugin_http_call_ns,
+        )
+        .await;
     }
 
     async fn remove_downstream_session(
@@ -3045,36 +3402,70 @@ impl McpGateway {
         let Some(session) = self.take_downstream_session(downstream_session_id) else {
             return false;
         };
-        self.delete_upstream_sessions(session, ctx).await;
+        // One session's request-path teardown (client `DELETE`, expiry on
+        // touch): its upstreams are torn down concurrently and bounded. The
+        // multi-session `initialize` eviction path keeps the sequential
+        // per-session teardown above.
+        delete_one_session_upstreams_concurrently(
+            &self.http_client,
+            &self.servers,
+            &self.sessions.upstream_session_header,
+            session,
+            crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+            &ctx.plugin_http_call_ns,
+        )
+        .await;
         true
     }
 
-    /// Write one fixed-key `mcp.*` metadata entry.
-    fn note_metadata(ctx: &mut RequestContext, key: &str, value: &str) {
-        ctx.metadata.insert(key.to_string(), value.to_string());
+    /// Write one descriptive `mcp.*` metadata entry when
+    /// `observability.emit_metadata` is on.
+    ///
+    /// Every descriptive key goes through here or an explicit
+    /// `emit_metadata` check. The exceptions are documented: the
+    /// `mcp.bridge.*` outcome keys (the client sees a `200` either way), the
+    /// argument keys governed by their own `observability.log_*` knobs, and the
+    /// internal rewrite-coordination keys other phases read.
+    fn note_metadata(&self, ctx: &mut RequestContext, key: &str, value: &str) {
+        if self.observability.emit_metadata {
+            ctx.metadata.insert(key.to_string(), value.to_string());
+        }
+    }
+
+    /// Record the hashed downstream session id (`mcp.session.downstream`),
+    /// hashing only when metadata is emitted.
+    fn note_downstream_session(&self, ctx: &mut RequestContext, session_id: &str) {
+        if self.observability.emit_metadata {
+            ctx.metadata
+                .insert("mcp.session.downstream".to_string(), hash_str(session_id));
+        }
     }
 
     /// Record a fixed SSE reason token.
     ///
     /// The token comes from the error VARIANT, so no session id, JSON-RPC id,
     /// header value, or event payload can reach transaction metadata or a log.
-    fn note_sse_error(ctx: &mut RequestContext, error: AggregateSseError) {
-        Self::note_metadata(ctx, "mcp.sse.error", error.reason_token());
+    fn note_sse_error(&self, ctx: &mut RequestContext, error: AggregateSseError) {
+        self.note_metadata(ctx, "mcp.sse.error", error.reason_token());
     }
 
-    fn note_sse_cancel(ctx: &mut RequestContext, reason: &str) {
-        Self::note_metadata(ctx, "mcp.sse.cancel", reason);
+    fn note_sse_cancel(&self, ctx: &mut RequestContext, reason: &str) {
+        self.note_metadata(ctx, "mcp.sse.cancel", reason);
     }
 
-    fn note_route_decision(ctx: &mut RequestContext, decision: &str) {
-        Self::note_metadata(ctx, "mcp.route_decision", decision);
+    fn note_route_decision(&self, ctx: &mut RequestContext, decision: &str) {
+        self.note_metadata(ctx, "mcp.route_decision", decision);
     }
 
     /// Fail-closed SSE rejection: fixed status, fixed reason, fixed metadata
     /// token. No client-controlled value reaches any of the three.
-    fn sse_error_response(ctx: &mut RequestContext, error: AggregateSseError) -> PluginResult {
-        Self::note_route_decision(ctx, "deny");
-        Self::note_sse_error(ctx, error);
+    fn sse_error_response(
+        &self,
+        ctx: &mut RequestContext,
+        error: AggregateSseError,
+    ) -> PluginResult {
+        self.note_route_decision(ctx, "deny");
+        self.note_sse_error(ctx, error);
         let body = json!({"error": error.as_static_reason()});
         json_response(error.http_status(), body, None)
     }
@@ -3095,26 +3486,26 @@ impl McpGateway {
         headers: &HashMap<String, String>,
     ) -> PluginResult {
         if !self.sessions.sse_multiplexing {
-            Self::note_route_decision(ctx, "deny");
+            self.note_route_decision(ctx, "deny");
             let body = json!({"error": "aggregate MCP SSE multiplexing is disabled"});
             return json_response(405, body, None);
         }
         if !super::mcp_aggregate_sse::headers_request_aggregate_sse(headers) {
-            return Self::sse_error_response(ctx, AggregateSseError::InvalidAccept);
+            return self.sse_error_response(ctx, AggregateSseError::InvalidAccept);
         }
         let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
-            return Self::sse_error_response(ctx, AggregateSseError::MissingSession);
+            return self.sse_error_response(ctx, AggregateSseError::MissingSession);
         };
         if !self.touch_downstream_session(&session_id, ctx).await {
-            Self::note_route_decision(ctx, "deny");
-            Self::note_sse_error(ctx, AggregateSseError::UnknownSession);
+            self.note_route_decision(ctx, "deny");
+            self.note_sse_error(ctx, AggregateSseError::UnknownSession);
             return session_not_found_response();
         }
         // Record only THAT a resume cursor was present. The value is
         // client-controlled, so neither it nor its length reaches metadata.
         let last_event_id = header_value(headers, "last-event-id");
         if last_event_id.is_some() {
-            Self::note_metadata(ctx, "mcp.sse.resume_requested", "true");
+            self.note_metadata(ctx, "mcp.sse.resume_requested", "true");
         }
         match self.sse_broker.attach_listener(&session_id, last_event_id) {
             Ok(listener) => {
@@ -3123,9 +3514,8 @@ impl McpGateway {
                 // duplicate delivery, and if no transport claims it, dropping
                 // the lease frees the session's single-listener slot.
                 ctx.mcp_aggregate_sse = Some(listener);
-                Self::note_route_decision(ctx, "sse_listener");
-                let session_hash = hash_str(&session_id);
-                Self::note_metadata(ctx, "mcp.session.downstream", &session_hash);
+                self.note_route_decision(ctx, "sse_listener");
+                self.note_downstream_session(ctx, &session_id);
                 PluginResult::Reject {
                     status_code: 200,
                     body: String::new(),
@@ -3142,11 +3532,11 @@ impl McpGateway {
                 if session_gone {
                     // Same shape the rest of the gateway uses to tell a client
                     // to re-initialize rather than retry on this session.
-                    Self::note_route_decision(ctx, "deny");
-                    Self::note_sse_error(ctx, error);
+                    self.note_route_decision(ctx, "deny");
+                    self.note_sse_error(ctx, error);
                     return session_not_found_response();
                 }
-                Self::sse_error_response(ctx, error)
+                self.sse_error_response(ctx, error)
             }
         }
     }
@@ -3155,8 +3545,8 @@ impl McpGateway {
     /// `post_stream` on the POST's own event stream, `inline` as
     /// `application/json` on the POST, or `suppressed` because the client
     /// cancelled it. Fixed tokens only.
-    fn note_sse_delivery(ctx: &mut RequestContext, outcome: &str) {
-        Self::note_metadata(ctx, "mcp.sse.delivery", outcome);
+    fn note_sse_delivery(&self, ctx: &mut RequestContext, outcome: &str) {
+        self.note_metadata(ctx, "mcp.sse.delivery", outcome);
     }
 
     /// Whether this dispatch may answer with a POST-attached event stream.
@@ -3224,16 +3614,16 @@ impl McpGateway {
         let identity = match StreamIdentity::from_raw_json_rpc_id(id, max_id_bytes) {
             Ok(identity) => identity,
             Err(error) => {
-                Self::note_sse_error(ctx, error);
+                self.note_sse_error(ctx, error);
                 return;
             }
         };
         match self.sse_broker.open_stream(&session_id, &identity) {
             Ok(stream) => {
                 ctx.mcp_sse_stream = Some(stream);
-                Self::note_metadata(ctx, "mcp.sse.stream", "open");
+                self.note_metadata(ctx, "mcp.sse.stream", "open");
             }
-            Err(error) => Self::note_sse_error(ctx, error),
+            Err(error) => self.note_sse_error(ctx, error),
         }
     }
 
@@ -3307,13 +3697,13 @@ impl McpGateway {
             // than silently retaining a lease no phase will settle.
             other => {
                 stream.settle_inline();
-                Self::note_sse_delivery(ctx, "inline");
+                self.note_sse_delivery(ctx, "inline");
                 return other;
             }
         };
         if !self.is_terminal_json_rpc_dispatch_response(status_code, &body, &headers) {
             stream.settle_inline();
-            Self::note_sse_delivery(ctx, "inline");
+            self.note_sse_delivery(ctx, "inline");
             return PluginResult::Reject {
                 status_code,
                 body,
@@ -3322,15 +3712,15 @@ impl McpGateway {
         }
         match stream.settle_for_inline_response() {
             Err(AggregateSseError::StreamCancelled) => {
-                Self::note_sse_error(ctx, AggregateSseError::StreamCancelled);
-                Self::note_route_decision(ctx, "sse_cancelled");
-                Self::note_sse_delivery(ctx, "suppressed");
+                self.note_sse_error(ctx, AggregateSseError::StreamCancelled);
+                self.note_route_decision(ctx, "sse_cancelled");
+                self.note_sse_delivery(ctx, "suppressed");
                 Self::post_attached_stream_response(
                     super::mcp_aggregate_sse::post_attached_stream_without_response(),
                 )
             }
             _ => {
-                Self::note_sse_delivery(ctx, "inline");
+                self.note_sse_delivery(ctx, "inline");
                 PluginResult::Reject {
                     status_code,
                     body,
@@ -3407,7 +3797,7 @@ impl McpGateway {
         // answer settles it.
         if Self::on_synthetic_response_lifecycle(ctx) {
             stream.settle_inline();
-            Self::note_sse_delivery(ctx, "inline");
+            self.note_sse_delivery(ctx, "inline");
             return None;
         }
         // A JSON-RPC response is carried as an event only when the FINAL
@@ -3425,30 +3815,30 @@ impl McpGateway {
             && !super::utils::sse::original_response_is_event_stream(ctx, response_headers);
         if !inspectable {
             stream.settle_inline();
-            Self::note_sse_delivery(ctx, "inline");
+            self.note_sse_delivery(ctx, "inline");
             return None;
         }
         match stream.reserve_post_attached_response(body) {
             Ok((framed, publication)) => {
                 ctx.mcp_sse_publication = Some(publication);
-                Self::note_route_decision(ctx, "sse_post_stream");
-                Self::note_sse_delivery(ctx, "post_stream");
+                self.note_route_decision(ctx, "sse_post_stream");
+                self.note_sse_delivery(ctx, "post_stream");
                 Some(Self::post_attached_stream_response(framed))
             }
             Err(AggregateSseError::StreamCancelled) => {
-                Self::note_sse_error(ctx, AggregateSseError::StreamCancelled);
-                Self::note_route_decision(ctx, "sse_cancelled");
-                Self::note_sse_delivery(ctx, "suppressed");
+                self.note_sse_error(ctx, AggregateSseError::StreamCancelled);
+                self.note_route_decision(ctx, "sse_cancelled");
+                self.note_sse_delivery(ctx, "suppressed");
                 Some(Self::post_attached_stream_response(
                     super::mcp_aggregate_sse::post_attached_stream_without_response(),
                 ))
             }
             Err(AggregateSseError::ResponseEnvelopeInvalid) => {
-                Self::note_sse_error(ctx, AggregateSseError::ResponseEnvelopeInvalid);
+                self.note_sse_error(ctx, AggregateSseError::ResponseEnvelopeInvalid);
                 // Distinct from "inline" (the answer was delivered on the POST
                 // as the upstream produced it) and "suppressed" (the client
                 // cancelled): the upstream answer was DISCARDED and replaced.
-                Self::note_sse_delivery(ctx, "refused");
+                self.note_sse_delivery(ctx, "refused");
                 let refusal = json_rpc_error(
                     None,
                     -32603,
@@ -3466,8 +3856,8 @@ impl McpGateway {
                 })
             }
             Err(error) => {
-                Self::note_sse_error(ctx, error);
-                Self::note_sse_delivery(ctx, "inline");
+                self.note_sse_error(ctx, error);
+                self.note_sse_delivery(ctx, "inline");
                 None
             }
         }
@@ -3486,13 +3876,13 @@ impl McpGateway {
 
     /// Release the request's stream identity because this POST is answering
     /// inline. Idempotent, and a no-op when no stream was opened.
-    fn settle_sse_stream_inline(ctx: &mut RequestContext) {
+    fn settle_sse_stream_inline(&self, ctx: &mut RequestContext) {
         if let Some(publication) = ctx.mcp_sse_publication.take() {
             publication.abort();
         }
         if let Some(stream) = ctx.mcp_sse_stream.take() {
             stream.settle_inline();
-            Self::note_sse_delivery(ctx, "inline");
+            self.note_sse_delivery(ctx, "inline");
         }
     }
 
@@ -3515,20 +3905,20 @@ impl McpGateway {
         let request_id = envelope.raw_cancel_id.as_deref();
         let Some(request_id) = request_id else {
             let missing = AggregateSseError::StreamIdMissing;
-            Self::note_sse_cancel(ctx, missing.reason_token());
+            self.note_sse_cancel(ctx, missing.reason_token());
             return;
         };
         let max_id_bytes = self.sessions.sse_bounds.max_stream_id_bytes;
         let identity = match StreamIdentity::from_raw_json_rpc_id(request_id, max_id_bytes) {
             Ok(identity) => identity,
             Err(error) => {
-                Self::note_sse_cancel(ctx, error.reason_token());
+                self.note_sse_cancel(ctx, error.reason_token());
                 return;
             }
         };
         match self.sse_broker.cancel_stream(&session_id, &identity) {
-            Ok(()) => Self::note_sse_cancel(ctx, "cancelled"),
-            Err(error) => Self::note_sse_cancel(ctx, error.reason_token()),
+            Ok(()) => self.note_sse_cancel(ctx, "cancelled"),
+            Err(error) => self.note_sse_cancel(ctx, error.reason_token()),
         }
     }
 
@@ -3566,12 +3956,14 @@ impl McpGateway {
         if let Some(session_id) = upstream_session_id {
             request = request.header(&self.sessions.upstream_session_header, session_id);
         }
+        request = server.headers.apply_to_request(request);
         request = stamp_upstream_proxy_hops(request, ctx);
         let response = self
             .http_client
-            .execute_tracked(
+            .execute_redacted_tracked(
                 request.json(&body),
                 "mcp_gateway.discovery",
+                &redacted_endpoint_url_str(upstream_url),
                 &ctx.plugin_http_call_ns,
             )
             .await
@@ -3639,19 +4031,27 @@ impl McpGateway {
                 Some(cursor) => json!({ "cursor": cursor }),
                 None => json!({}),
             };
-            let response = self
+            let mut response = self
                 .request_upstream_json(ctx, downstream_session_id, server, method, params)
                 .await?;
             let result = response
-                .get("result")
-                .and_then(Value::as_object)
+                .get_mut("result")
+                .and_then(Value::as_object_mut)
                 .ok_or_else(|| format!("upstream MCP {method} response missing result"))?;
-            let page_items = result
-                .get(result_key)
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    format!("upstream MCP {method} response missing result.{result_key}")
-                })?;
+            let next_cursor = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            // The page is owned, so its items move into the catalog list
+            // instead of being cloned.
+            let page_items = match result.get_mut(result_key) {
+                Some(Value::Array(page_items)) => std::mem::take(page_items),
+                _ => {
+                    return Err(format!(
+                        "upstream MCP {method} response missing result.{result_key}"
+                    ));
+                }
+            };
             for item in page_items {
                 if items.len() >= max_items {
                     warn!(
@@ -3664,7 +4064,7 @@ impl McpGateway {
                         "upstream MCP {method} catalog exceeded {max_items} items"
                     ));
                 }
-                let item_bytes = serde_json::to_vec(item).map_err(|error| {
+                let item_bytes = serialized_json_len(&item).map_err(|error| {
                     warn!(
                         server_id = %server.server_id,
                         method,
@@ -3673,7 +4073,7 @@ impl McpGateway {
                     );
                     format!("upstream MCP {method} catalog item could not be measured: {error}")
                 })?;
-                if total_item_bytes.saturating_add(item_bytes.len()) > max_bytes {
+                if total_item_bytes.saturating_add(item_bytes) > max_bytes {
                     warn!(
                         server_id = %server.server_id,
                         method,
@@ -3684,13 +4084,10 @@ impl McpGateway {
                         "upstream MCP {method} catalog exceeded {max_bytes} bytes"
                     ));
                 }
-                total_item_bytes += item_bytes.len();
-                items.push(item.clone());
+                total_item_bytes += item_bytes;
+                items.push(item);
             }
-            cursor = result
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
+            cursor = next_cursor;
             if cursor.is_none() {
                 return Ok(items);
             }
@@ -3711,17 +4108,17 @@ impl McpGateway {
         ctx: &RequestContext,
         downstream_session_id: &str,
     ) -> Result<(), McpCatalogError> {
-        let session = self
-            .downstream_session_clone(downstream_session_id)
+        let (catalog_lock, refresh_lock) = self
+            .session_catalog_locks(downstream_session_id)
             .ok_or(McpCatalogError::SessionNotFound)?;
-        let catalog_lock = &session.catalog;
+        let catalog_lock = &catalog_lock;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.is_stale(self.discovery.cache_ttl) {
                 return Ok(());
             }
         }
-        let _guard = session.catalog_refresh_lock.lock().await;
+        let _guard = refresh_lock.lock().await;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.is_stale(self.discovery.cache_ttl) {
@@ -3738,17 +4135,17 @@ impl McpGateway {
         ctx: &RequestContext,
         downstream_session_id: &str,
     ) -> Result<(), McpCatalogError> {
-        let session = self
-            .downstream_session_clone(downstream_session_id)
+        let (catalog_lock, refresh_lock) = self
+            .session_catalog_locks(downstream_session_id)
             .ok_or(McpCatalogError::SessionNotFound)?;
-        let catalog_lock = &session.catalog;
+        let catalog_lock = &catalog_lock;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.resource_templates_are_stale(self.discovery.cache_ttl) {
                 return Ok(());
             }
         }
-        let _guard = session.catalog_refresh_lock.lock().await;
+        let _guard = refresh_lock.lock().await;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.resource_templates_are_stale(self.discovery.cache_ttl) {
@@ -3769,11 +4166,12 @@ impl McpGateway {
         if !self.resource_response_rewrite_possible(server_id) {
             return;
         }
-        let Some(session) = self.downstream_session_clone(downstream_session_id) else {
+        let Some((catalog_lock, refresh_lock)) = self.session_catalog_locks(downstream_session_id)
+        else {
             return;
         };
         {
-            let catalog = session.catalog.read().await;
+            let catalog = catalog_lock.read().await;
             if catalog
                 .resource_templates_last_attempted_at
                 .get(server_id)
@@ -3782,9 +4180,9 @@ impl McpGateway {
                 return;
             }
         }
-        let _guard = session.catalog_refresh_lock.lock().await;
+        let _guard = refresh_lock.lock().await;
         {
-            let mut catalog = session.catalog.write().await;
+            let mut catalog = catalog_lock.write().await;
             if catalog
                 .resource_templates_last_attempted_at
                 .get(server_id)
@@ -3805,7 +4203,7 @@ impl McpGateway {
                 ctx,
                 downstream_session_id,
                 server_id,
-                &session.catalog,
+                &catalog_lock,
             )
             .await
         {
@@ -3850,6 +4248,65 @@ impl McpGateway {
         Ok(entries)
     }
 
+    /// Fetch one server's exposed catalog families for a refresh: `None` for a
+    /// family this server or the gateway does not aggregate.
+    async fn list_server_families(
+        &self,
+        ctx: &RequestContext,
+        downstream_session_id: &str,
+        server: &McpServerConfig,
+        discovered_at: DateTime<Utc>,
+        old_catalog: &McpCatalog,
+    ) -> ServerFamilyListings {
+        let tools = if self.discovery.aggregate_tools && server.expose_tools {
+            Some(
+                self.listed_tool_entries(
+                    ctx,
+                    downstream_session_id,
+                    server,
+                    discovered_at,
+                    old_catalog,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        let prompts = if self.discovery.aggregate_prompts && server.expose_prompts {
+            Some(
+                self.request_upstream_list_pages(
+                    ctx,
+                    downstream_session_id,
+                    server,
+                    "prompts/list",
+                    "prompts",
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        let resources = if self.discovery.aggregate_resources && server.expose_resources {
+            Some(
+                self.request_upstream_list_pages(
+                    ctx,
+                    downstream_session_id,
+                    server,
+                    "resources/list",
+                    "resources",
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        ServerFamilyListings {
+            tools,
+            prompts,
+            resources,
+        }
+    }
+
     async fn refresh_catalog(
         &self,
         ctx: &RequestContext,
@@ -3873,17 +4330,34 @@ impl McpGateway {
         let mut families: BTreeMap<&'static str, FamilyRefreshStats> = BTreeMap::new();
         let discovered_at = Utc::now();
 
-        for server in self.servers.values().filter(|server| server.enabled) {
-            if self.discovery.aggregate_tools && server.expose_tools {
-                let listed = self
-                    .listed_tool_entries(
-                        ctx,
-                        downstream_session_id,
-                        server,
-                        discovered_at,
-                        &old_catalog,
-                    )
-                    .await;
+        // Upstream I/O fans out across servers (bounded), so one slow upstream
+        // no longer serializes ahead of every other server's lists. Each
+        // server's own families stay sequential: they share its upstream
+        // session. Results are merged below exactly as before; collision
+        // handling is symmetric, so merge order does not decide a winner.
+        let enabled_servers: Vec<&McpServerConfig> = self
+            .servers
+            .values()
+            .filter(|server| server.enabled)
+            .collect();
+        let mut listings: Vec<(&McpServerConfig, ServerFamilyListings)> =
+            Vec::with_capacity(enabled_servers.len());
+        for chunk in enabled_servers.chunks(MAX_CONCURRENT_SERVER_DISCOVERY) {
+            let results = futures_util::future::join_all(chunk.iter().map(|server| {
+                self.list_server_families(
+                    ctx,
+                    downstream_session_id,
+                    server,
+                    discovered_at,
+                    &old_catalog,
+                )
+            }))
+            .await;
+            listings.extend(chunk.iter().copied().zip(results));
+        }
+
+        for (server, listing) in listings {
+            if let Some(listed) = listing.tools {
                 match listed {
                     Ok(entries) => {
                         families.entry("tools").or_default().record_success();
@@ -3923,24 +4397,13 @@ impl McpGateway {
                     }
                 }
             }
-            if self.discovery.aggregate_prompts && server.expose_prompts {
-                match self
-                    .request_upstream_list_pages(
-                        ctx,
-                        downstream_session_id,
-                        server,
-                        "prompts/list",
-                        "prompts",
-                    )
-                    .await
-                {
+            if let Some(listed) = listing.prompts {
+                match listed {
                     Ok(items) => {
                         families.entry("prompts").or_default().record_success();
                         last_good.insert((server.server_id.clone(), "prompts"));
                         for item in items {
-                            if let Some(entry) =
-                                self.prompt_entry_from_value(server, item, discovered_at)
-                            {
+                            if let Some(entry) = self.prompt_entry_from_value(server, item) {
                                 let public_name = entry.public_name.clone();
                                 insert_catalog_entry(
                                     &mut prompts,
@@ -3976,24 +4439,13 @@ impl McpGateway {
                     }
                 }
             }
-            if self.discovery.aggregate_resources && server.expose_resources {
-                match self
-                    .request_upstream_list_pages(
-                        ctx,
-                        downstream_session_id,
-                        server,
-                        "resources/list",
-                        "resources",
-                    )
-                    .await
-                {
+            if let Some(listed) = listing.resources {
+                match listed {
                     Ok(items) => {
                         families.entry("resources").or_default().record_success();
                         last_good.insert((server.server_id.clone(), "resources"));
                         for item in items {
-                            if let Some(entry) =
-                                self.resource_entry_from_value(server, item, discovered_at)
-                            {
+                            if let Some(entry) = self.resource_entry_from_value(server, item) {
                                 let public_uri = entry.public_uri.clone();
                                 insert_catalog_entry(
                                     &mut resources,
@@ -4119,6 +4571,12 @@ impl McpGateway {
             );
         }
 
+        // Baseline only the tools this refresh actually publishes, after
+        // collision handling and tombstone reconciliation.
+        for entry in tools.values_mut() {
+            self.admit_tool_schema_baseline(entry);
+        }
+
         let mut catalog = catalog_lock.write().await;
         let changed = catalog.tools.keys().collect::<HashSet<_>>() != tools.keys().collect()
             || catalog.prompts.keys().collect::<HashSet<_>>() != prompts.keys().collect()
@@ -4168,30 +4626,39 @@ impl McpGateway {
         let mut degraded: Vec<String> = Vec::new();
         let mut last_good: BTreeSet<(String, &'static str)> = BTreeSet::new();
         let mut stats = FamilyRefreshStats::default();
-        let discovered_at = Utc::now();
 
         if self.discovery.aggregate_resources {
-            for server in self
+            // Same bounded per-server fan-out as `refresh_catalog`; results are
+            // merged afterwards, and public template URIs are server-prefixed,
+            // so merge order cannot change the catalog.
+            let template_servers: Vec<&McpServerConfig> = self
                 .servers
                 .values()
                 .filter(|server| server.enabled && server.expose_resources)
-            {
-                match self
-                    .request_upstream_list_pages(
+                .collect();
+            let mut listings: Vec<ServerTemplateListing<'_>> =
+                Vec::with_capacity(template_servers.len());
+            for chunk in template_servers.chunks(MAX_CONCURRENT_SERVER_DISCOVERY) {
+                let results = futures_util::future::join_all(chunk.iter().map(|server| {
+                    self.request_upstream_list_pages(
                         ctx,
                         downstream_session_id,
                         server,
                         "resources/templates/list",
                         "resourceTemplates",
                     )
-                    .await
-                {
+                }))
+                .await;
+                listings.extend(chunk.iter().copied().zip(results));
+            }
+            for (server, listed) in listings {
+                match listed {
                     Ok(items) => {
                         stats.record_success();
                         last_good.insert((server.server_id.clone(), "resource_templates"));
                         for item in items {
                             if let Some(entry) =
-                                self.resource_template_entry_from_value(server, item, discovered_at)
+                                self.resource_template_entry_from_value(server, item)
                             {
                                 resource_templates.insert(entry.public_uri_template.clone(), entry);
                             }
@@ -4299,12 +4766,9 @@ impl McpGateway {
                 return Err(error);
             }
         };
-        let discovered_at = Utc::now();
         let mut resource_templates = HashMap::new();
         for item in items {
-            if let Some(entry) =
-                self.resource_template_entry_from_value(server, item, discovered_at)
-            {
+            if let Some(entry) = self.resource_template_entry_from_value(server, item) {
                 resource_templates.insert(entry.public_uri_template.clone(), entry);
             }
         }
@@ -4370,7 +4834,6 @@ impl McpGateway {
             input_validator,
             output_validator,
             schema_hash,
-            description_hash,
         } = parts;
         let policy_action = self.policy.action_for_tool(&public_name);
         let explicitly_configured = self.policy.tools.contains_key(&public_name);
@@ -4394,7 +4857,17 @@ impl McpGateway {
             .tools
             .get(&public_name)
             .is_some_and(|old| old.hidden_by_schema_change);
+        // The instance-wide baseline is what makes the quarantine hold across
+        // sessions: a fresh session has no old catalog, so without it the same
+        // (or any other) principal could re-`initialize` and see a changed
+        // tool as new.
+        let schema_quarantine =
+            self.existing_tool_schema_quarantine(&server.server_id, &public_name, &schema_hash);
+        let quarantined_for_instance = schema_quarantine
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire));
         let hidden_by_schema_change = previously_hidden_by_schema_change
+            || quarantined_for_instance
             || (schema_changed
                 && self.discovery.on_schema_change == DiscoveryBehavior::HideUntilConfigured);
         let hidden_by_discovery = (previously_hidden_by_discovery && !explicitly_configured)
@@ -4419,19 +4892,91 @@ impl McpGateway {
             hidden_by_discovery,
             hidden_from_discovery,
             hidden_by_schema_change,
+            schema_quarantine,
             input_validator,
             output_validator,
             discovered_at,
             schema_hash,
-            description_hash,
         }
+    }
+
+    /// The established instance-wide quarantine flag for a tool, recording a
+    /// schema change against it, or `None` when no baseline exists yet.
+    ///
+    /// Never allocates a baseline: a candidate entry may still be discarded by
+    /// collision handling, and a name that is never published must not
+    /// consume the bounded baseline table (see
+    /// [`Self::admit_tool_schema_baseline`]). A different hash than the
+    /// published baseline, from any session, sets the sticky quarantine under
+    /// `discovery.on_schema_change: hide_until_configured`; only a
+    /// configuration change (a new plugin instance) clears it.
+    fn existing_tool_schema_quarantine(
+        &self,
+        server_id: &str,
+        public_name: &str,
+        schema_hash: &str,
+    ) -> Option<Arc<AtomicBool>> {
+        if self.discovery.on_schema_change != DiscoveryBehavior::HideUntilConfigured {
+            return None;
+        }
+        let key = (server_id.to_string(), public_name.to_string());
+        let mut baseline = self.tool_schema_baselines.get_mut(&key)?;
+        if baseline.schema_hash != schema_hash {
+            baseline.quarantined.store(true, Ordering::Release);
+            baseline.schema_hash = schema_hash.to_string();
+        }
+        Some(Arc::clone(&baseline.quarantined))
+    }
+
+    /// Baseline a tool entry that survived collision handling into a refreshed
+    /// catalog, attaching the shared quarantine flag.
+    ///
+    /// Only published entries reach this point, so discarded collision
+    /// candidates never occupy the bounded table. When the table is full, a
+    /// tool it does not already track cannot be baselined and fails closed:
+    /// it is hidden like a schema-changed tool. A concurrent session that
+    /// baselined the same tool first with a different schema quarantines it.
+    fn admit_tool_schema_baseline(&self, entry: &mut ToolCatalogEntry) {
+        if entry.schema_quarantine.is_some()
+            || self.discovery.on_schema_change != DiscoveryBehavior::HideUntilConfigured
+        {
+            return;
+        }
+        let key = (entry.server_id.clone(), entry.public_name.clone());
+        if !self.tool_schema_baselines.contains_key(&key)
+            && self.tool_schema_baselines.len() >= self.max_tool_schema_baselines
+        {
+            warn_sampled!(
+                server_id = %entry.server_id,
+                "MCP tool schema baseline table is full; hiding a tool it cannot baseline"
+            );
+            entry.mark_schema_quarantined();
+            return;
+        }
+        let flag = {
+            let mut baseline =
+                self.tool_schema_baselines
+                    .entry(key)
+                    .or_insert_with(|| ToolSchemaBaseline {
+                        schema_hash: entry.schema_hash.clone(),
+                        quarantined: Arc::new(AtomicBool::new(false)),
+                    });
+            if baseline.schema_hash != entry.schema_hash {
+                baseline.quarantined.store(true, Ordering::Release);
+                baseline.schema_hash = entry.schema_hash.clone();
+            }
+            Arc::clone(&baseline.quarantined)
+        };
+        if flag.load(Ordering::Acquire) {
+            entry.mark_schema_quarantined();
+        }
+        entry.schema_quarantine = Some(flag);
     }
 
     fn prompt_entry_from_value(
         &self,
         server: &McpServerConfig,
         item: Value,
-        discovered_at: DateTime<Utc>,
     ) -> Option<PromptCatalogEntry> {
         let name = item.get("name")?.as_str()?.to_string();
         let public_name = namespaced(
@@ -4444,13 +4989,6 @@ impl McpGateway {
             _ => None,
         };
         let arguments_schema = item.get("argumentsSchema").cloned();
-        // Drift is tracked over the whole declared parameter surface, so a
-        // change to the standard `arguments` array is as visible as one to the
-        // nonstandard schema field.
-        let schema_hash = hash_value(&json!({
-            "arguments": arguments,
-            "argumentsSchema": arguments_schema,
-        }));
         Some(PromptCatalogEntry {
             public_name,
             upstream_name: name,
@@ -4466,9 +5004,6 @@ impl McpGateway {
                 .map(ToOwned::to_owned),
             arguments,
             arguments_schema,
-            enabled: true,
-            discovered_at,
-            schema_hash,
         })
     }
 
@@ -4476,12 +5011,10 @@ impl McpGateway {
         &self,
         server: &McpServerConfig,
         item: Value,
-        discovered_at: DateTime<Utc>,
     ) -> Option<ResourceCatalogEntry> {
         let upstream_uri = item.get("uri")?.as_str()?.to_string();
         let public_uri = public_resource_uri(&server.server_id, &upstream_uri);
         Some(ResourceCatalogEntry {
-            uri_hash: hash_str(&upstream_uri),
             public_uri,
             upstream_uri,
             server_id: server.server_id.clone(),
@@ -4498,8 +5031,6 @@ impl McpGateway {
                 .get("mimeType")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
-            enabled: true,
-            discovered_at,
         })
     }
 
@@ -4507,7 +5038,6 @@ impl McpGateway {
         &self,
         server: &McpServerConfig,
         item: Value,
-        discovered_at: DateTime<Utc>,
     ) -> Option<ResourceTemplateCatalogEntry> {
         let upstream_uri_template = item.get("uriTemplate")?.as_str()?.to_string();
         let uri_template_regex = match uri_template_regex(&upstream_uri_template) {
@@ -4547,8 +5077,6 @@ impl McpGateway {
                 .map(ToOwned::to_owned),
             annotations: item.get("annotations").cloned(),
             icons: item.get("icons").cloned(),
-            enabled: true,
-            discovered_at,
             uri_template_regex,
         })
     }
@@ -4644,13 +5172,13 @@ impl McpGateway {
         // `allowed_methods` refuses can never be called, so it is not listed
         // either.
         let route_ctx: &RequestContext = ctx;
-        let tools: Vec<Value> = catalog
+        let tools: Vec<PublicToolItem<'_>> = catalog
             .tools
             .values()
             .filter(|entry| {
                 !entry.hidden_from_discovery
-                    && (entry.enabled
-                        || !(self.discovery.hide_denied_items || self.policy.hide_denied_tools))
+                    && !entry.schema_quarantined()
+                    && (entry.enabled || !self.policy.hide_denied_tools)
                     && grant_view.as_ref().is_none_or(|view| {
                         self.policy
                             .grant_for_tool(&entry.public_name)
@@ -4658,17 +5186,20 @@ impl McpGateway {
                     })
                     && self.bridge_tool_allowed_on_route(route_ctx, entry)
             })
-            .map(tool_entry_to_public_value)
+            .map(PublicToolItem::from_entry)
             .collect();
-        json_response(
-            200,
-            json!({
-                "jsonrpc": "2.0",
-                "id": envelope.id.clone().unwrap_or(Value::Null),
-                "result": { "tools": tools }
-            }),
-            None,
-        )
+        // Serialized straight from the catalog's shared schemas: building a
+        // `Value` per tool would deep-clone every input and output schema on
+        // every `tools/list`.
+        let response = ToolsListResponse {
+            jsonrpc: "2.0",
+            id: envelope.id.as_ref().unwrap_or(&Value::Null),
+            result: ToolsListResult { tools },
+        };
+        match serde_json::to_string(&response) {
+            Ok(body) => json_body_response(200, body, None),
+            Err(_) => json_rpc_error(None, -32603, "MCP response serialization failed", None),
+        }
     }
 
     async fn aggregate_prompts_list(
@@ -4698,10 +5229,14 @@ impl McpGateway {
         if let Some(response) = family_unavailable_error(&catalog, "prompts", envelope.id.clone()) {
             return response;
         }
+        // A prompt the policy does not allow is never listed (and never routed:
+        // see `route_prompt_get`).
         let prompts: Vec<Value> = catalog
             .prompts
             .values()
-            .filter(|entry| entry.enabled)
+            .filter(|entry| {
+                self.policy.action_for_prompt(&entry.public_name) == PolicyAction::Allow
+            })
             .map(prompt_entry_to_public_value)
             .collect();
         json_response(
@@ -4746,7 +5281,7 @@ impl McpGateway {
         let resources: Vec<Value> = catalog
             .resources
             .values()
-            .filter(|entry| entry.enabled)
+            .filter(|entry| self.resource_listing_allowed(entry))
             .map(resource_entry_to_public_value)
             .collect();
         json_response(
@@ -4783,7 +5318,9 @@ impl McpGateway {
         let resource_templates: Vec<Value> = catalog
             .resource_templates
             .values()
-            .filter(|entry| entry.enabled)
+            .filter(|entry| {
+                self.policy.action_for_resource(&entry.public_uri_template) == PolicyAction::Allow
+            })
             .map(resource_template_entry_to_public_value)
             .collect();
         if self.observability.emit_metadata {
@@ -4841,12 +5378,13 @@ impl McpGateway {
             }
         };
         if self.observability.emit_metadata {
+            let logged_name = bounded_metadata_identifier(&public_name);
             ctx.metadata
-                .insert("mcp.public_tool_name".to_string(), public_name.clone());
+                .insert("mcp.public_tool_name".to_string(), logged_name.clone());
             ctx.metadata
                 .insert("mcp.item_type".to_string(), "tool".to_string());
             ctx.metadata
-                .insert("mcp.item_name".to_string(), public_name.clone());
+                .insert("mcp.item_name".to_string(), logged_name);
         }
         let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
             return session_not_found_response();
@@ -4887,14 +5425,13 @@ impl McpGateway {
             );
         }
         let policy_action = self.policy.action_for_tool(&public_name);
-        if policy_action != PolicyAction::Allow || !entry.enabled {
+        if policy_action != PolicyAction::Allow || !entry.enabled || entry.schema_quarantined() {
             if self.observability.emit_metadata {
                 ctx.metadata.insert(
                     "mcp.policy_decision".to_string(),
                     policy_action.as_policy_decision().to_string(),
                 );
-                ctx.metadata
-                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+                self.note_route_decision(ctx, "deny");
             }
             return tool_call_denied(envelope.id.clone());
         }
@@ -4912,8 +5449,7 @@ impl McpGateway {
                         "mcp.policy_decision".to_string(),
                         denial.as_policy_decision().to_string(),
                     );
-                    ctx.metadata
-                        .insert("mcp.route_decision".to_string(), "deny".to_string());
+                    self.note_route_decision(ctx, "deny");
                 }
                 return tool_call_denied(envelope.id.clone());
             }
@@ -4930,8 +5466,7 @@ impl McpGateway {
                     "mcp.policy_decision".to_string(),
                     "method_not_allowed".to_string(),
                 );
-                ctx.metadata
-                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+                self.note_route_decision(ctx, "deny");
             }
             return if self.policy.has_grants() {
                 tool_call_denied(envelope.id.clone())
@@ -4975,8 +5510,19 @@ impl McpGateway {
                     .insert("mcp.arguments_hash".to_string(), hash_value(arguments));
             }
             if self.observability.log_raw_arguments {
-                ctx.metadata
-                    .insert("mcp.arguments".to_string(), arguments.to_string());
+                let mut raw = arguments.to_string();
+                if raw.len() > MAX_LOGGED_RAW_ARGUMENTS_BYTES {
+                    let mut end = MAX_LOGGED_RAW_ARGUMENTS_BYTES;
+                    while !raw.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    // A fresh bounded copy: `truncate` would keep the full
+                    // serialized allocation alive in request metadata.
+                    raw = raw[..end].to_owned();
+                    ctx.metadata
+                        .insert("mcp.arguments_truncated".to_string(), "true".to_string());
+                }
+                ctx.metadata.insert("mcp.arguments".to_string(), raw);
             }
             if self.validation.validate_tool_arguments {
                 match validate_json_schema(&entry.input_validator, arguments) {
@@ -4990,8 +5536,7 @@ impl McpGateway {
                         if self.observability.emit_metadata {
                             ctx.metadata
                                 .insert("mcp.schema_validation".to_string(), "fail".to_string());
-                            ctx.metadata
-                                .insert("mcp.route_decision".to_string(), "deny".to_string());
+                            self.note_route_decision(ctx, "deny");
                         }
                         return json_rpc_error(
                             envelope.id.clone(),
@@ -5069,7 +5614,8 @@ impl McpGateway {
             &server.server_id,
             Some(
                 McpAdmittedTarget::with_arguments("name", &entry.upstream_name, envelope)
-                    .with_grant(grant),
+                    .with_grant(grant)
+                    .with_schema_quarantine(entry.schema_quarantine.clone()),
             ),
         );
         PluginResult::Continue
@@ -5117,6 +5663,17 @@ impl McpGateway {
             return json_rpc_error(envelope.id.clone(), -32008, "Unknown MCP prompt", None);
         };
         drop(catalog);
+        // Prompt policy is decided before any upstream initialize or dispatch,
+        // exactly like a tool's action.
+        if self.policy.action_for_prompt(&public_name) != PolicyAction::Allow {
+            self.note_item_policy_denial(ctx, "prompt");
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32001,
+                "MCP prompt request denied by gateway policy",
+                None,
+            );
+        }
         let Some(server) = self.servers.get(&entry.server_id) else {
             return json_rpc_error(
                 envelope.id.clone(),
@@ -5334,6 +5891,39 @@ impl McpGateway {
                 (server_id, upstream_uri, catalog.version)
             }
         };
+        // Resource policy is decided once the read resolved to an upstream
+        // binding, before any upstream initialize or dispatch. Configured
+        // denies are decided from configuration; when a default-derived deny
+        // depends on an exact-resource catalog this server never listed, the
+        // read fails closed rather than treating the missing binding as absent.
+        let resource_action = {
+            let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+                return session_not_found_response();
+            };
+            let catalog = catalog_lock.read().await;
+            self.resource_read_action(&catalog, &public_uri, &server_id, &upstream_uri)
+        };
+        let Some(resource_action) = resource_action else {
+            self.note_item_policy_denial(ctx, "resource");
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32006,
+                "MCP catalog unavailable",
+                Some(
+                    "the resource policy cannot be decided because this server's resources list has never succeeded"
+                        .to_string(),
+                ),
+            );
+        };
+        if resource_action != PolicyAction::Allow {
+            self.note_item_policy_denial(ctx, "resource");
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32001,
+                "MCP resource read denied by gateway policy",
+                None,
+            );
+        }
         let Some(server) = self.servers.get(&server_id) else {
             return json_rpc_error(
                 envelope.id.clone(),
@@ -5356,13 +5946,15 @@ impl McpGateway {
         if self.observability.emit_metadata {
             ctx.metadata
                 .insert("mcp.item_type".to_string(), "resource".to_string());
-            ctx.metadata
-                .insert("mcp.resource_uri".to_string(), public_uri.clone());
+            ctx.metadata.insert(
+                "mcp.resource_uri".to_string(),
+                bounded_metadata_identifier(&public_uri),
+            );
             ctx.metadata
                 .insert("mcp.server_id".to_string(), server_id.clone());
             ctx.metadata.insert(
                 "mcp.upstream_resource_uri".to_string(),
-                upstream_uri.clone(),
+                bounded_metadata_identifier(&upstream_uri),
             );
         }
         self.set_route_to_server(ctx, headers, server, Some(downstream_session_id));
@@ -5390,6 +5982,99 @@ impl McpGateway {
             Some(McpAdmittedTarget::without_arguments("uri", &upstream_uri)),
         );
         PluginResult::Continue
+    }
+
+    /// The policy action for a `resources/read` that resolved to
+    /// `(server_id, upstream_uri)`, or `None` when it cannot be decided.
+    ///
+    /// An explicit `policy.resources` entry for the requested public URI wins.
+    /// Otherwise any configured exact or template deny covering the resolved
+    /// upstream URI denies — decided from configuration, so a deny never
+    /// fails open because this session's catalog lacks the binding. Then every
+    /// discovered binding of the same upstream URI decides and any deny wins:
+    /// each exact resource of that server with that upstream URI AND each
+    /// matching enabled template. A read with no binding falls back to
+    /// `policy.default_resource_action`.
+    ///
+    /// With a non-allow default, an exact resource that was never discovered
+    /// would deny a read routed through an allowed template; when this
+    /// server's exact-resource list has never succeeded that cannot be ruled
+    /// out, so the decision is `None` and the read fails closed.
+    fn resource_read_action(
+        &self,
+        catalog: &McpCatalog,
+        public_uri: &str,
+        server_id: &str,
+        upstream_uri: &str,
+    ) -> Option<PolicyAction> {
+        if let Some(action) = self.policy.resources.get(public_uri) {
+            return Some(*action);
+        }
+        if self
+            .policy
+            .configured_resource_deny(server_id, upstream_uri)
+        {
+            return Some(PolicyAction::Deny);
+        }
+        let mut exact_bound = false;
+        for entry in catalog
+            .resources
+            .values()
+            .filter(|entry| entry.server_id == server_id && entry.upstream_uri == upstream_uri)
+        {
+            exact_bound = true;
+            let action = self.policy.action_for_resource(&entry.public_uri);
+            if action != PolicyAction::Allow {
+                return Some(action);
+            }
+        }
+        let mut template_bound = false;
+        for entry in catalog.resource_templates.values().filter(|entry| {
+            entry.server_id == server_id && entry.uri_template_regex.is_match(upstream_uri)
+        }) {
+            template_bound = true;
+            let action = self.policy.action_for_resource(&entry.public_uri_template);
+            if action != PolicyAction::Allow {
+                return Some(action);
+            }
+        }
+        if !exact_bound && !template_bound {
+            return Some(self.policy.default_resource_action);
+        }
+        if !exact_bound
+            && self.policy.default_resource_action != PolicyAction::Allow
+            && !catalog
+                .last_good
+                .contains(&(server_id.to_string(), "resources"))
+        {
+            return None;
+        }
+        Some(PolicyAction::Allow)
+    }
+
+    /// Whether `resources/list` publishes an exact resource: the decision a
+    /// `resources/read` of its own public URI gets, from configuration alone
+    /// (its explicit entry, then any configured exact or template deny, then
+    /// the default), so the listing never depends on the template catalog.
+    fn resource_listing_allowed(&self, entry: &ResourceCatalogEntry) -> bool {
+        if let Some(action) = self.policy.resources.get(&entry.public_uri) {
+            return *action == PolicyAction::Allow;
+        }
+        !self
+            .policy
+            .configured_resource_deny(&entry.server_id, &entry.upstream_uri)
+            && self.policy.default_resource_action == PolicyAction::Allow
+    }
+
+    /// Metadata for a prompt / resource request refused by policy.
+    fn note_item_policy_denial(&self, ctx: &mut RequestContext, item_type: &str) {
+        if self.observability.emit_metadata {
+            ctx.metadata
+                .insert("mcp.item_type".to_string(), item_type.to_string());
+            ctx.metadata
+                .insert("mcp.policy_decision".to_string(), "deny".to_string());
+            self.note_route_decision(ctx, "deny");
+        }
     }
 
     fn handle_transparent_post(
@@ -5494,8 +6179,7 @@ impl McpGateway {
                             // deny decision so the rejection stays observable.
                             self.clear_batch_item_routing_state(ctx);
                             self.restore_batch_request_metadata(ctx, headers, &BTreeSet::new());
-                            ctx.metadata
-                                .insert("mcp.route_decision".to_string(), "deny".to_string());
+                            self.note_route_decision(ctx, "deny");
                             return restore_response_id(response, envelope.raw_id.as_deref());
                         }
                         responses.push(Value::Null);
@@ -5553,19 +6237,13 @@ impl McpGateway {
                 ) {
                     self.clear_batch_item_routing_state(ctx);
                     self.restore_batch_request_metadata(ctx, headers, &BTreeSet::new());
-                    ctx.metadata.insert(
-                        "mcp.route_decision".to_string(),
-                        "synthetic_response".to_string(),
-                    );
+                    self.note_route_decision(ctx, "synthetic_response");
                     return response;
                 }
             }
             self.clear_batch_item_routing_state(ctx);
             self.restore_batch_request_metadata(ctx, headers, &BTreeSet::new());
-            ctx.metadata.insert(
-                "mcp.route_decision".to_string(),
-                "synthetic_response".to_string(),
-            );
+            self.note_route_decision(ctx, "synthetic_response");
             return self.bounded_batch_json_response(bounded_responses);
         }
 
@@ -5583,8 +6261,6 @@ impl McpGateway {
                 raw_cancel_id: None,
                 method: None,
                 params: None,
-                result: None,
-                error: None,
                 message_kind: McpMessageKind::Notification,
             });
         // The forwarded body is the whole batch, not `route_envelope`, so no
@@ -5742,7 +6418,7 @@ impl McpGateway {
                 continue;
             }
 
-            self.emit_envelope_metadata(ctx, &envelope);
+            // `dispatch_post_envelope` stamps this member's envelope metadata.
             let result = self.dispatch_post_envelope(ctx, headers, &envelope).await;
             // Take this member's degraded set before the next iteration's reset
             // drops it, so the request-level summary is the union across members
@@ -5832,10 +6508,7 @@ impl McpGateway {
         self.clear_batch_item_routing_state(ctx);
         *headers = inbound_headers;
         self.restore_batch_request_metadata(ctx, headers, &catalog_degraded);
-        ctx.metadata.insert(
-            "mcp.route_decision".to_string(),
-            "synthetic_response".to_string(),
-        );
+        self.note_route_decision(ctx, "synthetic_response");
 
         if !saw_response_bearing {
             // Notification-only batches carry no per-item response element, so
@@ -5898,10 +6571,7 @@ impl McpGateway {
         // A fail-closed batch publishes no catalog-degradation summary: the
         // members that would have contributed one never completed.
         self.restore_batch_request_metadata(ctx, inbound_headers, &BTreeSet::new());
-        ctx.metadata.insert(
-            "mcp.route_decision".to_string(),
-            "synthetic_response".to_string(),
-        );
+        self.note_route_decision(ctx, "synthetic_response");
         *headers = inbound_headers.clone();
         response
     }
@@ -6147,6 +6817,7 @@ impl McpGateway {
         ctx.metadata.remove("mcp.resource_uri");
         ctx.metadata.remove("mcp.upstream_resource_uri");
         ctx.metadata.remove("mcp.arguments");
+        ctx.metadata.remove("mcp.arguments_truncated");
         ctx.metadata.remove("mcp.arguments_hash");
         ctx.metadata.remove("mcp.input_schema_hash");
         ctx.metadata.remove("mcp.schema_validation");
@@ -6218,10 +6889,7 @@ impl McpGateway {
                     | "resources/read"
             )
         {
-            ctx.metadata.insert(
-                "mcp.route_decision".to_string(),
-                "synthetic_response".to_string(),
-            );
+            self.note_route_decision(ctx, "synthetic_response");
             return empty_response(202);
         }
         if let Some(response) =
@@ -6236,8 +6904,7 @@ impl McpGateway {
             {
                 return session_not_found_response();
             }
-            ctx.metadata
-                .insert("mcp.session.downstream".to_string(), hash_str(&session_id));
+            self.note_downstream_session(ctx, &session_id);
         }
 
         if self.mode == McpGatewayMode::TransparentProxy {
@@ -6296,10 +6963,7 @@ impl McpGateway {
                     }
                     Some(_) => {
                         let negotiated = self.preferred_protocol_version().to_string();
-                        ctx.metadata.insert(
-                            "mcp.protocol_version_negotiated".to_string(),
-                            negotiated.clone(),
-                        );
+                        self.note_metadata(ctx, "mcp.protocol_version_negotiated", &negotiated);
                         negotiated
                     }
                     None => self.preferred_protocol_version().to_string(),
@@ -6329,7 +6993,7 @@ impl McpGateway {
                         // together. Refusing here keeps the two cardinalities
                         // consistent instead of handing back a session that can
                         // never attach its event stream.
-                        Self::note_sse_error(ctx, error);
+                        self.note_sse_error(ctx, error);
                         return json_rpc_error(
                             envelope.id.clone(),
                             MCP_SSE_SESSION_UNAVAILABLE,
@@ -6338,21 +7002,12 @@ impl McpGateway {
                         );
                     }
                 };
-                ctx.metadata.insert(
-                    "mcp.session.downstream".to_string(),
-                    hash_str(&downstream_session_id),
-                );
-                ctx.metadata.insert(
-                    "mcp.route_decision".to_string(),
-                    "synthetic_response".to_string(),
-                );
+                self.note_downstream_session(ctx, &downstream_session_id);
+                self.note_route_decision(ctx, "synthetic_response");
                 self.synthetic_initialize_response(envelope, &version, &downstream_session_id)
             }
             "notifications/initialized" | "ping" => {
-                ctx.metadata.insert(
-                    "mcp.route_decision".to_string(),
-                    "synthetic_response".to_string(),
-                );
+                self.note_route_decision(ctx, "synthetic_response");
                 if envelope.message_kind == McpMessageKind::Notification {
                     return empty_response(202);
                 }
@@ -6478,10 +7133,7 @@ impl McpGateway {
                 }
             }
             _ if envelope.message_kind == McpMessageKind::Notification => {
-                ctx.metadata.insert(
-                    "mcp.route_decision".to_string(),
-                    "synthetic_response".to_string(),
-                );
+                self.note_route_decision(ctx, "synthetic_response");
                 empty_response(202)
             }
             _ => json_rpc_error(envelope.id.clone(), -32601, "MCP method not found", None),
@@ -6576,14 +7228,22 @@ impl McpGateway {
         grant.decide(&view).err()
     }
 
+    /// Whether the admitted tool's instance-wide schema quarantine is set.
+    fn final_schema_quarantined(ctx: &RequestContext) -> bool {
+        ctx.mcp_admission
+            .as_deref()
+            .and_then(|record| record.target.as_ref())
+            .and_then(|target| target.schema_quarantine.as_ref())
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
     fn reject_final_grant(&self, ctx: &mut RequestContext, denial: McpGrantDenial) -> PluginResult {
         if self.observability.emit_metadata {
             ctx.metadata.insert(
                 "mcp.policy_decision".to_string(),
                 denial.as_policy_decision().to_string(),
             );
-            ctx.metadata
-                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            self.note_route_decision(ctx, "deny");
         }
         Self::correlate_gateway_terminal(ctx, tool_call_denied(None), &[])
     }
@@ -6596,8 +7256,7 @@ impl McpGateway {
         if self.observability.emit_metadata {
             ctx.metadata
                 .insert("mcp.policy_decision".to_string(), "deny".to_string());
-            ctx.metadata
-                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            self.note_route_decision(ctx, "deny");
             ctx.metadata
                 .insert("mcp.admission_violation".to_string(), reason.to_string());
         }
@@ -6660,8 +7319,7 @@ impl McpGateway {
                 "mcp.result_schema_validation".to_string(),
                 "fail".to_string(),
             );
-            ctx.metadata
-                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            self.note_route_decision(ctx, "deny");
         }
         // Reason is a gateway-controlled category string — never a result body.
         warn_sampled!(
@@ -6709,8 +7367,8 @@ pub(crate) struct McpAdminCatalogSnapshot {
     pub(crate) on_new_tool: &'static str,
     pub(crate) on_schema_change: &'static str,
     pub(crate) default_action: &'static str,
-    /// Whether a denied tool is left out of `tools/list` (either of
-    /// `discovery.hide_denied_items` / `policy.hide_denied_tools`).
+    /// Whether a denied tool is left out of `tools/list`
+    /// (`policy.hide_denied_tools`).
     pub(crate) hide_denied_tools: bool,
     pub(crate) max_catalog_items_per_list: usize,
     pub(crate) max_catalog_bytes_per_list: usize,
@@ -6818,7 +7476,7 @@ impl McpGateway {
                 *slot = name.as_str();
             }
         }
-        let hide_denied_tools = self.discovery.hide_denied_items || self.policy.hide_denied_tools;
+        let hide_denied_tools = self.policy.hide_denied_tools;
         let mut tools: Vec<McpAdminToolSnapshot> = catalog
             .map(|catalog| {
                 catalog
@@ -6888,7 +7546,8 @@ impl McpGateway {
         allowed_methods: Option<&[String]>,
     ) -> McpAdminToolSnapshot {
         let action = self.policy.action_for_tool(&entry.public_name);
-        let effective = if entry.hidden_by_schema_change {
+        let schema_quarantined = entry.schema_quarantined();
+        let effective = if schema_quarantined {
             "hidden_schema_changed"
         } else if entry.hidden_by_discovery {
             "hidden_until_configured"
@@ -6912,9 +7571,10 @@ impl McpGateway {
             explicitly_configured: self.policy.tools.contains_key(&entry.public_name),
             effective,
             listed: route_allowed
+                && !schema_quarantined
                 && !entry.hidden_from_discovery
                 && (entry.enabled || !hide_denied_tools),
-            callable: route_allowed && entry.enabled,
+            callable: route_allowed && !schema_quarantined && entry.enabled,
             allowed_groups: grant
                 .and_then(|grant| grant.allowed)
                 .map(|allowed| admin_group_names(&allowed, group_names)),
@@ -6983,12 +7643,50 @@ impl Plugin for McpGateway {
         "mcp_gateway"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
+    /// Start the at-rest session expiry sweep once the generation that owns
+    /// this instance is installed. Only an enabled aggregate instance mints
+    /// sessions, so only it needs the sweep. Idempotent: a concurrent second
+    /// call drops its own guard, which aborts the duplicate tasks.
+    fn commit_background_tasks(&self) {
+        if !self.enabled
+            || self.mode != McpGatewayMode::AggregateRouter
+            || self.session_reaper.get().is_some()
+        {
+            return;
+        }
+        if let Some(reaper) = spawn_session_reaper(
+            &self.session_store,
+            &self.session_catalogs_by_hash,
+            &self.sse_broker,
+            self.sessions.session_ttl,
+            self.servers.clone(),
+            self.sessions.upstream_session_header.clone(),
+            self.http_client.clone(),
+        ) {
+            let _ = self.session_reaper.set(reaper);
+        }
+    }
+
+    /// MCP session IDs are bearer-like: report the configured session header
+    /// names so they are redacted and withheld from secondary egress.
+    fn request_headers_to_redact(&self) -> &[String] {
+        &self.session_header_names
+    }
+
     fn mcp_gateway(&self) -> Option<&McpGateway> {
         Some(self)
     }
 
     fn priority(&self) -> u16 {
         super::priority::MCP_GATEWAY
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY | crate::plugins::PluginHooks::AFTER_PROXY
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -7151,9 +7849,27 @@ impl Plugin for McpGateway {
         }
         let name = self.sessions.upstream_session_header.as_str();
         let recorded = record.upstream_session.as_deref();
-        if !self.upstream_session_intact(recorded, headers) {
+        let session_intact = self.upstream_session_intact(recorded, headers);
+        if !session_intact {
             record.upstream_session_drift.store(true, Ordering::Relaxed);
-        } else if recorded.is_none() || header_value(headers, name).is_some() {
+        }
+        // The selected MCP upstream's credential boundary is re-asserted over
+        // the FINAL header map too: a later generic header rule or a
+        // finalized-egress overlay must neither carry a client / normal-backend
+        // credential to the tool-selected upstream nor replace that server's
+        // configured credential. Unrelated headers are left alone. An OpenAPI
+        // bridge call targets this proxy's own backend and keeps its
+        // allowlist.
+        if record.bridge.is_none()
+            && let Some(server) = self.servers.get(&record.server_id)
+            && server.upstream().is_some()
+        {
+            if !server.forward_client_credentials {
+                strip_client_credential_headers(ctx, headers);
+            }
+            server.headers.apply_to_map(headers);
+        }
+        if session_intact && (recorded.is_none() || header_value(headers, name).is_some()) {
             // Already exactly the recorded state.
             return;
         }
@@ -7216,10 +7932,22 @@ impl Plugin for McpGateway {
         // the context at this point: a later plugin that swapped or cleared
         // the identified consumer after `before_proxy` cannot carry an
         // ungranted call to the upstream.
-        match self.final_grant_denial(ctx) {
-            None => PluginResult::Continue,
-            Some(denial) => self.reject_final_grant(ctx, denial),
+        if let Some(denial) = self.final_grant_denial(ctx) {
+            return self.reject_final_grant(ctx, denial);
         }
+        // A schema-change quarantine set by any session after admission still
+        // stops the call before egress.
+        if Self::final_schema_quarantined(ctx) {
+            if self.observability.emit_metadata {
+                ctx.metadata.insert(
+                    "mcp.policy_decision".to_string(),
+                    "hidden_schema_changed".to_string(),
+                );
+                self.note_route_decision(ctx, "deny");
+            }
+            return Self::correlate_gateway_terminal(ctx, tool_call_denied(None), &[]);
+        }
+        PluginResult::Continue
     }
 
     async fn before_proxy(
@@ -7247,8 +7975,7 @@ impl Plugin for McpGateway {
             // A reserved descendant is refused, exactly like the 405 below, so
             // the decision has to read as a denial rather than as this plugin
             // never having applied.
-            ctx.metadata
-                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            self.note_route_decision(ctx, "deny");
             return PluginResult::Reject {
                 status_code: 404,
                 body: json_rpc_error_value(None, -32600, "Unknown MCP endpoint").to_string(),
@@ -7287,18 +8014,20 @@ impl Plugin for McpGateway {
                 }
                 return PluginResult::Continue;
             }
-            if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
-                if !self.touch_downstream_session(&session_id, ctx).await {
-                    return session_not_found_response();
-                }
-                self.remove_downstream_session(&session_id, ctx).await;
-                ctx.metadata
-                    .insert("mcp.session.downstream".to_string(), hash_str(&session_id));
+            // A DELETE that names no session terminates nothing. Answer the
+            // same HTTP 400 the POST path returns for a missing session header
+            // rather than a success the client cannot tell from a real
+            // termination.
+            let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
+                self.note_route_decision(ctx, "deny");
+                return missing_session_response(None);
+            };
+            if !self.touch_downstream_session(&session_id, ctx).await {
+                return session_not_found_response();
             }
-            ctx.metadata.insert(
-                "mcp.route_decision".to_string(),
-                "synthetic_response".to_string(),
-            );
+            self.remove_downstream_session(&session_id, ctx).await;
+            self.note_downstream_session(ctx, &session_id);
+            self.note_route_decision(ctx, "synthetic_response");
             return PluginResult::Reject {
                 status_code: 200,
                 body: "{}".to_string(),
@@ -7310,8 +8039,7 @@ impl Plugin for McpGateway {
         }
 
         if !ctx.method.eq_ignore_ascii_case("POST") {
-            ctx.metadata
-                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            self.note_route_decision(ctx, "deny");
             return PluginResult::Reject {
                 status_code: 405,
                 body: json!({"error": "unsupported MCP HTTP method"}).to_string(),
@@ -7377,7 +8105,13 @@ impl Plugin for McpGateway {
         _content_type: Option<&str>,
         _request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if !self.enabled || self.mode != McpGatewayMode::AggregateRouter {
+        // Every enabled aggregate instance on a proxy is invoked for every
+        // buffered request body, so ownership gates the WHOLE hook: a sibling
+        // instance on a disjoint endpoint must never consume the rewrite
+        // marker staged by the owning instance, nor clear the private
+        // tool-name mapping that keeps public governor policy identity across
+        // the owner's rewrite.
+        if self.mode != McpGatewayMode::AggregateRouter || !self.owns_request(ctx) {
             return None;
         }
         // A bridged call's backend body is the REST body built from the
@@ -7753,7 +8487,7 @@ impl Plugin for McpGateway {
         // converted (normalization skipped, or its replacement refused by the
         // retained-response budget) is never released as the raw REST body.
         if self.bridge_response_unconverted(ctx) {
-            Self::settle_sse_stream_inline(ctx);
+            self.settle_sse_stream_inline(ctx);
             let observed = ctx
                 .mcp_bridge
                 .as_ref()
@@ -7761,10 +8495,9 @@ impl Plugin for McpGateway {
             let result = unconverted_result(observed);
             return self.bridge_terminal(ctx, &result);
         }
-        let enforced =
-            self.enforce_final_response_body(ctx, response_status, response_headers, body);
+        let enforced = self.enforce_final_response_body(ctx, response_headers, body);
         if !matches!(enforced, PluginResult::Continue) {
-            Self::settle_sse_stream_inline(ctx);
+            self.settle_sse_stream_inline(ctx);
             return Self::correlate_gateway_terminal(ctx, enforced, body);
         }
         let deferred =
@@ -7831,7 +8564,6 @@ impl McpGateway {
     fn enforce_final_response_body(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
@@ -7967,6 +8699,459 @@ enum ResponseRewriteOutcome {
     Ambiguous,
 }
 
+/// Strip the client credential headers an aggregate-routed call must not carry
+/// to the tool-selected upstream: [`MCP_CLIENT_CREDENTIAL_HEADERS`] and every
+/// name in the route's credential-header registry (which also lists the
+/// configured `servers.*.headers` names, so a client copy cannot survive).
+/// Case-insensitive, allocation-free, and never logs a value.
+fn strip_client_credential_headers(ctx: &RequestContext, headers: &mut HashMap<String, String>) {
+    headers.retain(|name, _| {
+        !(MCP_CLIENT_CREDENTIAL_HEADERS
+            .iter()
+            .any(|credential| name.eq_ignore_ascii_case(credential))
+            || ctx.request_header_requires_redaction(name))
+    });
+}
+
+/// Everything needed to delete an upstream MCP session independently of the
+/// request that minted it.
+struct PendingUpstreamCleanup {
+    http_client: PluginHttpClient,
+    server: McpServerConfig,
+    upstream_session_header: String,
+    teardown: UpstreamSessionTeardown,
+    hops: Option<u8>,
+}
+
+impl PendingUpstreamCleanup {
+    async fn run(self, accumulator: &AtomicU64) {
+        delete_upstream_session(
+            &self.http_client,
+            &self.server,
+            &self.upstream_session_header,
+            self.teardown,
+            self.hops,
+            accumulator,
+        )
+        .await;
+    }
+
+    /// Own the DELETE independently of the request, including while its caller
+    /// awaits completion. Dropping the returned handle detaches the task.
+    fn spawn(self, accumulator: Arc<AtomicU64>) -> Option<tokio::task::JoinHandle<()>> {
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let server_id = self.server.server_id.clone();
+        Some(runtime.spawn(async move {
+            if tokio::time::timeout(REAPER_TEARDOWN_TIMEOUT, self.run(&accumulator))
+                .await
+                .is_err()
+            {
+                warn_sampled!(
+                    server_id = %server_id,
+                    "MCP upstream session cleanup after a failed initialize timed out"
+                );
+            }
+        }))
+    }
+}
+
+/// Cleanup ownership of an upstream session minted by an in-flight
+/// `initialize` that has not yet been committed to its downstream session.
+///
+/// Until [`Self::disarm`] runs, dropping the guard — an error return or a
+/// cancelled request future — spawns a bounded best-effort `DELETE` for the
+/// minted id, so neither a failed `notifications/initialized` nor a vanished
+/// downstream owner can leave the upstream session orphaned.
+struct PendingUpstreamSession {
+    cleanup: Option<PendingUpstreamCleanup>,
+}
+
+impl PendingUpstreamSession {
+    fn new(cleanup: Option<PendingUpstreamCleanup>) -> Self {
+        Self { cleanup }
+    }
+
+    /// Record the negotiated protocol version the cleanup `DELETE` carries.
+    fn set_protocol_version(&mut self, protocol_version: &str) {
+        if let Some(cleanup) = self.cleanup.as_mut() {
+            cleanup.teardown.protocol_version = protocol_version.to_string();
+        }
+    }
+
+    /// The upstream session was committed to its downstream session, whose
+    /// removal now owns its teardown.
+    fn disarm(&mut self) {
+        self.cleanup = None;
+    }
+
+    /// Await independently owned cleanup (the downstream owner is already
+    /// gone), charging the call to `accumulator` even if this request is cancelled.
+    async fn clean_up_now(&mut self, accumulator: &Arc<AtomicU64>) {
+        if let Some(cleanup) = self.cleanup.take()
+            && let Some(task) = cleanup.spawn(Arc::clone(accumulator))
+            && let Err(error) = task.await
+        {
+            warn_sampled!(error = %error, "MCP upstream session cleanup task failed");
+        }
+    }
+}
+
+impl Drop for PendingUpstreamSession {
+    fn drop(&mut self) {
+        let Some(cleanup) = self.cleanup.take() else {
+            return;
+        };
+        let _ = cleanup.spawn(Arc::new(AtomicU64::new(0)));
+    }
+}
+
+/// One initialized upstream MCP session to tear down, detached from its
+/// downstream session so the session's catalog and other state can be released
+/// before any network I/O.
+struct UpstreamSessionTeardown {
+    server_id: String,
+    upstream_session_id: String,
+    protocol_version: String,
+}
+
+/// The initialized upstream sessions of an already-removed downstream session.
+fn upstream_session_teardowns(session: DownstreamMcpSession) -> Vec<UpstreamSessionTeardown> {
+    let fallback_protocol_version = session.protocol_version;
+    session
+        .upstream_sessions
+        .into_iter()
+        .filter_map(|(server_id, upstream)| {
+            if !upstream.initialized {
+                return None;
+            }
+            let upstream_session_id = upstream.upstream_session_id?;
+            Some(UpstreamSessionTeardown {
+                server_id,
+                upstream_session_id,
+                protocol_version: upstream
+                    .protocol_version
+                    .unwrap_or_else(|| fallback_protocol_version.clone()),
+            })
+        })
+        .collect()
+}
+
+/// Issue the upstream `DELETE` for one upstream MCP session, carrying the
+/// server's configured `servers.*.headers`. Failures are logged, not fatal.
+async fn delete_upstream_session(
+    http_client: &PluginHttpClient,
+    server: &McpServerConfig,
+    upstream_session_header: &str,
+    teardown: UpstreamSessionTeardown,
+    hops: Option<u8>,
+    accumulator: &AtomicU64,
+) {
+    let Some((upstream_url, _)) = server.upstream() else {
+        return;
+    };
+    let Ok(client) = http_client.get() else {
+        return;
+    };
+    let request = client
+        .delete(upstream_url)
+        .header(upstream_session_header, teardown.upstream_session_id)
+        .header("mcp-protocol-version", teardown.protocol_version);
+    let request = server.headers.apply_to_request(request);
+    let request = crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(request, hops);
+    match http_client
+        .execute_redacted_tracked(
+            request,
+            "mcp_gateway.session_delete",
+            &redacted_endpoint_url_str(upstream_url),
+            accumulator,
+        )
+        .await
+    {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            warn!(
+                server_id = %server.server_id,
+                status = %response.status(),
+                "MCP upstream session delete returned non-success status"
+            );
+        }
+        Err(error) => {
+            warn!(
+                server_id = %server.server_id,
+                error = %error,
+                "MCP upstream session delete failed"
+            );
+        }
+    }
+}
+
+/// Issue the upstream `DELETE` for each initialized upstream session of an
+/// already-removed downstream session, one server at a time. Used by
+/// `initialize` eviction, which runs one of these per evicted session
+/// concurrently; the single-session request paths use
+/// [`delete_one_session_upstreams_concurrently`]. Request-scoped teardown
+/// passes the request's hop count.
+async fn delete_upstream_session_set(
+    http_client: &PluginHttpClient,
+    servers: &HashMap<String, McpServerConfig>,
+    upstream_session_header: &str,
+    session: DownstreamMcpSession,
+    hops: Option<u8>,
+    accumulator: &AtomicU64,
+) {
+    for teardown in upstream_session_teardowns(session) {
+        let Some(server) = servers.get(&teardown.server_id) else {
+            continue;
+        };
+        delete_upstream_session(
+            http_client,
+            server,
+            upstream_session_header,
+            teardown,
+            hops,
+            accumulator,
+        )
+        .await;
+    }
+}
+
+/// Issue the upstream `DELETE` for each initialized upstream session of ONE
+/// already-removed downstream session on its request path (session `DELETE`,
+/// expiry on touch), passing the request's hop count.
+///
+/// The `DELETE`s run concurrently, at most [`MAX_CONCURRENT_REAPER_TEARDOWNS`]
+/// in flight, so the request waits about one upstream round trip per wave of 8
+/// rather than one per upstream server. That is safe because each record names
+/// a distinct (server, upstream session) pair, no `DELETE` reads another's
+/// result, every failure is only logged, and the session is already out of the
+/// store; the reaper's cleanup worker already runs these same calls
+/// concurrently.
+///
+/// The calls overlap, so their individual durations are NOT summed into the
+/// request's external-I/O accumulator (that would report more I/O than
+/// wall-clock time); the batch's wall-clock wait is recorded once.
+async fn delete_one_session_upstreams_concurrently(
+    http_client: &PluginHttpClient,
+    servers: &HashMap<String, McpServerConfig>,
+    upstream_session_header: &str,
+    session: DownstreamMcpSession,
+    hops: Option<u8>,
+    accumulator: &AtomicU64,
+) {
+    let deletes: Vec<(&McpServerConfig, UpstreamSessionTeardown)> =
+        upstream_session_teardowns(session)
+            .into_iter()
+            .filter_map(|teardown| {
+                let server = servers.get(&teardown.server_id)?;
+                Some((server, teardown))
+            })
+            .collect();
+    if deletes.is_empty() {
+        return;
+    }
+    // Per-call durations land here and are discarded; see above.
+    let overlapping_call_ns = AtomicU64::new(0);
+    let overlapping_call_ns = &overlapping_call_ns;
+    // Credits the batch's wall-clock wait when this future completes OR is
+    // dropped mid-batch (client abort), so completed DELETEs stay counted.
+    let _wait_credit = TeardownWaitCredit {
+        accumulator,
+        started: Instant::now(),
+    };
+    futures_util::stream::iter(deletes)
+        .for_each_concurrent(
+            MAX_CONCURRENT_REAPER_TEARDOWNS,
+            move |(server, teardown)| {
+                delete_upstream_session(
+                    http_client,
+                    server,
+                    upstream_session_header,
+                    teardown,
+                    hops,
+                    overlapping_call_ns,
+                )
+            },
+        )
+        .await;
+}
+
+/// Credits one request-path teardown batch's wall-clock wait to the request's
+/// external-I/O accumulator exactly once, on drop: when the batch completes
+/// and when the request future is dropped mid-batch.
+struct TeardownWaitCredit<'a> {
+    accumulator: &'a AtomicU64,
+    started: Instant,
+}
+
+impl Drop for TeardownWaitCredit<'_> {
+    fn drop(&mut self) {
+        let waited_ns = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.accumulator.fetch_add(waited_ns, Ordering::Relaxed);
+    }
+}
+
+/// Shortest and longest period of the background session expiry sweep. The
+/// sweep runs every half `sessions.session_ttl_seconds`, within these bounds.
+const MIN_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(60);
+/// Upstream `DELETE`s the reaper's cleanup worker queues before it drops new
+/// ones (best-effort teardown never grows without bound).
+const MAX_PENDING_REAPER_TEARDOWNS: usize = 4096;
+/// Upstream `DELETE`s the cleanup worker runs at once.
+const MAX_CONCURRENT_REAPER_TEARDOWNS: usize = 8;
+/// Bound on one reaper upstream `DELETE`, so a slow upstream holds one of
+/// the worker's slots at most this long.
+const REAPER_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Owns one instance's background session reaper tasks — the expiry sweep and
+/// its upstream-cleanup worker — and aborts both on drop, so a reloaded,
+/// updated, or deleted instance never leaves maintenance running.
+struct McpSessionReaperGuard {
+    sweep: tokio::task::JoinHandle<()>,
+    cleanup: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for McpSessionReaperGuard {
+    fn drop(&mut self) {
+        self.sweep.abort();
+        self.cleanup.abort();
+    }
+}
+
+/// Spawn the periodic sweep that reclaims expired downstream sessions at rest.
+///
+/// Without it a session whose client vanished without `DELETE` is reclaimed
+/// only when that session id is presented again or a later `initialize`
+/// scans the store, so `sessions.session_ttl_seconds` would not bound how long
+/// its catalog, SSE broker slot, and upstream MCP sessions are retained. The
+/// sweep holds only WEAK references to the instance's session state, so it
+/// never extends the generation's lifetime (in particular the SSE broker's
+/// `Drop`-driven retirement), and exits once that state is gone. Removal goes
+/// through the same store / catalog-index / broker funnel as every other
+/// teardown, re-checking expiry atomically per entry.
+///
+/// The sweep never waits on the network. Each removed session is reduced to
+/// lightweight teardown records at once (its catalog is released) and handed
+/// to a separate cleanup worker through a bounded queue; the worker keeps at
+/// most [`MAX_CONCURRENT_REAPER_TEARDOWNS`] upstream `DELETE`s in flight, each
+/// bounded by [`REAPER_TEARDOWN_TIMEOUT`], starting the next as soon as one
+/// finishes, and a full queue drops new records (teardown is best-effort). A
+/// slow upstream therefore delays only its own cleanup, never the next expiry
+/// sweep. These calls are not request-scoped
+/// and carry no hop count. `None` when no Tokio runtime is current.
+fn spawn_session_reaper(
+    session_store: &Arc<DashMap<String, DownstreamMcpSession>>,
+    session_catalogs_by_hash: &Arc<DashMap<String, Arc<RwLock<McpCatalog>>>>,
+    sse_broker: &Arc<AggregateSseBroker>,
+    session_ttl: Duration,
+    servers: HashMap<String, McpServerConfig>,
+    upstream_session_header: String,
+    http_client: PluginHttpClient,
+) -> Option<McpSessionReaperGuard> {
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let store = Arc::downgrade(session_store);
+    let catalogs = Arc::downgrade(session_catalogs_by_hash);
+    let broker = Arc::downgrade(sse_broker);
+    let interval = (session_ttl / 2).clamp(MIN_SESSION_REAP_INTERVAL, MAX_SESSION_REAP_INTERVAL);
+    let (sender, mut receiver) =
+        tokio::sync::mpsc::channel::<UpstreamSessionTeardown>(MAX_PENDING_REAPER_TEARDOWNS);
+    let sweep = runtime.spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            let reaped = {
+                let (Some(store), Some(catalogs), Some(broker)) =
+                    (store.upgrade(), catalogs.upgrade(), broker.upgrade())
+                else {
+                    return;
+                };
+                reap_expired_sessions(&store, &catalogs, &broker, session_ttl)
+            };
+            for session in reaped {
+                for teardown in upstream_session_teardowns(session) {
+                    if sender.try_send(teardown).is_err() {
+                        warn_sampled!(
+                            "MCP session reaper cleanup queue is full; dropping a best-effort upstream session delete"
+                        );
+                    }
+                }
+            }
+        }
+    });
+    let cleanup = runtime.spawn(async move {
+        let servers = Arc::new(servers);
+        let upstream_session_header: Arc<str> = Arc::from(upstream_session_header);
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REAPER_TEARDOWNS));
+        // Owned by this task: aborting the worker drops the set, which aborts
+        // every in-flight delete with it.
+        let mut in_flight = tokio::task::JoinSet::new();
+        while let Some(teardown) = receiver.recv().await {
+            while in_flight.try_join_next().is_some() {}
+            let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+                break;
+            };
+            let servers = Arc::clone(&servers);
+            let http_client = http_client.clone();
+            let upstream_session_header = Arc::clone(&upstream_session_header);
+            in_flight.spawn(async move {
+                let _permit = permit;
+                let Some(server) = servers.get(&teardown.server_id) else {
+                    return;
+                };
+                // Not request-scoped: there is no request to attribute call
+                // time to.
+                let accumulator = AtomicU64::new(0);
+                let delete = delete_upstream_session(
+                    &http_client,
+                    server,
+                    &upstream_session_header,
+                    teardown,
+                    None,
+                    &accumulator,
+                );
+                if tokio::time::timeout(REAPER_TEARDOWN_TIMEOUT, delete)
+                    .await
+                    .is_err()
+                {
+                    warn_sampled!(
+                        server_id = %server.server_id,
+                        "MCP session reaper upstream session delete timed out"
+                    );
+                }
+            });
+        }
+        while in_flight.join_next().await.is_some() {}
+    });
+    Some(McpSessionReaperGuard { sweep, cleanup })
+}
+
+/// Remove every downstream session idle for at least `session_ttl`, with its
+/// catalog index entry and SSE broker session, returning the removed sessions
+/// for upstream teardown. Expiry is re-checked atomically per entry, so a
+/// session touched after the scan is kept.
+fn reap_expired_sessions(
+    session_store: &DashMap<String, DownstreamMcpSession>,
+    session_catalogs_by_hash: &DashMap<String, Arc<RwLock<McpCatalog>>>,
+    sse_broker: &AggregateSseBroker,
+    session_ttl: Duration,
+) -> Vec<DownstreamMcpSession> {
+    let expired: Vec<String> = session_store
+        .iter()
+        .filter(|entry| entry.value().last_seen.elapsed() >= session_ttl)
+        .map(|entry| entry.key().clone())
+        .collect();
+    let mut reaped = Vec::with_capacity(expired.len());
+    for key in expired {
+        if let Some((_, session)) = session_store.remove_if(&key, |_, session| {
+            session.last_seen.elapsed() >= session_ttl
+        }) {
+            session_catalogs_by_hash.remove(&hash_str(&key));
+            sse_broker.remove_session(&key);
+            reaped.push(session);
+        }
+    }
+    reaped
+}
+
 /// Stamp the request's gateway hop count on an upstream MCP call made on its
 /// behalf (initialize, the initialized notification, discovery, session
 /// `DELETE`) through the shared plugin-call helper.
@@ -7993,7 +9178,9 @@ fn mcp_request_content_type_is_json(value: &str) -> bool {
     mcp_content_type_is_json(value) && mcp_jsonrpc::content_type_charset_is_utf8(value)
 }
 
-pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String>) {
+pub(crate) fn redact_internal_log_metadata<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+) {
     metadata.remove(METADATA_RESPONSE_REWRITE_KEY);
     metadata.remove(METADATA_RESPONSE_REWRITE_METHOD_KEY);
     metadata.remove(METADATA_RESPONSE_REWRITE_SERVER_KEY);
@@ -8162,9 +9349,11 @@ fn reverse_resource_uri(
     upstream_uri: &str,
 ) -> ReverseResourceUri {
     let mut matched_public_uri: Option<&str> = None;
-    for entry in catalog.resources.values().filter(|entry| {
-        entry.enabled && entry.server_id == server_id && entry.upstream_uri == upstream_uri
-    }) {
+    for entry in catalog
+        .resources
+        .values()
+        .filter(|entry| entry.server_id == server_id && entry.upstream_uri == upstream_uri)
+    {
         if matched_public_uri.is_some_and(|public_uri| public_uri != entry.public_uri.as_str()) {
             return ReverseResourceUri::Ambiguous;
         }
@@ -8178,7 +9367,7 @@ fn reverse_resource_uri(
     for entry in catalog
         .resource_templates
         .values()
-        .filter(|entry| entry.enabled && entry.server_id == server_id)
+        .filter(|entry| entry.server_id == server_id)
     {
         let Some(public_uri) = expand_public_resource_template(entry, upstream_uri) else {
             continue;
@@ -8264,17 +9453,19 @@ fn parse_mcp_envelope_value(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     let params = object.get("params").cloned();
-    let result = object.get("result").cloned();
-    let error = object.get("error").cloned();
+    // Only the presence of `result` / `error` classifies the message; their
+    // values are forwarded in the body, never read here, so they are not copied.
+    let has_result = object.contains_key("result");
+    let has_error = object.contains_key("error");
     // JSON-RPC 2.0 forbids a message that is both a call and a reply. Such a
     // body would be classified as a reply yet dispatched by its method, so it
     // is refused rather than guessed at.
-    if object.contains_key("method") && (result.is_some() || error.is_some()) {
+    if object.contains_key("method") && (has_result || has_error) {
         return Err("JSON-RPC envelope must not mix method with result or error".to_string());
     }
-    let message_kind = if error.is_some() {
+    let message_kind = if has_error {
         McpMessageKind::ErrorResponse
-    } else if result.is_some() {
+    } else if has_result {
         McpMessageKind::Response
     } else if method.is_some() && id.is_none() {
         McpMessageKind::Notification
@@ -8290,8 +9481,6 @@ fn parse_mcp_envelope_value(
         raw_cancel_id: None,
         method,
         params,
-        result,
-        error,
         message_kind,
     })
 }
@@ -8433,6 +9622,10 @@ async fn upstream_sse_json_rpc_response(
 ) -> Result<Value, String> {
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
+    // Bytes of `buffer` already searched without finding an event delimiter.
+    // Each chunk resumes the search just before this point instead of
+    // rescanning the whole buffer.
+    let mut scanned = 0usize;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             warn!(
@@ -8455,10 +9648,8 @@ async fn upstream_sse_json_rpc_response(
                 "upstream MCP SSE event exceeded {MAX_UPSTREAM_SSE_EVENT_BYTES} bytes"
             ));
         }
-        while let Some((event_end, delimiter_len)) = find_sse_event_delimiter(&buffer) {
-            let event = buffer[..event_end].to_vec();
-            buffer.drain(..event_end + delimiter_len);
-            let event = std::str::from_utf8(&event).map_err(|error| {
+        while let Some((event_end, delimiter_len)) = find_sse_event_delimiter(&buffer, scanned) {
+            let event = std::str::from_utf8(&buffer[..event_end]).map_err(|error| {
                 warn!(
                     server_id,
                     method,
@@ -8470,7 +9661,10 @@ async fn upstream_sse_json_rpc_response(
             if let Some(value) = parse_sse_json_rpc_response(event) {
                 return Ok(value);
             }
+            buffer.drain(..event_end + delimiter_len);
+            scanned = 0;
         }
+        scanned = buffer.len();
     }
 
     if !buffer.is_empty() {
@@ -8495,7 +9689,17 @@ async fn upstream_sse_json_rpc_response(
     Err("upstream MCP SSE response did not contain a JSON-RPC response".to_string())
 }
 
-fn find_sse_event_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
+/// Earliest SSE event delimiter in `buffer`, searching from just before
+/// `scanned` (the prefix a previous call already searched). Backing up by one
+/// byte less than the longest delimiter finds a delimiter that straddles the
+/// previous end; one wholly inside the searched prefix would have been found
+/// then, so the earliest delimiter is never missed.
+fn find_sse_event_delimiter(buffer: &[u8], scanned: usize) -> Option<(usize, usize)> {
+    const LONGEST_DELIMITER: usize = 4;
+    let start = scanned
+        .saturating_sub(LONGEST_DELIMITER - 1)
+        .min(buffer.len());
+    let tail = &buffer[start..];
     [
         b"\n\n".as_slice(),
         b"\r\n\r\n".as_slice(),
@@ -8503,10 +9707,9 @@ fn find_sse_event_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
     ]
     .into_iter()
     .filter_map(|delimiter| {
-        buffer
-            .windows(delimiter.len())
+        tail.windows(delimiter.len())
             .position(|window| window == delimiter)
-            .map(|position| (position, delimiter.len()))
+            .map(|position| (start + position, delimiter.len()))
     })
     .min_by_key(|(position, _)| *position)
 }
@@ -8555,7 +9758,7 @@ pub(crate) fn compile_tool_output_schema(
     if !schema.is_object() && !schema.is_boolean() {
         return Err("outputSchema must be a JSON Schema object or boolean".to_string());
     }
-    audit_output_schema(schema)?;
+    audit_tool_schema(schema, "outputSchema")?;
     jsonschema::draft202012::options()
         .should_validate_formats(true)
         .build(schema)
@@ -8566,42 +9769,52 @@ pub(crate) fn compile_tool_output_schema(
 /// Audit a generated OpenAPI bridge tool schema under the same depth, node,
 /// and local-reference budgets as a discovered `outputSchema`.
 pub(crate) fn audit_bridge_tool_schema(schema: &Value) -> Result<(), String> {
-    audit_output_schema(schema)
+    audit_tool_schema(schema, "inputSchema")
 }
 
-fn audit_output_schema(schema: &Value) -> Result<(), String> {
+/// Bounded structural and local-reference audit shared by every tool schema
+/// the gateway compiles: discovered `inputSchema` and `outputSchema`, and
+/// generated OpenAPI bridge schemas.
+///
+/// `jsonschema` compiles a chain of distinct local references by recursing
+/// once per link, and nothing in the JSON parser bounds a flat `$defs` chain,
+/// so every upstream-supplied schema must pass this audit BEFORE it reaches
+/// the compiler on the request worker. `label` names the schema in the
+/// diagnostic (`inputSchema` / `outputSchema`).
+fn audit_tool_schema(schema: &Value, label: &'static str) -> Result<(), String> {
     let mut nodes = 0usize;
-    audit_output_schema_structure(schema, 0, &mut nodes)?;
+    audit_output_schema_structure(schema, 0, &mut nodes, label)?;
     let mut max_depth_seen = HashMap::new();
     let mut active = HashSet::new();
-    audit_output_schema_node(schema, schema, 0, &mut max_depth_seen, &mut active)
+    audit_output_schema_node(schema, schema, 0, &mut max_depth_seen, &mut active, label)
 }
 
 fn audit_output_schema_structure(
     node: &Value,
     depth: usize,
     nodes: &mut usize,
+    label: &'static str,
 ) -> Result<(), String> {
     if depth > MAX_OUTPUT_SCHEMA_DEPTH {
         return Err(format!(
-            "outputSchema nests deeper than the {MAX_OUTPUT_SCHEMA_DEPTH}-level schema budget"
+            "{label} nests deeper than the {MAX_OUTPUT_SCHEMA_DEPTH}-level schema budget"
         ));
     }
     *nodes += 1;
     if *nodes > MAX_OUTPUT_SCHEMA_NODES {
         return Err(format!(
-            "outputSchema exceeds the {MAX_OUTPUT_SCHEMA_NODES}-node schema budget"
+            "{label} exceeds the {MAX_OUTPUT_SCHEMA_NODES}-node schema budget"
         ));
     }
     match node {
         Value::Array(items) => {
             for item in items {
-                audit_output_schema_structure(item, depth + 1, nodes)?;
+                audit_output_schema_structure(item, depth + 1, nodes, label)?;
             }
         }
         Value::Object(map) => {
             for value in map.values() {
-                audit_output_schema_structure(value, depth + 1, nodes)?;
+                audit_output_schema_structure(value, depth + 1, nodes, label)?;
             }
         }
         _ => {}
@@ -8615,10 +9828,11 @@ fn audit_output_schema_node(
     depth: usize,
     max_depth_seen: &mut HashMap<usize, usize>,
     active: &mut HashSet<usize>,
+    label: &'static str,
 ) -> Result<(), String> {
     if depth > MAX_OUTPUT_SCHEMA_REF_DEPTH {
         return Err(format!(
-            "outputSchema exceeds the {MAX_OUTPUT_SCHEMA_REF_DEPTH}-level schema-walk budget"
+            "{label} exceeds the {MAX_OUTPUT_SCHEMA_REF_DEPTH}-level schema-walk budget"
         ));
     }
     let identity = std::ptr::from_ref(node) as usize;
@@ -8636,35 +9850,48 @@ fn audit_output_schema_node(
         return Ok(());
     };
     active.insert(identity);
-    for key in ["$ref", "$dynamicRef"] {
+    // Every reference keyword any supported draft compiles: `$ref`, the
+    // 2020-12 `$dynamicRef`, and the 2019-09 `$recursiveRef`.
+    for key in ["$ref", "$dynamicRef", "$recursiveRef"] {
         if let Some(value) = map.get(key) {
             let Some(reference) = value.as_str() else {
-                return Err(format!("outputSchema has a non-string '{key}'"));
+                return Err(format!("{label} has a non-string '{key}'"));
             };
             if !reference.starts_with('#') {
                 return Err(format!(
-                    "outputSchema has a non-local '{key}'; only local references (starting with '#') are supported and no external reference is ever retrieved"
+                    "{label} has a non-local '{key}'; only local references (starting with '#') are supported and no external reference is ever retrieved"
                 ));
             }
-            if let Some(target) = local_output_schema_pointer_target(document, reference, key)? {
-                audit_output_schema_node(target, document, depth + 1, max_depth_seen, active)?;
+            if let Some(target) =
+                local_output_schema_pointer_target(document, reference, key, label)?
+            {
+                audit_output_schema_node(
+                    target,
+                    document,
+                    depth + 1,
+                    max_depth_seen,
+                    active,
+                    label,
+                )?;
             }
         }
     }
     for key in ["$id", "id"] {
         if let Some(value) = map.get(key) {
             let Some(id) = value.as_str() else {
-                return Err(format!("outputSchema has a non-string '{key}'"));
+                return Err(format!("{label} has a non-string '{key}'"));
             };
             if !id.starts_with('#') && !id.is_empty() {
                 return Err(format!(
-                    "outputSchema has a non-local '{key}'; only fragment identifiers are supported"
+                    "{label} has a non-local '{key}'; only fragment identifiers are supported"
                 ));
             }
         }
     }
     if map.contains_key("$vocabulary") {
-        return Err("outputSchema declares '$vocabulary', which is not supported".to_string());
+        return Err(format!(
+            "{label} declares '$vocabulary', which is not supported"
+        ));
     }
     for (key, value) in map {
         match key.as_str() {
@@ -8677,6 +9904,7 @@ fn audit_output_schema_node(
                             depth + 1,
                             max_depth_seen,
                             active,
+                            label,
                         )?;
                     }
                 }
@@ -8690,14 +9918,37 @@ fn audit_output_schema_node(
                             depth + 1,
                             max_depth_seen,
                             active,
+                            label,
                         )?;
                     }
                 }
-                other => {
-                    audit_output_schema_node(other, document, depth + 1, max_depth_seen, active)?
-                }
+                other => audit_output_schema_node(
+                    other,
+                    document,
+                    depth + 1,
+                    max_depth_seen,
+                    active,
+                    label,
+                )?,
             },
+            // Draft 4-7 `dependencies`: a schema-valued entry is compiled like
+            // `dependentSchemas`; an array-valued entry is a property list.
+            "dependencies" => {
+                if let Some(object) = value.as_object() {
+                    for child in object.values().filter(|child| !child.is_array()) {
+                        audit_output_schema_node(
+                            child,
+                            document,
+                            depth + 1,
+                            max_depth_seen,
+                            active,
+                            label,
+                        )?;
+                    }
+                }
+            }
             "additionalProperties"
+            | "additionalItems"
             | "unevaluatedProperties"
             | "unevaluatedItems"
             | "contains"
@@ -8707,7 +9958,14 @@ fn audit_output_schema_node(
             | "then"
             | "else"
             | "contentSchema" => {
-                audit_output_schema_node(value, document, depth + 1, max_depth_seen, active)?;
+                audit_output_schema_node(
+                    value,
+                    document,
+                    depth + 1,
+                    max_depth_seen,
+                    active,
+                    label,
+                )?;
             }
             "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
                 if let Some(items) = value.as_array() {
@@ -8718,6 +9976,7 @@ fn audit_output_schema_node(
                             depth + 1,
                             max_depth_seen,
                             active,
+                            label,
                         )?;
                     }
                 }
@@ -8733,6 +9992,7 @@ fn local_output_schema_pointer_target<'a>(
     document: &'a Value,
     reference: &str,
     key: &str,
+    label: &'static str,
 ) -> Result<Option<&'a Value>, String> {
     let Some(pointer) = reference.strip_prefix('#') else {
         return Ok(None);
@@ -8741,17 +10001,17 @@ fn local_output_schema_pointer_target<'a>(
         return Ok(Some(document));
     }
     let pointer = percent_decode_str(pointer).decode_utf8().map_err(|_| {
-        format!("outputSchema '{key}' has a local JSON Pointer fragment that is not valid UTF-8")
+        format!("{label} '{key}' has a local JSON Pointer fragment that is not valid UTF-8")
     })?;
     if !pointer.starts_with('/') {
         return Err(format!(
-            "outputSchema '{key}' must be a JSON Pointer fragment (starting with '#/')"
+            "{label} '{key}' must be a JSON Pointer fragment (starting with '#/')"
         ));
     }
     match document.pointer(pointer.as_ref()) {
         Some(target) => Ok(Some(target)),
         None => Err(format!(
-            "outputSchema '{key}' target '{reference}' was not found"
+            "{label} '{key}' target '{reference}' was not found"
         )),
     }
 }
@@ -9026,13 +10286,22 @@ fn json_response(
     body: Value,
     session_header: Option<(&str, &str)>,
 ) -> PluginResult {
+    json_body_response(status_code, body.to_string(), session_header)
+}
+
+/// [`json_response`] for a body that is already serialized JSON.
+fn json_body_response(
+    status_code: u16,
+    body: String,
+    session_header: Option<(&str, &str)>,
+) -> PluginResult {
     let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     if let Some((name, value)) = session_header {
         headers.insert(name.to_ascii_lowercase(), value.to_string());
     }
     PluginResult::Reject {
         status_code,
-        body: body.to_string(),
+        body,
         headers,
     }
 }
@@ -9218,7 +10487,6 @@ struct ToolDefinitionParts {
     input_validator: Arc<jsonschema::Validator>,
     output_validator: Option<Arc<jsonschema::Validator>>,
     schema_hash: String,
-    description_hash: String,
 }
 
 /// Session-independent catalog parts of one listed tool definition, or `None`
@@ -9247,6 +10515,20 @@ fn tool_definition_parts(
         // only, so it cannot hide or remove an otherwise valid tool.
         hash_value(&input_schema)
     };
+    // The upstream-supplied inputSchema reaches the recursive `jsonschema`
+    // compiler on the request worker, whether or not argument validation is
+    // enforced, so it must pass the same bounded depth / node / local-`$ref`
+    // walk audit as `outputSchema` first. A refused schema omits only this
+    // tool; healthy siblings stay listed.
+    if let Err(error) = audit_tool_schema(&input_schema, "inputSchema") {
+        warn!(
+            server_id = %server.server_id,
+            tool = %name,
+            error = %error,
+            "Skipping MCP tool with an inputSchema outside the schema admission budget"
+        );
+        return None;
+    }
     let input_validator = match jsonschema::validator_for(&input_schema) {
         Ok(validator) => Arc::new(validator),
         Err(error) => {
@@ -9282,7 +10564,6 @@ fn tool_definition_parts(
         .get("description")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let description_hash = hash_value(&Value::String(description.clone().unwrap_or_default()));
     Some(ToolDefinitionParts {
         public_name,
         upstream_name: name,
@@ -9297,7 +10578,6 @@ fn tool_definition_parts(
         input_validator,
         output_validator,
         schema_hash,
-        description_hash,
     })
 }
 
@@ -9329,26 +10609,67 @@ fn build_bridge_tool_parts(
     built
 }
 
-fn tool_entry_to_public_value(entry: &ToolCatalogEntry) -> Value {
-    let mut object = Map::new();
-    object.insert("name".to_string(), Value::String(entry.public_name.clone()));
-    if let Some(title) = &entry.title {
-        object.insert("title".to_string(), Value::String(title.clone()));
+/// `tools/list` response, serialized by reference from the session catalog.
+#[derive(serde::Serialize)]
+struct ToolsListResponse<'a> {
+    jsonrpc: &'static str,
+    id: &'a Value,
+    result: ToolsListResult<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct ToolsListResult<'a> {
+    tools: Vec<PublicToolItem<'a>>,
+}
+
+/// One public `tools/list` item. Borrows the entry's `Arc`-shared schemas
+/// instead of cloning them; only the namespaced description is built.
+#[derive(serde::Serialize)]
+struct PublicToolItem<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(rename = "inputSchema")]
+    input_schema: &'a Value,
+    #[serde(rename = "outputSchema", skip_serializing_if = "Option::is_none")]
+    output_schema: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annotations: Option<&'a Value>,
+}
+
+impl<'a> PublicToolItem<'a> {
+    fn from_entry(entry: &'a ToolCatalogEntry) -> Self {
+        Self {
+            name: &entry.public_name,
+            title: entry.title.as_deref(),
+            description: entry
+                .description
+                .as_ref()
+                .map(|description| format!("[{}] {}", entry.namespace, description)),
+            input_schema: &entry.input_schema,
+            output_schema: entry.output_schema.as_deref(),
+            annotations: entry.annotations.as_ref(),
+        }
     }
-    if let Some(description) = &entry.description {
-        object.insert(
-            "description".to_string(),
-            Value::String(format!("[{}] {}", entry.namespace, description)),
-        );
+}
+
+/// Serialized size of `value` as compact JSON, without allocating the bytes.
+fn serialized_json_len(value: &Value) -> serde_json::Result<usize> {
+    struct ByteCounter(usize);
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-    object.insert("inputSchema".to_string(), Value::clone(&entry.input_schema));
-    if let Some(output_schema) = &entry.output_schema {
-        object.insert("outputSchema".to_string(), Value::clone(output_schema));
-    }
-    if let Some(annotations) = &entry.annotations {
-        object.insert("annotations".to_string(), annotations.clone());
-    }
-    Value::Object(object)
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
 }
 
 fn prompt_entry_to_public_value(entry: &PromptCatalogEntry) -> Value {
@@ -9504,9 +10825,7 @@ fn resource_template_route(catalog: &McpCatalog, public_uri: &str) -> Option<(St
         .resource_templates
         .values()
         .find(|entry| {
-            entry.enabled
-                && entry.server_id == server_id
-                && entry.uri_template_regex.is_match(&upstream_uri)
+            entry.server_id == server_id && entry.uri_template_regex.is_match(&upstream_uri)
         })
         .map(|entry| (entry.server_id.clone(), upstream_uri))
 }
@@ -9518,13 +10837,42 @@ fn hash_value(value: &Value) -> String {
     }
 }
 
+/// Record a client-supplied identifier in request metadata, bounded by
+/// [`MAX_LOGGED_IDENTIFIER_BYTES`]. A longer value keeps its prefix (cut at a
+/// UTF-8 boundary) followed by `...sha256:` and the hex SHA-256 of the complete
+/// value, so distinct long values stay distinguishable in logs without being
+/// copied in full (`GHSA-f5px-j9pq-7cxm`).
+fn bounded_metadata_identifier(value: &str) -> String {
+    if value.len() <= MAX_LOGGED_IDENTIFIER_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_LOGGED_IDENTIFIER_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...sha256:{}", &value[..end], hash_str(value))
+}
+
+/// Verify-by-default backend TLS for every directly routed MCP upstream, built
+/// once so routing a request clones an `Arc` instead of allocating a config.
+static DEFAULT_UPSTREAM_TLS: LazyLock<Arc<BackendTlsConfig>> =
+    LazyLock::new(|| Arc::new(BackendTlsConfig::default_verify()));
+
 fn hash_str(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
 
+/// Case-insensitive header lookup that prefers the lowercase map key. Every
+/// built-in caller passes a lowercase literal, so `name` is lowercased (one
+/// allocation) only when it actually contains an uppercase byte, such as an
+/// operator-configured session header name.
 fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
-    headers
-        .get(&name.to_ascii_lowercase())
+    let lowercase_hit = if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        headers.get(&name.to_ascii_lowercase())
+    } else {
+        headers.get(name)
+    };
+    lowercase_hit
         .or_else(|| {
             headers
                 .iter()
@@ -9616,10 +10964,10 @@ fn optional_u64_from_object(
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(value)) => value
             .as_u64()
-            .ok_or_else(|| format!("mcp_gateway: `{key}` must be a positive integer"))
+            .ok_or_else(|| format!("mcp_gateway: `{key}` must be a non-negative integer"))
             .map(Some),
         Some(other) => Err(format!(
-            "mcp_gateway: `{key}` must be a positive integer, got {other:?}",
+            "mcp_gateway: `{key}` must be a non-negative integer, got {other:?}",
             other = other.to_string()
         )),
     }
@@ -9718,8 +11066,6 @@ fn parse_discovery(object: &Map<String, Value>) -> Result<McpDiscoveryConfig, St
             .unwrap_or(true),
         namespace_separator,
         cache_ttl: Duration::from_secs(cache_ttl_seconds),
-        hide_denied_items: optional_bool_from_object(discovery, "hide_denied_items")?
-            .unwrap_or(true),
         on_new_tool,
         on_schema_change,
     })
@@ -9925,12 +11271,137 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
     {
         return Err("mcp_gateway: `policy.tools` must be an object".to_string());
     }
+    let default_prompt_action =
+        parse_item_default_action(policy, "default_prompt_action")?.unwrap_or(default_action);
+    let default_resource_action =
+        parse_item_default_action(policy, "default_resource_action")?.unwrap_or(default_action);
+    let prompts = parse_item_policy_map(policy, "prompts")?;
+    let resources = parse_item_policy_map(policy, "resources")?;
+    let (exact_resource_denies, template_resource_denies) =
+        parse_resource_deny_bindings(&resources)?;
     Ok(McpPolicy {
         default_action,
         hide_denied_tools,
         tools,
+        default_prompt_action,
+        default_resource_action,
+        prompts,
+        resources,
+        exact_resource_denies,
+        template_resource_denies,
         grant_groups,
     })
+}
+
+/// Decode every non-allow `policy.resources` key into the upstream identity it
+/// denies, so resource denies are enforced from configuration and never fail
+/// open because a session's catalog lacks the binding (a failed or partial
+/// `resources/list` / `resources/templates/list`).
+///
+/// A key in `mcp://{server_id}/{percent-encoded upstream URI}` form is an exact
+/// deny; one carrying a `{...}` expression is a template deny and must decode
+/// to a valid URI template (the public template URI keeps expressions raw and
+/// percent-encodes the literal parts). A template deny that cannot be compiled
+/// is refused at load: silently ignoring it would leave its resources open. An
+/// exact key in any other form can only ever match that exact requested
+/// spelling, which the per-key lookup already handles.
+fn parse_resource_deny_bindings(
+    resources: &HashMap<String, PolicyAction>,
+) -> Result<ResourceDenyBindings, String> {
+    let mut exact = HashSet::new();
+    let mut templates = Vec::new();
+    for (key, action) in resources {
+        if *action == PolicyAction::Allow {
+            continue;
+        }
+        let is_template = key.contains('{');
+        let decoded = key
+            .strip_prefix("mcp://")
+            .and_then(|rest| rest.split_once('/'))
+            .and_then(|(server_id, encoded)| {
+                percent_decode_str(encoded)
+                    .decode_utf8()
+                    .ok()
+                    .map(|upstream| (server_id.to_string(), upstream.into_owned()))
+            });
+        match (decoded, is_template) {
+            (Some((server_id, upstream_template)), true) => {
+                let matcher = uri_template_regex(&upstream_template).map_err(|_| {
+                    "mcp_gateway: `policy.resources` template deny keys must be public resource-template URIs (`mcp://{server_id}/...` with valid `{...}` expressions)".to_string()
+                })?;
+                templates.push((server_id, Arc::new(matcher)));
+            }
+            (None, true) => {
+                return Err(
+                    "mcp_gateway: `policy.resources` template deny keys must be public resource-template URIs (`mcp://{server_id}/...` with valid `{...}` expressions)".to_string(),
+                );
+            }
+            (Some(identity), false) => {
+                exact.insert(identity);
+            }
+            (None, false) => {}
+        }
+    }
+    Ok((exact, templates))
+}
+
+/// Exact `(server_id, upstream URI)` denies and compiled template denies.
+type ResourceDenyBindings = (HashSet<(String, String)>, Vec<(String, Arc<Regex>)>);
+
+/// `allow` / `deny` action spelling shared by the prompt and resource
+/// families. `hide_from_discovery` is a tool-only action: a prompt or resource
+/// that is not allowed is never listed and never routed.
+fn parse_item_action(value: &str, field: &str) -> Result<PolicyAction, String> {
+    match value {
+        "allow" => Ok(PolicyAction::Allow),
+        "deny" => Ok(PolicyAction::Deny),
+        other => Err(format!(
+            "mcp_gateway: `{field}` must be `allow` or `deny`, got {other:?}"
+        )),
+    }
+}
+
+/// `policy.default_prompt_action` / `policy.default_resource_action`, `None`
+/// when omitted (the family then inherits `policy.default_action`).
+fn parse_item_default_action(
+    policy: Option<&Map<String, Value>>,
+    key: &'static str,
+) -> Result<Option<PolicyAction>, String> {
+    optional_string_from_object(policy, key)?
+        .map(|value| parse_item_action(&value, &format!("policy.{key}")))
+        .transpose()
+}
+
+/// `policy.prompts` / `policy.resources`: an operator-keyed map whose entries
+/// are closed `{ action }` objects.
+fn parse_item_policy_map(
+    policy: Option<&Map<String, Value>>,
+    family: &'static str,
+) -> Result<HashMap<String, PolicyAction>, String> {
+    let mut entries = HashMap::new();
+    match policy.and_then(|policy| policy.get(family)) {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(map)) => {
+            for (key, entry) in map {
+                let object = entry.as_object().ok_or_else(|| {
+                    format!("mcp_gateway: `policy.{family}` entries must be objects")
+                })?;
+                reject_unknown_mcp_keys(
+                    object,
+                    &format!("config.policy.{family}.*"),
+                    MCP_POLICY_ITEM_KEYS,
+                )?;
+                let field = format!("policy.{family}.*.action");
+                let action = optional_string(object, "action")?
+                    .ok_or_else(|| format!("mcp_gateway: `{field}` is required"))?;
+                entries.insert(key.clone(), parse_item_action(action, &field)?);
+            }
+        }
+        Some(_) => {
+            return Err(format!("mcp_gateway: `policy.{family}` must be an object"));
+        }
+    }
+    Ok(entries)
 }
 
 /// Refuse a group-conditioned `policy.tools` key that no catalog tool can
@@ -10193,6 +11664,7 @@ fn parse_observability(object: &Map<String, Value>) -> Result<McpObservabilityCo
 fn parse_servers(
     object: &Map<String, Value>,
     default_initialize_strategy: InitializeStrategy,
+    mode: McpGatewayMode,
 ) -> Result<HashMap<String, McpServerConfig>, String> {
     let servers_value = object
         .get("servers")
@@ -10253,6 +11725,19 @@ fn parse_servers(
             .map(|value| InitializeStrategy::parse(value, "servers.*.initialize_strategy"))
             .transpose()?
             .unwrap_or(default_initialize_strategy);
+        // Presence matters, as for the other inert transparent-mode fields:
+        // transparent mode forwards the client's request unchanged to its one
+        // upstream, so the opt-in has nothing to opt into.
+        if mode == McpGatewayMode::TransparentProxy
+            && object.contains_key("forward_client_credentials")
+        {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `forward_client_credentials` requires mode `aggregate_router`; `transparent_proxy` forwards the client's request unchanged to its single upstream"
+            ));
+        }
+        let forward_client_credentials =
+            optional_bool(object, "forward_client_credentials")?.unwrap_or(false);
+        let headers = parse_server_headers(object, server_id)?;
         servers.insert(
             server_id.clone(),
             McpServerConfig {
@@ -10264,10 +11749,94 @@ fn parse_servers(
                 expose_resources: optional_bool(object, "expose_resources")?.unwrap_or(false),
                 expose_prompts: optional_bool(object, "expose_prompts")?.unwrap_or(false),
                 initialize_strategy,
+                headers,
+                forward_client_credentials,
             },
         );
     }
     Ok(servers)
+}
+
+/// Parse `servers.*.headers`: a closed name → value map applied to every
+/// gateway-originated request to the server and to every routed call to it.
+///
+/// A value that is exactly `${FERRUM_PLUGIN_SECRET_<NAME>}` is resolved from
+/// the process environment at load through the shared plugin-secret
+/// namespace; any other `${...}` reference is refused before anything is read.
+/// The final value must be a valid HTTP header value. Names must be valid
+/// HTTP header names, unique case-insensitively, and none of the
+/// gateway-owned request headers (see [`MCP_SERVER_HEADER_RESERVED`]).
+/// Diagnostics never echo a configured name or value.
+fn parse_server_headers(
+    object: &Map<String, Value>,
+    server_id: &str,
+) -> Result<McpUpstreamHeaders, String> {
+    let map = match object.get("headers") {
+        None | Some(Value::Null) => return Ok(McpUpstreamHeaders::empty()),
+        Some(Value::Object(map)) => map,
+        Some(_) => {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `headers` must be an object"
+            ));
+        }
+    };
+    if map.len() > MAX_MCP_SERVER_HEADERS {
+        return Err(format!(
+            "mcp_gateway: server {server_id:?} `headers` must not configure more than {MAX_MCP_SERVER_HEADERS} headers"
+        ));
+    }
+    let mut resolved: Vec<(String, String)> = Vec::with_capacity(map.len());
+    for (name, value) in map {
+        if http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `headers` keys must be valid HTTP header names"
+            ));
+        }
+        let lower = name.to_ascii_lowercase();
+        if mcp_server_header_is_reserved(&lower) {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `headers` may not set a gateway-owned request header (hop-by-hop, framing, content negotiation, `mcp-protocol-version`, `last-event-id`, `host`, forwarding, hop-count, or `x-consumer-*` assertion headers)"
+            ));
+        }
+        if resolved.iter().any(|(existing, _)| existing == &lower) {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `headers` names one header more than once (names are case-insensitive)"
+            ));
+        }
+        let Some(raw) = value.as_str() else {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `headers` values must be strings"
+            ));
+        };
+        let field = format!("mcp_gateway: server {server_id:?} `headers` value");
+        let value = match raw
+            .strip_prefix("${")
+            .and_then(|rest| rest.strip_suffix('}'))
+        {
+            Some(reference) => crate::plugins::utils::plugin_secret_env::resolve_plugin_secret_env(
+                &field, reference,
+            )?,
+            None => raw.to_string(),
+        };
+        if value.is_empty() {
+            return Err(format!("{field} must not be empty"));
+        }
+        if http::HeaderValue::from_str(&value).is_err() {
+            return Err(format!("{field} is not a valid HTTP header value"));
+        }
+        resolved.push((lower, value));
+    }
+    Ok(McpUpstreamHeaders(Arc::from(resolved)))
+}
+
+/// Whether a lowercase header name is owned by the gateway or the transport on
+/// an upstream MCP request (session header names are checked separately,
+/// against the configured `sessions.*` names).
+fn mcp_server_header_is_reserved(lower: &str) -> bool {
+    MCP_SERVER_HEADER_RESERVED.contains(&lower)
+        || crate::proxy::headers::is_backend_request_strip_header(lower)
+        || crate::proxy::headers::is_proxy_generated_forwarding_header(lower)
+        || crate::proxy::headers::is_gateway_assertion_header(lower)
 }
 
 /// Whether the matched route's `allowed_methods` (when set) admits the method
@@ -10289,38 +11858,70 @@ fn bridge_method_is_allowed(allowed_methods: Option<&[String]>, method: &str) ->
 /// the proxy dispatches for a direct request to that same public path.
 ///
 /// The router matched this MCP request's own path, so its strip offset names
-/// the proxy's literal listen prefix. With `strip_listen_path` an operation
-/// path under that prefix loses it exactly as a direct request would, and the
-/// proxy then joins the remainder onto its `backend_path` as usual (a
-/// non-absolute route override). `None` when the operation path is not under
-/// the prefix: a direct request to it could never reach this proxy, so the
-/// bridge refuses rather than inventing a route.
+/// the proxy's listen prefix whether or not the proxy strips it. An operation
+/// path must sit under that prefix on a segment boundary: otherwise a direct
+/// request to it could never reach this proxy, so the bridge refuses (`None`)
+/// rather than inventing a route. That containment is decided BEFORE
+/// `strip_listen_path` is consulted (GHSA-26x8-8jq5-f73p): a non-stripping
+/// proxy forwards the full public path, so skipping the check there let an
+/// operation reach any backend path outside the route. With
+/// `strip_listen_path` the operation path then loses the prefix exactly as a
+/// direct request would, and the proxy joins the remainder onto its
+/// `backend_path` as usual (a non-absolute route override). A host-only route
+/// (offset 0) has no path boundary to enforce.
+///
+/// The offset is a listen PREFIX only on a literal-prefix route. An exact
+/// (`=`) route serves only its own path, which is this MCP endpoint, and a
+/// regex (`~`) route is anchored to the whole request path, so its offset is
+/// the endpoint's full length too; neither route can serve another public
+/// path that this gateway may bridge, and deciding regex reachability would
+/// need the router's compiled matcher. Both refuse every bridged call.
 fn bridge_backend_path(ctx: &RequestContext, public_path: &str) -> Option<String> {
+    if ctx
+        .matched_proxy
+        .as_deref()
+        .and_then(|proxy| proxy.listen_path.as_deref())
+        .is_some_and(|listen_path| listen_path.starts_with(['=', '~']))
+    {
+        return None;
+    }
     let strip_len = ctx.matched_path_strip_len();
-    let strips = strip_len > 0
-        && ctx
-            .matched_proxy
-            .as_deref()
-            .is_some_and(|proxy| proxy.strip_listen_path);
-    if !strips {
+    if strip_len == 0 {
         return Some(public_path.to_string());
     }
     let prefix = ctx.path.get(..strip_len)?;
     let rest = public_path.strip_prefix(prefix)?;
-    if rest.is_empty() {
+    if !(rest.is_empty() || rest.starts_with('/') || prefix.ends_with('/')) {
+        return None;
+    }
+    let strips = ctx
+        .matched_proxy
+        .as_deref()
+        .is_some_and(|proxy| proxy.strip_listen_path);
+    if !strips {
+        Some(public_path.to_string())
+    } else if rest.is_empty() {
         Some("/".to_string())
     } else if rest.starts_with('/') {
         Some(rest.to_string())
-    } else if prefix.ends_with('/') {
-        Some(format!("/{rest}"))
     } else {
-        None
+        Some(format!("/{rest}"))
     }
 }
 
 /// An OpenAPI bridge server publishes tools only and has no MCP upstream to
 /// initialize, so the upstream-only fields are refused rather than ignored.
 fn reject_bridge_server_fields(object: &Map<String, Value>, server_id: &str) -> Result<(), String> {
+    // A bridged call goes to this proxy's own backend with an allowlisted
+    // header set (`openapi.forward_request_headers`); MCP-upstream header
+    // and credential-forwarding settings would be inert.
+    for field in ["headers", "forward_client_credentials"] {
+        if object.get(field).is_some_and(|value| !value.is_null()) {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `{field}` requires `upstream_url`: an `openapi` server calls this proxy's own backend"
+            ));
+        }
+    }
     for field in ["expose_resources", "expose_prompts"] {
         if object.get(field).and_then(Value::as_bool) == Some(true) {
             return Err(format!(
@@ -10343,11 +11944,13 @@ fn reject_bridge_server_fields(object: &Map<String, Value>, server_id: &str) -> 
 /// cannot decide on its own.
 fn validate_bridge_servers(
     mode: McpGatewayMode,
+    endpoint_path: &str,
     servers: &HashMap<String, McpServerConfig>,
     sessions: &McpSessionConfig,
     validation: &McpValidationConfig,
     real_ip_header: Option<&str>,
 ) -> Result<(), String> {
+    let endpoint_scope = endpoint_path.trim_end_matches('/');
     for server in servers.values() {
         let Some(bridge) = server.bridge() else {
             continue;
@@ -10356,6 +11959,18 @@ fn validate_bridge_servers(
         if mode != McpGatewayMode::AggregateRouter {
             return Err(format!(
                 "mcp_gateway: server {server_id:?} `openapi` requires mode `aggregate_router` because `transparent_proxy` forwards MCP JSON-RPC to one MCP upstream"
+            ));
+        }
+        // The endpoint claims its whole subtree (case variants and encoded
+        // suffixes included) and answers 404 there, so an operation that can
+        // land inside it, through a literal or a path parameter value, is
+        // unreachable to direct clients of the same route (#7406).
+        if bridge
+            .operation_path_templates()
+            .any(|path| path_template_may_enter_endpoint_scope(endpoint_scope, path))
+        {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `openapi.operations` declares a `path` that can fall inside the `endpoint.path` scope (a literal match or a path parameter that can spell it); the MCP endpoint reserves its whole path subtree ASCII case-insensitively, so move `endpoint.path` to a path no operation can produce"
             ));
         }
         if bridge.tool_count() > validation.max_catalog_items_per_list {
@@ -10450,6 +12065,162 @@ fn authority_for_host_port(
     match explicit_port {
         Some(port) if port != default_port => format!("{rendered_host}:{port}"),
         _ => rendered_host,
+    }
+}
+
+/// Whether a request path falls inside the subtree an MCP endpoint scope
+/// (`endpoint.path` with trailing slashes trimmed) reserves at runtime: the
+/// scope itself and every descendant or `%`-encoded suffix, all compared
+/// ASCII case-insensitively. This is exactly the predicate the gateway uses to
+/// claim (and 404) requests, so admission checks that must agree with the
+/// runtime claim (`openapi.operations[].path`, the `/api-specs`
+/// `x-ferrum-mcp` generator) share it rather than re-deriving it (#7406).
+pub(crate) fn endpoint_scope_reserves(scope: &str, path: &str) -> bool {
+    path.eq_ignore_ascii_case(scope) || endpoint_scope_contains(scope, path)
+}
+
+/// Whether ANY request path an operation path template can produce is
+/// claimed by an MCP endpoint scope at runtime ([`endpoint_scope_reserves`]
+/// over the canonical request path).
+///
+/// The runtime claim is evaluated on `ctx.path`, the canonical policy path,
+/// so each literal run of the template has its escapes decoded the same way
+/// first (`/%6d%63p` is `/mcp`), independently of its neighbours: a run that
+/// cannot be decoded (an encoded separator, say) is compared as written and
+/// does not stop the others from being decoded. Segments then compare ASCII
+/// case-insensitively:
+///
+/// - a whole-segment `{name}` stands for any non-empty value (a value can
+///   never be empty, add a separator, or add an escape), and every repeat of
+///   the same name must take the same value, so `/{id}/{id}` cannot spell
+///   `/one/two`;
+/// - an expression inside a segment (`v{n}`, `mcp{suffix}`) is treated as
+///   able to match any text, INCLUDING none, because a direct client of an
+///   unbridged operation can send such a segment with an empty value. This
+///   is deliberately conservative: `/mcp{suffix}` overlaps `/mcp`.
+///
+/// When a run had to be compared as written, the claim's `%`-suffix rule is
+/// also applied to the raw template. Admission-time only (allocates).
+pub(crate) fn path_template_may_enter_endpoint_scope(scope: &str, template: &str) -> bool {
+    let mut any_raw = false;
+    let segments: Vec<TemplateSegmentPattern> = template
+        .split('/')
+        .map(|segment| template_segment_pattern(segment, &mut any_raw))
+        .collect();
+    let scope_segments: Vec<&str> = scope.split('/').collect();
+    let mut bindings: Vec<(&str, String)> = Vec::new();
+    let segment_overlap = segments.len() >= scope_segments.len()
+        && scope_segments
+            .iter()
+            .zip(&segments)
+            .all(|(scope_segment, pattern)| pattern.matches(scope_segment, &mut bindings));
+    segment_overlap || (any_raw && endpoint_scope_reserves(scope, template))
+}
+
+/// One path segment of an operation template.
+struct TemplateSegmentPattern<'a> {
+    /// `Some(name)` when the whole segment is one `{name}` expression.
+    whole_parameter: Option<&'a str>,
+    /// Otherwise: decoded, lower-cased literal runs, separated by template
+    /// expressions that match any text.
+    literals: Vec<String>,
+}
+
+impl<'a> TemplateSegmentPattern<'a> {
+    fn matches(&self, segment: &str, bindings: &mut Vec<(&'a str, String)>) -> bool {
+        let segment = segment.to_ascii_lowercase();
+        if let Some(name) = self.whole_parameter {
+            if segment.is_empty() {
+                return false;
+            }
+            if let Some((_, bound)) = bindings.iter().find(|(bound_name, _)| *bound_name == name) {
+                return *bound == segment;
+            }
+            bindings.push((name, segment));
+            return true;
+        }
+        // Glob match: the first and last literal runs anchor the ends (empty
+        // when the segment starts or ends with an expression), and the inner
+        // runs must appear in order between them.
+        let Some((first, rest)) = self.literals.split_first() else {
+            return segment.is_empty();
+        };
+        let Some(mut remaining) = segment.strip_prefix(first.as_str()) else {
+            return false;
+        };
+        let Some((last, inner)) = rest.split_last() else {
+            // No expression in this segment: an exact literal.
+            return remaining.is_empty();
+        };
+        for literal in inner {
+            let Some(index) = remaining.find(literal.as_str()) else {
+                return false;
+            };
+            remaining = &remaining[index + literal.len()..];
+        }
+        remaining.len() >= last.len() && remaining.ends_with(last.as_str())
+    }
+}
+
+/// Split one template segment on its `{...}` expressions and decode each
+/// literal run; sets `any_raw` when a run had to be kept as written.
+fn template_segment_pattern<'a>(
+    segment: &'a str,
+    any_raw: &mut bool,
+) -> TemplateSegmentPattern<'a> {
+    if let Some(name) = segment
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .filter(|name| !name.contains(['{', '}']))
+    {
+        return TemplateSegmentPattern {
+            whole_parameter: Some(name),
+            literals: Vec::new(),
+        };
+    }
+    let mut literals = Vec::new();
+    let mut rest = segment;
+    loop {
+        match rest.find('{') {
+            Some(open) => {
+                literals.push(decoded_literal_run(&rest[..open], any_raw));
+                rest = match rest[open..].find('}') {
+                    Some(close) => &rest[open + close + 1..],
+                    None => "",
+                };
+            }
+            None => {
+                literals.push(decoded_literal_run(rest, any_raw));
+                return TemplateSegmentPattern {
+                    whole_parameter: None,
+                    literals,
+                };
+            }
+        }
+    }
+}
+
+/// Decode one literal run's escapes exactly as request-path canonicalization
+/// would, lower-cased. The run is decoded behind a fixed `/x` prefix so that a
+/// fragment such as `.` (from `{name}.{ext}`) is not judged as a whole dot
+/// segment; a run that does not decode is kept as written.
+fn decoded_literal_run(run: &str, any_raw: &mut bool) -> String {
+    if run.is_empty() {
+        return String::new();
+    }
+    let rooted = format!("/x{run}");
+    match crate::policy_path::canonicalize_policy_path(&rooted) {
+        Ok(canonical) => match canonical.strip_prefix("/x") {
+            Some(decoded) => decoded.to_ascii_lowercase(),
+            None => {
+                *any_raw = true;
+                run.to_ascii_lowercase()
+            }
+        },
+        Err(_) => {
+            *any_raw = true;
+            run.to_ascii_lowercase()
+        }
     }
 }
 

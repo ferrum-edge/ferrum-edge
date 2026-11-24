@@ -40,6 +40,14 @@ use crate::plugins::utils::log_schema::{
 /// itself remains an intentionally open map keyed by operator-defined names.
 pub const TRANSACTION_LOG_SCHEMA_CONFIG_KEYS: &[&str] = &["schemas"];
 
+/// Upper bound on the named schemas one `transaction_log_schema` config may
+/// declare. Every definition is compiled at admission, on every graph
+/// validation, and on every reload, so the count is bounded at the boundary.
+pub const MAX_NAMED_SCHEMAS: usize = 256;
+
+/// Upper bound on a named-schema name, in bytes.
+pub const MAX_SCHEMA_NAME_BYTES: usize = 128;
+
 #[derive(Debug)]
 pub struct TransactionLogSchema {
     /// Per-construction handle to every compiled schema. The registry retains
@@ -76,14 +84,12 @@ impl TransactionLogSchema {
         let config_object = config.as_object().ok_or_else(|| {
             "transaction_log_schema: config must be an object containing `schemas`".to_string()
         })?;
-        for key in config_object.keys() {
-            if !TRANSACTION_LOG_SCHEMA_CONFIG_KEYS.contains(&key.as_str()) {
-                return Err(format!(
-                    "transaction_log_schema: unknown config key {key:?} at `config` (valid keys: `{}`)",
-                    TRANSACTION_LOG_SCHEMA_CONFIG_KEYS.join("`, `")
-                ));
-            }
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            TRANSACTION_LOG_SCHEMA_CONFIG_KEYS,
+            "transaction_log_schema: `config`: ",
+        )?;
         let schemas_value = config_object.get("schemas").ok_or_else(|| {
             "transaction_log_schema: `schemas` is required (an object mapping name -> schema definition)".to_string()
         })?;
@@ -96,16 +102,21 @@ impl TransactionLogSchema {
                     .to_string(),
             );
         }
+        if obj.len() > MAX_NAMED_SCHEMAS {
+            return Err(format!(
+                "transaction_log_schema: `schemas` declares {} named schemas (maximum {MAX_NAMED_SCHEMAS})",
+                obj.len()
+            ));
+        }
 
         let mut entries = Vec::with_capacity(obj.len());
-        let mut seen_names = BTreeSet::new();
         for (name, schema_value) in obj {
             if name.is_empty() {
                 return Err("transaction_log_schema: schema names must be non-empty".to_string());
             }
-            if !seen_names.insert(name.clone()) {
+            if name.len() > MAX_SCHEMA_NAME_BYTES {
                 return Err(format!(
-                    "transaction_log_schema: duplicate schema name {name:?} within the same plugin config"
+                    "transaction_log_schema: schema names must be at most {MAX_SCHEMA_NAME_BYTES} bytes"
                 ));
             }
             // Compile (validates everything). Plugin name uses the schema
@@ -129,7 +140,6 @@ impl TransactionLogSchema {
     /// All schemas declared by this plugin instance. Used by tests; future
     /// loader code can call this to publish schemas explicitly when the
     /// validation-mode `register_named` no-op is undesirable.
-    #[allow(dead_code)]
     pub fn schemas(&self) -> &HashMap<String, Arc<SummarySchema>> {
         &self.schemas
     }
@@ -179,12 +189,18 @@ pub(crate) fn validate_config_graph(
     let mut errors = Vec::new();
 
     for namespace in namespaces {
-        if let Err(error) = registry::begin_reload() {
-            errors.push(format!(
-                "transaction-log schema registry could not begin validation for namespace {namespace:?}: {error}"
-            ));
-            continue;
-        }
+        // The guard only matters if a constructor below unwinds: the explicit
+        // `abort_reload` at the end of this iteration closes the bracket on
+        // every normal path.
+        let _validation_bracket = match registry::begin_reload_guarded() {
+            Ok(guard) => guard,
+            Err(error) => {
+                errors.push(format!(
+                    "transaction-log schema registry could not begin validation for namespace {namespace:?}: {error}"
+                ));
+                continue;
+            }
+        };
 
         for plugin in config.plugin_configs.iter().filter(|plugin| {
             plugin.enabled
@@ -193,14 +209,14 @@ pub(crate) fn validate_config_graph(
         }) {
             if plugin.scope != crate::config::types::PluginScope::Global {
                 errors.push(format!(
-                    "Plugin {:?} (id={:?}, namespace={:?}): transaction_log_schema must have scope `global`",
+                    "Plugin {:?} (`id`={:?}, `namespace`={:?}): transaction_log_schema must have scope `global`",
                     plugin.plugin_name, plugin.id, namespace
                 ));
                 continue;
             }
             if let Err(error) = TransactionLogSchema::new(&plugin.config) {
                 errors.push(format!(
-                    "Plugin {:?} (id={:?}, namespace={:?}): {}",
+                    "Plugin {:?} (`id`={:?}, `namespace`={:?}): {}",
                     plugin.plugin_name, plugin.id, namespace, error
                 ));
             }
@@ -224,7 +240,7 @@ pub(crate) fn validate_config_graph(
                 SchemaCapabilities::BASE,
             ) {
                 errors.push(format!(
-                    "Plugin {:?} (id={:?}, namespace={:?}): {}",
+                    "Plugin {:?} (`id`={:?}, `namespace`={:?}): {}",
                     plugin.plugin_name, plugin.id, namespace, error
                 ));
                 continue;
@@ -235,7 +251,7 @@ pub(crate) fn validate_config_graph(
                 http_client.clone(),
             ) {
                 let message = format!(
-                    "Plugin {:?} (id={:?}, namespace={:?}): {}",
+                    "Plugin {:?} (`id`={:?}, `namespace`={:?}): {}",
                     plugin.plugin_name, plugin.id, namespace, error
                 );
                 if !optional_failures_are_errors
@@ -272,8 +288,16 @@ impl Plugin for TransactionLogSchema {
         "transaction_log_schema"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::TRANSACTION_LOG_SCHEMA
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
     }
 }
 

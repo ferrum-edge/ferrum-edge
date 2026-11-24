@@ -84,6 +84,7 @@ use super::utils::redis_rate_limiter::{
 };
 use super::utils::replay_partition::{self, AnonymousCallerScope, PartitionHasher};
 use super::utils::response_body::read_response_body_bounded;
+use super::utils::socket_host::is_loopback_ip_literal_endpoint;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::fips::approved::{HmacSha256, Sha256};
 use crate::startup::sanitize_startup_scalar;
@@ -126,8 +127,11 @@ fn staging_metadata_key(instance_id: u64, suffix: &str) -> String {
 /// delimiter concatenation to canonical length framing: keys minted under the
 /// old encoding are unreachable, which is the intended fail-closed outcome.
 /// v3 also binds provider context outside the modeled prompt/control fields.
-const AI_SEMANTIC_CACHE_EXACT_KEY_DOMAIN: &str = "ferrum-ai-semantic-cache-exact-v3";
-const AI_SEMANTIC_CACHE_SCOPE_KEY_DOMAIN: &str = "ferrum-ai-semantic-cache-scope-v3";
+/// v4 binds the complete response-side policy provenance (RTDS gate content +
+/// static presentation-policy digest) and exact instruction bytes in semantic
+/// scopes, so entries retained under an earlier policy are unreachable.
+const AI_SEMANTIC_CACHE_EXACT_KEY_DOMAIN: &str = "ferrum-ai-semantic-cache-exact-v4";
+const AI_SEMANTIC_CACHE_SCOPE_KEY_DOMAIN: &str = "ferrum-ai-semantic-cache-scope-v4";
 const AI_SEMANTIC_CACHE_CALLER_DOMAIN: &str = "ferrum-ai-semantic-cache-caller-v1";
 /// Effective destination under the shared canonical contract
 /// (`replay_partition::append_destination_partition`), which binds the proxy
@@ -162,6 +166,7 @@ pub const AI_SEMANTIC_CACHE_SEMANTIC_POLICY_KEYS: &[&str] = &[
     "semantic_embedding_api_key",
     "semantic_embedding_auth_header",
     "semantic_embedding_auth_scheme",
+    "semantic_embedding_allow_plaintext",
     "semantic_similarity_threshold",
     "semantic_vector_max_candidates",
     "semantic_embedding_timeout_ms",
@@ -198,6 +203,7 @@ pub const AI_SEMANTIC_CACHE_CONFIG_KEYS: &[&str] = &[
     "semantic_embedding_api_key",
     "semantic_embedding_auth_header",
     "semantic_embedding_auth_scheme",
+    "semantic_embedding_allow_plaintext",
     "semantic_similarity_threshold",
     "semantic_vector_max_candidates",
     "semantic_embedding_timeout_ms",
@@ -215,6 +221,9 @@ pub const AI_SEMANTIC_CACHE_CONFIG_KEYS: &[&str] = &[
     "redis_integrity_key",
 ];
 
+/// Minimum interval between HNSW vector-index rebuilds, measured, like the
+/// cleanup throttle, against the monotonic `created_at` clock so a wall-clock
+/// step cannot stall rebuilds (issue #7131).
 const VECTOR_REBUILD_INTERVAL_SECONDS: u64 = 30;
 
 /// Embedding-provider responses are small JSON documents in normal operation.
@@ -288,10 +297,17 @@ const MIN_REDIS_INTEGRITY_KEY_BYTES: usize = 32;
 /// v2 requires an HMAC authenticity tag; v3 length-frames every authenticated
 /// header name/value so embedded NUL bytes cannot repartition header fields;
 /// v4 authenticates the seal timestamp so Redis retention cannot extend replay
-/// beyond the configured cache TTL. There is no legacy unauthenticated read
-/// path during build-out.
-const SEMANTIC_CACHE_ENTRY_VERSION: u8 = 4;
+/// beyond the configured cache TTL; v5 drops the never-written semantic scope
+/// and embedding fields (Redis holds exact entries only). There is no legacy
+/// unauthenticated read path during build-out.
+const SEMANTIC_CACHE_ENTRY_VERSION: u8 = 5;
 
+/// Wall-clock skew tolerated between the replica that sealed an authenticated
+/// Redis envelope and the replica reading it. An envelope sealed up to this far
+/// in the reader's future is treated as age zero (so replay can extend past the
+/// configured TTL by at most this bound); one sealed further ahead is a plain
+/// miss, never a quarantine, because its MAC proves a trusted writer.
+const REDIS_SEAL_CLOCK_SKEW_ALLOWANCE_SECONDS: u64 = 60;
 /// Deployment-safe ceiling on concurrent outbound embedding requests per plugin
 /// instance. A burst of distinct concurrent misses (or an embedding outage that
 /// stalls in-flight calls) cannot fan out more than this many simultaneous
@@ -358,17 +374,30 @@ const GEMINI_SHAPE_FIELDS: &[&str] = &[
 ];
 
 /// Provider-native state, tool, and response-shape fields for Cohere v1 chat requests.
+///
+/// Cohere v1 `conversation_id` is deliberately absent: it names mutable
+/// provider-persisted history, so such requests bypass the cache entirely (see
+/// [`PROVIDER_MANAGED_CONTEXT_FIELDS`]).
 const COHERE_SHAPE_FIELDS: &[&str] = &[
-    // Cohere v1 can bind requests to backend-side conversation state. Include
-    // the identifier in exact keys and semantic scopes so stateful responses
-    // never cross persisted conversations with the same current message.
-    "conversation_id",
     "tools",
     "tool_choice",
     "tool_results",
     "documents",
     "response_format",
     "seed",
+];
+
+/// Root fields naming provider-managed state that can evolve independently of
+/// the request bytes (Responses `conversation`, Gemini `cachedContent`, Cohere
+/// v1 `conversation_id` persisted history). Binding the identifier cannot
+/// witness a mutation under the same identifier, and a hit would also skip the
+/// provider-side append, so any body carrying one of these fields — in any
+/// encoding — bypasses lookup and storage.
+const PROVIDER_MANAGED_CONTEXT_FIELDS: &[&str] = &[
+    "conversation",
+    "conversation_id",
+    "cachedContent",
+    "cached_content",
 ];
 
 /// Schema family used for exact-key / semantic-scope / semantic-input extraction.
@@ -429,6 +458,59 @@ struct CachedResponse {
     status_code: u16,
     headers: HashMap<String, String>,
     body: Bytes,
+}
+
+/// An admitted response waiting to be retained: the decoded body, sanitized
+/// headers, and this instance's staged key/semantic state. Ordinary backend
+/// responses are published immediately; a provider-backed synthetic
+/// (`ai_federation`) response is held in request state until the committed
+/// response shows its final client-visible status and headers.
+#[derive(Clone)]
+pub(crate) struct PendingSemanticCacheStore {
+    cache_key: String,
+    status_code: u16,
+    headers: HashMap<String, String>,
+    body: Bytes,
+    semantic_scope_key: Option<String>,
+    embedding: Option<EmbeddingPoint>,
+    /// Bytes charged against [`AiSemanticCache::cache_budget`] for this entry.
+    approx_size: usize,
+    /// Reservation taken BEFORE the body was copied, so a staged synthetic
+    /// entry counts against `max_total_size_bytes` while it waits for its
+    /// committed hook. Transferred into the published [`CacheEntry`]; a
+    /// refusal, cancellation, or request drop releases it with this value.
+    budget_lease: Arc<ByteLease>,
+}
+
+impl std::fmt::Debug for PendingSemanticCacheStore {
+    // Never render the cache key (an offline-checkable prompt fingerprint),
+    // headers, or body.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PendingSemanticCacheStore(<redacted>)")
+    }
+}
+
+/// Complete response-side policy provenance for one lookup (see
+/// `ResponsePolicyProvenance`): the pinned RTDS gate-content fingerprint and
+/// the static presentation-policy digest. Only a *complete* provenance can be
+/// bound; a request whose presentation policy is unprovable bypasses the cache.
+#[derive(Clone, Copy)]
+struct ReplayPolicyWitness {
+    gate: [u8; 32],
+    presentation: [u8; 32],
+}
+
+/// Hit-side verdict for one authenticated-or-not Redis envelope.
+enum RedisHitVerdict {
+    /// Authentic, fresh, and admissible: replay it.
+    Admit(CachedResponse),
+    /// Authentic (valid MAC for this key) but outside its validity window —
+    /// expired, or sealed further in the future than the clock-skew allowance.
+    /// A plain miss: a trusted writer produced it, so it is never quarantined
+    /// and Redis `EXPIRE` / a later store retires it.
+    NotFresh,
+    /// Inauthentic, cross-version, or failing store-side admission: quarantine.
+    Invalid,
 }
 
 #[derive(Clone)]
@@ -1100,7 +1182,9 @@ pub struct AiSemanticCache {
     /// Guards the lifecycle-owned cleanup worker so the full-map `retain` +
     /// oldest-entry eviction never overlaps itself.
     cleanup_running: Arc<AtomicBool>,
-    /// Last time the semantic vector snapshot was rebuilt.
+    /// Seconds elapsed (against `created_at`) at the last semantic vector
+    /// snapshot rebuild; `u64::MAX` until the first one. Monotonic for the same
+    /// reason as `last_cleanup`.
     last_vector_rebuild: Arc<AtomicU64>,
     /// Whether local semantic entries changed since the latest vector rebuild.
     vector_index_dirty: Arc<AtomicBool>,
@@ -1156,10 +1240,6 @@ struct SerializableCacheEntry {
     status_code: u16,
     headers: HashMap<String, String>,
     body: Vec<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    semantic_scope_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    embedding: Option<Vec<f32>>,
     /// Hex-encoded HMAC-SHA256 over the authenticated envelope fields and the
     /// Redis key context. Absent on foreign/legacy writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1342,7 +1422,8 @@ impl AiSemanticCache {
             // Sentinel: never cleaned, so the first cleanup pass always runs.
             last_cleanup: AtomicU64::new(u64::MAX),
             cleanup_running: Arc::new(AtomicBool::new(false)),
-            last_vector_rebuild: Arc::new(AtomicU64::new(0)),
+            // Sentinel: never rebuilt, so the first rebuild is never throttled.
+            last_vector_rebuild: Arc::new(AtomicU64::new(u64::MAX)),
             vector_index_dirty: Arc::new(AtomicBool::new(false)),
             vector_index_rebuild_running: Arc::new(AtomicBool::new(false)),
             cleanup_signal: Arc::new(Notify::new()),
@@ -1369,7 +1450,6 @@ impl AiSemanticCache {
     /// envelope and run it through L2 hit admission, modelling an entry
     /// persisted under an older header policy. Returns the status and headers
     /// a hit would serve, or `None` when admission refuses the entry.
-    #[allow(dead_code)]
     pub(crate) fn admit_sealed_redis_hit_for_tests(
         &self,
         redis_key: &str,
@@ -1378,8 +1458,38 @@ impl AiSemanticCache {
         body: &[u8],
     ) -> Option<(u16, HashMap<String, String>)> {
         let entry = self.seal_redis_entry(redis_key, status_code, headers, body)?;
-        let hit = self.admit_redis_hit(entry, redis_key)?;
-        Some((hit.status_code, hit.headers))
+        match self.classify_redis_hit(entry, redis_key) {
+            RedisHitVerdict::Admit(hit) => Some((hit.status_code, hit.headers)),
+            RedisHitVerdict::NotFresh | RedisHitVerdict::Invalid => None,
+        }
+    }
+
+    /// Seal an authenticated JSON envelope as a writer whose clock is
+    /// `seal_offset_seconds` ahead of (positive) or behind (negative) this
+    /// replica, then classify it the way a Redis lookup does. Returns
+    /// `"admit"`, `"miss"` (authentic but not fresh: never quarantined), or
+    /// `"quarantine"`.
+    pub(crate) fn redis_hit_verdict_for_tests(
+        &self,
+        redis_key: &str,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        seal_offset_seconds: i64,
+    ) -> &'static str {
+        let now = current_epoch_seconds();
+        let sealed_at = if seal_offset_seconds >= 0 {
+            now.saturating_add(seal_offset_seconds.unsigned_abs())
+        } else {
+            now.saturating_sub(seal_offset_seconds.unsigned_abs())
+        };
+        let Some(entry) = self.seal_redis_entry_at(redis_key, 200, headers, body, sealed_at) else {
+            return "quarantine";
+        };
+        match self.classify_redis_hit(entry, redis_key) {
+            RedisHitVerdict::Admit(_) => "admit",
+            RedisHitVerdict::NotFresh => "miss",
+            RedisHitVerdict::Invalid => "quarantine",
+        }
     }
 
     fn set_cache_status(&self, ctx: &mut RequestContext, status: &str) {
@@ -1456,6 +1566,7 @@ impl AiSemanticCache {
         request_headers: &HashMap<String, String>,
         body: &Value,
         multimodal_fingerprint: Option<&str>,
+        response_policy: &ReplayPolicyWitness,
     ) -> Option<String> {
         let family = classify_cache_request_family(body)?;
         let mut key_input = String::with_capacity(512);
@@ -1467,6 +1578,7 @@ impl AiSemanticCache {
             request_headers,
             body,
             family,
+            response_policy,
             &mut key_input,
             &mut has_part,
         )?;
@@ -1491,6 +1603,7 @@ impl AiSemanticCache {
         request_headers: &HashMap<String, String>,
         body: &Value,
         multimodal_fingerprint: Option<&str>,
+        response_policy: &ReplayPolicyWitness,
     ) -> Option<String> {
         let family = classify_cache_request_family(body)?;
         let mut key_input = String::with_capacity(512);
@@ -1502,6 +1615,7 @@ impl AiSemanticCache {
             request_headers,
             body,
             family,
+            response_policy,
             &mut key_input,
             &mut has_part,
         )?;
@@ -1819,7 +1933,7 @@ impl AiSemanticCache {
     /// to [`MAX_REDIS_VALUE_BYTES_HARD_CAP`] so checked Redis index conversion
     /// never sees a saturating `usize::MAX` cap. The exact per-entry limit is
     /// re-checked against `max_entry_size_bytes` on the decoded body in
-    /// [`Self::admit_redis_hit`].
+    /// [`Self::classify_redis_hit`].
     fn redis_value_byte_cap(&self) -> usize {
         let expanded = self
             .max_entry_size_bytes
@@ -1829,8 +1943,22 @@ impl AiSemanticCache {
         expanded.min(MAX_REDIS_VALUE_BYTES_HARD_CAP)
     }
 
+    /// Inline-test view of [`Self::classify_redis_hit`]: the sanitized
+    /// response to serve, or `None` for any refusal.
+    #[cfg(test)]
+    fn admit_redis_hit(
+        &self,
+        entry: SerializableCacheEntry,
+        redis_key: &str,
+    ) -> Option<CachedResponse> {
+        match self.classify_redis_hit(entry, redis_key) {
+            RedisHitVerdict::Admit(cached) => Some(cached),
+            RedisHitVerdict::NotFresh | RedisHitVerdict::Invalid => None,
+        }
+    }
+
     /// Re-apply the full store-side admission contract to a Redis hit before
-    /// replaying it.
+    /// replaying it, and classify the envelope.
     ///
     /// Redis is untrusted storage shared across gateway versions and other
     /// writers. Successful deserialization is not proof of a value this gateway
@@ -1838,25 +1966,35 @@ impl AiSemanticCache {
     /// the gateway emit an oversized, non-JSON, wrong-status, or unsanitized
     /// (cookie/auth-bearing) response. Authenticity is verified with an HMAC
     /// bound to the full cached status/header/body envelope and the Redis
-    /// namespace/key context before any other admission check. Returns the
-    /// sanitized response to serve, or `None` when any invariant fails so the
-    /// caller quarantines the entry.
-    fn admit_redis_hit(
+    /// namespace/key context before any other admission check.
+    ///
+    /// Authenticity is decided first. Only an inauthentic, cross-version, or
+    /// store-inadmissible envelope is [`RedisHitVerdict::Invalid`] (and
+    /// quarantined by the caller). An authentic envelope that is merely outside
+    /// its validity window — expired, or sealed further ahead of this
+    /// replica's clock than [`REDIS_SEAL_CLOCK_SKEW_ALLOWANCE_SECONDS`] — is
+    /// [`RedisHitVerdict::NotFresh`]: a plain miss that never deletes another
+    /// replica's valid entry because of ordinary NTP slew.
+    fn classify_redis_hit(
         &self,
         entry: SerializableCacheEntry,
         redis_key: &str,
-    ) -> Option<CachedResponse> {
+    ) -> RedisHitVerdict {
         // Fail closed when Redis mode cannot authenticate.
-        let integrity_key = self.redis_integrity_key.as_ref()?;
+        let Some(integrity_key) = self.redis_integrity_key.as_ref() else {
+            return RedisHitVerdict::Invalid;
+        };
         // Schema/version gate: reject envelopes not written by this version.
         if entry.version != SEMANTIC_CACHE_ENTRY_VERSION {
-            return None;
+            return RedisHitVerdict::Invalid;
         }
-        let provided_mac_hex = entry.integrity.as_deref()?;
-        let Ok(provided_mac) = hex::decode(provided_mac_hex) else {
-            return None;
+        let Some(provided_mac_hex) = entry.integrity.as_deref() else {
+            return RedisHitVerdict::Invalid;
         };
-        let expected_mac = compute_redis_envelope_mac(
+        let Ok(provided_mac) = hex::decode(provided_mac_hex) else {
+            return RedisHitVerdict::Invalid;
+        };
+        let Some(expected_mac) = compute_redis_envelope_mac(
             integrity_key,
             &RedisEnvelopeMacInput {
                 redis_key,
@@ -1865,25 +2003,33 @@ impl AiSemanticCache {
                 status_code: entry.status_code,
                 headers: &entry.headers,
                 body: &entry.body,
-                semantic_scope_key: entry.semantic_scope_key.as_deref(),
-                embedding: entry.embedding.as_deref(),
             },
-        )?;
+        ) else {
+            return RedisHitVerdict::Invalid;
+        };
         if !constant_time_eq(&provided_mac, &expected_mac) {
-            return None;
+            return RedisHitVerdict::Invalid;
         }
-        let age_seconds = current_epoch_seconds().checked_sub(entry.sealed_at_epoch_seconds)?;
+        // Freshness. The MAC proves a writer holding the integrity key, so a
+        // small future seal is clock skew, not forgery: admit it as age zero.
+        let now = current_epoch_seconds();
+        if entry.sealed_at_epoch_seconds
+            > now.saturating_add(REDIS_SEAL_CLOCK_SKEW_ALLOWANCE_SECONDS)
+        {
+            return RedisHitVerdict::NotFresh;
+        }
+        let age_seconds = now.saturating_sub(entry.sealed_at_epoch_seconds);
         if age_seconds >= self.ttl.as_secs() {
-            return None;
+            return RedisHitVerdict::NotFresh;
         }
         // Status: same 2xx contract as the store path (exclude 204/205, which
         // carry no body).
         if !(200..300).contains(&entry.status_code) || matches!(entry.status_code, 204 | 205) {
-            return None;
+            return RedisHitVerdict::Invalid;
         }
         // Hard per-entry body-size cap.
         if entry.body.len() > self.max_entry_size_bytes {
-            return None;
+            return RedisHitVerdict::Invalid;
         }
         // Content-type must be JSON-compatible and not an event stream, mirroring
         // the store path. An absent content-type is rejected: the store path only
@@ -1894,17 +2040,23 @@ impl AiSemanticCache {
         });
         match content_type {
             Some(ct) if is_json_content_type(ct) && !is_event_stream_content_type(ct) => {}
-            _ => return None,
+            _ => return RedisHitVerdict::Invalid,
+        }
+        // Retention directives: the store path never retains a response whose
+        // origin forbade it, so a hit carrying one is not a value we wrote.
+        // (`Set-Cookie` is stripped by the re-sanitization below instead.)
+        if cache_control_has_directive(&entry.headers, &["no-store", "private"]) {
+            return RedisHitVerdict::Invalid;
         }
         // Body must be syntactically valid JSON.
         if serde_json::from_slice::<Value>(&entry.body).is_err() {
-            return None;
+            return RedisHitVerdict::Invalid;
         }
         // Re-sanitize headers: a foreign writer could have injected Set-Cookie /
         // authorization headers even though this gateway's store path strips
         // them before writing.
         let headers = sanitize_cached_headers(&entry.headers);
-        Some(CachedResponse {
+        RedisHitVerdict::Admit(CachedResponse {
             status_code: entry.status_code,
             headers,
             body: Bytes::from(entry.body),
@@ -2133,7 +2285,6 @@ impl AiSemanticCache {
     /// Returns the peak `cache_budget.used()` observed while the previous
     /// published generation and the candidate rebuild lease overlapped (when
     /// both were non-zero).
-    #[allow(dead_code)]
     pub(crate) async fn rebuild_vector_index_for_tests(&self) -> usize {
         let Some(semantic) = self.semantic.as_ref() else {
             return self.cache_budget.used();
@@ -2168,7 +2319,7 @@ impl AiSemanticCache {
         );
         drop(previous);
         self.last_vector_rebuild
-            .store(current_epoch_seconds(), Ordering::Release);
+            .store(monotonic_elapsed_secs(self.created_at), Ordering::Release);
         self.vector_index_rebuild_running
             .store(false, Ordering::Release);
         peak_used
@@ -2198,7 +2349,6 @@ impl AiSemanticCache {
     }
 
     /// Published HNSW generation bytes currently charged to `cache_budget`.
-    #[allow(dead_code)]
     pub(crate) fn vector_snapshot_accounted_bytes_for_tests(&self) -> usize {
         self.vector_index
             .load_full()
@@ -2207,7 +2357,6 @@ impl AiSemanticCache {
     }
 
     /// Aggregate retained-byte budget usage (entries + vector generations).
-    #[allow(dead_code)]
     pub(crate) fn cache_budget_used_for_tests(&self) -> usize {
         self.cache_budget.used()
     }
@@ -2215,7 +2364,6 @@ impl AiSemanticCache {
     /// Force a rebuild reservation attempt that cannot fit, then confirm the
     /// candidate lease is not retained. Returns whether the budget rejected
     /// the reservation (and dirty was re-armed).
-    #[allow(dead_code)]
     pub(crate) async fn force_vector_rebuild_budget_failure_for_tests(&self) -> bool {
         let Some(semantic) = self.semantic.as_ref() else {
             return false;
@@ -2257,14 +2405,12 @@ impl AiSemanticCache {
 
     /// Whether the semantic vector snapshot is marked dirty. Used to prove
     /// same-key replacement still dirties when embeddings are gained or lost.
-    #[allow(dead_code)]
     pub(crate) fn vector_index_dirty_for_tests(&self) -> bool {
         self.vector_index_dirty.load(Ordering::Relaxed)
     }
 
     /// Clear the dirty flag without rebuilding so tests can assert a subsequent
     /// store re-dirties the index.
-    #[allow(dead_code)]
     pub(crate) fn clear_vector_index_dirty_for_tests(&self) {
         self.vector_index_dirty.store(false, Ordering::Release);
     }
@@ -2272,7 +2418,6 @@ impl AiSemanticCache {
     /// Hold or release the detached rebuild guard so tests can observe the
     /// dirtying side effect without racing the asynchronous rebuild that
     /// normally consumes the flag immediately.
-    #[allow(dead_code)]
     pub(crate) fn set_vector_index_rebuild_blocked_for_tests(&self, blocked: bool) {
         self.vector_index_rebuild_running
             .store(blocked, Ordering::Release);
@@ -2280,7 +2425,6 @@ impl AiSemanticCache {
 
     /// Backdate every retained entry past TTL so a forced cleanup pass expires
     /// them without sleeping on the wall clock.
-    #[allow(dead_code)]
     pub(crate) fn expire_all_entries_for_tests(&self) {
         let age = self.ttl.saturating_add(Duration::from_secs(1));
         let past = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
@@ -2289,17 +2433,21 @@ impl AiSemanticCache {
         }
     }
 
-    /// Bypass the cleanup throttle and run `cleanup_expired` immediately.
-    #[allow(dead_code)]
+    /// Bypass the cleanup throttle and run one cleanup sweep synchronously,
+    /// so the sweep has completed by the time this returns (the production
+    /// hot path schedules it through [`Self::signal_cleanup_if_due`]).
     pub(crate) fn force_cleanup_for_tests(&self) {
         self.last_cleanup.store(u64::MAX, Ordering::Relaxed);
-        self.cleanup_expired();
+        if self.try_claim_cleanup_interval()
+            && Self::run_cleanup(&self.cache, self.ttl, self.max_entries)
+        {
+            self.mark_vector_index_dirty();
+        }
     }
 
     /// Install (or clear) a callback that runs after byte-budget admission and
     /// before insert. Used by external tests to park concurrent stores that
     /// have already reserved leases.
-    #[allow(dead_code)]
     pub(crate) fn set_store_post_admit_hook_for_tests(
         &self,
         hook: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
@@ -2324,10 +2472,10 @@ impl AiSemanticCache {
         if !self.vector_index_dirty.load(Ordering::Acquire) {
             return;
         }
-        let now_epoch = current_epoch_seconds();
+        let now_secs = monotonic_elapsed_secs(self.created_at);
         let has_snapshot = self.vector_index.load().is_some();
         let last = self.last_vector_rebuild.load(Ordering::Relaxed);
-        if has_snapshot && now_epoch.saturating_sub(last) < VECTOR_REBUILD_INTERVAL_SECONDS {
+        if has_snapshot && vector_rebuild_throttled(last, now_secs) {
             return;
         }
         self.rebuild_signal.notify_one();
@@ -2451,15 +2599,72 @@ impl AiSemanticCache {
             .map(|(_, removed)| removed)
     }
 
-    /// Synchronous cleanup used only by the external test crate's
-    /// `force_cleanup_for_tests`, which wants the sweep to have completed by the
-    /// time it returns (the production hot path uses [`Self::signal_cleanup_if_due`]).
-    fn cleanup_expired(&self) {
-        if !self.try_claim_cleanup_interval() {
-            return;
+    /// Retain an admitted response locally and, when configured, in Redis,
+    /// under the byte budget.
+    async fn publish_retained_response(&self, pending: PendingSemanticCacheStore) {
+        // The byte-budget reservation was taken before the body was copied
+        // (see `on_final_response_body`) and is moved into the entry here, so
+        // publication never reserves twice.
+        let PendingSemanticCacheStore {
+            cache_key,
+            status_code,
+            headers: safe_headers,
+            body,
+            semantic_scope_key,
+            embedding,
+            approx_size,
+            budget_lease,
+        } = pending;
+
+        // Optional test rendezvous: park here after admission so concurrent
+        // stores can observe lease ownership before insert. Production keeps
+        // the hook empty (lock-free no-op).
+        self.run_store_post_admit_hook();
+
+        let entry = CacheEntry {
+            status_code,
+            headers: safe_headers.clone(),
+            body: body.clone(),
+            inserted_at: Instant::now(),
+            generation: self.next_entry_generation.fetch_add(1, Ordering::Relaxed),
+            approx_size,
+            semantic_scope_key: semantic_scope_key.clone(),
+            embedding: embedding.clone(),
+            _budget_lease: budget_lease,
+        };
+
+        // Insert. `DashMap::insert` is atomic per key and returns any
+        // displaced value; dropping that value releases its byte lease so
+        // same-key races never leave phantom retained bytes.
+        let mut replaced_semantic_entry = false;
+        if let Some(old) = self.cache.insert(cache_key.clone(), entry) {
+            replaced_semantic_entry = old.embedding.is_some();
         }
-        if Self::run_cleanup(&self.cache, self.ttl, self.max_entries) {
+        if replaced_semantic_entry || embedding.is_some() {
             self.mark_vector_index_dirty();
+            self.signal_vector_index_refresh_if_due();
+        }
+
+        // Also store in Redis if configured
+        if let Some(ref redis) = self.redis_client
+            && redis.is_available()
+        {
+            let redis_key = redis.make_key(&[&cache_key]);
+            if let Some(serializable) =
+                self.seal_redis_entry(&redis_key, status_code, &safe_headers, &body)
+                && let Ok(data) = serde_json::to_vec(&serializable)
+            {
+                let ttl_seconds = self.ttl.as_secs().max(1);
+                if let Ok(()) = redis
+                    .set_bytes_with_expire(&redis_key, &data, ttl_seconds)
+                    .await
+                {
+                    // A successful repair/replacement must be visible on the
+                    // next Redis lookup without waiting out a prior
+                    // quarantine-delete suppressor.
+                    self.redis_quarantine.clear(&cache_key);
+                }
+            }
         }
     }
 
@@ -2472,8 +2677,26 @@ impl AiSemanticCache {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> Option<SerializableCacheEntry> {
+        self.seal_redis_entry_at(
+            redis_key,
+            status_code,
+            headers,
+            body,
+            current_epoch_seconds(),
+        )
+    }
+
+    /// [`Self::seal_redis_entry`] with an explicit seal time (production passes
+    /// the current wall clock; tests model a skewed writer).
+    fn seal_redis_entry_at(
+        &self,
+        redis_key: &str,
+        status_code: u16,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        sealed_at_epoch_seconds: u64,
+    ) -> Option<SerializableCacheEntry> {
         let integrity_key = self.redis_integrity_key.as_ref()?;
-        let sealed_at_epoch_seconds = current_epoch_seconds();
         let mac = compute_redis_envelope_mac(
             integrity_key,
             &RedisEnvelopeMacInput {
@@ -2483,8 +2706,6 @@ impl AiSemanticCache {
                 status_code,
                 headers,
                 body,
-                semantic_scope_key: None,
-                embedding: None,
             },
         )?;
         Some(SerializableCacheEntry {
@@ -2493,15 +2714,12 @@ impl AiSemanticCache {
             status_code,
             headers: headers.clone(),
             body: body.to_vec(),
-            semantic_scope_key: None,
-            embedding: None,
             integrity: Some(hex::encode(mac)),
         })
     }
 
     /// Whether lifecycle maintenance workers have been staged. External tests
     /// observe activation rollback / reload drop behavior.
-    #[allow(dead_code)]
     pub(crate) fn maintenance_staged_for_tests(&self) -> bool {
         self.maintenance
             .lock()
@@ -2510,13 +2728,11 @@ impl AiSemanticCache {
     }
 
     /// Whether [`Plugin::commit_background_tasks`] has released maintenance.
-    #[allow(dead_code)]
     pub(crate) fn maintenance_committed_for_tests(&self) -> bool {
         self.maintenance_committed.load(Ordering::Acquire)
     }
 
     /// Count of lifecycle JoinHandles currently retained (0 after drop/abort).
-    #[allow(dead_code)]
     pub(crate) fn maintenance_handle_count_for_tests(&self) -> usize {
         self.maintenance
             .lock()
@@ -2525,20 +2741,12 @@ impl AiSemanticCache {
     }
 
     /// Notify the cleanup worker without claiming the interval (test scheduling).
-    #[allow(dead_code)]
     pub(crate) fn notify_cleanup_for_tests(&self) {
         self.cleanup_signal.notify_one();
     }
 
-    /// Notify the rebuild worker (test scheduling).
-    #[allow(dead_code)]
-    pub(crate) fn notify_rebuild_for_tests(&self) {
-        self.rebuild_signal.notify_one();
-    }
-
     /// Override the singleflight follower/admission wait used by external
     /// timeout tests. Pass `None` to restore the production default.
-    #[allow(dead_code)]
     pub(crate) fn set_singleflight_wait_override_for_tests(&self, wait: Option<Duration>) {
         let ms = wait
             .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
@@ -2549,7 +2757,6 @@ impl AiSemanticCache {
 
     /// Exercise the production quarantine-delete outcome handler with a
     /// synthetic Redis `DEL` result (no network).
-    #[allow(dead_code)]
     pub(crate) fn apply_redis_quarantine_delete_outcome_for_tests(
         &self,
         cache_key: &str,
@@ -2560,7 +2767,6 @@ impl AiSemanticCache {
     }
 
     /// Whether the local Redis quarantine suppressor is active for `cache_key`.
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_suppressed_for_tests(&self, cache_key: &str) -> bool {
         // Read-only probe: do not bump the suppression counter.
         matches!(
@@ -2570,41 +2776,34 @@ impl AiSemanticCache {
     }
 
     /// Force-expire a quarantine marker so TTL recovery can be tested without sleep.
-    #[allow(dead_code)]
     pub(crate) fn expire_redis_quarantine_for_tests(&self, cache_key: &str) {
         if let Some(mut entry) = self.redis_quarantine.entries.get_mut(cache_key) {
             entry.expires_at = Instant::now() - Duration::from_secs(1);
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_len_for_tests(&self) -> usize {
         self.redis_quarantine.len()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_delete_failures_for_tests(&self) -> u64 {
         self.redis_quarantine.delete_failures_total()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_suppressions_for_tests(&self) -> u64 {
         self.redis_quarantine.suppressions_total()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_cap_for_tests(&self) -> usize {
         self.redis_quarantine.max_entries
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_ttl_for_tests(&self) -> Duration {
         self.redis_quarantine.ttl
     }
 
     /// Hot-path suppressor probe that increments the suppression counter when
     /// active (mirrors production lookup behavior).
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_is_suppressed_for_tests(&self, cache_key: &str) -> bool {
         self.redis_quarantine
             .is_suppressed(cache_key, Instant::now())
@@ -2612,7 +2811,6 @@ impl AiSemanticCache {
 
     /// Fingerprint reconsideration helper: same poison stays suppressed; a
     /// replaced fingerprint clears the marker so the new value can be admitted.
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_matches_active_for_tests(
         &self,
         cache_key: &str,
@@ -2622,28 +2820,23 @@ impl AiSemanticCache {
             .matches_active(cache_key, fingerprint, Instant::now())
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_fingerprint_content_for_tests(data: &[u8]) -> [u8; 32] {
         redis_quarantine_fingerprint_content(data)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_fingerprint_oversized_for_tests(length: usize) -> [u8; 32] {
         redis_quarantine_fingerprint_oversized(length)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_fingerprint_empty_for_tests() -> [u8; 32] {
         redis_quarantine_fingerprint_empty()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn clear_redis_quarantine_for_tests(&self, cache_key: &str) {
         self.redis_quarantine.clear(cache_key);
     }
 
     /// Exercise the production per-key in-flight quarantine claim.
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_try_claim_for_tests(
         &self,
         cache_key: &str,
@@ -2654,7 +2847,6 @@ impl AiSemanticCache {
     }
 
     /// Currently available dedicated quarantine dial permits.
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_dial_permits_for_tests(&self) -> usize {
         self.redis_quarantine_dials.available_permits()
     }
@@ -2662,7 +2854,6 @@ impl AiSemanticCache {
     /// Hold every dedicated quarantine dial permit for the caller's scope so a
     /// test can drive the exhaustion path. Permits release when the returned
     /// vector drops.
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_hold_all_dials_for_tests(
         &self,
     ) -> Vec<tokio::sync::SemaphorePermit<'_>> {
@@ -2675,7 +2866,6 @@ impl AiSemanticCache {
 
     /// Exercise the production quarantine path (permit gate included) without a
     /// real Redis read.
-    #[allow(dead_code)]
     pub(crate) async fn quarantine_invalid_redis_entry_for_tests(
         &self,
         redis: &RedisRateLimitClient,
@@ -2792,7 +2982,7 @@ fn classify_cache_request_family(body: &Value) -> Option<CacheRequestFamily> {
 
     // Provider-managed contexts can evolve independently of this request and
     // may require provider-side effects. They remain outside replay admission.
-    if ["conversation", "cachedContent", "cached_content"]
+    if PROVIDER_MANAGED_CONTEXT_FIELDS
         .iter()
         .any(|field| object.contains_key(*field))
     {
@@ -2859,18 +3049,35 @@ fn classify_cache_request_family(body: &Value) -> Option<CacheRequestFamily> {
     family
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_identity_key_parts(
     plugin: &AiSemanticCache,
     ctx: &RequestContext,
     request_headers: &HashMap<String, String>,
     body: &Value,
     family: CacheRequestFamily,
+    response_policy: &ReplayPolicyWitness,
     key_input: &mut String,
     has_part: &mut KeyParts,
 ) -> Option<()> {
     start_key_part(key_input, has_part);
     key_input.push_str("fam:");
     key_input.push_str(family.as_str());
+
+    // Response-side policy provenance. A hit is replayed as a finalized
+    // representation, so ordinary response-body transforms are skipped for it
+    // (`RequestContext::finalized_response_replay`). That is only sound while
+    // the retained bytes were produced under the live policy: the RTDS gate
+    // content and the static presentation-policy digest of every enrolled
+    // response transform. Binding both into every exact key and semantic scope
+    // makes an entry retained under any other policy — in this process, in a
+    // shared Redis written by another replica, or before a reload —
+    // unreachable rather than replayed past a newly configured rule.
+    start_key_part(key_input, has_part);
+    key_input.push_str("policy:");
+    key_input.push_str(&hex::encode(response_policy.gate));
+    key_input.push(':');
+    key_input.push_str(&hex::encode(response_policy.presentation));
 
     // Mandatory caller-authorization partition. A retained AI completion is
     // returned before the provider ever sees the request, so it may only be
@@ -3326,17 +3533,26 @@ fn extract_gemini_parts_text(parts: &[Value], mode: PromptTextCanon) -> String {
     canonicalize_prompt_text(&texts.join(" "), mode)
 }
 
+/// Embedding text of a Responses `input`. Items with an instruction role
+/// (`system` / `developer`) are excluded: they are bound exactly in the
+/// semantic scope instead, mirroring the Messages family.
 fn extract_responses_input_text(input: &Value, mode: PromptTextCanon) -> String {
     match input {
         Value::String(text) => canonicalize_prompt_text(text, mode),
         Value::Array(items) => {
             let mut texts = Vec::new();
             for item in items {
+                if is_instruction_role_item(item) {
+                    continue;
+                }
                 push_responses_item_text(item, &mut texts);
             }
             canonicalize_prompt_text(&texts.join(" "), mode)
         }
         Value::Object(_) => {
+            if is_instruction_role_item(input) {
+                return String::new();
+            }
             let mut texts = Vec::new();
             push_responses_item_text(input, &mut texts);
             canonicalize_prompt_text(&texts.join(" "), mode)
@@ -3632,6 +3848,16 @@ fn append_family_semantic_role_scope(
     }
 }
 
+/// Bind governing instructions into the semantic scope **exactly**.
+///
+/// Instructions are an exact partition, not approximate input: two requests
+/// whose system/developer text differs only in case, whitespace, or
+/// indentation can demand different outputs (`Return exactly "ACME".` vs
+/// `"acme"`), and the embedding never sees instruction text, so the scope is
+/// the only thing separating them. Every container is therefore hashed over its
+/// canonical JSON (object key order normalized, string bytes preserved), the
+/// same representation the exact key binds. Only the user/prompt text that
+/// feeds the embedding keeps the lossy semantic normalization.
 fn append_family_instruction_scope(
     family: CacheRequestFamily,
     body: &Value,
@@ -3641,52 +3867,48 @@ fn append_family_instruction_scope(
     match family {
         CacheRequestFamily::Messages => {
             if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-                let mut has_instruction_message = false;
-                for msg in messages {
-                    let role = msg
-                        .get("role")
-                        .and_then(|r| r.as_str())
-                        .unwrap_or("unknown");
-                    if !matches!(role.to_ascii_lowercase().as_str(), "system" | "developer") {
-                        continue;
-                    }
-                    let content = extract_message_content(msg, PromptTextCanon::Semantic);
-                    if content.is_empty() {
-                        continue;
-                    }
-                    if !has_instruction_message {
-                        start_key_part(key_input, has_part);
-                        key_input.push_str("instructions:");
-                        has_instruction_message = true;
-                    } else {
-                        key_input.push('|');
-                    }
-                    push_ascii_lowercase(key_input, role);
-                    key_input.push(':');
-                    let hash = Sha256::digest(content.as_bytes());
-                    key_input.push_str(&hex::encode(hash));
-                }
+                append_instruction_items_scope(
+                    messages,
+                    "instructions:",
+                    "content",
+                    key_input,
+                    has_part,
+                );
             }
             if let Some(system) = body.get("system") {
-                start_key_part(key_input, has_part);
-                key_input.push_str("sys:");
-                key_input.push_str(&system_value_for_key(system, PromptTextCanon::Semantic));
+                append_hashed_instruction_part("sys:", system, key_input, has_part);
             }
-            if let Some(preamble) = body.get("preamble").and_then(|v| v.as_str()) {
-                start_key_part(key_input, has_part);
-                key_input.push_str("preamble:");
-                key_input.push_str(&normalize_text(preamble));
+            if let Some(preamble) = body.get("preamble") {
+                append_hashed_instruction_part("preamble:", preamble, key_input, has_part);
             }
         }
         CacheRequestFamily::Responses => {
             if let Some(instructions) = body.get("instructions") {
-                let normalized = prompt_value_for_key(instructions, PromptTextCanon::Semantic);
-                if !normalized.is_empty() {
-                    start_key_part(key_input, has_part);
-                    key_input.push_str("instructions:");
-                    let hash = Sha256::digest(normalized.as_bytes());
-                    key_input.push_str(&hex::encode(hash));
+                append_hashed_instruction_part("instructions:", instructions, key_input, has_part);
+            }
+            // Responses `input` items may carry `system` / `developer` roles,
+            // which govern the output exactly like top-level `instructions`.
+            // Their text is excluded from the embedding input, so bind it here.
+            match body.get("input") {
+                Some(Value::Array(items)) => {
+                    append_instruction_items_scope(
+                        items,
+                        "input_instructions:",
+                        "item",
+                        key_input,
+                        has_part,
+                    );
                 }
+                Some(item) if item.is_object() => {
+                    append_instruction_items_scope(
+                        std::slice::from_ref(item),
+                        "input_instructions:",
+                        "item",
+                        key_input,
+                        has_part,
+                    );
+                }
+                _ => {}
             }
             if let Some(previous) = body.get("previous_response_id").and_then(|v| v.as_str()) {
                 start_key_part(key_input, has_part);
@@ -3697,14 +3919,10 @@ fn append_family_instruction_scope(
         CacheRequestFamily::Gemini => {
             for field in ["systemInstruction", "system_instruction"] {
                 if let Some(system) = body.get(field) {
-                    let normalized = gemini_instruction_for_key(system, PromptTextCanon::Semantic);
-                    if normalized.is_empty() {
-                        continue;
-                    }
                     start_key_part(key_input, has_part);
                     key_input.push_str(field);
                     key_input.push(':');
-                    let hash = Sha256::digest(normalized.as_bytes());
+                    let hash = Sha256::digest(canonical_json_for_key(system).as_bytes());
                     key_input.push_str(&hex::encode(hash));
                 }
             }
@@ -3723,17 +3941,69 @@ fn append_family_instruction_scope(
                     }
                 }
             }
-            if let Some(preamble) = body.get("preamble").and_then(|v| v.as_str()) {
-                let normalized = normalize_text(preamble);
-                if !normalized.is_empty() {
-                    start_key_part(key_input, has_part);
-                    key_input.push_str("preamble:");
-                    let hash = Sha256::digest(normalized.as_bytes());
-                    key_input.push_str(&hex::encode(hash));
-                }
+            if let Some(preamble) = body.get("preamble") {
+                append_hashed_instruction_part("preamble:", preamble, key_input, has_part);
             }
         }
         CacheRequestFamily::LegacyPrompt | CacheRequestFamily::Tgi | CacheRequestFamily::Titan => {}
+    }
+}
+
+/// Append one instruction container as `label` + SHA-256 of its canonical JSON.
+fn append_hashed_instruction_part(
+    label: &str,
+    value: &Value,
+    key_input: &mut String,
+    has_part: &mut KeyParts,
+) {
+    start_key_part(key_input, has_part);
+    key_input.push_str(label);
+    let hash = Sha256::digest(canonical_json_for_key(value).as_bytes());
+    key_input.push_str(&hex::encode(hash));
+}
+
+/// Whether a message / input item carries an instruction role
+/// (`system` / `developer`, ASCII case-insensitive).
+fn is_instruction_role_item(item: &Value) -> bool {
+    item.get("role")
+        .and_then(Value::as_str)
+        .is_some_and(|role| {
+            role.eq_ignore_ascii_case("system") || role.eq_ignore_ascii_case("developer")
+        })
+}
+
+/// Bind every instruction-role item of `items` in order under one `label`
+/// part, by its exact role string and the SHA-256 of `field`'s canonical JSON
+/// (`"item"` hashes the whole item). Positions are bound so moving an
+/// instruction is a new scope.
+fn append_instruction_items_scope(
+    items: &[Value],
+    label: &str,
+    field: &str,
+    key_input: &mut String,
+    has_part: &mut KeyParts,
+) {
+    let mut wrote = false;
+    for (index, item) in items.iter().enumerate() {
+        if !is_instruction_role_item(item) {
+            continue;
+        }
+        if !wrote {
+            start_key_part(key_input, has_part);
+            key_input.push_str(label);
+            wrote = true;
+        }
+        let role = item.get("role").and_then(Value::as_str).unwrap_or("");
+        let _ = write!(key_input, "{index}:");
+        append_len_prefixed(key_input, role);
+        let value = if field == "item" {
+            item
+        } else {
+            item.get(field).unwrap_or(&Value::Null)
+        };
+        let hash = Sha256::digest(canonical_json_for_key(value).as_bytes());
+        key_input.push_str(&hex::encode(hash));
+        key_input.push(';');
     }
 }
 
@@ -3890,35 +4160,53 @@ fn prompt_value_for_key(value: &Value, mode: PromptTextCanon) -> String {
     }
 }
 
-fn gemini_instruction_for_key(system: &Value, mode: PromptTextCanon) -> String {
-    if let Some(text) = system.as_str() {
-        return canonicalize_prompt_text(text, mode);
-    }
-    if let Some(parts) = system.get("parts").and_then(|p| p.as_array()) {
-        return extract_gemini_parts_text(parts, mode);
-    }
-    if let Some(parts) = system.as_array() {
-        return extract_gemini_parts_text(parts, mode);
-    }
-    canonicalize_prompt_text(&canonical_json_for_key(system), mode)
+/// Whether any `Cache-Control` field in `headers` carries one of `directives`
+/// as a member name (ASCII case-insensitive, any argument).
+///
+/// Deliberately conservative: members are split on every comma, so a comma
+/// inside a quoted argument can only produce an extra candidate name, never
+/// hide a real top-level directive. A false positive is a safe cache bypass.
+fn cache_control_has_directive(headers: &HashMap<String, String>, directives: &[&str]) -> bool {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+        .any(|(_, value)| {
+            value.split(',').any(|member| {
+                let name = member.split('=').next().unwrap_or("").trim();
+                directives
+                    .iter()
+                    .any(|directive| name.eq_ignore_ascii_case(directive))
+            })
+        })
 }
 
-fn system_value_for_key(system: &Value, mode: PromptTextCanon) -> String {
-    if let Some(s) = system.as_str() {
-        canonicalize_prompt_text(s, mode)
-    } else if let Some(parts) = system.as_array() {
-        let mut texts = Vec::with_capacity(parts.len());
-        for part in parts {
-            if part.get("type").and_then(|t| t.as_str()) == Some("text")
-                && let Some(text) = part.get("text").and_then(|t| t.as_str())
-            {
-                texts.push(text);
-            }
-        }
-        canonicalize_prompt_text(&texts.join(" "), mode)
-    } else {
-        canonicalize_prompt_text(&canonical_json_for_key(system), mode)
-    }
+/// A response whose origin forbade retention (`no-store`, bare or qualified
+/// `private`) or that establishes per-client session state (`Set-Cookie`) is
+/// never stored locally or in Redis. The body of a `Set-Cookie` response may be
+/// personalized to that session even though the cookie header itself would be
+/// stripped from the retained copy.
+fn response_forbids_retention(headers: &HashMap<String, String>) -> bool {
+    cache_control_has_directive(headers, &["no-store", "private"])
+        || headers.keys().any(|name| {
+            name.eq_ignore_ascii_case("set-cookie") || name.eq_ignore_ascii_case("set-cookie2")
+        })
+}
+
+/// A request carrying `Cache-Control: no-store` or `no-cache` asks for a fresh
+/// generation that is not retained, so it bypasses both lookup and storage.
+fn request_forbids_cache(headers: &HashMap<String, String>) -> bool {
+    cache_control_has_directive(headers, &["no-store", "no-cache"])
+}
+
+/// Whole seconds elapsed on the monotonic clock since `origin`.
+fn monotonic_elapsed_secs(origin: Instant) -> u64 {
+    Instant::now().saturating_duration_since(origin).as_secs()
+}
+
+/// Whether a vector-index rebuild at monotonic second `now_secs` falls inside
+/// the interval after the last one (`u64::MAX`: never rebuilt).
+fn vector_rebuild_throttled(last: u64, now_secs: u64) -> bool {
+    last != u64::MAX && now_secs.saturating_sub(last) < VECTOR_REBUILD_INTERVAL_SECONDS
 }
 
 fn current_epoch_seconds() -> u64 {
@@ -4793,6 +5081,10 @@ impl Plugin for AiSemanticCache {
         "ai_semantic_cache"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     // Every short-circuit is a cached provider response (a cache HIT), never
     // a rejection of this plugin's own.
     fn rejects_with_origin_response(&self) -> bool {
@@ -4801,6 +5093,10 @@ impl Plugin for AiSemanticCache {
 
     fn priority(&self) -> u16 {
         super::priority::AI_SEMANTIC_CACHE
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::AFTER_PROXY
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -4901,6 +5197,7 @@ impl Plugin for AiSemanticCache {
             let cache_budget = Arc::clone(&self.cache_budget);
             let rebuild_reserved_bytes = Arc::clone(&self.rebuild_reserved_bytes);
             let last_vector_rebuild = Arc::clone(&self.last_vector_rebuild);
+            let created_at = self.created_at;
             let ttl = self.ttl;
             let max_candidates = self
                 .semantic
@@ -4930,12 +5227,10 @@ impl Plugin for AiSemanticCache {
                     if !dirty.load(Ordering::Acquire) {
                         continue;
                     }
-                    let now_epoch = current_epoch_seconds();
+                    let now_secs = monotonic_elapsed_secs(created_at);
                     let has_snapshot = vector_index.load().is_some();
                     let last = last_vector_rebuild.load(Ordering::Relaxed);
-                    if has_snapshot
-                        && now_epoch.saturating_sub(last) < VECTOR_REBUILD_INTERVAL_SECONDS
-                    {
+                    if has_snapshot && vector_rebuild_throttled(last, now_secs) {
                         continue;
                     }
                     if rebuild_running
@@ -4948,7 +5243,7 @@ impl Plugin for AiSemanticCache {
                         rebuild_running.store(false, Ordering::Release);
                         continue;
                     }
-                    last_vector_rebuild.store(now_epoch, Ordering::Release);
+                    last_vector_rebuild.store(now_secs, Ordering::Release);
                     let _state_guard = RebuildStateGuard {
                         running: Arc::clone(&rebuild_running),
                         reserved: Arc::clone(&rebuild_reserved_bytes),
@@ -5086,6 +5381,22 @@ impl Plugin for AiSemanticCache {
             Err(_) => return PluginResult::Continue,
         };
 
+        // `serde_json` collapses duplicate object members to the LAST value,
+        // while the original bytes are what a miss forwards to the provider —
+        // whose parser may keep the FIRST. Keying or storing on the collapsed
+        // view would let one prompt/model's completion be retained under
+        // another's key. Screen the exact final bytes with the shared bounded
+        // scanner (budget exhaustion also reports ambiguity) and treat an
+        // ambiguous document like an unknown shape: no lookup, no store.
+        if ctx.json_scan_memo.ambiguity(body).is_some() {
+            debug!(
+                "ai_semantic_cache: skipping request body with ambiguous duplicate JSON members"
+            );
+            self.clear_instance_staging(ctx);
+            self.set_cache_status(ctx, "BYPASS");
+            return PluginResult::Continue;
+        }
+
         // Unknown or ambiguous provider shapes deliberately bypass caching
         // rather than guessing a family or mixing structural metadata into
         // prompt text. Clear only this instance's staged key so a later
@@ -5117,18 +5428,49 @@ impl Plugin for AiSemanticCache {
             return PluginResult::Continue;
         }
 
+        // A client `Cache-Control: no-store` / `no-cache` asks for a fresh,
+        // unretained generation. Honor it on both the request context's
+        // header view and the finalized outbound view, so an outbound header
+        // transform that drops it cannot erase the client's intent.
+        if request_forbids_cache(&ctx.headers) || request_forbids_cache(headers) {
+            debug!("ai_semantic_cache: request Cache-Control forbids cache reuse; bypassing");
+            self.clear_instance_staging(ctx);
+            self.set_cache_status(ctx, "BYPASS");
+            return PluginResult::Continue;
+        }
+
+        // A hit replays a finalized representation and skips ordinary response
+        // transforms, so it is admissible only under a provable response-side
+        // policy. Pin the RTDS gate stamp now (before any response-side gate is
+        // read) and require the static presentation-policy digest; an
+        // unprovable policy (no plugin-cache view, or a `Dynamic` presentation
+        // plugin on this proxy) bypasses lookup and storage rather than
+        // matching "unknown" against "unknown".
+        let Some((gate, presentation)) = ctx.response_policy_provenance().complete() else {
+            debug!("ai_semantic_cache: response presentation policy is unprovable; bypassing");
+            self.clear_instance_staging(ctx);
+            self.set_cache_status(ctx, "BYPASS");
+            return PluginResult::Continue;
+        };
+        let response_policy = ReplayPolicyWitness { gate, presentation };
+
         let multimodal_fingerprint = build_multimodal_fingerprint(&json);
 
         // Build cache key
-        let cache_key =
-            match self.build_cache_key(ctx, headers, &json, multimodal_fingerprint.as_deref()) {
-                Some(k) => k,
-                None => {
-                    self.clear_instance_staging(ctx);
-                    self.set_cache_status(ctx, "BYPASS");
-                    return PluginResult::Continue;
-                }
-            };
+        let cache_key = match self.build_cache_key(
+            ctx,
+            headers,
+            &json,
+            multimodal_fingerprint.as_deref(),
+            &response_policy,
+        ) {
+            Some(k) => k,
+            None => {
+                self.clear_instance_staging(ctx);
+                self.set_cache_status(ctx, "BYPASS");
+                return PluginResult::Continue;
+            }
+        };
 
         // Periodic cleanup — scheduled off the request hot path so no single
         // request pays the full-map scan / oldest-entry eviction.
@@ -5163,11 +5505,13 @@ impl Plugin for AiSemanticCache {
                         // poison quarantine/races after the value is known
                         // inadmissible. A concurrent valid replacement clears
                         // any stale marker without hashing.
-                        match serde_json::from_slice::<SerializableCacheEntry>(&data)
-                            .ok()
-                            .and_then(|entry| self.admit_redis_hit(entry, &redis_key))
+                        let verdict = match serde_json::from_slice::<SerializableCacheEntry>(&data)
                         {
-                            Some(cached) => {
+                            Ok(entry) => self.classify_redis_hit(entry, &redis_key),
+                            Err(_) => RedisHitVerdict::Invalid,
+                        };
+                        match verdict {
+                            RedisHitVerdict::Admit(cached) => {
                                 debug!(
                                     "ai_semantic_cache: Redis cache HIT, returning cached response"
                                 );
@@ -5183,7 +5527,16 @@ impl Plugin for AiSemanticCache {
                                     headers: response_headers,
                                 };
                             }
-                            None => {
+                            RedisHitVerdict::NotFresh => {
+                                // Authentic but expired or sealed beyond the
+                                // clock-skew allowance: a plain miss. Never
+                                // delete a trusted writer's entry; Redis
+                                // `EXPIRE` or a later store retires it.
+                                debug!(
+                                    "ai_semantic_cache: authentic Redis entry outside its validity window; treating as a miss"
+                                );
+                            }
+                            RedisHitVerdict::Invalid => {
                                 let fingerprint = redis_quarantine_fingerprint_content(&data);
                                 // Claim the per-key in-flight marker before the
                                 // dial. A concurrent same-poison claim (installed
@@ -5300,14 +5653,24 @@ impl Plugin for AiSemanticCache {
         let semantic_allowed = multimodal_fingerprint.is_none()
             || self.cache_multimodal == MultimodalCacheMode::IncludeFingerprints;
 
+        // A canonical boolean `stream: true` request expects an SSE reply,
+        // which is never retained, so no entry in its `stream:true` scope can
+        // exist from a real stream: skip the embedding round-trip (latency,
+        // provider cost, and permit pressure) rather than pay it for nothing.
+        // The exact lookup above still runs. Non-boolean spellings keep the
+        // previous behavior (a possibly wasted call, never a wrong hit).
+        let deterministic_stream = matches!(json.get("stream"), Some(Value::Bool(true)));
+
         if self.semantic.is_some()
             && semantic_allowed
+            && !deterministic_stream
             && let (Some(scope_key), Some(input)) = (
                 self.build_semantic_scope_key(
                     ctx,
                     headers,
                     &json,
                     multimodal_fingerprint.as_deref(),
+                    &response_policy,
                 ),
                 self.build_semantic_input(&json),
             )
@@ -5415,12 +5778,41 @@ impl Plugin for AiSemanticCache {
         // every future semantically-similar request (cache poisoning). The proxy
         // sets `ferrum:synthetic_short_circuit` only for the duration of the
         // synthetic body-hook phase, so its presence is a precise, unspoofable
-        // signal; a genuine backend response (the only legitimate store path)
-        // never carries it and falls through to store normally. Mirrors
-        // `response_caching`'s and `request_deduplication`'s synthetic guards.
-        if ctx
+        // signal; a genuine backend response never carries it and falls
+        // through to store normally. Mirrors `response_caching`'s and
+        // `request_deduplication`'s synthetic guards.
+        //
+        // The one synthetic body that IS a genuine model response is a
+        // provider-backed `ai_federation` dispatch: federation records
+        // `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY` only once a provider
+        // actually returned response headers, and every 2xx it then returns is
+        // that provider's normalized answer. Without this exemption the
+        // documented cache-before-federation chain could never populate and
+        // would pay the provider (and the embedding call) on every repeat. The
+        // marker is internal request metadata no client input can write, and
+        // fabricated short-circuits (mocks, fault injection, terminations,
+        // cache replays) never set it. Store admission below still applies in
+        // full (2xx, JSON, size, decoding, retention directives).
+        //
+        // Federation sanitizes the provider's headers before normalization, so
+        // the origin's `Cache-Control` / `Set-Cookie` are not visible here; it
+        // therefore also records `PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY`
+        // only when those ORIGINAL headers allowed retention, and nothing is
+        // stored without it. And because the synthetic path runs its reject
+        // `after_proxy` header hooks only AFTER this body hook, the admitted
+        // body is staged here and published by `on_response_committed`, which
+        // re-checks the final client-visible status and headers.
+        let synthetic_response = ctx
             .metadata
-            .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
+            .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+        if synthetic_response
+            && !(ctx
+                .metadata
+                .contains_key(super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY)
+                && ctx
+                    .metadata
+                    .get(super::ai_federation::PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY)
+                    .is_some_and(|value| value == "true"))
         {
             debug!(
                 "ai_semantic_cache: skipping store of synthetic short-circuit response (no model tokens / upstream body)"
@@ -5434,6 +5826,25 @@ impl Plugin for AiSemanticCache {
             Some(k) => k.clone(),
             None => return PluginResult::Continue,
         };
+
+        // The key binds the response-side policy pinned at lookup. If an RTDS
+        // gate publication landed while this response was being shaped, the
+        // bytes belong to neither policy, so they are not retained at all.
+        if !ctx.response_policy_stamp_stable() {
+            debug!("ai_semantic_cache: response-side policy changed mid-request; skipping store");
+            return PluginResult::Continue;
+        }
+
+        // Origin and session retention directives. `no-store` / `private`
+        // forbid a shared cache from retaining the response, and a
+        // `Set-Cookie` response may carry a session-personalized body even
+        // though the cookie header itself would be stripped.
+        if response_forbids_retention(response_headers) {
+            debug!(
+                "ai_semantic_cache: response Cache-Control or Set-Cookie forbids retention; skipping store"
+            );
+            return PluginResult::Continue;
+        }
 
         // Cache admission is shared by the local and Redis paths below. A
         // successful status alone is not proof of an LLM response: upstreams
@@ -5535,10 +5946,12 @@ impl Plugin for AiSemanticCache {
             embedding.as_ref(),
         );
 
-        // Hard total-size enforcement via lock-free byte leases. Concurrent
-        // distinct-key admits race on `ByteBudget::try_acquire`; losers skip
-        // retention so published + in-flight HNSW generations and entries
-        // cannot permanently exceed `max_total_size_bytes`.
+        // Hard total-size enforcement via lock-free byte leases, reserved
+        // BEFORE the body is copied or staged. Concurrent distinct-key admits
+        // race on `ByteBudget::try_acquire`; losers skip retention, so
+        // published entries, staged synthetic entries awaiting their committed
+        // hook, and published + in-flight HNSW generations cannot exceed
+        // `max_total_size_bytes`.
         let Some(budget_lease) = self.cache_budget.try_acquire(approx_size) else {
             debug!(
                 entry_size = approx_size,
@@ -5547,59 +5960,82 @@ impl Plugin for AiSemanticCache {
             );
             return PluginResult::Continue;
         };
-
-        // Optional test rendezvous: park here after admission so concurrent
-        // stores can observe lease ownership before insert. Production keeps
-        // the hook empty (lock-free no-op).
-        self.run_store_post_admit_hook();
-
-        let entry = CacheEntry {
+        let pending = PendingSemanticCacheStore {
+            cache_key,
             status_code: response_status,
-            headers: safe_headers.clone(),
-            body: Bytes::from(body.to_vec()),
-            inserted_at: Instant::now(),
-            generation: self.next_entry_generation.fetch_add(1, Ordering::Relaxed),
+            headers: safe_headers,
+            body: Bytes::copy_from_slice(body),
+            semantic_scope_key,
+            embedding,
             approx_size,
-            semantic_scope_key: semantic_scope_key.clone(),
-            embedding: embedding.clone(),
-            _budget_lease: budget_lease,
+            budget_lease,
         };
-
-        // Insert. `DashMap::insert` is atomic per key and returns any
-        // displaced value; dropping that value releases its byte lease so
-        // same-key races never leave phantom retained bytes.
-        let mut replaced_semantic_entry = false;
-        if let Some(old) = self.cache.insert(cache_key.clone(), entry) {
-            replaced_semantic_entry = old.embedding.is_some();
+        if synthetic_response {
+            ctx.plugin_state_mut()
+                .ai_semantic_cache_pending_stores
+                .insert(self.instance_id, pending);
+            return PluginResult::Continue;
         }
-        if replaced_semantic_entry || embedding.is_some() {
-            self.mark_vector_index_dirty();
-            self.signal_vector_index_refresh_if_due();
-        }
-
-        // Also store in Redis if configured
-        if let Some(ref redis) = self.redis_client
-            && redis.is_available()
-        {
-            let redis_key = redis.make_key(&[&cache_key]);
-            if let Some(serializable) =
-                self.seal_redis_entry(&redis_key, response_status, &safe_headers, body)
-                && let Ok(data) = serde_json::to_vec(&serializable)
-            {
-                let ttl_seconds = self.ttl.as_secs().max(1);
-                if let Ok(()) = redis
-                    .set_bytes_with_expire(&redis_key, &data, ttl_seconds)
-                    .await
-                {
-                    // A successful repair/replacement must be visible on the
-                    // next Redis lookup without waiting out a prior
-                    // quarantine-delete suppressor.
-                    self.redis_quarantine.clear(&cache_key);
-                }
-            }
-        }
+        self.publish_retained_response(pending).await;
 
         PluginResult::Continue
+    }
+
+    /// Needed only to publish a staged provider-backed synthetic response; a
+    /// request with nothing staged pays one per-instance map lookup.
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    /// Publish (or drop) a provider-backed synthetic response staged by
+    /// [`Plugin::on_final_response_body`].
+    ///
+    /// On the synthetic path the reject `after_proxy` header hooks — late
+    /// `response_transformer` header rules, a rotated session cookie — run only
+    /// after the body hooks, so retention is decided here, over the final
+    /// client-visible status and headers: a non-2xx or replaced status, a
+    /// late `Cache-Control: no-store` / `private`, a `Set-Cookie`, a
+    /// non-JSON or event-stream content type, or an RTDS publication during
+    /// the request drops the staged entry instead of retaining it.
+    async fn on_response_committed(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        let Some(pending) = ctx.plugin_state_opt_mut().and_then(|state| {
+            state
+                .ai_semantic_cache_pending_stores
+                .remove(&self.instance_id)
+        }) else {
+            return;
+        };
+        if pending.status_code != response_status || response_forbids_retention(response_headers) {
+            debug!(
+                "ai_semantic_cache: final synthetic response forbids retention; dropping staged store"
+            );
+            return;
+        }
+        let content_type = response_headers.iter().find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                .then_some(value.as_str())
+        });
+        if !content_type
+            .is_some_and(|ct| is_json_content_type(ct) && !is_event_stream_content_type(ct))
+        {
+            debug!(
+                "ai_semantic_cache: final synthetic response is not JSON; dropping staged store"
+            );
+            return;
+        }
+        if !ctx.response_policy_stamp_stable() {
+            debug!(
+                "ai_semantic_cache: response-side policy changed mid-request; dropping staged store"
+            );
+            return;
+        }
+        self.publish_retained_response(pending).await;
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -5638,19 +6074,17 @@ struct RedisEnvelopeMacInput<'a> {
     status_code: u16,
     headers: &'a HashMap<String, String>,
     body: &'a [u8],
-    semantic_scope_key: Option<&'a str>,
-    embedding: Option<&'a [f32]>,
 }
 
 /// HMAC-SHA256 authenticity tag over the Redis envelope and key context.
 ///
-/// Binds status/headers/body (and optional semantic fields) to the Redis
+/// Binds status/headers/body and the seal time to the Redis
 /// namespace/key so a valid-looking foreign JSON document under another key
 /// cannot be replayed. Returns `None` only when the HMAC implementation fails
 /// to initialize (fail closed).
 fn compute_redis_envelope_mac(key: &[u8], envelope: &RedisEnvelopeMacInput<'_>) -> Option<Vec<u8>> {
     let mut mac = HmacSha256::new_from_slice(key).ok()?;
-    mac.update(b"ai_semantic_cache.v4\0");
+    mac.update(b"ai_semantic_cache.v5\0");
     mac.update((envelope.redis_key.len() as u64).to_le_bytes());
     mac.update(envelope.redis_key.as_bytes());
     mac.update([envelope.version]);
@@ -5671,22 +6105,6 @@ fn compute_redis_envelope_mac(key: &[u8], envelope: &RedisEnvelopeMacInput<'_>) 
     }
     mac.update((envelope.body.len() as u64).to_le_bytes());
     mac.update(envelope.body);
-    if let Some(scope) = envelope.semantic_scope_key {
-        mac.update([1]);
-        mac.update((scope.len() as u64).to_le_bytes());
-        mac.update(scope.as_bytes());
-    } else {
-        mac.update([0]);
-    }
-    if let Some(values) = envelope.embedding {
-        mac.update([1]);
-        mac.update((values.len() as u64).to_le_bytes());
-        for value in values {
-            mac.update(value.to_le_bytes());
-        }
-    } else {
-        mac.update([0]);
-    }
     Some(mac.finalize().into_bytes().to_vec())
 }
 
@@ -5811,6 +6229,8 @@ fn parse_semantic_config(
     }
     let timeout_ms =
         optional_positive_u64(config, "semantic_embedding_timeout_ms")?.unwrap_or(5_000);
+    let allow_plaintext =
+        optional_bool(config, "semantic_embedding_allow_plaintext")?.unwrap_or(false);
 
     let auth_header =
         reqwest::header::HeaderName::from_bytes(auth_header.as_bytes()).map_err(|_| {
@@ -5854,7 +6274,8 @@ fn parse_semantic_config(
         "ai_semantic_cache: `semantic_embedding_endpoint` is required when `semantic_similarity_enabled=true`"
             .to_string()
     })?;
-    let validated_endpoint = validate_semantic_embedding_endpoint(&endpoint, backend_allow_ips)?;
+    let validated_endpoint =
+        validate_semantic_embedding_endpoint(&endpoint, allow_plaintext, backend_allow_ips)?;
 
     Ok(Some(SemanticConfig {
         provider,
@@ -5879,6 +6300,7 @@ struct ValidatedSemanticEmbeddingEndpoint {
 
 fn validate_semantic_embedding_endpoint(
     endpoint: &str,
+    allow_plaintext: bool,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<ValidatedSemanticEmbeddingEndpoint, String> {
     let parsed_endpoint = Url::parse(endpoint)
@@ -5920,6 +6342,19 @@ fn validate_semantic_embedding_endpoint(
         return Err(format!(
             "ai_semantic_cache: `semantic_embedding_endpoint` IP \"{ip}\" denied by backend egress policy"
         ));
+    }
+
+    // The embedding call carries the configured API key. Cleartext is admitted
+    // without an opt-in only to a loopback IP literal (a local sidecar); any other
+    // `http://` destination needs `semantic_embedding_allow_plaintext: true`.
+    if parsed_endpoint.scheme() == "http"
+        && !allow_plaintext
+        && !is_loopback_ip_literal_endpoint(endpoint, parsed_endpoint.host())
+    {
+        return Err(
+            "ai_semantic_cache: `semantic_embedding_endpoint` uses `http://` to a host that is not a loopback IP literal, which is rejected by default; use `https://` or set `semantic_embedding_allow_plaintext: true`"
+                .to_string(),
+        );
     }
 
     Ok(ValidatedSemanticEmbeddingEndpoint {
@@ -5977,8 +6412,7 @@ mod tests {
     /// Force cleanup to run regardless of the cooldown gate by resetting the
     /// gate to the "never cleaned" sentinel before the call.
     fn force_cleanup(plugin: &AiSemanticCache) {
-        plugin.last_cleanup.store(u64::MAX, Ordering::Relaxed);
-        plugin.cleanup_expired();
+        plugin.force_cleanup_for_tests();
     }
 
     #[test]
@@ -6521,15 +6955,13 @@ mod tests {
     }
 
     #[test]
-    fn redis_serialized_cache_entry_omits_semantic_vector_fields_when_empty() {
+    fn redis_serialized_cache_entry_carries_no_semantic_vector_fields() {
         let entry = SerializableCacheEntry {
             version: SEMANTIC_CACHE_ENTRY_VERSION,
             sealed_at_epoch_seconds: current_epoch_seconds(),
             status_code: 200,
             headers: HashMap::new(),
             body: b"cached".to_vec(),
-            semantic_scope_key: None,
-            embedding: None,
             integrity: None,
         };
 
@@ -6568,8 +7000,6 @@ mod tests {
                     status_code,
                     headers: &headers,
                     body,
-                    semantic_scope_key: None,
-                    embedding: None,
                 },
             )
             .expect("test HMAC");
@@ -6583,8 +7013,6 @@ mod tests {
             status_code,
             headers,
             body: body.to_vec(),
-            semantic_scope_key: None,
-            embedding: None,
             integrity,
         }
     }
@@ -6650,8 +7078,6 @@ mod tests {
                 status_code: 200,
                 headers: &split_headers,
                 body: b"body",
-                semantic_scope_key: None,
-                embedding: None,
             },
         )
         .expect("test HMAC");
@@ -6664,8 +7090,6 @@ mod tests {
                 status_code: 200,
                 headers: &fused_headers,
                 body: b"body",
-                semantic_scope_key: None,
-                embedding: None,
             },
         )
         .expect("test HMAC");
@@ -6706,8 +7130,6 @@ mod tests {
                 status_code: valid.status_code,
                 headers: &valid.headers,
                 body: &valid.body,
-                semantic_scope_key: None,
-                embedding: None,
             },
         )
         .expect("test HMAC");
@@ -6743,15 +7165,13 @@ mod tests {
                 status_code: stale.status_code,
                 headers: &stale.headers,
                 body: &stale.body,
-                semantic_scope_key: None,
-                embedding: None,
             },
         )
         .expect("test HMAC");
         stale.integrity = Some(hex::encode(stale_mac));
         assert!(
             plugin.admit_redis_hit(stale, TEST_REDIS_KEY).is_none(),
-            "an authenticated entry at the TTL boundary must be quarantined"
+            "an authenticated entry past the TTL is a plain miss, never served"
         );
 
         // Missing MAC / cross-key MAC / cross-version envelopes are quarantined.

@@ -13,9 +13,10 @@ use crate::modes::mesh::config::{
     MultiClusterConfig, NodeWaypointAssertor, OutboundTrafficPolicy, PeerAuthentication,
     PolicyScope, ResolvedIngressListener, ServiceEntry, SidecarHostPattern, TrustBundleSet,
     WaypointAttachment, Workload, WorkloadLabels, destination_rule_exported_to_namespace,
-    destination_rule_lookup_tier, is_false, is_zero_usize, policy_scope_applies_to_workload,
-    policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
-    proxy_config_applies_to_workload, scope_applies_to_workload, service_entry_applies_to_workload,
+    destination_rule_is_namespace_private, destination_rule_lookup_tier, is_false, is_zero_usize,
+    policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
+    policy_target_attachment_applies_to_service, proxy_config_applies_to_workload,
+    scope_applies_to_workload, service_entry_applies_to_workload,
     virtual_service_cors_policy_exported_to_namespace, workload_selector_matches,
 };
 use crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
@@ -31,8 +32,8 @@ pub struct MeshSliceRequest {
     /// DP's `MeshTopology == ServiceWaypoint`; the slice builder narrows
     /// `services` / `service_entries` (and the workloads / mesh policies that
     /// hang off them) to entries bound to this waypoint via
-    /// `MeshConfig.waypoint_bindings`. `None` keeps the legacy behavior of
-    /// admitting every resource visible to the workload's namespace.
+    /// `MeshConfig.waypoint_bindings`. `None` admits every resource visible
+    /// to the workload's namespace.
     pub waypoint_name: Option<String>,
     pub labels: BTreeMap<String, String>,
     /// Kubernetes cluster DNS domain used when synthesizing MeshService FQDN
@@ -50,8 +51,7 @@ pub struct MeshSliceRequest {
     pub sidecar_egress_dry_run: bool,
     /// When `true`, and only when Sidecar egress narrowing is also enabled and
     /// applicable, the slice builder filters `workloads` to identities
-    /// referenced by admitted services. Defaults to `false` for a one-release
-    /// dry-run window.
+    /// referenced by admitted services. Defaults to `false`.
     pub enforce_sidecar_identity_narrowing: bool,
     /// Keep the namespace-visible AuthorizationPolicy candidate superset needed
     /// for destination-side Ambient UDP per-pod source scoping. The consumer
@@ -73,8 +73,17 @@ pub struct MeshSliceRequest {
     ///
     /// The inventory NEVER widens the ordinary routing views (`workloads`,
     /// `services`, `mesh_policies`, `peer_authentications`); it rides its own
-    /// slice fields consumed solely by the capture resolver.
+    /// slice fields consumed by the capture resolver and, for the destinations,
+    /// the NodeWaypoint source identity resolver (exact pod-UID binding only).
     pub node_waypoint_capture_scoping: bool,
+    /// This subscriber is a **Sidecar** that serves the VirtualService
+    /// `http[]` routes bound to the mesh (issue #7423): the slice carries them
+    /// on `http_routes` exactly as it does for a NodeWaypoint
+    /// ([`Self::node_waypoint_capture_scoping`]), and the Sidecar applies them
+    /// on its outbound capture listener. Set only for `MeshTopology::Sidecar`;
+    /// Ambient (the L4 data plane), ServiceWaypoint and the gateway topologies
+    /// leave it `false` and receive no routes.
+    pub sidecar_http_routes: bool,
 }
 
 impl Default for MeshSliceRequest {
@@ -91,6 +100,7 @@ impl Default for MeshSliceRequest {
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }
     }
 }
@@ -114,6 +124,7 @@ impl MeshSliceRequest {
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }
     }
 
@@ -135,6 +146,7 @@ impl MeshSliceRequest {
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }
     }
 
@@ -149,7 +161,6 @@ impl MeshSliceRequest {
 
     /// Returns `self` bound to a GAMMA Waypoint name. Used by mesh-mode
     /// startup when `topology == ServiceWaypoint`; tests use it directly.
-    #[allow(dead_code)]
     pub fn with_waypoint_name(mut self, name: Option<String>) -> Self {
         self.waypoint_name = name.filter(|value| !value.trim().is_empty());
         self
@@ -189,6 +200,14 @@ impl MeshSliceRequest {
         self
     }
 
+    /// Returns `self` marked as a Sidecar that serves mesh-bound VirtualService
+    /// `http[]` routes (issue #7423). See
+    /// [`MeshSliceRequest::sidecar_http_routes`].
+    pub fn with_sidecar_http_routes(mut self, enabled: bool) -> Self {
+        self.sidecar_http_routes = enabled;
+        self
+    }
+
     /// Override the workload SPIFFE id when provided. Used by the xDS CP to
     /// apply the identity carried in `Node.metadata` (which takes precedence
     /// over any `node_id`-derived value); `None` leaves the existing value so a
@@ -203,7 +222,18 @@ impl MeshSliceRequest {
 
 /// Canonical per-node mesh view. This is the common source for both xDS
 /// translators and native ConfigSync mesh subscribers.
+///
+/// Root members are closed (`deny_unknown_fields`, issue #6616): within one
+/// build every producer serializes this same type, so an unrecognized member
+/// is a misspelled or foreign key, and `mesh_authz` must not build an
+/// authorization generation from a slice whose members it silently dropped.
+/// Across builds it is an upgrade constraint: `MeshSubscribe` admits a
+/// control plane at the same major.minor, so while a rolling upgrade runs a
+/// newer CP that adds a root member, older data planes refuse its slices
+/// (`invalid_slice_json`) and keep serving their last-good slice until they
+/// are upgraded too (`docs/mesh.md`, "Response binding").
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshSlice {
     pub node_id: String,
     pub namespace: String,
@@ -309,6 +339,21 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub virtual_service_l4_upstreams: Vec<serde_json::Value>,
+    /// VirtualService HTTP routes this data plane serves (issue #7233): the
+    /// route proxies, the weighted-split upstreams they and their
+    /// `mesh_route_dispatch` rules reference, and their route plugins.
+    /// Populated only for a NodeWaypoint subscription, from the routes bound
+    /// to the mesh in the subscription namespace whose `exportTo` admits it
+    /// (`MeshConfig::virtual_service_http_routes`).
+    ///
+    /// Without this a NodeWaypoint built from a slice had no HTTP route
+    /// upstream, so the `mesh_authz` destination index
+    /// (`node_waypoint_route_upstreams`) and RequestAuthentication destination
+    /// scoping could not reach a VirtualService route. Compared by
+    /// [`MeshSlice::content_eq`] so a route edit or withdrawal re-applies.
+    #[serde(default, skip_serializing_if = "MeshHttpRouteSet::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
+    pub http_routes: MeshHttpRouteSet,
     pub version: String,
     /// Authoritative, CP-replica-shared config revision this slice was built
     /// from (issue #2473).
@@ -365,8 +410,11 @@ pub struct MeshSlice {
     /// and bearer-namespace constraints applied before it crosses the boundary.
     ///
     /// It is a CAPTURE-ONLY view: it never widens `workloads` / `services` /
-    /// routing visibility, and is read solely by
-    /// `crate::proxy::resolve_node_waypoint_capture_destination`. Empty means
+    /// routing visibility. It is read by
+    /// `crate::proxy::resolve_node_waypoint_capture_destination` and seeds the
+    /// NodeWaypoint source identity resolver
+    /// (`NodeWaypointIdentityResolver::build_policy_scope_snapshot_from_slice`,
+    /// exact pod-UID binding only). Empty means
     /// the capture path resolves NOTHING and fails closed — never a PERMISSIVE
     /// default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -387,6 +435,43 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub node_waypoint_capture_peer_authentications: Vec<PeerAuthentication>,
+    /// AuthorizationPolicy (`MeshPolicy`) entries applicable to
+    /// [`Self::node_waypoint_capture_destinations`].
+    ///
+    /// `mesh_policies` is narrowed to the subscription namespace (and this
+    /// proxy's own identity), so a policy declared in a CAPTURED pod's own
+    /// namespace never reaches a NodeWaypoint deployed elsewhere. The capture
+    /// relay stamps that destination's exact policy scope, and the per-pod
+    /// evaluator can only filter the policies it was given — so without this
+    /// inventory a destination DENY (or a destination ALLOW's implicit-deny
+    /// floor) was silently absent and the connection was admitted.
+    ///
+    /// Carries exactly the policies the evaluator would apply to one of those
+    /// destinations (mesh-wide/root-namespace, namespace-scoped, and
+    /// selector-scoped entries matching a destination's own namespace and
+    /// labels) and nothing else. `mesh_authz` unions it into its per-pod
+    /// candidate set under NodeWaypoint per-pod scoping; it is never folded into
+    /// `mesh_policies` on the wire or in the slice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub node_waypoint_capture_mesh_policies: Vec<MeshPolicy>,
+    /// Completeness evidence for [`Self::node_waypoint_capture_mesh_policies`]:
+    /// `true` exactly when the producer of THIS slice generation resolved the
+    /// destination AuthorizationPolicy inventory (the slice builder sets it for
+    /// every capture-scoped request, including when the resolved inventory is
+    /// empty).
+    ///
+    /// An empty inventory is otherwise indistinguishable from a producer that
+    /// never resolved one, and evaluating a captured destination against an
+    /// unresolved inventory silently drops that destination's own DENY/ALLOW.
+    /// [`Self::validate_node_waypoint_capture_inventory`] therefore refuses a
+    /// slice that carries capture destinations (or capture policies) without
+    /// this marker, so the candidate is rejected and the previous complete
+    /// generation keeps serving. Over xDS the marker is the presence of the
+    /// `NodeWaypointCaptureMeshPoliciesCarrier`, which is emitted whenever this
+    /// is `true`, even for an empty inventory.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub node_waypoint_capture_mesh_policies_resolved: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub services: Vec<MeshService>,
@@ -484,6 +569,10 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub service_entries: Vec<ServiceEntry>,
+    /// RequestAuthentications selecting this workload. A waypoint slice
+    /// (NodeWaypoint or ServiceWaypoint) also carries those selecting the
+    /// destination workloads it fronts (issue #6670); the data plane applies
+    /// each one only to requests for the workloads it selects.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub request_authentications: Vec<MeshRequestAuthentication>,
@@ -493,6 +582,17 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub destination_rules: Vec<MeshDestinationRule>,
+    /// Control-plane-resolved outcomes of Istio's exported-rule host
+    /// selection (issue #7395): a visible wildcard rule in `destination_rules`
+    /// that does NOT apply to one destination host of this slice, because a
+    /// rule of the same namespace that is hidden from this subscriber is more
+    /// specific for that host and Istio then falls through to the next tier.
+    /// Names only the visible rule and the destination host; nothing about
+    /// the hidden rule (name, host pattern, `exportTo`, policy) leaves the
+    /// control plane. See [`destination_rule_host_exclusions`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub destination_rule_host_exclusions: Vec<DestinationRuleHostExclusion>,
     /// VirtualService-derived host-level CORS policies (issue #1973),
     /// narrowed like `destination_rules`. The DP synthesizes per-route `cors`
     /// plugin instances onto materialized outbound routes from these.
@@ -508,8 +608,10 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub multi_cluster: Option<MultiClusterConfig>,
-    /// Mesh-wide outbound traffic policy. `None` keeps the legacy
-    /// `AllowAny` behavior. When `Some(RegistryOnly)`, the slice-apply
+    /// Mesh-wide outbound traffic policy. `None` falls back to the runtime
+    /// default (`FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY`, see
+    /// [`Self::effective_outbound_traffic_policy`]). When
+    /// `Some(RegistryOnly)`, the slice-apply
     /// path auto-injects the `mesh_outbound_registry` plugin with a
     /// registry built from `services` ∪ `service_entries` ∪
     /// `workloads.addresses`.
@@ -565,6 +667,34 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "MeshRuntimeOverlay::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub runtime_overlay: MeshRuntimeOverlay,
+}
+
+/// HTTP route resources carried on a [`MeshSlice`] (issue #7233).
+///
+/// Each element is the full serialized resource, decoded at apply time
+/// through the ordinary `Proxy` / `Upstream` / `PluginConfig` admission path,
+/// like [`MeshSlice::virtual_service_l4_proxies`]. The set is closed: every
+/// proxy's plugin associations resolve to `plugin_configs` owned by that
+/// proxy, and every upstream id a proxy or a `mesh_route_dispatch` rule names
+/// resolves to `upstreams`. The data plane refuses a slice that breaks this.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshHttpRouteSet {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub proxies: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub upstreams: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub plugin_configs: Vec<serde_json::Value>,
+}
+
+impl MeshHttpRouteSet {
+    pub fn is_empty(&self) -> bool {
+        self.proxies.is_empty() && self.upstreams.is_empty() && self.plugin_configs.is_empty()
+    }
 }
 
 /// One opaque typed extension config, transported through xDS ECDS.
@@ -778,6 +908,43 @@ pub(crate) fn node_waypoint_capture_peer_authentications_for_destinations<'a>(
         .collect()
 }
 
+/// AuthorizationPolicy (`MeshPolicy`) entries applicable to `destinations`.
+///
+/// Uses the canonical [`policy_scope_applies_to_workload`] predicate — the one
+/// `PolicyScopeCache::policy_applies` evaluates per connection — against each
+/// destination workload's OWN namespace and labels, so mesh-wide/root-namespace,
+/// namespace-scoped, and selector-scoped policies are kept exactly when the
+/// scoped evaluator would apply them to that destination. Everything else is
+/// dropped: a policy in a namespace with no captured destination, or a
+/// selector that matches no captured destination, never rides this inventory.
+/// `targetRefs` policies are never kept: Istio attaches them at waypoint
+/// proxies only, and the per-pod evaluator never applies them on a
+/// NodeWaypoint.
+///
+/// Returns an empty vec for an empty destination set: with no destination there
+/// is nothing to authorize and carrying policy would only leak it.
+pub(crate) fn node_waypoint_capture_mesh_policies_for_destinations<'a>(
+    mesh_policies: impl IntoIterator<Item = &'a MeshPolicy>,
+    destinations: &[Workload],
+) -> Vec<MeshPolicy> {
+    if destinations.is_empty() {
+        return Vec::new();
+    }
+    mesh_policies
+        .into_iter()
+        .filter(|policy| {
+            destinations.iter().any(|workload| {
+                policy_scope_applies_to_workload(
+                    policy,
+                    &workload.namespace,
+                    &workload.selector.labels,
+                )
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// PeerAuthentication set that governs a generated NodeWaypoint DTLS listener.
 ///
 /// The NodeWaypoint's own inbound view (`peer_authentications`) is filtered to
@@ -812,6 +979,40 @@ pub fn node_waypoint_destination_peer_authentications(
 }
 
 impl MeshSlice {
+    /// Refuse a slice whose NodeWaypoint capture inventory is incomplete.
+    ///
+    /// A slice that names capture destinations must also prove that their
+    /// AuthorizationPolicy inventory was resolved for this generation
+    /// ([`Self::node_waypoint_capture_mesh_policies_resolved`]). Without that
+    /// proof the capture relay would authorize a captured connection against
+    /// the destination's exact scope but without the destination's own
+    /// policies, which admits what those policies refuse. Capture policies
+    /// without the proof are refused too: they are incoherent with this
+    /// generation's producer. Cold path (slice conversion / xDS recovery); the
+    /// diagnostic names fields only, never slice content.
+    pub fn validate_node_waypoint_capture_inventory(&self) -> Result<(), String> {
+        if self.node_waypoint_capture_mesh_policies_resolved {
+            return Ok(());
+        }
+        if !self.node_waypoint_capture_destinations.is_empty() {
+            return Err(
+                "mesh slice carries `node_waypoint_capture_destinations` without \
+                 `node_waypoint_capture_mesh_policies_resolved`: the captured destinations' \
+                 AuthorizationPolicy inventory was not resolved by the producer, so captured \
+                 connections cannot be authorized against it; refusing the slice"
+                    .to_string(),
+            );
+        }
+        if !self.node_waypoint_capture_mesh_policies.is_empty() {
+            return Err(
+                "mesh slice carries `node_waypoint_capture_mesh_policies` without \
+                 `node_waypoint_capture_mesh_policies_resolved`; refusing the incoherent slice"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Compare mesh-slice content while ignoring the transport version stamp.
     ///
     /// MeshSubscribe uses this to suppress no-op updates. Keep the comparison
@@ -847,8 +1048,14 @@ impl MeshSlice {
             && self.labels_ambiguous == other.labels_ambiguous
             && self.virtual_service_l4_proxies == other.virtual_service_l4_proxies
             && self.virtual_service_l4_upstreams == other.virtual_service_l4_upstreams
+            // A VirtualService HTTP route edit or withdrawal (issue #7233) can
+            // leave every other field unchanged; it must re-apply so the
+            // NodeWaypoint stops serving the stale route and its destination
+            // policy scope.
+            && self.http_routes == other.http_routes
             && self.workloads == other.workloads
             && self.ambient_udp_source_workloads == other.ambient_udp_source_workloads
+            && self.destination_rule_host_exclusions == other.destination_rule_host_exclusions
             && self.node_waypoint_assertors == other.node_waypoint_assertors
             // The NodeWaypoint capture inventory changes independently of
             // `workloads` / `peer_authentications` (a pod in ANOTHER namespace
@@ -860,6 +1067,15 @@ impl MeshSlice {
             && self.node_waypoint_capture_destinations == other.node_waypoint_capture_destinations
             && self.node_waypoint_capture_peer_authentications
                 == other.node_waypoint_capture_peer_authentications
+            // A captured destination's AuthorizationPolicy moves independently
+            // of `mesh_policies` (it lives in ANOTHER namespace). Omitting it
+            // would let dedupe keep serving the old destination policy set —
+            // e.g. still admitting a connection after the operator added a
+            // DENY in the captured pod's namespace.
+            && self.node_waypoint_capture_mesh_policies
+                == other.node_waypoint_capture_mesh_policies
+            && self.node_waypoint_capture_mesh_policies_resolved
+                == other.node_waypoint_capture_mesh_policies_resolved
             && self.services == other.services
             && self.local_inbound_services == other.local_inbound_services
             && self.local_inbound_workloads == other.local_inbound_workloads
@@ -969,11 +1185,20 @@ impl MeshSlice {
     /// Returned entries are alphabetically sorted so the plugin config is
     /// deterministic across reloads (preventing spurious slice-update
     /// re-broadcasts via `content_eq`).
+    ///
+    /// Every returned entry satisfies the `mesh_outbound_registry` entry
+    /// grammar. A slice host/name outside it (ServiceEntry `*`, an underscore
+    /// name, a zero port) is dropped with a structured warning naming the
+    /// resource, so it stays denied while the rest of the registry applies.
+    /// The HTTP plugin, the stream lane, and the egress-scope diagnostics all
+    /// read this builder, so they narrow identically instead of the HTTP lane
+    /// rejecting the whole config. Operator-authored registries stay strict.
     pub fn build_known_destinations(&self, cluster_domain: &str) -> Vec<String> {
         let mut entries: HashSet<String> = HashSet::new();
+        let mut warned: KnownDestinationWarned<'_> = HashSet::new();
         let cluster_domain = normalize_known_destination_host(cluster_domain).unwrap_or_default();
         let local_namespace = normalize_known_destination_host(&self.namespace);
-        for service in &self.services {
+        for (resource_index, service) in self.services.iter().enumerate() {
             let Some(service_name) = normalize_known_destination_host(&service.name) else {
                 continue;
             };
@@ -987,32 +1212,73 @@ impl MeshSlice {
             } else {
                 format!("{svc}.{cluster_domain}")
             };
+            let source = KnownDestinationSource {
+                kind: "Service",
+                collection: "services",
+                index: resource_index,
+                namespace: &service.namespace,
+                name: &service.name,
+            };
             if local_namespace.as_deref() == Some(namespace.as_str()) {
                 insert_known_destination(
                     &mut entries,
+                    &mut warned,
+                    source,
+                    None,
                     &service_name,
                     service.ports.iter().map(|p| p.port),
                 );
             }
             for host in [&namespaced, &svc, &fqdn] {
-                insert_known_destination(&mut entries, host, service.ports.iter().map(|p| p.port));
+                insert_known_destination(
+                    &mut entries,
+                    &mut warned,
+                    source,
+                    None,
+                    host,
+                    service.ports.iter().map(|p| p.port),
+                );
             }
         }
-        for entry in &self.service_entries {
-            for host in &entry.hosts {
+        for (resource_index, entry) in self.service_entries.iter().enumerate() {
+            let source = KnownDestinationSource {
+                kind: "ServiceEntry",
+                collection: "service_entries",
+                index: resource_index,
+                namespace: &entry.namespace,
+                name: &entry.name,
+            };
+            for (host_index, host) in entry.hosts.iter().enumerate() {
                 let Some(host) = normalize_known_destination_host(host) else {
                     continue;
                 };
-                insert_known_destination(&mut entries, &host, entry.ports.iter().map(|p| p.port));
+                insert_known_destination(
+                    &mut entries,
+                    &mut warned,
+                    source,
+                    Some(("hosts", host_index)),
+                    &host,
+                    entry.ports.iter().map(|p| p.port),
+                );
             }
         }
-        for workload in &self.workloads {
-            for addr in &workload.addresses {
+        for (resource_index, workload) in self.workloads.iter().enumerate() {
+            let source = KnownDestinationSource {
+                kind: "Workload",
+                collection: "workloads",
+                index: resource_index,
+                namespace: &workload.namespace,
+                name: &workload.service_name,
+            };
+            for (address_index, addr) in workload.addresses.iter().enumerate() {
                 let Some(addr) = normalize_known_destination_host(addr) else {
                     continue;
                 };
                 insert_known_destination(
                     &mut entries,
+                    &mut warned,
+                    source,
+                    Some(("addresses", address_index)),
                     &addr,
                     workload.ports.iter().map(|p| p.port),
                 );
@@ -1032,7 +1298,9 @@ impl MeshSlice {
     ///      which is already pre-filtered by `from_gateway_config`)
     ///
     /// Within the winning policy, a port-level override for `port` takes
-    /// precedence over the policy's top-level `mtls_mode`.
+    /// precedence over the policy's top-level `mtls_mode`. An `Unset` (Istio
+    /// `UNSET` / omitted) mode inherits from the next tier down: workload port
+    /// override -> workload mode -> namespace -> mesh-wide -> `Permissive`.
     ///
     /// When no PeerAuthentication applies, returns `MtlsMode::Permissive`
     /// (Istio default).
@@ -1087,12 +1355,13 @@ impl MeshSlice {
         &self,
         mode_for: impl Fn(&PeerAuthentication) -> MtlsMode + Copy,
     ) -> MtlsMode {
-        let resolved = resolve_peer_auth_mtls_mode(
+        let resolution = resolve_peer_auth_tiers(
             &self.peer_authentications,
             &self.namespace,
             &self.labels,
             mode_for,
         );
+        let resolved = resolution.effective;
         if !self.labels_ambiguous {
             return resolved;
         }
@@ -1122,7 +1391,12 @@ impl MeshSlice {
             if !peer_auth_selector_namespace_matches(pa, &self.namespace) {
                 continue;
             }
-            let candidate = mode_for(pa);
+            // An `Unset` candidate would inherit the namespace/mesh-wide mode,
+            // which resolves against the authoritative namespace.
+            let candidate = match mode_for(pa) {
+                MtlsMode::Unset => resolution.inherited_by_workload_tier,
+                mode => mode,
+            };
             if peer_auth_mtls_restrictiveness(candidate) < peer_auth_mtls_restrictiveness(effective)
             {
                 effective = candidate;
@@ -1198,7 +1472,9 @@ impl MeshSlice {
                 .filter(|upstream| {
                     upstream.namespace == request.namespace
                         && referenced.contains(upstream.id.as_str())
-                        && upstream.id.starts_with("istio-vs-l4-upstream-")
+                        && upstream
+                            .id
+                            .starts_with(crate::proxy::stream_match::ISTIO_VS_L4_UPSTREAM_ID_PREFIX)
                 })
                 .collect()
         };
@@ -1241,40 +1517,71 @@ impl MeshSlice {
         } else {
             mesh.node_waypoint_assertors.clone()
         };
-        // NodeWaypoint transparent-inbound-capture inventory (issue #3287).
-        // Computed from the PRE-narrowing view on purpose: an enrolled pod this
-        // NodeWaypoint captures for can live in another namespace, so deriving it
-        // after the `workloads` narrowing below would silently drop exactly the
-        // cross-namespace destinations whose PeerAuthentication posture must be
-        // enforced. When the CP already resolved it (`filter_mesh_config_to_request`
-        // runs BEFORE its own namespace retains and applies scope/bearer
-        // authorization), that authoritative value wins; the `is_empty` fallback
-        // covers the file/local source and any CP that resolved nothing, and can
-        // only ever yield a SUBSET of the authorized inventory — never a widening.
-        let (node_waypoint_capture_destinations, node_waypoint_capture_peer_authentications) =
-            if request.node_waypoint_capture_scoping {
-                let destinations = if mesh.node_waypoint_capture_destinations.is_empty() {
-                    node_waypoint_capture_destinations_from_workloads(
-                        mesh.workloads.iter(),
-                        request.workload_spiffe_id.as_deref(),
-                    )
-                } else {
-                    mesh.node_waypoint_capture_destinations.clone()
-                };
-                let candidates = if mesh.node_waypoint_capture_peer_authentications.is_empty() {
-                    &mesh.peer_authentications
-                } else {
-                    &mesh.node_waypoint_capture_peer_authentications
-                };
-                let peer_authentications =
-                    node_waypoint_capture_peer_authentications_for_destinations(
-                        candidates.iter(),
+        // NodeWaypoint transparent-inbound-capture inventory (issue #3287):
+        // capture destinations, their PeerAuthentication candidates, and their
+        // AuthorizationPolicy. Derived ONLY from an authoritative, pre-narrowing
+        // source, chosen by the config's explicit provenance — never inferred
+        // from whether the dedicated fields happen to be empty:
+        //
+        // * `Unfiltered` (file/local source, stock-xDS baseline, an unfiltered
+        //   snapshot): derive all three from the whole document.
+        // * `Resolved` (the CP filter resolved the inventory before narrowing
+        //   under CP scope + bearer bounds, or a DP back-projected a resolved
+        //   slice): the dedicated fields are authoritative EVEN WHEN EMPTY.
+        //   Destinations are re-narrowed to this exact NodeWaypoint identity
+        //   (the CP may hold an identity-agnostic candidate set), and the
+        //   candidates are re-narrowed to exactly those destinations. Nothing is
+        //   rebuilt from `workloads` / `peer_authentications` / `mesh_policies`,
+        //   which are narrowed (or Sidecar-widened) routing views here.
+        // * `NotResolved` (narrowed without an inventory): an empty inventory
+        //   WITHOUT completeness evidence, so captured connections resolve
+        //   nothing and the DP refuses capture policies — fail closed.
+        //
+        // The completeness marker is stamped only for the first two, i.e. only
+        // when the inventory really was derived from the authoritative source.
+        let (
+            node_waypoint_capture_destinations,
+            node_waypoint_capture_peer_authentications,
+            node_waypoint_capture_mesh_policies,
+            node_waypoint_capture_mesh_policies_resolved,
+        ) = if !request.node_waypoint_capture_scoping {
+            (Vec::new(), Vec::new(), Vec::new(), false)
+        } else {
+            use crate::modes::mesh::config::NodeWaypointCaptureInventoryState;
+            let identity = request.workload_spiffe_id.as_deref();
+            let sources = match mesh.node_waypoint_capture_inventory_state {
+                NodeWaypointCaptureInventoryState::Unfiltered => Some((
+                    &mesh.workloads,
+                    &mesh.peer_authentications,
+                    &mesh.mesh_policies,
+                )),
+                NodeWaypointCaptureInventoryState::Resolved => Some((
+                    &mesh.node_waypoint_capture_destinations,
+                    &mesh.node_waypoint_capture_peer_authentications,
+                    &mesh.node_waypoint_capture_mesh_policies,
+                )),
+                NodeWaypointCaptureInventoryState::NotResolved => None,
+            };
+            match sources {
+                None => (Vec::new(), Vec::new(), Vec::new(), false),
+                Some((workloads, peer_authentications, mesh_policies)) => {
+                    let destinations = node_waypoint_capture_destinations_from_workloads(
+                        workloads.iter(),
+                        identity,
+                    );
+                    let peer_authentications =
+                        node_waypoint_capture_peer_authentications_for_destinations(
+                            peer_authentications.iter(),
+                            &destinations,
+                        );
+                    let mesh_policies = node_waypoint_capture_mesh_policies_for_destinations(
+                        mesh_policies.iter(),
                         &destinations,
                     );
-                (destinations, peer_authentications)
-            } else {
-                (Vec::new(), Vec::new())
-            };
+                    (destinations, peer_authentications, mesh_policies, true)
+                }
+            }
+        };
         let workloads: Vec<Workload> = mesh
             .workloads
             .iter()
@@ -1335,17 +1642,32 @@ impl MeshSlice {
         // destination candidates come from the destination-visible workload
         // view and must remain present even when their pod UID was stripped at
         // the CP boundary or never existed (for example, WorkloadEntry).
+        //
+        // Only topologies that authorize traffic for OTHER workloads need this
+        // superset: Ambient / ServiceWaypoint (UDP source scoping) and
+        // NodeWaypoint (per-pod destination scoping). A Sidecar, gateway, or
+        // other single-workload slice keeps only the policies selecting its own
+        // workload (issue #7241): a neighbour's selector policy there is never
+        // enforced, can fail `mesh_authz` construction on a `labels_ambiguous`
+        // slice, and makes every subscriber's slice change when any
+        // namespace workload's policy does.
+        let carries_other_workload_policy_candidates =
+            request.ambient_udp_source_scoping || request.node_waypoint_capture_scoping;
         let ambient_udp_policy_candidates: Vec<(String, BTreeMap<String, String>)> =
-            ambient_udp_source_workloads
-                .iter()
-                .chain(workloads.iter())
-                .map(|workload| {
-                    (
-                        workload.namespace.clone(),
-                        labels_to_btree(&workload.selector.labels),
-                    )
-                })
-                .collect();
+            if carries_other_workload_policy_candidates {
+                ambient_udp_source_workloads
+                    .iter()
+                    .chain(workloads.iter())
+                    .map(|workload| {
+                        (
+                            workload.namespace.clone(),
+                            labels_to_btree(&workload.selector.labels),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let policy_candidate_labels: Vec<&BTreeMap<String, String>> = if request.labels.is_empty() {
             if candidate_label_sets.is_empty() {
                 vec![&effective_labels]
@@ -1363,12 +1685,27 @@ impl MeshSlice {
         // from. The enforcement and dry-run flags gate Sidecar resolution so
         // existing deployments see zero behavior change unless one of the
         // rollout flags is enabled.
+        //
+        // SECURITY (GHSA-mhm9-gp97-237q): on a `labels_ambiguous` slice
+        // `effective_labels` is only the INTERSECTION of several same-SPIFFE
+        // workloads' divergent label sets, so a `workloadSelector` Sidecar that
+        // really selects one of them can miss it and egress narrowing would
+        // fall through to a wider tier (or to none). The same candidate label
+        // sets the #3262 outbound-policy fold uses are resolved here too and
+        // every distinct scope must admit a resource (strictest wins). See
+        // `resolve_applicable_sidecar_egress_scopes`.
+        let ambiguous_policy_candidates: &[&BTreeMap<String, String>] = if labels_ambiguous {
+            &policy_candidate_labels
+        } else {
+            &[]
+        };
         let resolved_sidecar = if sidecar_enforced || sidecar_dry_run {
-            resolve_applicable_sidecar_egress(
+            resolve_applicable_sidecar_egress_scopes(
                 &mesh.sidecars,
                 effective_namespace,
                 &effective_labels,
                 mesh.istio_root_namespace.as_str(),
+                ambiguous_policy_candidates,
             )
         } else {
             None
@@ -1376,7 +1713,7 @@ impl MeshSlice {
         let applicable_sidecar = if sidecar_dry_run {
             None
         } else {
-            resolved_sidecar
+            resolved_sidecar.as_ref()
         };
 
         // ONE `select_applicable_sidecar` scan, shared by the two consumers that
@@ -1431,11 +1768,6 @@ impl MeshSlice {
         // default. The extra candidate label sets are therefore passed in (empty
         // unless ambiguous) and the resolution folds them fail-closed. See
         // `resolve_applicable_sidecar_outbound_policy`.
-        let ambiguous_policy_candidates: &[&BTreeMap<String, String>] = if labels_ambiguous {
-            &policy_candidate_labels
-        } else {
-            &[]
-        };
         let sidecar_outbound_traffic_policy = if sidecar_enforced && !sidecar_dry_run {
             resolve_applicable_sidecar_outbound_policy(
                 &mesh.sidecars,
@@ -1472,7 +1804,7 @@ impl MeshSlice {
         {
             (
                 mesh_service_identities(&mesh.services),
-                visible_service_entry_hosts(mesh, effective_namespace, &effective_labels),
+                visible_service_entry_hosts(mesh, effective_namespace),
             )
         } else {
             (BTreeSet::new(), BTreeMap::new())
@@ -1519,9 +1851,7 @@ impl MeshSlice {
                             .iter()
                             .map(String::as_str)
                             .collect();
-                        sidecar_egress_includes_service(
-                            sidecar.namespace,
-                            sidecar.egress,
+                        sidecar.includes_service(
                             &host_scope.scope_namespace,
                             &host_refs,
                             Some(&[*port]),
@@ -1538,6 +1868,47 @@ impl MeshSlice {
                 .into_iter()
                 .filter(|upstream| admitted_upstream_ids.contains(upstream.id.as_str())),
         );
+        // VirtualService HTTP routes (issues #7233, #7423), for the topologies
+        // that serve them (NodeWaypoint and Sidecar): the routes bound to the
+        // mesh in this subscription's namespace whose `exportTo` admits it,
+        // with every destination admitted by an applicable Sidecar egress
+        // scope exactly like the L4 routes above. Ambient (the L4 data plane),
+        // ServiceWaypoint and the gateway topologies request none.
+        let http_routes = if request.node_waypoint_capture_scoping || request.sidecar_http_routes {
+            node_waypoint_http_route_set(
+                config,
+                mesh,
+                &namespace,
+                &service_waypoint_namespaces,
+                &|proxy_namespace: &str, host: &str, port: u16| {
+                    let Some(sidecar) = applicable_sidecar else {
+                        return true;
+                    };
+                    let host_scope = policy_host_scope(
+                        host,
+                        proxy_namespace,
+                        &cluster_domain,
+                        &mesh_service_identities,
+                        &service_entry_hosts,
+                    );
+                    let host_refs: Vec<&str> = host_scope
+                        .host_candidates
+                        .iter()
+                        .map(String::as_str)
+                        .collect();
+                    sidecar.includes_service(&host_scope.scope_namespace, &host_refs, Some(&[port]))
+                },
+                // A Sidecar forwards an admitted `rewrite.authority` verbatim
+                // (issue #7423), so a port-less one must name a single-port
+                // destination in the destination's full inventory, which the
+                // Sidecar's egress-narrowed view may not show.
+                request
+                    .sidecar_http_routes
+                    .then_some(cluster_domain.as_str()),
+            )
+        } else {
+            MeshHttpRouteSet::default()
+        };
 
         let services: Vec<MeshService> = mesh
             .services
@@ -1551,7 +1922,7 @@ impl MeshSlice {
                     )
                     .then(|| service.clone());
                 };
-                narrow_service_ports(service, sidecar, &cluster_domain)
+                sidecar.narrow_service(service, &cluster_domain)
             })
             .collect();
         // Inbound serving must not be gated by egress scope. When a Sidecar
@@ -1728,23 +2099,39 @@ impl MeshSlice {
         let service_entries: Vec<ServiceEntry> = mesh
             .service_entries
             .iter()
-            .filter(|entry| {
-                service_entry_applies_to_workload(entry, effective_namespace, &effective_labels)
-            })
+            .filter(|entry| service_entry_applies_to_workload(entry, effective_namespace))
             .flat_map(|entry| {
                 let Some(sidecar) = applicable_sidecar else {
                     return vec![entry.clone()];
                 };
-                narrow_service_entry_ports(entry, sidecar)
+                sidecar.narrow_service_entry(entry)
             })
             .collect();
+        // A waypoint (NodeWaypoint or ServiceWaypoint) terminates requests for
+        // OTHER workloads, so it also carries the RequestAuthentications that
+        // select the destinations it fronts (issue #6670): the visible
+        // workloads its routes reach and, on a NodeWaypoint, its capture
+        // destinations. The data plane selects among them per destination;
+        // the waypoint's own identity still selects its own set.
+        let waypoint_destination_request_auth =
+            request.waypoint_name.is_some() || request.node_waypoint_capture_scoping;
         let request_authentications: Vec<MeshRequestAuthentication> = mesh
             .request_authentications
             .iter()
             .filter(|ra| {
                 policy_candidate_labels.iter().any(|labels| {
                     scope_applies_to_workload(&ra.scope, effective_namespace, *labels)
-                })
+                }) || (waypoint_destination_request_auth
+                    && workloads
+                        .iter()
+                        .chain(node_waypoint_capture_destinations.iter())
+                        .any(|workload| {
+                            scope_applies_to_workload(
+                                &ra.scope,
+                                &workload.namespace,
+                                &workload.selector.labels,
+                            )
+                        }))
             })
             .cloned()
             .collect();
@@ -1763,12 +2150,15 @@ impl MeshSlice {
         // service → root lookup tiers (#2469), then this path's own scope gate,
         // then per-destination tier resolution. The root namespace is resolved
         // HERE, at slice build, so the data plane never has to know it.
+        let carried_destination_hosts =
+            carried_route_destination_hosts(&http_routes, &virtual_service_l4_upstreams);
         let destination_rule_scope = DestinationRuleScope {
             client_namespace: effective_namespace,
             root_namespace: mesh.istio_root_namespace.as_str(),
             cluster_domain: &cluster_domain,
             mesh_service_identities: &mesh_service_identities,
             service_entry_hosts: &service_entry_hosts,
+            carried_destination_hosts: &carried_destination_hosts,
         };
         let destination_rules: Vec<MeshDestinationRule> = admit_destination_rules(
             mesh.destination_rules.iter(),
@@ -1787,13 +2177,7 @@ impl MeshSlice {
                     ) || dr.namespace.trim() == mesh.istio_root_namespace.trim();
                 };
                 let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
-                sidecar_egress_includes_service(
-                    sidecar.namespace,
-                    sidecar.egress,
-                    resource_namespace,
-                    &host_refs,
-                    None,
-                )
+                sidecar.includes_service(resource_namespace, &host_refs, None)
             },
         );
         // VirtualService-derived CORS policies narrow EXACTLY like
@@ -1850,13 +2234,7 @@ impl MeshSlice {
                     .iter()
                     .map(String::as_str)
                     .collect();
-                sidecar_egress_includes_service(
-                    sidecar.namespace,
-                    sidecar.egress,
-                    &host_scope.scope_namespace,
-                    &host_refs,
-                    None,
-                )
+                sidecar.includes_service(&host_scope.scope_namespace, &host_refs, None)
             })
             .cloned()
             .collect();
@@ -1887,12 +2265,19 @@ impl MeshSlice {
                 workloads
             };
 
-        let sidecar_egress_scope = resolved_sidecar.map(|sidecar| {
+        let sidecar_egress_scope = resolved_sidecar.as_ref().map(|sidecar| {
             build_sidecar_egress_scope_snapshot(EgressScopeBuildContext {
                 mesh,
                 sidecar,
+                // Outside dry-run this Sidecar IS `applicable_sidecar`, so the
+                // slice's own narrowed services, ServiceEntries and
+                // DestinationRules are exactly the set the snapshot reports.
+                admitted: (!sidecar_dry_run).then_some(AdmittedEgressScope {
+                    services: &services,
+                    service_entries: &service_entries,
+                    destination_rules: &destination_rules,
+                }),
                 workload_namespace: effective_namespace,
-                workload_labels: &effective_labels,
                 cluster_domain: &cluster_domain,
                 mesh_service_identities: &mesh_service_identities,
                 service_entry_hosts: &service_entry_hosts,
@@ -1946,8 +2331,11 @@ impl MeshSlice {
         // narrowing is a projection of what the policy set already named, so
         // it can never remove a provider a retained policy needs.
         let ext_authz_providers: Vec<crate::modes::mesh::config::MeshExtAuthzProvider> = {
+            // The NodeWaypoint capture-destination inventory is evaluated beside
+            // `mesh_policies`, so a provider only it references must ride too.
             let referenced: BTreeSet<&str> = mesh_policies
                 .iter()
+                .chain(node_waypoint_capture_mesh_policies.iter())
                 .flat_map(|policy| policy.rules.iter())
                 .filter_map(|rule| rule.action.custom_provider())
                 .collect();
@@ -1976,7 +2364,7 @@ impl MeshSlice {
             request.waypoint_name.as_deref(),
             &request_namespace,
         );
-        Self {
+        let mut slice = Self {
             node_id: request.node_id,
             namespace: request_namespace.clone(),
             // Issue #2469: the DP needs the mesh root namespace to distinguish
@@ -1992,6 +2380,7 @@ impl MeshSlice {
             labels_ambiguous,
             virtual_service_l4_proxies,
             virtual_service_l4_upstreams,
+            http_routes,
             version,
             revision,
             workloads,
@@ -1999,6 +2388,8 @@ impl MeshSlice {
             node_waypoint_assertors,
             node_waypoint_capture_destinations,
             node_waypoint_capture_peer_authentications,
+            node_waypoint_capture_mesh_policies,
+            node_waypoint_capture_mesh_policies_resolved,
             services,
             local_inbound_services,
             local_inbound_workloads,
@@ -2012,6 +2403,7 @@ impl MeshSlice {
             request_authentications,
             telemetry_resources,
             destination_rules,
+            destination_rule_host_exclusions: Vec::new(),
             virtual_service_cors_policies,
             proxy_configs,
             trust_bundles: mesh.trust_bundles.clone(),
@@ -2030,25 +2422,147 @@ impl MeshSlice {
             // xDS reverse translation populates this field directly; native
             // MeshSubscribe configs leave it empty.
             runtime_overlay: MeshRuntimeOverlay::default(),
-        }
+        };
+        slice.destination_rule_host_exclusions = destination_rule_host_exclusions(
+            &mesh.destination_rules,
+            &slice,
+            effective_namespace,
+            mesh.istio_root_namespace.as_str(),
+            &cluster_domain,
+        );
+        slice
     }
 }
 
-/// Narrow slice resources to those bound to the named GAMMA Waypoint.
+/// One control-plane-resolved exclusion: the visible wildcard
+/// DestinationRule identified by `namespace`, `name` and its own host pattern
+/// `rule_host` does not apply to destination `host` (issue #7395,
+/// [`MeshSlice::destination_rule_host_exclusions`]). The rule host is part of
+/// the identity because native/file configs may repeat one `(namespace,
+/// name)` for distinct hosts; it is the visible rule's own, already
+/// authorized metadata.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DestinationRuleHostExclusion {
+    pub namespace: String,
+    pub name: String,
+    pub rule_host: String,
+    pub host: String,
+}
+
+impl DestinationRuleHostExclusion {
+    /// Whether this excludes `rule` for destination `host` (hosts compared in
+    /// canonical form: trimmed, no trailing dot, ASCII-lowercase).
+    pub(crate) fn excludes(&self, rule: &MeshDestinationRule, host: &str) -> bool {
+        self.namespace == rule.namespace.trim()
+            && self.name == rule.name
+            && self.rule_host == canonical_destination_rule_host(&rule.host)
+            && self.host == canonical_destination_rule_host(host)
+    }
+}
+
+fn canonical_destination_rule_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Resolve, on the control plane, Istio's exported-rule host selection for
+/// the destination hosts this slice can reach (issue #7395; Istio
+/// `pilot/pkg/model/push_context.go`, `SetDestinationRules` and
+/// `getExportedDestinationRuleFromNamespace`).
 ///
-/// Returns the input vectors unchanged when no binding for `waypoint_name`
-/// exists (the slice falls back to whatever the workload-scope filter
-/// already produced — fail-open is intentional for the **routing** rollout
-/// window, so an operator who flips `FERRUM_MESH_TOPOLOGY=service_waypoint`
-/// before the matching `Gateway` resource lands does not see immediate
-/// service loss). When at least one binding matches, services and dependent
-/// resources are filtered to only those in the binding's `services` list.
+/// In the target service's namespace and the root namespace Istio picks the
+/// most specific host among that namespace's EXPORTED rules (every rule that
+/// is not namespace-private) BEFORE checking that the chosen rule is exported
+/// to the client; when it is not, the lookup falls through to the next tier
+/// rather than retrying a broader visible wildcard of the same namespace. A
+/// namespace-private rule (`exportTo: ["."]` or only its own namespace) is not
+/// in that exported index, so it shadows nothing for other namespaces.
 ///
-/// This fail-open is NOT a binding and must never license the inbound HBONE
-/// relay. That inventory is derived from
-/// [`MeshSlice::service_waypoint_bound_services`], which stays empty unless
-/// this exact waypoint identity has a matching binding that claims service
-/// traffic (`waypoint_for=service` or `all`; issue #4251).
+/// For every admitted, non-client-tier wildcard rule and every destination
+/// host the slice carries (Service FQDNs, ServiceEntry hosts, and the target
+/// hosts of carried VirtualService HTTP and L4 route upstreams) that it
+/// names, this records an
+/// exclusion when a hidden exported rule of the same namespace names that host
+/// strictly more specifically. Only the outcome rides the slice.
+fn destination_rule_host_exclusions(
+    all_rules: &[MeshDestinationRule],
+    slice: &MeshSlice,
+    client_namespace: &str,
+    root_namespace: &str,
+    cluster_domain: &str,
+) -> Vec<DestinationRuleHostExclusion> {
+    let hidden: Vec<&MeshDestinationRule> = all_rules
+        .iter()
+        .filter(|rule| destination_rule_shadows_from_hiding(rule, client_namespace, root_namespace))
+        .collect();
+    if hidden.is_empty() {
+        return Vec::new();
+    }
+    let cluster_domain = cluster_domain.trim().trim_end_matches('.');
+    let mut hosts: BTreeSet<String> = BTreeSet::new();
+    for service in &slice.services {
+        hosts.insert(canonical_destination_rule_host(
+            &if cluster_domain.is_empty() {
+                format!("{}.{}.svc", service.name, service.namespace)
+            } else {
+                format!(
+                    "{}.{}.svc.{cluster_domain}",
+                    service.name, service.namespace
+                )
+            },
+        ));
+    }
+    for entry in &slice.service_entries {
+        hosts.extend(
+            entry
+                .hosts
+                .iter()
+                .map(|host| canonical_destination_rule_host(host.as_str())),
+        );
+    }
+    // Carried VirtualService HTTP route and L4 (`tcp[]` / `tls[]`) upstream
+    // targets are destinations too: they reach DestinationRule selection on
+    // the data plane like any other upstream.
+    hosts.extend(carried_route_destination_hosts(
+        &slice.http_routes,
+        &slice.virtual_service_l4_upstreams,
+    ));
+    let mut exclusions = BTreeSet::new();
+    for rule in &slice.destination_rules {
+        if !is_wildcard_destination_rule_host(&rule.host)
+            || destination_rule_lookup_tier(rule, client_namespace, None, root_namespace)
+                == DestinationRuleLookupTier::Client
+        {
+            continue;
+        }
+        for host in &hosts {
+            let Some(specificity) =
+                super::destination_rule_host_specificity(&rule.host, &rule.namespace, host)
+            else {
+                continue;
+            };
+            let shadowed = hidden.iter().any(|hidden| {
+                hidden.namespace.trim() == rule.namespace.trim()
+                    && super::destination_rule_host_specificity(
+                        &hidden.host,
+                        &hidden.namespace,
+                        host,
+                    )
+                    .is_some_and(|hidden_specificity| hidden_specificity > specificity)
+            });
+            if shadowed {
+                exclusions.insert(DestinationRuleHostExclusion {
+                    namespace: rule.namespace.trim().to_string(),
+                    name: rule.name.clone(),
+                    rule_host: canonical_destination_rule_host(&rule.host),
+                    host: host.clone(),
+                });
+            }
+        }
+    }
+    exclusions.into_iter().collect()
+}
+
 struct ServiceWaypointNarrowingResources {
     services: Vec<MeshService>,
     service_entries: Vec<ServiceEntry>,
@@ -2227,6 +2741,21 @@ fn target_refs_attach_to_waypoint_services(
     })
 }
 
+/// Narrow slice resources to those bound to the named GAMMA Waypoint.
+///
+/// Returns the input vectors unchanged when no binding for `waypoint_name`
+/// exists (the slice falls back to whatever the workload-scope filter
+/// already produced — fail-open is intentional for the **routing** rollout
+/// window, so an operator who flips `FERRUM_MESH_TOPOLOGY=service_waypoint`
+/// before the matching `Gateway` resource lands does not see immediate
+/// service loss). When at least one binding matches, services and dependent
+/// resources are filtered to only those in the binding's `services` list.
+///
+/// This fail-open is NOT a binding and must never license the inbound HBONE
+/// relay. That inventory is derived from
+/// [`MeshSlice::service_waypoint_bound_services`], which stays empty unless
+/// this exact waypoint identity has a matching binding that claims service
+/// traffic (`waypoint_for=service` or `all`; issue #4251).
 fn narrow_for_service_waypoint(
     waypoint_name: &str,
     waypoint_namespace: &str,
@@ -2274,16 +2803,15 @@ fn narrow_for_service_waypoint(
         .destination_rules
         .into_iter()
         .filter(|dr| {
-            // DR is admitted only when its host is one of the admitted
-            // Service's canonical Kubernetes DNS aliases. Broad prefix
-            // matches can accidentally admit unrelated external hosts.
+            // DR is admitted only when it names an admitted Service, through
+            // the one DestinationRule host matcher (exact alias or wildcard,
+            // issue #7395), from a namespace on that Service's lookup path.
             destination_rule_matches_admitted_service(
                 dr,
                 waypoint_namespace,
                 root_namespace,
                 cluster_domain,
                 &admitted_services,
-                &admitted_hosts,
             )
         })
         .collect();
@@ -2369,62 +2897,43 @@ fn admitted_service_hosts(services: &[MeshService], cluster_domain: &str) -> BTr
     hosts
 }
 
+/// Whether a DestinationRule governs a Service this service waypoint is bound
+/// to: it names one of the Service's dotted aliases (`<svc>.<ns>`,
+/// `<svc>.<ns>.svc`, the FQDN) through the ONE DestinationRule host matcher,
+/// [`super::destination_rule_host_specificity`] (exact, Service alias, or
+/// wildcard, issue #7395), AND its namespace is on that Service's Istio
+/// lookup path from the waypoint's client position, re-derived from the
+/// MATCHED Service: the waypoint's own namespace (client tier), the matched
+/// Service's namespace (service tier), or the configured
+/// `istio_root_namespace` (root tier, issue #2469 — omitting it dropped the
+/// mesh-wide default entirely). A short host resolves in the rule's own
+/// namespace, so it can only name a Service there. Export visibility and
+/// cross-tier precedence have already been resolved by
+/// `admit_destination_rules` and are re-applied per destination host by
+/// `apply_destination_rules`; this pass only re-checks ownership against the
+/// waypoint's narrowed service set.
 fn destination_rule_matches_admitted_service(
     dr: &MeshDestinationRule,
     waypoint_namespace: &str,
     root_namespace: &str,
     cluster_domain: &str,
     admitted_services: &[MeshService],
-    admitted_hosts: &BTreeSet<String>,
 ) -> bool {
-    let host = dr.host.trim_end_matches('.');
-    host_matches_admitted_service(host, admitted_hosts)
-        && destination_rule_namespace_allowed_for_admitted_service(
-            dr,
-            waypoint_namespace,
-            root_namespace,
-            cluster_domain,
-            admitted_services,
-            host,
-        )
-        || admitted_services
-            .iter()
-            .any(|service| host == service.name && dr.namespace == service.namespace)
-}
-
-/// Which namespaces may own a DestinationRule for a service-waypoint-admitted
-/// service.
-///
-/// This mirrors Istio's lookup path for the waypoint's client position: the
-/// waypoint's own namespace (client tier), the target Service's namespace
-/// (service tier), and the configured `istio_root_namespace` (root tier,
-/// issue #2469 — omitting it dropped the mesh-wide default entirely). Export
-/// visibility and cross-tier precedence have already been resolved by
-/// `admit_destination_rules`; this pass only re-checks ownership against the
-/// waypoint's narrowed service set.
-fn destination_rule_namespace_allowed_for_admitted_service(
-    dr: &MeshDestinationRule,
-    waypoint_namespace: &str,
-    root_namespace: &str,
-    cluster_domain: &str,
-    admitted_services: &[MeshService],
-    host: &str,
-) -> bool {
-    let cluster_domain = cluster_domain.trim().trim_end_matches('.');
     let root_namespace = root_namespace.trim();
+    let rule_namespace = dr.namespace.trim();
     admitted_services.iter().any(|service| {
-        let host_matches = host == format!("{}.{}", service.name, service.namespace)
-            || host == format!("{}.{}.svc", service.name, service.namespace)
-            || (!cluster_domain.is_empty()
-                && host
-                    == format!(
-                        "{}.{}.svc.{}",
-                        service.name, service.namespace, cluster_domain
-                    ));
-        host_matches
-            && (dr.namespace == service.namespace
-                || dr.namespace == waypoint_namespace
-                || (!root_namespace.is_empty() && dr.namespace.trim() == root_namespace))
+        let names_service = service_host_aliases(&service.name, &service.namespace, cluster_domain)
+            .iter()
+            // The dotless short alias would match a short host declared in
+            // ANY namespace; the dotted aliases carry the namespace.
+            .filter(|alias| alias.contains('.'))
+            .any(|alias| {
+                super::destination_rule_host_specificity(&dr.host, &dr.namespace, alias).is_some()
+            });
+        names_service
+            && (rule_namespace == service.namespace.trim()
+                || rule_namespace == waypoint_namespace.trim()
+                || (!root_namespace.is_empty() && rule_namespace == root_namespace))
     })
 }
 
@@ -2482,9 +2991,12 @@ fn narrow_workload_identities(
         );
     } else if admitted_services.is_empty() {
         debug!(
-            node_id = request.node_id.as_str(),
-            namespace = request.namespace.as_str(),
-            workload_spiffe_id = request.workload_spiffe_id.as_deref().unwrap_or(""),
+            node_id = %sanitize_startup_cause(format!("{:?}", request.node_id.as_str()), &[]),
+            namespace = %sanitize_startup_cause(format!("{:?}", request.namespace.as_str()), &[]),
+            workload_spiffe_id = %sanitize_startup_cause(
+                format!("{:?}", request.workload_spiffe_id.as_deref().unwrap_or("")),
+                &[]
+            ),
             "Sidecar workload identity narrowing found no admitted services; slice workloads will be empty"
         );
     }
@@ -2582,27 +3094,118 @@ fn normalize_known_destination_host(value: &str) -> Option<String> {
     Some(value)
 }
 
-fn insert_known_destination(
-    entries: &mut HashSet<String>,
-    host: &str,
-    ports: impl Iterator<Item = u16>,
-) {
-    entries.insert(host.to_string());
-    let mut inserted_port = false;
-    for port in ports {
-        inserted_port = true;
-        entries.insert(format!("{host}:{port}"));
-    }
-    if !inserted_port {
-        entries.insert(format!("{host}:*"));
+/// Slice resource a known destination came from, for the skip warning.
+/// `collection` + `index` form a fixed schema path; `namespace` / `name` are
+/// document values and are only emitted through
+/// [`diagnostic_resource_identity`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct KnownDestinationSource<'a> {
+    kind: &'static str,
+    collection: &'static str,
+    index: usize,
+    namespace: &'a str,
+    name: &'a str,
+}
+
+/// Emit a resource namespace/name only when it is a DNS-1123 subdomain
+/// (lowercase alphanumerics, `-`, `.`; at most 253 bytes), which cannot carry
+/// userinfo, URLs, quotes, or control characters. Anything else is withheld
+/// through the startup diagnostic sanitizer.
+fn diagnostic_resource_identity(value: &str) -> String {
+    let is_dns1123_subdomain = !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|component| {
+            let bytes = component.as_bytes();
+            let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+            !bytes.is_empty()
+                && alnum(bytes[0])
+                && alnum(bytes[bytes.len() - 1])
+                && bytes.iter().all(|b| alnum(*b) || *b == b'-')
+        });
+    if is_dns1123_subdomain {
+        value.to_string()
+    } else {
+        sanitize_startup_cause(format!("{:?}", value.to_string()), &[])
     }
 }
 
-struct EgressScopeBuildContext<'a, L: WorkloadLabels + ?Sized> {
+/// Resources already warned about within one registry build.
+type KnownDestinationWarned<'a> = HashSet<KnownDestinationSource<'a>>;
+
+fn insert_known_destination<'a>(
+    entries: &mut HashSet<String>,
+    warned: &mut KnownDestinationWarned<'a>,
+    source: KnownDestinationSource<'a>,
+    member: Option<(&'static str, usize)>,
+    host: &str,
+    ports: impl Iterator<Item = u16>,
+) {
+    let mut skipped = 0usize;
+    let mut first_error: Option<&'static str> = None;
+    let mut admit =
+        |entry: String| match crate::plugins::mesh::outbound_registry::validate_registry_entry(
+            &entry,
+        ) {
+            Ok(()) => {
+                entries.insert(entry);
+            }
+            Err(error) => {
+                skipped += 1;
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        };
+    admit(host.to_string());
+    let mut inserted_port = false;
+    for port in ports {
+        inserted_port = true;
+        admit(format!("{host}:{port}"));
+    }
+    if !inserted_port {
+        admit(format!("{host}:*"));
+    }
+    // One line per resource per registry build (its first offending member),
+    // not per derived form. The dropped destination stays denied
+    // (REGISTRY_ONLY fails closed for it). The rejected value itself is never
+    // logged: it failed the hostname grammar, so it may be a pasted URL with
+    // userinfo credentials. Only the fixed schema path with ordinals, the
+    // fixed grammar reason, and grammar-checked resource identities appear.
+    if let Some(error) = first_error
+        && warned.insert(source)
+    {
+        let mut resource = format!("{}[{}]", source.collection, source.index);
+        if let Some((field, index)) = member {
+            resource.push_str(&format!(".{field}[{index}]"));
+        }
+        warn!(
+            resource_kind = source.kind,
+            resource = %resource,
+            resource_namespace = %diagnostic_resource_identity(source.namespace),
+            resource_name = %diagnostic_resource_identity(source.name),
+            skipped_entries = skipped,
+            error,
+            "Mesh REGISTRY_ONLY: skipping destination outside the outbound registry grammar; \
+             it stays denied"
+        );
+    }
+}
+
+/// The egress-narrowed resources the slice build already admitted for the
+/// same Sidecar, reused by the scope snapshot instead of a second pass.
+struct AdmittedEgressScope<'a> {
+    services: &'a [MeshService],
+    service_entries: &'a [ServiceEntry],
+    destination_rules: &'a [MeshDestinationRule],
+}
+
+struct EgressScopeBuildContext<'a> {
     mesh: &'a MeshConfig,
-    sidecar: ResolvedSidecarEgress<'a>,
+    sidecar: &'a SidecarEgressScopes<'a>,
+    /// `Some` when `sidecar` is the slice's applied Sidecar (not dry-run):
+    /// the snapshot then reports the slice's own admitted set verbatim.
+    admitted: Option<AdmittedEgressScope<'a>>,
     workload_namespace: &'a str,
-    workload_labels: &'a L,
     cluster_domain: &'a str,
     mesh_service_identities: &'a BTreeSet<(String, String)>,
     service_entry_hosts: &'a BTreeMap<String, ServiceEntryHostOwner>,
@@ -2610,64 +3213,70 @@ struct EgressScopeBuildContext<'a, L: WorkloadLabels + ?Sized> {
     dry_run: bool,
 }
 
-fn build_sidecar_egress_scope_snapshot<L: WorkloadLabels + ?Sized>(
-    ctx: EgressScopeBuildContext<'_, L>,
+fn build_sidecar_egress_scope_snapshot(
+    ctx: EgressScopeBuildContext<'_>,
 ) -> MeshEgressScopeSnapshot {
     let EgressScopeBuildContext {
         mesh,
         sidecar,
+        admitted,
         workload_namespace,
-        workload_labels,
         cluster_domain,
         mesh_service_identities,
         service_entry_hosts,
         sidecar_enforced,
         dry_run,
     } = ctx;
-    let scoped_services: Vec<MeshService> = mesh
-        .services
-        .iter()
-        .filter_map(|service| narrow_service_ports(service, sidecar, cluster_domain))
-        .collect();
-    let scoped_service_entries: Vec<ServiceEntry> = mesh
-        .service_entries
-        .iter()
-        .filter(|entry| {
-            service_entry_applies_to_workload(entry, workload_namespace, workload_labels)
-        })
-        .flat_map(|entry| narrow_service_entry_ports(entry, sidecar))
-        .collect();
+    let (scoped_services, scoped_service_entries, scoped_destination_rules) = match admitted {
+        Some(admitted) => (
+            admitted.services.to_vec(),
+            admitted.service_entries.to_vec(),
+            admitted.destination_rules.to_vec(),
+        ),
+        None => {
+            let services: Vec<MeshService> = mesh
+                .services
+                .iter()
+                .filter_map(|service| sidecar.narrow_service(service, cluster_domain))
+                .collect();
+            let service_entries: Vec<ServiceEntry> = mesh
+                .service_entries
+                .iter()
+                .filter(|entry| service_entry_applies_to_workload(entry, workload_namespace))
+                .flat_map(|entry| sidecar.narrow_service_entry(entry))
+                .collect();
+            // The operator-facing egress-scope snapshot must report the SAME
+            // admitted set the live slice serves, so it runs the one shared
+            // admission pass (`exportTo` visibility → lookup tier → egress
+            // scope → tier resolution) rather than its own copy of the
+            // namespace rule (issues #2465, #2469).
+            let destination_rule_scope = DestinationRuleScope {
+                client_namespace: workload_namespace,
+                root_namespace: mesh.istio_root_namespace.as_str(),
+                cluster_domain,
+                mesh_service_identities,
+                service_entry_hosts,
+                // The operator egress-scope snapshot narrows registry
+                // destinations only; it carries no route upstreams.
+                carried_destination_hosts: &[],
+            };
+            let destination_rules: Vec<MeshDestinationRule> = admit_destination_rules(
+                mesh.destination_rules.iter(),
+                &destination_rule_scope,
+                |_dr, resource_namespace, host_candidates| {
+                    let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
+                    sidecar.includes_service(resource_namespace, &host_refs, None)
+                },
+            );
+            (services, service_entries, destination_rules)
+        }
+    };
     let scoped_workloads: Vec<Workload> = mesh
         .workloads
         .iter()
         .filter(|workload| workload.namespace == workload_namespace)
         .cloned()
         .collect();
-    // The operator-facing egress-scope snapshot must report the SAME admitted
-    // set the live slice serves, so it runs the one shared admission pass
-    // (`exportTo` visibility → lookup tier → egress scope → tier resolution)
-    // rather than its own copy of the namespace rule (issues #2465, #2469).
-    let destination_rule_scope = DestinationRuleScope {
-        client_namespace: workload_namespace,
-        root_namespace: mesh.istio_root_namespace.as_str(),
-        cluster_domain,
-        mesh_service_identities,
-        service_entry_hosts,
-    };
-    let scoped_destination_rules: Vec<MeshDestinationRule> = admit_destination_rules(
-        mesh.destination_rules.iter(),
-        &destination_rule_scope,
-        |_dr, resource_namespace, host_candidates| {
-            let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
-            sidecar_egress_includes_service(
-                sidecar.namespace,
-                sidecar.egress,
-                resource_namespace,
-                &host_refs,
-                None,
-            )
-        },
-    );
 
     let baseline_local_services = mesh
         .services
@@ -2691,11 +3300,19 @@ fn build_sidecar_egress_scope_snapshot<L: WorkloadLabels + ?Sized>(
         .iter()
         .map(destination_rule_scope_resource)
         .collect();
+    let service_resources: Vec<MeshEgressScopeResource> = scoped_services
+        .iter()
+        .map(|service| mesh_service_scope_resource(service, cluster_domain))
+        .collect();
+    let service_entry_resources: Vec<MeshEgressScopeResource> = scoped_service_entries
+        .iter()
+        .map(service_entry_scope_resource)
+        .collect();
     let scope_slice = MeshSlice {
         namespace: workload_namespace.to_string(),
         workloads: scoped_workloads,
-        services: scoped_services.clone(),
-        service_entries: scoped_service_entries.clone(),
+        services: scoped_services,
+        service_entries: scoped_service_entries,
         destination_rules: scoped_destination_rules,
         outbound_traffic_policy: mesh.outbound_traffic_policy,
         ..MeshSlice::default()
@@ -2711,14 +3328,8 @@ fn build_sidecar_egress_scope_snapshot<L: WorkloadLabels + ?Sized>(
         sidecar_denied_destination_rules: baseline_local_destination_rules
             .saturating_sub(admitted_local_destination_rules),
         destination_rules: destination_rule_resources,
-        services: scoped_services
-            .iter()
-            .map(|service| mesh_service_scope_resource(service, cluster_domain))
-            .collect(),
-        service_entries: scoped_service_entries
-            .iter()
-            .map(service_entry_scope_resource)
-            .collect(),
+        services: service_resources,
+        service_entries: service_entry_resources,
         known_destinations: scope_slice.build_known_destinations(cluster_domain),
     }
 }
@@ -2812,17 +3423,14 @@ pub(crate) enum ServiceEntryHostOwner {
 /// Index the hosts of every ServiceEntry visible to this workload by their
 /// owning (declaring) namespace. Narrowing only; the ownership rules live in
 /// [`index_service_entry_host_owners`].
-fn visible_service_entry_hosts<L: WorkloadLabels + ?Sized>(
+fn visible_service_entry_hosts(
     mesh: &MeshConfig,
     workload_namespace: &str,
-    workload_labels: &L,
 ) -> BTreeMap<String, ServiceEntryHostOwner> {
     let visible: Vec<&ServiceEntry> = mesh
         .service_entries
         .iter()
-        .filter(|entry| {
-            service_entry_applies_to_workload(entry, workload_namespace, workload_labels)
-        })
+        .filter(|entry| service_entry_applies_to_workload(entry, workload_namespace))
         .collect();
     index_service_entry_host_owners(visible)
 }
@@ -2951,6 +3559,323 @@ fn serialize_virtual_service_l4_upstreams<'a>(
         .collect()
 }
 
+/// Upstream id prefix of a VirtualService HTTP weighted-split upstream.
+pub(crate) const VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX: &str = "istio-vs-upstream-";
+
+/// The upstream ids a `mesh_route_dispatch` plugin config names: its rules'
+/// destinations, and each `weighted_splits` entry with its legs (issue #7387).
+pub(crate) fn mesh_route_dispatch_rule_upstream_ids(config: &serde_json::Value) -> Vec<&str> {
+    let rules = config
+        .get("rules")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|rule| {
+            rule.get("destination")
+                .and_then(|destination| destination.get("upstream_id"))
+                .and_then(serde_json::Value::as_str)
+        });
+    let splits = config
+        .get("weighted_splits")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|split| {
+            split
+                .get("upstream_id")
+                .and_then(serde_json::Value::as_str)
+                .into_iter()
+                .chain(
+                    split
+                        .get("legs")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|leg| {
+                            leg.get("upstream_id").and_then(serde_json::Value::as_str)
+                        }),
+                )
+        });
+    rules.chain(splits).collect()
+}
+
+/// Project the VirtualService HTTP routes a NodeWaypoint (issue #7233) or a
+/// Sidecar (issue #7423) serves. Both topologies receive the same route set;
+/// each data plane rebinds it onto its own mesh transport.
+///
+/// A route rides the slice only when a [`MeshConfig::virtual_service_http_routes`]
+/// binding lists it, the binding lives in a namespace this subscription sees
+/// (the same visibility as `services`), and its `exportTo` admits the
+/// subscription namespace. Each route carries exactly the plugin configs it is
+/// associated with (all owned by that proxy) and the weighted-split upstreams
+/// it and its `mesh_route_dispatch` rules name. A route that is not
+/// self-contained — an association or upstream that is missing, shared, or
+/// not translator-owned — or one with a destination the applicable Sidecar
+/// egress scope does not admit is dropped, fail-closed: the waypoint then
+/// serves that host through its materialized Service route instead.
+fn node_waypoint_http_route_set(
+    config: &GatewayConfig,
+    mesh: &MeshConfig,
+    namespace: &str,
+    service_waypoint_namespaces: &Option<BTreeSet<String>>,
+    destination_admitted: &dyn Fn(&str, &str, u16) -> bool,
+    portless_rewrite_cluster_domain: Option<&str>,
+) -> MeshHttpRouteSet {
+    use crate::config::types::{PluginConfig, Upstream};
+    use crate::modes::mesh::config::{
+        is_virtual_service_http_route_proxy_id, virtual_service_http_routes_exported_to_namespace,
+    };
+
+    let mut bound: HashSet<(&str, &str)> = HashSet::new();
+    for binding in &mesh.virtual_service_http_routes {
+        if !resource_namespace_visible(service_waypoint_namespaces, &binding.namespace, namespace)
+            || !virtual_service_http_routes_exported_to_namespace(binding, namespace)
+        {
+            continue;
+        }
+        for id in &binding.proxy_ids {
+            bound.insert((binding.namespace.as_str(), id.as_str()));
+        }
+    }
+    if bound.is_empty() {
+        return MeshHttpRouteSet::default();
+    }
+    let upstreams: HashMap<(&str, &str), &Upstream> = config
+        .upstreams
+        .iter()
+        .filter(|upstream| {
+            upstream
+                .id
+                .starts_with(VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+        })
+        .map(|upstream| {
+            (
+                (upstream.namespace.as_str(), upstream.id.as_str()),
+                upstream,
+            )
+        })
+        .collect();
+    let plugins: HashMap<(&str, &str), &PluginConfig> = config
+        .plugin_configs
+        .iter()
+        .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
+        .collect();
+
+    let mut set = MeshHttpRouteSet::default();
+    let mut carried_upstreams: HashSet<(&str, &str)> = HashSet::new();
+    let mut carried_plugins: HashSet<(&str, &str)> = HashSet::new();
+    for proxy in &config.proxies {
+        if !bound.contains(&(proxy.namespace.as_str(), proxy.id.as_str()))
+            || !is_virtual_service_http_route_proxy_id(&proxy.id)
+            || proxy.dispatch_kind.is_stream()
+            || proxy
+                .backend_scheme
+                .is_some_and(|scheme| scheme.is_stream())
+        {
+            continue;
+        }
+        let proxy_namespace = proxy.namespace.as_str();
+        let mut route_plugins: Vec<&PluginConfig> = Vec::with_capacity(proxy.plugins.len());
+        let mut self_contained = true;
+        for association in &proxy.plugins {
+            match plugins.get(&(proxy_namespace, association.plugin_config_id.as_str())) {
+                Some(&plugin)
+                    if plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+                        && plugin
+                            .id
+                            .starts_with(VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_PLUGIN_PREFIX) =>
+                {
+                    route_plugins.push(plugin);
+                }
+                _ => self_contained = false,
+            }
+        }
+        let mut upstream_ids: BTreeSet<&str> = BTreeSet::new();
+        upstream_ids.extend(proxy.upstream_id.as_deref());
+        let mut destinations: Vec<(&str, u16)> = Vec::new();
+        if !proxy.backend_host.is_empty() && proxy.backend_port != 0 {
+            destinations.push((proxy.backend_host.as_str(), proxy.backend_port));
+        }
+        for &plugin in &route_plugins {
+            if plugin.plugin_name != "mesh_route_dispatch" {
+                continue;
+            }
+            upstream_ids.extend(mesh_route_dispatch_rule_upstream_ids(&plugin.config));
+            for rule in plugin
+                .config
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(destination) = rule.get("destination") else {
+                    continue;
+                };
+                let host = destination
+                    .get("backend_host")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(proxy.backend_host.as_str());
+                let port = destination
+                    .get("backend_port")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok())
+                    .unwrap_or(proxy.backend_port);
+                if destination.get("upstream_id").is_none() && !host.is_empty() && port != 0 {
+                    destinations.push((host, port));
+                }
+            }
+        }
+        let mut route_upstreams: Vec<&Upstream> = Vec::with_capacity(upstream_ids.len());
+        for upstream_id in &upstream_ids {
+            match upstreams.get(&(proxy_namespace, *upstream_id)) {
+                Some(&upstream) => route_upstreams.push(upstream),
+                None => self_contained = false,
+            }
+        }
+        for &upstream in &route_upstreams {
+            for target in &upstream.targets {
+                destinations.push((target.host.as_str(), target.port));
+            }
+        }
+        if !self_contained {
+            debug!(
+                proxy_id = %sanitize_startup_cause(format!("{:?}", proxy.id.to_string()), &[]),
+                "VirtualService HTTP route is not self-contained; not carrying it to the \
+                 mesh slice"
+            );
+            continue;
+        }
+        if let Some(cluster_domain) = portless_rewrite_cluster_domain
+            && route_plugins.iter().any(|plugin| {
+                portless_authority_rewrite_names_multi_port_service(
+                    plugin,
+                    proxy,
+                    mesh,
+                    cluster_domain,
+                )
+            })
+        {
+            debug!(
+                proxy_id = %sanitize_startup_cause(format!("{:?}", proxy.id.to_string()), &[]),
+                "VirtualService HTTP route rewrites the authority to a port-less host of a \
+                 multi-port Service; not carrying it to the Sidecar slice"
+            );
+            continue;
+        }
+        if !destinations
+            .iter()
+            .all(|(host, port)| destination_admitted(proxy_namespace, host, *port))
+        {
+            continue;
+        }
+        let Ok(proxy_value) = serde_json::to_value(proxy) else {
+            continue;
+        };
+        let mut plugin_values = Vec::with_capacity(route_plugins.len());
+        let mut upstream_values = Vec::with_capacity(route_upstreams.len());
+        let mut serialized = true;
+        for &plugin in &route_plugins {
+            if carried_plugins.contains(&(plugin.namespace.as_str(), plugin.id.as_str())) {
+                continue;
+            }
+            match serde_json::to_value(plugin) {
+                Ok(value) => plugin_values.push((plugin, value)),
+                Err(_) => serialized = false,
+            }
+        }
+        for &upstream in &route_upstreams {
+            if carried_upstreams.contains(&(upstream.namespace.as_str(), upstream.id.as_str())) {
+                continue;
+            }
+            match serde_json::to_value(upstream) {
+                Ok(value) => upstream_values.push((upstream, value)),
+                Err(_) => serialized = false,
+            }
+        }
+        if !serialized {
+            warn!(
+                proxy_id = %sanitize_startup_cause(format!("{:?}", proxy.id.to_string()), &[]),
+                "Failed to serialize a VirtualService HTTP route into the mesh slice; \
+                 dropping the route fail-closed"
+            );
+            continue;
+        }
+        set.proxies.push(proxy_value);
+        for (plugin, value) in plugin_values {
+            carried_plugins.insert((plugin.namespace.as_str(), plugin.id.as_str()));
+            set.plugin_configs.push(value);
+        }
+        for (upstream, value) in upstream_values {
+            carried_upstreams.insert((upstream.namespace.as_str(), upstream.id.as_str()));
+            set.upstreams.push(value);
+        }
+    }
+    set
+}
+
+/// Whether a route's `mesh_route_dispatch` instance has a rule that rewrites
+/// the authority to a host with no port while its destination is an in-mesh
+/// Service with more than one HTTP port in the full inventory (issue #7423).
+/// A Sidecar forwards an admitted rewrite verbatim, and the destination Sidecar
+/// cannot pick among several ports without one. Over-matching (any Service
+/// alias match) only withholds more routes.
+fn portless_authority_rewrite_names_multi_port_service(
+    plugin: &crate::config::types::PluginConfig,
+    proxy: &crate::config::types::Proxy,
+    mesh: &MeshConfig,
+    cluster_domain: &str,
+) -> bool {
+    if plugin.plugin_name != "mesh_route_dispatch" {
+        return false;
+    }
+    plugin
+        .config
+        .get("rules")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|rule| {
+            let Some(authority) = rule
+                .get("rewrite")
+                .and_then(|rewrite| rewrite.get("authority"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            if authority.trim().contains(':') {
+                return false;
+            }
+            let destination = rule.get("destination");
+            if destination
+                .and_then(|destination| destination.get("upstream_id"))
+                .is_some()
+            {
+                // A split destination is refused by the data plane.
+                return false;
+            }
+            let host = destination
+                .and_then(|destination| destination.get("backend_host"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(proxy.backend_host.as_str())
+                .trim()
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            mesh.services.iter().any(|service| {
+                crate::modes::mesh::service_http_family_ports(service).len() > 1
+                    && service_host_aliases(&service.name, &service.namespace, cluster_domain)
+                        .iter()
+                        .any(|alias| {
+                            *alias == host
+                                && (alias.contains('.') || service.namespace == proxy.namespace)
+                        })
+            })
+        })
+}
+
+/// Id prefix shared by every route plugin the K8s translator attaches to a
+/// VirtualService HTTP route (`istio-vs-mrd-`, `istio-vs-cors-`, …).
+pub(crate) const VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_PLUGIN_PREFIX: &str = "istio-vs-";
+
 fn service_host_aliases(name: &str, namespace: &str, cluster_domain: &str) -> Vec<String> {
     let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
     let namespace = namespace.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -2982,6 +3907,12 @@ pub(crate) struct DestinationRuleScope<'a> {
     pub cluster_domain: &'a str,
     pub mesh_service_identities: &'a BTreeSet<(String, String)>,
     pub service_entry_hosts: &'a BTreeMap<String, ServiceEntryHostOwner>,
+    /// Concrete destination hosts of the carried VirtualService HTTP and L4
+    /// route upstreams (issue #7395). They reach DestinationRule selection on
+    /// the data plane like registry destinations, so wildcard admission
+    /// considers them too (a concrete host under a wildcard ServiceEntry is
+    /// owned by that ServiceEntry's namespace, `destination_host_owner`).
+    pub carried_destination_hosts: &'a [String],
 }
 
 /// Groups admitted DestinationRules by the destination they RESOLVE to, not by
@@ -3012,7 +3943,10 @@ type DestinationRuleGroupKey = (Option<String>, String);
 /// from the ownership claim tiering reads.
 ///
 /// The service tier is granted only on EVIDENCE of ownership (see
-/// `policy_target_service_ref`). A host whose owner cannot be established —
+/// `policy_target_service_ref`). A wildcard host owns nothing itself: it is
+/// admitted at the service tier only when it names a registry destination its
+/// own namespace owns (`wildcard_destination_rule_admitted_destination`,
+/// issue #7395). A host whose owner cannot be established —
 /// an external host with no visible ServiceEntry, one claimed by ServiceEntries
 /// in two different namespaces, or an unqualified two-label host absent from
 /// the service inventory — has NO service tier, so only the client namespace
@@ -3053,26 +3987,62 @@ where
             scope.service_entry_hosts,
         );
         let tier = destination_rule_lookup_tier(
-            &rule.namespace,
+            rule,
             scope.client_namespace,
             host_scope.service_namespace.as_deref(),
             scope.root_namespace,
         );
-        if !tier.is_in_lookup_path() {
-            continue;
-        }
-        if !extra_admits(
-            rule,
-            &host_scope.scope_namespace,
-            &host_scope.host_candidates,
-        ) {
-            continue;
-        }
         let group_host = host_scope
             .host_candidates
             .first()
             .cloned()
             .unwrap_or_default();
+        let wildcard = is_wildcard_destination_rule_host(&rule.host);
+        if !tier.is_in_lookup_path() {
+            // Issue #7395: a wildcard host names no single destination, so
+            // it has no owner of its own and its service tier is decided per
+            // destination it matches: the rule is admitted at the service
+            // tier when it names a registry destination its OWN namespace
+            // owns and the caller's scope admits. The data plane
+            // (`MaterializationTierScope::eligible_tier`) then grants it the
+            // service tier for exactly those destinations.
+            let rule_namespace = rule.namespace.trim();
+            if wildcard
+                && !rule_namespace.is_empty()
+                && wildcard_destination_rule_admitted_destination(
+                    rule,
+                    scope,
+                    Some(rule_namespace),
+                    &mut extra_admits,
+                )
+            {
+                visible.push((
+                    (Some(rule_namespace.to_string()), group_host),
+                    DestinationRuleLookupTier::Service,
+                    rule,
+                ));
+            }
+            continue;
+        }
+        // A client- or root-tier wildcard is judged by the caller's scope
+        // against the destinations it covers too (issue #7395): its literal
+        // host and declaring namespace are not a destination, so a Sidecar
+        // egress scope importing only `payments/*` must still admit a root
+        // `*.example.com` rule for `payments`' ServiceEntry host.
+        let scope_admits = extra_admits(
+            rule,
+            &host_scope.scope_namespace,
+            &host_scope.host_candidates,
+        ) || (wildcard
+            && wildcard_destination_rule_admitted_destination(
+                rule,
+                scope,
+                None,
+                &mut extra_admits,
+            ));
+        if !scope_admits {
+            continue;
+        }
         visible.push(((host_scope.service_namespace, group_host), tier, rule));
     }
 
@@ -3109,6 +4079,151 @@ where
         );
     }
     admitted
+}
+
+/// Whether `rule` takes part in Istio's exported-rule host selection for
+/// `client_namespace` while being hidden from it: exported (not
+/// namespace-private), not exported to the client, and declared outside the
+/// client's own namespace (the client tier is that namespace's own index),
+/// except that a root-namespace client still looks the root namespace's
+/// exported rules up through the exported index. Read only by the control
+/// plane ([`destination_rule_host_exclusions`]); hidden rules never leave it.
+fn destination_rule_shadows_from_hiding(
+    rule: &MeshDestinationRule,
+    client_namespace: &str,
+    root_namespace: &str,
+) -> bool {
+    let namespace = rule.namespace.trim();
+    let client_namespace = client_namespace.trim();
+    let root_namespace = root_namespace.trim();
+    if namespace.is_empty() || (namespace == client_namespace && client_namespace != root_namespace)
+    {
+        return false;
+    }
+    !destination_rule_exported_to_namespace(rule, client_namespace)
+        && !destination_rule_is_namespace_private(rule)
+}
+
+/// Whether a DestinationRule host is a wildcard (`*`, `*.example.com`).
+fn is_wildcard_destination_rule_host(host: &str) -> bool {
+    host.trim().starts_with('*')
+}
+
+/// Whether wildcard DestinationRule `rule` names a registry destination the
+/// caller's scope admits (issue #7395), restricted to destinations owned by
+/// `owner` when it is `Some` (the service-tier question: does the rule's own
+/// namespace own something it covers?).
+///
+/// Destinations are the in-cluster Services and the ServiceEntry hosts with a
+/// single owner, wildcard ServiceEntry hosts included. Ownership comes from
+/// the same evidence, in the same order, as every other service-tier decision
+/// ([`destination_host_owner`]): an in-cluster Service is owned by its
+/// namespace, an external host by the single namespace whose visible
+/// ServiceEntry declares it. It is NEVER inferred from the rule's declaring
+/// namespace alone. Each matched destination is offered to the caller's gate
+/// (`extra_admits`) as that destination (its owning namespace and host
+/// aliases), so the Sidecar egress scope judges the concrete host.
+fn wildcard_destination_rule_admitted_destination<F>(
+    rule: &MeshDestinationRule,
+    scope: &DestinationRuleScope<'_>,
+    owner: Option<&str>,
+    extra_admits: &mut F,
+) -> bool
+where
+    F: FnMut(&MeshDestinationRule, &str, &[String]) -> bool,
+{
+    let cluster_domain = scope.cluster_domain.trim().trim_end_matches('.');
+    for (namespace, name) in scope.mesh_service_identities {
+        if owner.is_some_and(|owner| namespace != owner) {
+            continue;
+        }
+        let fqdn = if cluster_domain.is_empty() {
+            format!("{name}.{namespace}.svc")
+        } else {
+            format!("{name}.{namespace}.svc.{cluster_domain}")
+        };
+        if super::destination_rule_host_specificity(&rule.host, &rule.namespace, &fqdn).is_some()
+            && extra_admits(
+                rule,
+                namespace.as_str(),
+                &service_host_aliases(name, namespace, cluster_domain),
+            )
+        {
+            return true;
+        }
+    }
+    for host in scope.service_entry_hosts.keys() {
+        let Some(host_owner) = destination_host_owner(
+            host,
+            scope.cluster_domain,
+            scope.mesh_service_identities,
+            scope.service_entry_hosts,
+        ) else {
+            continue;
+        };
+        let host_owner = host_owner.namespace();
+        if owner.is_some_and(|owner| host_owner != owner) {
+            continue;
+        }
+        if super::destination_rule_host_specificity(&rule.host, &rule.namespace, host).is_some()
+            && extra_admits(rule, host_owner, std::slice::from_ref(host))
+        {
+            return true;
+        }
+    }
+    // Concrete destinations of carried routes: `api.one.example.com` under a
+    // `*.example.com` ServiceEntry belongs to its declaring namespace, so that
+    // namespace's narrower `*.one.example.com` rule is the most specific match
+    // for it (Istio `MostSpecificHostMatch` with the destination host as the
+    // needle), exactly as the data plane decides.
+    for host in scope.carried_destination_hosts {
+        let Some(host_owner) = destination_host_owner(
+            host,
+            scope.cluster_domain,
+            scope.mesh_service_identities,
+            scope.service_entry_hosts,
+        ) else {
+            continue;
+        };
+        let host_owner = host_owner.namespace();
+        if owner.is_some_and(|owner| host_owner != owner) {
+            continue;
+        }
+        if super::destination_rule_host_specificity(&rule.host, &rule.namespace, host).is_some()
+            && extra_admits(rule, host_owner, std::slice::from_ref(host))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The canonical target hosts of carried VirtualService HTTP route and L4
+/// route upstreams (`targets[].host`), deduplicated and sorted. Shared by
+/// wildcard admission and host-exclusion resolution so both see the same
+/// destination inventory.
+fn carried_route_destination_hosts(
+    http_routes: &MeshHttpRouteSet,
+    virtual_service_l4_upstreams: &[serde_json::Value],
+) -> Vec<String> {
+    let mut hosts: BTreeSet<String> = BTreeSet::new();
+    for upstream in http_routes
+        .upstreams
+        .iter()
+        .chain(virtual_service_l4_upstreams)
+    {
+        for target in upstream
+            .get("targets")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(host) = target.get("host").and_then(serde_json::Value::as_str) {
+                hosts.insert(canonical_destination_rule_host(host));
+            }
+        }
+    }
+    hosts.into_iter().collect()
 }
 
 /// Ambiguous-destination counts ALREADY REPORTED for each client namespace, as
@@ -3426,8 +4541,25 @@ pub(crate) fn destination_host_owner(
         .trim()
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    if host.is_empty() || host.contains('*') {
+    if host.is_empty() {
         return None;
+    }
+    // A wildcard host is never a Kubernetes Service; the only destination it
+    // can name is a registered wildcard ServiceEntry host (`*.example.com`),
+    // owned like any external host by the single namespace that declares it
+    // (issue #7395). Checked before the syntax arms, which would otherwise
+    // read `*.beta.svc` as a Service named `*`.
+    if host.contains('*') {
+        let is_wildcard_service_entry_host = host
+            .strip_prefix("*.")
+            .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains('*'));
+        if !is_wildcard_service_entry_host {
+            return None;
+        }
+        let declared_owner = service_entry_host_owner(service_entry_hosts, &host)?;
+        return Some(DestinationHostOwner::ExternalHost {
+            namespace: declared_owner.to_string(),
+        });
     }
 
     if let Some((name, namespace)) = host
@@ -3459,10 +4591,49 @@ pub(crate) fn destination_host_owner(
         });
     }
 
-    let declared_owner = service_entry_host_owner(service_entry_hosts, &host)?;
+    // An exact ServiceEntry host decides (a contested one owns nothing).
+    // Otherwise the concrete host is a member of the most specific registered
+    // wildcard ServiceEntry host covering it (issue #7395): `api.one.example.com`
+    // under `*.example.com` belongs to the namespace that declares that
+    // wildcard, as Istio resolves the request to that ServiceEntry.
+    let declared_owner = if service_entry_hosts.contains_key(&host) {
+        service_entry_host_owner(service_entry_hosts, &host)?
+    } else {
+        wildcard_service_entry_host_owner(service_entry_hosts, &host)?
+    };
     Some(DestinationHostOwner::ExternalHost {
         namespace: declared_owner.to_string(),
     })
+}
+
+/// The owner of the most specific registered wildcard ServiceEntry host
+/// (`*.example.com`) covering concrete `host` (already canonical), or `None`
+/// when none covers it or the most specific one is contested. `*.example.com`
+/// covers `api.example.com` and `a.b.example.com`, never `example.com`.
+fn wildcard_service_entry_host_owner<'a>(
+    service_entry_hosts: &'a BTreeMap<String, ServiceEntryHostOwner>,
+    host: &str,
+) -> Option<&'a str> {
+    let mut best: Option<(usize, &'a ServiceEntryHostOwner)> = None;
+    for (registered, owner) in service_entry_hosts {
+        let Some(suffix) = registered.strip_prefix('*') else {
+            continue;
+        };
+        if !suffix.starts_with('.')
+            || suffix.contains('*')
+            || host.len() <= suffix.len()
+            || !host.ends_with(suffix)
+        {
+            continue;
+        }
+        if best.is_none_or(|(len, _)| suffix.len() > len) {
+            best = Some((suffix.len(), owner));
+        }
+    }
+    match best?.1 {
+        ServiceEntryHostOwner::Owned(namespace) => Some(namespace.as_str()),
+        ServiceEntryHostOwner::Ambiguous => None,
+    }
 }
 
 fn mesh_service_identity_exists(
@@ -3781,8 +4952,11 @@ fn resolve_applicable_sidecar_outbound_policy(
             && let Some(policy) = selected_policy
         {
             debug!(
-                sidecar = %sidecar.name,
-                namespace = %sidecar.namespace,
+                sidecar = %sanitize_startup_cause(format!("{:?}", sidecar.name.as_str()), &[]),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", sidecar.namespace.as_str()),
+                    &[]
+                ),
                 policy = ?policy,
                 "Applying Sidecar-scoped outboundTrafficPolicy to the mesh slice"
             );
@@ -3959,6 +5133,158 @@ struct ResolvedSidecarEgress<'a> {
     egress: &'a [MeshSidecarEgress],
 }
 
+impl ResolvedSidecarEgress<'_> {
+    /// Two resolutions are the same scope when they match hosts against the
+    /// same namespace with the same egress listeners.
+    fn same_scope(&self, other: &ResolvedSidecarEgress<'_>) -> bool {
+        self.namespace == other.namespace && self.egress == other.egress
+    }
+}
+
+/// The Sidecar egress scope(s) a slice must satisfy (GHSA-mhm9-gp97-237q).
+///
+/// Normally exactly one [`ResolvedSidecarEgress`]. On a `labels_ambiguous`
+/// slice it holds every distinct scope the intersection labels or any
+/// candidate label set resolves, and a resource is admitted only when EVERY
+/// scope admits it: the egress counterpart of the #3262 strictest-wins
+/// outbound-policy fold. Admission is therefore order-independent, and a
+/// candidate that resolves no narrowing at all contributes nothing (the
+/// identity of an intersection), so ambiguity can only narrow.
+///
+/// Never empty: built only by [`Self::single`] / [`resolve_applicable_sidecar_egress_scopes`],
+/// and every check fails closed if it ever were.
+#[derive(Debug, Clone)]
+struct SidecarEgressScopes<'a> {
+    scopes: Vec<ResolvedSidecarEgress<'a>>,
+}
+
+impl<'a> SidecarEgressScopes<'a> {
+    fn single(scope: ResolvedSidecarEgress<'a>) -> Self {
+        Self {
+            scopes: vec![scope],
+        }
+    }
+
+    /// [`sidecar_egress_includes_service`] for every scope.
+    fn includes_service(
+        &self,
+        resource_namespace: &str,
+        host_candidates: &[&str],
+        resource_ports: Option<&[u16]>,
+    ) -> bool {
+        !self.scopes.is_empty()
+            && self.scopes.iter().all(|scope| {
+                sidecar_egress_includes_service(
+                    scope.namespace,
+                    scope.egress,
+                    resource_namespace,
+                    host_candidates,
+                    resource_ports,
+                )
+            })
+    }
+
+    /// [`narrow_service_ports`] through every scope: the service survives
+    /// with the ports every scope admits, or not at all.
+    fn narrow_service(&self, service: &MeshService, cluster_domain: &str) -> Option<MeshService> {
+        let (first, rest) = self.scopes.split_first()?;
+        let mut narrowed = narrow_service_ports(service, *first, cluster_domain)?;
+        for scope in rest {
+            narrowed = narrow_service_ports(&narrowed, *scope, cluster_domain)?;
+        }
+        Some(narrowed)
+    }
+
+    /// [`narrow_service_entry_ports`] through every scope: each host keeps
+    /// the ports every scope admits for it.
+    fn narrow_service_entry(&self, entry: &ServiceEntry) -> Vec<ServiceEntry> {
+        let Some((first, rest)) = self.scopes.split_first() else {
+            return Vec::new();
+        };
+        let mut narrowed = narrow_service_entry_ports(entry, *first);
+        for scope in rest {
+            narrowed = narrowed
+                .iter()
+                .flat_map(|entry| narrow_service_entry_ports(entry, *scope))
+                .collect();
+        }
+        narrowed
+    }
+}
+
+/// Resolve the Sidecar egress scope(s) for a slice (GHSA-mhm9-gp97-237q).
+///
+/// `ambiguous_candidate_labels` is EMPTY on an unambiguous slice, and the
+/// result is then exactly [`resolve_applicable_sidecar_egress`] for
+/// `effective_labels`. It is non-empty only on a `labels_ambiguous` slice,
+/// where `effective_labels` is merely the intersection of several same-SPIFFE
+/// workloads' divergent label sets. A `workloadSelector` Sidecar that really
+/// selects one of those workloads can then miss the intersection, and the
+/// resolution would fall through to a namespace default (or to no narrowing),
+/// handing the workload destinations its own Sidecar excluded.
+///
+/// This applies the rule issue #3262 settled for `outboundTrafficPolicy`
+/// (`resolve_applicable_sidecar_outbound_policy`): resolve each candidate label
+/// set on its own and keep the strictest outcome. For egress scope "strictest"
+/// is the intersection of the admitted views, so every distinct resolved scope
+/// is kept and a resource must satisfy all of them. The intersection-derived
+/// scope is included, so the fold only ever narrows; cold path, once per slice
+/// build, bounded by `candidates × sidecars`.
+fn resolve_applicable_sidecar_egress_scopes<'a>(
+    sidecars: &'a [MeshSidecar],
+    workload_namespace: &'a str,
+    effective_labels: &BTreeMap<String, String>,
+    istio_root_namespace: &str,
+    ambiguous_candidate_labels: &[&BTreeMap<String, String>],
+) -> Option<SidecarEgressScopes<'a>> {
+    let intersection = resolve_applicable_sidecar_egress(
+        sidecars,
+        workload_namespace,
+        effective_labels,
+        istio_root_namespace,
+    );
+    if ambiguous_candidate_labels.is_empty() {
+        return intersection.map(SidecarEgressScopes::single);
+    }
+
+    let mut scopes: Vec<ResolvedSidecarEgress<'a>> = intersection.into_iter().collect();
+    for labels in ambiguous_candidate_labels {
+        let Some(scope) = resolve_applicable_sidecar_egress(
+            sidecars,
+            workload_namespace,
+            *labels,
+            istio_root_namespace,
+        ) else {
+            continue;
+        };
+        if !scopes.iter().any(|existing| existing.same_scope(&scope)) {
+            scopes.push(scope);
+        }
+    }
+
+    let intersection_scopes = usize::from(intersection.is_some());
+    if scopes.len() == intersection_scopes {
+        debug!(
+            candidates = ambiguous_candidate_labels.len(),
+            "Ambiguous workload labels did not change the Sidecar egress scope"
+        );
+    } else {
+        warn!(
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", workload_namespace.to_string()),
+                &[]
+            ),
+            candidates = ambiguous_candidate_labels.len(),
+            intersection_scope = intersection.is_some(),
+            resolved_scopes = scopes.len(),
+            "Workload labels are ambiguous (several workloads share this SPIFFE id with divergent \
+             labels); narrowing the Sidecar egress scope to what every Sidecar any candidate could \
+             select admits. Set explicit workload labels to resolve it exactly"
+        );
+    }
+    (!scopes.is_empty()).then_some(SidecarEgressScopes { scopes })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SidecarPortAdmission {
     All,
@@ -4112,6 +5438,11 @@ fn narrow_service_ports(
 /// Returns the per-host narrowed `ServiceEntry` projections that satisfy the
 /// resolved Sidecar egress scope.
 ///
+/// Every host is judged on its own: a host the Sidecar does not admit is
+/// never carried into the slice because a sibling host of the same entry
+/// matched. A port-less entry keeps only its admitted hosts (and is dropped
+/// when none is admitted).
+///
 /// Hosts that share the same admitted port-set are grouped into a single
 /// returned entry; hosts that admit different port-sets produce separate
 /// entries that all carry the original entry's `name`. As a result the
@@ -4122,18 +5453,30 @@ fn narrow_service_entry_ports(
     entry: &ServiceEntry,
     sidecar: ResolvedSidecarEgress<'_>,
 ) -> Vec<ServiceEntry> {
-    let host_refs: Vec<&str> = entry.hosts.iter().map(String::as_str).collect();
     let resource_ports: Vec<u16> = entry.ports.iter().map(|port| port.port).collect();
     if resource_ports.is_empty() {
-        return sidecar_egress_port_admission(
-            sidecar.namespace,
-            sidecar.egress,
-            entry.namespace.as_str(),
-            &host_refs,
-            Some(&resource_ports),
-        )
-        .map(|_| vec![entry.clone()])
-        .unwrap_or_default();
+        let hosts = entry
+            .hosts
+            .iter()
+            .filter(|host| {
+                sidecar_egress_port_admission(
+                    sidecar.namespace,
+                    sidecar.egress,
+                    entry.namespace.as_str(),
+                    &[host.as_str()],
+                    Some(&resource_ports),
+                )
+                .is_some()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if hosts.is_empty() {
+            return Vec::new();
+        }
+        return vec![ServiceEntry {
+            hosts,
+            ..entry.clone()
+        }];
     }
 
     let resource_port_set: BTreeSet<u16> = resource_ports.iter().copied().collect();
@@ -4359,9 +5702,10 @@ fn host_matches_pattern(pattern: &str, candidate: &str) -> bool {
 
 /// Scope tier used for PeerAuthentication precedence ranking.
 ///
-/// Discriminant order is load-bearing: `Ord` derive uses it, and the
-/// resolution loop picks the highest-valued tier. Istio semantics:
-/// WorkloadSelector > Namespace > MeshWide.
+/// Discriminant order is load-bearing: the `Ord` derive uses it, and
+/// [`resolve_peer_auth_tiers`] indexes its per-tier state by it and folds the
+/// tiers from the lowest value up. Istio semantics: WorkloadSelector >
+/// Namespace > MeshWide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PeerAuthScope {
     MeshWide = 0,
@@ -4386,29 +5730,21 @@ fn proxy_config_scope_tier(pc: &MeshProxyConfig) -> u8 {
 
 /// Classify a [`PeerAuthentication`] into a scope tier for precedence ordering.
 fn classify_peer_auth_scope(pa: &PeerAuthentication) -> PeerAuthScope {
-    if let Some(scope) = &pa.scope {
-        return match scope {
-            PolicyScope::MeshWide => PeerAuthScope::MeshWide,
-            PolicyScope::Namespace { .. } => PeerAuthScope::Namespace,
-            PolicyScope::WorkloadSelector { .. } if pa.has_workload_selector() => {
-                PeerAuthScope::WorkloadSelector
-            }
-            // Defensive normalization for native/file slices: an empty
-            // selector is a namespace default when namespace-constrained and a
-            // mesh default when it has no namespace constraint.
-            PolicyScope::WorkloadSelector { selector } if selector.namespace.is_none() => {
-                PeerAuthScope::MeshWide
-            }
-            PolicyScope::WorkloadSelector { .. } => PeerAuthScope::Namespace,
-            // TargetRefs is AuthorizationPolicy-only; never classify PeerAuth.
-            PolicyScope::TargetRefs { .. } => PeerAuthScope::Namespace,
-        };
-    }
-
-    if pa.has_workload_selector() {
-        PeerAuthScope::WorkloadSelector
-    } else {
-        PeerAuthScope::Namespace
+    match &pa.scope {
+        PolicyScope::MeshWide => PeerAuthScope::MeshWide,
+        PolicyScope::Namespace { .. } => PeerAuthScope::Namespace,
+        PolicyScope::WorkloadSelector { .. } if pa.has_workload_selector() => {
+            PeerAuthScope::WorkloadSelector
+        }
+        // Defensive normalization for native/file slices: an empty selector is
+        // a namespace default when namespace-constrained and a mesh default
+        // when it has no namespace constraint.
+        PolicyScope::WorkloadSelector { selector } if selector.namespace.is_none() => {
+            PeerAuthScope::MeshWide
+        }
+        PolicyScope::WorkloadSelector { .. } => PeerAuthScope::Namespace,
+        // TargetRefs is AuthorizationPolicy-only; never classify PeerAuth.
+        PolicyScope::TargetRefs { .. } => PeerAuthScope::Namespace,
     }
 }
 
@@ -4418,21 +5754,16 @@ fn classify_peer_auth_scope(pa: &PeerAuthentication) -> PeerAuthScope {
 /// not match is authoritatively non-applicable (namespace is never ambiguous), so
 /// it must not force a more-restrictive mTLS mode for an unrelated namespace.
 fn peer_auth_selector_namespace_matches(pa: &PeerAuthentication, proxy_namespace: &str) -> bool {
-    let selector_namespace = match &pa.scope {
-        Some(PolicyScope::WorkloadSelector { selector }) => selector.namespace.as_deref(),
-        _ => pa
-            .selector
-            .as_ref()
-            .and_then(|selector| selector.namespace.as_deref()),
-    };
-    // A scope-form selector with no explicit selector namespace is mesh-wide for
-    // namespace purposes; the legacy `pa.selector` form additionally requires the
-    // policy's own namespace to match the workload (Istio scopes a bare selector
-    // to the policy namespace).
-    match (&pa.scope, selector_namespace) {
-        (_, Some(ns)) => ns == proxy_namespace,
-        (Some(PolicyScope::WorkloadSelector { .. }), None) => true,
-        (Some(_), None) | (None, None) => pa.namespace == proxy_namespace,
+    // A selector with no explicit namespace is mesh-wide for namespace
+    // purposes (Istio root-namespace selectors).
+    match &pa.scope {
+        PolicyScope::WorkloadSelector { selector } => selector
+            .namespace
+            .as_deref()
+            .is_none_or(|namespace| namespace == proxy_namespace),
+        PolicyScope::MeshWide | PolicyScope::Namespace { .. } | PolicyScope::TargetRefs { .. } => {
+            pa.namespace == proxy_namespace
+        }
     }
 }
 
@@ -4441,27 +5772,24 @@ fn peer_auth_applies_to_workload<L: WorkloadLabels + ?Sized>(
     namespace: &str,
     labels: &L,
 ) -> bool {
-    if let Some(scope) = &pa.scope {
-        return scope_applies_to_workload(scope, namespace, labels);
-    }
-
-    pa.namespace == namespace
-        && pa
-            .selector
-            .as_ref()
-            .is_none_or(|selector| workload_selector_matches(selector, namespace, labels))
+    scope_applies_to_workload(&pa.scope, namespace, labels)
 }
 
 /// Effective inbound mTLS mode a single PeerAuthentication yields for `port`: a
 /// per-port override on a selector-scoped policy takes precedence over the
 /// policy's top-level `mtls_mode`. Selector-less namespace/mesh-wide policies
 /// ignore `port_overrides`, matching Istio's `portLevelMtls` contract.
+///
+/// An `Unset` port override inherits the policy's top-level mode, and an
+/// `Unset` result means the policy itself inherits: the tier walk in
+/// [`resolve_peer_auth_tiers`] substitutes the mode resolved from the tiers
+/// below.
 fn peer_auth_effective_mode(pa: &PeerAuthentication, port: u16) -> MtlsMode {
     if pa.has_workload_selector() {
-        pa.port_overrides
-            .get(&port)
-            .copied()
-            .unwrap_or(pa.mtls_mode)
+        match pa.port_overrides.get(&port) {
+            Some(&mode) if mode != MtlsMode::Unset => mode,
+            _ => pa.mtls_mode,
+        }
     } else {
         pa.mtls_mode
     }
@@ -4475,7 +5803,9 @@ fn peer_auth_effective_mode(pa: &PeerAuthentication, port: u16) -> MtlsMode {
 /// outrank — and thereby downgrade — a trusted `Strict`.
 fn peer_auth_mtls_restrictiveness(mode: MtlsMode) -> u8 {
     match mode {
-        MtlsMode::Strict => 0,
+        // `Unset` is folded into the inherited concrete mode before any
+        // comparison; rank a stray one as `Strict` so it can only tighten.
+        MtlsMode::Strict | MtlsMode::Unset => 0,
         MtlsMode::Permissive => 1,
         MtlsMode::Disable => 2,
         MtlsMode::Simple | MtlsMode::Mutual | MtlsMode::IstioMutual => 3,
@@ -4504,54 +5834,89 @@ fn resolve_peer_auth_mtls_mode<'a, L: WorkloadLabels + ?Sized>(
     labels: &L,
     mode_for: impl Fn(&'a PeerAuthentication) -> MtlsMode,
 ) -> MtlsMode {
-    let mut best: Option<(PeerAuthScope, &PeerAuthentication)> = None;
+    let resolution = resolve_peer_auth_tiers(peer_auths, namespace, labels, mode_for);
+    resolution.effective
+}
+
+/// Result of the PeerAuthentication tier walk for one workload and port.
+#[derive(Debug, Clone, Copy)]
+struct PeerAuthTierResolution {
+    /// Mode inherited from the namespace and mesh-wide tiers (or the
+    /// `Permissive` default): what an `Unset` workload-selector policy yields.
+    inherited_by_workload_tier: MtlsMode,
+    /// Final effective mode after the workload-selector tier.
+    effective: MtlsMode,
+}
+
+/// Walk the PeerAuthentication tiers for one workload, from the `Permissive`
+/// default up through MeshWide, Namespace, and WorkloadSelector.
+///
+/// A tier with an applicable policy whose effective mode (from `mode_for`) is
+/// concrete replaces the inherited mode, so a more specific tier still wins
+/// over a less specific one (WorkloadSelector > Namespace > MeshWide). An
+/// `Unset` (Istio "inherit") policy contributes the mode resolved from the
+/// tiers below it instead of a concrete posture, so a lower-tier policy that
+/// omits its mode, or only sets `portLevelMtls`, can no longer downgrade an
+/// inherited `Strict`. Within the SAME tier, two equally-applicable policies
+/// are an operator misconfiguration and resolve FAIL-SECURE: the more
+/// restrictive effective mode wins (`Strict` > `Permissive` > `Disable`),
+/// with each `Unset` policy counted at the mode it inherits. Because the
+/// winner is decided by mode rather than by the policy's namespace string or
+/// name, a tenant-controlled policy cannot downgrade inbound mTLS below a
+/// trusted same-tier policy by choosing a low-sorting namespace or policy
+/// name. Equal-mode ties need no further ordering: only the mode is returned.
+fn resolve_peer_auth_tiers<'a, L: WorkloadLabels + ?Sized>(
+    peer_auths: &'a [PeerAuthentication],
+    namespace: &str,
+    labels: &L,
+    mode_for: impl Fn(&'a PeerAuthentication) -> MtlsMode,
+) -> PeerAuthTierResolution {
+    // Per tier (indexed by the `PeerAuthScope` discriminant): the most
+    // restrictive concrete mode, and whether any applicable policy inherits.
+    let mut concrete: [Option<MtlsMode>; 3] = [None; 3];
+    let mut inherits = [false; 3];
 
     for pa in peer_auths {
         if !peer_auth_applies_to_workload(pa, namespace, labels) {
             continue;
         }
-
-        let scope = classify_peer_auth_scope(pa);
-        // Higher tier wins (WorkloadSelector > Namespace > MeshWide). Within the
-        // SAME tier, two equally-applicable PeerAuthentications are an operator
-        // misconfiguration, so resolve the tie FAIL-SECURE: prefer the more-
-        // restrictive effective mTLS mode for this port (Strict > Permissive >
-        // Disable). This is both deterministic AND a real trust boundary —
-        // because the winner is decided by mode, not by the policy's namespace
-        // string or name, a tenant-controlled policy cannot downgrade inbound
-        // mTLS below a trusted same-tier policy by choosing a low-sorting
-        // namespace or policy name (and a customized root namespace that sorts
-        // after tenants is equally safe). Only when the effective modes are
-        // identical do we fall back to the value-neutral `(namespace, name)`
-        // ordering, purely to pick a canonical winner deterministically across
-        // pods/reconciles.
-        let dominated = best.as_ref().is_none_or(|&(current_scope, current_pa)| {
-            use std::cmp::Ordering;
-            match scope.cmp(&current_scope) {
-                Ordering::Greater => true,
-                Ordering::Less => false,
-                Ordering::Equal => {
-                    let candidate = peer_auth_mtls_restrictiveness(mode_for(pa));
-                    let current = peer_auth_mtls_restrictiveness(mode_for(current_pa));
-                    match candidate.cmp(&current) {
-                        Ordering::Less => true,
-                        Ordering::Greater => false,
-                        Ordering::Equal => {
-                            (pa.namespace.as_str(), pa.name.as_str())
-                                < (current_pa.namespace.as_str(), current_pa.name.as_str())
-                        }
-                    }
-                }
+        let tier = classify_peer_auth_scope(pa) as usize;
+        match mode_for(pa) {
+            MtlsMode::Unset => inherits[tier] = true,
+            mode => {
+                concrete[tier] = Some(match concrete[tier] {
+                    Some(current) => more_restrictive_peer_auth_mode(current, mode),
+                    None => mode,
+                });
             }
-        });
-        if dominated {
-            best = Some((scope, pa));
         }
     }
 
-    match best {
-        Some((_, pa)) => mode_for(pa),
-        None => MtlsMode::Permissive,
+    // Fold one tier over the mode inherited from the tiers below it.
+    let fold_tier = |tier: PeerAuthScope, inherited: MtlsMode| {
+        let index = tier as usize;
+        match (concrete[index], inherits[index]) {
+            (Some(mode), false) => mode,
+            (Some(mode), true) => more_restrictive_peer_auth_mode(mode, inherited),
+            (None, _) => inherited,
+        }
+    };
+    let mesh_wide = fold_tier(PeerAuthScope::MeshWide, MtlsMode::Permissive);
+    let inherited_by_workload_tier = fold_tier(PeerAuthScope::Namespace, mesh_wide);
+    let effective = fold_tier(PeerAuthScope::WorkloadSelector, inherited_by_workload_tier);
+
+    PeerAuthTierResolution {
+        inherited_by_workload_tier,
+        effective,
+    }
+}
+
+/// The more restrictive of two PeerAuthentication modes; `current` wins ties.
+fn more_restrictive_peer_auth_mode(current: MtlsMode, candidate: MtlsMode) -> MtlsMode {
+    if peer_auth_mtls_restrictiveness(candidate) < peer_auth_mtls_restrictiveness(current) {
+        candidate
+    } else {
+        current
     }
 }
 
@@ -4814,6 +6179,7 @@ mod tests {
                 waypoint_name: Some("waypoint".into()),
                 ambient_udp_source_scoping: true,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
                 ..MeshSliceRequest::default()
             },
         );
@@ -4858,10 +6224,26 @@ mod tests {
         PeerAuthentication {
             name: name.into(),
             namespace: namespace.into(),
-            scope: None,
-            selector,
+            scope: peer_auth_test_scope(namespace, selector),
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
+        }
+    }
+
+    /// The scope a test PeerAuthentication in `namespace` gets: the namespace
+    /// default without a selector, otherwise those labels in `namespace` (or
+    /// the selector's own namespace when it names one).
+    fn peer_auth_test_scope(namespace: &str, selector: Option<WorkloadSelector>) -> PolicyScope {
+        match selector {
+            Some(selector) => PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    namespace: selector.namespace.or_else(|| Some(namespace.to_string())),
+                    labels: selector.labels,
+                },
+            },
+            None => PolicyScope::Namespace {
+                namespace: namespace.to_string(),
+            },
         }
     }
 
@@ -4890,6 +6272,7 @@ mod tests {
         scope: PolicyScope,
     ) -> MeshRequestAuthentication {
         MeshRequestAuthentication {
+            refused: false,
             name: name.into(),
             namespace: namespace.into(),
             scope,
@@ -4954,6 +6337,7 @@ mod tests {
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }
     }
 
@@ -4973,6 +6357,7 @@ mod tests {
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }
     }
 
@@ -5002,6 +6387,8 @@ mod tests {
             node_waypoint_assertors: Vec::new(),
             node_waypoint_capture_destinations: Vec::new(),
             node_waypoint_capture_peer_authentications: Vec::new(),
+            node_waypoint_capture_mesh_policies: Vec::new(),
+            node_waypoint_capture_mesh_policies_resolved: false,
             services: vec![make_service("ns", "web")],
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,
@@ -5013,9 +6400,11 @@ mod tests {
             peer_authentications: vec![make_peer_auth("pa1", "ns", None)],
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],
             destination_rules: Vec::new(),
+            destination_rule_host_exclusions: Vec::new(),
             virtual_service_cors_policies: Vec::new(),
             virtual_service_l4_proxies: Vec::new(),
             virtual_service_l4_upstreams: Vec::new(),
+            http_routes: MeshHttpRouteSet::default(),
             proxy_configs: Vec::new(),
             request_authentications: vec![make_request_auth("ra1", "ns", PolicyScope::MeshWide)],
             telemetry_resources: vec![make_telemetry("t1", "ns", PolicyScope::MeshWide)],
@@ -5134,11 +6523,12 @@ mod tests {
         PeerAuthentication {
             name: name.into(),
             namespace: "default".into(),
-            scope: None,
-            selector: Some(WorkloadSelector {
-                labels: HashMap::from([(key.to_string(), value.to_string())]),
-                namespace: None,
-            }),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([(key.to_string(), value.to_string())]),
+                    namespace: Some("default".into()),
+                },
+            },
             mtls_mode: mode,
             port_overrides: HashMap::new(),
         }
@@ -5262,10 +6652,12 @@ mod tests {
         // ambiguous), so the policy genuinely does not apply to this workload.
         // Only LABEL divergence within this namespace is escalated fail-closed.
         let mut pa = selector_peer_auth("other-ns-strict", "role", "api", MtlsMode::Strict);
-        pa.selector = Some(WorkloadSelector {
-            labels: HashMap::from([("role".to_string(), "api".to_string())]),
-            namespace: Some("other-namespace".to_string()),
-        });
+        pa.scope = PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                namespace: Some("other-namespace".to_string()),
+            },
+        };
         let slice = MeshSlice {
             namespace: "default".into(),
             labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
@@ -6178,6 +7570,7 @@ mod tests {
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // The slice should inherit labels from the matched workload.
@@ -6237,6 +7630,7 @@ mod tests {
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -6320,6 +7714,7 @@ mod tests {
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -6394,6 +7789,7 @@ mod tests {
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -6441,6 +7837,7 @@ mod tests {
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // Explicit labels should be used, not the workload's labels.
@@ -6720,8 +8117,7 @@ mod tests {
         PeerAuthentication {
             name: name.to_string(),
             namespace: namespace.to_string(),
-            scope: None,
-            selector,
+            scope: peer_auth_test_scope(namespace, selector),
             mtls_mode: mode,
             port_overrides,
         }
@@ -6733,17 +8129,10 @@ mod tests {
         scope: PolicyScope,
         mode: MtlsMode,
     ) -> PeerAuthentication {
-        let selector = match &scope {
-            PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
-            PolicyScope::MeshWide
-            | PolicyScope::Namespace { .. }
-            | PolicyScope::TargetRefs { .. } => None,
-        };
         PeerAuthentication {
             name: name.to_string(),
             namespace: namespace.to_string(),
-            scope: Some(scope),
-            selector,
+            scope,
             mtls_mode: mode,
             port_overrides: HashMap::new(),
         }
@@ -6905,9 +8294,8 @@ mod tests {
     #[test]
     fn same_tier_peer_auth_equal_modes_resolve_deterministically() {
         // When two same-tier policies carry the SAME effective mode, the result
-        // is identical regardless of slice order; the value-neutral
-        // (namespace, name) tiebreak only selects a canonical winning policy,
-        // never the resolved mode.
+        // is identical regardless of slice order: only the mode is returned,
+        // so equal-mode ties need no further ordering.
         let a = pa_with_scope(
             "zz-policy",
             "aaa-root",
@@ -7038,6 +8426,7 @@ mod tests {
                 waypoint_name: None,
                 ambient_udp_source_scoping: false,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
             },
         );
 
@@ -7866,6 +9255,7 @@ mod tests {
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }
     }
 
@@ -7885,6 +9275,7 @@ mod tests {
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }
     }
 
@@ -10347,10 +11738,10 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_narrowing_multi_host_service_entry_any_match_admits() {
-        // A ServiceEntry with multiple hosts: as long as ONE host matches the
-        // egress pattern, the whole entry is admitted. Documented at the
-        // sidecar_egress_includes_service rustdoc.
+    fn sidecar_narrowing_multi_host_service_entry_keeps_only_admitted_hosts() {
+        // A ServiceEntry with multiple hosts is narrowed per host: the entry
+        // survives because one host matches the egress pattern, but only that
+        // host is carried into the slice (see `narrow_service_entry_ports`).
         let mesh = MeshConfig {
             sidecars: vec![make_sidecar(
                 "wildcard-sc",
@@ -10379,6 +11770,10 @@ mod tests {
         let config = config_with_mesh(mesh);
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
         assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(
+            slice.service_entries[0].hosts,
+            vec!["api.example.com".to_string()]
+        );
     }
 
     #[test]

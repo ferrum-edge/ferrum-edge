@@ -83,7 +83,7 @@ use tokio::sync::watch;
 
 use crate::scaffolding::port_registry::TestSocket;
 
-use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope, Proxy};
+use ferrum_edge::config::types::{Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::{
@@ -96,7 +96,8 @@ use ferrum_edge::modes::mesh::config::{
     OutboundTrafficPolicy, PolicyAction, PolicyScope, RequestMatch, ResolvedIngressListener,
 };
 use ferrum_edge::modes::mesh::{
-    MeshRuntimeConfig, MeshTopology, MeshTrafficDirection, prepare_gateway_config_for_mesh,
+    MeshRuntimeConfig, MeshTopology, MeshTrafficDirection,
+    prepare_gateway_config_via_mesh_slice_with_fixtures,
 };
 use ferrum_edge::plugins::{HboneReuseContext, ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::hbone_admission_fence::{
@@ -282,8 +283,8 @@ fn prepared_config_from_mesh_with_runtime(
         .collect();
     let mut config = gateway_config_with_mesh(proxies, Vec::new(), mesh);
     config.plugin_configs = plugin_configs;
-    let mut prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared config");
+    let mut prepared = prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime)
+        .expect("mesh-prepared config");
     retag_mesh_managed_plugins(&mut prepared);
     prepared
 }
@@ -641,10 +642,9 @@ struct Tunnel {
 /// Send a plain HBONE CONNECT and, on a `200`, hand back both halves of the
 /// live tunnel. A non-`200` head is the admission refusal.
 ///
-/// Deliberately plain: a CONNECT carrying a gRPC `content-type` classifies as
-/// gRPC before the HBONE branch is reached and is refused as a trailers-only
-/// `200`, which this helper could not tell from an admitted tunnel. Tests that
-/// want that shape use [`send_connect`] and read the `grpc-status` themselves.
+/// Deliberately plain: a CONNECT carrying a gRPC or gRPC-Web `content-type` is
+/// refused with a plain HTTP `400` before the HBONE branch is reached. Tests
+/// that want that shape use [`send_connect`] directly.
 async fn open_tunnel(sender: &mut h2::client::SendRequest<Bytes>) -> Result<Tunnel, StatusCode> {
     let (resp, request_body) = send_connect(sender, None).await;
     if resp.status() != StatusCode::OK {
@@ -657,8 +657,7 @@ async fn open_tunnel(sender: &mut h2::client::SendRequest<Bytes>) -> Result<Tunn
 }
 
 /// Send a CONNECT and hand back the response head plus the request-body handle.
-/// The caller decides what the head means — a gRPC-classified refusal is shaped
-/// as trailers-only (`200` + `grpc-status`), not as an HTTP error status.
+/// The caller decides what the head means.
 async fn send_connect(
     sender: &mut h2::client::SendRequest<Bytes>,
     content_type: Option<&str>,
@@ -678,8 +677,8 @@ async fn send_connect(
     (resp, request_body)
 }
 
-/// The `grpc-status` a trailers-only refusal carries, if any. An admitted HBONE
-/// CONNECT's `200` carries none.
+/// The `grpc-status` a response head carries, if any. No answer to an HBONE
+/// CONNECT carries one.
 fn grpc_status_of(response: &hyper::Response<h2::RecvStream>) -> Option<String> {
     response
         .headers()
@@ -1607,10 +1606,10 @@ async fn a_loopback_pinned_inbound_relay_is_revoked_when_the_namespace_privilege
 /// admitted with, because a CONNECT that declares a gRPC content type is not
 /// admitted at all.
 ///
-/// `content-type: application/grpc` classifies the request as
-/// `HttpFlavor::Grpc` well before the HBONE branch, and the gRPC spec's POST
-/// requirement then refuses any other method as trailers-only (`200` + a
-/// non-zero `grpc-status`, END_STREAM) — a refusal, not a tunnel. Every
+/// An HBONE CONNECT declaring a native gRPC or gRPC-Web `content-type` is
+/// refused before routing with a plain HTTP `400` (gRPC requires POST). The
+/// refusal is never gRPC-framed: a trailers-only `200` would itself read as
+/// "tunnel established" (RFC 9110 §9.3.6). Every
 /// admitted HBONE tunnel is therefore admitted on the plain-HTTP view, which is
 /// the view a sweep re-resolves. The snapshot still records whichever view the
 /// request path actually used
@@ -1633,27 +1632,27 @@ async fn a_grpc_classified_connect_is_refused_before_it_can_become_a_fenced_tunn
 
     // This generation ALLOWS the principal, so the refusal below is the
     // protocol gate rather than authorization.
-    let (refused, _refused_request) = send_connect(&mut sender, Some("application/grpc")).await;
-    assert_eq!(
-        refused.status(),
-        StatusCode::OK,
-        "a gRPC-classified refusal is trailers-only, not an HTTP error status"
-    );
-    let refused_grpc_status = grpc_status_of(&refused);
-    assert!(
-        refused_grpc_status
-            .as_deref()
-            .is_some_and(|status| status != "0"),
-        "a gRPC-classified CONNECT must be refused, never admitted as a tunnel; got \
-         grpc-status {refused_grpc_status:?}"
-    );
-    let mut refused_body = refused.into_body();
-    assert_tunnel_closed(&mut refused_body).await;
-    assert_eq!(
-        state.hbone_admission_fence.live_tunnels(),
-        0,
-        "a refused CONNECT must not register a sweepable tunnel"
-    );
+    for content_type in ["application/grpc", "application/grpc-web+proto"] {
+        let (refused, _refused_request) = send_connect(&mut sender, Some(content_type)).await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::BAD_REQUEST,
+            "a CONNECT declaring {content_type} must be refused with an HTTP status, \
+             never admitted as a tunnel or answered with a gRPC-framed 200"
+        );
+        assert_eq!(
+            grpc_status_of(&refused),
+            None,
+            "the refusal of a CONNECT declaring {content_type} is plain HTTP"
+        );
+        let mut refused_body = refused.into_body();
+        assert_tunnel_closed(&mut refused_body).await;
+        assert_eq!(
+            state.hbone_admission_fence.live_tunnels(),
+            0,
+            "a refused CONNECT must not register a sweepable tunnel"
+        );
+    }
     assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
     // The same peer's plain CONNECT IS admitted, on the plain-HTTP view, and
@@ -3340,9 +3339,9 @@ fn every_trust_publisher_stores_before_it_requests_a_sweep() {
     // the verifier's slot themselves. Every `.store(` inside each publisher's
     // own body is enumerated, because the two writers bind the inbound slot
     // under DIFFERENT names (`inbound_slot` and, in `publish_staged_spiffe_
-    // bundle`'s `DirectSlot` arm, plain `slot`): pinning one variable name
-    // leaves the other free to regress, and only the sibling call-count
-    // assertion would notice — and only because the call disappeared.
+    // bundle`, plain `slot`): pinning one variable name leaves the other free
+    // to regress, and only the sibling call-count assertion would notice —
+    // and only because the call disappeared.
     let mesh = include_str!("../../src/modes/mesh/mod.rs");
     for (what, publisher, permitted_stores) in [
         (
@@ -3387,9 +3386,9 @@ fn every_trust_publisher_stores_before_it_requests_a_sweep() {
     }
     assert_eq!(
         mesh.matches("publish_mesh_inbound_trust_bundle(").count(),
-        2,
-        "exactly the two inbound-slot writers — the runtime SVID republisher and the staged \
-         slice publisher — may publish inbound trust"
+        1,
+        "exactly one inbound-slot writer — the runtime SVID republisher, which the staged \
+         slice publisher also goes through — may publish inbound trust"
     );
 }
 
@@ -3426,7 +3425,7 @@ fn tunnel_reuse_advertisement(response: &hyper::Response<h2::RecvStream>) -> Opt
 
 /// The ordinary mesh inbound chain is reusable end to end.
 ///
-/// `prepare_gateway_config_for_mesh` injects `spiffe_identity`, `mesh_authz`,
+/// `prepare_gateway_config_via_mesh_slice_with_fixtures` injects `spiffe_identity`, `mesh_authz`,
 /// `workload_metrics`, and the `stdout_logging` access log, so this is not a
 /// one-plugin assertion: EVERY member of the production chain must classify
 /// itself reusable for the header to appear at all. Demoting any one of them —
@@ -3646,6 +3645,159 @@ async fn an_access_control_chain_refuses_the_connect_it_would_have_let_reuse() {
     let _ = shutdown_tx.send(true);
     backend_handle.abort();
     conn_task.abort();
+}
+
+/// A globally scoped `access_control` row that admits only Consumers in the
+/// `engineering` ACL group.
+fn access_control_engineering_plugin() -> PluginConfig {
+    PluginConfig {
+        labels: Default::default(),
+        id: "operator-access-control-engineering".to_string(),
+        plugin_name: "access_control".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        config: json!({ "allowed_groups": ["engineering"] }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn fence_acl_consumer(id: &str, username: &str, groups: &[&str]) -> Consumer {
+    Consumer {
+        labels: Default::default(),
+        id: id.to_string(),
+        username: username.to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: groups.iter().map(|group| group.to_string()).collect(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+/// The Consumer the fence ACL fixtures admit, with the given ACL groups.
+fn fence_alice(groups: &[&str]) -> Consumer {
+    fence_acl_consumer("fence-acl-alice", "alice", groups)
+}
+
+/// [`prepared_config_with`] carrying the `engineering` ACL policy and the given
+/// Consumer records.
+fn consumer_acl_config(app_port: u16, consumers: Vec<Consumer>) -> GatewayConfig {
+    let mut config = prepared_config_with(
+        Some(app_port),
+        None,
+        vec![allow_client()],
+        vec![access_control_engineering_plugin()],
+    );
+    config.consumers = consumers;
+    config
+}
+
+/// [`dual_gate_snapshot`] admitted as a mapped Consumer — what `mtls_auth`
+/// leaves in the CONNECT context. Under the default PERMISSIVE posture only the
+/// authorize gate is armed.
+fn consumer_mapped_snapshot(
+    proxy: Arc<Proxy>,
+    consumer: Consumer,
+    admission_sweep_epoch: u64,
+) -> HboneAdmissionSnapshot {
+    let mut snapshot = dual_gate_snapshot(proxy, admission_sweep_epoch);
+    snapshot.ctx.identified_consumer = Some(Arc::new(consumer));
+    snapshot
+}
+
+/// The sweep must judge the CURRENT Consumer record, not the `Arc<Consumer>`
+/// the CONNECT captured: removing the admitting Consumer from the ACL group the
+/// policy allows is a Consumer edit, and a fresh CONNECT would be refused for
+/// it, so the live tunnel must be revoked too. An unrelated Consumer edit
+/// re-judges the tunnel and keeps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_the_admitting_consumers_acl_group_revokes_a_live_tunnel() {
+    const APP_PORT: u16 = 8080;
+    let state = build_state(consumer_acl_config(
+        APP_PORT,
+        vec![fence_alice(&["engineering"])],
+    ));
+    let fence = &state.hbone_admission_fence;
+    let proxy = Arc::new(create_mesh_proxy(APP_PORT));
+
+    let tunnel = fence.admit(consumer_mapped_snapshot(
+        proxy,
+        fence_alice(&["engineering"]),
+        fence.sweep_epoch(),
+    ));
+    assert_eq!(tunnel.revoked_reason(), None);
+
+    let completed_before = fence.sweeps_completed();
+    let reevaluations_before = fence.reevaluations();
+    let outcome = state.update_config(consumer_acl_config(
+        APP_PORT,
+        vec![
+            fence_alice(&["engineering"]),
+            fence_acl_consumer("fence-acl-bob", "bob", &[]),
+        ],
+    ));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    wait_for_sweep_after(&state, completed_before).await;
+    assert!(
+        fence.reevaluations() > reevaluations_before,
+        "the publication must re-judge the live tunnel"
+    );
+    assert_eq!(
+        tunnel.revoked_reason(),
+        None,
+        "an unrelated Consumer edit must keep a tunnel whose Consumer is still allowed"
+    );
+
+    let outcome = state.update_config(consumer_acl_config(APP_PORT, vec![fence_alice(&[])]));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::AuthorizationDenied),
+        "the admitting Consumer left the allowed group, so access_control must deny the \
+         re-judged tunnel"
+    );
+    assert_eq!(
+        revocation_counts(&state),
+        [0, 0, 0, 0, 1, 0, 0, 0, 0],
+        "exactly one authorization_denied revocation"
+    );
+}
+
+/// A tunnel whose admitting Consumer the published generation no longer
+/// carries is revoked: the credential that admitted it maps to nobody now.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_the_admitting_consumer_revokes_a_live_tunnel() {
+    const APP_PORT: u16 = 8080;
+    let state = build_state(consumer_acl_config(
+        APP_PORT,
+        vec![fence_alice(&["engineering"])],
+    ));
+    let fence = &state.hbone_admission_fence;
+    let proxy = Arc::new(create_mesh_proxy(APP_PORT));
+
+    let tunnel = fence.admit(consumer_mapped_snapshot(
+        proxy,
+        fence_alice(&["engineering"]),
+        fence.sweep_epoch(),
+    ));
+    assert_eq!(tunnel.revoked_reason(), None);
+
+    let outcome = state.update_config(consumer_acl_config(APP_PORT, Vec::new()));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::AuthorizationDenied)
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 1, 0, 0, 0, 0]);
 }
 
 /// The datagram CONNECT path never advertises reuse, whatever its admitting

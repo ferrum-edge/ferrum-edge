@@ -24,7 +24,6 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 const TEST_NAMESPACE: &str = "ferrum";
@@ -32,8 +31,14 @@ const TEST_JWT_SECRET: &str = "ferrum-edge-grpc-pre-hook-test-secret";
 const TEST_JWT_ISSUER: &str = "ferrum-edge-grpc-pre-hook-test";
 
 #[ignore]
-#[tokio::test]
-async fn functional_grpc_method_rate_limit_precedes_external_hook_on_h2_and_h3() {
+#[test]
+fn functional_grpc_method_rate_limit_precedes_external_hook_on_h2_and_h3() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_grpc_method_rate_limit_precedes_external_hook_on_h2_and_h3_inner,
+    );
+}
+
+async fn functional_grpc_method_rate_limit_precedes_external_hook_on_h2_and_h3_inner() {
     let (backend_port, backend_hits, backend_task) = spawn_counting_grpc_backend().await;
     let (function_port, function_hits, function_task) = spawn_counting_function().await;
     let gateway = start_gateway(test_config(backend_port, function_port))
@@ -107,13 +112,13 @@ async fn functional_grpc_method_rate_limit_precedes_external_hook_on_h2_and_h3()
 struct RunningGateway {
     http_port: u16,
     https_port: u16,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: ferrum_edge::overload::ShutdownSender,
     handles: ServeHandles,
 }
 
 impl RunningGateway {
     async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(5), self.handles.join())
             .await
             .expect("gRPC method-policy gateway shutdown timed out")
@@ -166,7 +171,9 @@ async fn start_gateway(
     };
     drop(https_udp);
 
-    let (shutdown_tx, _) = watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let handles =
         ferrum_edge::modes::file::serve(env_config, config, options, shutdown_tx.clone()).await?;
 

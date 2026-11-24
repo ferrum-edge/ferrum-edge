@@ -2,7 +2,7 @@
 
 use ferrum_ebpf_common::{INCLUDE_PORTS_MAX, IncludePortsPolicy};
 use ferrum_edge::capture::{
-    CaptureConfig, DEFAULT_PROXY_UID, EbpfPlan, FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
+    CaptureConfig, DEFAULT_PROXY_UID, FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
     ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION, IptablesPlan, include_outbound_ports_from_annotations,
 };
 use ferrum_edge::config::EnvConfig;
@@ -124,7 +124,6 @@ fn directly_constructed_root_uid_cannot_generate_tcp_udp_or_fallback_rules() {
         IptablesPlan::udp_only_for_config(&config).unwrap_err(),
         IptablesPlan::udp_setup_script(&config).unwrap_err(),
         IptablesPlan::host_udp_for_config(&config, &["veth-test".to_string()]).unwrap_err(),
-        EbpfPlan::for_config(&config).unwrap_err(),
     ] {
         assert!(error.contains("FERRUM_MESH_PROXY_UID"));
         assert!(error.contains("non-zero"));

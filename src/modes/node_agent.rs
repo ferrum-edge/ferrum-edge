@@ -35,7 +35,7 @@ use crate::capture::{
     XTABLES_LOCK_WAIT_SECONDS, include_outbound_ports_from_annotations,
 };
 use crate::cni::ownership::{
-    DurableCniCleanupSnapshot, DurableCniOwnershipRecord, cni_ownership_store_is_rejected,
+    DurableCniCleanupSnapshot, DurableCniOwnershipRecord, cni_ownership_store_state,
     configure_cni_ownership_store, is_safe_cni_pod_uid, load_configured_cni_ownership,
     load_durable_cni_ownership, ownership_store_path_for_socket, persist_configured_cni_ownership,
 };
@@ -65,14 +65,28 @@ use crate::ebpf::{
     NodeAgentProxyMode, PodAttachmentState, PodInfo, TcAttachDirection,
 };
 use crate::modes::node_agent_cni_server::{
-    self, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,
+    self, CniListenerExit, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,
 };
 use crate::proxy::node_waypoint_udp_reply_source::ReplySourceGeneration;
 
 const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
-const DEFAULT_BPF_FS_PATH: &str = "/sys/fs/bpf";
+const DEFAULT_BPF_FS_PATH: &str = crate::ebpf::BPF_FS_MOUNT_PATH;
 const DEFAULT_FALLBACK_MODE: &str = "fail";
 const CNI_METADATA_FETCH_TIMEOUT: Duration = Duration::from_millis(750);
+/// Bounded attempts at the CNI ADD pod metadata GET. Two attempts plus the
+/// pause between them stay well under the ferrum-cni RPC client timeout
+/// (`DEFAULT_RPC_TIMEOUT` = 5s), so a transient API hiccup is absorbed while a
+/// real outage still answers ADD (fail closed) before the client gives up.
+const CNI_METADATA_FETCH_ATTEMPTS: u32 = 2;
+const CNI_METADATA_FETCH_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Sanitized ADD refusal when the pod's Kubernetes metadata cannot be read:
+/// without labels/annotations the node-agent cannot tell whether the pod must
+/// be captured, and acknowledging ADD would let an opted-in pod start outside
+/// the mesh (GHSA-7x6j-vmqm-xx2v). kubelet retries the sandbox.
+pub(crate) const CNI_ADD_METADATA_UNAVAILABLE_REASON: &str = "Kubernetes API pod metadata is unavailable; ADD fails closed so the pod cannot start outside the mesh";
+/// Sanitized ADD refusal when an opted-in pod's capture enrollment did not land
+/// (GHSA-7x6j-vmqm-xx2v). kubelet retries the sandbox.
+pub(crate) const CNI_ADD_ENROLLMENT_INCOMPLETE_REASON: &str = "pod is opted in to the mesh but capture enrollment did not complete; ADD fails closed so the pod cannot start outside the mesh";
 /// Live Kubernetes ADD-dependency probe budget for CNI STATUS.
 ///
 /// Equal to the ADD metadata GET budget so STATUS cannot occupy the serial
@@ -103,7 +117,12 @@ const VERIFIED_UDP_HANDSHAKE_RETENTION_MULTIPLIER: u32 = 20;
 
 static FAILED_POD_ENROLLMENT_ATTEMPTS: LazyLock<DashMap<String, FailedPodEnrollmentAttempt>> =
     LazyLock::new(DashMap::new);
-static PENDING_CAPTURE_FAILURES: LazyLock<DashMap<String, ()>> = LazyLock::new(DashMap::new);
+/// Pending per-pod capture failures, keyed by `pod_state_key` (owning
+/// `pod_states` instance + pod UID). An entry is present only while its set is
+/// non-empty; it is mutated only through the remember/forget API below.
+static PENDING_CAPTURE_FAILURES: LazyLock<
+    DashMap<String, std::collections::BTreeSet<CaptureFailureOp>>,
+> = LazyLock::new(DashMap::new);
 /// Ferrum-CNI-owned attachment identities keyed by generation + CNI network +
 /// `(containerID, ifname)`.
 ///
@@ -134,23 +153,65 @@ struct CniOwnedAttachment {
     cleanup: DurableCniCleanupSnapshot,
 }
 
-const CAPTURE_FAILURE_POD_IP_UPDATE: &str = "pod_ip_update";
-const CAPTURE_FAILURE_POD_IP_REMOVE: &str = "pod_ip_remove";
-const CAPTURE_FAILURE_POD_DETACH: &str = "pod_detach";
-const CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE: &str = "node_probe_port_update";
-const CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE: &str = "node_probe_port_remove";
-const CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE: &str = "include_ports_remove";
-const CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE: &str = "workload_identity_remove";
-const CAPTURE_FAILURE_UDP_READINESS: &str = "udp_readiness";
-const CAPTURE_FAILURE_INBOUND_REDIRECT_UPDATE: &str = "inbound_redirect_update";
-const CAPTURE_FAILURE_DETAIL_POD_IP: &str = "pod_ip";
-const CAPTURE_FAILURE_DETAIL_POD_IP6: &str = "pod_ip6";
-const CAPTURE_FAILURE_DETAIL_POD_DETACH: &str = "pod_detach";
-const CAPTURE_FAILURE_DETAIL_NODE_PROBE_PORTS: &str = "node_probe_ports";
-const CAPTURE_FAILURE_DETAIL_UDP_READINESS: &str = "udp_readiness";
-const CAPTURE_FAILURE_DETAIL_INBOUND_REDIRECT: &str = "inbound_redirect_ports";
+/// One pending, retryable capture failure recorded against a pod-state
+/// identity (`pod_state_key`: the owning `pod_states` instance plus pod UID).
+///
+/// Every operation carries exactly the typed data its retry or supersession
+/// needs, so no record is ever encoded into, or parsed back out of, a string.
+/// Records are created and dropped only through `remember_capture_failure` /
+/// `forget_capture_failure` / `forget_capture_failures_matching`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum CaptureFailureOp {
+    /// A live pod's move to this IPv4 address failed part-way: its redirect
+    /// scope and/or pod-IP entry may already be written there while the tracked
+    /// address was not advanced.
+    PodIpUpdate(std::net::Ipv4Addr),
+    /// IPv6 counterpart of `PodIpUpdate`.
+    PodIp6Update(std::net::Ipv6Addr),
+    /// A live pod's node probe-port maps could not be brought to `desired_ports`.
+    NodeProbePortUpdate { desired_ports: Vec<u16> },
+    /// A live pod's Ambient UDP readiness bit could not be reconciled.
+    UdpReadiness,
+    /// A live pod's inbound redirect scope/flag write failed part-way, so the
+    /// BPF-written scope may differ from the tracked `inbound_redirect_ports`.
+    InboundRedirectUpdate,
+    /// Removal blocker: the pod-IP entry (and its redirect scope) for this
+    /// address may still be present.
+    PodIpRemove(std::net::IpAddr),
+    /// Removal blocker: the pod's cgroup/tc programs may still be attached.
+    PodDetach,
+    /// Removal blocker: a node probe-port map key may still be present.
+    NodeProbePortRemove { ip: std::net::IpAddr, port: u16 },
+    /// Removal blocker: an includeOutboundPorts cgroup entry may still be present.
+    IncludePortsRemove { cgroup_id: u64 },
+    /// Removal blocker: a workload-identity cgroup entry may still be present.
+    WorkloadIdentityRemove { cgroup_id: u64 },
+}
 
-#[allow(dead_code)]
+impl CaptureFailureOp {
+    /// Whether this record is BPF state that must still be torn down after the
+    /// pod is gone. Removal blockers are the durable retry queue for teardown
+    /// and survive pod removal; every other record describes a desired state of
+    /// a LIVE pod and is meaningless (and must be pruned) once the pod is gone.
+    ///
+    /// Deliberately exhaustive (no wildcard arm): a new operation must be
+    /// classified here, so pod removal can never silently strand it.
+    fn blocks_removal(&self) -> bool {
+        match self {
+            Self::PodIpRemove(_)
+            | Self::PodDetach
+            | Self::NodeProbePortRemove { .. }
+            | Self::IncludePortsRemove { .. }
+            | Self::WorkloadIdentityRemove { .. } => true,
+            Self::PodIpUpdate(_)
+            | Self::PodIp6Update(_)
+            | Self::NodeProbePortUpdate { .. }
+            | Self::UdpReadiness
+            | Self::InboundRedirectUpdate => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeAgentConfig {
     pub node_name: String,
@@ -183,6 +244,25 @@ pub struct PodSourceIps {
 }
 
 impl PodSourceIps {
+    /// Prefer the primary CNI's allocation for THIS sandbox (the chained
+    /// `prevResult` the ADD carried) over Kubernetes status, which is usually
+    /// still empty at ADD and can name a previous sandbox's address on a
+    /// sandbox restart. An empty allocation keeps the status view unchanged.
+    fn preferring_cni_allocation(self, allocation: &[std::net::IpAddr]) -> Self {
+        if allocation.is_empty() {
+            return self;
+        }
+        let mut ips = Self::default();
+        for ip in allocation {
+            match ip {
+                std::net::IpAddr::V4(ip) if ips.ipv4.is_none() => ips.ipv4 = Some(*ip),
+                std::net::IpAddr::V6(ip) if ips.ipv6.is_none() => ips.ipv6 = Some(*ip),
+                _ => {}
+            }
+        }
+        ips
+    }
+
     #[cfg(test)]
     fn from_primary_str(ip: Option<&str>) -> Self {
         let mut ips = Self::default();
@@ -282,6 +362,46 @@ impl CniListenerConfig {
     }
 }
 
+/// Validate `FERRUM_NODE_AGENT_BPF_FS_PATH` against the fixed pin contract.
+///
+/// Every pinned map lives at a constant path under
+/// [`crate::ebpf::BPF_PIN_DIR`], shared with the mesh-proxy / NodeWaypoint
+/// readers, so the in-container bpffs mount point cannot move. A different
+/// value would let the capability probe pass on one mount while pins are
+/// written to (and read from) another, so it is refused at startup. To use a
+/// non-default *host* bpffs, mount it at `/sys/fs/bpf` inside the container
+/// (the Helm chart does this for `nodeAgent.bpfFsPath`).
+fn validate_bpf_fs_path(raw: Option<String>) -> Result<String, String> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_BPF_FS_PATH.to_string());
+    };
+    let trimmed = raw.trim();
+    let normalized = trimmed.trim_end_matches('/');
+    if trimmed.is_empty() || normalized == DEFAULT_BPF_FS_PATH {
+        return Ok(DEFAULT_BPF_FS_PATH.to_string());
+    }
+    Err(format!(
+        "FERRUM_NODE_AGENT_BPF_FS_PATH={} is not supported: Ferrum pins its BPF maps at \
+         fixed paths under {} that the mesh proxy also opens, so bpffs must be mounted at \
+         {} inside the container. Mount a non-default host bpffs at {} instead \
+         (the Helm chart does this for nodeAgent.bpfFsPath)",
+        crate::startup::sanitize_startup_scalar(trimmed),
+        crate::ebpf::BPF_PIN_DIR,
+        DEFAULT_BPF_FS_PATH,
+        DEFAULT_BPF_FS_PATH,
+    ))
+}
+
+/// `FERRUM_MESH_TOPOLOGY` as the node-agent sees it: parsed by the same
+/// [`crate::modes::mesh::MeshTopology::parse`] the mesh proxy uses (default
+/// `sidecar` when unset), so a typo fails node-agent startup instead of being
+/// read as "not ambient" (issue #7237).
+fn node_agent_mesh_topology() -> Result<crate::modes::mesh::MeshTopology, String> {
+    crate::modes::mesh::MeshTopology::parse(
+        &resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").unwrap_or_else(|| "sidecar".to_string()),
+    )
+}
+
 impl NodeAgentConfig {
     pub fn from_env_config(env_config: &EnvConfig) -> Result<Self, String> {
         let node_name = resolve_ferrum_var("FERRUM_NODE_AGENT_NODE_NAME").ok_or(
@@ -325,8 +445,8 @@ impl NodeAgentConfig {
         capture_config.ensure_exclude_port(env_config.node_agent_hbone_redirect_port);
         let cgroup_root = resolve_ferrum_var("FERRUM_NODE_AGENT_CGROUP_ROOT")
             .unwrap_or_else(|| DEFAULT_CGROUP_ROOT.to_string());
-        let bpf_fs_path = resolve_ferrum_var("FERRUM_NODE_AGENT_BPF_FS_PATH")
-            .unwrap_or_else(|| DEFAULT_BPF_FS_PATH.to_string());
+        let bpf_fs_path =
+            validate_bpf_fs_path(resolve_ferrum_var("FERRUM_NODE_AGENT_BPF_FS_PATH"))?;
         let fallback_mode = FallbackMode::parse(
             &resolve_ferrum_var("FERRUM_NODE_AGENT_FALLBACK_MODE")
                 .unwrap_or_else(|| DEFAULT_FALLBACK_MODE.to_string()),
@@ -337,24 +457,16 @@ impl NodeAgentConfig {
             env_config.node_agent_proxy_mode,
             capture_config.outbound_port,
             env_config.node_agent_hbone_redirect_port,
-            DEFAULT_NODE_AGENT_SOCKET_PATH,
         )?;
 
         // In-netns capture is the default for NodeWaypoint: publish the per-pod
         // registry whenever the node-agent runs in NodeWaypoint proxy mode with
-        // outbound capture enabled. Other proxy modes have no in-netns listener
-        // consumer, so leave it `None` and skip all the filesystem work on the
-        // hot paths.
+        // outbound capture enabled. The registry is also published for every
+        // Ambient topology (see `should_publish_registry` below); otherwise it
+        // stays `None` and the filesystem work is skipped on the hot paths.
         let node_waypoint_in_netns = env_config.node_agent_proxy_mode
             == NodeAgentProxyMode::NodeWaypoint
             && capture_config.outbound_capture_enabled;
-        // NodeWaypoint in-netns capture now binds both pod-loopback families.
-        // Keep the global IPv6 include so dual-stack destinations are captured
-        // instead of bypassing `mesh_authz`; if a pod's IPv6 listener is not
-        // ready yet, connect6 redirects to `[::1]:<port>` and fails closed by
-        // connection refusal until the proxy publishes `.ready6`.
-        capture_contract.ipv6_outbound_deny = false;
-
         // Inbound tc ingress redirect (issue #3287). Off unless the operator
         // names at least one node capture interface: the redirect replaces the
         // node-global iptables REDIRECT for enrolled workloads and needs an
@@ -429,7 +541,7 @@ impl NodeAgentConfig {
         // is a generic per-pod map; publishing it does NOT change eBPF/redirect
         // behavior — that stays gated on `node_waypoint_in_netns` via the capture
         // contract, so a plain Ambient (LocalPod) deployment gets the registry for
-        // the UDP producer WITHOUT the NodeWaypoint ipv6-deny / connect4-deferral
+        // the UDP producer WITHOUT the NodeWaypoint `::/0` include / connect4-deferral
         // posture. The UDP gate is `udp_capture_enabled && topology == ambient`,
         // but is NOT anded with `outbound_capture_enabled`: the producer binds its own
         // `FERRUM_MESH_CAPTURE_UDP_PORT` inside each pod netns and does not use the
@@ -442,13 +554,12 @@ impl NodeAgentConfig {
         // before publishing this entry. The host-veth tc guard drops pod UDP until
         // the producer installs its guard/socket/rules and publishes
         // `.udp-ready/<uid>`.
-        let mesh_topology =
-            resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").unwrap_or_else(|| "sidecar".to_string());
-        let ambient_topology = mesh_topology.trim().eq_ignore_ascii_case("ambient");
+        let mesh_topology = node_agent_mesh_topology()?;
+        let ambient_topology = mesh_topology == crate::modes::mesh::MeshTopology::Ambient;
         let udp_capture_requested = capture_config.udp_capture_enabled;
         if udp_capture_requested && !ambient_topology {
             warn!(
-                mesh_topology = %crate::startup::sanitize_startup_scalar(mesh_topology.trim()),
+                mesh_topology = ?mesh_topology,
                 "FERRUM_MESH_CAPTURE_UDP_ENABLED=true requires FERRUM_MESH_TOPOLOGY=ambient; the Ambient UDP readiness guard is disabled and registry publication remains topology-dependent"
             );
         }
@@ -1082,9 +1193,13 @@ fn log_node_agent_startup(config: &NodeAgentConfig) {
 
 pub async fn run(
     env_config: EnvConfig,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<(), anyhow::Error> {
     let config = NodeAgentConfig::from_env_config(&env_config).map_err(anyhow::Error::msg)?;
+    // Read before any listener starts, so the `?` needs no cleanup.
+    // `from_env_config` already refused an unparseable value.
+    let ambient_topology = node_agent_mesh_topology().map_err(anyhow::Error::msg)?
+        == crate::modes::mesh::MeshTopology::Ambient;
     let metrics = Arc::new(NodeAgentMetrics::default());
     crate::plugins::prometheus_metrics::global_registry().set_node_agent_metrics(metrics.clone());
     let startup_ready = Arc::new(AtomicBool::new(false));
@@ -1119,8 +1234,6 @@ pub async fn run(
     // pod-netns-only; see `handle_fallback_with`). Refuse startup with an
     // actionable error rather than silently break either lifecycle phase,
     // mirroring `create_backend`'s refusal to no-op when eBPF is unavailable.
-    let ambient_topology = resolve_ferrum_var("FERRUM_MESH_TOPOLOGY")
-        .is_some_and(|topology| topology.trim().eq_ignore_ascii_case("ambient"));
     if ambient_udp_registry_requires_ebpf(
         probe.supports_ebpf(),
         ambient_topology,
@@ -1128,7 +1241,7 @@ pub async fn run(
     ) {
         metrics.set_topology_degraded(probe.degradation_reason().unwrap_or("unknown"));
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         for handle in admin_handles {
             if let Err(err) = handle.await {
                 warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent admin listener task failed");
@@ -1162,19 +1275,25 @@ pub async fn run(
         )
         .await
     } else {
-        let backend = create_backend(&config, &metrics)?;
-        run_with_backend(
-            backend,
-            &config,
-            metrics,
-            &shutdown_tx,
-            startup_ready,
-            cni_config,
-        )
-        .await
+        // A backend failure takes the common tail below like every other exit,
+        // so the admin listeners are shut down and joined (#2372, #3704).
+        match create_backend(&config, &metrics) {
+            Ok(backend) => {
+                run_with_backend(
+                    backend,
+                    &config,
+                    metrics,
+                    &shutdown_tx,
+                    startup_ready,
+                    cni_config,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
     };
 
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     for handle in admin_handles {
         if let Err(err) = handle.await {
             warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent admin listener task failed");
@@ -1210,7 +1329,7 @@ fn ambient_udp_registry_requires_ebpf(
 
 async fn start_node_agent_admin_listeners(
     env_config: &EnvConfig,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     startup_ready: Arc<AtomicBool>,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>, anyhow::Error> {
     let mut handles = Vec::new();
@@ -1330,7 +1449,6 @@ async fn start_node_agent_admin_listeners(
             crate::admin::api_specs::DefaultExternalDocumentLoader {
                 egress: env_config.backend_allow_ips.clone(),
                 dns_cache: None,
-                fixtures: std::collections::HashMap::new(),
             },
         ),
         runtime_config_apply: None,
@@ -1507,7 +1625,7 @@ async fn start_node_agent_admin_listeners(
     {
         // Partial bind must not leave a half-started admin surface: shut down
         // and join every listener/watcher already spawned.
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         for handle in handles {
             if let Err(join_err) = handle.await {
                 warn!(
@@ -1524,11 +1642,10 @@ async fn start_node_agent_admin_listeners(
 
 /// Test-only seam for issue #3704 external coverage of the production
 /// node-agent admin HTTP/HTTPS planner and startup path.
-#[allow(dead_code)]
 #[doc(hidden)]
 pub async fn start_node_agent_admin_listeners_for_test(
     env_config: &EnvConfig,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     startup_ready: Arc<AtomicBool>,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>, anyhow::Error> {
     start_node_agent_admin_listeners(env_config, shutdown_tx, startup_ready).await
@@ -1661,18 +1778,30 @@ fn create_backend(
 /// Explicit shutdown remains a clean `Ok` exit. Unexpected end-of-stream from
 /// the Kubernetes watcher still runs the same BPF/CNI cleanup, then returns
 /// `Err` so supervisors that restart only on nonzero exit will relaunch the
-/// agent (#2369).
+/// agent (#2369). A CNI listener that stops serving outside shutdown is fatal
+/// the same way (#7253): with the chained conflist installed every pod
+/// creation on the node fails until a listener serves the socket again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PodWatcherLoopExit {
     ShutdownRequested,
     WatcherExhausted,
+    CniListenerStopped(CniListenerExit),
+}
+
+/// Timer for the pod/CNI select loop's maintenance arms. `Delay` keeps a loop
+/// that was stalled (for example by an awaited Kubernetes call) from replaying
+/// every missed tick back to back once it resumes (#7254).
+fn maintenance_interval(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
 }
 
 async fn run_with_backend(
     mut backend: Box<dyn EbpfBackend>,
     config: &NodeAgentConfig,
     metrics: Arc<NodeAgentMetrics>,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
@@ -1681,10 +1810,6 @@ async fn run_with_backend(
         config.node_name.clone(),
         config.capture_contract.ingress_capture_supports_ipv6,
     );
-    let topology_ready = Arc::new(AtomicBool::new(
-        !config.capture_contract.ingress_redirect_enabled(),
-    ));
-
     // `initialize_backend` is transactional: any post-`load_programs` failure
     // rolls back via `cleanup_all` before returning. Once it succeeds, THIS
     // function owns cleanup exactly once through `InitializedBackendOwner`
@@ -1743,15 +1868,11 @@ async fn run_with_backend(
             diagnostic: "inbound ingress redirect is disabled".to_string(),
         }
     };
-    let topology_publication_ok = apply_ingress_topology_outcome(
+    let initial_topology_application = apply_ingress_topology_outcome(
         owner.backend_mut(),
         config,
         metrics.as_ref(),
-        topology_ready.as_ref(),
-        startup_ready.as_ref(),
         false,
-        false,
-        udp_migration_generation.is_none(),
         &initial_topology,
         "startup",
     );
@@ -1802,8 +1923,7 @@ async fn run_with_backend(
         cni_config,
         Some(client),
         topology_monitor,
-        topology_ready,
-        topology_publication_ok,
+        initial_topology_application,
         udp_migration_generation,
         udp_node_uid,
         pod_stream,
@@ -1812,47 +1932,189 @@ async fn run_with_backend(
     .await
 }
 
-fn set_node_agent_startup_readiness(
-    startup_ready: &AtomicBool,
-    initial_pod_sync_complete: bool,
-    topology_ready: bool,
-    udp_migration_ready: bool,
-) -> bool {
-    let ready = initial_pod_sync_complete && topology_ready && udp_migration_ready;
-    startup_ready.store(ready, Ordering::Release);
-    ready
+/// Pod-watch synchronization phase. kube-rs emits `Init`, `InitApply`*, then
+/// `InitDone` for every (re)list; only a completed relist makes `pod_states`
+/// authoritative enough to treat an absent UID as removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PodSyncState {
+    /// No relist has completed since the last `Init`, or this run just started.
+    Unsynced,
+    /// A relist is in progress; the UIDs observed so far feed the `InitDone`
+    /// stale sweep.
+    Relisting(HashSet<String>),
+    /// The last relist completed and `pod_states` is authoritative.
+    Synced,
 }
 
-#[allow(dead_code)] // External unit tests cover the combined readiness boundary.
+impl PodSyncState {
+    fn is_synced(&self) -> bool {
+        match self {
+            Self::Synced => true,
+            Self::Unsynced | Self::Relisting(_) => false,
+        }
+    }
+}
+
+/// Ambient UDP migration registry-synchronization proof (issue #3809):
+/// the `.udp-registry-synced` marker this loop publishes for the migration
+/// cleanup phase and the privileged preflight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpRegistryProof {
+    /// No migration generation is configured; the proof does not gate
+    /// readiness and no lane retracts or publishes it.
+    NotRequired,
+    /// The marker is durably absent: never published, retracted, or withheld
+    /// until inventory converges.
+    Withheld,
+    /// A marker bound to the current pod inventory is published.
+    Published,
+    /// A retraction failed, so a stale marker may still be visible. It is
+    /// never a valid proof: readiness and the CNI capture gate treat it like
+    /// `Withheld`, and every capture mutation stays fenced until a retraction
+    /// succeeds.
+    RetractionPending,
+}
+
+/// Completed marker operation that moves [`UdpRegistryProof`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpRegistryProofEvent {
+    /// The marker is durably absent (a retraction or publication rollback
+    /// succeeded).
+    Absent,
+    /// Publication was declined because inventory has not converged; the
+    /// marker was not touched.
+    PublicationDeclined,
+    /// A fresh marker was published for the current pod inventory.
+    Published,
+    /// Retracting the marker failed; it may still be visible.
+    RetractionFailed,
+}
+
+impl UdpRegistryProof {
+    fn for_generation(generation: Option<&str>) -> Self {
+        match generation {
+            Some(_) => Self::Withheld,
+            None => Self::NotRequired,
+        }
+    }
+
+    /// The single transition function. `NotRequired` is absorbing: without a
+    /// migration generation the marker never gates readiness or mutations.
+    /// A declined publication leaves the marker untouched, so a marker that
+    /// was (or may still be) visible stays a stale proof awaiting retraction.
+    fn transition(self, event: UdpRegistryProofEvent) -> Self {
+        match (self, event) {
+            (Self::NotRequired, _) => Self::NotRequired,
+            (_, UdpRegistryProofEvent::Absent) => Self::Withheld,
+            (_, UdpRegistryProofEvent::Published) => Self::Published,
+            (_, UdpRegistryProofEvent::RetractionFailed) => Self::RetractionPending,
+            (Self::Withheld, UdpRegistryProofEvent::PublicationDeclined) => Self::Withheld,
+            (
+                Self::Published | Self::RetractionPending,
+                UdpRegistryProofEvent::PublicationDeclined,
+            ) => Self::RetractionPending,
+        }
+    }
+
+    /// Whether the proof satisfies `/health` readiness and the CNI
+    /// ADD/CHECK/STATUS capture gate.
+    fn admits_readiness(self) -> bool {
+        match self {
+            Self::NotRequired | Self::Published => true,
+            Self::Withheld | Self::RetractionPending => false,
+        }
+    }
+
+    fn retraction_pending(self) -> bool {
+        match self {
+            Self::RetractionPending => true,
+            Self::NotRequired | Self::Withheld | Self::Published => false,
+        }
+    }
+}
+
+/// The node-agent's published `/health` readiness and every input it is
+/// derived from. `startup_ready` is written only by [`Self::publish`], always
+/// from [`Self::readiness`], so no caller chooses which inputs to pass.
+#[derive(Debug)]
+struct NodeAgentReadiness {
+    startup_ready: Arc<AtomicBool>,
+    pod_sync: PodSyncState,
+    topology_ready: bool,
+    udp_proof: UdpRegistryProof,
+}
+
+impl NodeAgentReadiness {
+    fn readiness(&self) -> bool {
+        self.pod_sync.is_synced() && self.topology_ready && self.udp_proof.admits_readiness()
+    }
+
+    /// Store the derived readiness. Call after every transition of any input;
+    /// publishing more often than needed is always correct.
+    fn publish(&self) -> bool {
+        let ready = self.readiness();
+        self.startup_ready.store(ready, Ordering::Release);
+        ready
+    }
+
+    fn set_topology_ready(&mut self, topology_ready: bool) {
+        self.topology_ready = topology_ready;
+        self.publish();
+    }
+
+    fn record_udp_proof(&mut self, event: UdpRegistryProofEvent) {
+        self.udp_proof = self.udp_proof.transition(event);
+        self.publish();
+    }
+
+    /// Teardown begins: `pod_states` stops being the authoritative capture
+    /// view, so readiness is withdrawn before the potentially slow cleanup.
+    fn begin_shutdown(&mut self) {
+        self.pod_sync = PodSyncState::Unsynced;
+        self.publish();
+    }
+}
+
 pub(crate) fn set_node_agent_startup_readiness_for_test(
     initial_pod_sync_complete: bool,
     topology_ready: bool,
     udp_migration_ready: bool,
 ) -> bool {
-    let startup_ready = AtomicBool::new(false);
-    set_node_agent_startup_readiness(
-        &startup_ready,
-        initial_pod_sync_complete,
+    NodeAgentReadiness {
+        startup_ready: Arc::new(AtomicBool::new(false)),
+        pod_sync: if initial_pod_sync_complete {
+            PodSyncState::Synced
+        } else {
+            PodSyncState::Unsynced
+        },
         topology_ready,
-        udp_migration_ready,
-    )
+        udp_proof: if udp_migration_ready {
+            UdpRegistryProof::Published
+        } else {
+            UdpRegistryProof::Withheld
+        },
+    }
+    .publish()
 }
 
-// This publication boundary deliberately receives each independent readiness
-// input explicitly so callers cannot hide capture or startup state in defaults.
-#[allow(clippy::too_many_arguments)]
+/// Result of publishing one ingress-topology outcome to the BPF capture map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IngressTopologyApplication {
+    /// The topology is proved and its quarantine state reached the datapath.
+    topology_ready: bool,
+    /// The capture-map update succeeded (or redirect is disabled). `false`
+    /// arms the bounded datapath publication retry.
+    datapath_published: bool,
+}
+
 fn apply_ingress_topology_outcome(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
-    topology_ready: &AtomicBool,
-    startup_ready: &AtomicBool,
-    initial_sync_complete: bool,
     capture_failures_pending: bool,
-    udp_migration_ready: bool,
     outcome: &IngressTopologyOutcome,
     phase: &'static str,
-) -> bool {
+) -> IngressTopologyApplication {
     let previous_snapshot = metrics.snapshot();
     let previous = previous_snapshot.ingress_topology;
     let ingress_redirect_enabled = config.capture_contract.ingress_redirect_enabled();
@@ -1879,13 +2141,6 @@ fn apply_ingress_topology_outcome(
     };
     metrics.set_ingress_topology(status);
     let ready = requested_ready && datapath_update_ok;
-    topology_ready.store(ready, Ordering::Release);
-    set_node_agent_startup_readiness(
-        startup_ready,
-        initial_sync_complete,
-        ready,
-        udp_migration_ready,
-    );
     if ready {
         if previous_snapshot.capture_state
             == NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE
@@ -1927,52 +2182,47 @@ fn apply_ingress_topology_outcome(
             );
         }
     }
-    datapath_update_ok
+    IngressTopologyApplication {
+        topology_ready: ready,
+        datapath_published: datapath_update_ok,
+    }
 }
 
 /// Narrow external-test seam for the production topology outcome transition.
-/// It exposes only the two readiness bits; BPF-map and metrics effects remain
-/// observable through the existing mock backend and metrics snapshots.
-#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
+/// It exposes only the topology bit and the readiness derived from it (with no
+/// UDP migration generation); BPF-map and metrics effects remain observable
+/// through the existing mock backend and metrics snapshots.
 pub(crate) fn apply_ingress_topology_outcome_for_test(
     backend: &mut crate::ebpf::MockEbpfBackend,
     config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
-    topology_ready: bool,
-    startup_ready: bool,
     initial_sync_complete: bool,
     outcome: &IngressTopologyOutcome,
 ) -> (bool, bool) {
-    let topology_ready = AtomicBool::new(topology_ready);
-    let startup_ready = AtomicBool::new(startup_ready);
-    let _ = apply_ingress_topology_outcome(
-        backend,
-        config,
-        metrics,
-        &topology_ready,
-        &startup_ready,
-        initial_sync_complete,
-        false,
-        true,
-        outcome,
-        "test",
-    );
-    (
-        topology_ready.load(Ordering::Acquire),
-        startup_ready.load(Ordering::Acquire),
-    )
+    let application =
+        apply_ingress_topology_outcome(backend, config, metrics, false, outcome, "test");
+    let readiness = NodeAgentReadiness {
+        startup_ready: Arc::new(AtomicBool::new(false)),
+        pod_sync: if initial_sync_complete {
+            PodSyncState::Synced
+        } else {
+            PodSyncState::Unsynced
+        },
+        topology_ready: application.topology_ready,
+        udp_proof: UdpRegistryProof::NotRequired,
+    };
+    (application.topology_ready, readiness.publish())
 }
 
 /// Test seam for [#2369](https://github.com/ferrum-edge/ferrum-edge/issues/2369):
 /// drive the node-agent watcher loop against an injected finite (or pending)
 /// pod-event stream without a live Kubernetes API. CNI is disabled; callers
 /// may seed already-attached pods to assert BPF detach/cleanup side effects.
-#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
 pub(crate) async fn run_with_pod_stream_for_test<S, I>(
     backend: &mut crate::ebpf::MockEbpfBackend,
     config: &NodeAgentConfig,
     metrics: Arc<NodeAgentMetrics>,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     pod_stream: S,
     seed_pods: I,
 ) -> Result<(), anyhow::Error>
@@ -1990,7 +2240,6 @@ where
         enabled: false,
         socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
     };
-    let topology_ready = Arc::new(AtomicBool::new(true));
     run_with_pod_stream(
         &mut owner,
         config,
@@ -2000,8 +2249,10 @@ where
         cni_config,
         None,
         None,
-        topology_ready,
-        true,
+        IngressTopologyApplication {
+            topology_ready: true,
+            datapath_published: true,
+        },
         None,
         None,
         pod_stream,
@@ -2013,13 +2264,16 @@ where
 /// Inject completed topology outcomes into the production pod/CNI select loop.
 /// Kubernetes and host I/O stay outside this seam; it exists solely so external
 /// tests can exercise the real outcome arm and readiness/quarantine wiring.
-#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
+/// `startup_ready` is the loop's published `/health` bit, and a
+/// `udp_migration_generation` requires `config.node_waypoint_pod_registry_dir`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_with_topology_outcome_stream_for_test<S, T>(
     backend: &mut crate::ebpf::MockEbpfBackend,
     config: &NodeAgentConfig,
     metrics: Arc<NodeAgentMetrics>,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
+    startup_ready: Arc<AtomicBool>,
+    udp_migration_generation: Option<String>,
     pod_stream: S,
     initial_topology: IngressTopologyOutcome,
     mut topology_stream: T,
@@ -2035,17 +2289,11 @@ where
         }
     });
     let monitor = IngressTopologyMonitor { outcomes, task };
-    let startup_ready = Arc::new(AtomicBool::new(false));
-    let topology_ready = Arc::new(AtomicBool::new(false));
-    let topology_publication_ok = apply_ingress_topology_outcome(
+    let initial_topology_application = apply_ingress_topology_outcome(
         backend,
         config,
         metrics.as_ref(),
-        topology_ready.as_ref(),
-        startup_ready.as_ref(),
         false,
-        false,
-        true,
         &initial_topology,
         "test_startup",
     );
@@ -2062,9 +2310,8 @@ where
         },
         None,
         Some(monitor),
-        topology_ready,
-        topology_publication_ok,
-        None,
+        initial_topology_application,
+        udp_migration_generation,
         None,
         pod_stream,
         std::iter::empty(),
@@ -2077,13 +2324,12 @@ async fn run_with_pod_stream<S, I>(
     owner: &mut InitializedBackendOwner<'_>,
     config: &NodeAgentConfig,
     metrics: Arc<NodeAgentMetrics>,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
     kube_client: Option<Client>,
     mut topology_monitor: Option<IngressTopologyMonitor>,
-    topology_ready: Arc<AtomicBool>,
-    mut topology_publication_ok: bool,
+    initial_topology: IngressTopologyApplication,
     udp_migration_generation: Option<String>,
     // This node-agent incarnation's AUTHORITATIVELY resolved
     // `Node.metadata.uid`, or `None` when it could not prove one. It binds every
@@ -2115,22 +2361,26 @@ where
     }
 
     let mut shutdown_rx = shutdown_tx.subscribe();
-    let mut init_seen: Option<HashSet<String>> = None;
     if udp_migration_generation.is_some() && config.node_waypoint_pod_registry_dir.is_none() {
         anyhow::bail!(
             "Ambient UDP migration generation requires the node-waypoint pod registry directory"
         );
     }
-    let mut udp_registry_sync_published = false;
-    let mut udp_registry_sync_retraction_pending = false;
+    let mut topology_publication_ok = initial_topology.datapath_published;
+    let mut readiness = NodeAgentReadiness {
+        startup_ready,
+        pod_sync: PodSyncState::Unsynced,
+        topology_ready: initial_topology.topology_ready,
+        udp_proof: UdpRegistryProof::for_generation(udp_migration_generation.as_deref()),
+    };
+    readiness.publish();
     let mut pending_pod_event = None;
-    let mut initial_pod_sync_complete = false;
     if udp_migration_generation.is_some()
         && let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref()
         && let Err(error) =
             crate::proxy::udp_placement_migration::clear_registry_sync_marker(registry_dir)
     {
-        udp_registry_sync_retraction_pending = true;
+        readiness.record_udp_proof(UdpRegistryProofEvent::RetractionFailed);
         warn!(
             error = %crate::startup::sanitize_startup_scalar(&error),
             "Ambient UDP registry proof retraction failed at startup; keeping capture mutations and readiness fenced while retrying"
@@ -2138,12 +2388,12 @@ where
     }
 
     // Optional CNI plugin listener: when enabled, spawns a UDS server that
-    // funnels ADD/DEL/CHECK calls from the `ferrum-cni` binary into this
-    // loop via the `cni_work_rx` channel. When disabled (the default), the
-    // channel stays empty and the receiver in the select! arm parks
-    // forever — the kube-rs watcher remains the sole enrollment driver.
+    // funnels ADD/DEL/CHECK/STATUS/GC calls from the `ferrum-cni` binary into this
+    // loop via the `cni_work_rx` channel. When disabled (the default), no
+    // listener holds a sender and the select! arm is never enabled — the
+    // kube-rs watcher remains the sole enrollment driver.
     let (cni_work_tx, mut cni_work_rx): (_, CniWorkReceiver) = cni_work_channel();
-    let cni_listener_handle = if cni_config.enabled {
+    let mut cni_listener_handle = if cni_config.enabled {
         // Durable ownership rides beside the configured CNI socket. Rehydrate
         // before the listener accepts GC so crash recovery can identify
         // Ferrum-owned attachments. Rejected durable state fails closed for GC
@@ -2154,10 +2404,17 @@ where
         };
         configure_cni_ownership_store(Some(ownership_store_path));
         if let Err(error) = rehydrate_cni_owned_attachments(&pod_states) {
-            error!(
-                error = %crate::startup::sanitize_startup_scalar(&error),
-                "Failed to rehydrate durable Ferrum CNI ownership; GC will fail closed"
-            );
+            if cni_ownership_store_state().load_is_retryable() {
+                warn!(
+                    error = %crate::startup::sanitize_startup_scalar(&error),
+                    "Durable Ferrum CNI ownership state is unavailable; CNI ADD, GC, and STATUS fail closed and the load is retried before each CNI request"
+                );
+            } else {
+                error!(
+                    error = %crate::startup::sanitize_startup_scalar(&error),
+                    "Durable Ferrum CNI ownership state rejected; CNI ADD, GC, and STATUS fail closed until the store is repaired and the node-agent restarts"
+                );
+            }
         }
         Some(spawn_cni_listener(
             cni_config.socket_path.clone(),
@@ -2172,9 +2429,11 @@ where
     };
     // Drop the local sender so the receiver closes cleanly when the
     // listener task exits — otherwise the select! would park forever on
-    // the receiver during shutdown.
+    // the receiver during shutdown. With the listener disabled no sender
+    // remains and the receiver is closed from the start: keep its arm off
+    // rather than reading that as a listener that stopped serving (#7253).
     drop(cni_work_tx);
-    let mut cni_work_open = true;
+    let mut cni_work_open = cni_listener_handle.is_some();
 
     info!(
         "Node agent initialized, watching pod events on node {}",
@@ -2188,24 +2447,33 @@ where
     // `retry_backed_off_pod_enrollments` is a cheap no-op when no failures are
     // pending. Consume the immediate first tick that `interval` fires so the
     // first real pass waits a full backoff window rather than firing instantly.
-    let mut retry_interval = tokio::time::interval(POD_ENROLLMENT_RETRY_BACKOFF);
+    let mut retry_interval = maintenance_interval(POD_ENROLLMENT_RETRY_BACKOFF);
     retry_interval.tick().await;
+    // The Node GET behind node-identity revalidation is bounded only by
+    // NODE_UID_LOOKUP_TIMEOUT (10 s), longer than the CNI server gives this
+    // loop to answer an RPC. It runs as a background task started on the
+    // retry cadence; this loop applies its result when it lands, so pod
+    // events, CNI calls and the other timers never wait on the API (#7254).
+    let mut node_uid_lookup: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
+    // The last applied refresh left identity fenced; the capture retry pass
+    // stays deferred while its registry-proof retraction is outstanding.
+    let mut node_identity_fenced = false;
     let mut topology_monitor_open = topology_monitor.is_some();
     let mut last_topology_outcome = topology_monitor
         .as_ref()
         .map(|monitor| monitor.outcomes.borrow().clone());
-    let mut topology_datapath_retry = tokio::time::interval(INGRESS_TOPOLOGY_DATAPATH_RETRY);
+    let mut topology_datapath_retry = maintenance_interval(INGRESS_TOPOLOGY_DATAPATH_RETRY);
     topology_datapath_retry.tick().await;
-    let mut udp_registry_retraction_retry = tokio::time::interval(UDP_REGISTRY_RETRACTION_RETRY);
+    let mut udp_registry_retraction_retry = maintenance_interval(UDP_REGISTRY_RETRACTION_RETRY);
     udp_registry_retraction_retry.tick().await;
-    let mut udp_readiness_interval = tokio::time::interval(UDP_CAPTURE_READINESS_POLL);
+    let mut udp_readiness_interval = maintenance_interval(UDP_CAPTURE_READINESS_POLL);
     udp_readiness_interval.tick().await;
     let mut udp_ready_uids = HashSet::new();
     // NodeWaypoint UDP/DTLS reply-source authorization (issue #3286). Shares
     // the readiness cadence: the proxy withdraws a claim before its listener's
     // socket goes away, so this is the bound on how long a revoked ClusterIP
     // can stay authorized, and it must stay short.
-    let mut udp_reply_source_interval = tokio::time::interval(UDP_CAPTURE_READINESS_POLL);
+    let mut udp_reply_source_interval = maintenance_interval(UDP_CAPTURE_READINESS_POLL);
     udp_reply_source_interval.tick().await;
     let mut udp_reply_source_state = NodeWaypointUdpReplySourceState::default();
 
@@ -2229,22 +2497,19 @@ where
                     Some(event) => Some(Ok(event)),
                     None => pod_stream.next().await,
                 }
-            }, if !udp_registry_sync_retraction_pending => {
+            }, if !readiness.udp_proof.retraction_pending() => {
                 match event {
                     Some(Ok(Event::Apply(pod))) => {
                         let refresh_udp_registry_sync = match
                             retract_udp_migration_registry_sync_for_mutation(
-                                udp_migration_generation.as_deref(),
-                                initial_pod_sync_complete && init_seen.is_none(),
+                                readiness.pod_sync.is_synced(),
                                 config,
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
+                                &mut readiness,
                                 UdpRegistryMutationLane::WatchApply,
                             )
                         {
                             Ok(refresh) => refresh,
                             Err(error) => {
-                                startup_ready.store(false, Ordering::Release);
                                 pending_pod_event = Some(Event::Apply(pod));
                                 warn!(
                                     error = %crate::startup::sanitize_startup_scalar(&error),
@@ -2253,9 +2518,6 @@ where
                                 continue;
                             }
                         };
-                        if refresh_udp_registry_sync {
-                            startup_ready.store(false, Ordering::Release);
-                        }
                         handle_kube_pod_applied(
                             owner.backend_mut(),
                             &pod_states,
@@ -2265,7 +2527,6 @@ where
                         );
                         if refresh_udp_registry_sync {
                             let Some(generation) = udp_migration_generation.as_deref() else {
-                                startup_ready.store(false, Ordering::Release);
                                 warn!(
                                     "Ambient UDP migration generation disappeared during registry refresh; readiness remains fenced"
                                 );
@@ -2276,31 +2537,21 @@ where
                                 &pod_states,
                                 config,
                                 udp_node_uid.as_deref(),
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
-                            );
-                            set_node_agent_startup_readiness(
-                                startup_ready.as_ref(),
-                                initial_pod_sync_complete,
-                                topology_ready.load(Ordering::Acquire),
-                                udp_registry_sync_published,
+                                &mut readiness,
                             );
                         }
                     }
                     Some(Ok(Event::Delete(pod))) => {
                         let refresh_udp_registry_sync = match
                             retract_udp_migration_registry_sync_for_mutation(
-                                udp_migration_generation.as_deref(),
-                                initial_pod_sync_complete && init_seen.is_none(),
+                                readiness.pod_sync.is_synced(),
                                 config,
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
+                                &mut readiness,
                                 UdpRegistryMutationLane::WatchDelete,
                             )
                         {
                             Ok(refresh) => refresh,
                             Err(error) => {
-                                startup_ready.store(false, Ordering::Release);
                                 pending_pod_event = Some(Event::Delete(pod));
                                 warn!(
                                     error = %crate::startup::sanitize_startup_scalar(&error),
@@ -2309,15 +2560,11 @@ where
                                 continue;
                             }
                         };
-                        if refresh_udp_registry_sync {
-                            startup_ready.store(false, Ordering::Release);
-                        }
                         if let Some(uid) = pod_uid(&pod) {
                             handle_pod_removed(owner.backend_mut(), &pod_states, config, metrics.as_ref(), &uid);
                         }
                         if refresh_udp_registry_sync {
                             let Some(generation) = udp_migration_generation.as_deref() else {
-                                startup_ready.store(false, Ordering::Release);
                                 warn!(
                                     "Ambient UDP migration generation disappeared during registry refresh; readiness remains fenced"
                                 );
@@ -2328,27 +2575,17 @@ where
                                 &pod_states,
                                 config,
                                 udp_node_uid.as_deref(),
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
-                            );
-                            set_node_agent_startup_readiness(
-                                startup_ready.as_ref(),
-                                initial_pod_sync_complete,
-                                topology_ready.load(Ordering::Acquire),
-                                udp_registry_sync_published,
+                                &mut readiness,
                             );
                         }
                     }
                     Some(Ok(Event::Init)) => {
                         if let Err(error) = retract_udp_migration_registry_sync_for_mutation(
-                            udp_migration_generation.as_deref(),
                             true,
                             config,
-                            &mut udp_registry_sync_published,
-                            &mut udp_registry_sync_retraction_pending,
+                            &mut readiness,
                             UdpRegistryMutationLane::WatchRelist,
                         ) {
-                            startup_ready.store(false, Ordering::Release);
                             pending_pod_event = Some(Event::Init);
                             warn!(
                                 error = %crate::startup::sanitize_startup_scalar(&error),
@@ -2356,9 +2593,8 @@ where
                             );
                             continue;
                         }
-                        init_seen = Some(HashSet::new());
-                        initial_pod_sync_complete = false;
-                        startup_ready.store(false, Ordering::Release);
+                        readiness.pod_sync = PodSyncState::Relisting(HashSet::new());
+                        readiness.publish();
                     }
                     Some(Ok(Event::InitApply(pod))) => {
                         if let Some(uid) = handle_kube_pod_applied(
@@ -2367,12 +2603,16 @@ where
                             config,
                             metrics.as_ref(),
                             &pod,
-                        ) && let Some(seen) = &mut init_seen {
+                        ) && let PodSyncState::Relisting(seen) = &mut readiness.pod_sync {
                             seen.insert(uid);
                         }
                     }
                     Some(Ok(Event::InitDone)) => {
-                        if let Some(seen) = init_seen.take() {
+                        // `InitDone` makes `pod_states` authoritative; only a
+                        // relist that recorded its seen set runs the sweep.
+                        if let PodSyncState::Relisting(seen) =
+                            std::mem::replace(&mut readiness.pod_sync, PodSyncState::Synced)
+                        {
                             let stale_uids = watcher_init_stale_uids(&pod_states, &seen);
                             for uid in stale_uids {
                                 handle_pod_removed(owner.backend_mut(), &pod_states, config, metrics.as_ref(), &uid);
@@ -2388,32 +2628,22 @@ where
                                 &seen,
                             );
                         }
-                        initial_pod_sync_complete = true;
                         if let Some(generation) = udp_migration_generation.as_deref() {
                             publish_udp_migration_registry_sync_with_recovery(
                                 generation,
                                 &pod_states,
                                 config,
                                 udp_node_uid.as_deref(),
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
+                                &mut readiness,
                             );
-                            if !udp_registry_sync_published {
+                            if !readiness.udp_proof.admits_readiness() {
                                 warn!(
                                     "Withholding Ambient UDP registry synchronization marker until all relisted pod registry entries and cleanup ownership converge"
                                 );
                             }
                         }
-                        let topology_is_ready = topology_ready.load(Ordering::Acquire);
-                        let udp_migration_ready =
-                            udp_migration_generation.is_none() || udp_registry_sync_published;
-                        let ready = set_node_agent_startup_readiness(
-                            startup_ready.as_ref(),
-                            initial_pod_sync_complete,
-                            topology_is_ready,
-                            udp_migration_ready,
-                        );
-                        if ready {
+                        let topology_is_ready = readiness.topology_ready;
+                        if readiness.publish() {
                             info!(
                                 "Node agent initial pod sync, ingress topology proof, and UDP migration proof complete; /health now reports ready"
                             );
@@ -2453,9 +2683,9 @@ where
                         };
                         if let Some(reason) = cni_capture_readiness_rejection(
                             work.request.verb,
-                            initial_pod_sync_complete,
-                            topology_ready.load(Ordering::Acquire),
-                            udp_migration_generation.is_none() || udp_registry_sync_published,
+                            readiness.pod_sync.is_synced(),
+                            readiness.topology_ready,
+                            readiness.udp_proof.admits_readiness(),
                         ) {
                             // Durable cleanup snapshots may name IP/map keys
                             // now owned by a replacement pod. Until InitDone,
@@ -2475,19 +2705,14 @@ where
                         );
                         let refresh_udp_registry_sync = match
                             retract_udp_migration_registry_sync_for_mutation(
-                                udp_migration_generation.as_deref(),
-                                cni_mutates_capture
-                                    && initial_pod_sync_complete
-                                    && init_seen.is_none(),
+                                cni_mutates_capture && readiness.pod_sync.is_synced(),
                                 config,
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
+                                &mut readiness,
                                 UdpRegistryMutationLane::Cni,
                             )
                         {
                             Ok(refresh) => refresh,
                             Err(error) => {
-                                startup_ready.store(false, Ordering::Release);
                                 let _ = work.respond.send(CniRpcResponse::Error {
                                     reason: "CNI capture mutation deferred while the node-agent retracts stale UDP migration proof"
                                         .to_string(),
@@ -2500,9 +2725,6 @@ where
                                 continue;
                             }
                         };
-                        if refresh_udp_registry_sync {
-                            startup_ready.store(false, Ordering::Release);
-                        }
                         let enrolled_uid = process_cni_work_item(
                             owner.backend_mut(),
                             &pod_states,
@@ -2511,10 +2733,9 @@ where
                             client,
                             work,
                         ).await;
-                        mark_relist_seen_from_cni_add(&mut init_seen, enrolled_uid.as_deref());
+                        mark_relist_seen_from_cni_add(&mut readiness.pod_sync, enrolled_uid.as_deref());
                         if refresh_udp_registry_sync {
                             let Some(generation) = udp_migration_generation.as_deref() else {
-                                startup_ready.store(false, Ordering::Release);
                                 warn!(
                                     "Ambient UDP migration generation disappeared during CNI registry refresh; readiness remains fenced"
                                 );
@@ -2525,134 +2746,182 @@ where
                                 &pod_states,
                                 config,
                                 udp_node_uid.as_deref(),
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
-                            );
-                            set_node_agent_startup_readiness(
-                                startup_ready.as_ref(),
-                                initial_pod_sync_complete,
-                                topology_ready.load(Ordering::Acquire),
-                                udp_registry_sync_published,
+                                &mut readiness,
                             );
                         }
                     }
                     None => {
                         // Channel closed — listener task exited. Disable this
-                        // select arm so the watcher keeps running instead of
-                        // spinning on an immediately-ready closed receiver.
+                        // select arm so the loop never spins on an
+                        // immediately-ready closed receiver.
                         cni_work_open = false;
-                        debug!("CNI work queue closed; CNI plugin path inactive for the remainder of this run");
+                        if *shutdown_rx.borrow() {
+                            debug!("CNI work queue closed during shutdown");
+                            continue;
+                        }
+                        // Every sender is gone, so the listener task has
+                        // returned (or is returning) its exit reason.
+                        let listener_exit = match cni_listener_handle.take() {
+                            Some(handle) => handle.await.unwrap_or(CniListenerExit::Failed),
+                            None => CniListenerExit::Failed,
+                        };
+                        match listener_exit {
+                            CniListenerExit::Unsupported => {
+                                warn!(
+                                    "Node-agent CNI listener is unavailable on this target; the kube-rs watcher is the sole enrollment path"
+                                );
+                            }
+                            CniListenerExit::Shutdown => {
+                                break PodWatcherLoopExit::ShutdownRequested;
+                            }
+                            CniListenerExit::Failed | CniListenerExit::ReplacedByAnotherOwner => {
+                                // With the chained conflist installed, ADD
+                                // fails closed while no listener serves the
+                                // socket: a node-wide pod-creation outage.
+                                // Exit nonzero so the supervisor restarts the
+                                // agent and with it the listener (#7253).
+                                error!(
+                                    listener_exit = ?listener_exit,
+                                    "Node-agent CNI listener stopped serving; exiting so a restart restores CNI ADD on this node"
+                                );
+                                break PodWatcherLoopExit::CniListenerStopped(listener_exit);
+                            }
+                        }
                     }
                 }
             }
-            _ = udp_registry_retraction_retry.tick(), if udp_registry_sync_retraction_pending => {
-                match retract_udp_migration_registry_sync_for_mutation(
-                    udp_migration_generation.as_deref(),
+            _ = udp_registry_retraction_retry.tick(), if readiness.udp_proof.retraction_pending() => {
+                // A failed retraction leaves the proof `RetractionPending`,
+                // which already withholds readiness; only success continues.
+                // A deferred watcher mutation must run before a fresh proof is
+                // published. With no queued mutation, restore the proof
+                // immediately once the authoritative initial snapshot already
+                // completed.
+                if retract_udp_migration_registry_sync_for_mutation(
                     false,
                     config,
-                    &mut udp_registry_sync_published,
-                    &mut udp_registry_sync_retraction_pending,
+                    &mut readiness,
                     UdpRegistryMutationLane::RetryTick,
-                ) {
-                    Ok(_) => {
-                        // A deferred watcher mutation must run before a fresh
-                        // proof is published. With no queued mutation, restore
-                        // the proof immediately once the authoritative initial
-                        // snapshot already completed.
-                        if pending_pod_event.is_none()
-                            && initial_pod_sync_complete
-                            && init_seen.is_none()
-                            && let Some(generation) = udp_migration_generation.as_deref()
-                        {
-                            publish_udp_migration_registry_sync_with_recovery(
-                                generation,
-                                &pod_states,
-                                config,
-                                udp_node_uid.as_deref(),
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
-                            );
-                            set_node_agent_startup_readiness(
-                                startup_ready.as_ref(),
-                                initial_pod_sync_complete,
-                                topology_ready.load(Ordering::Acquire),
-                                udp_registry_sync_published,
-                            );
+                )
+                .is_ok()
+                    && pending_pod_event.is_none()
+                    && readiness.pod_sync.is_synced()
+                    && let Some(generation) = udp_migration_generation.as_deref()
+                {
+                    publish_udp_migration_registry_sync_with_recovery(
+                        generation,
+                        &pod_states,
+                        config,
+                        udp_node_uid.as_deref(),
+                        &mut readiness,
+                    );
+                }
+            }
+            node_uid = async {
+                match node_uid_lookup.as_mut() {
+                    Some(lookup) => lookup.await,
+                    None => std::future::pending().await,
+                }
+            }, if node_uid_lookup.is_some() => {
+                node_uid_lookup = None;
+                let node_uid = node_uid.unwrap_or_else(|_| {
+                    Err("the node UID lookup task did not complete".to_string())
+                });
+                // Background lookups are started only when both are present.
+                let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() else {
+                    continue;
+                };
+                // Revalidate / retry this node's Kubernetes UID (issue #3809).
+                // A transient API, RBAC, or publication failure must not leave
+                // identity unresolved forever, and a same-name Node recreation
+                // must not keep using the predecessor UID. Registry-sync is
+                // retracted before any identity change is applied; capture
+                // mutations stay fenced while that retraction is outstanding.
+                // The lookup already ran in the background, so this applies its
+                // result without awaiting the API.
+                let refresh = refresh_node_identity_binding(
+                    udp_node_uid.as_deref(),
+                    &mut shutdown_rx,
+                    || std::future::ready(node_uid),
+                    || {
+                        match crate::proxy::udp_placement_migration::clear_registry_sync_marker(
+                            registry_dir,
+                        ) {
+                            Ok(()) => {
+                                readiness.record_udp_proof(UdpRegistryProofEvent::Absent);
+                                Ok(())
+                            }
+                            Err(error) => {
+                                readiness.record_udp_proof(
+                                    UdpRegistryProofEvent::RetractionFailed,
+                                );
+                                Err(error)
+                            }
+                        }
+                    },
+                    || {
+                        crate::proxy::udp_placement_migration::retract_node_identity(
+                            registry_dir,
+                        )
+                    },
+                    |uid| {
+                        crate::proxy::udp_placement_migration::publish_node_identity(
+                            registry_dir,
+                            uid,
+                        )
+                    },
+                )
+                .await;
+                match refresh {
+                    NodeIdentityRefresh::Interrupted { uid } => {
+                        udp_node_uid = uid;
+                        if *shutdown_rx.borrow() {
+                            break PodWatcherLoopExit::ShutdownRequested;
                         }
                     }
-                    Err(_) => {
-                        startup_ready.store(false, Ordering::Release);
+                    refresh => {
+                        // A retraction during the refresh already moved the
+                        // proof (and therefore readiness) through the closure
+                        // above.
+                        udp_node_uid = refresh.uid().map(str::to_string);
+                        node_identity_fenced =
+                            matches!(refresh, NodeIdentityRefresh::Fenced { .. });
                     }
+                }
+                // Republish a registry-sync marker bound to the refreshed
+                // identity now rather than on the next retry tick.
+                if !node_identity_fenced
+                    && readiness.pod_sync.is_synced()
+                    && readiness.udp_proof != UdpRegistryProof::Published
+                    && let Some(generation) = udp_migration_generation.as_deref()
+                {
+                    publish_udp_migration_registry_sync_with_recovery(
+                        generation,
+                        &pod_states,
+                        config,
+                        udp_node_uid.as_deref(),
+                        &mut readiness,
+                    );
                 }
             }
             _ = retry_interval.tick() => {
-                // Revalidate / retry this node's Kubernetes UID on the existing
-                // enrollment-retry cadence (issue #3809). A transient API, RBAC,
-                // or publication failure must not leave identity unresolved
-                // forever, and a same-name Node recreation must not keep using
-                // the predecessor UID. Registry-sync is retracted before any
-                // identity lookup/change; capture mutations stay fenced while
-                // that retraction is outstanding.
-                if let (Some(registry_dir), Some(client)) = (
-                    config.node_waypoint_pod_registry_dir.as_deref(),
-                    kube_client.as_ref(),
-                ) {
-                    let refresh = refresh_node_identity_binding(
-                        udp_node_uid.as_deref(),
-                        &mut shutdown_rx,
-                        || resolve_this_node_uid(client, config.node_name.as_str()),
-                        || {
-                            match crate::proxy::udp_placement_migration::clear_registry_sync_marker(
-                                registry_dir,
-                            ) {
-                                Ok(()) => {
-                                    udp_registry_sync_published = false;
-                                    udp_registry_sync_retraction_pending = false;
-                                    Ok(())
-                                }
-                                Err(error) => {
-                                    udp_registry_sync_published = false;
-                                    udp_registry_sync_retraction_pending = true;
-                                    Err(error)
-                                }
-                            }
-                        },
-                        || {
-                            crate::proxy::udp_placement_migration::retract_node_identity(
-                                registry_dir,
-                            )
-                        },
-                        |uid| {
-                            crate::proxy::udp_placement_migration::publish_node_identity(
-                                registry_dir,
-                                uid,
-                            )
-                        },
-                    )
-                    .await;
-                    match refresh {
-                        NodeIdentityRefresh::Interrupted { uid } => {
-                            udp_node_uid = uid;
-                            if *shutdown_rx.borrow() {
-                                break PodWatcherLoopExit::ShutdownRequested;
-                            }
-                        }
-                        refresh => {
-                            let retracted = refresh.registry_sync_was_retracted();
-                            udp_node_uid = refresh.uid().map(str::to_string);
-                            if retracted {
-                                startup_ready.store(false, Ordering::Release);
-                            }
-                            if matches!(refresh, NodeIdentityRefresh::Fenced { .. })
-                                && udp_registry_sync_retraction_pending
-                            {
-                                warn!(
-                                    "Deferring capture retry tick until node identity and Ambient UDP registry proof retraction recover"
-                                );
-                                continue;
-                            }
-                        }
-                    }
+                // Start the next node-identity revalidation in the background
+                // (see `node_uid_lookup`); at most one is in flight.
+                if node_uid_lookup.is_none()
+                    && config.node_waypoint_pod_registry_dir.is_some()
+                    && let Some(client) = kube_client.as_ref()
+                {
+                    let client = client.clone();
+                    let node_name = config.node_name.clone();
+                    node_uid_lookup = Some(tokio::spawn(async move {
+                        resolve_this_node_uid(&client, &node_name).await
+                    }));
+                }
+                if node_identity_fenced && readiness.udp_proof.retraction_pending() {
+                    warn!(
+                        "Deferring capture retry tick until node identity and Ambient UDP registry proof retraction recover"
+                    );
+                    continue;
                 }
                 // Re-drive any pod whose transient enrollment failure has aged
                 // past the backoff window, and retry stale detach/map cleanup
@@ -2660,29 +2929,19 @@ where
                 // no-ops when none are pending.
                 let retry_mutates_udp_registry = has_failed_pod_enrollments(&pod_states)
                     || has_pending_capture_failures(&pod_states);
-                let refresh_udp_registry_sync =
-                    match retract_udp_migration_registry_sync_for_mutation(
-                        udp_migration_generation.as_deref(),
-                        retry_mutates_udp_registry
-                            && initial_pod_sync_complete
-                            && init_seen.is_none(),
-                        config,
-                        &mut udp_registry_sync_published,
-                        &mut udp_registry_sync_retraction_pending,
-                        UdpRegistryMutationLane::RetryTick,
-                    ) {
-                        Ok(refresh) => refresh,
-                        Err(error) => {
-                            startup_ready.store(false, Ordering::Release);
-                            warn!(
-                                error = %crate::startup::sanitize_startup_scalar(&error),
-                                "Deferring capture retry tick until the stale Ambient UDP registry proof is retracted"
-                            );
-                            continue;
-                        }
-                    };
-                if refresh_udp_registry_sync {
-                    startup_ready.store(false, Ordering::Release);
+                // A successful retraction leaves the proof `Withheld`; the
+                // publication step below republishes it once retries converge.
+                if let Err(error) = retract_udp_migration_registry_sync_for_mutation(
+                    retry_mutates_udp_registry && readiness.pod_sync.is_synced(),
+                    config,
+                    &mut readiness,
+                    UdpRegistryMutationLane::RetryTick,
+                ) {
+                    warn!(
+                        error = %crate::startup::sanitize_startup_scalar(&error),
+                        "Deferring capture retry tick until the stale Ambient UDP registry proof is retracted"
+                    );
+                    continue;
                 }
                 retry_backed_off_pod_enrollments(
                     owner.backend_mut(),
@@ -2720,8 +2979,8 @@ where
                     config,
                     metrics.as_ref(),
                 );
-                if initial_pod_sync_complete
-                    && !udp_registry_sync_published
+                if readiness.pod_sync.is_synced()
+                    && readiness.udp_proof != UdpRegistryProof::Published
                     && let Some(generation) = udp_migration_generation.as_deref()
                 {
                     publish_udp_migration_registry_sync_with_recovery(
@@ -2729,21 +2988,12 @@ where
                         &pod_states,
                         config,
                         udp_node_uid.as_deref(),
-                        &mut udp_registry_sync_published,
-                        &mut udp_registry_sync_retraction_pending,
+                        &mut readiness,
                     );
-                    if udp_registry_sync_published {
-                        set_node_agent_startup_readiness(
-                            startup_ready.as_ref(),
-                            initial_pod_sync_complete,
-                            topology_ready.load(Ordering::Acquire),
-                            true,
-                        );
+                    if readiness.udp_proof == UdpRegistryProof::Published {
                         info!(
                             "Ambient UDP registry synchronization marker published after relist recovery converged"
                         );
-                    } else if refresh_udp_registry_sync {
-                        startup_ready.store(false, Ordering::Release);
                     }
                 }
             }
@@ -2760,19 +3010,17 @@ where
                             continue;
                         };
                         let outcome = monitor.outcomes.borrow_and_update().clone();
-                        topology_publication_ok = apply_ingress_topology_outcome(
+                        let application = apply_ingress_topology_outcome(
                             owner.backend_mut(),
                             config,
                             metrics.as_ref(),
-                            topology_ready.as_ref(),
-                            startup_ready.as_ref(),
-                            initial_pod_sync_complete,
                             has_failed_pod_enrollments(&pod_states)
                                 || has_pending_capture_failures(&pod_states),
-                            udp_migration_generation.is_none() || udp_registry_sync_published,
                             &outcome,
                             "runtime_revalidation",
                         );
+                        topology_publication_ok = application.datapath_published;
+                        readiness.set_topology_ready(application.topology_ready);
                         last_topology_outcome = Some(outcome);
                     }
                     Err(_) => {
@@ -2780,38 +3028,34 @@ where
                         let outcome = IngressTopologyOutcome::monitor_stopped(
                             config.capture_contract.ingress_redirect_ifaces.len(),
                         );
-                        topology_publication_ok = apply_ingress_topology_outcome(
+                        let application = apply_ingress_topology_outcome(
                             owner.backend_mut(),
                             config,
                             metrics.as_ref(),
-                            topology_ready.as_ref(),
-                            startup_ready.as_ref(),
-                            initial_pod_sync_complete,
                             has_failed_pod_enrollments(&pod_states)
                                 || has_pending_capture_failures(&pod_states),
-                            udp_migration_generation.is_none() || udp_registry_sync_published,
                             &outcome,
                             "runtime_revalidation",
                         );
+                        topology_publication_ok = application.datapath_published;
+                        readiness.set_topology_ready(application.topology_ready);
                         last_topology_outcome = Some(outcome);
                     }
                 }
             }
             _ = topology_datapath_retry.tick(), if !topology_publication_ok => {
                 if let Some(outcome) = last_topology_outcome.as_ref() {
-                    topology_publication_ok = apply_ingress_topology_outcome(
+                    let application = apply_ingress_topology_outcome(
                         owner.backend_mut(),
                         config,
                         metrics.as_ref(),
-                        topology_ready.as_ref(),
-                        startup_ready.as_ref(),
-                        initial_pod_sync_complete,
                         has_failed_pod_enrollments(&pod_states)
                             || has_pending_capture_failures(&pod_states),
-                        udp_migration_generation.is_none() || udp_registry_sync_published,
                         outcome,
                         "datapath_publication_retry",
                     );
+                    topology_publication_ok = application.datapath_published;
+                    readiness.set_topology_ready(application.topology_ready);
                 }
             }
             _ = udp_readiness_interval.tick(), if udp_readiness_reconcile_enabled(config) => {
@@ -2821,7 +3065,10 @@ where
                     config,
                     metrics.as_ref(),
                     &mut udp_ready_uids,
-                    startup_ready.load(Ordering::Acquire),
+                    // Close-ack and orphan-reap safety depend only on whether
+                    // `pod_states` is authoritative, not on topology or the
+                    // UDP migration proof that also gate `/health`.
+                    readiness.pod_sync.is_synced(),
                 );
             }
             _ = udp_reply_source_interval.tick(),
@@ -2835,6 +3082,10 @@ where
             }
         }
     };
+    // A revalidation still in flight has nothing left to apply it to.
+    if let Some(lookup) = node_uid_lookup.take() {
+        lookup.abort();
+    }
 
     // Same finally-style path for both exit reasons: stop background CNI work,
     // detach BPF / maps, then await the listener. Watcher exhaustion must not
@@ -2842,8 +3093,8 @@ where
     // shutdown. Drop readiness before the potentially slow CNI join so probes
     // do not keep reporting ready while capture is tearing down.
     //
-    startup_ready.store(false, Ordering::Release);
-    let _ = shutdown_tx.send(true);
+    readiness.begin_shutdown();
+    shutdown_tx.shutdown();
 
     info!(
         exit_reason = ?exit_reason,
@@ -2853,24 +3104,35 @@ where
         attached_pods = pod_states.len(),
         "Node agent shutting down, detaching BPF programs"
     );
-    let registry_proof_retracted = match retract_udp_migration_registry_sync_for_mutation(
-        udp_migration_generation.as_deref(),
-        udp_migration_generation.is_some(),
-        config,
-        &mut udp_registry_sync_published,
-        &mut udp_registry_sync_retraction_pending,
-        UdpRegistryMutationLane::Shutdown,
-    ) {
-        Ok(_) => true,
-        Err(error) => {
-            warn!(
-                error = %crate::startup::sanitize_startup_scalar(&error),
-                "Ambient UDP registry proof could not be retracted during shutdown; preserving registry entries and refusing ordered pod detach mutation"
-            );
-            false
+    // Another live generation published over this agent's CNI socket: its
+    // capture state and registry proof may be what that owner serves, so this
+    // agent leaves both untouched (the same latch as a failed retraction).
+    let another_owner_is_live = matches!(
+        exit_reason,
+        PodWatcherLoopExit::CniListenerStopped(CniListenerExit::ReplacedByAnotherOwner)
+    );
+    let registry_proof_retracted = if another_owner_is_live {
+        false
+    } else {
+        match retract_udp_migration_registry_sync_for_mutation(
+            udp_migration_generation.is_some(),
+            config,
+            &mut readiness,
+            UdpRegistryMutationLane::Shutdown,
+        ) {
+            Ok(_) => true,
+            Err(error) => {
+                warn!(
+                    error = %crate::startup::sanitize_startup_scalar(&error),
+                    "Ambient UDP registry proof could not be retracted during shutdown; preserving registry entries and refusing ordered pod detach mutation"
+                );
+                false
+            }
         }
     };
-    if registry_proof_retracted {
+    if another_owner_is_live {
+        owner.preserve_fail_closed_state("CNI socket replaced by another live node-agent");
+    } else if registry_proof_retracted {
         owner.shutdown_pods(&pod_states, config);
     } else {
         // The marker is still a live proof consumed by the mesh cleanup
@@ -2900,6 +3162,9 @@ where
         PodWatcherLoopExit::WatcherExhausted => {
             Err(anyhow::anyhow!("Pod watcher ended unexpectedly"))
         }
+        PodWatcherLoopExit::CniListenerStopped(_) => Err(anyhow::anyhow!(
+            "Node-agent CNI listener stopped serving the CNI socket"
+        )),
     }
 }
 
@@ -2926,15 +3191,6 @@ fn cni_capture_readiness_rejection(
     }
 }
 
-fn cni_topology_readiness_rejection(
-    verb: RpcVerb,
-    initial_sync_complete: bool,
-    topology_ready: bool,
-) -> Option<&'static str> {
-    cni_capture_readiness_rejection(verb, initial_sync_complete, topology_ready, true)
-}
-
-#[allow(dead_code)] // External unit tests cover the combined proof gate.
 pub(crate) fn cni_capture_readiness_rejection_for_test(
     verb: RpcVerb,
     initial_sync_complete: bool,
@@ -2949,15 +3205,6 @@ pub(crate) fn cni_capture_readiness_rejection_for_test(
     )
 }
 
-#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
-pub(crate) fn cni_topology_readiness_rejection_for_test(
-    verb: RpcVerb,
-    initial_sync_complete: bool,
-    startup_ready: bool,
-) -> Option<&'static str> {
-    cni_topology_readiness_rejection(verb, initial_sync_complete, startup_ready)
-}
-
 fn watcher_init_stale_uids(
     pod_states: &DashMap<String, PodAttachmentState>,
     seen: &HashSet<String>,
@@ -2969,18 +3216,6 @@ fn watcher_init_stale_uids(
         .collect()
 }
 
-/// Remove transiently-failed pods (in `FAILED_POD_ENROLLMENT_ATTEMPTS`) that
-/// vanished across a watcher reconnect/relist. The InitDone stale sweep only
-/// reconciles enrolled pods (`watcher_init_stale_uids` walks `pod_states`), but a
-/// pod that failed enrollment before it was inserted into `pod_states` keeps an
-/// owned snapshot *outside* `pod_states`. If that pod is gone after the relist,
-/// nothing else clears the record, so the periodic retry loop would replay it
-/// forever — warning and bumping `attach_errors` every ~30s for a UID the API no
-/// longer reports. Routing it through `handle_pod_removed` consumes any partial
-/// BPF cleanup evidence before clearing the retry record.
-///
-/// Records are scoped by the `pod_states` key prefix so a sibling node-agent
-/// runtime (or, under `cargo test`, another test's pods) is never pruned.
 fn has_failed_pod_enrollments(pod_states: &DashMap<String, PodAttachmentState>) -> bool {
     if FAILED_POD_ENROLLMENT_ATTEMPTS.is_empty() {
         return false;
@@ -3000,7 +3235,7 @@ fn has_pending_capture_failures(pod_states: &DashMap<String, PodAttachmentState>
     let key_prefix = pod_state_key_prefix(pod_states);
     PENDING_CAPTURE_FAILURES
         .iter()
-        .any(|entry| entry.key().starts_with(&key_prefix))
+        .any(|entry| entry.key().starts_with(&key_prefix) && !entry.value().is_empty())
 }
 
 /// Outcome of one bounded node-identity retry/revalidation.
@@ -3034,12 +3269,6 @@ impl NodeIdentityRefresh {
             Self::Fenced { uid } | Self::Interrupted { uid } => uid.as_deref(),
             Self::Unresolved => None,
         }
-    }
-
-    /// Whether this outcome retracted the registry-synchronization marker and
-    /// the caller must republish only after inventory converges.
-    pub fn registry_sync_was_retracted(&self) -> bool {
-        !matches!(self, Self::Unchanged { .. } | Self::Interrupted { .. })
     }
 }
 
@@ -3318,18 +3547,14 @@ fn publish_udp_migration_registry_sync_with_recovery(
     pod_states: &DashMap<String, PodAttachmentState>,
     config: &NodeAgentConfig,
     node_uid: Option<&str>,
-    published: &mut bool,
-    retraction_pending: &mut bool,
+    readiness: &mut NodeAgentReadiness,
 ) {
     match publish_udp_migration_registry_sync_if_ready(generation, pod_states, config, node_uid) {
-        Ok(was_published) => {
-            *published = was_published;
-            *retraction_pending = false;
-        }
+        Ok(true) => readiness.record_udp_proof(UdpRegistryProofEvent::Published),
+        Ok(false) => readiness.record_udp_proof(UdpRegistryProofEvent::PublicationDeclined),
         Err(error) => {
-            *published = false;
             let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() else {
-                *retraction_pending = true;
+                readiness.record_udp_proof(UdpRegistryProofEvent::RetractionFailed);
                 warn!(
                     error = %crate::startup::sanitize_startup_scalar(&error),
                     "Ambient UDP registry proof publication failed without a registry directory; keeping mutation fence closed"
@@ -3338,14 +3563,14 @@ fn publish_udp_migration_registry_sync_with_recovery(
             };
             match crate::proxy::udp_placement_migration::clear_registry_sync_marker(registry_dir) {
                 Ok(()) => {
-                    *retraction_pending = false;
+                    readiness.record_udp_proof(UdpRegistryProofEvent::Absent);
                     warn!(
                         error = %crate::startup::sanitize_startup_scalar(&error),
                         "Ambient UDP registry proof publication failed; proof remains withheld and will be retried"
                     );
                 }
                 Err(retraction_error) => {
-                    *retraction_pending = true;
+                    readiness.record_udp_proof(UdpRegistryProofEvent::RetractionFailed);
                     warn!(
                         error = %crate::startup::sanitize_startup_scalar(&error),
                         retraction_error = %crate::startup::sanitize_startup_scalar(&retraction_error),
@@ -3361,26 +3586,23 @@ fn publish_udp_migration_registry_sync_with_recovery(
 /// mutation can attach, detach, or rewrite pod capture ownership. The caller
 /// republishes only after the mutation and all retry/failure state converge.
 /// During the initial relist the marker is already retracted by `Event::Init`,
-/// so individual `InitApply` events deliberately do not churn it.
+/// so individual `InitApply` events deliberately do not churn it. A pending
+/// retraction is retried by every lane, mutating or not. Returns whether the
+/// caller must republish after its mutation.
 fn retract_udp_migration_registry_sync_for_mutation(
-    generation: Option<&str>,
     mutation_requires_refresh: bool,
     config: &NodeAgentConfig,
-    published: &mut bool,
-    retraction_pending: &mut bool,
+    readiness: &mut NodeAgentReadiness,
     lane: UdpRegistryMutationLane,
 ) -> Result<bool, String> {
-    if generation.is_none() {
-        return Ok(false);
-    }
-    if !mutation_requires_refresh && !*retraction_pending {
-        return Ok(false);
-    }
-    if !*published && !*retraction_pending {
-        return Ok(mutation_requires_refresh);
+    match readiness.udp_proof {
+        UdpRegistryProof::NotRequired => return Ok(false),
+        UdpRegistryProof::Withheld => return Ok(mutation_requires_refresh),
+        UdpRegistryProof::Published if !mutation_requires_refresh => return Ok(false),
+        UdpRegistryProof::Published | UdpRegistryProof::RetractionPending => {}
     }
     let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() else {
-        *retraction_pending = true;
+        readiness.record_udp_proof(UdpRegistryProofEvent::RetractionFailed);
         return Err(
             "Ambient UDP migration generation requires the node-waypoint pod registry directory"
                 .to_string(),
@@ -3389,7 +3611,7 @@ fn retract_udp_migration_registry_sync_for_mutation(
     if let Err(error) =
         crate::proxy::udp_placement_migration::clear_registry_sync_marker(registry_dir)
     {
-        *retraction_pending = true;
+        readiness.record_udp_proof(UdpRegistryProofEvent::RetractionFailed);
         return Err(format!(
             "{} mutation lane could not retract the Ambient UDP registry proof: {error}",
             match lane {
@@ -3402,8 +3624,7 @@ fn retract_udp_migration_registry_sync_for_mutation(
             }
         ));
     }
-    *published = false;
-    *retraction_pending = false;
+    readiness.record_udp_proof(UdpRegistryProofEvent::Absent);
     Ok(mutation_requires_refresh)
 }
 
@@ -3424,6 +3645,18 @@ fn clear_partial_capture_state_if_recovered(
     }
 }
 
+/// Remove transiently-failed pods (in `FAILED_POD_ENROLLMENT_ATTEMPTS`) that
+/// vanished across a watcher reconnect/relist. The InitDone stale sweep only
+/// reconciles enrolled pods (`watcher_init_stale_uids` walks `pod_states`), but a
+/// pod that failed enrollment before it was inserted into `pod_states` keeps an
+/// owned snapshot *outside* `pod_states`. If that pod is gone after the relist,
+/// nothing else clears the record, so the periodic retry loop would replay it
+/// forever — warning and bumping `attach_errors` every ~30s for a UID the API no
+/// longer reports. Routing it through `handle_pod_removed` consumes any partial
+/// BPF cleanup evidence before clearing the retry record.
+///
+/// Records are scoped by the `pod_states` key prefix so a sibling node-agent
+/// runtime (or, under `cargo test`, another test's pods) is never pruned.
 fn prune_failed_enrollments_from_relist(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
@@ -3454,11 +3687,8 @@ fn prune_failed_enrollments_from_relist(
     clear_partial_capture_state_if_recovered(pod_states, metrics);
 }
 
-fn mark_relist_seen_from_cni_add(
-    init_seen: &mut Option<HashSet<String>>,
-    enrolled_uid: Option<&str>,
-) {
-    if let (Some(seen), Some(uid)) = (init_seen.as_mut(), enrolled_uid) {
+fn mark_relist_seen_from_cni_add(pod_sync: &mut PodSyncState, enrolled_uid: Option<&str>) {
+    if let (PodSyncState::Relisting(seen), Some(uid)) = (pod_sync, enrolled_uid) {
         seen.insert(uid.to_string());
     }
 }
@@ -3470,10 +3700,10 @@ fn mark_relist_seen_from_cni_add(
 /// calls with the same identity are no-ops.
 ///
 /// The production ADD path first fetches pod metadata from the Kubernetes API
-/// in [`apply_cni_request_with_kube_metadata`]. This pure helper keeps the
-/// no-metadata fallback behavior testable: if that API GET fails, ADD is
-/// acknowledged without BPF attachment and the kube-rs watcher reconciles when
-/// its event arrives.
+/// in [`apply_cni_request_with_kube_metadata`] and fails ADD closed when that
+/// read fails or when an opted-in pod's enrollment does not land
+/// (GHSA-7x6j-vmqm-xx2v), so kubelet never starts an opted-in pod outside the
+/// mesh. [`apply_cni_request`] is the metadata-free core for the other verbs.
 ///
 /// On the DEL path: when we already have a pod-state entry, we tear
 /// down BPF attachment immediately — the CNI DEL is a strong signal
@@ -3516,6 +3746,7 @@ async fn apply_cni_request_with_kube_metadata(
     if let Err(reason) = request.validate() {
         return (CniRpcResponse::Error { reason }, None);
     }
+    retry_transient_cni_ownership_load(pod_states);
     if request.verb == RpcVerb::Status {
         // CNI 1.1: STATUS must fail when an external service needed for ADD is
         // unavailable. Initial sync (`startup_ready`) is gated in the main loop
@@ -3537,33 +3768,69 @@ async fn apply_cni_request_with_kube_metadata(
         );
     }
 
+    // Fail closed (GHSA-7x6j-vmqm-xx2v): without the pod's labels and
+    // annotations the node-agent cannot tell whether the pod must be captured,
+    // and acknowledging ADD would let an opted-in pod start outside the mesh
+    // until the watcher (which depends on the same API server) catches up.
+    // STATUS already reports the Kubernetes API as an ADD dependency.
     let pod_api: Api<Pod> = Api::namespaced(kube_client.clone(), &request.pod_namespace);
-    match tokio::time::timeout(CNI_METADATA_FETCH_TIMEOUT, pod_api.get(&request.pod_name)).await {
-        Ok(Ok(pod)) => apply_cni_add_from_pod(backend, pod_states, config, metrics, request, &pod),
-        Ok(Err(err)) => {
-            debug!(
-                namespace = %crate::startup::sanitize_startup_scalar(&request.pod_namespace),
-                pod_name = %crate::startup::sanitize_startup_scalar(&request.pod_name),
-                error = %crate::startup::sanitize_startup_scalar(&err),
-                "CNI ADD could not fetch pod metadata; kube-rs watcher will reconcile"
-            );
-            (
-                apply_cni_request(backend, pod_states, config, metrics, request),
-                None,
-            )
+    let mut attempt = 0;
+    let pod = loop {
+        attempt += 1;
+        match tokio::time::timeout(CNI_METADATA_FETCH_TIMEOUT, pod_api.get(&request.pod_name)).await
+        {
+            Ok(Ok(pod)) => break Some(pod),
+            Ok(Err(_)) | Err(_) if attempt < CNI_METADATA_FETCH_ATTEMPTS => {
+                tokio::time::sleep(CNI_METADATA_FETCH_RETRY_DELAY).await;
+            }
+            outcome => {
+                // The Kubernetes error text and request URI are
+                // remote-controlled; log only fixed fields.
+                warn!(
+                    namespace = %crate::startup::sanitize_startup_scalar(&request.pod_namespace),
+                    pod_name = %crate::startup::sanitize_startup_scalar(&request.pod_name),
+                    attempts = attempt,
+                    timed_out = outcome.is_err(),
+                    "CNI ADD refused: Kubernetes pod metadata is unavailable, so the node-agent cannot evaluate mesh enrollment; failing closed (kubelet retries the sandbox)"
+                );
+                break None;
+            }
         }
-        Err(_elapsed) => {
-            debug!(
-                namespace = %crate::startup::sanitize_startup_scalar(&request.pod_namespace),
-                pod_name = %crate::startup::sanitize_startup_scalar(&request.pod_name),
-                timeout_ms = CNI_METADATA_FETCH_TIMEOUT.as_millis(),
-                "CNI ADD pod metadata fetch timed out; kube-rs watcher will reconcile"
-            );
-            (
-                apply_cni_request(backend, pod_states, config, metrics, request),
-                None,
-            )
-        }
+    };
+    let Some(pod) = pod else {
+        return (
+            CniRpcResponse::Error {
+                reason: CNI_ADD_METADATA_UNAVAILABLE_REASON.to_string(),
+            },
+            None,
+        );
+    };
+    apply_cni_add_from_pod(backend, pod_states, config, metrics, request, &pod)
+}
+
+/// Re-attempt a durable ownership load that failed on a transient I/O error, so
+/// one failed startup read cannot fence ADD, GC, and STATUS for the lifetime of
+/// the process. Runs on the serialized CNI work path before the request is
+/// applied; content rejection is terminal and is never re-read here.
+fn retry_transient_cni_ownership_load(pod_states: &DashMap<String, PodAttachmentState>) {
+    if !cni_ownership_store_state().load_is_retryable() {
+        return;
+    }
+    // Warn only on a state change: recovery, or content now rejected. A load
+    // that stays unavailable was already reported at startup and repeats on
+    // every CNI request, so it is debug-level here.
+    match rehydrate_cni_owned_attachments(pod_states) {
+        Ok(()) => info!(
+            "Durable Ferrum CNI ownership state loaded after a transient failure; CNI ADD, GC, and STATUS resume"
+        ),
+        Err(error) if cni_ownership_store_state().load_is_retryable() => debug!(
+            error = %crate::startup::sanitize_startup_scalar(&error),
+            "Durable Ferrum CNI ownership state is still unavailable; CNI ADD, GC, and STATUS remain fail-closed"
+        ),
+        Err(error) => warn!(
+            error = %crate::startup::sanitize_startup_scalar(&error),
+            "Durable Ferrum CNI ownership state rejected on retry; CNI ADD, GC, and STATUS fail closed until the store is repaired and the node-agent restarts"
+        ),
     }
 }
 
@@ -3607,7 +3874,6 @@ async fn probe_kube_add_dependency_ready(
 }
 
 /// Test seam for CNI STATUS live Kubernetes ADD-dependency readiness (#3225).
-#[allow(dead_code)] // External integration tests exercise this through `_test_support`.
 pub(crate) async fn apply_cni_request_with_kube_metadata_for_test(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
@@ -3621,7 +3887,6 @@ pub(crate) async fn apply_cni_request_with_kube_metadata_for_test(
 }
 
 /// External tests advance paused Tokio time against this exact STATUS probe budget.
-#[allow(dead_code)] // Re-exported through `_test_support` for integration coverage.
 pub(crate) const CNI_STATUS_KUBE_PROBE_TIMEOUT_FOR_TEST: Duration = CNI_STATUS_KUBE_PROBE_TIMEOUT;
 
 fn apply_cni_add_from_pod(
@@ -3632,12 +3897,14 @@ fn apply_cni_add_from_pod(
     request: &CniRpcRequest,
     pod: &Pod,
 ) -> (CniRpcResponse, Option<String>) {
+    // Both refusals below fail closed (GHSA-7x6j-vmqm-xx2v): a `Rejected`
+    // ADD is passed through by ferrum-cni, which would start the sandbox
+    // without the node-agent having evaluated THIS pod's enrollment.
     let Some(api_uid) = pod_uid(pod) else {
         return (
-            CniRpcResponse::Rejected {
-                reason:
-                    "Kubernetes API pod is missing metadata.uid; kube-rs watcher will reconcile"
-                        .to_string(),
+            CniRpcResponse::Error {
+                reason: "Kubernetes API pod is missing metadata.uid; ADD fails closed until it can be evaluated"
+                    .to_string(),
             },
             None,
         );
@@ -3646,8 +3913,8 @@ fn apply_cni_add_from_pod(
         && request_uid != api_uid
     {
         return (
-            CniRpcResponse::Rejected {
-                reason: "CNI pod UID does not match Kubernetes API pod UID; kube-rs watcher will reconcile"
+            CniRpcResponse::Error {
+                reason: "CNI pod UID does not match Kubernetes API pod UID; ADD fails closed until the API view catches up"
                     .to_string(),
             },
             None,
@@ -3679,8 +3946,18 @@ fn apply_cni_add_from_pod(
         .as_deref()
         .unwrap_or(request.pod_namespace.as_str());
     let status = pod.status.as_ref();
-    let pod_ip = status.and_then(|status| status.pod_ip.as_deref());
-    let pod_source_ips = PodSourceIps::from_status(status);
+    // Kubernetes publishes `status.podIP` only after ADD returns, so the
+    // primary CNI's allocation carried on the request is what lets the pod's
+    // dedicated host route resolve and enrollment land before kubelet starts
+    // the pod. It is authoritative for this sandbox; status is the fallback.
+    let pod_ip = if request.pod_ips.is_empty() {
+        status.and_then(|status| status.pod_ip.as_deref())
+    } else {
+        None
+    };
+    let pod_source_ips =
+        PodSourceIps::from_status(status).preferring_cni_allocation(&request.pod_ips);
+    let host_network = pod_uses_host_network(pod);
     let node_probe_ports = pod_probe_ports_from_spec(pod.spec.as_ref());
     let inbound_redirect_ports = pod_inbound_redirect_ports_from_spec(pod.spec.as_ref());
     let service_account = pod
@@ -3699,7 +3976,7 @@ fn apply_cni_add_from_pod(
         node_probe_ports,
         inbound_redirect_ports,
         veth_iface_override: None,
-        host_network: pod_uses_host_network(pod),
+        host_network,
     };
     handle_pod_added(backend, pod_states, config, metrics, &event);
     // Surface the UID that was actually inserted into `pod_states` (the
@@ -3712,6 +3989,32 @@ fn apply_cni_add_from_pod(
     } else {
         None
     };
+    // An opted-in pod whose enrollment did not land (no dedicated host route
+    // for its address, a missing cgroup, an attach or map failure, or a retry
+    // still inside its backoff) must not start: acknowledging ADD here is the
+    // capture gap GHSA-7x6j-vmqm-xx2v describes. kubelet retries the sandbox,
+    // and every retry re-runs enrollment.
+    let enrollment_required = pod_watcher::evaluate_enrollment(
+        &labels,
+        &annotations,
+        namespace,
+        &config.excluded_namespaces,
+        host_network,
+    ) == EnrollmentDecision::Enroll;
+    if enrollment_required && enrolled_uid.is_none() {
+        warn!(
+            namespace = %crate::startup::sanitize_startup_scalar(namespace),
+            pod_name = %crate::startup::sanitize_startup_scalar(pod_name),
+            cni_addresses = request.pod_ips.len(),
+            "CNI ADD refused: the pod is opted in to the mesh but capture enrollment did not complete; failing closed (kubelet retries the sandbox)"
+        );
+        return (
+            CniRpcResponse::Error {
+                reason: CNI_ADD_ENROLLMENT_INCOMPLETE_REASON.to_string(),
+            },
+            None,
+        );
+    }
     if let Some(uid) = enrolled_uid.as_deref()
         && let Some(ifname) = request.ifname.as_deref()
         && let Err(reason) = remember_cni_owned_attachment(
@@ -3747,18 +4050,15 @@ pub fn apply_cni_request(
     let event = node_agent_cni_server::pod_event_from_request(request, &labels, &annotations);
     match request.verb {
         RpcVerb::Add => {
-            // Metadata-free ADD requests must not drive enrollment
-            // decisions. They arrive before we can reliably evaluate
-            // labels/annotations, so we acknowledge and let either
-            // `apply_cni_request_with_kube_metadata` (when available)
-            // or the kube-rs watcher perform authoritative reconcile.
-            if event.pod_uid.is_empty() {
-                return CniRpcResponse::Rejected {
-                    reason: "missing K8S_POD_UID in CNI args; kube-rs watcher will reconcile"
-                        .to_string(),
-                };
+            // ADD is decided only by `apply_cni_add_from_pod` over the pod's
+            // Kubernetes metadata. Without labels/annotations nothing can say
+            // whether the pod must be captured, and acknowledging (or
+            // `Rejected`, which ferrum-cni passes through) would let an
+            // opted-in pod start outside the mesh (GHSA-7x6j-vmqm-xx2v).
+            CniRpcResponse::Error {
+                reason: "CNI ADD requires the pod's Kubernetes metadata; a metadata-free ADD fails closed"
+                    .to_string(),
             }
-            CniRpcResponse::Ok
         }
         RpcVerb::Del => {
             if event.pod_uid.is_empty() {
@@ -3860,7 +4160,17 @@ pub fn apply_cni_request(
             // additionally proves live Kubernetes ADD-dependency readiness in
             // `apply_cni_request_with_kube_metadata` (after the main-loop
             // initial-sync gate). This pure path carries no attachment work.
-            CniRpcResponse::Ok
+            // ADD must durably claim GC ownership for every enrolled
+            // attachment and fails closed while the store refuses claims, so
+            // STATUS cannot report ADD serviceable in that state (CNI 1.1).
+            match cni_ownership_store_state().refusal() {
+                Some(refusal) => CniRpcResponse::Error {
+                    reason: format!(
+                        "durable Ferrum CNI ownership state is {refusal}; ADD cannot record GC ownership"
+                    ),
+                },
+                None => CniRpcResponse::Ok,
+            }
         }
         RpcVerb::Gc => {
             // Re-validate on the node-agent side so a hostile or buggy CNI
@@ -3885,7 +4195,7 @@ pub fn apply_cni_request(
     }
 }
 
-async fn wait_for_shutdown(shutdown_tx: &tokio::sync::watch::Sender<bool>) {
+async fn wait_for_shutdown(shutdown_tx: &crate::overload::ShutdownSender) {
     let mut shutdown_rx = shutdown_tx.subscribe();
     if *shutdown_rx.borrow() {
         return;
@@ -3900,7 +4210,7 @@ async fn wait_for_shutdown(shutdown_tx: &tokio::sync::watch::Sender<bool>) {
 async fn build_node_agent_kube_client() -> Result<kube::Client, anyhow::Error> {
     let config = match kube::Config::incluster() {
         Ok(config) => config,
-        Err(in_cluster_err) => match kube::Config::infer().await {
+        Err(in_cluster_err) => match crate::k8s_controller::infer_kube_config().await {
             Ok(config) => config,
             Err(infer_err) => {
                 anyhow::bail!(
@@ -3910,7 +4220,7 @@ async fn build_node_agent_kube_client() -> Result<kube::Client, anyhow::Error> {
             }
         },
     };
-    Ok(kube::Client::try_from(config)?)
+    crate::k8s_controller::build_kube_client_from_config(config).map_err(anyhow::Error::msg)
 }
 
 fn pod_uid(pod: &Pod) -> Option<String> {
@@ -4343,7 +4653,10 @@ fn remove_node_probe_port_if_unowned(
     removal: NodeProbePortRemoval<'_>,
 ) {
     let state_key = pod_state_key(pod_states, removal.pod_uid);
-    let detail = node_probe_port_failure_detail(removal.ip, removal.port);
+    let failure = CaptureFailureOp::NodeProbePortRemove {
+        ip: removal.ip,
+        port: removal.port,
+    };
     if let Some(owner_pod_uid) =
         other_pod_owning_probe_port_addr(pod_states, removal.pod_uid, removal.ip, removal.port)
     {
@@ -4355,7 +4668,7 @@ fn remove_node_probe_port_if_unowned(
             removal_reason = removal.reason,
             "Skipping node probe-port map removal; key is owned by another tracked pod"
         );
-        forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE, &detail);
+        forget_capture_failure(&state_key, &failure);
         forget_pending_node_probe_port_remove_failures_for_key(
             pod_states,
             removal.ip,
@@ -4381,15 +4694,11 @@ fn remove_node_probe_port_if_unowned(
             "Failed to remove node probe-port entry from BPF map"
         );
         metrics.record_attach_error();
-        remember_pending_capture_failure(
-            &state_key,
-            CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE,
-            &detail,
-        );
+        remember_capture_failure(&state_key, failure);
         return;
     }
 
-    forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE, &detail);
+    forget_capture_failure(&state_key, &failure);
     if removal.clear_recovered_state {
         clear_partial_capture_state_if_recovered(pod_states, metrics);
     }
@@ -4595,7 +4904,7 @@ struct PodEnrollmentAttemptSignature {
 /// transient eBPF attach/map failure that lands *after* the cgroup and veth
 /// resolved would become an indefinite capture gap whenever no further pod
 /// event arrives for that pod. We keep this snapshot so the periodic retry loop
-/// in `run_with_backend` can rebuild the event and try again every ~30s until
+/// in `run_with_pod_stream` can rebuild the event and try again every ~30s until
 /// it succeeds (or the pod is removed / no longer matches enrollment).
 ///
 /// `veth_iface_override` is intentionally not captured: production always sets
@@ -4765,10 +5074,10 @@ fn remember_cni_owned_attachment(
             "refusing CNI ownership claim for unsafe containerID, ifname, or pod UID".to_string(),
         );
     }
-    if cni_ownership_store_is_rejected() {
-        return Err(
-            "refusing CNI ownership claim while durable ownership state is rejected".to_string(),
-        );
+    if let Some(refusal) = cni_ownership_store_state().refusal() {
+        return Err(format!(
+            "refusing CNI ownership claim while durable ownership state is {refusal}"
+        ));
     }
     let Some(state_entry) = pod_states.get(pod_uid) else {
         // Cleanup keys cannot be reconstructed after the sandbox dies; refuse
@@ -4901,13 +5210,10 @@ fn rehydrate_cni_owned_attachments(
     let records = match load_configured_cni_ownership() {
         Ok(None) => return Ok(()),
         Ok(Some(records)) => records,
-        Err(err) => {
-            warn!(
-                error = %crate::startup::sanitize_startup_scalar(&err),
-                "Durable Ferrum CNI ownership state rejected; GC will fail closed until the store is repaired"
-            );
-            return Err(err.to_string());
-        }
+        // Callers log: startup once, and the transient retry only when the
+        // store changes state, so a persistent failure is not logged per
+        // CNI request.
+        Err(err) => return Err(err.to_string()),
     };
     let prefix = pod_state_key_prefix(pod_states);
     // Drop only this generation's keys before installing durable records.
@@ -5020,9 +5326,9 @@ fn apply_cni_gc(
     network_name: &str,
     valid_attachments: &[CniValidAttachment],
 ) -> CniRpcResponse {
-    if cni_ownership_store_is_rejected() {
+    if let Some(refusal) = cni_ownership_store_state().refusal() {
         return CniRpcResponse::Error {
-            reason: "gc refused because durable Ferrum CNI ownership state is rejected".to_string(),
+            reason: format!("gc refused because durable Ferrum CNI ownership state is {refusal}"),
         };
     }
 
@@ -5118,97 +5424,88 @@ fn apply_cni_gc(
     }
 }
 
-fn pending_capture_failure_key(state_key: &str, operation: &str, detail: &str) -> String {
-    format!(
-        "{state_key}:{operation}:{}",
-        encode_pending_capture_detail(detail)
-    )
-}
-
-fn encode_pending_capture_detail(detail: &str) -> String {
-    detail.replace('%', "%25").replace(':', "%3A")
-}
-
-fn decode_pending_capture_detail(detail: &str) -> String {
-    detail.replace("%3A", ":").replace("%25", "%")
-}
-
-#[derive(Debug, Clone)]
-struct PendingCaptureFailure {
-    key: String,
-    state_key: String,
-    operation: String,
-    detail: String,
-}
-
-fn parse_pending_capture_failure_key(key: &str) -> Option<PendingCaptureFailure> {
-    let mut parts = key.rsplitn(3, ':');
-    let detail = decode_pending_capture_detail(parts.next()?);
-    let operation = parts.next()?;
-    let state_key = parts.next()?;
-    if state_key.is_empty() || operation.is_empty() || detail.is_empty() {
-        return None;
-    }
-    Some(PendingCaptureFailure {
-        key: key.to_string(),
-        state_key: state_key.to_string(),
-        operation: operation.to_string(),
-        detail,
-    })
-}
-
-#[cfg(test)]
-fn pending_capture_failure_prefix(state_key: &str) -> String {
-    format!("{state_key}:")
-}
-
-fn remember_pending_capture_failure(state_key: &str, operation: &str, detail: &str) {
-    PENDING_CAPTURE_FAILURES.insert(
-        pending_capture_failure_key(state_key, operation, detail),
-        (),
-    );
-}
-
-fn forget_pending_capture_failure(state_key: &str, operation: &str, detail: &str) -> bool {
+/// Record (idempotently) a pending capture failure for one pod-state identity.
+///
+/// Callers must not hold a guard on `PENDING_CAPTURE_FAILURES` while calling
+/// any of these transition helpers.
+fn remember_capture_failure(state_key: &str, op: CaptureFailureOp) {
     PENDING_CAPTURE_FAILURES
-        .remove(&pending_capture_failure_key(state_key, operation, detail))
-        .is_some()
+        .entry(state_key.to_string())
+        .or_default()
+        .insert(op);
 }
 
-fn node_probe_port_failure_detail(ip: std::net::IpAddr, port: u16) -> String {
-    format!("{ip},{port}")
+/// Drop every pending record of `state_key` that `matches` selects, removing
+/// the per-pod entry once it is empty. Returns how many records were dropped.
+fn forget_capture_failures_matching(
+    state_key: &str,
+    mut matches: impl FnMut(&CaptureFailureOp) -> bool,
+) -> usize {
+    let removed = match PENDING_CAPTURE_FAILURES.get_mut(state_key) {
+        Some(mut record) => {
+            let before = record.len();
+            record.retain(|op| !matches(op));
+            before - record.len()
+        }
+        None => return 0,
+    };
+    PENDING_CAPTURE_FAILURES.remove_if(state_key, |_, record| record.is_empty());
+    removed
 }
 
-fn parse_node_probe_port_failure_detail(detail: &str) -> Option<(std::net::IpAddr, u16)> {
-    let (ip, port) = detail.split_once(',')?;
-    Some((ip.parse().ok()?, port.parse().ok()?))
+/// Drop one exact pending record. Returns whether it was present.
+fn forget_capture_failure(state_key: &str, op: &CaptureFailureOp) -> bool {
+    forget_capture_failures_matching(state_key, |pending| pending == op) > 0
 }
 
-fn node_probe_port_update_failure_detail(ports: &[u16]) -> String {
+/// Whether one exact pending record is present for `state_key`.
+fn has_capture_failure(state_key: &str, op: &CaptureFailureOp) -> bool {
+    PENDING_CAPTURE_FAILURES
+        .get(state_key)
+        .is_some_and(|record| record.contains(op))
+}
+
+/// Drop every LIVE-pod record of a pod that is being removed (#7025): any
+/// operation that is not a removal blocker describes desired state of a pod
+/// that no longer exists, so leaving it would keep `has_pending_capture_failures`
+/// true (and the node `PARTIALLY_ATTACHED`) forever. Removal blockers stay:
+/// they are the durable teardown retry queue and are re-evaluated by teardown
+/// and the periodic retries.
+fn forget_live_pod_capture_failures(state_key: &str) -> usize {
+    forget_capture_failures_matching(state_key, |op| !op.blocks_removal())
+}
+
+/// Collect every pending record in this `pod_states` scope that `select` maps
+/// to `Some`, as `(state_key, pod_uid, selected)`. The map guard is released
+/// before returning, so callers may freely remember/forget while iterating.
+fn pending_capture_failures_in_scope<T>(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    mut select: impl FnMut(&CaptureFailureOp) -> Option<T>,
+) -> Vec<(String, String, T)> {
+    if PENDING_CAPTURE_FAILURES.is_empty() {
+        return Vec::new();
+    }
+
+    let key_prefix = pod_state_key_prefix(pod_states);
+    let mut pending = Vec::new();
+    for entry in PENDING_CAPTURE_FAILURES.iter() {
+        let Some(pod_uid) = entry.key().strip_prefix(key_prefix.as_str()) else {
+            continue;
+        };
+        for op in entry.value() {
+            if let Some(selected) = select(op) {
+                pending.push((entry.key().clone(), pod_uid.to_string(), selected));
+            }
+        }
+    }
+    pending
+}
+
+fn normalized_node_probe_ports(ports: &[u16]) -> Vec<u16> {
     let mut ports = ports.to_vec();
     ports.sort_unstable();
     ports.dedup();
-    let ports = ports
-        .iter()
-        .map(u16::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{CAPTURE_FAILURE_DETAIL_NODE_PROBE_PORTS}={ports}")
-}
-
-fn parse_node_probe_port_update_failure_detail(detail: &str) -> Option<Vec<u16>> {
-    let ports = detail.strip_prefix(CAPTURE_FAILURE_DETAIL_NODE_PROBE_PORTS)?;
-    let ports = ports.strip_prefix('=')?;
-    if ports.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut parsed = Vec::new();
-    for port in ports.split(',') {
-        parsed.push(port.parse().ok()?);
-    }
-    parsed.sort_unstable();
-    parsed.dedup();
-    Some(parsed)
+    ports
 }
 
 fn forget_pending_node_probe_port_remove_failures_for_key(
@@ -5216,80 +5513,49 @@ fn forget_pending_node_probe_port_remove_failures_for_key(
     ip: std::net::IpAddr,
     port: u16,
 ) -> usize {
-    let key_prefix = pod_state_key_prefix(pod_states);
-    let detail = node_probe_port_failure_detail(ip, port);
-    let keys: Vec<String> = PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            (failure.state_key.starts_with(&key_prefix)
-                && failure.operation == CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE
-                && failure.detail == detail)
-                .then_some(failure.key)
-        })
-        .collect();
-    let removed = keys.len();
-    for key in keys {
-        PENDING_CAPTURE_FAILURES.remove(&key);
+    let target = CaptureFailureOp::NodeProbePortRemove { ip, port };
+    let state_keys: Vec<String> =
+        pending_capture_failures_in_scope(pod_states, |op| (op == &target).then_some(()))
+            .into_iter()
+            .map(|(state_key, _, ())| state_key)
+            .collect();
+    let mut removed = 0;
+    for state_key in state_keys {
+        if forget_capture_failure(&state_key, &target) {
+            removed += 1;
+        }
     }
     removed
 }
 
 fn forget_pending_node_probe_port_update_failures_for_state(state_key: &str) -> usize {
-    let keys: Vec<String> = PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            (failure.state_key == state_key
-                && failure.operation == CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE)
-                .then_some(failure.key)
-        })
-        .collect();
-    let removed = keys.len();
-    for key in keys {
-        PENDING_CAPTURE_FAILURES.remove(&key);
-    }
-    removed
+    forget_capture_failures_matching(state_key, |op| {
+        matches!(op, CaptureFailureOp::NodeProbePortUpdate { .. })
+    })
 }
 
 fn forget_pending_pod_ip_remove_failures_for_ip(
     pod_states: &DashMap<String, PodAttachmentState>,
-    ip: impl std::fmt::Display,
+    ip: impl Into<std::net::IpAddr>,
 ) -> usize {
-    let key_prefix = pod_state_key_prefix(pod_states);
-    let detail = ip.to_string();
-    let keys: Vec<String> = PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            (failure.state_key.starts_with(&key_prefix)
-                && failure.operation == CAPTURE_FAILURE_POD_IP_REMOVE
-                && failure.detail == detail)
-                .then_some(failure.key)
-        })
-        .collect();
-    let removed = keys.len();
-    for key in keys {
-        PENDING_CAPTURE_FAILURES.remove(&key);
+    let target = CaptureFailureOp::PodIpRemove(ip.into());
+    let state_keys: Vec<String> =
+        pending_capture_failures_in_scope(pod_states, |op| (op == &target).then_some(()))
+            .into_iter()
+            .map(|(state_key, _, ())| state_key)
+            .collect();
+    let mut removed = 0;
+    for state_key in state_keys {
+        if forget_capture_failure(&state_key, &target) {
+            removed += 1;
+        }
     }
     removed
 }
 
 #[cfg(test)]
 fn forget_pending_capture_failures_for_pod(state_key: &str) {
-    let prefix = pending_capture_failure_prefix(state_key);
-    let keys: Vec<String> = PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .key()
-                .starts_with(&prefix)
-                .then(|| entry.key().clone())
-        })
-        .collect();
-    for key in keys {
-        PENDING_CAPTURE_FAILURES.remove(&key);
-    }
+    forget_capture_failures_matching(state_key, |_| true);
 }
 
 fn map_fingerprint(map: &HashMap<String, String>) -> u64 {
@@ -5475,10 +5741,6 @@ fn has_failed_pod_enrollment_attempt(state_key: &str) -> bool {
     FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(state_key)
 }
 
-fn forget_pod_enrollment_attempt(state_key: &str) {
-    FAILED_POD_ENROLLMENT_ATTEMPTS.remove(state_key);
-}
-
 /// Re-drive enrollment for every pod that failed transiently and whose backoff
 /// window has elapsed.
 ///
@@ -5552,121 +5814,77 @@ fn retry_backed_off_pod_enrollments(
 
 fn pending_pod_ip_removal_failures(
     pod_states: &DashMap<String, PodAttachmentState>,
-) -> Vec<(String, String, String, std::net::IpAddr)> {
-    if PENDING_CAPTURE_FAILURES.is_empty() {
-        return Vec::new();
-    }
-
-    let key_prefix = pod_state_key_prefix(pod_states);
-    PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            if !failure.state_key.starts_with(&key_prefix)
-                || failure.operation != CAPTURE_FAILURE_POD_IP_REMOVE
-            {
-                return None;
-            }
-            let pod_uid = failure.state_key.strip_prefix(&key_prefix)?.to_string();
-            let ip = failure.detail.parse().ok()?;
-            Some((failure.key, failure.state_key, pod_uid, ip))
-        })
-        .collect()
+) -> Vec<(String, String, std::net::IpAddr)> {
+    pending_capture_failures_in_scope(pod_states, |op| match op {
+        CaptureFailureOp::PodIpRemove(ip) => Some(*ip),
+        _ => None,
+    })
 }
 
 fn pending_pod_detach_failures(
     pod_states: &DashMap<String, PodAttachmentState>,
-) -> Vec<(String, String, String)> {
-    if PENDING_CAPTURE_FAILURES.is_empty() {
-        return Vec::new();
-    }
-
-    let key_prefix = pod_state_key_prefix(pod_states);
-    PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            if !failure.state_key.starts_with(&key_prefix)
-                || failure.operation != CAPTURE_FAILURE_POD_DETACH
-                || failure.detail != CAPTURE_FAILURE_DETAIL_POD_DETACH
-            {
-                return None;
-            }
-            let pod_uid = failure.state_key.strip_prefix(&key_prefix)?.to_string();
-            Some((failure.key, failure.state_key, pod_uid))
-        })
-        .collect()
+) -> Vec<(String, String)> {
+    pending_capture_failures_in_scope(pod_states, |op| {
+        matches!(op, CaptureFailureOp::PodDetach).then_some(())
+    })
+    .into_iter()
+    .map(|(state_key, pod_uid, ())| (state_key, pod_uid))
+    .collect()
 }
 
 fn pending_node_probe_port_removal_failures(
     pod_states: &DashMap<String, PodAttachmentState>,
-) -> Vec<(String, String, String, std::net::IpAddr, u16)> {
-    if PENDING_CAPTURE_FAILURES.is_empty() {
-        return Vec::new();
+) -> Vec<(String, String, (std::net::IpAddr, u16))> {
+    pending_capture_failures_in_scope(pod_states, |op| match op {
+        CaptureFailureOp::NodeProbePortRemove { ip, port } => Some((*ip, *port)),
+        _ => None,
+    })
+}
+
+/// Which cgroup-keyed map a pending cgroup removal targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CgroupMapRemoval {
+    IncludePorts,
+    WorkloadIdentity,
+}
+
+impl CgroupMapRemoval {
+    fn failure(self, cgroup_id: u64) -> CaptureFailureOp {
+        match self {
+            Self::IncludePorts => CaptureFailureOp::IncludePortsRemove { cgroup_id },
+            Self::WorkloadIdentity => CaptureFailureOp::WorkloadIdentityRemove { cgroup_id },
+        }
     }
 
-    let key_prefix = pod_state_key_prefix(pod_states);
-    PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            if !failure.state_key.starts_with(&key_prefix)
-                || failure.operation != CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE
-            {
-                return None;
-            }
-            let (ip, port) = parse_node_probe_port_failure_detail(&failure.detail)?;
-            let pod_uid = failure.state_key.strip_prefix(&key_prefix)?.to_string();
-            Some((failure.key, failure.state_key, pod_uid, ip, port))
-        })
-        .collect()
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::IncludePorts => "include_ports_remove",
+            Self::WorkloadIdentity => "workload_identity_remove",
+        }
+    }
 }
 
 fn pending_cgroup_map_removal_failures(
     pod_states: &DashMap<String, PodAttachmentState>,
-    operation: &str,
-) -> Vec<(String, String, String, u64)> {
-    if PENDING_CAPTURE_FAILURES.is_empty() {
-        return Vec::new();
-    }
-
-    let key_prefix = pod_state_key_prefix(pod_states);
-    PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            if !failure.state_key.starts_with(&key_prefix) || failure.operation != operation {
-                return None;
-            }
-            let pod_uid = failure.state_key.strip_prefix(&key_prefix)?.to_string();
-            let cgroup_id = failure.detail.parse().ok()?;
-            Some((failure.key, failure.state_key, pod_uid, cgroup_id))
-        })
-        .collect()
+    removal: CgroupMapRemoval,
+) -> Vec<(String, String, u64)> {
+    pending_capture_failures_in_scope(pod_states, |op| match (removal, op) {
+        (CgroupMapRemoval::IncludePorts, CaptureFailureOp::IncludePortsRemove { cgroup_id })
+        | (
+            CgroupMapRemoval::WorkloadIdentity,
+            CaptureFailureOp::WorkloadIdentityRemove { cgroup_id },
+        ) => Some(*cgroup_id),
+        _ => None,
+    })
 }
 
 fn pending_node_probe_port_update_failures(
     pod_states: &DashMap<String, PodAttachmentState>,
 ) -> Vec<(String, String, Vec<u16>)> {
-    if PENDING_CAPTURE_FAILURES.is_empty() {
-        return Vec::new();
-    }
-
-    let key_prefix = pod_state_key_prefix(pod_states);
-    PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            if !failure.state_key.starts_with(&key_prefix)
-                || failure.operation != CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE
-            {
-                return None;
-            }
-            let pod_uid = failure.state_key.strip_prefix(&key_prefix)?.to_string();
-            let desired_ports = parse_node_probe_port_update_failure_detail(&failure.detail)?;
-            Some((failure.key, pod_uid, desired_ports))
-        })
-        .collect()
+    pending_capture_failures_in_scope(pod_states, |op| match op {
+        CaptureFailureOp::NodeProbePortUpdate { desired_ports } => Some(desired_ports.clone()),
+        _ => None,
+    })
 }
 
 fn retry_pending_node_probe_port_updates(
@@ -5679,12 +5897,15 @@ fn retry_pending_node_probe_port_updates(
         return;
     }
 
-    for (failure_key, pod_uid, desired_ports) in pending {
-        if !PENDING_CAPTURE_FAILURES.contains_key(&failure_key) {
+    for (state_key, pod_uid, desired_ports) in pending {
+        let failure = CaptureFailureOp::NodeProbePortUpdate {
+            desired_ports: desired_ports.clone(),
+        };
+        if !has_capture_failure(&state_key, &failure) {
             continue;
         }
         let Some(mut state) = pod_states.get_mut(&pod_uid) else {
-            PENDING_CAPTURE_FAILURES.remove(&failure_key);
+            forget_capture_failure(&state_key, &failure);
             debug!(
                 pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid),
                 "Cleared pending node probe-port update because the pod is no longer tracked"
@@ -5707,7 +5928,7 @@ fn retry_pending_node_probe_port_updates(
                 let pod_ip6 = state.pod_ip6;
                 drop(state);
 
-                PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                forget_capture_failure(&state_key, &failure);
                 if let Some(ip) = pod_ip {
                     remove_node_probe_ports_for_ip(
                         backend,
@@ -5730,9 +5951,7 @@ fn retry_pending_node_probe_port_updates(
                         "probe ports update retry",
                     );
                 }
-                forget_pending_node_probe_port_update_failures_for_state(&pod_state_key(
-                    pod_states, &pod_uid,
-                ));
+                forget_pending_node_probe_port_update_failures_for_state(&state_key);
                 debug!(
                     pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid),
                     desired_ports = %crate::startup::sanitize_startup_scalar(format_args!("{:?}", desired_ports)),
@@ -5766,9 +5985,10 @@ fn retry_pending_node_probe_port_removals(
         return;
     }
 
-    for (failure_key, state_key, pod_uid, ip, port) in pending {
+    for (state_key, pod_uid, (ip, port)) in pending {
+        let failure = CaptureFailureOp::NodeProbePortRemove { ip, port };
         if let Some(owner_pod_uid) = pod_owning_probe_port_addr(pod_states, ip, port) {
-            PENDING_CAPTURE_FAILURES.remove(&failure_key);
+            forget_capture_failure(&state_key, &failure);
             debug!(
                 owner_pod_uid = %crate::startup::sanitize_startup_scalar(&owner_pod_uid),
                 ip = %crate::startup::sanitize_startup_scalar(ip),
@@ -5785,7 +6005,7 @@ fn retry_pending_node_probe_port_removals(
         };
         match result {
             Ok(()) => {
-                PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                forget_capture_failure(&state_key, &failure);
                 debug!(ip = %crate::startup::sanitize_startup_scalar(ip), port = %crate::startup::sanitize_startup_scalar(port), "Recovered pending node probe-port map removal failure");
                 complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
             }
@@ -5809,15 +6029,17 @@ fn retry_pending_cgroup_map_removals(
     config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
 ) {
-    for operation in [
-        CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE,
-        CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE,
+    for removal in [
+        CgroupMapRemoval::IncludePorts,
+        CgroupMapRemoval::WorkloadIdentity,
     ] {
-        for (failure_key, state_key, pod_uid, cgroup_id) in
-            pending_cgroup_map_removal_failures(pod_states, operation)
+        let operation = removal.as_str();
+        for (state_key, pod_uid, cgroup_id) in
+            pending_cgroup_map_removal_failures(pod_states, removal)
         {
+            let failure = removal.failure(cgroup_id);
             let live_owner = pod_states.iter().find_map(|entry| {
-                let owns_key = if operation == CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE {
+                let owns_key = if removal == CgroupMapRemoval::IncludePorts {
                     entry.value().include_ports_cgroup_ids.contains(&cgroup_id)
                 } else {
                     entry
@@ -5828,7 +6050,7 @@ fn retry_pending_cgroup_map_removals(
                 owns_key.then(|| entry.key().clone())
             });
             if let Some(owner_pod_uid) = live_owner {
-                PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                forget_capture_failure(&state_key, &failure);
                 debug!(
                     pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid),
                     owner_pod_uid = %crate::startup::sanitize_startup_scalar(&owner_pod_uid),
@@ -5839,14 +6061,14 @@ fn retry_pending_cgroup_map_removals(
                 complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
                 continue;
             }
-            let result = if operation == CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE {
+            let result = if removal == CgroupMapRemoval::IncludePorts {
                 backend.remove_pod_include_ports(cgroup_id)
             } else {
                 backend.remove_workload_identity(cgroup_id)
             };
             match result {
                 Ok(()) => {
-                    PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                    forget_capture_failure(&state_key, &failure);
                     debug!(
                         pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid),
                         cgroup_id, operation, "Recovered pending cgroup map removal failure"
@@ -5880,9 +6102,10 @@ fn retry_pending_pod_ip_removals(
         return;
     }
 
-    for (failure_key, state_key, pod_uid, ip) in pending {
+    for (state_key, pod_uid, ip) in pending {
+        let failure = CaptureFailureOp::PodIpRemove(ip);
         if let Some(owner_pod_uid) = pod_owning_ip_addr(pod_states, ip) {
-            PENDING_CAPTURE_FAILURES.remove(&failure_key);
+            forget_capture_failure(&state_key, &failure);
             debug!(
                 owner_pod_uid = %crate::startup::sanitize_startup_scalar(&owner_pod_uid),
                 ip = %crate::startup::sanitize_startup_scalar(ip),
@@ -5914,7 +6137,7 @@ fn retry_pending_pod_ip_removals(
         };
         match clear_result {
             Ok(()) => {
-                PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                forget_capture_failure(&state_key, &failure);
                 debug!(ip = %crate::startup::sanitize_startup_scalar(ip), "Recovered pending pod IP map removal and inbound redirect scope clear");
                 complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
             }
@@ -5943,7 +6166,7 @@ fn retry_pending_pod_detaches(
         return;
     }
 
-    for (failure_key, state_key, pod_uid) in pending {
+    for (state_key, pod_uid) in pending {
         // A same-UID pod that is live again may own newly-attached links. Do not
         // let a stale removal retry detach the current enrollment.
         if pod_states.contains_key(&pod_uid) {
@@ -5951,7 +6174,7 @@ fn retry_pending_pod_detaches(
         }
         match backend.detach_pod(&pod_uid) {
             Ok(()) => {
-                PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                forget_capture_failure(&state_key, &CaptureFailureOp::PodDetach);
                 debug!(pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid), "Recovered pending pod BPF detach failure");
                 complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
             }
@@ -6223,16 +6446,9 @@ fn remove_udp_gate_cleaned_proof(dir: &std::path::Path, pod_uid: &str) -> bool {
 }
 
 fn has_pending_removal_blocking_failure(state_key: &str) -> bool {
-    PENDING_CAPTURE_FAILURES.iter().any(|entry| {
-        parse_pending_capture_failure_key(entry.key()).is_some_and(|failure| {
-            failure.state_key == state_key
-                && (failure.operation == CAPTURE_FAILURE_POD_IP_REMOVE
-                    || failure.operation == CAPTURE_FAILURE_POD_DETACH
-                    || failure.operation == CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE
-                    || failure.operation == CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE
-                    || failure.operation == CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE)
-        })
-    })
+    PENDING_CAPTURE_FAILURES
+        .get(state_key)
+        .is_some_and(|record| record.iter().any(CaptureFailureOp::blocks_removal))
 }
 
 /// Complete a removed pod's durable UDP close handoff after all removal-blocking
@@ -7099,22 +7315,14 @@ fn reconcile_udp_capture_readiness_with_sync_state(
                 .pod_ip6
                 .is_none_or(|ip| backend.update_pod_ip6(ip, &info_v6).is_ok());
             if v4_ok && v6_ok {
-                forget_pending_capture_failure(
-                    &state_key,
-                    CAPTURE_FAILURE_UDP_READINESS,
-                    CAPTURE_FAILURE_DETAIL_UDP_READINESS,
-                );
+                forget_capture_failure(&state_key, &CaptureFailureOp::UdpReadiness);
                 ready_uids.insert(uid.clone());
                 if let Some(dir) = &config.node_waypoint_pod_registry_dir {
                     write_udp_not_ready_ack(dir, uid);
                 }
             } else {
                 metrics.record_attach_error();
-                remember_pending_capture_failure(
-                    &state_key,
-                    CAPTURE_FAILURE_UDP_READINESS,
-                    CAPTURE_FAILURE_DETAIL_UDP_READINESS,
-                );
+                remember_capture_failure(&state_key, CaptureFailureOp::UdpReadiness);
                 warn!(
                     pod_uid = %crate::startup::sanitize_startup_scalar(uid.as_str()),
                     "Failed to verify disabled Ambient UDP pod-map posture; withholding cleanup acknowledgement and retrying"
@@ -7183,11 +7391,7 @@ fn reconcile_udp_capture_readiness_with_sync_state(
             .pod_ip6
             .is_none_or(|ip| backend.update_pod_ip6(ip, &info_v6).is_ok());
         if v4_ok && v6_ok {
-            forget_pending_capture_failure(
-                &state_key,
-                CAPTURE_FAILURE_UDP_READINESS,
-                CAPTURE_FAILURE_DETAIL_UDP_READINESS,
-            );
+            forget_capture_failure(&state_key, &CaptureFailureOp::UdpReadiness);
             if ready {
                 ready_uids.insert(uid.clone());
                 if let Some(dir) = &config.node_waypoint_pod_registry_dir {
@@ -7207,11 +7411,7 @@ fn reconcile_udp_capture_readiness_with_sync_state(
             );
         } else {
             metrics.record_attach_error();
-            remember_pending_capture_failure(
-                &state_key,
-                CAPTURE_FAILURE_UDP_READINESS,
-                CAPTURE_FAILURE_DETAIL_UDP_READINESS,
-            );
+            remember_capture_failure(&state_key, CaptureFailureOp::UdpReadiness);
             warn!(
                 pod_uid = %crate::startup::sanitize_startup_scalar(uid.as_str()),
                 udp_ready = ready,
@@ -7454,6 +7654,17 @@ fn handle_pod_added_inner(
                 "Pod already enrolled, reconciled state"
             );
             drop(state);
+            // Before the recovery check, so a failed removal's durable blocker
+            // is visible to it.
+            remove_abandoned_pod_ip_targets(
+                backend,
+                pod_states,
+                metrics,
+                pod_uid,
+                &pod_ip_reconcile.abandoned_pod_ips,
+                &pod_ip6_reconcile.abandoned_pod_ips,
+                "abandoned pod IP move",
+            );
             if pod_ip_reconcile.recovered_pending_failure
                 || pod_ip6_reconcile.recovered_pending_failure
                 || node_probe_reconcile.recovered_pending_failure
@@ -7566,7 +7777,7 @@ fn handle_pod_added_inner(
     }
 
     // Owned event snapshot stored alongside the failed-enrollment record so the
-    // periodic retry loop in `run_with_backend` can re-drive this enrollment
+    // periodic retry loop in `run_with_pod_stream` can re-drive this enrollment
     // once the backoff window expires, even if no further pod/CNI event arrives
     // for this pod. Cheap to build but only needed on the cold failure paths
     // below, so each `remember_failed_pod_enrollment` call clones it.
@@ -7962,11 +8173,7 @@ fn handle_pod_added_inner(
 
     if state.attached {
         forget_failed_pod_enrollment(&state_key);
-        if forget_pending_capture_failure(
-            &state_key,
-            CAPTURE_FAILURE_POD_DETACH,
-            CAPTURE_FAILURE_DETAIL_POD_DETACH,
-        ) {
+        if forget_capture_failure(&state_key, &CaptureFailureOp::PodDetach) {
             debug!(
                 pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                 "Cleared superseded detach failure after same-UID pod re-enrollment"
@@ -8039,6 +8246,10 @@ fn handle_pod_added_inner(
 #[derive(Debug)]
 struct PodIpReconcileResult<Ip> {
     stale_pod_ip: Option<Ip>,
+    /// Targets of earlier failed moves that the converged address superseded.
+    /// Their scope (and any pod-IP entry) may have been written, so the caller
+    /// removes them once it no longer holds the pod's state guard.
+    abandoned_pod_ips: Vec<Ip>,
     recovered_pending_failure: bool,
     pod_ip_update_failed: bool,
 }
@@ -8047,9 +8258,64 @@ impl<Ip> Default for PodIpReconcileResult<Ip> {
     fn default() -> Self {
         Self {
             stale_pod_ip: None,
+            abandoned_pod_ips: Vec::new(),
             recovered_pending_failure: false,
             pod_ip_update_failed: false,
         }
+    }
+}
+
+/// IPv4 targets of pending failed pod-IP moves for one pod-state identity.
+fn pending_pod_ip_update_targets(state_key: &str) -> Vec<std::net::Ipv4Addr> {
+    PENDING_CAPTURE_FAILURES
+        .get(state_key)
+        .map(|record| {
+            record
+                .iter()
+                .filter_map(|op| match op {
+                    CaptureFailureOp::PodIpUpdate(ip) => Some(*ip),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// IPv6 targets of pending failed pod-IP moves for one pod-state identity.
+fn pending_pod_ip6_update_targets(state_key: &str) -> Vec<std::net::Ipv6Addr> {
+    PENDING_CAPTURE_FAILURES
+        .get(state_key)
+        .map(|record| {
+            record
+                .iter()
+                .filter_map(|op| match op {
+                    CaptureFailureOp::PodIp6Update(ip) => Some(*ip),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Remove the pod-IP entry and redirect scope a failed pod-IP move may have
+/// written at addresses the pod no longer moves to. Ownership by another
+/// tracked pod is respected, and a failed removal is queued as a durable
+/// `PodIpRemove` blocker by the removal helpers. Must be called without
+/// holding a `pod_states` guard.
+fn remove_abandoned_pod_ip_targets(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+    pod_uid: &str,
+    abandoned_v4: &[std::net::Ipv4Addr],
+    abandoned_v6: &[std::net::Ipv6Addr],
+    removal_reason: &'static str,
+) {
+    for ip in abandoned_v4 {
+        remove_pod_ip_if_unowned(backend, pod_states, metrics, pod_uid, *ip, removal_reason);
+    }
+    for ip in abandoned_v6 {
+        remove_pod_ip6_if_unowned(backend, pod_states, metrics, pod_uid, *ip, removal_reason);
     }
 }
 
@@ -8086,10 +8352,11 @@ fn reconcile_existing_node_probe_ports(
         );
         metrics.record_attach_error();
         forget_pending_node_probe_port_update_failures_for_state(state_key);
-        remember_pending_capture_failure(
+        remember_capture_failure(
             state_key,
-            CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE,
-            &node_probe_port_update_failure_detail(desired_ports),
+            CaptureFailureOp::NodeProbePortUpdate {
+                desired_ports: normalized_node_probe_ports(desired_ports),
+            },
         );
         return NodeProbePortReconcileResult {
             recovered_pending_failure: false,
@@ -8118,7 +8385,12 @@ fn reconcile_existing_pod_ip(
     let Some(new_ip) = pod_ip else {
         return PodIpReconcileResult::default();
     };
-    if state.pod_ip == Some(new_ip) {
+    // A failed move may have written scope (and the pod-IP entry) at its
+    // target while the tracked address stayed put. While any such record is
+    // pending, an event naming the tracked address must not return early: it
+    // re-converges that address and retires the abandoned target (#7025).
+    let pending_targets = pending_pod_ip_update_targets(state_key);
+    if state.pod_ip == Some(new_ip) && pending_targets.is_empty() {
         return PodIpReconcileResult::default();
     }
 
@@ -8136,11 +8408,7 @@ fn reconcile_existing_pod_ip(
             "Failed to move the inbound redirect scope to the pod's new IP"
         );
         metrics.record_attach_error();
-        remember_pending_capture_failure(
-            state_key,
-            CAPTURE_FAILURE_POD_IP_UPDATE,
-            CAPTURE_FAILURE_DETAIL_POD_IP,
-        );
+        remember_capture_failure(state_key, CaptureFailureOp::PodIpUpdate(new_ip));
         return PodIpReconcileResult {
             pod_ip_update_failed: true,
             ..PodIpReconcileResult::default()
@@ -8151,25 +8419,24 @@ fn reconcile_existing_pod_ip(
     if let Err(e) = backend.update_pod_ip(new_ip, &info) {
         warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), new_ip = %crate::startup::sanitize_startup_scalar(new_ip), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to update pod IP map for existing pod");
         metrics.record_attach_error();
-        remember_pending_capture_failure(
-            state_key,
-            CAPTURE_FAILURE_POD_IP_UPDATE,
-            CAPTURE_FAILURE_DETAIL_POD_IP,
-        );
+        remember_capture_failure(state_key, CaptureFailureOp::PodIpUpdate(new_ip));
         return PodIpReconcileResult {
             pod_ip_update_failed: true,
             ..PodIpReconcileResult::default()
         };
     }
-    forget_pending_capture_failure(
-        state_key,
-        CAPTURE_FAILURE_POD_IP_UPDATE,
-        CAPTURE_FAILURE_DETAIL_POD_IP,
-    );
+    forget_capture_failures_matching(state_key, |op| {
+        matches!(op, CaptureFailureOp::PodIpUpdate(_))
+    });
     let old_ip = state.pod_ip;
     state.pod_ip = Some(new_ip);
+    let abandoned_pod_ips = pending_targets
+        .into_iter()
+        .filter(|ip| *ip != new_ip && Some(*ip) != old_ip)
+        .collect();
     PodIpReconcileResult {
-        stale_pod_ip: old_ip,
+        stale_pod_ip: old_ip.filter(|ip| *ip != new_ip),
+        abandoned_pod_ips,
         recovered_pending_failure: true,
         pod_ip_update_failed: false,
     }
@@ -8187,7 +8454,9 @@ fn reconcile_existing_pod_ip6(
     let Some(new_ip) = pod_ip else {
         return PodIpReconcileResult::default();
     };
-    if state.pod_ip6 == Some(new_ip) {
+    // Same pending-move contract as the IPv4 reconcile (#7025).
+    let pending_targets = pending_pod_ip6_update_targets(state_key);
+    if state.pod_ip6 == Some(new_ip) && pending_targets.is_empty() {
         return PodIpReconcileResult::default();
     }
 
@@ -8208,11 +8477,7 @@ fn reconcile_existing_pod_ip6(
             "Failed to move the IPv6 inbound redirect scope to the pod's new IP"
         );
         metrics.record_attach_error();
-        remember_pending_capture_failure(
-            state_key,
-            CAPTURE_FAILURE_POD_IP_UPDATE,
-            CAPTURE_FAILURE_DETAIL_POD_IP6,
-        );
+        remember_capture_failure(state_key, CaptureFailureOp::PodIp6Update(new_ip));
         return PodIpReconcileResult {
             pod_ip_update_failed: true,
             ..PodIpReconcileResult::default()
@@ -8223,25 +8488,24 @@ fn reconcile_existing_pod_ip6(
     if let Err(e) = backend.update_pod_ip6(new_ip, &info) {
         warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), new_ip = %crate::startup::sanitize_startup_scalar(new_ip), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to update pod IPv6 map for existing pod");
         metrics.record_attach_error();
-        remember_pending_capture_failure(
-            state_key,
-            CAPTURE_FAILURE_POD_IP_UPDATE,
-            CAPTURE_FAILURE_DETAIL_POD_IP6,
-        );
+        remember_capture_failure(state_key, CaptureFailureOp::PodIp6Update(new_ip));
         return PodIpReconcileResult {
             pod_ip_update_failed: true,
             ..PodIpReconcileResult::default()
         };
     }
-    forget_pending_capture_failure(
-        state_key,
-        CAPTURE_FAILURE_POD_IP_UPDATE,
-        CAPTURE_FAILURE_DETAIL_POD_IP6,
-    );
+    forget_capture_failures_matching(state_key, |op| {
+        matches!(op, CaptureFailureOp::PodIp6Update(_))
+    });
     let old_ip = state.pod_ip6;
     state.pod_ip6 = Some(new_ip);
+    let abandoned_pod_ips = pending_targets
+        .into_iter()
+        .filter(|ip| *ip != new_ip && Some(*ip) != old_ip)
+        .collect();
     PodIpReconcileResult {
-        stale_pod_ip: old_ip,
+        stale_pod_ip: old_ip.filter(|ip| *ip != new_ip),
+        abandoned_pod_ips,
         recovered_pending_failure: true,
         pod_ip_update_failed: false,
     }
@@ -8316,8 +8580,10 @@ fn apply_pod_inbound_redirect_v6(
 /// clears any stale v6 scope and keeps the v6 flag false.
 ///
 /// A failed write is a visible, retryable capture failure: the tracked scope is
-/// NOT advanced (so the next event recomputes the same delta) and a pending
-/// capture failure is recorded rather than silently claiming success.
+/// NOT advanced and a pending capture failure is recorded rather than silently
+/// claiming success. While that record is pending, the next event rewrites the
+/// full scope even if its ports equal the tracked set, because the BPF-written
+/// scope may have diverged from it part-way through the failed write.
 fn reconcile_existing_pod_inbound_redirect(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
@@ -8338,7 +8604,16 @@ fn reconcile_existing_pod_inbound_redirect(
     } else {
         Vec::new()
     };
-    if desired == state.inbound_redirect_ports {
+    // The tracked set is only the last scope known to be FULLY written. While a
+    // redirect write is pending, the BPF-written scope is unknown: a failure
+    // after `update_pod_inbound_ports` succeeded (pod-IP flag write, or the
+    // other family) can leave a port the pod never had tracked — and has
+    // since withdrawn — redirect-eligible. Converge the written scope on every
+    // event until a full write succeeds, even when `desired` equals the
+    // tracked set (#7025).
+    let written_scope_uncertain =
+        has_capture_failure(state_key, &CaptureFailureOp::InboundRedirectUpdate);
+    if desired == state.inbound_redirect_ports && !written_scope_uncertain {
         return InboundRedirectReconcileResult::default();
     }
     let desired_v6: &[u16] = if config.capture_contract.ingress_capture_supports_ipv6 {
@@ -8378,11 +8653,7 @@ fn reconcile_existing_pod_inbound_redirect(
 
     if failed {
         metrics.record_attach_error();
-        remember_pending_capture_failure(
-            state_key,
-            CAPTURE_FAILURE_INBOUND_REDIRECT_UPDATE,
-            CAPTURE_FAILURE_DETAIL_INBOUND_REDIRECT,
-        );
+        remember_capture_failure(state_key, CaptureFailureOp::InboundRedirectUpdate);
         return InboundRedirectReconcileResult {
             update_failed: true,
             recovered_pending_failure: false,
@@ -8390,11 +8661,8 @@ fn reconcile_existing_pod_inbound_redirect(
     }
 
     state.inbound_redirect_ports = desired;
-    let recovered_pending_failure = forget_pending_capture_failure(
-        state_key,
-        CAPTURE_FAILURE_INBOUND_REDIRECT_UPDATE,
-        CAPTURE_FAILURE_DETAIL_INBOUND_REDIRECT,
-    );
+    let recovered_pending_failure =
+        forget_capture_failure(state_key, &CaptureFailureOp::InboundRedirectUpdate);
     InboundRedirectReconcileResult {
         update_failed: false,
         recovered_pending_failure,
@@ -8418,7 +8686,10 @@ fn remove_pod_ip_if_unowned(
             "Skipping pod IP map removal; IP is owned by another tracked pod"
         );
         let state_key = pod_state_key(pod_states, pod_uid);
-        forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+        forget_capture_failure(
+            &state_key,
+            &CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
+        );
         forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
         clear_partial_capture_state_if_recovered(pod_states, metrics);
         return;
@@ -8427,10 +8698,9 @@ fn remove_pod_ip_if_unowned(
     if let Err(e) = backend.remove_pod_ip(ip) {
         warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), ip = %crate::startup::sanitize_startup_scalar(ip), error = %crate::startup::sanitize_startup_scalar(&e), removal_reason, "Failed to remove pod IP from map");
         metrics.record_attach_error();
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
         return;
     }
@@ -8471,7 +8741,10 @@ fn remove_pod_ip6_if_unowned(
             "Skipping pod IPv6 map removal; IP is owned by another tracked pod"
         );
         let state_key = pod_state_key(pod_states, pod_uid);
-        forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+        forget_capture_failure(
+            &state_key,
+            &CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
+        );
         forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
         clear_partial_capture_state_if_recovered(pod_states, metrics);
         return;
@@ -8480,10 +8753,9 @@ fn remove_pod_ip6_if_unowned(
     if let Err(e) = backend.remove_pod_ip6(ip) {
         warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), ip = %crate::startup::sanitize_startup_scalar(ip), error = %crate::startup::sanitize_startup_scalar(&e), removal_reason, "Failed to remove pod IPv6 from map");
         metrics.record_attach_error();
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
         return;
     }
@@ -8598,7 +8870,10 @@ fn remove_pre_enrollment_pod_ip_if_unowned(
             removal_reason,
             "Skipping pre-enrollment pod IP map removal; IP is owned by another tracked pod"
         );
-        forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+        forget_capture_failure(
+            &state_key,
+            &CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
+        );
         forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
         return;
     }
@@ -8611,10 +8886,9 @@ fn remove_pre_enrollment_pod_ip_if_unowned(
             "Failed to remove pre-enrollment pod IP from map"
         );
         metrics.record_attach_error();
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
         return;
     }
@@ -8651,7 +8925,10 @@ fn remove_pre_enrollment_pod_ip6_if_unowned(
             removal_reason,
             "Skipping pre-enrollment pod IPv6 map removal; IP is owned by another tracked pod"
         );
-        forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+        forget_capture_failure(
+            &state_key,
+            &CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
+        );
         forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
         return;
     }
@@ -8664,10 +8941,9 @@ fn remove_pre_enrollment_pod_ip6_if_unowned(
             "Failed to remove pre-enrollment pod IPv6 from map"
         );
         metrics.record_attach_error();
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
         return;
     }
@@ -8721,10 +8997,10 @@ fn finish_pod_ip_removal_scope_clear(
             "{scope_label}"
         );
         metrics.record_attach_error();
-        remember_pending_capture_failure(state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+        remember_capture_failure(state_key, CaptureFailureOp::PodIpRemove(ip));
         return false;
     }
-    forget_pending_capture_failure(state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+    forget_capture_failure(state_key, &CaptureFailureOp::PodIpRemove(ip));
     if !pre_enrollment {
         clear_partial_capture_state_if_recovered(pod_states, metrics);
     }
@@ -9039,21 +9315,13 @@ fn record_removed_pod_detach_result(
 ) -> bool {
     match result {
         Ok(()) => {
-            forget_pending_capture_failure(
-                state_key,
-                CAPTURE_FAILURE_POD_DETACH,
-                CAPTURE_FAILURE_DETAIL_POD_DETACH,
-            );
+            forget_capture_failure(state_key, &CaptureFailureOp::PodDetach);
             true
         }
         Err(e) => {
             warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to detach BPF programs");
             metrics.record_attach_error();
-            remember_pending_capture_failure(
-                state_key,
-                CAPTURE_FAILURE_POD_DETACH,
-                CAPTURE_FAILURE_DETAIL_POD_DETACH,
-            );
+            remember_capture_failure(state_key, CaptureFailureOp::PodDetach);
             false
         }
     }
@@ -9068,25 +9336,19 @@ fn remove_pod_cgroup_maps_recording_failures(
     state: &PodAttachmentState,
 ) {
     for cgroup_id in &state.include_ports_cgroup_ids {
-        let detail = cgroup_id.to_string();
+        let failure = CaptureFailureOp::IncludePortsRemove {
+            cgroup_id: *cgroup_id,
+        };
         if pod_states.iter().any(|entry| {
             entry.key().as_str() != pod_uid
                 && entry.value().include_ports_cgroup_ids.contains(cgroup_id)
         }) {
-            forget_pending_capture_failure(
-                state_key,
-                CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE,
-                &detail,
-            );
+            forget_capture_failure(state_key, &failure);
             continue;
         }
         match backend.remove_pod_include_ports(*cgroup_id) {
             Ok(()) => {
-                forget_pending_capture_failure(
-                    state_key,
-                    CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE,
-                    &detail,
-                );
+                forget_capture_failure(state_key, &failure);
             }
             Err(e) => {
                 warn!(
@@ -9096,16 +9358,14 @@ fn remove_pod_cgroup_maps_recording_failures(
                     "Failed to remove pod includeOutboundPorts entry"
                 );
                 metrics.record_attach_error();
-                remember_pending_capture_failure(
-                    state_key,
-                    CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE,
-                    &detail,
-                );
+                remember_capture_failure(state_key, failure);
             }
         }
     }
     for cgroup_id in &state.workload_identity_cgroup_ids {
-        let detail = cgroup_id.to_string();
+        let failure = CaptureFailureOp::WorkloadIdentityRemove {
+            cgroup_id: *cgroup_id,
+        };
         if pod_states.iter().any(|entry| {
             entry.key().as_str() != pod_uid
                 && entry
@@ -9113,20 +9373,12 @@ fn remove_pod_cgroup_maps_recording_failures(
                     .workload_identity_cgroup_ids
                     .contains(cgroup_id)
         }) {
-            forget_pending_capture_failure(
-                state_key,
-                CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE,
-                &detail,
-            );
+            forget_capture_failure(state_key, &failure);
             continue;
         }
         match backend.remove_workload_identity(*cgroup_id) {
             Ok(()) => {
-                forget_pending_capture_failure(
-                    state_key,
-                    CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE,
-                    &detail,
-                );
+                forget_capture_failure(state_key, &failure);
             }
             Err(e) => {
                 warn!(
@@ -9136,11 +9388,7 @@ fn remove_pod_cgroup_maps_recording_failures(
                     "Failed to remove pod workload-identity entry"
                 );
                 metrics.record_attach_error();
-                remember_pending_capture_failure(
-                    state_key,
-                    CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE,
-                    &detail,
-                );
+                remember_capture_failure(state_key, failure);
             }
         }
     }
@@ -9197,7 +9445,6 @@ fn verify_failed_enrollment_cleanup_on_removal(
 /// disabled reconciler independently verifies the same closed pod-map posture,
 /// so removed pods must not lose their producer close handoff solely because
 /// the current process is no longer arming UDP capture.
-#[allow(dead_code)]
 pub fn handle_pod_removed(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
@@ -9211,22 +9458,17 @@ pub fn handle_pod_removed(
     let failed_attempt = FAILED_POD_ENROLLMENT_ATTEMPTS
         .get(&state_key)
         .map(|attempt| attempt.value().clone());
-    forget_pending_capture_failure(
-        &state_key,
-        CAPTURE_FAILURE_POD_IP_UPDATE,
-        CAPTURE_FAILURE_DETAIL_POD_IP,
-    );
-    forget_pending_capture_failure(
-        &state_key,
-        CAPTURE_FAILURE_POD_IP_UPDATE,
-        CAPTURE_FAILURE_DETAIL_POD_IP6,
-    );
-    forget_pending_capture_failure(
-        &state_key,
-        CAPTURE_FAILURE_UDP_READINESS,
-        CAPTURE_FAILURE_DETAIL_UDP_READINESS,
-    );
-    forget_pending_node_probe_port_update_failures_for_state(&state_key);
+    // Every live-pod record (pod-IP, probe-port, UDP-readiness and inbound
+    // redirect updates, plus any future non-removal operation) describes a
+    // pod that no longer exists. Leaving one would keep the node
+    // PARTIALLY_ATTACHED forever and make every retry tick re-retract the
+    // Ambient UDP registry proof (#7025). Removal blockers survive: teardown
+    // below and the periodic retries own them. A failed pod-IP move may have
+    // written scope at its target, so those targets are snapshotted first and
+    // removed below (as durable removal blockers when that fails).
+    let abandoned_v4 = pending_pod_ip_update_targets(&state_key);
+    let abandoned_v6 = pending_pod_ip6_update_targets(&state_key);
+    forget_live_pod_capture_failures(&state_key);
     // Drop this pod's per-pod registry entry (if publishing is enabled) so the
     // mesh proxy's in-netns capture listeners stop discovering a torn-down pod.
     // Best-effort and independent of whether the pod was actually attached: a
@@ -9240,6 +9482,28 @@ pub fn handle_pod_removed(
     }
 
     let removed = pod_states.remove(pod_uid);
+    // Teardown below owns the tracked addresses (and their removal order);
+    // only addresses the pod never converged to are retired here.
+    let (tracked_v4, tracked_v6) = removed
+        .as_ref()
+        .map_or((None, None), |(_, state)| (state.pod_ip, state.pod_ip6));
+    let abandoned_v4: Vec<std::net::Ipv4Addr> = abandoned_v4
+        .into_iter()
+        .filter(|ip| Some(*ip) != tracked_v4)
+        .collect();
+    let abandoned_v6: Vec<std::net::Ipv6Addr> = abandoned_v6
+        .into_iter()
+        .filter(|ip| Some(*ip) != tracked_v6)
+        .collect();
+    remove_abandoned_pod_ip_targets(
+        backend,
+        pod_states,
+        metrics,
+        pod_uid,
+        &abandoned_v4,
+        &abandoned_v6,
+        "abandoned pod IP move on pod removal",
+    );
     let Some((_, state)) = removed else {
         if let Some(failed_attempt) = failed_attempt {
             // `None` proves the attempt failed before the BPF mutation phase;
@@ -9252,7 +9516,7 @@ pub fn handle_pod_removed(
                     backend, pod_states, metrics, &state_key, pod_uid, state,
                 )
             });
-            forget_pod_enrollment_attempt(&state_key);
+            forget_failed_pod_enrollment(&state_key);
             // Pod events, retry ticks, and responder ticks share this select!
             // task, so the responder cannot observe suppression lifted between
             // the pending-failure writes above and this completion attempt.
@@ -9268,7 +9532,7 @@ pub fn handle_pod_removed(
             // Process restart / missed DEL: durable ownership rehydrated without
             // live `pod_states`. Drive the same Ferrum-owned teardown using the
             // persisted cleanup snapshot before ownership may clear.
-            forget_pod_enrollment_attempt(&state_key);
+            forget_failed_pod_enrollment(&state_key);
             unenroll_pod_attachment_state(
                 backend,
                 pod_states,
@@ -9286,23 +9550,19 @@ pub fn handle_pod_removed(
                 pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                 "Retaining Ferrum CNI ownership because rehydrated attachment lacks a cleanup snapshot"
             );
-            remember_pending_capture_failure(
-                &state_key,
-                CAPTURE_FAILURE_POD_DETACH,
-                CAPTURE_FAILURE_DETAIL_POD_DETACH,
-            );
-            forget_pod_enrollment_attempt(&state_key);
+            remember_capture_failure(&state_key, CaptureFailureOp::PodDetach);
+            forget_failed_pod_enrollment(&state_key);
             clear_partial_capture_state_if_recovered(pod_states, metrics);
             return;
         } else {
-            forget_pod_enrollment_attempt(&state_key);
+            forget_failed_pod_enrollment(&state_key);
         }
         clear_partial_capture_state_if_recovered(pod_states, metrics);
         let _ = forget_cni_owned_attachments_if_removal_complete(pod_states, pod_uid);
         return;
     };
 
-    forget_pod_enrollment_attempt(&state_key);
+    forget_failed_pod_enrollment(&state_key);
     unenroll_pod_attachment_state(
         backend, pod_states, config, metrics, &state_key, pod_uid, &state,
     );
@@ -9368,7 +9628,7 @@ async fn handle_fallback(
     config: &NodeAgentConfig,
     probe: &KernelProbeResult,
     metrics: Arc<NodeAgentMetrics>,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
@@ -9392,27 +9652,59 @@ async fn handle_fallback(
         None
     };
 
-    let result = handle_fallback_with(
+    let fallback = handle_fallback_with(
         config,
         probe,
         metrics.as_ref(),
         shutdown_tx,
         |cmds, phase| async move { execute_iptables_commands(&cmds, phase).await },
         startup_ready,
-    )
-    .await;
+    );
 
-    if let Some((listener, worker)) = cni_handles {
-        let _ = shutdown_tx.send(true);
-        if let Err(err) = listener.await {
-            warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI passthrough listener task panicked");
+    let Some((mut listener, worker)) = cni_handles else {
+        return fallback.await;
+    };
+    // A passthrough listener that stops serving outside shutdown is the same
+    // node-wide pod-creation outage as on the eBPF path (#7253): shut the
+    // fallback down through its normal cleanup and exit nonzero.
+    tokio::pin!(fallback);
+    let mut listener_failure = None;
+    let mut listener_joined = false;
+    let result = tokio::select! {
+        result = &mut fallback => result,
+        exit = &mut listener => {
+            listener_joined = true;
+            let exit = exit.unwrap_or(CniListenerExit::Failed);
+            if matches!(
+                exit,
+                CniListenerExit::Failed | CniListenerExit::ReplacedByAnotherOwner
+            ) && !*shutdown_tx.borrow()
+            {
+                error!(
+                    listener_exit = ?exit,
+                    "Node-agent CNI passthrough listener stopped serving; exiting so a restart restores CNI ADD on this node"
+                );
+                listener_failure = Some(exit);
+                shutdown_tx.shutdown();
+            }
+            fallback.await
         }
-        if let Err(err) = worker.await {
-            warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI passthrough worker task panicked");
-        }
+    };
+
+    shutdown_tx.shutdown();
+    if !listener_joined && let Err(err) = listener.await {
+        warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI passthrough listener task panicked");
+    }
+    if let Err(err) = worker.await {
+        warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI passthrough worker task panicked");
     }
 
-    result
+    match (result, listener_failure) {
+        (Ok(()), Some(_)) => Err(anyhow::anyhow!(
+            "Node-agent CNI passthrough listener stopped serving the CNI socket"
+        )),
+        (result, _) => result,
+    }
 }
 
 fn spawn_cni_passthrough_listener(
@@ -9421,7 +9713,10 @@ fn spawn_cni_passthrough_listener(
     shutdown: tokio::sync::watch::Receiver<bool>,
     startup_ready: Arc<AtomicBool>,
     ownership_store_path: Option<std::path::PathBuf>,
-) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+) -> (
+    tokio::task::JoinHandle<CniListenerExit>,
+    tokio::task::JoinHandle<()>,
+) {
     let (cni_work_tx, mut cni_work_rx) = cni_work_channel();
     let listener = spawn_cni_listener(socket_path, cni_work_tx.clone(), metrics, shutdown);
     drop(cni_work_tx);
@@ -9503,7 +9798,7 @@ async fn handle_fallback_with<F, Fut>(
     config: &NodeAgentConfig,
     probe: &KernelProbeResult,
     metrics: &NodeAgentMetrics,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     mut execute: F,
     startup_ready: Arc<AtomicBool>,
 ) -> Result<(), anyhow::Error>
@@ -9542,31 +9837,10 @@ where
             // Always try IPv6 cleanup: an earlier process/config may have
             // created ip6tables chains even when the current plan has none.
             let include_v6_cleanup = true;
-            let udp_capture_enabled = config.capture_config.udp_capture_enabled;
 
-            // The node-agent runs in the HOST netns, where the UDP TPROXY
-            // `addrtype --dst-type LOCAL` direction split is wrong (pod IPs are
-            // FORWARDED, not LOCAL), so `udp_tproxy_commands_for_family` emits NO
-            // UDP TPROXY rules for `host_netns`. Surface that explicitly so an
-            // operator who set FERRUM_MESH_CAPTURE_UDP_ENABLED=true on the
-            // node-agent is not silently left thinking UDP is captured: node-agent
-            // host-netns UDP capture is unsupported in this stage and eBPF does NOT
-            // cover UDP either (the connect()-cgroup hooks are TCP-only). UDP
-            // capture lives in the injector's pod-netns path; node-agent /
-            // node-waypoint UDP capture is a future stage.
-            if udp_capture_enabled && config.capture_config.host_netns {
-                warn!(
-                    "FERRUM_MESH_CAPTURE_UDP_ENABLED=true, but the node-agent installs no UDP \
-                     TPROXY rules: it has no UDP listener, and capture rules without a socket \
-                     are a black hole. This is expected — UDP capture is owned by the mesh \
-                     proxy. For Ambient, set FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
-                     on the ambient proxy to use the host-network capture path (per-pod \
-                     ingress-interface scoping), or leave it unset to use the per-pod-netns \
-                     producer; for Sidecar, the injector's init container installs the \
-                     pod-netns rules. eBPF capture does NOT cover UDP either (the \
-                     connect()-cgroup hooks are TCP-only). TCP capture is unaffected."
-                );
-            }
+            // The fallback never captures UDP: only the Ambient topology enables
+            // it, and `run` refuses this fallback for Ambient (#7254). Host-netns
+            // UDP TPROXY is unsupported anyway (pod IPs are FORWARDED, not LOCAL).
 
             // UNCONDITIONAL pre-setup teardown of the EXACT Ferrum-owned UDP TPROXY
             // state, regardless of the CURRENT `udp_capture_enabled` flag (codex
@@ -9597,7 +9871,7 @@ where
 
             let setup = setup_commands_for_plan(&plan);
             if let Err(setup_err) = execute(setup, "setup").await {
-                let cleanup = cleanup_commands_for_plan(include_v6_cleanup, udp_capture_enabled);
+                let cleanup = cleanup_commands_for_plan(include_v6_cleanup);
                 if let Err(cleanup_err) = execute(cleanup, "cleanup").await {
                     warn!(
                         error = %crate::startup::sanitize_startup_scalar(&cleanup_err),
@@ -9614,7 +9888,7 @@ where
             wait_for_shutdown(shutdown_tx).await;
 
             info!("Shutdown signal received, cleaning up iptables rules");
-            let cleanup = cleanup_commands_for_plan(include_v6_cleanup, udp_capture_enabled);
+            let cleanup = cleanup_commands_for_plan(include_v6_cleanup);
             if let Err(e) = execute(cleanup, "cleanup").await {
                 warn!(error = %crate::startup::sanitize_startup_scalar(&e), "Failed to clean up iptables fallback rules");
             }
@@ -9672,20 +9946,17 @@ fn setup_commands_for_plan(plan: &IptablesPlan) -> Vec<String> {
     commands
 }
 
-fn cleanup_commands_for_plan(include_v6: bool, udp_capture_enabled: bool) -> Vec<String> {
-    // `udp_capture_enabled` gates the UDP TPROXY teardown (mangle chains + the
-    // Ferrum-owned `ip rule`/`ip route`): when this node never installs UDP
-    // capture, cleanup must not touch routing state it never created (codex r1).
-    //
-    // The cleanup is split into the iptables-TABLE teardown and the RAW `ip`
-    // routing teardown. The IPv4 routing teardown is already emitted
-    // unconditionally (raw `ip`, no iptables dependency).
-    let v4 = IptablesPlan::cleanup_split(udp_capture_enabled);
+/// TCP-capture teardown for the iptables fallback. The fallback never installs
+/// UDP capture: `NodeAgentConfig::from_env_config` enables it only for the
+/// Ambient topology, and `run` refuses the fallback for Ambient (#7254). Stale
+/// UDP state from an earlier run is reaped by [`udp_pre_setup_teardown_commands`].
+fn cleanup_commands_for_plan(include_v6: bool) -> Vec<String> {
+    let v4 = IptablesPlan::cleanup_split();
     let mut commands = v4.iptables;
     commands.extend(v4.ip_routing);
     if include_v6 {
-        let v6 = IptablesPlan::cleanup_v6_split(udp_capture_enabled);
-        // Only the ip6tables-TABLE teardown is guarded behind an `ip6tables`
+        let v6 = IptablesPlan::cleanup_v6_split();
+        // The ip6tables-TABLE teardown is guarded behind an `ip6tables`
         // availability probe — stale v6 chains from an earlier config should not
         // make node-agent fallback cleanup fail when `ip6tables` is absent.
         commands.extend(
@@ -9693,11 +9964,6 @@ fn cleanup_commands_for_plan(include_v6: bool, udp_capture_enabled: bool) -> Vec
                 .iter()
                 .map(|cmd| ip6tables_best_effort_wrapped_command(cmd)),
         );
-        // The RAW `ip -6` routing teardown (fwmark rule + local route) is emitted
-        // UNCONDITIONALLY — `ip -6` does not depend on `ip6tables`, so gating it on
-        // the probe would leak the rule/route and keep diverting marked UDP after
-        // shutdown when `ip6tables` is missing (codex r3). It carries its own
-        // best-effort `|| true`.
         commands.extend(v6.ip_routing);
     }
     commands
@@ -10491,18 +10757,11 @@ fn shutdown_backend_state(
 /// Test-only seams for the issue #2371 startup-rollback contract.
 ///
 /// Every item here exists solely so external unit tests (`tests/unit/`) can
-/// drive the *production* rollback paths through `crate::_test_support`. The
-/// library target reaches them through that bridge; `src/main.rs` re-declares
-/// every module **without** it, so in the binary target nothing in this module
-/// has a caller. That is the entire justification for the module-scoped
-/// `allow(dead_code)`: it covers only test-only items — no production item is
-/// suppressed, and `-D dead_code` still applies to the rest of the file. Same
-/// convention as the `_for_test` seams in `src/load_balancer.rs`.
+/// drive the *production* rollback paths through `crate::_test_support`.
 ///
 /// These probes call the production entry points (`initialize_backend`,
 /// `InitializedBackendOwner::{shutdown_pods, fail_with}`) directly — there is no
 /// test-only twin of the cleanup logic to drift from.
-#[allow(dead_code)]
 #[doc(hidden)]
 pub mod startup_cleanup_test_seams {
     use super::*;
@@ -10730,6 +10989,25 @@ mod capture_boundary_tests;
 mod tests {
     use super::*;
     use crate::capture::{CaptureMode, Ip6TablesMode};
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_interval_does_not_burst_after_a_stall() {
+        let period = Duration::from_millis(250);
+        let mut interval = maintenance_interval(period);
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Delay
+        );
+        interval.tick().await;
+        // Stall the loop for many periods, then resume: only one tick is
+        // ready immediately, and the next waits a full period after it.
+        tokio::time::advance(period * 40).await;
+        let resumed = tokio::time::Instant::now();
+        interval.tick().await;
+        assert_eq!(tokio::time::Instant::now(), resumed);
+        interval.tick().await;
+        assert_eq!(tokio::time::Instant::now(), resumed + period);
+    }
     use crate::ebpf::MockEbpfBackend;
 
     #[test]
@@ -10900,6 +11178,70 @@ mod tests {
     }
 
     #[test]
+    fn from_env_config_refuses_bpf_fs_path_that_would_split_pins() {
+        // Pins live at fixed /sys/fs/bpf/ferrum paths shared with the mesh
+        // proxy readers, so a different in-container bpffs mount point would
+        // pass the probe on one mount while pins go to another (issue #6698).
+        for custom in ["/mnt/ferrum-bpffs", "/sys/fs/bpf/ferrum", "/sys/fs"] {
+            with_env_vars(
+                &[
+                    ("FERRUM_NODE_AGENT_NODE_NAME", "node-a"),
+                    ("FERRUM_NODE_AGENT_BPF_FS_PATH", custom),
+                ],
+                || {
+                    let err = NodeAgentConfig::from_env_config(&EnvConfig::default())
+                        .err()
+                        .unwrap_or_else(|| panic!("{custom} must be refused"));
+                    assert!(
+                        err.contains("FERRUM_NODE_AGENT_BPF_FS_PATH")
+                            && err.contains(crate::ebpf::BPF_PIN_DIR),
+                        "refusal must name the setting and the fixed pin root: {err}"
+                    );
+                },
+            );
+        }
+        for accepted in ["/sys/fs/bpf", "/sys/fs/bpf/", " /sys/fs/bpf "] {
+            with_env_vars(
+                &[
+                    ("FERRUM_NODE_AGENT_NODE_NAME", "node-a"),
+                    ("FERRUM_NODE_AGENT_BPF_FS_PATH", accepted),
+                ],
+                || {
+                    let config = NodeAgentConfig::from_env_config(&EnvConfig::default())
+                        .unwrap_or_else(|e| panic!("{accepted:?} must be accepted: {e}"));
+                    assert_eq!(config.bpf_fs_path, crate::ebpf::BPF_FS_MOUNT_PATH);
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn bpf_pin_paths_live_under_the_fixed_bpffs_mount() {
+        use crate::ebpf::{
+            BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH, BPF_FS_MOUNT_PATH, BPF_ORIG_DST4_PIN_PATH,
+            BPF_ORIG_DST6_PIN_PATH, BPF_PIN_DIR, BPF_SOCK_OPS_EVENTS_PIN_PATH,
+            BPF_SOCK_OPS_STATS_PIN_PATH,
+        };
+        assert_eq!(
+            std::path::Path::new(BPF_PIN_DIR).parent(),
+            Some(std::path::Path::new(BPF_FS_MOUNT_PATH))
+        );
+        for pin in [
+            BPF_SOCK_OPS_EVENTS_PIN_PATH,
+            BPF_SOCK_OPS_STATS_PIN_PATH,
+            BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH,
+            BPF_ORIG_DST4_PIN_PATH,
+            BPF_ORIG_DST6_PIN_PATH,
+        ] {
+            assert_eq!(
+                std::path::Path::new(pin).parent(),
+                Some(std::path::Path::new(BPF_PIN_DIR)),
+                "{pin} must live directly under {BPF_PIN_DIR}"
+            );
+        }
+    }
+
+    #[test]
     fn from_env_config_auto_excludes_configured_hbone_redirect_port() {
         let env_config = EnvConfig {
             node_agent_hbone_redirect_port: 16008,
@@ -10939,9 +11281,9 @@ mod tests {
     #[test]
     fn from_env_config_captures_ipv6_only_in_node_waypoint_mode() {
         // NodeWaypoint in-netns capture binds both pod-loopback families, so the
-        // node-agent must include IPv6 destinations but must not set the old
-        // global deny flag. Other proxy modes leave the normal IPv4-only default
-        // include shape alone.
+        // node-agent must include IPv6 destinations (connect6 redirects them to
+        // `[::1]`). Other proxy modes leave the normal IPv4-only default include
+        // shape alone.
         let waypoint = EnvConfig {
             node_agent_proxy_mode: NodeAgentProxyMode::NodeWaypoint,
             ..EnvConfig::default()
@@ -10949,18 +11291,6 @@ mod tests {
         with_env_vars(&[("FERRUM_NODE_AGENT_NODE_NAME", "node-a")], || {
             let config = NodeAgentConfig::from_env_config(&waypoint)
                 .expect("node-agent config should parse");
-            assert!(
-                !config.capture_contract.ipv6_outbound_deny,
-                "NodeWaypoint in-netns mode must redirect captured IPv6 egress to the IPv6 pod-loopback listener"
-            );
-            assert_eq!(
-                config
-                    .capture_contract
-                    .bpf_capture_config()
-                    .ipv6_outbound_deny,
-                0,
-                "the old deny flag must remain clear so connect6 redirects to [::1]"
-            );
             assert!(
                 config
                     .capture_config
@@ -10983,10 +11313,6 @@ mod tests {
             let config = NodeAgentConfig::from_env_config(&local_pod)
                 .expect("node-agent config should parse");
             assert!(
-                !config.capture_contract.ipv6_outbound_deny,
-                "non-NodeWaypoint modes do not fail-close IPv6 egress"
-            );
-            assert!(
                 !config
                     .capture_config
                     .include_cidrs
@@ -11002,7 +11328,7 @@ mod tests {
         // #2013: a plain Ambient (LocalPod) node-agent with UDP capture enabled
         // must publish the per-pod registry so the mesh proxy's per-pod-netns UDP
         // producer can discover enrolled pods — WITHOUT taking on the NodeWaypoint
-        // ipv6-deny / connect4-deferral posture (which stays gated on
+        // `::/0` include / connect4-deferral posture (which stays gated on
         // `node_waypoint_in_netns`).
         let local_pod = EnvConfig {
             node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
@@ -11020,10 +11346,6 @@ mod tests {
                 assert!(
                     config.node_waypoint_pod_registry_dir.is_some(),
                     "Ambient/LocalPod + UDP capture must publish the per-pod registry (#2013)"
-                );
-                assert!(
-                    !config.capture_contract.ipv6_outbound_deny,
-                    "the UDP producer must not flip the NodeWaypoint ipv6-deny posture"
                 );
                 assert!(
                     !config
@@ -11151,7 +11473,9 @@ mod tests {
         // cannot run eBPF (would take the iptables `handle_fallback()` path) must
         // refuse startup: `handle_fallback()` never runs the pod watcher that
         // populates the registry, so producer startup or disabled stale-rule
-        // cleanup would poll an empty directory (#2013).
+        // cleanup would poll an empty directory (#2013). The predicate has no
+        // UDP-enabled input: disabled capture still runs the registry-dependent
+        // stale-rule cleanup, so fallback refuses in both cases.
         assert!(
             ambient_udp_registry_requires_ebpf(false, true, true),
             "no eBPF + configured Ambient lifecycle registry must fail closed"
@@ -11163,10 +11487,6 @@ mod tests {
             !ambient_udp_registry_requires_ebpf(true, true, true),
             "eBPF-capable node publishes the registry; must not refuse"
         );
-
-        // Disabled capture still runs the registry-dependent stale-rule cleanup,
-        // so fallback must refuse rather than strand retained guards forever.
-        assert!(ambient_udp_registry_requires_ebpf(false, true, true));
 
         // NodeWaypoint also has a registry-backed in-netns path, but its
         // established iptables fallback remains valid when Ambient lifecycle
@@ -11717,11 +12037,10 @@ mod tests {
         // Scope the pending-failure assertions to this pod's redirect operation
         // rather than the whole map: the failure registry is process-global.
         let retry_pending = || {
-            PENDING_CAPTURE_FAILURES.contains_key(&pending_capture_failure_key(
+            has_capture_failure(
                 &pod_state_key(&pod_states, "pod-uid-1"),
-                CAPTURE_FAILURE_INBOUND_REDIRECT_UPDATE,
-                CAPTURE_FAILURE_DETAIL_INBOUND_REDIRECT,
-            ))
+                &CaptureFailureOp::InboundRedirectUpdate,
+            )
         };
 
         drive(&mut backend, vec![8080]);
@@ -12808,10 +13127,9 @@ mod tests {
             },
             &failed_cleanup_state,
         );
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
         retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
@@ -12929,10 +13247,9 @@ mod tests {
             },
             &failed_cleanup_state,
         );
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
         retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
         assert!(!has_pending_removal_blocking_failure(&state_key));
@@ -13371,10 +13688,9 @@ mod tests {
         backend
             .update_pod_ip(ip, &PodInfo::for_capture(15001, true, true))
             .unwrap();
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
         assert!(!record_removed_pod_detach_result(
             &state_key,
@@ -13860,10 +14176,9 @@ mod tests {
             cgroup_v2_available: false,
             bpf_fs_available: false,
         };
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-        shutdown_tx
-            .send(true)
-            .expect("watch channel should be open");
+        let (shutdown_tx, _shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
+        shutdown_tx.shutdown();
         let startup_ready = Arc::new(AtomicBool::new(false));
         let metrics = NodeAgentMetrics::default();
 
@@ -13937,8 +14252,8 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments,
+            pod_ips: Vec::new(),
         };
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("node-agent-cni.sock");
@@ -14046,7 +14361,8 @@ mod tests {
             cgroup_v2_available: false,
             bpf_fs_available: false,
         };
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let startup_ready = Arc::new(AtomicBool::new(false));
         let metrics = NodeAgentMetrics::default();
         let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
@@ -14111,7 +14427,7 @@ mod tests {
 
     #[test]
     fn cleanup_commands_try_ipv6_teardown_when_ip6tables_disabled() {
-        let commands = cleanup_commands_for_plan(true, false);
+        let commands = cleanup_commands_for_plan(true);
 
         assert!(
             commands.iter().any(|cmd| cmd.contains("ip6tables")),
@@ -14127,7 +14443,7 @@ mod tests {
 
     #[test]
     fn cleanup_commands_wrap_required_ipv6_teardown_best_effort() {
-        let commands = cleanup_commands_for_plan(true, false);
+        let commands = cleanup_commands_for_plan(true);
 
         assert!(
             commands
@@ -14144,13 +14460,14 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_emits_v6_ip_routing_unconditionally_not_ip6tables_gated() {
+    fn udp_teardown_emits_v6_ip_routing_unconditionally_not_ip6tables_gated() {
         // codex r3: the raw `ip -6 rule/route del` UDP routing teardown must be
         // emitted UNCONDITIONALLY (NOT wrapped in the `ip6tables` availability
         // probe) — `ip -6` can remove the fwmark rule + local route even when
         // `ip6tables` is missing, so gating it would leak routing state and keep
-        // marked UDP diverting after shutdown.
-        let commands = cleanup_commands_for_plan(true, true);
+        // marked UDP diverting after shutdown. The fallback's shutdown cleanup
+        // carries no UDP state (#7254); the pre-setup teardown owns it.
+        let commands = udp_pre_setup_teardown_commands(true);
 
         // The v6 `ip -6 rule del`/`ip -6 route del` must appear as standalone
         // commands, NOT embedded inside an `if command -v ip6tables` wrapper.
@@ -14265,7 +14582,8 @@ mod tests {
             cgroup_v2_available: false,
             bpf_fs_available: false,
         };
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let startup_ready = Arc::new(AtomicBool::new(false));
         let metrics = NodeAgentMetrics::default();
         let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
@@ -14323,11 +14641,7 @@ mod tests {
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let metrics = NodeAgentMetrics::default();
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
-        remember_pending_capture_failure(
-            &state_key,
-            CAPTURE_FAILURE_POD_DETACH,
-            CAPTURE_FAILURE_DETAIL_POD_DETACH,
-        );
+        remember_capture_failure(&state_key, CaptureFailureOp::PodDetach);
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED);
         let cgroup_root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
@@ -16033,12 +16347,10 @@ mod tests {
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
 
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
-        let failure_key = pending_capture_failure_key(
-            &state_key,
-            CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE,
-            &node_probe_port_update_failure_detail(&[8080]),
-        );
-        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        let failure_key = CaptureFailureOp::NodeProbePortUpdate {
+            desired_ports: vec![8080],
+        };
+        assert!(has_capture_failure(&state_key, &failure_key));
         assert!(
             !backend.node_probe_ports.contains(&(ip, 8080)),
             "failed update must leave the probe-port exemption absent until retry"
@@ -16051,7 +16363,7 @@ mod tests {
         backend.fail_update_node_probe_port = false;
         retry_pending_node_probe_port_updates(&mut backend, &pod_states, &metrics);
 
-        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(!has_capture_failure(&state_key, &failure_key));
         assert!(
             backend.node_probe_ports.contains(&(ip, 8080)),
             "retry must write the missing probe-port exemption without another pod event"
@@ -16175,9 +16487,8 @@ mod tests {
         cleanup_partial_pod_enrollment(&mut backend, &pod_states, &metrics, "pod-uid-1", &state);
 
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
-        let failure_key =
-            pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
-        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        let failure_key = CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip));
+        assert!(has_capture_failure(&state_key, &failure_key));
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
@@ -16197,7 +16508,7 @@ mod tests {
         };
         retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
-        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(!has_capture_failure(&state_key, &failure_key));
         assert!(
             !backend.pod_ips.contains_key(&ip),
             "retry must remove stale pod IP left by partial enrollment cleanup"
@@ -16790,6 +17101,15 @@ mod tests {
         );
     }
 
+    fn synced_readiness_with_udp_proof(udp_proof: UdpRegistryProof) -> NodeAgentReadiness {
+        NodeAgentReadiness {
+            startup_ready: Arc::new(AtomicBool::new(false)),
+            pod_sync: PodSyncState::Synced,
+            topology_ready: true,
+            udp_proof,
+        }
+    }
+
     #[test]
     fn udp_migration_marker_retracts_before_post_relist_mutation() {
         let registry = tempfile::tempdir().unwrap();
@@ -16813,21 +17133,19 @@ mod tests {
             trust_domain: "cluster.local".to_string(),
             node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
         };
-        let mut published = true;
-        let mut retraction_pending = false;
+        let mut readiness = synced_readiness_with_udp_proof(UdpRegistryProof::Published);
 
         assert!(
             retract_udp_migration_registry_sync_for_mutation(
-                Some("generation-1"),
                 true,
                 &config,
-                &mut published,
-                &mut retraction_pending,
+                &mut readiness,
                 UdpRegistryMutationLane::WatchApply,
             )
             .unwrap()
         );
-        assert!(!published);
+        assert_eq!(readiness.udp_proof, UdpRegistryProof::Withheld);
+        assert!(!readiness.startup_ready.load(Ordering::Acquire));
         assert!(!registry.path().join(".udp-registry-synced").exists());
 
         assert!(
@@ -16841,11 +17159,9 @@ mod tests {
         );
         assert!(
             !retract_udp_migration_registry_sync_for_mutation(
-                Some("generation-1"),
                 false,
                 &config,
-                &mut published,
-                &mut retraction_pending,
+                &mut readiness,
                 UdpRegistryMutationLane::WatchDelete,
             )
             .unwrap()
@@ -16869,19 +17185,17 @@ mod tests {
             node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
         };
         let pod_states = DashMap::new();
-        let mut published = false;
-        let mut retraction_pending = false;
+        let mut readiness = synced_readiness_with_udp_proof(UdpRegistryProof::Withheld);
 
         publish_udp_migration_registry_sync_with_recovery(
             "generation-1",
             &pod_states,
             &config,
             None,
-            &mut published,
-            &mut retraction_pending,
+            &mut readiness,
         );
-        assert!(!published);
-        assert!(!retraction_pending);
+        assert_eq!(readiness.udp_proof, UdpRegistryProof::Withheld);
+        assert!(!readiness.startup_ready.load(Ordering::Acquire));
         assert!(!registry.path().join(".udp-registry-synced").exists());
 
         std::fs::remove_dir(registry.path().join("hostile-entry")).unwrap();
@@ -16890,11 +17204,10 @@ mod tests {
             &pod_states,
             &config,
             None,
-            &mut published,
-            &mut retraction_pending,
+            &mut readiness,
         );
-        assert!(published);
-        assert!(!retraction_pending);
+        assert_eq!(readiness.udp_proof, UdpRegistryProof::Published);
+        assert!(readiness.startup_ready.load(Ordering::Acquire));
         assert!(registry.path().join(".udp-registry-synced").is_file());
     }
 
@@ -16921,7 +17234,8 @@ mod tests {
         let mut owner = InitializedBackendOwner::borrowed(&mut backend, false);
         let startup_ready = Arc::new(AtomicBool::new(false));
         let readiness = startup_ready.clone();
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let events = futures_util::stream::iter(vec![Ok(Event::Init), Ok(Event::InitDone)]);
 
         let error = run_with_pod_stream(
@@ -16936,8 +17250,10 @@ mod tests {
             },
             None,
             None,
-            Arc::new(AtomicBool::new(true)),
-            true,
+            IngressTopologyApplication {
+                topology_ready: true,
+                datapath_published: true,
+            },
             Some("generation-1".to_string()),
             None,
             events,
@@ -16974,7 +17290,8 @@ mod tests {
         let mut owner = InitializedBackendOwner::borrowed(&mut backend, false);
         let startup_ready = Arc::new(AtomicBool::new(false));
         let readiness = startup_ready.clone();
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let stop = shutdown_tx.clone();
         let events = futures_util::stream::iter(vec![Ok(Event::Init), Ok(Event::InitDone)])
             .chain(futures_util::stream::pending());
@@ -16991,8 +17308,10 @@ mod tests {
             },
             None,
             None,
-            Arc::new(AtomicBool::new(true)),
-            true,
+            IngressTopologyApplication {
+                topology_ready: true,
+                datapath_published: true,
+            },
             Some("generation-1".to_string()),
             None,
             events,
@@ -17008,7 +17327,7 @@ mod tests {
             }
             assert!(readiness.load(Ordering::Acquire));
             assert!(registry.path().join(".udp-registry-synced").is_file());
-            let _ = stop.send(true);
+            stop.shutdown();
         };
 
         let (result, ()) = tokio::join!(run, recover);
@@ -17041,7 +17360,8 @@ mod tests {
         {
             let mut owner = InitializedBackendOwner::borrowed(&mut backend, false);
             let startup_ready = Arc::new(AtomicBool::new(false));
-            let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+            let (shutdown_tx, _shutdown_rx) =
+                crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
             let events = futures_util::stream::pending::<Result<Event<Pod>, kube_watcher::Error>>();
             let run = run_with_pod_stream(
                 &mut owner,
@@ -17055,8 +17375,10 @@ mod tests {
                 },
                 None,
                 None,
-                Arc::new(AtomicBool::new(true)),
-                true,
+                IngressTopologyApplication {
+                    topology_ready: true,
+                    datapath_published: true,
+                },
                 Some("generation-1".to_string()),
                 None,
                 events,
@@ -17064,7 +17386,7 @@ mod tests {
             );
             let stop = async {
                 tokio::task::yield_now().await;
-                let _ = shutdown_tx.send(true);
+                shutdown_tx.shutdown();
             };
             let (result, ()) = tokio::join!(run, stop);
             result.expect("shutdown remains clean while fail-closed state is preserved");
@@ -17100,40 +17422,118 @@ mod tests {
                 trust_domain: "cluster.local".to_string(),
                 node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
             };
-            let mut published = true;
-            let mut retraction_pending = false;
+            let mut readiness = synced_readiness_with_udp_proof(UdpRegistryProof::Published);
+            assert!(readiness.publish());
 
             assert!(
                 retract_udp_migration_registry_sync_for_mutation(
-                    Some("generation-1"),
                     true,
                     &config,
-                    &mut published,
-                    &mut retraction_pending,
+                    &mut readiness,
                     lane,
                 )
                 .is_err(),
                 "{lane:?} must refuse its mutation when marker retraction fails"
             );
-            assert!(retraction_pending);
-            assert!(published);
+            // A possibly-visible stale marker is never a valid proof.
+            assert_eq!(readiness.udp_proof, UdpRegistryProof::RetractionPending);
+            assert!(!readiness.readiness());
+            assert!(!readiness.startup_ready.load(Ordering::Acquire));
 
             std::fs::remove_dir(registry.path().join(".udp-registry-synced")).unwrap();
             assert!(
                 retract_udp_migration_registry_sync_for_mutation(
-                    Some("generation-1"),
                     true,
                     &config,
-                    &mut published,
-                    &mut retraction_pending,
+                    &mut readiness,
                     lane,
                 )
                 .unwrap(),
                 "{lane:?} must resume only after retraction succeeds"
             );
-            assert!(!retraction_pending);
-            assert!(!published);
+            assert_eq!(readiness.udp_proof, UdpRegistryProof::Withheld);
+            assert!(!readiness.startup_ready.load(Ordering::Acquire));
         }
+    }
+
+    #[test]
+    fn udp_registry_proof_transition_table() {
+        use UdpRegistryProof::{NotRequired, Published, RetractionPending, Withheld};
+        use UdpRegistryProofEvent::{Absent, PublicationDeclined, RetractionFailed};
+        let published = UdpRegistryProofEvent::Published;
+        for (from, event, to) in [
+            (NotRequired, Absent, NotRequired),
+            (NotRequired, PublicationDeclined, NotRequired),
+            (NotRequired, published, NotRequired),
+            (NotRequired, RetractionFailed, NotRequired),
+            (Withheld, Absent, Withheld),
+            (Withheld, PublicationDeclined, Withheld),
+            (Withheld, published, Published),
+            (Withheld, RetractionFailed, RetractionPending),
+            (Published, Absent, Withheld),
+            (Published, PublicationDeclined, RetractionPending),
+            (Published, published, Published),
+            (Published, RetractionFailed, RetractionPending),
+            (RetractionPending, Absent, Withheld),
+            (RetractionPending, PublicationDeclined, RetractionPending),
+            (RetractionPending, published, Published),
+            (RetractionPending, RetractionFailed, RetractionPending),
+        ] {
+            assert_eq!(from.transition(event), to, "{from:?} --{event:?}-->");
+        }
+    }
+
+    /// Without a migration generation the marker never gates readiness or
+    /// mutations. On the base, the node-identity refresh's failed marker clear
+    /// still set `retraction_pending`: `/health` was withdrawn and the pod
+    /// event arm (gated on that flag) stalled for good, because the retry
+    /// lane returned early for a missing generation without clearing it.
+    #[test]
+    fn udp_proof_failures_without_a_migration_generation_keep_readiness_and_pod_events() {
+        let registry = tempfile::tempdir().unwrap();
+        // A directory at the marker path makes every clear attempt fail.
+        std::fs::create_dir(registry.path().join(".udp-registry-synced")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let mut readiness = synced_readiness_with_udp_proof(UdpRegistryProof::for_generation(None));
+        assert_eq!(readiness.udp_proof, UdpRegistryProof::NotRequired);
+        assert!(readiness.publish());
+
+        // The identity-refresh closure records exactly this event when its
+        // marker clear fails.
+        readiness.record_udp_proof(UdpRegistryProofEvent::RetractionFailed);
+        assert_eq!(readiness.udp_proof, UdpRegistryProof::NotRequired);
+        assert!(
+            !readiness.udp_proof.retraction_pending(),
+            "the pod event arm and retraction retry are gated on a pending retraction"
+        );
+        assert!(readiness.startup_ready.load(Ordering::Acquire));
+
+        // Every mutation lane proceeds without touching the marker.
+        for mutation_requires_refresh in [false, true] {
+            assert!(
+                !retract_udp_migration_registry_sync_for_mutation(
+                    mutation_requires_refresh,
+                    &config,
+                    &mut readiness,
+                    UdpRegistryMutationLane::WatchApply,
+                )
+                .expect("no generation means no marker fence"),
+                "no generation means nothing to republish"
+            );
+        }
+        assert_eq!(readiness.udp_proof, UdpRegistryProof::NotRequired);
+        assert!(readiness.startup_ready.load(Ordering::Acquire));
+        assert!(registry.path().join(".udp-registry-synced").is_dir());
     }
 
     #[test]
@@ -17470,11 +17870,11 @@ mod tests {
         assert!(keep.exists(), "unsafe UID must not delete a sibling entry");
     }
 
-    /// `apply_cni_request` ADD without Kubernetes metadata is a no-op and
-    /// returns `Ok`. The kube-rs watcher (or the metadata-enriched ADD path)
-    /// performs the real enrollment once labels/annotations are available.
+    /// `apply_cni_request` ADD without Kubernetes metadata cannot decide
+    /// enrollment, so it fails closed and touches nothing
+    /// (GHSA-7x6j-vmqm-xx2v).
     #[test]
-    fn apply_cni_request_add_with_empty_labels_returns_ok_and_skips_enrollment() {
+    fn apply_cni_request_add_without_metadata_fails_closed_and_skips_enrollment() {
         use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
@@ -17500,14 +17900,17 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: Some("eth0".to_string()),
             netns_path: Some("/var/run/netns/cni-1".to_string()),
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
-        assert_eq!(resp, CniRpcResponse::Ok);
+        assert!(
+            matches!(resp, CniRpcResponse::Error { .. }),
+            "a metadata-free ADD must fail closed, got {resp:?}"
+        );
         assert!(
             !pod_states.contains_key("pod-uid-1"),
-            "empty labels intentionally short-circuit enrollment; the watcher reconciles later"
+            "a metadata-free ADD must not enroll"
         );
         assert_eq!(
             metrics.pods_enrolled.load(Ordering::Relaxed),
@@ -17517,7 +17920,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_cni_request_add_with_empty_labels_does_not_unenroll_existing_pod() {
+    fn apply_cni_request_add_without_metadata_does_not_unenroll_existing_pod() {
         use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
@@ -17562,12 +17965,12 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: Some("eth0".to_string()),
             netns_path: Some("/var/run/netns/cni-1".to_string()),
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
 
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
-        assert_eq!(resp, CniRpcResponse::Ok);
+        assert!(matches!(resp, CniRpcResponse::Error { .. }), "got {resp:?}");
         assert!(pod_states.contains_key("pod-uid-1"));
         assert!(backend.detached_pods.is_empty());
         assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 0);
@@ -17595,12 +17998,14 @@ mod tests {
     fn cni_add_during_relist_marks_tracked_pod_seen() {
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         pod_states.insert("pod-uid-1".to_string(), enrolled_pod_state("pod-uid-1"));
-        let mut init_seen = Some(HashSet::new());
+        let mut pod_sync = PodSyncState::Relisting(HashSet::new());
 
         // The CNI apply path reports the UID it actually enrolled.
-        mark_relist_seen_from_cni_add(&mut init_seen, Some("pod-uid-1"));
+        mark_relist_seen_from_cni_add(&mut pod_sync, Some("pod-uid-1"));
 
-        let seen = init_seen.take().expect("relist in progress");
+        let PodSyncState::Relisting(seen) = pod_sync else {
+            panic!("relist in progress");
+        };
         assert!(
             watcher_init_stale_uids(&pod_states, &seen).is_empty(),
             "CNI-enrolled pod should survive the current watcher InitDone sweep"
@@ -17611,12 +18016,14 @@ mod tests {
     fn unrelated_cni_add_during_relist_does_not_mask_stale_pod() {
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         pod_states.insert("pod-uid-1".to_string(), enrolled_pod_state("pod-uid-1"));
-        let mut init_seen = Some(HashSet::new());
+        let mut pod_sync = PodSyncState::Relisting(HashSet::new());
 
         // A CNI ADD that enrolled a *different* pod marks only that UID.
-        mark_relist_seen_from_cni_add(&mut init_seen, Some("pod-uid-2"));
+        mark_relist_seen_from_cni_add(&mut pod_sync, Some("pod-uid-2"));
 
-        let seen = init_seen.take().expect("relist in progress");
+        let PodSyncState::Relisting(seen) = pod_sync else {
+            panic!("relist in progress");
+        };
         assert_eq!(
             watcher_init_stale_uids(&pod_states, &seen),
             vec!["pod-uid-1".to_string()],
@@ -17683,8 +18090,8 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: Some("eth0".to_string()),
             netns_path: Some("/var/run/netns/cni-1".to_string()),
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
 
         let (response, enrolled_uid) =
@@ -17694,9 +18101,11 @@ mod tests {
         assert!(pod_states.contains_key("api-uid-x"));
 
         // And it survives the InitDone sweep once marked.
-        let mut init_seen = Some(HashSet::new());
-        mark_relist_seen_from_cni_add(&mut init_seen, enrolled_uid.as_deref());
-        let seen = init_seen.take().expect("relist in progress");
+        let mut pod_sync = PodSyncState::Relisting(HashSet::new());
+        mark_relist_seen_from_cni_add(&mut pod_sync, enrolled_uid.as_deref());
+        let PodSyncState::Relisting(seen) = pod_sync else {
+            panic!("relist in progress");
+        };
         assert!(watcher_init_stale_uids(&pod_states, &seen).is_empty());
         CNI_OWNED_ATTACHMENTS.remove(&cni_owned_attachment_key(
             &pod_states,
@@ -17706,13 +18115,177 @@ mod tests {
         ));
     }
 
-    /// `apply_cni_request` ADD without a pod_uid maps to `Rejected` (we
-    /// cannot key BPF state without a UID) — the watcher fallback handles
-    /// the reconcile by selector instead. Kubelet treats `Rejected` as a
-    /// soft signal but the CNI binary still emits a success result so
-    /// pod networking isn't broken.
+    fn cni_add_test_config(cgroup_root: &std::path::Path) -> NodeAgentConfig {
+        NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        }
+    }
+
+    fn cni_add_test_pod(
+        uid: &str,
+        opted_in: bool,
+        status_pod_ip: Option<&str>,
+    ) -> k8s_openapi::api::core::v1::Pod {
+        use k8s_openapi::api::core::v1::{Pod, PodSpec, PodStatus};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+        Pod {
+            metadata: ObjectMeta {
+                name: Some("alpha".to_string()),
+                namespace: Some("default".to_string()),
+                uid: Some(uid.to_string()),
+                labels: opted_in.then(|| {
+                    [("ferrum.io/mesh".to_string(), "enabled".to_string())]
+                        .into_iter()
+                        .collect()
+                }),
+                ..Default::default()
+            },
+            spec: Some(PodSpec::default()),
+            status: Some(PodStatus {
+                pod_ip: status_pod_ip.map(str::to_string),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn cni_add_test_request(
+        uid: Option<&str>,
+        pod_ips: Vec<std::net::IpAddr>,
+    ) -> crate::cni::rpc::CniRpcRequest {
+        crate::cni::rpc::CniRpcRequest {
+            verb: crate::cni::rpc::RpcVerb::Add,
+            network_name: "ferrum-mesh".to_string(),
+            pod_namespace: "default".to_string(),
+            pod_name: "alpha".to_string(),
+            pod_uid: uid.map(str::to_string),
+            container_id: "ctr-ghsa".to_string(),
+            ifname: Some("eth0".to_string()),
+            netns_path: Some("/var/run/netns/cni-ghsa".to_string()),
+            valid_attachments: Vec::new(),
+            pod_ips,
+        }
+    }
+
+    /// GHSA-7x6j-vmqm-xx2v: `status.podIP` is not published until after ADD
+    /// returns, so the primary CNI's `prevResult` address carried on the
+    /// request is what enrolls the pod at ADD. It also wins over a stale status
+    /// address left by a previous sandbox.
     #[test]
-    fn apply_cni_request_add_without_pod_uid_returns_rejected() {
+    fn cni_add_enrolls_from_the_prev_result_address_before_status_has_one() {
+        let _cni_guard = lock_cni_ownership_tests();
+        crate::cni::ownership::reset_cni_ownership_store_for_tests();
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        for (uid, status_ip) in [("ghsa-uid-1", None), ("ghsa-uid-2", Some("10.0.0.5"))] {
+            let mut backend = MockEbpfBackend::default();
+            backend.load_programs().unwrap();
+            let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+            let metrics = NodeAgentMetrics::default();
+            let cgroup_root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(cgroup_root.path().join(format!("kubepods/pod{uid}"))).unwrap();
+            let config = cni_add_test_config(cgroup_root.path());
+            let pod = cni_add_test_pod(uid, true, status_ip);
+            let req = cni_add_test_request(
+                Some(uid),
+                vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 9))],
+            );
+
+            let (response, enrolled_uid) =
+                apply_cni_add_from_pod(&mut backend, &pod_states, &config, &metrics, &req, &pod);
+            assert_eq!(response, crate::cni::rpc::CniRpcResponse::Ok, "{uid}");
+            assert_eq!(enrolled_uid.as_deref(), Some(uid));
+            let state = pod_states.get(uid).expect("enrolled at ADD");
+            assert_eq!(
+                state.pod_ip,
+                Some(std::net::Ipv4Addr::new(10, 0, 0, 9)),
+                "{uid}: the CNI allocation for this sandbox is the enrolled address"
+            );
+            drop(state);
+            CNI_OWNED_ATTACHMENTS.remove(&cni_owned_attachment_key(
+                &pod_states,
+                "ferrum-mesh",
+                "ctr-ghsa",
+                "eth0",
+            ));
+        }
+    }
+
+    /// GHSA-7x6j-vmqm-xx2v: an opted-in pod whose enrollment does not land (no
+    /// dedicated host route for its address here) fails ADD closed instead of
+    /// starting outside the mesh. A pod that is not opted in is unaffected.
+    #[test]
+    fn cni_add_fails_closed_when_an_opted_in_pod_does_not_enroll() {
+        let _cni_guard = lock_cni_ownership_tests();
+        crate::cni::ownership::reset_cni_ownership_store_for_tests();
+        // No veth override: the production resolver finds no route to the
+        // documentation address on the test host.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podghsa-no-route")).unwrap();
+        let config = cni_add_test_config(cgroup_root.path());
+        let address = vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            203, 0, 113, 78,
+        ))];
+
+        let pod = cni_add_test_pod("ghsa-no-route", true, None);
+        let req = cni_add_test_request(Some("ghsa-no-route"), address.clone());
+        let (response, enrolled_uid) =
+            apply_cni_add_from_pod(&mut backend, &pod_states, &config, &metrics, &req, &pod);
+        assert_eq!(
+            response,
+            crate::cni::rpc::CniRpcResponse::Error {
+                reason: CNI_ADD_ENROLLMENT_INCOMPLETE_REASON.to_string(),
+            }
+        );
+        assert!(enrolled_uid.is_none());
+        assert!(!pod_states.contains_key("ghsa-no-route"));
+        assert!(backend.tc_attachments.is_empty());
+        forget_failed_pod_enrollment(&pod_state_key(&pod_states, "ghsa-no-route"));
+
+        let pod = cni_add_test_pod("ghsa-not-meshed", false, None);
+        let req = cni_add_test_request(Some("ghsa-not-meshed"), address);
+        let (response, enrolled_uid) =
+            apply_cni_add_from_pod(&mut backend, &pod_states, &config, &metrics, &req, &pod);
+        assert_eq!(response, crate::cni::rpc::CniRpcResponse::Ok);
+        assert!(enrolled_uid.is_none());
+    }
+
+    /// GHSA-7x6j-vmqm-xx2v: a CNI UID the API pod does not carry means the API
+    /// view does not describe this sandbox yet; ADD fails closed rather than
+    /// passing the sandbox through unevaluated.
+    #[test]
+    fn cni_add_with_mismatched_pod_uid_fails_closed() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = cni_add_test_config(std::path::Path::new("/nonexistent"));
+        let pod = cni_add_test_pod("api-uid", true, None);
+        let req = cni_add_test_request(Some("other-uid"), Vec::new());
+        let (response, enrolled_uid) =
+            apply_cni_add_from_pod(&mut backend, &pod_states, &config, &metrics, &req, &pod);
+        assert!(
+            matches!(response, crate::cni::rpc::CniRpcResponse::Error { .. }),
+            "got {response:?}"
+        );
+        assert!(enrolled_uid.is_none());
+        assert!(pod_states.is_empty());
+    }
+
+    /// A metadata-free ADD without a pod UID also fails closed: ferrum-cni
+    /// passes a `Rejected` ADD through, which would start the pod unevaluated.
+    #[test]
+    fn apply_cni_request_add_without_pod_uid_fails_closed() {
         use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
@@ -17738,19 +18311,20 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: Some("eth0".to_string()),
             netns_path: Some("/var/run/netns/cni-1".to_string()),
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
         match resp {
-            CniRpcResponse::Rejected { reason } => {
+            CniRpcResponse::Error { reason } => {
                 assert!(
-                    reason.contains("K8S_POD_UID"),
-                    "rejection message should explain why; got: {reason}"
+                    reason.contains("fails closed"),
+                    "refusal should explain why; got: {reason}"
                 );
             }
-            other => panic!("expected Rejected, got {other:?}"),
+            other => panic!("expected Error, got {other:?}"),
         }
+        assert!(pod_states.is_empty());
     }
 
     /// `apply_cni_request` DEL tears down BPF state for a pod the watcher
@@ -17801,8 +18375,8 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: Some("eth0".to_string()),
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
         assert_eq!(resp, CniRpcResponse::Ok);
@@ -17862,8 +18436,8 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: Some("eth0".to_string()),
             netns_path: Some("/var/run/netns/cni-1".to_string()),
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
             CniRpcResponse::Rejected { reason } => {
@@ -17918,6 +18492,9 @@ mod tests {
     fn apply_cni_request_status_succeeds_without_attachment_fields() {
         use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
 
+        // STATUS consults the process-global durable ownership store.
+        let _cni_guard = lock_cni_ownership_tests();
+        crate::cni::ownership::reset_cni_ownership_store_for_tests();
         let mut backend = MockEbpfBackend::default();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let metrics = NodeAgentMetrics::default();
@@ -17942,8 +18519,8 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         assert_eq!(
             apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req),
@@ -18024,11 +18601,11 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: vec![CniValidAttachment {
                 container_id: "ctr-live".to_string(),
                 ifname: "eth0".to_string(),
             }],
+            pod_ips: Vec::new(),
         };
         assert_eq!(
             apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req),
@@ -18108,8 +18685,8 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         assert_eq!(
             apply_cni_request(
@@ -18182,11 +18759,11 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: vec![CniValidAttachment {
                 container_id: "ctr-live".to_string(),
                 ifname: "eth0".to_string(),
             }],
+            pod_ips: Vec::new(),
         };
 
         match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
@@ -18295,8 +18872,8 @@ mod tests {
                 container_id: String::new(),
                 ifname: None,
                 netns_path: None,
-                args: HashMap::new(),
                 valid_attachments: Vec::new(),
+                pod_ips: Vec::new(),
             },
         );
         match response {
@@ -18375,11 +18952,11 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: vec![CniValidAttachment {
                 container_id: "../escape".to_string(),
                 ifname: "eth0".to_string(),
             }],
+            pod_ips: Vec::new(),
         };
         match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
             CniRpcResponse::Error { reason } => {
@@ -18500,8 +19077,8 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         assert_eq!(
             apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req),
@@ -18626,8 +19203,8 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
 
         match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
@@ -18727,7 +19304,10 @@ mod tests {
             err.contains("invalid"),
             "expected sanitized rejection: {err}"
         );
-        assert!(cni_ownership_store_is_rejected());
+        assert!(matches!(
+            cni_ownership_store_state(),
+            crate::cni::ownership::CniOwnershipStoreState::Rejected { .. }
+        ));
 
         let mut backend = MockEbpfBackend::default();
         backend
@@ -18768,8 +19348,8 @@ mod tests {
                 container_id: String::new(),
                 ifname: None,
                 netns_path: None,
-                args: HashMap::new(),
                 valid_attachments: Vec::new(),
+                pod_ips: Vec::new(),
             },
         ) {
             CniRpcResponse::Error { reason } => {
@@ -19086,12 +19666,8 @@ mod tests {
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
 
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
-        let failure_key = pending_capture_failure_key(
-            &state_key,
-            CAPTURE_FAILURE_POD_IP_UPDATE,
-            CAPTURE_FAILURE_DETAIL_POD_IP,
-        );
-        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        let failure_key = CaptureFailureOp::PodIpUpdate(std::net::Ipv4Addr::new(10, 0, 0, 8));
+        assert!(has_capture_failure(&state_key, &failure_key));
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
@@ -19110,7 +19686,7 @@ mod tests {
             pod_states.get("pod-uid-1").unwrap().pod_ip,
             Some(std::net::Ipv4Addr::new(10, 0, 0, 8))
         );
-        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(!has_capture_failure(&state_key, &failure_key));
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_READY
@@ -19169,9 +19745,8 @@ mod tests {
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
         handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-1");
 
-        let failure_key =
-            pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, "10.0.0.8");
-        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        let failure_key = CaptureFailureOp::PodIpRemove(std::net::IpAddr::from([10, 0, 0, 8]));
+        assert!(has_capture_failure(&state_key, &failure_key));
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
@@ -19186,7 +19761,7 @@ mod tests {
         backend.fail_remove_pod_ip = false;
         retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
-        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(!has_capture_failure(&state_key, &failure_key));
         assert!(
             !backend.pod_ips.contains_key(&ip),
             "retry must remove the stale pod-IP map entry"
@@ -19266,14 +19841,14 @@ mod tests {
 
             handle_pod_removed(&mut backend, &pod_states, &config, &metrics, &pod_uid);
 
-            let detail = ip_v4
-                .map(|ip| ip.to_string())
-                .or_else(|| ip_v6.map(|ip| ip.to_string()))
-                .unwrap();
-            let failure_key =
-                pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &detail);
+            let failure_key = CaptureFailureOp::PodIpRemove(
+                ip_v4
+                    .map(std::net::IpAddr::V4)
+                    .or_else(|| ip_v6.map(std::net::IpAddr::V6))
+                    .unwrap(),
+            );
             assert!(
-                PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+                has_capture_failure(&state_key, &failure_key),
                 "scope clear failure must keep the durable pod_ip_remove key ({family})"
             );
             assert!(has_pending_removal_blocking_failure(&state_key));
@@ -19298,7 +19873,7 @@ mod tests {
             // path) but scope remains, so the pending key must stay.
             retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
             assert!(
-                PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+                has_capture_failure(&state_key, &failure_key),
                 "retry must keep the pending key while scope clear fails ({family})"
             );
             assert!(
@@ -19312,7 +19887,7 @@ mod tests {
             backend.fail_clear_pod_inbound_ports = false;
             retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
-            assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+            assert!(!has_capture_failure(&state_key, &failure_key));
             if let Some(ip) = ip_v4 {
                 assert!(!backend.pod_inbound_ports.contains(&(ip, 8080)));
             }
@@ -19385,14 +19960,14 @@ mod tests {
                 );
             }
 
-            let detail = ip_v4
-                .map(|ip| ip.to_string())
-                .or_else(|| ip_v6.map(|ip| ip.to_string()))
-                .unwrap();
-            let failure_key =
-                pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &detail);
+            let failure_key = CaptureFailureOp::PodIpRemove(
+                ip_v4
+                    .map(std::net::IpAddr::V4)
+                    .or_else(|| ip_v6.map(std::net::IpAddr::V6))
+                    .unwrap(),
+            );
             assert!(
-                PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+                has_capture_failure(&state_key, &failure_key),
                 "pre-enrollment scope clear failure must stay pending ({family})"
             );
             if let Some(ip) = ip_v4 {
@@ -19417,7 +19992,7 @@ mod tests {
             };
             backend.fail_clear_pod_inbound_ports = false;
             retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
-            assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+            assert!(!has_capture_failure(&state_key, &failure_key));
             if let Some(ip) = ip_v4 {
                 assert!(!backend.pod_inbound_ports.contains(&(ip, 9090)));
             }
@@ -19470,13 +20045,11 @@ mod tests {
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
         handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-1");
 
-        let detail = node_probe_port_failure_detail(std::net::IpAddr::V4(ip), 8080);
-        let failure_key = pending_capture_failure_key(
-            &state_key,
-            CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE,
-            &detail,
-        );
-        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        let failure_key = CaptureFailureOp::NodeProbePortRemove {
+            ip: std::net::IpAddr::V4(ip),
+            port: 8080,
+        };
+        assert!(has_capture_failure(&state_key, &failure_key));
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
@@ -19485,7 +20058,7 @@ mod tests {
         backend.fail_remove_node_probe_port = false;
         retry_pending_node_probe_port_removals(&mut backend, &pod_states, &config, &metrics);
 
-        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(!has_capture_failure(&state_key, &failure_key));
         assert!(
             !backend.node_probe_ports.contains(&(ip, 8080)),
             "retry must remove stale probe-port map entry"
@@ -19513,20 +20086,12 @@ mod tests {
             .unwrap();
 
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
-        let failure_key =
-            pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
-        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
-        assert_eq!(
-            parse_pending_capture_failure_key(&failure_key)
-                .unwrap()
-                .detail,
-            ip.to_string()
-        );
+        let failure_key = CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip));
+        assert!(has_capture_failure(&state_key, &failure_key));
 
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
@@ -19541,7 +20106,7 @@ mod tests {
         };
         retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
-        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(!has_capture_failure(&state_key, &failure_key));
         assert!(
             !backend.pod_ips6.contains_key(&ip),
             "retry must remove stale IPv6 pod map entries"
@@ -19599,9 +20164,8 @@ mod tests {
         let old_state_key = pod_state_key(&pod_states, "pod-uid-1");
         handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-1");
 
-        let failure_key =
-            pending_capture_failure_key(&old_state_key, CAPTURE_FAILURE_POD_IP_REMOVE, "10.0.0.8");
-        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        let failure_key = CaptureFailureOp::PodIpRemove(std::net::IpAddr::from([10, 0, 0, 8]));
+        assert!(has_capture_failure(&old_state_key, &failure_key));
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
@@ -19629,7 +20193,7 @@ mod tests {
         retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
         assert!(
-            !PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+            !has_capture_failure(&old_state_key, &failure_key),
             "re-owned pod IP should clear stale removal failure instead of keeping readiness degraded"
         );
         assert_eq!(
@@ -19733,7 +20297,8 @@ mod tests {
             cgroup_v2_available: false,
             bpf_fs_available: false,
         };
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let startup_ready = Arc::new(AtomicBool::new(false));
         let metrics = Arc::new(NodeAgentMetrics::default());
 
@@ -19784,10 +20349,9 @@ mod tests {
             cgroup_v2_available: false,
             bpf_fs_available: true,
         };
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-        shutdown_tx
-            .send(true)
-            .expect("watch channel should be open");
+        let (shutdown_tx, _shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
+        shutdown_tx.shutdown();
         let startup_ready = Arc::new(AtomicBool::new(false));
         let metrics = NodeAgentMetrics::default();
 
@@ -19818,7 +20382,8 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_shutdown_blocks_until_signal() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let wait = wait_for_shutdown(&shutdown_tx);
         tokio::pin!(wait);
 
@@ -19827,9 +20392,7 @@ mod tests {
             _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
         }
 
-        shutdown_tx
-            .send(true)
-            .expect("shutdown receiver should be live");
+        shutdown_tx.shutdown();
         tokio::time::timeout(std::time::Duration::from_secs(1), wait)
             .await
             .expect("shutdown wait should resolve after signal");
@@ -19845,7 +20408,8 @@ mod tests {
             admin_https_port: 0,
             ..EnvConfig::default()
         };
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let startup_ready = Arc::new(AtomicBool::new(false));
 
         let handles = start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready)
@@ -19858,7 +20422,8 @@ mod tests {
     #[tokio::test]
     async fn admin_listener_default_disabled_spawns_no_tasks() {
         let env_config = EnvConfig::default();
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let startup_ready = Arc::new(AtomicBool::new(false));
 
         let handles = start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready)
@@ -19876,7 +20441,8 @@ mod tests {
             admin_allowed_cidrs: "not-a-cidr".to_string(),
             ..EnvConfig::default()
         };
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let startup_ready = Arc::new(AtomicBool::new(false));
 
         let err = start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready)
@@ -19897,7 +20463,8 @@ mod tests {
             admin_http_port: blocked_port,
             ..EnvConfig::default()
         };
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let startup_ready = Arc::new(AtomicBool::new(false));
 
         let err =

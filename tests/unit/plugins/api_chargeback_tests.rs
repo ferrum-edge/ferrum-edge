@@ -58,6 +58,7 @@ fn make_summary(
         timestamp_received: "2025-01-01T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: consumer.map(|c| c.to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/test".to_string(),
@@ -79,12 +80,13 @@ fn make_summary(
         error_class: None,
         body_error_class: None,
         body_completed: false,
+        response_delivery: Default::default(),
         bytes_sent: 0,
         bytes_received: 0,
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -137,6 +139,7 @@ fn make_stream_summary(
         proxy_name: Some(proxy_name.to_string()),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: consumer.map(|c| c.to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         backend_target: "127.0.0.1:9000".to_string(),
         backend_resolved_ip: None,
@@ -152,7 +155,7 @@ fn make_stream_summary(
         timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
         timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 
@@ -189,7 +192,11 @@ fn make_key_with_prices(
         ProtocolFamily::Stream => "stream",
     };
     format!(
-        "{}|{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
+        "{}.{}.{}.{}|{}|{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
+        consumer.len(),
+        scope.namespace.len(),
+        proxy_id.len(),
+        scope.currency.len(),
         consumer,
         scope.namespace,
         proxy_id,
@@ -254,12 +261,12 @@ fn test_pricing_constructor_diagnostics_render_without_document_content() {
         (
             json!({"bandwidth_pricing": {(hostile): true}}),
             "`bandwidth_pricing`",
-            "unknown key",
+            "unknown configuration key(s)",
         ),
         (
             json!({"stream_connection_pricing": {(hostile): 918273641}}),
             "`stream_connection_pricing`",
-            "unknown key",
+            "unknown configuration key(s)",
         ),
         (
             json!({"pricing_tiers": [hostile]}),
@@ -579,7 +586,7 @@ fn test_bandwidth_pricing_rejects_unknown_key() {
         }
     });
     let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
-    assert!(err.contains("unknown key"));
+    assert!(err.contains("unknown configuration key"));
 }
 
 /// GHSA-8478: misspelled top-level pricing dimensions and unknown
@@ -836,6 +843,42 @@ async fn test_global_plugin_qualifies_same_proxy_id_by_matched_namespace() {
 
 // --- Registry tests ---
 
+/// Text dimensions that contain `|` must not merge into one registry entry.
+/// Consumer identities and currency labels may contain `|`, so without length
+/// prefixes these two admitted inputs concatenate to the same key bytes.
+#[test]
+fn test_registry_keys_do_not_collide_across_pipe_bearing_names() {
+    let registry = ChargebackRegistry::new();
+    let cases = [
+        ("a|ferrum|proxy-a|200|http|b", "c"),
+        ("a", "b|ferrum|proxy-a|200|http|c"),
+    ];
+    for (consumer, currency) in cases {
+        registry.record_http(
+            &scope_for(currency, "ferrum"),
+            consumer,
+            "proxy-a",
+            "My API",
+            200,
+            0.00001,
+            0,
+            0,
+            0.0,
+            0.0,
+        );
+    }
+    assert_eq!(registry.entries.len(), 2);
+    for (consumer, currency) in cases {
+        let entry = registry
+            .entries
+            .iter()
+            .find(|entry| &*entry.consumer == consumer)
+            .expect("each consumer keeps its own entry");
+        assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
+        assert_eq!(&*entry.currency, currency);
+    }
+}
+
 #[test]
 fn test_registry_records_charge() {
     let registry = ChargebackRegistry::new();
@@ -1036,8 +1079,9 @@ fn test_registry_stale_eviction() {
         0.0,
     );
 
-    // A completed export collects the entry's counters (issue #5276); only then
-    // does idle age make it evictable.
+    // Two delivered exports confirm the entry's counters were collected
+    // (issue #5276); only then does idle age make it evictable.
+    registry.render_prometheus().unwrap();
     registry.render_prometheus().unwrap();
 
     // Evict with zero TTL should remove everything
@@ -3381,8 +3425,11 @@ async fn test_reload_overlap_old_stream_disconnect_after_new_websocket_stays_par
             io_side: None,
             error_class: None,
             consumer_username: Some(CONSUMER.to_string()),
+            principal_origin: Some(
+                ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer,
+            ),
             auth_method: None,
-            metadata: HashMap::new(),
+            metadata: ferrum_edge::plugins::MetadataMap::default(),
             proxy_lifecycle_generation: Some(2),
         })
         .await;
@@ -3534,8 +3581,11 @@ async fn test_effective_chain_records_each_protocol_path_exactly_once() {
             io_side: None,
             error_class: None,
             consumer_username: Some(CONSUMER.to_string()),
+            principal_origin: Some(
+                ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer,
+            ),
             auth_method: None,
-            metadata: HashMap::new(),
+            metadata: ferrum_edge::plugins::MetadataMap::default(),
             proxy_lifecycle_generation: None,
         })
         .await;
@@ -3841,6 +3891,122 @@ fn record_identity(registry: &ChargebackRegistry, consumer: &str) {
     );
 }
 
+/// Empty bandwidth-only disconnects must not occupy invisible, unevictable
+/// identity rows and force a later real charge into overflow.
+#[test]
+fn test_zero_byte_websocket_disconnects_do_not_exhaust_identity_budget() {
+    for (bytes_sent, bytes_received) in [(100, 0), (0, 200), (100, 200)] {
+        let registry = ChargebackRegistry::new();
+        registry.configure(5, 3600, 0, 2, TEST_MAX_BYTES);
+        let s = scope();
+
+        // Exercise the registry path used by on_ws_disconnect with bandwidth
+        // pricing enabled, across more distinct consumers than max_entries.
+        for index in 0..8 {
+            registry.record_websocket_bandwidth(
+                &s,
+                &format!("empty-ws-{index}"),
+                "proxy-a",
+                "My API",
+                0,
+                0,
+                0.001,
+                0.001,
+            );
+        }
+        assert!(registry.entries.is_empty());
+        assert_eq!(registry.reserved_entries_for_tests(), 0);
+        assert_eq!(registry.retained_bytes_for_tests(), 0);
+
+        registry.render_prometheus().unwrap();
+        registry.render_prometheus().unwrap();
+        assert_eq!(registry.evict_stale(0), 0);
+        assert!(registry.entries.is_empty());
+        assert_eq!(registry.reserved_entries_for_tests(), 0);
+        assert_eq!(registry.retained_bytes_for_tests(), 0);
+
+        // Either direction alone is activity, even though WebSocket bandwidth
+        // does not count a call. Preserve the consumer's own row and counters.
+        registry.record_websocket_bandwidth(
+            &s,
+            "active-ws",
+            "proxy-a",
+            "My API",
+            bytes_sent,
+            bytes_received,
+            0.001,
+            0.001,
+        );
+        let key = make_key_with_prices(
+            "active-ws",
+            "proxy-a",
+            0,
+            ProtocolFamily::Http,
+            0.0,
+            0.001,
+            0.001,
+        );
+        let entry = registry.entries.get(&key).expect("real charge admitted");
+        assert_eq!(entry.call_count.load(Ordering::Relaxed), 0);
+        assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), bytes_sent);
+        assert_eq!(
+            entry.bytes_received_total.load(Ordering::Relaxed),
+            bytes_received
+        );
+        drop(entry);
+
+        // The earlier empty exports cannot acknowledge this later charge.
+        let retained_bytes = registry.retained_bytes_for_tests();
+        assert!(retained_bytes > 0);
+        assert_eq!(registry.evict_stale(0), 0);
+        assert_eq!(registry.entries.len(), 1);
+        assert!(registry.entries.contains_key(&key));
+        assert_eq!(registry.reserved_entries_for_tests(), 1);
+        assert_eq!(registry.retained_bytes_for_tests(), retained_bytes);
+    }
+}
+
+/// Zero bytes alone do not make HTTP calls or stream connections empty records,
+/// including when their per-call price is zero.
+#[test]
+fn test_zero_byte_calls_and_stream_connections_still_consume_identity_budget() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 0, 2, TEST_MAX_BYTES);
+    let s = scope();
+    registry.record_http(
+        &s,
+        "http-user",
+        "proxy-a",
+        "My API",
+        200,
+        0.0,
+        0,
+        0,
+        0.001,
+        0.001,
+    );
+    registry.record_stream(
+        &s,
+        "stream-user",
+        "proxy-a",
+        "My API",
+        0.0,
+        0,
+        0,
+        0.001,
+        0.001,
+    );
+
+    assert_eq!(registry.evict_stale(0), 0);
+    assert_eq!(registry.entries.len(), 2);
+    assert_eq!(registry.reserved_entries_for_tests(), 2);
+    for entry in registry.entries.iter() {
+        assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
+        assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), 0);
+        assert_eq!(entry.bytes_received_total.load(Ordering::Relaxed), 0);
+    }
+}
+
 /// Distinct identities beyond `max_entries` must not grow the registry, and
 /// their charges must survive in the fixed-cardinality aggregate row.
 #[test]
@@ -4056,8 +4222,9 @@ fn test_eviction_releases_budget_capacity() {
     let saturated_bytes = registry.retained_bytes_for_tests();
     assert!(saturated_bytes > 0);
 
-    // Acknowledge collection first: idle age alone no longer deletes billing
-    // rows (issue #5276).
+    // Confirm collection first (two delivered exports): idle age alone no
+    // longer deletes billing rows (issue #5276).
+    registry.render_prometheus().unwrap();
     registry.render_prometheus().unwrap();
 
     // Evict everything (ttl of 0 nanos makes every entry stale).
@@ -4391,6 +4558,70 @@ fn test_request_before_plugin_then_reload_honors_configured_shard_amount() {
     );
 }
 
+/// Issue #7109: shared Admin / CP / config-load validation must never claim
+/// the process-global registry — neither for a config it rejects nor for one
+/// it accepts — so the first accepted generation sizes the hot map with the
+/// node's configured shard count. The `OnceLock` is shared by every test in
+/// this binary, so the assertions run in a fresh child process.
+#[test]
+fn validation_never_claims_the_global_registry() {
+    const CHILD: &str = "FERRUM_TEST_CHARGEBACK_REGISTRY_CHILD";
+    const CONFIGURED_SHARDS: usize = 64;
+    if std::env::var_os(CHILD).is_some() {
+        assert!(
+            try_global_registry().is_none(),
+            "a fresh process starts with the registry unclaimed"
+        );
+        let valid = json!({
+            "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.001 }],
+        });
+        ferrum_edge::plugins::validate_plugin_config("api_chargeback", &valid)
+            .expect("valid config passes validation");
+        for invalid in [
+            json!({ "currency": "" }),
+            json!({ "pricing_tiers": [{ "status_codes": [200], "price_per_call": -1.0 }] }),
+            json!({}),
+            json!({ "unknown_key": true, "pricing_tiers": [] }),
+        ] {
+            ferrum_edge::plugins::validate_plugin_config("api_chargeback", &invalid)
+                .expect_err("invalid config is rejected");
+            assert!(
+                ApiChargeback::new_with_shard_amount(&invalid, "ferrum", CONFIGURED_SHARDS)
+                    .is_err(),
+                "invalid config fails construction"
+            );
+        }
+        assert!(
+            try_global_registry().is_none(),
+            "validation and failed construction must leave the registry unclaimed"
+        );
+
+        let plugin = ApiChargeback::new_with_shard_amount(&valid, "ferrum", CONFIGURED_SHARDS)
+            .expect("accepted construction");
+        assert_eq!(
+            plugin.registry_shard_amount_for_tests(),
+            CONFIGURED_SHARDS,
+            "the first accepted construction sizes the registry"
+        );
+        assert!(try_global_registry().is_some());
+        return;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("unit::plugins::api_chargeback_tests::validation_never_claims_the_global_registry")
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
 /// Admin `GET /charges` must use the non-owning try path, not claim the
 /// registry with auto sharding.
 #[test]
@@ -4408,18 +4639,29 @@ fn test_admin_charges_path_is_non_owning_when_unconfigured() {
         charges_block.contains("try_global_registry"),
         "GET /charges must use try_global_registry"
     );
+    // The route hands the optional registry to `charges_response`, which renders
+    // the empty shapes when no plugin has configured the registry.
+    let renderer_idx = admin
+        .find("async fn charges_response(")
+        .expect("charges_response renderer");
+    let renderer_end = admin[renderer_idx..]
+        .find("\n}\n")
+        .map(|offset| renderer_idx + offset)
+        .expect("charges_response body end");
+    let renderer = &admin[renderer_idx..renderer_end];
     assert!(
-        charges_block.contains("empty_charges_json")
-            && charges_block.contains("empty_charges_prometheus"),
+        renderer.contains("empty_charges_json") && renderer.contains("empty_charges_prometheus"),
         "GET /charges must render empty shapes without claiming the registry"
     );
     // `try_global_registry()` contains the substring `global_registry()`; strip
     // the non-owning helper so this assertion only catches owning calls.
-    let without_try = charges_block.replace("try_global_registry()", "");
-    assert!(
-        !without_try.contains("global_registry()"),
-        "GET /charges must not call owning global_registry()"
-    );
+    for (label, block) in [("route", charges_block), ("renderer", renderer)] {
+        let without_try = block.replace("try_global_registry()", "");
+        assert!(
+            !without_try.contains("global_registry()"),
+            "GET /charges {label} must not call owning global_registry()"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5069,7 +5311,10 @@ fn test_uncollected_idle_entry_is_retained_by_eviction() {
     let row = &rendered["consumers"]["user-a"]["proxies"]["proxy-a"];
     assert_eq!(row["total_calls"], 1, "the retained row stays billable");
 
-    // The export above collected it, so the next pass may reclaim it.
+    // One delivery does not confirm collection; a second one (here a cached
+    // re-serve of the same document) does, so the next pass may reclaim it.
+    assert_eq!(registry.evict_stale(0), 0);
+    registry.render_json().unwrap();
     assert_eq!(registry.evict_stale(0), 1);
     assert!(registry.entries.is_empty());
     assert_eq!(registry.reserved_entries_for_tests(), 0);
@@ -5095,7 +5340,8 @@ fn test_charges_recorded_after_the_last_export_survive_eviction() {
         .map(|entry| entry.call_count.load(Ordering::Relaxed));
     assert_eq!(calls, Some(2), "the second billed call is retained");
 
-    // Collect again, and the row becomes reclaimable.
+    // Collect again (twice, to confirm), and the row becomes reclaimable.
+    registry.render_json().unwrap();
     registry.render_json().unwrap();
     assert_eq!(registry.evict_stale(0), 1);
 }
@@ -5148,10 +5394,12 @@ fn test_either_export_format_acknowledges_collection() {
         let registry = ChargebackRegistry::new();
         registry.configure(600, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
         record_identity(&registry, "user-a");
-        if json_collector {
-            registry.render_json().unwrap();
-        } else {
-            registry.render_prometheus().unwrap();
+        for _ in 0..2 {
+            if json_collector {
+                registry.render_json().unwrap();
+            } else {
+                registry.render_prometheus().unwrap();
+            }
         }
         let evicted = registry.evict_stale(0);
         assert_eq!(
@@ -5221,4 +5469,2296 @@ fn test_uncollected_retained_entries_is_exported_without_identities() {
     assert!(line.ends_with(" 2"), "both idle rows are uncollected");
     assert!(prometheus.contains(&format!("# TYPE {gauge} gauge")));
     assert!(!line.contains("consumer="), "the gauge carries no labels");
+}
+
+// --- Production-launch review fixes ---
+
+/// A one-proxy gateway configuration whose `api_chargeback` uses `pricing`.
+fn reservation_config(
+    proxy_id: &str,
+    proxy_name: &str,
+    pricing: serde_json::Value,
+) -> GatewayConfig {
+    let mut proxy = chargeback_chain_proxy(proxy_id, "/billing", "cb-reserve");
+    proxy.name = Some(proxy_name.to_string());
+    GatewayConfig {
+        proxies: vec![proxy],
+        plugin_configs: vec![chargeback_chain_plugin(
+            "cb-reserve",
+            proxy_id,
+            "USD",
+            pricing,
+        )],
+        ..GatewayConfig::default()
+    }
+}
+
+fn with_reservation_budget(config: &GatewayConfig, budget: usize) -> GatewayConfig {
+    let mut config = config.clone();
+    for plugin in &mut config.plugin_configs {
+        if plugin.plugin_name == "api_chargeback" {
+            plugin.config["max_retained_bytes"] = json!(budget);
+        }
+    }
+    config
+}
+
+fn reserve_generation(
+    registry: &Arc<ChargebackRegistry>,
+    config: &GatewayConfig,
+) -> ferrum_edge::plugins::api_chargeback::OverflowReservation {
+    let reservation = registry
+        .prepare_overflow_reservations(&with_reservation_budget(
+            config,
+            registry.max_retained_bytes_for_test(),
+        ))
+        .unwrap_or_else(|error| panic!("reserve generation: {error}"));
+    reservation.activate();
+    reservation
+}
+
+fn total_registry_calls(registry: &ChargebackRegistry) -> u64 {
+    registry
+        .entries
+        .iter()
+        .map(|entry| entry.value().call_count.load(Ordering::Relaxed))
+        .sum()
+}
+
+/// api_chargeback-SOL-1 / PR6842-SOL-1: the configured overflow matrix is
+/// reserved before ordinary rows can consume it, so every refused tuple —
+/// including ones first seen after saturation — folds into an overflow row
+/// instead of being dropped.
+#[test]
+fn test_reserved_overflow_matrix_absorbs_every_refused_tuple() {
+    use ferrum_edge::plugins::api_chargeback::overflow_reservation_matrix;
+
+    let config = reservation_config(
+        "proxy-a",
+        "My API",
+        json!({"pricing_tiers": [{"status_codes": [200, 201, 202], "price_per_call": 0.00001}]}),
+    );
+    let matrix = overflow_reservation_matrix(&config);
+    assert_eq!(matrix.len(), 3, "one overflow row per priced status");
+    let matrix_bytes: usize = matrix.values().sum();
+    let budget = 4096;
+    assert!(
+        2 * matrix_bytes <= budget,
+        "the scenario budget admits the protected matrix ({matrix_bytes} bytes)"
+    );
+
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, budget);
+    let _reservation = reserve_generation(&registry, &config);
+    assert_eq!(registry.retained_bytes_for_tests(), matrix_bytes);
+
+    for index in 0..500 {
+        record_identity(&registry, &format!("user-{index}"));
+    }
+    // Tuples first seen after the ordinary share is exhausted.
+    for status in [201, 202] {
+        registry.record_http(
+            &scope(),
+            &format!("late-{status}"),
+            "proxy-a",
+            "My API",
+            status,
+            0.00001,
+            0,
+            0,
+            0.0,
+            0.0,
+        );
+    }
+
+    assert!(registry.retained_bytes_for_tests() <= budget);
+    assert_eq!(
+        total_registry_calls(&registry),
+        502,
+        "no billable call is lost"
+    );
+    assert!(matrix.keys().all(|key| registry.entries.contains_key(key)));
+    let rendered: serde_json::Value =
+        serde_json::from_str(&registry.render_json().unwrap()).unwrap();
+    assert_eq!(rendered["registry"]["dropped_charges_total"], 0);
+}
+
+/// The overflow matrix covers bandwidth-only statuses with one shared row and
+/// a stream proxy with its single stream row.
+#[test]
+fn test_overflow_matrix_is_bounded_by_configuration() {
+    use ferrum_edge::plugins::api_chargeback::overflow_reservation_matrix;
+
+    let http = reservation_config(
+        "proxy-bw",
+        "Bandwidth API",
+        json!({
+            "pricing_tiers": [{"status_codes": [200, 204], "price_per_call": 0.001}],
+            "bandwidth_pricing": {"price_per_byte_received": 0.000001}
+        }),
+    );
+    assert_eq!(
+        overflow_reservation_matrix(&http).len(),
+        3,
+        "two priced statuses plus the shared status-0 bandwidth row"
+    );
+
+    let stream = GatewayConfig {
+        proxies: vec![chargeback_chain_stream_proxy("proxy-tcp", "cb-stream")],
+        plugin_configs: vec![chargeback_chain_plugin(
+            "cb-stream",
+            "proxy-tcp",
+            "USD",
+            json!({
+                "stream_connection_pricing": {"price_per_connection": 0.5},
+                "bandwidth_pricing": {"price_per_byte_sent": 0.000001}
+            }),
+        )],
+        ..GatewayConfig::default()
+    };
+    assert_eq!(overflow_reservation_matrix(&stream).len(), 1);
+}
+
+/// A `max_retained_bytes` that cannot hold twice the overflow matrix (the live
+/// generation plus a pricing reload's next one) is refused at admission.
+#[test]
+fn test_budget_below_twice_the_overflow_matrix_is_refused() {
+    use ferrum_edge::plugins::api_chargeback::validate_composition;
+
+    let pricing = |budget: u64| {
+        json!({
+            "pricing_tiers": [{"status_codes": [200, 201, 202], "price_per_call": 0.00001}],
+            "max_retained_bytes": budget
+        })
+    };
+    let errors = validate_composition(&reservation_config("proxy-a", "My API", pricing(2048)))
+        .expect_err("a budget below twice the matrix must be refused");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`max_retained_bytes`") && error.contains("overflow")),
+        "{errors:?}"
+    );
+    validate_composition(&reservation_config("proxy-a", "My API", pricing(4096)))
+        .unwrap_or_else(|errors| panic!("a budget holding the matrix is admitted: {errors:?}"));
+}
+
+fn single_tier_config(price_per_call: f64) -> GatewayConfig {
+    reservation_config(
+        "proxy-a",
+        "My API",
+        json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": price_per_call}]}),
+    )
+}
+
+fn dropped_charges(registry: &ChargebackRegistry) -> serde_json::Value {
+    let rendered: serde_json::Value =
+        serde_json::from_str(&registry.render_json().unwrap()).unwrap();
+    rendered["registry"]["dropped_charges_total"].clone()
+}
+
+/// PR6842-SOL-1 (round 2): a reload whose new overflow rows do not fit beside
+/// the billing state the registry already retains is refused before it is
+/// published, instead of reserving bytes retained history occupies and then
+/// dropping current-generation charges.
+#[test]
+fn test_reload_whose_overflow_rows_do_not_fit_beside_retained_history_is_refused() {
+    let budget = 4096;
+    let generation_a = single_tier_config(0.00001);
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, budget);
+    let _reservation = reserve_generation(&registry, &generation_a);
+    for index in 0..500 {
+        record_identity(&registry, &format!("user-{index}"));
+    }
+    assert_eq!(total_registry_calls(&registry), 500);
+
+    // Generation B reprices and adds two statuses: three new overflow rows.
+    let generation_b = reservation_config(
+        "proxy-a",
+        "My API",
+        json!({"pricing_tiers": [{"status_codes": [200, 201, 202], "price_per_call": 0.00002}]}),
+    );
+    let error = match registry
+        .prepare_overflow_reservations(&with_reservation_budget(&generation_b, budget))
+    {
+        Err(error) => error,
+        Ok(_) => panic!("B's overflow rows must not fit beside the retained rows"),
+    };
+    assert!(
+        error.contains("`max_retained_bytes`") && error.contains("retained"),
+        "{error}"
+    );
+
+    // The same reload against a registry with free space is admitted.
+    let fresh = Arc::new(ChargebackRegistry::new());
+    fresh.configure(5, 3600, 500, TEST_MAX_ENTRIES, budget);
+    let _fresh_reservation = reserve_generation(&fresh, &generation_b);
+    assert_eq!(dropped_charges(&registry), 0);
+}
+
+/// PR6842-SOL-1 (round 2): repeated same-sized repricing consumes free space
+/// with each generation's overflow row; once the next one would not fit, the
+/// reload is refused, and every accepted generation loses nothing.
+#[test]
+fn test_repeated_repricing_is_refused_once_retained_history_fills_the_budget() {
+    let budget = 4096;
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, budget);
+    let reservation_a = reserve_generation(&registry, &single_tier_config(0.00001));
+    for index in 0..500 {
+        record_identity(&registry, &format!("user-{index}"));
+    }
+
+    let generation_b = single_tier_config(0.00002);
+    let _reservation_b = reserve_generation(&registry, &generation_b);
+    drop(reservation_a);
+    registry.record_http(
+        &scope(),
+        "after-b",
+        "proxy-a",
+        "My API",
+        200,
+        0.00002,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+    assert_eq!(total_registry_calls(&registry), 501);
+    assert_eq!(dropped_charges(&registry), 0, "generation B lost nothing");
+
+    let generation_c = single_tier_config(0.00003);
+    assert!(
+        registry
+            .prepare_overflow_reservations(&with_reservation_budget(&generation_c, budget))
+            .is_err(),
+        "generation C's overflow row no longer fits"
+    );
+}
+
+fn record_generation_b(registry: &ChargebackRegistry, consumer: &str) {
+    registry.record_http(
+        &scope(),
+        consumer,
+        "proxy-a",
+        "My API",
+        200,
+        0.00002,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+}
+
+/// #6891: a current-generation overflow row stays pinned during eviction,
+/// including when the pass removes ordinary rows and records another charge.
+/// It never needs a second byte reservation.
+#[test]
+fn test_charge_on_a_pinned_overflow_row_during_eviction_is_kept() {
+    let budget = 4096;
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, budget);
+    let reservation_a = reserve_generation(&registry, &single_tier_config(0.00001));
+    for index in 0..500 {
+        record_identity(&registry, &format!("user-{index}"));
+    }
+    let _reservation_b = reserve_generation(&registry, &single_tier_config(0.00002));
+    drop(reservation_a);
+    record_generation_b(&registry, "after-b");
+    registry.render_prometheus().unwrap();
+    registry.render_prometheus().unwrap();
+    let overflow_before = by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL);
+    let ordinary_rows = registry.reserved_entries_for_tests();
+
+    // Every row is idle and collected; the pass unlinks the ordinary rows.
+    // The current overflow row and its exported history remain pinned.
+    let evicted = registry.evict_stale_interleaved_for_tests(
+        0,
+        || {},
+        || record_generation_b(&registry, "during-eviction"),
+    );
+
+    assert_eq!(
+        by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL),
+        overflow_before + 1,
+        "the charge is recorded on the pinned overflow row"
+    );
+    assert_eq!(dropped_charges(&registry), 0);
+    assert_eq!(
+        evicted, ordinary_rows,
+        "the idle ordinary rows retire; the charged overflow group is kept"
+    );
+    assert!(registry.retained_bytes_for_tests() <= budget);
+}
+
+/// PR6842-MUSE-8 / MUSE-9: the live-registry fit check reads the candidate's
+/// own budget, refuses overflow rows that do not fit beside retained history,
+/// and does not refuse a budget lowered below occupancy when every reserved
+/// row already exists (that keeps draining through eviction).
+#[test]
+fn test_overflow_preparation_uses_the_candidate_budget() {
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, 4096);
+    let reservation_a = reserve_generation(&registry, &single_tier_config(0.00001));
+    for index in 0..500 {
+        record_identity(&registry, &format!("user-{index}"));
+    }
+
+    let expanded = reservation_config(
+        "proxy-a",
+        "My API",
+        json!({
+            "pricing_tiers": [{"status_codes": [200, 201, 202], "price_per_call": 0.00002}],
+            "max_retained_bytes": 4096
+        }),
+    );
+    assert!(
+        registry.prepare_overflow_reservations(&expanded).is_err(),
+        "the expanded matrix does not fit beside retained rows"
+    );
+
+    let lowered = reservation_config(
+        "proxy-a",
+        "My API",
+        json!({
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}],
+            "max_retained_bytes": 2048
+        }),
+    );
+    let _lowered_reservation = registry
+        .prepare_overflow_reservations(&lowered)
+        .expect("lowering the budget with every reserved row present is not refused");
+    drop(reservation_a);
+}
+
+/// PR6842-SOL-5: creating an aggregate overflow row never waits for an
+/// eviction pass. The record below runs while this thread holds the
+/// retirement lock exclusively; a blocking acquisition would never return.
+#[test]
+fn test_overflow_creation_during_an_eviction_pass_does_not_wait() {
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, 2, TEST_MAX_BYTES);
+    let _reservation = reserve_generation(&registry, &single_tier_config(0.00001));
+    record_identity(&registry, "old-user");
+    registry.render_prometheus().unwrap();
+    registry.render_prometheus().unwrap();
+    record_identity(&registry, "live-user");
+
+    // Both ordinary slots are taken, so this identity folds into the reserved
+    // overflow row, already created during staging.
+    let evicted = registry.evict_stale_interleaved_for_tests(
+        0,
+        || record_identity(&registry, "burst-user"),
+        || {},
+    );
+    assert_eq!(evicted, 1, "the idle, collected old-user group retires");
+    assert_eq!(by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL), 1);
+    assert!(registry.retained_bytes_for_tests() <= TEST_MAX_BYTES);
+    assert_eq!(dropped_charges(&registry), 0);
+}
+
+/// PR6842-MUSE-4: concurrent first creations of one aggregate row serialize
+/// under its shard lock, so a budget that holds one overflow row (but not two
+/// speculative reservations of it) loses nothing.
+#[test]
+fn test_concurrent_first_creation_of_one_overflow_row_drops_nothing() {
+    use ferrum_edge::plugins::api_chargeback::overflow_reservation_matrix;
+
+    let overflow_row_bytes: usize = overflow_reservation_matrix(&single_tier_config(0.00001))
+        .values()
+        .sum();
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(5, 3600, 500, 1, TEST_MAX_BYTES);
+    record_identity(&registry, "seed");
+    let seed_bytes = registry.retained_bytes_for_tests();
+    registry.configure(
+        5,
+        3600,
+        500,
+        1,
+        seed_bytes + overflow_row_bytes + overflow_row_bytes / 2,
+    );
+
+    let barrier = std::sync::Barrier::new(16);
+    std::thread::scope(|threads| {
+        for index in 0..16 {
+            let registry = &registry;
+            let barrier = &barrier;
+            threads.spawn(move || {
+                barrier.wait();
+                record_identity(registry, &format!("burst-{index}"));
+            });
+        }
+    });
+
+    assert_eq!(total_registry_calls(&registry), 17);
+    assert_eq!(by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL), 16);
+    assert_eq!(dropped_charges(&registry), 0);
+}
+
+/// api_chargeback-SOL-2: an idle, collected status row whose bandwidth series
+/// is still live must not be evicted on its own — the exported cumulative
+/// counter would otherwise decrease and read as a reset.
+#[test]
+fn test_idle_row_of_a_live_series_is_not_evicted_alone() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    let record = |status: u16, bytes_received: u64| {
+        registry.record_http(
+            &scope(),
+            "alice-live-series",
+            "proxy-live-series",
+            "API",
+            status,
+            0.0,
+            0,
+            bytes_received,
+            0.0,
+            0.001,
+        );
+    };
+    record(500, 100_000);
+    record(200, 1_000_000);
+    registry.render_prometheus().unwrap();
+    registry.render_prometheus().unwrap();
+    // Only the 200 row sees traffic after the exports.
+    record(200, 1);
+
+    assert_eq!(
+        registry.evict_stale(0),
+        0,
+        "the idle 500 row shares a live bandwidth series"
+    );
+    assert_eq!(registry.entries.len(), 2);
+    let document = registry.render_prometheus().unwrap();
+    assert_eq!(
+        prometheus_sample(
+            &document,
+            "ferrum_api_bytes_received_total",
+            "alice-live-series"
+        ),
+        Some(1_100_001.0),
+        "the cumulative counter must not decrease:\n{document}"
+    );
+
+    // Once every member is idle and confirmed collected, the group retires
+    // together.
+    registry.render_prometheus().unwrap();
+    assert_eq!(registry.evict_stale(0), 2);
+    assert!(registry.entries.is_empty());
+    assert_eq!(registry.reserved_entries_for_tests(), 0);
+}
+
+/// api_chargeback-SOL-2: a retired pricing generation shares its per-call
+/// series with the live generation and must not be evicted on its own.
+#[test]
+fn test_retired_pricing_generation_of_a_live_series_is_not_evicted_alone() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    let record = |price: f64| {
+        registry.record_http(
+            &scope(),
+            "bob-reprice",
+            "proxy-reprice",
+            "API",
+            200,
+            price,
+            0,
+            0,
+            0.0,
+            0.0,
+        );
+    };
+    record(0.01);
+    record(0.01);
+    registry.render_prometheus().unwrap();
+    registry.render_prometheus().unwrap();
+    // A pricing reload: new traffic lands on a new pricing-generation row.
+    record(0.02);
+
+    assert_eq!(registry.evict_stale(0), 0);
+    let document = registry.render_prometheus().unwrap();
+    assert_eq!(
+        prometheus_sample(
+            &document,
+            "ferrum_api_chargeable_calls_total",
+            "bob-reprice"
+        ),
+        Some(3.0),
+        "{document}"
+    );
+    registry.render_prometheus().unwrap();
+    assert_eq!(registry.evict_stale(0), 2);
+}
+
+/// Two idle, confirmed-collected rows of one bandwidth series, ready to retire.
+fn collected_live_series(registry: &ChargebackRegistry, consumer: &str) {
+    for (status, bytes) in [(500, 100_000), (200, 1_000_000)] {
+        registry.record_http(
+            &scope(),
+            consumer,
+            "proxy-race",
+            "API",
+            status,
+            0.0,
+            0,
+            bytes,
+            0.0,
+            0.001,
+        );
+    }
+    registry.render_prometheus().unwrap();
+    registry.render_prometheus().unwrap();
+}
+
+fn record_race_bytes(registry: &ChargebackRegistry, consumer: &str, status: u16, bytes: u64) {
+    registry.record_http(
+        &scope(),
+        consumer,
+        "proxy-race",
+        "API",
+        status,
+        0.0,
+        0,
+        bytes,
+        0.0,
+        0.001,
+    );
+}
+
+/// PR6842-SOL-2: a member refreshed after candidate selection but before
+/// removal revives its whole group; no sibling is removed.
+#[test]
+fn test_member_refreshed_during_eviction_revives_its_whole_group() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    collected_live_series(&registry, "carol-refresh");
+
+    let evicted = registry.evict_stale_interleaved_for_tests(
+        0,
+        || record_race_bytes(&registry, "carol-refresh", 200, 1),
+        || {},
+    );
+    assert_eq!(evicted, 0, "a refreshed member keeps its whole group");
+    assert_eq!(registry.entries.len(), 2);
+    let document = registry.render_prometheus().unwrap();
+    assert_eq!(
+        prometheus_sample(
+            &document,
+            "ferrum_api_bytes_received_total",
+            "carol-refresh"
+        ),
+        Some(1_100_001.0),
+        "{document}"
+    );
+}
+
+/// PR6842-SOL-2: a group that gains a row while its members are being removed
+/// is restored in full; a fresh row for a removed key is merged, not lost.
+#[test]
+fn test_group_revived_during_removal_is_restored_in_full() {
+    for (consumer, revive_status) in [("dave-new-member", 404), ("dave-same-key", 200)] {
+        let registry = ChargebackRegistry::new();
+        registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+        collected_live_series(&registry, consumer);
+
+        let evicted = registry.evict_stale_interleaved_for_tests(
+            0,
+            || {},
+            || record_race_bytes(&registry, consumer, revive_status, 7),
+        );
+        assert_eq!(evicted, 0, "{consumer}: a revived group keeps every member");
+        let document = registry.render_prometheus().unwrap();
+        assert_eq!(
+            prometheus_sample(&document, "ferrum_api_bytes_received_total", consumer),
+            Some(1_100_007.0),
+            "{consumer}: {document}"
+        );
+        assert_eq!(
+            registry.reserved_entries_for_tests(),
+            registry.entries.len(),
+            "{consumer}: one reservation per retained row"
+        );
+    }
+}
+
+/// The value of the first `family` sample labelled with `consumer`.
+fn prometheus_sample(document: &str, family: &str, consumer: &str) -> Option<f64> {
+    let prefix = format!("{family}{{");
+    let label = format!("consumer=\"{consumer}\"");
+    document
+        .lines()
+        .filter(|line| line.starts_with(&prefix))
+        .find(|line| line.contains(&label))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse().ok())
+}
+
+/// api_chargeback-CLAUDE-1: bandwidth pricing keeps WebSocket sessions on the
+/// parsed relay, so tunnel mode cannot change the billing basis.
+#[test]
+fn test_bandwidth_pricing_requires_the_parsed_websocket_relay() {
+    let framing = |config: serde_json::Value| {
+        ApiChargeback::new(&config, "ferrum")
+            .unwrap()
+            .requires_websocket_framing()
+    };
+    assert!(framing(
+        json!({"bandwidth_pricing": {"price_per_byte_sent": 0.001}})
+    ));
+    assert!(framing(json!({
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.001}],
+        "bandwidth_pricing": {"price_per_byte_sent": 0.0, "price_per_byte_received": 0.002}
+    })));
+    assert!(!framing(
+        json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.001}]})
+    ));
+    assert!(!framing(
+        json!({"stream_connection_pricing": {"price_per_connection": 0.5}})
+    ));
+}
+
+/// api_chargeback-CLAUDE-2: a gRPC terminal status present on the wire but
+/// unreadable by the gateway bills at the documented `500`, not the wire `200`.
+#[tokio::test]
+async fn test_unreadable_grpc_status_bills_the_500_tier() {
+    let config = json!({
+        "pricing_tiers": [
+            {"status_codes": [200], "price_per_call": 0.001},
+            {"status_codes": [500], "price_per_call": 0.008}
+        ]
+    });
+    let plugin = ApiChargeback::new(&config, "ferrum").unwrap();
+    let registry = global_registry();
+    let consumer = "grpc-billing-unreadable-user";
+    let proxy_id = "grpc-billing-unreadable";
+    let mut summary = make_grpc_summary(proxy_id, consumer, None);
+    summary.metadata.insert(
+        "grpc_status_unreadable".to_string(),
+        "compressed_trailer_frame".to_string(),
+    );
+
+    let outcome = ferrum_edge::plugins::chargeback::http_billing_outcome(&summary);
+    assert_eq!(outcome.status_code, 500);
+    assert_eq!(outcome.http_status_code, 200);
+    assert_eq!(outcome.grpc_status, None, "the raw status stays unset");
+
+    plugin.log(&summary).await;
+    let billed = make_key_with_prices(
+        consumer,
+        proxy_id,
+        500,
+        ProtocolFamily::Http,
+        0.008,
+        0.0,
+        0.0,
+    );
+    assert!(registry.entries.contains_key(&billed));
+    let success = make_key_with_prices(
+        consumer,
+        proxy_id,
+        200,
+        ProtocolFamily::Http,
+        0.001,
+        0.0,
+        0.0,
+    );
+    assert!(
+        !registry.entries.contains_key(&success),
+        "an unreadable status must not be billed as success"
+    );
+}
+
+/// api_chargeback-CLAUDE-3: rendering a document acknowledges nothing until
+/// its receipt is returned, and a cached re-serve carries the same receipt.
+#[test]
+fn test_pending_render_acknowledges_only_when_its_receipt_is_returned() {
+    for json_format in [true, false] {
+        let registry = ChargebackRegistry::new();
+        registry.configure(600, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+        record_identity(&registry, "user-a");
+        let render = || {
+            if json_format {
+                registry.render_json_pending().unwrap()
+            } else {
+                registry.render_prometheus_pending().unwrap()
+            }
+        };
+
+        let (document, receipt) = render();
+        assert_eq!(
+            registry.evict_stale(0),
+            0,
+            "an undelivered document collected nothing (json={json_format})"
+        );
+        let (cached, cached_receipt) = render();
+        assert_eq!(cached, document, "the retry is served from the cache");
+        assert_eq!(cached_receipt, receipt);
+
+        // PR6842-SOL-3: one delivery never confirms collection on its own.
+        registry.acknowledge_collection(receipt);
+        assert_eq!(
+            registry.evict_stale(0),
+            0,
+            "a single delivery does not confirm collection (json={json_format})"
+        );
+        registry.acknowledge_collection(cached_receipt);
+        assert_eq!(registry.evict_stale(0), 1, "json={json_format}");
+    }
+}
+
+/// api_chargeback-CLAUDE-3: the admin connection acknowledges a `/charges`
+/// document only once it has taken the complete body.
+#[tokio::test]
+async fn test_charges_delivery_ack_fires_only_once_the_body_is_taken() {
+    use ferrum_edge::plugins::api_chargeback::ChargesDeliveryAck;
+
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    record_identity(&registry, "user-a");
+    let (document, receipt) = registry.render_json_pending().unwrap();
+    let response_with_ack = || {
+        let mut response = hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from(
+            document.clone(),
+        )));
+        response
+            .extensions_mut()
+            .insert(ChargesDeliveryAck::new(Arc::clone(&registry), receipt));
+        response
+    };
+
+    ferrum_edge::_test_support::drop_guarded_admin_response_unpolled_for_test(response_with_ack());
+    assert_eq!(
+        registry.evict_stale(0),
+        0,
+        "a response dropped before its body was taken acknowledges nothing"
+    );
+
+    let body =
+        ferrum_edge::_test_support::collect_guarded_admin_response_for_test(response_with_ack())
+            .await;
+    assert_eq!(body.as_ref(), document.as_bytes());
+    // PR6842-SOL-3: taking the body is not proof the peer received it, so one
+    // delivery does not authorize eviction; a second delivery confirms it.
+    assert_eq!(
+        registry.evict_stale(0),
+        0,
+        "one delivered document does not confirm collection"
+    );
+    let _ =
+        ferrum_edge::_test_support::collect_guarded_admin_response_for_test(response_with_ack())
+            .await;
+    assert_eq!(
+        registry.evict_stale(0),
+        1,
+        "two delivered documents confirm collection"
+    );
+}
+
+/// GHSA-jjvr-vvwv-8qmh: only a designated collector's `GET /charges`
+/// acknowledges delivery. A `viewer` token without the `charges:collect` scope
+/// and a `FERRUM_ADMIN_JWT_VIEWER_SECRET` token (whose scope claims grant
+/// nothing) read the same document without moving the collection watermark,
+/// so an idle row nobody collected stays retained and counted.
+#[tokio::test]
+async fn test_only_collector_scoped_charges_reads_acknowledge_delivery() {
+    use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
+    use ferrum_edge::plugins::api_chargeback::CHARGES_COLLECT_SCOPE;
+
+    const PRIMARY: &str = "charges-collector-primary-secret-0123456789";
+    const VIEWER_KEY: &str = "charges-collector-viewer-secret-0123456789";
+    const ISSUER: &str = "charges-collector-test";
+
+    let manager = JwtManager::new(JwtConfig {
+        secret: PRIMARY.to_string(),
+        issuer: ISSUER.to_string(),
+        audience: None,
+        max_ttl_seconds: 3600,
+        algorithm: jsonwebtoken::Algorithm::HS256,
+    })
+    .with_viewer_secret(VIEWER_KEY.to_string())
+    .expect("distinct viewer secret");
+    let bearer = |secret: &str, role: &str, scope: Option<&str>| {
+        let now = chrono::Utc::now();
+        let mut claims = json!({
+            "iss": ISSUER,
+            "sub": "billing",
+            "role": role,
+            "iat": now.timestamp(),
+            "nbf": now.timestamp(),
+            "exp": (now + chrono::Duration::seconds(600)).timestamp(),
+            "jti": uuid::Uuid::new_v4().to_string(),
+        });
+        if let Some(scope) = scope {
+            claims["scope"] = json!(scope);
+        }
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        format!("Bearer {token}")
+    };
+
+    let registry = Arc::new(ChargebackRegistry::new());
+    // No render cache and a zero idle TTL: every read walks the registry, and
+    // every row is idle, so only collection decides eviction.
+    registry.configure(0, 0, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    record_identity(&registry, "user-a");
+
+    let read = |authorization: String| {
+        let manager = manager.clone();
+        let registry = Arc::clone(&registry);
+        async move {
+            let response = ferrum_edge::_test_support::charges_response_for_test(
+                &manager,
+                &authorization,
+                registry,
+                Some("format=json"),
+            )
+            .await
+            .expect("token verifies");
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+            let body =
+                ferrum_edge::_test_support::collect_guarded_admin_response_for_test(response).await;
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        }
+    };
+
+    for (label, authorization) in [
+        (
+            "viewer without the collector scope",
+            bearer(PRIMARY, "viewer", None),
+        ),
+        (
+            "admin without the collector scope",
+            bearer(PRIMARY, "admin", None),
+        ),
+        (
+            "viewer-key token claiming the collector scope",
+            bearer(VIEWER_KEY, "viewer", Some(CHARGES_COLLECT_SCOPE)),
+        ),
+    ] {
+        for _ in 0..2 {
+            let document = read(authorization.clone()).await;
+            assert_eq!(
+                document["consumers"]["user-a"]["proxies"]["proxy-a"]["total_calls"], 1,
+                "{label}: the reader still receives the billing data"
+            );
+        }
+        assert_eq!(
+            registry.evict_stale(0),
+            0,
+            "{label}: two reads must not make an uncollected row evictable"
+        );
+        let document = read(authorization).await;
+        assert_eq!(
+            document["registry"]["uncollected_retained_entries"], 1,
+            "{label}: the idle row is retained and counted as uncollected"
+        );
+    }
+
+    // The designated collector: one hand-off is still insufficient, the second
+    // confirms collection (issue #5276).
+    let collector = bearer(PRIMARY, "viewer", Some(CHARGES_COLLECT_SCOPE));
+    read(collector.clone()).await;
+    assert_eq!(registry.evict_stale(0), 0, "one collector delivery");
+    read(collector).await;
+    assert_eq!(registry.evict_stale(0), 1, "two collector deliveries");
+}
+
+/// api_chargeback-CLAUDE-4: a reload that invalidates every walk cannot keep
+/// one `/charges` render walking forever — each format stops after exactly
+/// `MAX_RENDER_ATTEMPTS` walks and returns its last document uncached.
+#[test]
+fn test_render_returns_after_bounded_walks_when_every_walk_is_invalidated() {
+    use ferrum_edge::plugins::api_chargeback::MAX_RENDER_ATTEMPTS;
+
+    let registry = ChargebackRegistry::new();
+    registry.configure(600, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    record_identity(&registry, "user-bounded");
+    registry.invalidate_every_render_walk_for_tests(true);
+    for json_format in [true, false] {
+        let before = registry.render_walks_for_tests();
+        let (document, _receipt) = if json_format {
+            registry.render_json_pending().unwrap()
+        } else {
+            registry.render_prometheus_pending().unwrap()
+        };
+        assert!(document.contains("user-bounded"), "{document}");
+        assert_eq!(
+            registry.render_walks_for_tests() - before,
+            MAX_RENDER_ATTEMPTS,
+            "json={json_format}"
+        );
+    }
+
+    // Nothing was cached, and without the churn one walk suffices.
+    registry.invalidate_every_render_walk_for_tests(false);
+    let before = registry.render_walks_for_tests();
+    registry.render_json_pending().unwrap();
+    assert_eq!(registry.render_walks_for_tests() - before, 1);
+}
+
+/// api_chargeback-CLAUDE-5: an interval whose sleep deadline could overflow is
+/// refused instead of panicking the singleton cleanup task.
+#[test]
+fn test_cleanup_interval_above_one_year_is_rejected() {
+    use ferrum_edge::plugins::api_chargeback::{MAX_CLEANUP_INTERVAL_SECS, SharedRegistryTunables};
+
+    let base = json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.001}]});
+    for value in [MAX_CLEANUP_INTERVAL_SECS + 1, u64::MAX] {
+        let mut config = base.clone();
+        config["cleanup_interval_seconds"] = json!(value);
+        let error = ApiChargeback::new(&config, "ferrum")
+            .err()
+            .unwrap_or_else(|| panic!("cleanup_interval_seconds={value} must be refused"));
+        assert!(error.contains("`cleanup_interval_seconds`"), "{error}");
+        assert!(SharedRegistryTunables::from_config(&config).is_err());
+    }
+
+    let mut at_max = base;
+    at_max["cleanup_interval_seconds"] = json!(MAX_CLEANUP_INTERVAL_SECS);
+    assert!(ApiChargeback::new(&at_max, "ferrum").is_ok());
+}
+
+/// #6891: staged rows own their bytes before publication, including a matrix
+/// larger than the live generation's headroom. Old-generation traffic cannot
+/// spend those bytes between admission and activation.
+#[test]
+fn test_staged_overflow_matrix_survives_prepublication_saturation() {
+    use ferrum_edge::plugins::api_chargeback::overflow_reservation_matrix;
+
+    let registry = Arc::new(ChargebackRegistry::new());
+    let budget = 8192;
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, budget);
+    let live = reserve_generation(&registry, &single_tier_config(0.00001));
+    let candidate = with_reservation_budget(
+        &reservation_config(
+            "proxy-a",
+            "My API",
+            json!({
+                "pricing_tiers": [{"status_codes": [200, 201, 202], "price_per_call": 0.00002}]
+            }),
+        ),
+        budget,
+    );
+    let matrix = overflow_reservation_matrix(&candidate);
+    let staged = registry.prepare_overflow_reservations(&candidate).unwrap();
+    assert!(matrix.keys().all(|key| registry.entries.contains_key(key)));
+    assert_eq!(registry.reserved_entries_for_tests(), 0);
+    let before: serde_json::Value = serde_json::from_str(&registry.render_json().unwrap()).unwrap();
+    assert!(
+        before["consumers"].as_object().unwrap().is_empty(),
+        "unused reservations are not billing rows"
+    );
+
+    // Saturate while the old cache/budgets are still serving. No call to
+    // staged.activate() has occurred yet.
+    for index in 0..500 {
+        record_identity(&registry, &format!("live-{index}"));
+    }
+    let bytes_before = registry.retained_bytes_for_tests();
+    let rows_before = registry.entries.len();
+    for status in [200, 201, 202] {
+        registry.record_http(
+            &scope(),
+            "new-generation",
+            "proxy-a",
+            "My API",
+            status,
+            0.00002,
+            0,
+            0,
+            0.0,
+            0.0,
+        );
+    }
+    assert_eq!(registry.retained_bytes_for_tests(), bytes_before);
+    assert_eq!(registry.entries.len(), rows_before);
+    assert_eq!(total_registry_calls(&registry), 503);
+    assert_eq!(dropped_charges(&registry), 0);
+    assert!(bytes_before <= budget);
+    staged.activate();
+    drop(live);
+}
+
+/// #6891: two distinct reserved rows can receive their first charges while a
+/// maintenance pass holds the retirement lock. Neither row needs a second
+/// reservation, and the pass cannot double-count either one.
+#[test]
+fn test_two_reserved_overflow_rows_record_during_one_eviction_pass() {
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, 1, 4096);
+    let config = reservation_config(
+        "proxy-a",
+        "My API",
+        json!({
+            "pricing_tiers": [{"status_codes": [200, 201], "price_per_call": 0.00001}]
+        }),
+    );
+    let _reservation = reserve_generation(&registry, &config);
+    record_identity(&registry, "collected-seed");
+    registry.render_prometheus().unwrap();
+    registry.render_prometheus().unwrap();
+    let bytes_before = registry.retained_bytes_for_tests();
+    let rows_before = registry.entries.len();
+    let evicted = registry.evict_stale_interleaved_for_tests(
+        0,
+        || {
+            for status in [200, 201] {
+                registry.record_http(
+                    &scope(),
+                    "during-pass",
+                    "proxy-a",
+                    "My API",
+                    status,
+                    0.00001,
+                    7,
+                    11,
+                    0.0,
+                    0.0,
+                );
+            }
+            assert_eq!(registry.retained_bytes_for_tests(), bytes_before);
+            assert_eq!(registry.entries.len(), rows_before);
+        },
+        || {},
+    );
+    assert_eq!(evicted, 1);
+    assert_eq!(by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL), 2);
+    assert_eq!(dropped_charges(&registry), 0);
+    assert_eq!(registry.entries.len(), 2);
+    assert_eq!(registry.reserved_entries_for_tests(), 0);
+}
+
+/// #6891: concurrent first use of a prepared row does not create or reserve
+/// anything on the request path, even when the ordinary byte budget is full.
+#[test]
+fn test_concurrent_first_use_of_precreated_overflow_row_keeps_exact_budget() {
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, 1, 4096);
+    let _reservation = reserve_generation(&registry, &single_tier_config(0.00001));
+    record_identity(&registry, "seed");
+    let before = registry.retained_bytes_for_tests();
+    registry.configure(0, 3600, 0, 1, before);
+    let barrier = std::sync::Barrier::new(16);
+    std::thread::scope(|threads| {
+        for _ in 0..16 {
+            let registry = &registry;
+            let barrier = &barrier;
+            threads.spawn(move || {
+                barrier.wait();
+                record_identity(registry, "first-use");
+            });
+        }
+    });
+    assert_eq!(by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL), 16);
+    assert_eq!(registry.retained_bytes_for_tests(), before);
+    assert_eq!(registry.entries.len(), 2);
+    assert_eq!(dropped_charges(&registry), 0);
+}
+
+/// #6891: competing stages cannot both pass a fit check and publish above the
+/// byte ceiling. The losing stage leaves no partial rows or reservations.
+#[test]
+fn test_concurrent_matrix_preparations_reserve_atomically_and_roll_back() {
+    use ferrum_edge::plugins::api_chargeback::overflow_reservation_matrix;
+
+    let a = single_tier_config(0.00001);
+    let b = single_tier_config(0.00002);
+    let a_bytes: usize = overflow_reservation_matrix(&a).values().sum();
+    let b_bytes: usize = overflow_reservation_matrix(&b).values().sum();
+    let budget = a_bytes + b_bytes - 1;
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, 1, budget);
+    let barrier = std::sync::Barrier::new(2);
+    let results = std::thread::scope(|threads| {
+        let handles: Vec<_> = [a, b]
+            .into_iter()
+            .map(|config| {
+                let registry = &registry;
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    barrier.wait();
+                    registry
+                        .prepare_overflow_reservations(&with_reservation_budget(&config, budget))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(registry.entries.len(), 1);
+    assert!(registry.retained_bytes_for_tests() <= budget);
+    drop(results);
+    assert!(registry.entries.is_empty());
+    assert_eq!(registry.retained_bytes_for_tests(), 0);
+}
+
+#[test]
+fn test_abandoned_stage_releases_only_its_unused_rows() {
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, 1, TEST_MAX_BYTES);
+    let active = reserve_generation(&registry, &single_tier_config(0.00001));
+    let active_bytes = registry.retained_bytes_for_tests();
+    let duplicate = registry
+        .prepare_overflow_reservations(&single_tier_config(0.00001))
+        .unwrap();
+    drop(duplicate);
+    assert_eq!(registry.retained_bytes_for_tests(), active_bytes);
+    let unused = registry
+        .prepare_overflow_reservations(&single_tier_config(0.00002))
+        .unwrap();
+    assert!(registry.retained_bytes_for_tests() > active_bytes);
+    drop(unused);
+    assert_eq!(registry.retained_bytes_for_tests(), active_bytes);
+
+    // The current row stays allocated even after idle collection and only the
+    // ordinary seed row is retired. Its fallback is ready for the next charge.
+    record_identity(&registry, "seed");
+    record_identity(&registry, "overflow");
+    registry.render_json().unwrap();
+    registry.render_json().unwrap();
+    assert_eq!(registry.evict_stale(0), 1);
+    assert_eq!(registry.entries.len(), 1);
+    assert_eq!(registry.retained_bytes_for_tests(), active_bytes);
+    drop(active);
+    assert_eq!(
+        registry.entries.len(),
+        1,
+        "dropping a pin never discards billed counters"
+    );
+    assert_eq!(registry.evict_stale(0), 1);
+    assert_eq!(registry.retained_bytes_for_tests(), 0);
+}
+
+/// #6891: the global chain's unknown-proxy fallback is a bounded, prepared
+/// matrix too, across its namespace and the namespaces known by the config.
+#[test]
+fn test_global_unknown_proxy_overflow_is_reserved_for_http_and_streams() {
+    use ferrum_edge::config::types::PluginScope;
+    use ferrum_edge::plugins::api_chargeback::overflow_reservation_matrix;
+
+    let mut config = single_tier_config(0.00001);
+    config.plugin_configs[0].scope = PluginScope::Global;
+    config.plugin_configs[0].proxy_id = None;
+    config.plugin_configs[0].config["stream_connection_pricing"] =
+        json!({"price_per_connection": 0.5});
+    config.plugin_configs[0].config["bandwidth_pricing"] = json!({"price_per_byte_sent": 0.000001});
+    config.known_namespaces = vec!["tenant-b".to_string()];
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, 1, TEST_MAX_BYTES);
+    let _reservation = reserve_generation(&registry, &config);
+    let matrix = overflow_reservation_matrix(&config);
+    assert_eq!(
+        matrix.len(),
+        8,
+        "configured HTTP rows plus HTTP/bandwidth/stream fallback per namespace"
+    );
+    record_identity(&registry, "seed");
+    let bytes_before = registry.retained_bytes_for_tests();
+    registry.configure(0, 3600, 0, 1, bytes_before);
+    for namespace in ["ferrum", "tenant-b"] {
+        let scope = scope_for("USD", namespace);
+        registry.record_http(
+            &scope,
+            "http-user",
+            "unknown",
+            "unknown",
+            200,
+            0.00001,
+            3,
+            5,
+            0.000001,
+            0.0,
+        );
+        registry.record_stream(
+            &scope,
+            "stream-user",
+            "unknown",
+            "unknown",
+            0.5,
+            7,
+            11,
+            0.000001,
+            0.0,
+        );
+        registry.record_websocket_bandwidth(
+            &scope, "ws-user", "unknown", "unknown", 13, 17, 0.000001, 0.0,
+        );
+    }
+    assert_eq!(total_registry_calls(&registry), 5);
+    assert_eq!(registry.retained_bytes_for_tests(), bytes_before);
+    assert_eq!(dropped_charges(&registry), 0);
+}
+
+/// #6891: a budget-lowering reload can refuse the whole candidate if it also
+/// needs a missing fallback row. It leaves live knobs and all charges intact.
+#[test]
+fn test_lower_budget_reload_with_missing_rows_is_refused_without_mutation() {
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, 8192);
+    let _reservation = reserve_generation(&registry, &single_tier_config(0.00001));
+    for index in 0..500 {
+        record_identity(&registry, &format!("user-{index}"));
+    }
+    let before = registry.retained_bytes_for_tests();
+    let lowered = with_reservation_budget(&single_tier_config(0.00002), 4096);
+    assert!(registry.prepare_overflow_reservations(&lowered).is_err());
+    assert_eq!(registry.retained_bytes_for_tests(), before);
+    assert_eq!(registry.max_retained_bytes_for_test(), 8192);
+    assert_eq!(total_registry_calls(&registry), 500);
+    assert_eq!(dropped_charges(&registry), 0);
+}
+
+/// #6891: response-extension clones represent one body hand-off, and cannot
+/// masquerade as two separate responses for the collection heuristic.
+#[test]
+fn test_duplicate_delivery_ack_does_not_confirm_collection() {
+    use ferrum_edge::plugins::api_chargeback::ChargesDeliveryAck;
+
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    record_identity(&registry, "user-a");
+    let (_, receipt) = registry.render_json_pending().unwrap();
+    let ack = ChargesDeliveryAck::new(Arc::clone(&registry), receipt);
+    ack.acknowledge();
+    ack.clone().acknowledge();
+    ack.acknowledge();
+    assert_eq!(
+        registry.evict_stale(0),
+        0,
+        "one response is only one hand-off"
+    );
+    ChargesDeliveryAck::new(Arc::clone(&registry), receipt).acknowledge();
+    assert_eq!(registry.evict_stale(0), 1);
+}
+
+/// The last generation owner can be released by a request. It must not wait
+/// for an eviction pass to release its pins; the next pass finishes cleanup.
+#[test]
+fn test_generation_drop_during_retirement_defers_unused_row_cleanup() {
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    let mut staged = Some(
+        registry
+            .prepare_overflow_reservations(&single_tier_config(0.00002))
+            .unwrap(),
+    );
+    record_identity(&registry, "collected-seed");
+    registry.render_json().unwrap();
+    registry.render_json().unwrap();
+    let evicted = registry.evict_stale_interleaved_for_tests(
+        0,
+        || {
+            drop(staged.take());
+        },
+        || {},
+    );
+    assert_eq!(evicted, 1);
+    assert_eq!(registry.entries.len(), 1, "unused row cleanup was deferred");
+    assert_eq!(registry.evict_stale(0), 0);
+    assert!(registry.entries.is_empty());
+    assert_eq!(registry.retained_bytes_for_tests(), 0);
+}
+
+/// Composition validation was already pure on the assigned base. Keep its
+/// config-only decision separate from the stateful, atomic staging decision;
+/// this fixture owns its registry and has no process-order precondition.
+#[test]
+fn test_composition_validation_remains_independent_of_live_admission() {
+    use ferrum_edge::plugins::api_chargeback::validate_composition;
+
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, 8192);
+    let _reservation = reserve_generation(&registry, &single_tier_config(0.00001));
+    let candidate = with_reservation_budget(&single_tier_config(0.00002), 4096);
+    validate_composition(&candidate).unwrap();
+    for index in 0..500 {
+        record_identity(&registry, &format!("user-{index}"));
+    }
+    assert!(registry.prepare_overflow_reservations(&candidate).is_err());
+    validate_composition(&candidate).unwrap();
+}
+
+/// Both full cache builds and incremental rebuilds must own their fallback
+/// matrix before serving any transaction, even if it has never overflowed.
+#[tokio::test]
+async fn test_cache_build_full_reload_and_delta_precreate_overflow_rows() {
+    use ferrum_edge::config::db_backend::NamespacedResourceId;
+    use ferrum_edge::plugins::api_chargeback::overflow_reservation_matrix;
+    use std::collections::HashSet;
+
+    const PROXY_ID: &str = "issue-6891-cache-preallocation";
+    let mut config = reservation_config(
+        PROXY_ID,
+        "Preallocation API",
+        json!({
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}]
+        }),
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let registry = global_registry();
+    let assert_precreated = |config: &GatewayConfig| {
+        let matrix = overflow_reservation_matrix(config);
+        assert!(!matrix.is_empty());
+        for key in matrix.keys() {
+            let entry = registry
+                .entries
+                .get(key)
+                .expect("fallback exists before first transaction");
+            assert_eq!(entry.call_count.load(Ordering::Relaxed), 0);
+        }
+    };
+    assert_precreated(&config);
+    config.plugin_configs[0].config["pricing_tiers"] =
+        json!([{"status_codes": [200, 201], "price_per_call": 0.00002}]);
+    let changed = HashSet::from([NamespacedResourceId::new("ferrum", PROXY_ID)]);
+    cache.apply_delta(&config, &changed, &[], false).unwrap();
+    assert_precreated(&config);
+    config.plugin_configs[0].config["pricing_tiers"] =
+        json!([{"status_codes": [200, 201, 202], "price_per_call": 0.00003}]);
+    cache.rebuild(&config).unwrap();
+    assert_precreated(&config);
+    let final_keys = overflow_reservation_matrix(&config);
+    drop(cache);
+    assert!(
+        final_keys
+            .keys()
+            .all(|key| !registry.entries.contains_key(key))
+    );
+}
+
+/// An unused scoped definition may exist before any instance claims the global
+/// registry. Cache construction must behave the same in either process order.
+#[tokio::test]
+async fn test_unattached_chargeback_definition_needs_no_registry_reservation() {
+    let mut config = reservation_config(
+        "issue-6891-unattached",
+        "Unattached API",
+        json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}]}),
+    );
+    config.proxies[0].plugins.clear();
+    let cache = PluginCache::new(&config).unwrap();
+    assert!(
+        cache
+            .get_plugins("ferrum", "issue-6891-unattached")
+            .iter()
+            .all(|plugin| plugin.name() != "api_chargeback")
+    );
+}
+
+// --- GHSA-q9vj-rf66-3j58: billing rows key on the principal, not its display string ---
+
+/// Verifying-authority digests of two `jwks_auth` providers that both issue
+/// the subject `alice`.
+const PROVIDER_A_AUTHORITY: [u8; 32] = [0xa1; 32];
+const PROVIDER_B_AUTHORITY: [u8; 32] = [0xb2; 32];
+
+fn external_alice_key(authority: [u8; 32]) -> String {
+    format!("external:jwks_auth:{}:alice", hex::encode(authority))
+}
+
+/// A mapped Consumer `alice` and unmapped `jwks_auth` principals `alice` from
+/// two providers, each committed exactly as the authentication boundary
+/// leaves it. All three share the display identity `alice`.
+fn alice_principal_contexts() -> [ferrum_edge::plugins::RequestContext; 3] {
+    let consumer = super::plugin_utils::consumer_context("alice");
+    let mut provider_a = super::plugin_utils::create_test_context();
+    super::plugin_utils::commit_external_identity_with_authority(
+        &mut provider_a,
+        "alice",
+        "jwks_auth",
+        Some(PROVIDER_A_AUTHORITY),
+    );
+    let mut provider_b = super::plugin_utils::create_test_context();
+    super::plugin_utils::commit_external_identity_with_authority(
+        &mut provider_b,
+        "alice",
+        "jwks_auth",
+        Some(PROVIDER_B_AUTHORITY),
+    );
+    for ctx in [&consumer, &provider_a, &provider_b] {
+        assert_eq!(ctx.effective_identity(), Some("alice"));
+    }
+    [consumer, provider_a, provider_b]
+}
+
+/// The summary a production builder stamps from `ctx`: the display identity
+/// plus its recorded principal origin.
+fn principal_summary(
+    proxy_id: &str,
+    ctx: &ferrum_edge::plugins::RequestContext,
+) -> TransactionSummary {
+    let mut summary = make_summary(proxy_id, "Principal API", ctx.effective_identity(), 200);
+    summary.principal_origin = ctx.principal_origin();
+    summary
+}
+
+fn billed_consumers_for_proxy(proxy_id: &str) -> HashMap<String, u64> {
+    global_registry()
+        .entries
+        .iter()
+        .filter(|entry| entry.proxy_id.as_ref() == proxy_id)
+        .map(|entry| {
+            (
+                entry.consumer.to_string(),
+                entry.call_count.load(Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_consumer_and_external_principals_from_two_jwks_providers_bill_three_rows() {
+    const PROXY_ID: &str = "principal-rows-ghsa-q9vj";
+    let plugin = ApiChargeback::new(
+        &json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 1.0}]}),
+        "ferrum",
+    )
+    .unwrap();
+    let [consumer, provider_a, provider_b] = alice_principal_contexts();
+
+    plugin.log(&principal_summary(PROXY_ID, &consumer)).await;
+    for _ in 0..2 {
+        plugin.log(&principal_summary(PROXY_ID, &provider_a)).await;
+    }
+    for _ in 0..3 {
+        plugin.log(&principal_summary(PROXY_ID, &provider_b)).await;
+    }
+
+    let provider_a_key = external_alice_key(PROVIDER_A_AUTHORITY);
+    let provider_b_key = external_alice_key(PROVIDER_B_AUTHORITY);
+    assert_eq!(
+        billed_consumers_for_proxy(PROXY_ID),
+        HashMap::from([
+            ("alice".to_string(), 1),
+            (provider_a_key.clone(), 2),
+            (provider_b_key.clone(), 3),
+        ]),
+        "the mapped Consumer keeps its bare row and each provider bills its own row"
+    );
+
+    // The `/charges` JSON document exposes the same three disjoint rows.
+    let rendered: serde_json::Value =
+        serde_json::from_str(&global_registry().render_json_uncached().unwrap()).unwrap();
+    let consumers = rendered["consumers"].as_object().expect("consumers map");
+    for key in ["alice", provider_a_key.as_str(), provider_b_key.as_str()] {
+        assert!(
+            consumers
+                .get(key)
+                .and_then(|row| row["proxies"].get(PROXY_ID))
+                .is_some(),
+            "/charges must render a `{key}` row for {PROXY_ID}: {rendered}"
+        );
+    }
+
+    // And the Prometheus exposition labels them apart.
+    let prometheus = global_registry().render_prometheus_uncached().unwrap();
+    for key in ["alice", provider_a_key.as_str(), provider_b_key.as_str()] {
+        assert!(
+            prometheus.contains(&format!(
+                "ferrum_api_chargeable_calls_total{{consumer=\"{key}\",proxy_id=\"{PROXY_ID}\""
+            )),
+            "Prometheus /charges must carry a `{key}` series"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_stream_external_principal_never_shares_a_consumer_stream_row() {
+    const PROXY_ID: &str = "principal-stream-rows-ghsa-q9vj";
+    let plugin = ApiChargeback::new(
+        &json!({"stream_connection_pricing": {"price_per_connection": 0.5}}),
+        "ferrum",
+    )
+    .unwrap();
+    let consumer = make_stream_summary(PROXY_ID, "Stream", Some("alice"), "tcp", 10, 20);
+    let mut external = make_stream_summary(PROXY_ID, "Stream", Some("alice"), "tcp", 10, 20);
+    external.principal_origin =
+        Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::External { realm: None });
+
+    plugin.on_stream_disconnect(&consumer).await;
+    plugin.on_stream_disconnect(&external).await;
+
+    assert_eq!(
+        billed_consumers_for_proxy(PROXY_ID),
+        HashMap::from([
+            ("alice".to_string(), 1),
+            ("external:-:-:alice".to_string(), 1),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn test_websocket_bandwidth_bills_the_external_principal_row() {
+    const PROXY_ID: &str = "principal-ws-rows-ghsa-q9vj";
+    let plugin = ApiChargeback::new(
+        &json!({"bandwidth_pricing": {"price_per_byte_sent": 0.001}}),
+        "ferrum",
+    )
+    .unwrap();
+    let [consumer, provider_a, _] = alice_principal_contexts();
+    for ctx in [&consumer, &provider_a] {
+        let mut ws = super::plugin_utils::create_test_ws_disconnect_context();
+        ws.proxy_id = PROXY_ID.to_string();
+        ws.bytes_client_to_backend = 100;
+        ws.consumer_username = ctx.effective_identity().map(str::to_owned);
+        ws.principal_origin = ctx.principal_origin();
+        plugin.on_ws_disconnect(&ws).await;
+    }
+
+    let rows = billed_consumers_for_proxy(PROXY_ID);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.contains_key("alice"));
+    assert!(rows.contains_key(&external_alice_key(PROVIDER_A_AUTHORITY)));
+}
+
+/// A summary whose builder recorded no origin is never billed as a Consumer.
+#[tokio::test]
+async fn test_summary_without_principal_origin_fails_closed_to_external_row() {
+    const PROXY_ID: &str = "principal-origin-missing-ghsa-q9vj";
+    let plugin = ApiChargeback::new(
+        &json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 1.0}]}),
+        "ferrum",
+    )
+    .unwrap();
+    let mut summary = make_summary(PROXY_ID, "Principal API", Some("alice"), 200);
+    summary.principal_origin = None;
+    plugin.log(&summary).await;
+
+    assert_eq!(
+        billed_consumers_for_proxy(PROXY_ID),
+        HashMap::from([("external:-:-:alice".to_string(), 1)])
+    );
+}
+
+#[test]
+fn test_principal_billing_identity_classes_are_disjoint() {
+    use ferrum_edge::plugins::chargeback::{
+        billing_principal, owned_principal_billing_identity, principal_billing_identity,
+        with_principal_billing_identity,
+    };
+    use ferrum_edge::plugins::utils::auth_flow::ExternalIdentityRealm;
+    use ferrum_edge::plugins::utils::principal::{Principal, PrincipalOrigin};
+
+    const BOUND: usize = 512;
+    /// An unmapped principal verified by `jwks_auth` provider A.
+    fn external(identity: &str) -> Principal<'_> {
+        Principal::External {
+            identity,
+            realm: Some(ExternalIdentityRealm::new(
+                "jwks_auth",
+                Some(PROVIDER_A_AUTHORITY),
+            )),
+        }
+    }
+    /// The bounded billing identity, checked on both the owned and the
+    /// per-thread paths.
+    fn identity_of(principal: Principal<'_>) -> String {
+        let owned = principal_billing_identity(principal, BOUND).into_owned();
+        let pooled = with_principal_billing_identity(principal, BOUND, str::to_owned);
+        assert_eq!(
+            owned, pooled,
+            "the per-thread path must agree with the owned path for {principal:?}"
+        );
+        assert_eq!(
+            owned_principal_billing_identity(principal, BOUND),
+            owned,
+            "the event-owned path must agree with the owned path for {principal:?}"
+        );
+        assert!(owned.len() <= BOUND, "{owned}");
+        assert_ne!(owned, OVERFLOW_CONSUMER_SENTINEL);
+        owned
+    }
+
+    // Consumer rows are unchanged; external rows are the namespaced key.
+    assert_eq!(identity_of(Principal::Consumer("alice")), "alice");
+    let external_alice = identity_of(external("alice"));
+    assert_eq!(external_alice, external_alice_key(PROVIDER_A_AUTHORITY));
+
+    // A Consumer cannot spell an external principal's row.
+    let spelled = identity_of(Principal::Consumer(&external_alice));
+    assert_ne!(spelled, external_alice);
+    assert!(spelled.contains("~sha256:"), "{spelled}");
+
+    // Marker-bearing values are digested under disjoint domains, so the same
+    // bytes presented as a Consumer and as an external identity stay apart.
+    let marker = "bob~sha256:0000";
+    let consumer_marker = identity_of(Principal::Consumer(marker));
+    let external_marker = identity_of(external(marker));
+    assert!(consumer_marker.contains("~sha256:"));
+    assert!(external_marker.contains("~sha256:"));
+    assert_ne!(consumer_marker, external_marker);
+
+    // Oversized external identities keep a digest of their complete key.
+    let long_a = format!("{}a", "x".repeat(600));
+    let long_b = format!("{}b", "x".repeat(600));
+    assert_ne!(
+        identity_of(external(long_a.as_str())),
+        identity_of(external(long_b.as_str()))
+    );
+
+    // A Consumer whose username is the complete canonical key of an external
+    // principal whose key must itself be digested (marker-bearing, or over
+    // the bound): both sides hash the very same text, so only the digest
+    // domains keep them apart.
+    let long_subject = "y".repeat(500);
+    for subject in ["bob~sha256:0000", long_subject.as_str()] {
+        let canonical_key = external(subject).key();
+        let external_side = identity_of(external(subject));
+        let consumer_side = identity_of(Principal::Consumer(&canonical_key));
+        for side in [&external_side, &consumer_side] {
+            assert!(side.contains("~sha256:"), "{side}");
+            assert!(side.len() <= BOUND, "{side}");
+        }
+        assert_ne!(
+            external_side, consumer_side,
+            "equal hashed text must still yield distinct rows"
+        );
+    }
+
+    // Owned and per-thread paths agree at every bound, including a prefix
+    // cut that lands inside a multi-byte character and a bound too small for
+    // any prefix.
+    let wide = "é".repeat(400);
+    for bound in [40usize, 80, 81, 512] {
+        for principal in [
+            Principal::Consumer(wide.as_str()),
+            Principal::Consumer(&external_alice),
+            external(wide.as_str()),
+            external("alice"),
+        ] {
+            let owned = principal_billing_identity(principal, bound).into_owned();
+            let pooled = with_principal_billing_identity(principal, bound, str::to_owned);
+            assert_eq!(owned, pooled, "bound {bound}: {principal:?}");
+            assert_eq!(
+                owned_principal_billing_identity(principal, bound),
+                owned,
+                "bound {bound}: {principal:?}"
+            );
+            assert!(owned.len() <= bound, "bound {bound}: {owned}");
+        }
+    }
+    identity_of(Principal::Consumer(&"z".repeat(600)));
+
+    // A custom mechanism name can complete the digest marker at its trailing
+    // separator; every path must still digest that key the same way.
+    for mechanism in ["partner~sha256", "partner~sha256:x"] {
+        let custom = Principal::External {
+            identity: "alice",
+            realm: Some(ExternalIdentityRealm::new(mechanism, None)),
+        };
+        let custom_identity = identity_of(custom);
+        assert!(custom_identity.contains("~sha256:"), "{custom_identity}");
+    }
+
+    // Inputs larger than the per-thread buffer retains take the plain owned
+    // path and still agree byte for byte.
+    let huge = "h".repeat(8192);
+    identity_of(external(huge.as_str()));
+    identity_of(Principal::Consumer(huge.as_str()));
+
+    // The overflow sentinel itself is never reproduced by a real principal.
+    identity_of(Principal::Consumer(OVERFLOW_CONSUMER_SENTINEL));
+    identity_of(external(OVERFLOW_CONSUMER_SENTINEL));
+
+    // Summary entry point: empty identities are not billed, a missing origin
+    // fails closed to an external principal, and a recorded origin is kept.
+    assert_eq!(
+        billing_principal(Some(""), Some(PrincipalOrigin::Consumer)),
+        None
+    );
+    assert_eq!(
+        billing_principal(None, Some(PrincipalOrigin::Consumer)),
+        None
+    );
+    assert_eq!(
+        billing_principal(Some("alice"), None),
+        Some(Principal::External {
+            identity: "alice",
+            realm: None
+        })
+    );
+    assert_eq!(
+        billing_principal(Some("alice"), Some(PrincipalOrigin::Consumer)),
+        Some(Principal::Consumer("alice"))
+    );
+}
+
+/// The origin is provenance only: it never reaches transaction-log output,
+/// and the WebSocket session-end projection keeps it for billing.
+#[test]
+fn test_principal_origin_is_not_serialized_and_survives_ws_session_end_projection() {
+    let [_, provider_a, _] = alice_principal_contexts();
+    let summary = principal_summary("principal-serialize-ghsa-q9vj", &provider_a);
+    assert!(summary.principal_origin.is_some());
+    let rendered = serde_json::to_string(&summary).unwrap();
+    assert!(!rendered.contains("principal_origin"), "{rendered}");
+    assert!(!rendered.contains("external:"), "{rendered}");
+
+    let mut stream = make_stream_summary("s", "S", Some("alice"), "tcp", 1, 1);
+    stream.principal_origin =
+        Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer);
+    let rendered = serde_json::to_string(&stream).unwrap();
+    assert!(!rendered.contains("principal_origin"), "{rendered}");
+
+    let mut ws = super::plugin_utils::create_test_ws_disconnect_context();
+    ws.principal_origin = provider_a.principal_origin();
+    assert_eq!(
+        ws.session_end_summary().principal_origin,
+        provider_a.principal_origin()
+    );
+}
+
+/// Struct types whose literals carry a principal's display identity into a
+/// summary, or into a context a summary is later built from.
+const PRINCIPAL_CARRIERS: &[&str] = &[
+    "TransactionSummary",
+    "StreamTransactionSummary",
+    "WsDisconnectContext",
+    "WsSessionMeta",
+    "UdpSession",
+    "UdpSetupAttribution",
+    "DtlsDisconnectContext",
+];
+
+/// GHSA-q9vj-rf66-3j58 parity guard: every carrier literal in `src/` that
+/// sets `consumer_username` must record that identity's origin beside it,
+/// from the same source, and may leave the origin `None` only when there is
+/// no identity. The exporter tests above project the origin by hand, so this
+/// is what catches a builder (HTTP, gRPC, H3, WebSocket, stream, UDP/DTLS,
+/// mesh, abort, HBONE, …) that drops it. See
+/// [`principal_origin_violations`] for the accepted pairings.
+#[test]
+fn every_summary_builder_records_principal_origin_beside_consumer_username() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    collect_rust_sources(&root.join("src"), &mut files);
+    assert!(!files.is_empty(), "src/ must contain Rust sources");
+
+    let mut inspected = 0usize;
+    let mut violations = Vec::new();
+    for path in files {
+        let source = std::fs::read_to_string(&path).expect("read source");
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let (found, file_violations) = principal_origin_violations(&relative, &source);
+        inspected += found;
+        violations.extend(file_violations);
+    }
+    assert!(
+        inspected >= 30,
+        "the guard must actually find the summary builders (found {inspected})"
+    );
+    assert!(
+        violations.is_empty(),
+        "summary builders must record principal_origin beside consumer_username:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// The guard must reject the regressions it exists for, including through
+/// shorthand locals (the TCP disconnect builder's shape) and a comment between
+/// the type name and its brace.
+#[test]
+fn principal_origin_guard_rejects_lost_or_mismatched_origins() {
+    const TCP_STYLE: &str = r#"
+fn build(stream_ctx: &StreamConnectionContext, plugins: &[u8]) -> StreamTransactionSummary {
+    let (consumer_username, principal_origin) = if !plugins.is_empty() {
+        stream_ctx.summary_identity()
+    } else {
+        (None, None)
+    };
+    StreamTransactionSummary {
+        namespace: String::new(),
+        consumer_username,
+        principal_origin,
+        auth_method: None,
+    }
+}
+"#;
+    let check = |source: &str| principal_origin_violations("fixture.rs", source);
+
+    assert_eq!(
+        check(TCP_STYLE),
+        (1, Vec::new()),
+        "the paired builder passes"
+    );
+
+    // The origin local cleared while the identity local survives.
+    let cleared = TCP_STYLE.replace(
+        "let (consumer_username, principal_origin) = if !plugins.is_empty() {\n        stream_ctx.summary_identity()\n    } else {\n        (None, None)\n    };",
+        "let consumer_username = stream_ctx.effective_identity().map(str::to_owned);\n    let principal_origin = None;",
+    );
+    assert_ne!(cleared, TCP_STYLE, "fixture rewrite must apply");
+    let (found, violations) = check(cleared.as_str());
+    assert_eq!(found, 1);
+    assert_eq!(violations.len(), 1, "{violations:?}");
+
+    // A literal `None` origin beside a carried identity.
+    let none_origin = TCP_STYLE.replace(
+        "        principal_origin,\n",
+        "        principal_origin: None,\n",
+    );
+    assert_eq!(check(none_origin.as_str()).1.len(), 1);
+
+    // A conditional whose fallback branch keeps the identity but drops the
+    // origin.
+    let lossy_fallback = TCP_STYLE.replace(
+        "        (None, None)\n",
+        "        (stream_ctx.effective_identity().map(str::to_owned), None)\n",
+    );
+    assert_ne!(lossy_fallback, TCP_STYLE, "fixture rewrite must apply");
+    let (found, violations) = check(lossy_fallback.as_str());
+    assert_eq!(found, 1);
+    assert_eq!(violations.len(), 1, "{violations:?}");
+
+    // The same lossy fallback held in a local and returned from the branch.
+    let fallback_local = TCP_STYLE
+        .replace(
+            "    let (consumer_username, principal_origin) = if !plugins.is_empty() {\n",
+            "    let fallback = (stream_ctx.effective_identity().map(str::to_owned), None);\n    let (consumer_username, principal_origin) = if !plugins.is_empty() {\n",
+        )
+        .replace("        (None, None)\n", "        fallback\n");
+    assert!(
+        fallback_local.contains("let fallback") && fallback_local.contains("        fallback\n"),
+        "fixture rewrite must apply"
+    );
+    let (found, violations) = check(fallback_local.as_str());
+    assert_eq!(found, 1);
+    assert_eq!(violations.len(), 1, "{violations:?}");
+
+    // A missing origin behind a comment between the type name and its brace.
+    let commented = r#"
+fn build(ctx: &RequestContext) -> TransactionSummary {
+    TransactionSummary /* terminal record */
+    {
+        consumer_username: ctx.effective_identity().map(str::to_owned),
+        ..TransactionSummary::default()
+    }
+}
+"#;
+    let (found, violations) = check(commented);
+    assert_eq!(
+        found, 1,
+        "a comment before the brace must not hide the literal"
+    );
+    assert_eq!(violations.len(), 1, "{violations:?}");
+
+    // Identity and origin from different sources.
+    let mismatched = r#"
+fn build(ctx: &RequestContext, other: &RequestContext) -> TransactionSummary {
+    TransactionSummary {
+        consumer_username: ctx.effective_identity().map(str::to_owned),
+        principal_origin: other.principal_origin(),
+        ..TransactionSummary::default()
+    }
+}
+fn carry(session: &Meta, other: &Meta) -> WsDisconnectContext {
+    WsDisconnectContext {
+        consumer_username: session.consumer_username.clone(),
+        principal_origin: other.principal_origin,
+    }
+}
+fn hardcode(stream_ctx: &StreamConnectionContext) -> StreamTransactionSummary {
+    let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
+    StreamTransactionSummary {
+        consumer_username,
+        principal_origin: Some(PrincipalOrigin::Consumer),
+    }
+}
+"#;
+    let (found, violations) = check(mismatched);
+    assert_eq!(found, 3);
+    assert_eq!(violations.len(), 3, "{violations:?}");
+}
+
+/// `(inspected, violations)` for one source file. Values are compared with
+/// whitespace removed. Accepted pairings for a literal that sets
+/// `consumer_username`:
+///
+/// - both `None`;
+/// - `X.effective_identity().map(str::to_owned)` with `X.principal_origin()`;
+/// - a carried `X.consumer_username` (optionally `.clone()`) with
+///   `X.principal_origin`;
+/// - a local (or shorthand) identity bound together with the origin local by
+///   the nearest preceding `let (identity, origin) = …` in the same function,
+///   whose initializer is exactly one of [`PAIRED_IDENTITY_INITIALIZERS`];
+/// - an origin derived from the identity value itself (`identity.…`), as the
+///   crate's own test-session helpers do;
+/// - a literal fixture identity (`Some(…)`) with a non-`None` origin.
+///
+/// Everything else, including a missing origin, is a violation.
+fn principal_origin_violations(relative: &str, source: &str) -> (usize, Vec<String>) {
+    let code = blank_strings_and_comments(source);
+    let is_ident = |value: &str| {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    };
+    let mut inspected = 0usize;
+    let mut violations = Vec::new();
+    for (offset, body) in carrier_literals(&code, PRINCIPAL_CARRIERS) {
+        let fields = top_level_fields(body);
+        let Some(consumer) = fields.get("consumer_username") else {
+            continue;
+        };
+        inspected += 1;
+        let line = code[..offset].matches('\n').count() + 1;
+        let location = format!("{relative}:{line}");
+        let Some(origin) = fields.get("principal_origin") else {
+            violations.push(format!(
+                "{location}: sets consumer_username without principal_origin"
+            ));
+            continue;
+        };
+        let accepted = if origin == "None" || consumer == "None" {
+            origin == "None" && consumer == "None"
+        } else if let Some(receiver) =
+            consumer.strip_suffix(".effective_identity().map(str::to_owned)")
+        {
+            origin.as_str() == format!("{receiver}.principal_origin()")
+        } else if let Some(receiver) = consumer
+            .strip_suffix(".consumer_username.clone()")
+            .or_else(|| consumer.strip_suffix(".consumer_username"))
+        {
+            origin.as_str() == format!("{receiver}.principal_origin")
+        } else {
+            let local = consumer
+                .strip_suffix(".clone()")
+                .unwrap_or(consumer.as_str());
+            if !is_ident(local) {
+                consumer.starts_with("Some(")
+            } else if origin.starts_with(&format!("{local}.")) {
+                true
+            } else {
+                is_ident(origin.as_str())
+                    && nearest_let_binding(&code[..offset], local).is_some_and(
+                        |(pattern, initializer)| {
+                            pattern == format!("({local},{origin})")
+                                && PAIRED_IDENTITY_INITIALIZERS.contains(&initializer.as_str())
+                        },
+                    )
+            }
+        };
+        if !accepted {
+            violations.push(format!(
+                "{location}: consumer_username `{consumer}` is not paired with principal_origin `{origin}` from the same source"
+            ));
+        }
+    }
+    (inspected, violations)
+}
+
+/// The only `let (identity, origin) = …` initializers (whitespace removed) the
+/// guard accepts for a shorthand/local pair: exactly the forms the TCP, DTLS,
+/// and UDP-session builders use, each of which yields `summary_identity()` or
+/// `(None, None)` on every branch. A new builder shape must be added here
+/// deliberately, after review.
+const PAIRED_IDENTITY_INITIALIZERS: &[&str] = &[
+    "stream_ctx.summary_identity()",
+    "if!plugins.is_empty(){stream_ctx.summary_identity()}else{(None,None)}",
+    "ifhandler_has_plugins{stream_ctx.summary_identity()}else{(None,None)}",
+];
+
+/// The `(pattern, initializer)` of the last `let` before the end of `code`,
+/// within the enclosing function, whose pattern binds `local` (whitespace and
+/// `mut` removed from the pattern).
+fn nearest_let_binding(code: &str, local: &str) -> Option<(String, String)> {
+    let scope_start = code.rfind("fn ").unwrap_or(0);
+    let scope = &code[scope_start..];
+    let bytes = scope.as_bytes();
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut found = None;
+    let mut from = 0;
+    while let Some(at) = scope[from..].find("let") {
+        let start = from + at;
+        from = start + 3;
+        if (start > 0 && is_ident(bytes[start - 1]))
+            || bytes.get(start + 3).is_some_and(|&byte| is_ident(byte))
+        {
+            continue;
+        }
+        let rest = &scope[start + 3..];
+        let Some(equals) = rest
+            .char_indices()
+            .find(|&(index, c)| {
+                c == '=' && !matches!(rest.as_bytes().get(index + 1), Some(b'=' | b'>'))
+            })
+            .map(|(index, _)| index)
+        else {
+            continue;
+        };
+        let pattern: String = rest[..equals]
+            .split_whitespace()
+            .filter(|token| *token != "mut")
+            .collect::<String>()
+            .replace("(mut", "(")
+            .replace(",mut", ",");
+        let simple = pattern.split(':').next().unwrap_or("").to_string();
+        let binds = if pattern.starts_with('(') && pattern.ends_with(')') {
+            pattern[1..pattern.len() - 1]
+                .split(',')
+                .any(|element| element == local)
+        } else {
+            simple == local
+        };
+        if !binds {
+            continue;
+        }
+        let initializer = &rest[equals + 1..];
+        let mut depth = 0i32;
+        let end = initializer
+            .char_indices()
+            .find(|&(_, c)| {
+                match c {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth -= 1,
+                    ';' if depth == 0 => return true,
+                    _ => {}
+                }
+                false
+            })
+            .map_or(initializer.len(), |(index, _)| index);
+        let pattern = if pattern.starts_with('(') {
+            pattern
+        } else {
+            simple
+        };
+        found = Some((
+            pattern,
+            initializer[..end].split_whitespace().collect::<String>(),
+        ));
+    }
+    found
+}
+
+fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .expect("read source dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            collect_rust_sources(&path, out);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Replace string/char literal contents and comments with spaces (newlines
+/// kept) so brace and comma structure can be scanned without a parser.
+fn blank_strings_and_comments(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = bytes.to_vec();
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
+        let to = to.min(bytes.len());
+        if from >= to {
+            return;
+        }
+        for byte in &mut out[from..to] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        let previous_is_ident = i > 0 && is_ident(bytes[i - 1]);
+        if bytes[i..].starts_with(b"//") {
+            let end = bytes[i..]
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map_or(bytes.len(), |at| i + at);
+            blank(&mut out, i, end);
+            i = end;
+            continue;
+        }
+        if bytes[i..].starts_with(b"/*") {
+            let end = source[i + 2..]
+                .find("*/")
+                .map_or(bytes.len(), |at| i + 2 + at + 2);
+            blank(&mut out, i, end);
+            i = end;
+            continue;
+        }
+        let raw_start = if !previous_is_ident && bytes[i] == b'r' {
+            Some(i + 1)
+        } else if !previous_is_ident && bytes[i] == b'b' && bytes.get(i + 1) == Some(&b'r') {
+            Some(i + 2)
+        } else {
+            None
+        };
+        if let Some(start) = raw_start {
+            let hashes = bytes[start..]
+                .iter()
+                .take_while(|&&byte| byte == b'#')
+                .count();
+            if bytes.get(start + hashes) == Some(&b'"') {
+                let mut closing = vec![b'"'];
+                closing.resize(hashes + 1, b'#');
+                let body = start + hashes + 1;
+                let end = bytes[body..]
+                    .windows(closing.len())
+                    .position(|window| window == closing.as_slice())
+                    .map_or(bytes.len(), |at| body + at + closing.len());
+                blank(&mut out, body, end.saturating_sub(closing.len()));
+                i = end;
+                continue;
+            }
+        }
+        if bytes[i] == b'"' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'"' {
+                j += if bytes[j] == b'\\' { 2 } else { 1 };
+            }
+            blank(&mut out, i + 1, j);
+            i = j + 1;
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            // Char/byte literal; a lone quote is a lifetime or label.
+            let end = if bytes.get(i + 1) == Some(&b'\\') {
+                bytes[i + 2..]
+                    .iter()
+                    .position(|&byte| byte == b'\'')
+                    .map(|at| i + 2 + at)
+            } else {
+                (i + 2..(i + 6).min(bytes.len()))
+                    .find(|&at| bytes[at] == b'\'')
+                    .filter(|&at| {
+                        std::str::from_utf8(&bytes[i + 1..at])
+                            .is_ok_and(|text| text.chars().count() == 1)
+                    })
+            };
+            if let Some(end) = end {
+                blank(&mut out, i + 1, end);
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `(offset, body)` of each struct literal of a carrier type: the type's name
+/// (optionally path-qualified) directly followed by `{`, excluding struct,
+/// impl, and function-signature positions.
+fn carrier_literals<'a>(code: &'a str, carriers: &[&str]) -> Vec<(usize, &'a str)> {
+    let bytes = code.as_bytes();
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut literals = Vec::new();
+    for carrier in carriers {
+        let mut from = 0;
+        while let Some(at) = code[from..].find(carrier) {
+            let start = from + at;
+            let end = start + carrier.len();
+            from = end;
+            if start > 0 && is_ident(bytes[start - 1]) {
+                continue;
+            }
+            let rest = &code[end..];
+            let trimmed = rest.trim_start();
+            // Any whitespace (a blanked comment included) may precede the
+            // brace.
+            if !trimmed.starts_with('{') {
+                continue;
+            }
+            let path_start = code[..start]
+                .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                .len();
+            let before = code[..path_start].trim_end();
+            if ["struct", "impl", "for", "enum", "->", "trait", "union"]
+                .iter()
+                .any(|keyword| before.ends_with(keyword))
+            {
+                continue;
+            }
+            let open = end + (rest.len() - trimmed.len());
+            let mut depth = 0usize;
+            let mut close = None;
+            for (index, byte) in bytes.iter().enumerate().skip(open) {
+                match *byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(index);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(close) = close {
+                literals.push((start, &code[open + 1..close]));
+            }
+        }
+    }
+    literals
+}
+
+/// Top-level `field: value` pairs of a struct-literal body (shorthand fields
+/// map to their own name), with whitespace removed from values.
+fn top_level_fields(body: &str) -> HashMap<String, String> {
+    let mut segments = Vec::new();
+    let mut depth = 0i32;
+    let mut segment_start = 0;
+    for (index, byte) in body.bytes().enumerate() {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                segments.push(&body[segment_start..index]);
+                segment_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&body[segment_start..]);
+    let mut fields = HashMap::new();
+    for segment in segments {
+        let segment = segment.trim();
+        if segment.is_empty() || segment.starts_with("..") {
+            continue;
+        }
+        let name_len = segment
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        if name_len == 0 {
+            continue;
+        }
+        let (name, rest) = segment.split_at(name_len);
+        let rest = rest.trim_start();
+        let value = if rest.is_empty() {
+            name.to_string()
+        } else if let Some(value) = rest
+            .strip_prefix(':')
+            .filter(|value| !value.starts_with(':'))
+        {
+            value.split_whitespace().collect::<String>()
+        } else {
+            continue;
+        };
+        fields.insert(name.to_string(), value);
+    }
+    fields
 }

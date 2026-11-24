@@ -29,7 +29,8 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     publish_dead_letter_payload_with_identity_for_tests, reconcile_active_spool_usage_for_tests,
     render_prometheus, render_status_json, replay_spool_once_for_tests,
     replay_spool_once_with_batch_size_for_tests, replay_spool_once_with_ceiling_for_tests,
-    serialize_json_each_row, serialize_json_each_row_projected, set_spool_walk_hook_for_tests,
+    replay_spool_tick_off_worker_for_tests, serialize_json_each_row,
+    serialize_json_each_row_projected, set_spool_walk_hook_for_tests,
     set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
     spool_claim_lease_secs_for_tests, spool_decompression_limit_for_tests,
     spool_index_entry_bytes_for_tests, spool_split_worklist_max_entries_for_tests,
@@ -372,6 +373,7 @@ fn grpc_summary(proxy_id: &str, grpc_status: &str) -> TransactionSummary {
     let mut summary = TransactionSummary {
         namespace: "ferrum".to_string(),
         consumer_username: Some("alice".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         proxy_id: Some(proxy_id.to_string()),
         proxy_name: Some("gRPC API".to_string()),
         response_status_code: 200,
@@ -397,6 +399,7 @@ fn http_summary_with_dims(
     let mut summary = TransactionSummary {
         namespace: "ferrum".to_string(),
         consumer_username: Some("alice".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         proxy_id: Some(proxy_id.to_string()),
         proxy_name: Some(proxy_name.to_string()),
         response_status_code: status,
@@ -553,6 +556,60 @@ fn grpc_snapshot_bounds_non_standard_terminal_status_cardinality() {
     assert_eq!(events[0].http_status_code, Some(200));
     assert_eq!(events[0].grpc_status, Some(u32::MAX));
     assert_eq!(events[0].call_count, 2);
+}
+
+/// Issue #7112: a repeat charge for a live snapshot identity is found with a
+/// key borrowed from the request summary — including digest-bounded fields
+/// and optional metadata dimensions — so it refreshes the entry the owned key
+/// was stored under instead of creating a second identity.
+#[test]
+fn snapshot_refresh_finds_the_identity_with_a_borrowed_key() {
+    let mut config = ApiChargebackSinkConfig {
+        mode: ferrum_edge::plugins::api_chargeback_sink::SinkMode::Snapshot,
+        ..Default::default()
+    };
+    config.currency = "USD".to_string();
+    config.pricing_version = "test-v1".to_string();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = ChargeComputation {
+        call_count: 1,
+        charge_call: 0.08,
+        charge_total: 0.08,
+        ..ChargeComputation::default()
+    };
+    let long_consumer = "c".repeat(4096);
+    let mut summary = grpc_summary("borrowed-key", "0");
+    summary.namespace = "n".repeat(4096);
+    summary
+        .metadata
+        .insert("consumer_name".to_string(), "Alice".to_string());
+    summary
+        .metadata
+        .insert("route_id".to_string(), "route-a".to_string());
+    let mut other_route = summary.clone();
+    other_route
+        .metadata
+        .insert("route_id".to_string(), "route-b".to_string());
+
+    accumulator.record_http_for_test(&summary, &long_consumer, charge);
+    accumulator.record_http_for_test(&summary, &long_consumer, charge);
+    accumulator.record_http_for_test(&other_route, &long_consumer, charge);
+    assert_eq!(accumulator.total_call_count_for_tests(), 3);
+
+    let mut events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-borrowed")
+        .unwrap();
+    events.sort_by(|a, b| a.route_id.cmp(&b.route_id));
+    assert_eq!(events.len(), 2, "one identity per route");
+    assert_eq!(events[0].route_id.as_deref(), Some("route-a"));
+    assert_eq!(events[0].call_count, 2, "the repeat refreshed one identity");
+    assert_eq!(events[0].consumer_name.as_deref(), Some("Alice"));
+    assert!(
+        events[0].consumer_id.len() < long_consumer.len(),
+        "the over-long consumer is digest-bounded in the key"
+    );
+    assert_eq!(events[1].route_id.as_deref(), Some("route-b"));
+    assert_eq!(events[1].call_count, 1);
 }
 
 #[tokio::test]
@@ -869,6 +926,40 @@ async fn password_ref_rejects_disabled_tls_verification() {
     assert!(error.contains("`clickhouse.password_ref` cannot be used when ClickHouse TLS"));
 }
 
+/// reqwest's rustls backend disables hostname verification only with a pinned
+/// CA bundle or with certificate verification off, so `verify_hostname: false`
+/// with neither could never activate the sink; admission refuses it.
+#[tokio::test]
+async fn disabled_hostname_verification_requires_a_pinned_ca_or_no_verification() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!("https://localhost:8443");
+    config["clickhouse"]["tls"] = json!({ "verify_hostname": false });
+    let error = match ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
+        Ok(_) => panic!("verify_hostname: false without a CA bundle must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("`clickhouse.tls.verify_hostname: false` requires `clickhouse.tls.ca_file`"),
+        "got: {error}"
+    );
+    assert!(validate_plugin_config("api_chargeback_sink", &config).is_err());
+
+    for tls in [
+        json!({ "verify_hostname": false, "ca_file": "/nonexistent/clickhouse-ca.pem" }),
+        json!({ "verify_hostname": false, "insecure_skip_verify": true }),
+    ] {
+        let mut config = valid_config(temp.path());
+        config["clickhouse"]["url"] = json!("https://localhost:8443");
+        config["clickhouse"]["tls"] = tls.clone();
+        if let Err(error) = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
+            panic!("{tls} must be admitted: {error}");
+        }
+    }
+}
+
 /// Issue #2627: OpenAPI must reject the same required/cross-field failures the
 /// constructor rejects, and admit each minimal valid pricing shape.
 #[tokio::test]
@@ -1046,6 +1137,17 @@ async fn openapi_schema_matches_runtime_admission_boundaries() {
             }),
         ),
         (
+            "verify_hostname disabled without a pinned CA",
+            json!({
+                "clickhouse": {
+                    "url": "https://clickhouse.example:8443",
+                    "tls": { "verify_hostname": false }
+                },
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+        (
             "url with user-info",
             json!({
                 "clickhouse": { "url": "https://user:pass@clickhouse.example:8443" },
@@ -1185,6 +1287,7 @@ async fn password_ref_must_use_plugin_secret_namespace() {
 
     let mut config = valid_config(temp.path());
     config["clickhouse"]["url"] = json!("https://localhost:8123");
+    config["clickhouse"]["username"] = json!("ferrum_ingest");
     config["clickhouse"]["password_ref"] = json!("  FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD  ");
     ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
         .expect("a namespaced password_ref is admitted without reading the environment");
@@ -1428,10 +1531,7 @@ fn disk_owned_bytes(root: &Path) -> u64 {
                 continue;
             }
             let is_temp = name.ends_with(".tmp")
-                && (name.contains(".write-")
-                    || name.ends_with(".ndjson.tmp")
-                    || name.ends_with(".ndjson.zst.tmp")
-                    || name.ends_with(".rejected.meta.tmp"));
+                && (name.contains(".write-") || name.ends_with(".rejected.meta.tmp"));
             let owned = name.ends_with(".inflight")
                 || is_temp
                 || name.ends_with(".ndjson.corrupt")
@@ -1441,7 +1541,6 @@ fn disk_owned_bytes(root: &Path) -> u64 {
                 || ((name.ends_with(".ndjson.zst") || name.ends_with(".ndjson"))
                     && !name.ends_with(".tmp")
                     && !name.ends_with(".corrupt")
-                    && !name.ends_with(".rejected")
                     && !name.ends_with(".meta")
                     && !name.ends_with(".inflight"));
             if owned {
@@ -1654,12 +1753,17 @@ fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
     assert_eq!(stats.bytes, encoded_len);
 }
 
+/// A record-write temp another process left behind:
+/// `<data-name>.write-<process_tag>-<generation>.tmp`.
+const FOREIGN_PROCESS_STALE_TEMP: &str =
+    "00000000000000000000000001.ndjson.write-foreignprocess-1.tmp";
+
 #[test]
 fn spool_reconciles_stale_tmp_files_at_startup() {
     let temp = tempfile::tempdir().unwrap();
     let day = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&day).unwrap();
-    let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
+    let stale_tmp = day.join(FOREIGN_PROCESS_STALE_TEMP);
     fs::write(&stale_tmp, vec![0u8; 4096]).unwrap();
 
     let settings = SpoolSettings {
@@ -1691,7 +1795,7 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
     let encoded_len = encoded_event_len(&event, SpoolCompression::None);
     let day = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&day).unwrap();
-    let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
+    let stale_tmp = day.join(FOREIGN_PROCESS_STALE_TEMP);
     fs::write(&stale_tmp, vec![0u8; encoded_len as usize]).unwrap();
 
     // Construct without going through for_tests' reconcile by using a second
@@ -2719,7 +2823,7 @@ fn spool_reconcile_fails_closed_when_stale_tmp_cannot_be_removed() {
     let temp = tempfile::tempdir().unwrap();
     let day = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&day).unwrap();
-    let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
+    let stale_tmp = day.join(FOREIGN_PROCESS_STALE_TEMP);
     fs::write(&stale_tmp, vec![0u8; 128]).unwrap();
 
     // Remove directory write bits so unlink of the planted temp fails. Startup
@@ -2872,6 +2976,9 @@ async fn websocket_disconnect_exports_bandwidth_charge() {
             io_side: None,
             error_class: None,
             consumer_username: Some("alice".to_string()),
+            principal_origin: Some(
+                ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer,
+            ),
             auth_method: None,
             connection_id: 0,
             metadata: Default::default(),
@@ -2906,6 +3013,9 @@ async fn connect_method_is_not_classified_as_websocket() {
         .log(&TransactionSummary {
             namespace: "ferrum".to_string(),
             consumer_username: Some("alice".to_string()),
+            principal_origin: Some(
+                ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer,
+            ),
             http_method: "CONNECT".to_string(),
             proxy_id: Some("proxy-a".to_string()),
             proxy_name: Some("Proxy A".to_string()),
@@ -5349,6 +5459,7 @@ fn billable_summary(request_id: &str) -> TransactionSummary {
     let mut summary = TransactionSummary {
         namespace: "ferrum".to_string(),
         consumer_username: Some("alice".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         proxy_id: Some("proxy-a".to_string()),
         proxy_name: Some("Payments".to_string()),
         response_status_code: 200,
@@ -6400,42 +6511,41 @@ fn spool_metadata_owner_mismatch_fails_closed_without_mutating_records() {
     assert_eq!(replayable, vec![record]);
 }
 
+/// Issue #7115: only the full owner tag binds a record. A record whose name
+/// carries a truncated (16-character) tag is not this identity's record.
 #[test]
-fn version_one_spool_replays_legacy_owner_tags() {
+fn truncated_owner_tag_records_are_not_replayed() {
     let temp = tempfile::tempdir().unwrap();
     let settings = spool_settings(temp.path(), 1024 * 1024);
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
     let current_record = spool
-        .write_events(&[sample_event("evt-legacy-owner-tag")])
+        .write_events(&[sample_event("evt-truncated-owner-tag")])
         .unwrap();
     let current_tag = spool.owner_tag_for_tests();
-    let legacy_tag = &current_tag[..16];
+    let truncated_tag = &current_tag[..16];
 
-    let meta_path = spool.namespace_root_for_tests().join("spool.meta.json");
-    let mut meta: Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
-    assert_eq!(meta["version"], json!(1));
-    meta["owner_tag"] = json!(legacy_tag);
-    fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
-
-    let legacy_name = current_record
+    let truncated_name = current_record
         .file_name()
         .unwrap()
         .to_string_lossy()
-        .replace(current_tag, legacy_tag);
-    let legacy_record = current_record.with_file_name(legacy_name);
-    fs::rename(&current_record, &legacy_record).unwrap();
+        .replace(current_tag, truncated_tag);
+    let truncated_record = current_record.with_file_name(truncated_name);
+    fs::rename(&current_record, &truncated_record).unwrap();
 
-    assert_eq!(
-        spool.list_replayable_spool_files_for_tests().unwrap(),
-        vec![legacy_record.clone()],
-        "version-1 records with the original 16-character tag remain replayable"
+    assert!(
+        spool
+            .list_replayable_spool_files_for_tests()
+            .unwrap()
+            .is_empty(),
+        "a truncated owner tag must not make a record replayable"
     );
-    let claim = spool
-        .claim_replay_file_for_tests(&legacy_record)
-        .unwrap()
-        .expect("a legacy-tagged record remains claimable by its digest owner");
-    assert!(claim.exists());
-    assert!(!legacy_record.exists());
+    assert!(
+        spool
+            .claim_replay_file_for_tests(&truncated_record)
+            .is_err(),
+        "a truncated owner tag must not make a record claimable"
+    );
+    assert!(truncated_record.exists());
 }
 
 #[test]
@@ -6837,9 +6947,7 @@ fn admission_eviction_never_unlinks_a_fresh_peer_process_temp() {
 fn compressed_spool_record_expanding_past_its_bound_fails_closed() {
     let temp = tempfile::tempdir().unwrap();
     let bomb_plain = vec![b'\n'; 2 * 1024 * 1024];
-    let bomb =
-        encode_spool_bytes_without_content_size_for_tests(&bomb_plain, SpoolCompression::Zstd)
-            .unwrap();
+    let bomb = zstd_frame_within_ratio_window(&bomb_plain, false);
     assert!(
         bomb.len() < 4096,
         "the fixture must exercise a high compression ratio"
@@ -6850,17 +6958,48 @@ fn compressed_spool_record_expanding_past_its_bound_fails_closed() {
         .err()
         .unwrap_or_else(|| panic!("a high-ratio archive must not expand without bound"));
     assert!(
-        err.contains("decompression bound"),
+        err.contains("decoded-byte bound"),
         "unexpected error: {err}"
     );
 
     // A record within the expansion allowance still decodes normally.
-    let ok_plain = vec![b'\n'; 512 * 1024];
+    let (ok_plain, ok_rows) = compressible_json_rows(512 * 1024);
     let ok = encode_spool_bytes_for_tests(&ok_plain, SpoolCompression::Zstd).unwrap();
     let ok_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FB4.ndjson.zst");
     fs::write(&ok_path, &ok).unwrap();
     let decoded = decode_spool_file_for_tests(&ok_path).unwrap();
-    assert_eq!(decoded.len(), ok_plain.len());
+    assert_eq!(decoded, ok_rows);
+}
+
+/// A zstd frame whose back-reference window (1 MiB) fits the window replay
+/// grants a frame at the ratio floor, so the bounded streaming reader refuses an
+/// oversized frame by its decoded-byte bound rather than by its window cap.
+/// `declare_size` records the decompressed size in the frame header.
+fn zstd_frame_within_ratio_window(bytes: &[u8], declare_size: bool) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+    encoder.window_log(20).unwrap();
+    if declare_size {
+        encoder
+            .set_pledged_src_size(Some(bytes.len() as u64))
+            .unwrap();
+    }
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// Highly compressible JSONEachRow rows totalling about `total_bytes`, as the
+/// spool file bytes (trailing newline) and as the rows the bounded streaming
+/// reader yields (joined by `\n`).
+fn compressible_json_rows(total_bytes: usize) -> (Vec<u8>, String) {
+    const ROW_PAD: usize = 64 * 1024;
+    let rows: Vec<String> = (0..total_bytes.div_ceil(ROW_PAD))
+        .map(|index| format!(r#"{{"row":{index},"pad":"{}"}}"#, "a".repeat(ROW_PAD)))
+        .collect();
+    let joined = rows.join("\n");
+    let mut file = joined.clone().into_bytes();
+    file.push(b'\n');
+    (file, joined)
 }
 
 #[test]
@@ -7689,18 +7828,19 @@ async fn replay_outcomes_delivered_permanent_and_claim_cleanup() {
 }
 
 #[test]
-fn legacy_and_orphaned_namespaces_are_reported_but_never_replayed() {
+fn orphaned_namespaces_are_reported_but_never_replayed() {
     let temp = tempfile::tempdir().unwrap();
     let spec = test_owner_spec("node-a");
     let root = SpoolManager::namespace_root_path_for_tests(temp.path(), &spec).unwrap();
     let plugin_dir = root.parent().unwrap().to_path_buf();
     let node_dir = plugin_dir.parent().unwrap().to_path_buf();
 
-    // Pre-namespace layout: `<spool.dir>/<node>/<YYYYMMDD>/<ULID>.ndjson`.
-    let legacy_day = node_dir.join("20260101");
-    fs::create_dir_all(&legacy_day).unwrap();
-    let legacy = legacy_day.join("00000000000000000000000000.ndjson");
-    fs::write(&legacy, b"{\"event_id\":\"legacy\"}\n").unwrap();
+    // A day directory directly under the node (no owner namespace) is not a
+    // layout this format writes; it is neither reported nor touched.
+    let stray_day = node_dir.join("20260101");
+    fs::create_dir_all(&stray_day).unwrap();
+    let stray = stray_day.join("00000000000000000000000000.ndjson");
+    fs::write(&stray, b"{\"event_id\":\"stray\"}\n").unwrap();
 
     // A namespace orphaned by a destination change.
     let orphan_ns = plugin_dir.join("o00000000000000000000000000000000");
@@ -7712,7 +7852,7 @@ fn legacy_and_orphaned_namespaces_are_reported_but_never_replayed() {
     let settings = spool_settings(temp.path(), 1024 * 1024);
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
     let (files, namespaces) = spool.unbound_record_counts_for_tests();
-    assert_eq!(files, 2, "both unbound records must be reported");
+    assert_eq!(files, 1, "only the orphaned namespace's record is reported");
     assert_eq!(namespaces, 1, "the orphaned namespace must be reported");
     let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
     assert!(
@@ -7722,7 +7862,10 @@ fn legacy_and_orphaned_namespaces_are_reported_but_never_replayed() {
 
     // Writing under the new identity leaves the unbound records untouched.
     spool.write_events(&[sample_event("evt-new")]).unwrap();
-    assert!(legacy.exists(), "legacy records must never be deleted");
+    assert!(
+        stray.exists(),
+        "records outside the namespace are never deleted"
+    );
     assert!(orphan.exists(), "orphaned records must never be deleted");
 }
 
@@ -8021,6 +8164,51 @@ fn snapshot_cardinality_overflow_bounds_entries_and_preserves_protocol_dimension
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].protocol, "tcp");
     assert_eq!(events[1].protocol, "ws");
+}
+
+/// Issue #7112: a billable record hook that runs after its snapshot generation
+/// closed admission (a request that outlived a reload or shutdown) cannot be
+/// accumulated or spooled, so it is counted instead of vanishing silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_charges_after_admission_closes_are_counted() {
+    use ferrum_edge::_test_support::api_chargeback_sink_finalize_snapshot_for_test;
+
+    const LATE: &str = "chargeback_sink_snapshot_late_charges_dropped_total";
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("late-charge-spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let mut config = valid_config(&spool_dir);
+    config["mode"] = json!("snapshot");
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+        .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    let before = prometheus_counter(&render_prometheus(), LATE);
+    plugin.log(&billable_summary("admitted-charge")).await;
+    assert_eq!(
+        prometheus_counter(&render_prometheus(), LATE),
+        before,
+        "an admitted charge is accumulated, not counted as late"
+    );
+
+    assert!(
+        api_chargeback_sink_finalize_snapshot_for_test(&plugin)
+            .await
+            .is_some(),
+        "finalization closes snapshot admission"
+    );
+    plugin.log(&billable_summary("late-charge")).await;
+    plugin.log(&billable_summary("late-charge-2")).await;
+    assert_eq!(
+        prometheus_counter(&render_prometheus(), LATE),
+        before + 2,
+        "every billable hook after admission closed is counted"
+    );
+    drop(plugin);
 }
 
 #[tokio::test]
@@ -12761,6 +12949,37 @@ fn insert_url_carries_params_but_redacted_form_does_not() {
     assert!(!redacted.contains("INSERT"));
 }
 
+/// Issue #7112: spool replay reuses the live delivery client, so activating a
+/// custom-TLS sink builds one dedicated ClickHouse client — its TLS files are
+/// read and its insecure-TLS warning is logged once, not once per pool.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn custom_tls_sink_builds_one_clickhouse_client_for_delivery_and_replay() {
+    const WARNING: &str = "ClickHouse TLS hostname verification is disabled";
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!("https://clickhouse.example:8443");
+    // reqwest's rustls backend only disables hostname verification together
+    // with a pinned CA or with certificate verification off; this test needs
+    // no CA file, so it turns both off.
+    config["clickhouse"]["tls"] = json!({ "verify_hostname": false, "insecure_skip_verify": true });
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+        .expect("custom-TLS sink with spool");
+
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    plugin
+        .start_background_tasks()
+        .expect("activate custom-TLS sink");
+    drop(guard);
+
+    assert_eq!(
+        logs.contents().matches(WARNING).count(),
+        1,
+        "one dedicated client serves live delivery and spool replay"
+    );
+    drop(plugin);
+}
+
 /// The custom-TLS (`Dedicated`) client path classifies its transport failure
 /// rather than rendering the `reqwest::Error`, so the INSERT URL cannot reach a
 /// log line or the returned replay error.
@@ -13373,19 +13592,16 @@ fn a_zstd_artifact_without_a_frame_content_size_still_decodes_via_the_ratio_clam
     // them, and the clamp must still fail closed on a high-ratio bomb.
     let temp = tempfile::tempdir().unwrap();
 
-    let plain = vec![b'\n'; 512 * 1024];
-    let legacy =
-        encode_spool_bytes_without_content_size_for_tests(&plain, SpoolCompression::Zstd).unwrap();
+    let (plain, rows) = compressible_json_rows(512 * 1024);
+    let legacy = zstd_frame_within_ratio_window(&plain, false);
     let legacy_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FC1.ndjson.zst");
     fs::write(&legacy_path, &legacy).unwrap();
     let decoded = decode_spool_file_for_tests(&legacy_path)
         .expect("a frame without a content size must still decode");
-    assert_eq!(decoded.len(), plain.len());
+    assert_eq!(decoded, rows);
 
     let bomb_plain = vec![b'\n'; 2 * 1024 * 1024];
-    let bomb =
-        encode_spool_bytes_without_content_size_for_tests(&bomb_plain, SpoolCompression::Zstd)
-            .unwrap();
+    let bomb = zstd_frame_within_ratio_window(&bomb_plain, false);
     let bomb_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FC2.ndjson.zst");
     fs::write(&bomb_path, &bomb).unwrap();
     let err = decode_spool_file_for_tests(&bomb_path)
@@ -13394,7 +13610,7 @@ fn a_zstd_artifact_without_a_frame_content_size_still_decodes_via_the_ratio_clam
             panic!("the ratio clamp must still bound a header-less high-ratio archive")
         });
     assert!(
-        err.contains("decompression bound"),
+        err.contains("decoded-byte bound"),
         "unexpected error: {err}"
     );
 }
@@ -13426,7 +13642,7 @@ fn a_declared_zstd_size_cannot_bypass_the_decompression_ratio_limit() {
     // must not let a planted high-ratio archive bypass the ratio limit.
     let temp = tempfile::tempdir().unwrap();
     let plain = vec![b'\n'; 2 * 1024 * 1024];
-    let encoded = encode_spool_bytes_without_ratio_padding_for_tests(&plain).unwrap();
+    let encoded = zstd_frame_within_ratio_window(&plain, true);
     let ratio_bound = spool_decompression_limit_for_tests(encoded.len() as u64);
     assert!(
         ratio_bound < plain.len() as u64,
@@ -13440,7 +13656,7 @@ fn a_declared_zstd_size_cannot_bypass_the_decompression_ratio_limit() {
         .err()
         .unwrap_or_else(|| panic!("a declared size must not bypass the decompression-ratio limit"));
     assert!(
-        err.contains("decompression bound"),
+        err.contains("decoded-byte bound"),
         "unexpected error: {err}"
     );
 }
@@ -14523,6 +14739,34 @@ async fn openapi_component_matches_constructor_defaults_and_field_bounds() {
             }),
         ),
         (
+            "password_ref with a username",
+            json!({
+                "clickhouse": {
+                    "url": url,
+                    "username": "ferrum_ingest",
+                    "password_ref": "FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD"
+                },
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "qualified ClickHouse identifiers",
+            json!({
+                "clickhouse": {"url": url, "database": "_ferrum2", "table": "ferrum.charges_raw"},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "enabled spool at the max_bytes floor",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {"enabled": true, "max_bytes": 1_048_576},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
             "complete ClickHouse client identity",
             json!({
                 "clickhouse": {
@@ -14617,6 +14861,114 @@ async fn openapi_component_matches_constructor_defaults_and_field_bounds() {
             }),
         ),
         (
+            "password_ref without a username",
+            json!({
+                "clickhouse": {"url": url, "password_ref": "FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD"},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "password_ref with a null username",
+            json!({
+                "clickhouse": {
+                    "url": url,
+                    "username": null,
+                    "password_ref": "FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD"
+                },
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "empty username",
+            json!({
+                "clickhouse": {"url": url, "username": ""},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "whitespace-only username",
+            json!({
+                "clickhouse": {"url": url, "username": "   "},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "reserved query insert parameter",
+            json!({
+                "clickhouse": {"url": url, "insert_query_params": {"Query": "SELECT 1"}},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "reserved database insert parameter",
+            json!({
+                "clickhouse": {"url": url, "insert_query_params": {"database": "other"}},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "table starting with a digit",
+            json!({
+                "clickhouse": {"url": url, "table": "123charges"},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "table with an empty qualifier part",
+            json!({
+                "clickhouse": {"url": url, "table": "a..b"},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "table that is only a dot",
+            json!({
+                "clickhouse": {"url": url, "table": "."},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "table with two qualifier dots",
+            json!({
+                "clickhouse": {"url": url, "table": "a.b.c"},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "dotted database",
+            json!({
+                "clickhouse": {"url": url, "database": "ferrum.charges"},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "database with a trailing dot",
+            json!({
+                "clickhouse": {"url": url, "database": "ferrum."},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "enabled spool below the max_bytes floor",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {"enabled": true, "max_bytes": 1_048_575},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
             "NUL byte in an enabled spool directory",
             json!({
                 "clickhouse": {"url": url},
@@ -14635,4 +14987,1008 @@ async fn openapi_component_matches_constructor_defaults_and_field_bounds() {
             "{label} must be runtime-rejected: {config}"
         );
     }
+}
+
+// --- Production-launch review hardening ---
+
+/// A retiring generation aborts its replay worker. Cancelling replay while a
+/// claimed artifact is awaiting its ClickHouse POST must release the claim back
+/// to its durable replayable name — keeping the original rows and event IDs —
+/// instead of stranding a descriptor-free `.inflight` claim that no generation
+/// will ever replay again.
+#[tokio::test]
+async fn cancelled_replay_releases_its_claim_for_the_next_generation() {
+    let slow = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+        .mount(&slow)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let record = spool
+        .write_events(&[sample_event("evt-cancelled-replay")])
+        .unwrap();
+
+    // The replay future's only await is the delivery, so the claim is held
+    // (and the POST in flight) when the timeout drops it — exactly what a
+    // retiring generation's `abort()` does to the replay task.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(500),
+        replay_spool_once_for_tests(&spool, &slow.uri()),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "the delayed delivery must still be in flight when replay is cancelled"
+    );
+
+    assert!(
+        record.exists(),
+        "a cancelled replay must release its claim back to the durable replayable name"
+    );
+    let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
+    assert!(
+        replayable.len() == 1 && replayable.contains(&record),
+        "the released artifact must be replayable by the next tick or generation: {replayable:?}"
+    );
+    assert!(
+        spool
+            .list_owned_spool_files_for_tests()
+            .unwrap()
+            .iter()
+            .all(|path| !path.to_string_lossy().ends_with(".inflight")),
+        "no stranded in-flight claim may remain after cancellation"
+    );
+
+    // Once ClickHouse is healthy the original row is delivered unchanged.
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&healthy)
+        .await;
+    replay_spool_once_for_tests(&spool, &healthy.uri())
+        .await
+        .expect("the released artifact must replay once ClickHouse recovers");
+    let requests = healthy.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "exactly one delivery of the released file"
+    );
+    assert!(
+        String::from_utf8_lossy(&requests[0].body).contains("evt-cancelled-replay"),
+        "the replayed row must keep its original event_id"
+    );
+    assert!(!record.exists(), "a delivered artifact leaves the spool");
+}
+
+/// Issue #7111: a replay tick's synchronous spool work (listing, claim,
+/// streaming preflight, dead-letter publication) runs on the blocking pool, so
+/// another task on a one-worker runtime keeps making progress while the tick
+/// is held inside that work.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn replay_tick_synchronous_work_leaves_the_runtime_worker_free() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let temp = tempfile::tempdir().unwrap();
+    let spool = Arc::new(test_spool(&temp));
+    let record = spool
+        .write_events(&[sample_event("evt-off-worker-replay")])
+        .unwrap();
+
+    let namespace_root = spool.namespace_root_for_tests().to_path_buf();
+    let (progress_tx, progress_rx) = mpsc::channel::<()>();
+    let progress_rx = Mutex::new(progress_rx);
+    let entered = Arc::new(AtomicBool::new(false));
+    let progressed = Arc::new(AtomicBool::new(false));
+    let entered_hook = Arc::clone(&entered);
+    let progressed_hook = Arc::clone(&progressed);
+    let _clear = ClearReplayHookOnDrop;
+    set_spool_replay_hook_for_tests(Some(Arc::new(move |point, claimed| {
+        if point != SpoolReplayHookPoint::AfterStreamingPreflight
+            || !claimed.starts_with(&namespace_root)
+        {
+            return;
+        }
+        entered_hook.store(true, Ordering::Release);
+        // Hold the tick inside its synchronous section until a task that
+        // needs the runtime's only worker reports progress.
+        let reported = progress_rx
+            .lock()
+            .expect("progress receiver")
+            .recv_timeout(Duration::from_secs(10))
+            .is_ok();
+        progressed_hook.store(reported, Ordering::Release);
+    })));
+
+    let probe_entered = Arc::clone(&entered);
+    let probe = tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !probe_entered.load(Ordering::Acquire) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let _ = progress_tx.send(());
+    });
+    let uri = server.uri();
+    let tick_spool = Arc::clone(&spool);
+    let tick =
+        tokio::spawn(async move { replay_spool_tick_off_worker_for_tests(tick_spool, &uri).await });
+
+    tick.await
+        .expect("replay tick task")
+        .expect("replay tick delivers the record");
+    probe.await.expect("progress probe task");
+    assert!(
+        entered.load(Ordering::Acquire),
+        "the tick must reach its synchronous streaming preflight"
+    );
+    assert!(
+        progressed.load(Ordering::Acquire),
+        "another task on the runtime's only worker must run while the tick is inside synchronous spool work"
+    );
+    assert!(!record.exists(), "a delivered artifact leaves the spool");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+/// Aborting the production replay task (what a retiring generation does) while
+/// the off-worker tick awaits its POST still releases the claim back to the
+/// durable replayable name: the cancellation reaches the blocking-pool tick at
+/// its next await.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_off_worker_replay_tick_releases_its_claim() {
+    let slow = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+        .mount(&slow)
+        .await;
+    let temp = tempfile::tempdir().unwrap();
+    let spool = Arc::new(test_spool(&temp));
+    let record = spool
+        .write_events(&[sample_event("evt-cancelled-off-worker-replay")])
+        .unwrap();
+
+    let uri = slow.uri();
+    let tick_spool = Arc::clone(&spool);
+    let tick =
+        tokio::spawn(async move { replay_spool_tick_off_worker_for_tests(tick_spool, &uri).await });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while slow
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .is_empty()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the replay tick must reach its delivery POST"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    tick.abort();
+    let _ = tick.await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !record.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "a cancelled off-worker tick must release its claim back to the durable replayable name"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        spool
+            .list_owned_spool_files_for_tests()
+            .unwrap()
+            .iter()
+            .all(|path| !path.to_string_lossy().ends_with(".inflight")),
+        "no stranded in-flight claim may remain after cancellation"
+    );
+
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&healthy)
+        .await;
+    replay_spool_once_for_tests(&spool, &healthy.uri())
+        .await
+        .expect("the released artifact must replay once ClickHouse recovers");
+    assert_eq!(healthy.received_requests().await.unwrap().len(), 1);
+    assert!(!record.exists(), "a delivered artifact leaves the spool");
+}
+
+/// ClickHouse can report an exception after it has already committed HTTP
+/// 200. Known transient server conditions must stay retryable; row and schema
+/// defects stay permanent, and an unreadable code stays permanent.
+#[test]
+fn clickhouse_success_status_exceptions_are_classified_by_code() {
+    use ferrum_edge::plugins::api_chargeback_sink::classify_clickhouse_acknowledgement_with_header_for_tests as classify;
+
+    for transient in [
+        "3", "32", "107", "159", "164", "202", "203", "209", "210", "241", "242", "252", "285",
+        "319", "394", "425", "439", "999",
+    ] {
+        let body = format!("Code: {transient}. DB::Exception: transient server condition");
+        assert_eq!(
+            classify(200, Some(body.as_bytes()), None),
+            "retryable",
+            "body code {transient} must be retryable"
+        );
+        assert_eq!(
+            classify(200, Some(b""), Some(transient)),
+            "retryable",
+            "header code {transient} must be retryable"
+        );
+        let padded = format!(" {transient} ");
+        assert_eq!(
+            classify(204, Some(b""), Some(padded.as_str())),
+            "retryable",
+            "a whitespace-padded header code {transient} must be retryable"
+        );
+    }
+    for permanent in ["60", "62", "27", "117", "1000"] {
+        let body = format!("Code: {permanent}. DB::Exception: row or schema defect");
+        assert_eq!(
+            classify(200, Some(body.as_bytes()), None),
+            "permanent",
+            "body code {permanent} must stay permanent"
+        );
+        assert_eq!(
+            classify(200, Some(b""), Some(permanent)),
+            "permanent",
+            "header code {permanent} must stay permanent"
+        );
+    }
+    // Unreadable or absent codes keep the conservative permanent disposition.
+    assert_eq!(
+        classify(200, Some(b"DB::Exception: no code"), None),
+        "permanent"
+    );
+    assert_eq!(classify(200, Some(b""), Some("")), "permanent");
+    assert_eq!(classify(200, Some(b""), Some("241x")), "permanent");
+    assert_eq!(classify(200, Some(b""), Some("2410000000")), "permanent");
+    assert_eq!(
+        classify(200, Some(b"Code: 99999999999. DB::Exception"), None),
+        "permanent"
+    );
+    // An unreadable header code falls back to a readable body code.
+    assert_eq!(
+        classify(
+            200,
+            Some(b"Code: 241. DB::Exception: Memory limit exceeded"),
+            Some("n/a")
+        ),
+        "retryable"
+    );
+    // The header remains authoritative when it names a permanent code.
+    assert_eq!(
+        classify(
+            200,
+            Some(b"Code: 241. DB::Exception: Memory limit exceeded"),
+            Some("60")
+        ),
+        "permanent"
+    );
+    // No exception at all keeps the existing durable-ACK contract.
+    assert_eq!(classify(200, Some(b""), None), "delivered");
+}
+
+async fn mount_transient_exception_then_success(
+    server: &MockServer,
+    via_header: bool,
+    code: &'static str,
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .respond_with(move |_: &Request| {
+            if calls_for_mock.fetch_add(1, Ordering::SeqCst) > 0 {
+                return ResponseTemplate::new(200);
+            }
+            if via_header {
+                ResponseTemplate::new(200).insert_header("X-ClickHouse-Exception-Code", code)
+            } else {
+                ResponseTemplate::new(200).set_body_string(format!(
+                    "Code: {code}. DB::Exception: Memory limit (total) exceeded. password=super-secret"
+                ))
+            }
+        })
+        .mount(server)
+        .await;
+}
+
+/// A transient ClickHouse exception under HTTP 200 must keep the spool file
+/// replayable — never dead-letter it — and the next tick must deliver the same
+/// event once the server recovers.
+#[tokio::test]
+async fn replay_retries_transient_http_200_exceptions_instead_of_dead_lettering() {
+    // 241/159 are resource/time limits; 203 (NO_FREE_CONNECTION) and 285
+    // (TOO_FEW_LIVE_REPLICAS) are availability failures that recover with the
+    // cluster. Each is exercised through both the body and header carriers.
+    for (via_header, code) in [
+        (false, "241"),
+        (true, "159"),
+        (false, "203"),
+        (true, "203"),
+        (false, "285"),
+        (true, "285"),
+    ] {
+        let server = MockServer::start().await;
+        mount_transient_exception_then_success(&server, via_header, code).await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let spool = test_spool(&temp);
+        let event_id = format!("evt-transient-{via_header}-{code}");
+        let path = spool.write_events(&[sample_event(&event_id)]).unwrap();
+
+        let err = replay_spool_once_for_tests(&spool, &server.uri())
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a transient exception must be retryable"));
+        assert!(
+            err.contains("transient ClickHouse exception code"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("super-secret") && !err.contains("Memory limit"),
+            "the retryable diagnostic must carry only the numeric code: {err}"
+        );
+        assert!(
+            path.exists(),
+            "a transient exception must leave the record replayable"
+        );
+        assert!(
+            !dead_letter_meta_path(&path).exists() && !dead_letter_payload_path(&path).exists(),
+            "a transient exception must never produce a dead-letter artifact"
+        );
+
+        replay_spool_once_for_tests(&spool, &server.uri())
+            .await
+            .expect("the recovered server must accept the replayed row");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            String::from_utf8_lossy(&requests[1].body).contains(&event_id),
+            "the retry must carry the unchanged event_id"
+        );
+        assert!(!path.exists(), "a delivered artifact leaves the spool");
+        assert!(!dead_letter_meta_path(&path).exists());
+    }
+}
+
+/// `password_ref` is only ever sent as the HTTP Basic password of
+/// `clickhouse.username`; without a username it was resolved and then silently
+/// dropped. A blank username never names the intended account either.
+#[tokio::test]
+async fn password_ref_requires_a_non_blank_clickhouse_username() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!("https://localhost:8443");
+    config["clickhouse"]["password_ref"] = json!("FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD");
+    for username in [None, Some(Value::Null)] {
+        let mut candidate = config.clone();
+        if let Some(username) = username {
+            candidate["clickhouse"]["username"] = username;
+        }
+        let error = validate_plugin_config("api_chargeback_sink", &candidate)
+            .err()
+            .unwrap_or_else(|| panic!("password_ref without a username must be rejected"));
+        assert!(
+            error.contains("`clickhouse.password_ref` requires `clickhouse.username`"),
+            "unexpected error: {error}"
+        );
+    }
+    for blank in ["", "   "] {
+        let mut candidate = config.clone();
+        candidate["clickhouse"]["username"] = json!(blank);
+        let error = validate_plugin_config("api_chargeback_sink", &candidate)
+            .err()
+            .unwrap_or_else(|| panic!("a blank username {blank:?} must be rejected"));
+        assert!(
+            error.contains("`clickhouse.username` must not be empty"),
+            "unexpected error for {blank:?}: {error}"
+        );
+    }
+    // A blank username is rejected even without a password.
+    let mut no_password = valid_config(temp.path());
+    no_password["clickhouse"]["username"] = json!(" ");
+    assert!(validate_plugin_config("api_chargeback_sink", &no_password).is_err());
+
+    let mut paired = config.clone();
+    paired["clickhouse"]["username"] = json!("ferrum_ingest");
+    validate_plugin_config("api_chargeback_sink", &paired)
+        .expect("a username plus a namespaced password_ref is admitted");
+    // A blank password_ref stays "unset" and needs no username.
+    let mut blank_ref = valid_config(temp.path());
+    blank_ref["clickhouse"]["password_ref"] = json!("   ");
+    validate_plugin_config("api_chargeback_sink", &blank_ref)
+        .expect("a blank password_ref is treated as unset");
+}
+
+/// `database` and `query` are set by the sink itself; a second occurrence from
+/// `insert_query_params` would leave the executed statement to ClickHouse's
+/// duplicate-parameter handling.
+#[tokio::test]
+async fn insert_query_params_reject_reserved_database_and_query_names() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let temp = tempfile::tempdir().unwrap();
+    for name in ["query", "Query", "QUERY", "database", "DataBase"] {
+        let mut config = valid_config(temp.path());
+        config["clickhouse"]["insert_query_params"] =
+            json!({ name: "INSERT INTO other.table FORMAT JSONEachRow" });
+        let error = validate_plugin_config("api_chargeback_sink", &config)
+            .err()
+            .unwrap_or_else(|| panic!("reserved parameter {name:?} must be rejected"));
+        assert!(
+            error.contains("is reserved"),
+            "unexpected error for {name}: {error}"
+        );
+        assert!(
+            !error.contains("other.table"),
+            "the rejection must not echo the value for {name}: {error}"
+        );
+    }
+
+    // A normal config carries exactly one `database` and one `query` pair.
+    let config: ApiChargebackSinkConfig =
+        serde_json::from_value(valid_config(temp.path())).unwrap();
+    let url = clickhouse_insert_url_for_tests(&config).unwrap();
+    let parsed = url::Url::parse(&url).unwrap();
+    for reserved in ["database", "query"] {
+        assert_eq!(
+            parsed
+                .query_pairs()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(reserved))
+                .count(),
+            1,
+            "the INSERT URL must carry exactly one `{reserved}` parameter: {url}"
+        );
+    }
+}
+
+/// The identifier charset admitted names ClickHouse cannot parse unquoted, so
+/// every INSERT was a syntax error and every row was dead-lettered. `table` is
+/// `table` or `database.table`; `database` is a single identifier.
+#[tokio::test]
+async fn clickhouse_identifiers_must_be_parseable_insert_targets() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let temp = tempfile::tempdir().unwrap();
+    let rejected = |field: &str, value: &str| {
+        let mut config = valid_config(temp.path());
+        config["clickhouse"][field] = json!(value);
+        validate_plugin_config("api_chargeback_sink", &config)
+            .err()
+            .unwrap_or_else(|| panic!("`clickhouse.{field}` = {value:?} must be rejected"))
+    };
+    let admitted = |field: &str, value: &str| {
+        let mut config = valid_config(temp.path());
+        config["clickhouse"][field] = json!(value);
+        validate_plugin_config("api_chargeback_sink", &config).unwrap_or_else(|error| {
+            panic!("`clickhouse.{field}` = {value:?} must be admitted: {error}")
+        });
+    };
+
+    for field in ["table", "database"] {
+        for bad in [
+            "123charges",
+            ".",
+            "ferrum.",
+            ".charges",
+            "a..b",
+            "ferrum.9raw",
+        ] {
+            let error = rejected(field, bad);
+            assert!(
+                error.contains(&format!(
+                    "`clickhouse.{field}` must be a ClickHouse identifier"
+                )),
+                "unexpected error for {field} = {bad:?}: {error}"
+            );
+        }
+        for good in ["charges_raw", "_t1", "T_2"] {
+            admitted(field, good);
+        }
+    }
+    for over_qualified in ["a.b.c", "ferrum.billing.charges_raw"] {
+        let error = rejected("table", over_qualified);
+        assert!(
+            error.contains("must be `table` or `database.table` (at most one dot)"),
+            "unexpected error for table = {over_qualified:?}: {error}"
+        );
+    }
+    for good in ["ferrum.charges_raw", "_db.T_2"] {
+        admitted("table", good);
+    }
+    for dotted in ["ferrum.charges", "a.b"] {
+        let error = rejected("database", dotted);
+        assert!(
+            error.contains("`clickhouse.database` must be a single ClickHouse identifier"),
+            "unexpected error for database = {dotted:?}: {error}"
+        );
+    }
+}
+
+/// `spool.max_bytes` has a 1 MiB policy floor while spooling is enabled: a
+/// much smaller quota refuses ordinary failed batches and snapshot chunks too
+/// often for the durable spool to be relied on.
+#[tokio::test]
+async fn enabled_spool_max_bytes_has_a_viable_artifact_floor() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let temp = tempfile::tempdir().unwrap();
+    for (mode, below) in [
+        ("per_event", 1u64),
+        ("per_event", 4096),
+        ("per_event", 1_048_575),
+        ("snapshot", 4096),
+    ] {
+        let mut config = valid_config(temp.path());
+        config["mode"] = json!(mode);
+        config["spool"]["max_bytes"] = json!(below);
+        let error = validate_plugin_config("api_chargeback_sink", &config)
+            .err()
+            .unwrap_or_else(|| panic!("{mode} spool.max_bytes={below} must be rejected"));
+        assert!(
+            error.contains("`spool.max_bytes` must be at least 1048576"),
+            "unexpected error for {mode} {below}: {error}"
+        );
+    }
+    let mut floor = valid_config(temp.path());
+    floor["spool"]["max_bytes"] = json!(1_048_576u64);
+    validate_plugin_config("api_chargeback_sink", &floor)
+        .expect("the documented floor itself is admitted");
+}
+
+/// Per-event status-cache invalidation must not pay an `ArcSwap` store and an
+/// `Arc` allocation while the cache is already empty.
+#[test]
+fn status_cache_invalidation_skips_the_store_when_already_empty() {
+    use ferrum_edge::plugins::api_chargeback_sink::probe_status_cache_invalidation_for_tests;
+
+    let (empty_cell_store_skipped, populated_cell_cleared) =
+        probe_status_cache_invalidation_for_tests();
+    assert!(
+        empty_cell_store_skipped,
+        "invalidating an already-empty status cache must not store a new value"
+    );
+    assert!(
+        populated_cell_cleared,
+        "invalidating a populated status cache must still clear it"
+    );
+}
+
+/// The snapshot identity charge must cover every copy the accumulator retains
+/// (map key, entry metadata, last-emitted baseline key), so the hard
+/// `max_retained_bytes` budget admits only identities it can actually hold.
+#[test]
+fn snapshot_identity_charge_covers_every_retained_copy() {
+    use ferrum_edge::plugins::api_chargeback_sink::snapshot_identity_retained_bytes_for_tests;
+
+    let consumer = "c".repeat(400);
+    let (charged, field_bytes) =
+        snapshot_identity_retained_bytes_for_tests("ferrum", &consumer, "proxy", "Proxy", "http");
+    assert!(
+        charged >= field_bytes.saturating_mul(3),
+        "every identity string is retained three times; charged {charged} for {field_bytes} field bytes"
+    );
+
+    // Recording the identity charges exactly that amount ...
+    let accumulator = SnapshotAccumulator::with_limits(100, 16 * 1024 * 1024);
+    assert!(accumulator.record_accumulated_for_test(
+        "ferrum",
+        &consumer,
+        "proxy",
+        "Proxy",
+        200,
+        "http",
+        unit_call_charge(0.01),
+    ));
+    assert_eq!(accumulator.retained_bytes_for_tests(), charged);
+
+    // ... and a budget of two identities admits exactly two same-sized ones.
+    let budgeted = SnapshotAccumulator::with_limits(100, charged * 2);
+    let mut admitted = 0;
+    for index in 0..10 {
+        let consumer = format!("{}{index}", "c".repeat(399));
+        if budgeted.record_accumulated_for_test(
+            "ferrum",
+            &consumer,
+            "proxy",
+            "Proxy",
+            200,
+            "http",
+            unit_call_charge(0.01),
+        ) {
+            admitted += 1;
+        }
+    }
+    assert_eq!(
+        admitted, 2,
+        "the byte budget must bind on the honestly charged identity size"
+    );
+    assert!(budgeted.retained_bytes_for_tests() <= charged * 2);
+}
+
+/// A same-identity refresh is the hot snapshot path: it must accumulate in
+/// place without charging or publishing a second identity.
+#[test]
+fn snapshot_same_identity_refresh_accumulates_without_new_admission() {
+    let accumulator = SnapshotAccumulator::with_limits(4, 16 * 1024 * 1024);
+    let record = || {
+        accumulator.record_accumulated_for_test(
+            "ferrum",
+            "consumer-hot",
+            "proxy",
+            "Proxy",
+            200,
+            "http",
+            unit_call_charge(0.01),
+        )
+    };
+    assert!(record());
+    let charged = accumulator.retained_bytes_for_tests();
+    for _ in 0..16 {
+        assert!(record());
+    }
+    assert_eq!(accumulator.entry_count(), 1);
+    assert_eq!(accumulator.retained_bytes_for_tests(), charged);
+    assert_eq!(accumulator.total_call_count_for_tests(), 17);
+}
+
+/// Issue #7110: an unavailable plugin HTTP client (a failed CRL-generation
+/// rebuild, retried on the next call) is a local, transient condition. It must
+/// classify as `Retryable` — never `Permanent`, which spool replay treats as a
+/// destination rejection and dead-letters every row ClickHouse never saw — and
+/// it must be counted as a failed attempt. Inducing a failed CRL rebuild needs
+/// a live CRL rotation, so the classification is pinned over the source.
+#[test]
+fn unavailable_http_client_is_a_counted_retryable_delivery_outcome() {
+    let source = include_str!("../../../src/plugins/api_chargeback_sink.rs");
+    let start = source
+        .find("async fn post_json_each_row_bytes(")
+        .expect("post_json_each_row_bytes exists");
+    let end = start
+        + source[start..]
+            .find("cfg.http.execute(")
+            .expect("post_json_each_row_bytes sends through cfg.http.execute");
+    let preamble = &source[start..end];
+    assert!(
+        preamble.contains("client.get()") && preamble.contains("client.current()"),
+        "both client families must be resolved before the request is built"
+    );
+    assert!(
+        !preamble.contains("DeliveryOutcome::Permanent"),
+        "an unavailable client must not classify as a permanent rejection"
+    );
+    assert!(
+        preamble.contains("record_failure(FailureReason::Tls")
+            && preamble.contains("DeliveryOutcome::Retryable { message }"),
+        "an unavailable client must be counted and returned as retryable"
+    );
+}
+
+/// Issue #7112: in snapshot mode an HTTP charge refused by the accumulator's
+/// cardinality bound is spooled as an immediate overflow row. That row must
+/// carry the same normalized `grpc_status` the accumulator keys on (see
+/// `grpc_snapshot_bounds_non_standard_terminal_status_cardinality`), or one
+/// request class appears under two values exactly when the accumulator is
+/// under pressure. Driving a live snapshot lifecycle to its cardinality bound
+/// is out of reach of a unit test, so both producers are pinned to the one
+/// shared normalization over the source.
+#[test]
+fn snapshot_overflow_rows_use_the_accumulator_grpc_status_normalization() {
+    let source = include_str!("../../../src/plugins/api_chargeback_sink.rs");
+    let arm = source
+        .find("SnapshotRecordOutcome::OverflowImmediate => {")
+        .expect("snapshot overflow arm exists");
+    let arm_end = arm
+        + source[arm..]
+            .find("self.enqueue(event_from_http_summary(")
+            .expect("the immediate-export path follows the snapshot arm");
+    let arm_body = &source[arm..arm_end];
+    assert!(
+        arm_body.contains("snapshot_http_outcome(outcome)"),
+        "the overflow row must be built from the snapshot-normalized outcome"
+    );
+    assert!(
+        source.contains("grpc_status: snapshot_http_outcome(outcome).grpc_status,"),
+        "the accumulator identity must use the same normalization"
+    );
+}
+
+/// Issue #7122: the billing spool's fault injection and its process-global
+/// spool hooks are compiled only with the never-shipped `test-support` cargo
+/// feature, which test builds get from the crate's self dev-dependency. This
+/// suite compiling and running the faulted constructors above proves the
+/// feature is on here; this pins that the production build cannot reach them.
+#[test]
+fn spool_fault_injection_and_hooks_exist_only_with_test_support() {
+    let manifest = include_str!("../../../Cargo.toml");
+    assert!(
+        manifest.contains("\ntest-support = []\n"),
+        "Cargo.toml must declare the empty `test-support` feature"
+    );
+    assert!(
+        manifest.contains("\ndefault = [\"crypto-ring\"]\n"),
+        "`test-support` must never be a default feature"
+    );
+    let dev_dependencies = manifest
+        .split("\n[dev-dependencies]\n")
+        .nth(1)
+        .expect("Cargo.toml has [dev-dependencies]");
+    let dev_dependencies = &dev_dependencies[..dev_dependencies
+        .find("\n[")
+        .unwrap_or(dev_dependencies.len())];
+    assert!(
+        dev_dependencies.contains(
+            "\nferrum-edge = { path = \".\", default-features = false, features = [\"test-support\"] }\n"
+        ),
+        "test builds must enable `test-support` through a self dev-dependency that leaves the \
+         crypto backend to the command line (a FIPS test build must not pull `crypto-ring` back in)"
+    );
+    let normal_dependencies = manifest
+        .split("\n[dependencies]\n")
+        .nth(1)
+        .expect("Cargo.toml has [dependencies]");
+    let normal_dependencies = &normal_dependencies[..normal_dependencies
+        .find("\n[")
+        .unwrap_or(normal_dependencies.len())];
+    assert!(
+        !normal_dependencies.contains("test-support"),
+        "no normal dependency edge may enable `test-support`"
+    );
+
+    let source = include_str!("../../../src/plugins/api_chargeback_sink.rs");
+    let gated = "#[cfg(feature = \"test-support\")]";
+    for item in [
+        "pub enum SpoolFsFault {",
+        "fn with_fault(fault: SpoolFsFault) -> Self {",
+        "fn fail_sync_spool_file(",
+        "fn fail_rename_spool_file(",
+        "fn fail_open_spool_dir(",
+        "fn fail_sync_spool_dir(",
+        "fn republish_final_path_as_peer(",
+        "pub const PEER_REPUBLISH_MARKER",
+        "pub fn for_tests_with_owner_and_faults(",
+        "pub fn for_tests_with_owner_faults_and_ages(",
+        "pub fn for_tests_with_owner_faults_ages_and_ceiling(",
+        "pub fn write_private_file_atomically_with_fault_for_tests(",
+        "pub async fn probe_shared_spool_batch_clone_for_tests(",
+        "fn spool_write_hook_slot()",
+        "pub fn set_spool_write_hook_for_tests(",
+        "fn spool_walk_hook_slot()",
+        "pub fn set_spool_walk_hook_for_tests(",
+        "fn spool_replay_hook_slot()",
+        "pub fn set_spool_replay_hook_for_tests(",
+    ] {
+        let at = source
+            .find(item)
+            .unwrap_or_else(|| panic!("`{item}` must exist in api_chargeback_sink.rs"));
+        // The item's own attribute/doc block: the contiguous `#[...]` and `//`
+        // lines directly above it.
+        let line_start = source[..at].rfind('\n').map_or(0, |newline| newline + 1);
+        let attributes: Vec<&str> = source[..line_start]
+            .lines()
+            .rev()
+            .map(str::trim_start)
+            .take_while(|line| line.starts_with("#[") || line.starts_with("//"))
+            .collect();
+        assert!(
+            attributes.contains(&gated),
+            "`{item}` must be compiled only with the `test-support` feature (#7122)"
+        );
+    }
+    for kind in ["write", "walk", "replay"] {
+        let stub = format!(
+            "#[cfg(not(feature = \"test-support\"))]\n#[inline(always)]\nfn snapshot_spool_{kind}_hook_for_tests()"
+        );
+        let at = source
+            .find(&stub)
+            .unwrap_or_else(|| panic!("the production `{kind}` hook snapshot stub must exist"));
+        let body = &source[at..];
+        let body = &body[..body.find("\n}\n").expect("stub body ends")];
+        assert!(
+            body.contains("    None") && !body.contains("lock()"),
+            "without `test-support` the `{kind}` hook snapshot must be a constant None that \
+             takes no lock"
+        );
+    }
+}
+
+// --- GHSA-q9vj-rf66-3j58: `consumer_id` is the principal, not its display string ---
+
+const PROVIDER_A_AUTHORITY: [u8; 32] = [0xa1; 32];
+const PROVIDER_B_AUTHORITY: [u8; 32] = [0xb2; 32];
+
+fn external_alice_consumer_id(authority: [u8; 32]) -> String {
+    format!("external:jwks_auth:{}:alice", hex::encode(authority))
+}
+
+/// The billable summaries of a mapped Consumer `alice` and of unmapped
+/// `jwks_auth` principals `alice` from two providers, each stamped from a
+/// context committed through the authentication boundary exactly as the
+/// production summary builders stamp it.
+fn alice_principal_summaries() -> [TransactionSummary; 3] {
+    let consumer = super::plugin_utils::consumer_context("alice");
+    let mut provider_a = super::plugin_utils::create_test_context();
+    super::plugin_utils::commit_external_identity_with_authority(
+        &mut provider_a,
+        "alice",
+        "jwks_auth",
+        Some(PROVIDER_A_AUTHORITY),
+    );
+    let mut provider_b = super::plugin_utils::create_test_context();
+    super::plugin_utils::commit_external_identity_with_authority(
+        &mut provider_b,
+        "alice",
+        "jwks_auth",
+        Some(PROVIDER_B_AUTHORITY),
+    );
+    [&consumer, &provider_a, &provider_b].map(|ctx| {
+        let mut summary = billable_summary("principal-row");
+        summary.consumer_username = ctx.effective_identity().map(str::to_owned);
+        summary.principal_origin = ctx.principal_origin();
+        assert_eq!(summary.consumer_username.as_deref(), Some("alice"));
+        summary
+    })
+}
+
+fn expected_alice_consumer_ids() -> std::collections::BTreeSet<String> {
+    std::collections::BTreeSet::from([
+        "alice".to_string(),
+        external_alice_consumer_id(PROVIDER_A_AUTHORITY),
+        external_alice_consumer_id(PROVIDER_B_AUTHORITY),
+    ])
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn per_event_exports_bill_consumer_and_two_jwks_providers_to_three_consumer_ids() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(server.uri());
+    config["batch"]["size"] = json!(1);
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    plugin.start_background_tasks().expect("chargeback start");
+    plugin.commit_background_tasks();
+
+    for summary in alice_principal_summaries() {
+        plugin.log(&summary).await;
+    }
+
+    let requests = wait_for_requests(&server, 3).await;
+    let consumer_ids: std::collections::BTreeSet<String> = requests
+        .iter()
+        .flat_map(|request| {
+            String::from_utf8(request.body.clone())
+                .expect("JSONEachRow body is UTF-8")
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    let row: Value = serde_json::from_str(line).expect("charge event row");
+                    row["consumer_id"]
+                        .as_str()
+                        .expect("consumer_id string")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        consumer_ids,
+        expected_alice_consumer_ids(),
+        "a mapped Consumer and each provider's principal must export disjoint consumer_ids"
+    );
+}
+
+/// Rows exported to a test-owned ClickHouse mock, deduplicated by `event_id`
+/// (the snapshot hand-off and a later spool replay deliver the same event).
+fn exported_rows_by_event_id(requests: &[Request]) -> std::collections::BTreeMap<String, Value> {
+    let mut rows = std::collections::BTreeMap::new();
+    for request in requests {
+        let body = String::from_utf8(request.body.clone()).expect("JSONEachRow body is UTF-8");
+        for line in body.lines().filter(|line| !line.trim().is_empty()) {
+            let row: Value = serde_json::from_str(line).expect("charge event row");
+            let event_id = row["event_id"].as_str().expect("event_id").to_string();
+            rows.insert(event_id, row);
+        }
+    }
+    rows
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_rows_bill_consumer_and_two_jwks_providers_to_three_consumer_ids() {
+    use ferrum_edge::_test_support::api_chargeback_sink_emit_snapshot_tick_for_test;
+
+    // Verified through a test-owned ClickHouse mock rather than the spool
+    // directory, which the replay worker may claim (rename) at any time.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("principal-snapshot-spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let mut config = valid_config(&spool_dir);
+    config["mode"] = json!("snapshot");
+    config["clickhouse"]["url"] = json!(server.uri());
+    config["batch"]["size"] = json!(1);
+    config["batch"]["flush_interval_ms"] = json!(50);
+    config["snapshot"] = json!({
+        "interval_secs": 3600,
+        "cleanup_interval_secs": 3600,
+        "stale_entry_ttl_secs": 7200
+    });
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+        .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    let [consumer, provider_a, provider_b] = alice_principal_summaries();
+    plugin.log(&consumer).await;
+    for _ in 0..2 {
+        plugin.log(&provider_a).await;
+    }
+    for _ in 0..3 {
+        plugin.log(&provider_b).await;
+    }
+
+    assert_eq!(
+        api_chargeback_sink_emit_snapshot_tick_for_test(&plugin),
+        Some(Ok(3)),
+        "three principals must accumulate into three snapshot identities"
+    );
+
+    let mut rows = std::collections::BTreeMap::new();
+    for _ in 0..400 {
+        rows = exported_rows_by_event_id(&server.received_requests().await.unwrap_or_default());
+        if rows.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(rows.len(), 3, "exactly three snapshot rows: {rows:?}");
+    let mut calls_by_consumer = std::collections::BTreeMap::new();
+    for row in rows.values() {
+        assert!(
+            row["snapshot_id"].as_str().is_some_and(|id| !id.is_empty()),
+            "a snapshot delta carries its snapshot_id: {row}"
+        );
+        calls_by_consumer.insert(
+            row["consumer_id"]
+                .as_str()
+                .expect("consumer_id")
+                .to_string(),
+            row["call_count"].as_u64().expect("call_count"),
+        );
+    }
+    assert_eq!(
+        calls_by_consumer,
+        std::collections::BTreeMap::from([
+            ("alice".to_string(), 1),
+            (external_alice_consumer_id(PROVIDER_A_AUTHORITY), 2),
+            (external_alice_consumer_id(PROVIDER_B_AUTHORITY), 3),
+        ])
+    );
+    drop(plugin);
 }

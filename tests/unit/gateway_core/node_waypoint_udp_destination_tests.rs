@@ -36,7 +36,6 @@ fn route_in(
         ip(destination),
         port,
         NamespacedResourceId::new(namespace, proxy),
-        false,
     )
 }
 

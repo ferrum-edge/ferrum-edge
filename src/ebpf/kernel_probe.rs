@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Runtime kernel detection for eBPF capability probing.
 //!
 //! The node agent checks kernel version and cgroup v2 availability before
@@ -7,10 +6,6 @@
 //! `FERRUM_NODE_AGENT_FALLBACK_MODE`.
 
 use std::path::Path;
-
-/// Minimum kernel version required for cgroup-based eBPF capture.
-pub const MIN_KERNEL_MAJOR: u32 = 5;
-pub const MIN_KERNEL_MINOR: u32 = 7;
 
 /// Kernel capability probe result.
 #[derive(Debug, Clone, PartialEq, Eq)]

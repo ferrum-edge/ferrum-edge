@@ -4,11 +4,12 @@
 
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    admin_batch_persistence_message_for_test, admin_consumer_persistence_response_for_test,
-    admin_database_error_body_for_test, admin_mtls_dns_admission_contention_response,
-    admin_mtls_dns_admission_drop_should_release, admin_proxy_route_conflict_message_for_test,
-    admin_recovery_persistence_message_for_test, admin_throttle_conflict_message_for_test,
-    admin_wrapped_mtls_conflict_message_for_test, admin_wrapped_mtls_conflict_response_for_test,
+    AdminMtlsDnsAdmissionHoldProbe, admin_batch_persistence_message_for_test,
+    admin_consumer_persistence_response_for_test, admin_database_error_body_for_test,
+    admin_mtls_dns_admission_contention_response, admin_mtls_dns_admission_drop_should_release,
+    admin_proxy_route_conflict_message_for_test, admin_recovery_persistence_message_for_test,
+    admin_throttle_conflict_message_for_test, admin_wrapped_mtls_conflict_message_for_test,
+    admin_wrapped_mtls_conflict_response_for_test,
 };
 use ferrum_edge::admin::{
     AdminState,
@@ -60,6 +61,336 @@ fn mtls_dns_admission_lifecycle_only_retains_uncertain_mutations() {
     assert!(!admin_mtls_dns_admission_drop_should_release(true, false));
 }
 
+type RestoreImportResult = (usize, Vec<String>);
+
+fn restore_import_succeeded(result: &RestoreImportResult) -> bool {
+    result.1.is_empty()
+}
+
+#[tokio::test]
+async fn mtls_dns_admission_single_mutation_drop_behaviour_is_unchanged() {
+    let probe = AdminMtlsDnsAdmissionHoldProbe::new();
+    assert!(probe.drop_releases(), "not-started mutation releases");
+
+    // A cancelled in-flight mutation retains the fence.
+    tokio::select! {
+        biased;
+        _ = probe.run_mutation(std::future::pending::<()>()) => unreachable!(),
+        _ = std::future::ready(()) => {}
+    }
+    assert!(
+        !probe.drop_releases(),
+        "cancelled in-flight mutation retains"
+    );
+
+    let fresh = AdminMtlsDnsAdmissionHoldProbe::new();
+    fresh.run_mutation(async { 1_u8 }).await;
+    assert!(fresh.drop_releases(), "settled mutation releases");
+    fresh.run_mutation(async { 2_u8 }).await;
+    assert!(
+        fresh.drop_releases(),
+        "sequential settled mutations release"
+    );
+}
+
+#[tokio::test]
+async fn mtls_dns_admission_nested_mutation_does_not_settle_outer_uncertain_mutation() {
+    let probe = AdminMtlsDnsAdmissionHoldProbe::new();
+    let (inner_done_tx, inner_done_rx) = tokio::sync::oneshot::channel::<()>();
+    let outer = probe.run_mutation(async {
+        probe.run_mutation(async {}).await;
+        let _ = inner_done_tx.send(());
+        std::future::pending::<()>().await
+    });
+    tokio::select! {
+        biased;
+        _ = outer => unreachable!(),
+        _ = inner_done_rx => {}
+    }
+    assert!(
+        !probe.drop_releases(),
+        "a nested mutation's exit must restore the outer in-flight state"
+    );
+}
+
+#[tokio::test]
+async fn mtls_dns_restore_import_errors_then_unpolled_rollback_retains_fence() {
+    let probe = AdminMtlsDnsAdmissionHoldProbe::new();
+    probe
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .unwrap();
+    assert!(!probe.drop_releases(), "cleared namespace retains");
+
+    let result: RestoreImportResult = probe
+        .run_restore_import(
+            async { (3, vec!["chunk failed".to_string()]) },
+            restore_import_succeeded,
+        )
+        .await;
+    assert_eq!(result.1.len(), 1);
+    assert!(
+        !probe.drop_releases(),
+        "import with errors must not settle the incomplete restore"
+    );
+
+    // The compensating rollback is dispatched through an admission wrapper
+    // that can fail (for example `ensure_held()`) without polling it.
+    let rollback = probe.run_restore_rollback(async { Ok::<(), Vec<String>>(()) });
+    drop(rollback);
+    assert!(
+        !probe.drop_releases(),
+        "an unpolled rollback leaves a half-restored namespace fenced"
+    );
+}
+
+#[tokio::test]
+async fn mtls_dns_restore_cancellation_after_clear_retains_fence() {
+    // Cancelled between the clear and the import dispatch.
+    let probe = AdminMtlsDnsAdmissionHoldProbe::new();
+    probe
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .unwrap();
+    assert!(!probe.drop_releases());
+
+    // Cancelled while the import is in flight.
+    let in_flight = AdminMtlsDnsAdmissionHoldProbe::new();
+    in_flight
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .unwrap();
+    tokio::select! {
+        biased;
+        _ = in_flight.run_restore_import(
+            std::future::pending::<RestoreImportResult>(),
+            restore_import_succeeded,
+        ) => unreachable!(),
+        _ = std::future::ready(()) => {}
+    }
+    assert!(!in_flight.drop_releases());
+
+    // Cancelled while the compensating rollback is in flight.
+    let rolling_back = AdminMtlsDnsAdmissionHoldProbe::new();
+    rolling_back
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .unwrap();
+    rolling_back
+        .run_restore_import(
+            async { (0, vec!["chunk failed".to_string()]) },
+            restore_import_succeeded,
+        )
+        .await;
+    tokio::select! {
+        biased;
+        _ = rolling_back.run_restore_rollback(
+            std::future::pending::<Result<(), Vec<String>>>(),
+        ) => unreachable!(),
+        _ = std::future::ready(()) => {}
+    }
+    assert!(!rolling_back.drop_releases());
+}
+
+// The production finalizer path (`finish_failed_restore` through
+// `/restore`) is covered by
+// `tests/integration/admin_cached_config_tests.rs::mtls_dns_restore_failed_rollback_retains_fence`.
+#[tokio::test]
+async fn mtls_dns_restore_failed_rollback_phase_retains_from_any_prior_phase() {
+    let after_import = AdminMtlsDnsAdmissionHoldProbe::new();
+    after_import
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .unwrap();
+    after_import
+        .run_restore_import(
+            async { (0, vec!["chunk failed".to_string()]) },
+            restore_import_succeeded,
+        )
+        .await;
+    let rollback = after_import
+        .run_restore_rollback(async { Err::<(), _>(vec!["replay failed".to_string()]) })
+        .await;
+    assert!(rollback.is_err());
+    assert!(!after_import.drop_releases());
+
+    // A non-atomic clear failure reaches the rollback without a recorded
+    // clear; a failed replay must still retain the fence.
+    let after_partial_clear = AdminMtlsDnsAdmissionHoldProbe::new();
+    assert!(
+        after_partial_clear
+            .run_restore_clear(async { Err::<(), _>("partial clear") })
+            .await
+            .is_err()
+    );
+    assert!(after_partial_clear.drop_releases());
+    let rollback = after_partial_clear
+        .run_restore_rollback(async { Err::<(), _>(vec!["replay failed".to_string()]) })
+        .await;
+    assert!(rollback.is_err());
+    assert!(!after_partial_clear.drop_releases());
+}
+
+#[tokio::test]
+async fn mtls_dns_restore_success_and_completed_rollback_release_fence() {
+    let restored = AdminMtlsDnsAdmissionHoldProbe::new();
+    restored
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .unwrap();
+    restored
+        .run_restore_import(async { (5, Vec::new()) }, restore_import_succeeded)
+        .await;
+    assert!(restored.drop_releases(), "successful restore releases");
+
+    let rolled_back = AdminMtlsDnsAdmissionHoldProbe::new();
+    rolled_back
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .unwrap();
+    rolled_back
+        .run_restore_import(
+            async { (1, vec!["chunk failed".to_string()]) },
+            restore_import_succeeded,
+        )
+        .await;
+    rolled_back
+        .run_restore_rollback(async { Ok::<(), Vec<String>>(()) })
+        .await
+        .unwrap();
+    assert!(rolled_back.drop_releases(), "completed rollback releases");
+
+    // A definitively failed clear never enters the incomplete-restore phase.
+    let clear_aborted = AdminMtlsDnsAdmissionHoldProbe::new();
+    assert!(
+        clear_aborted
+            .run_restore_clear(async { Err::<(), _>("atomic abort") })
+            .await
+            .is_err()
+    );
+    assert!(clear_aborted.drop_releases());
+}
+
+/// Source slice from `start` up to the next `end` marker.
+fn admin_source_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let from = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing {start}"));
+    let to = source[from..]
+        .find(end)
+        .map(|offset| from + offset)
+        .unwrap_or_else(|| panic!("missing {end} after {start}"));
+    &source[from..to]
+}
+
+/// Issue #7062 (following #7032): the lost-lease recovery sites cannot be
+/// driven through the SQLite `/restore` harness, so pin their wiring
+/// structurally. Recovery keeps the restore's original guard (the durable
+/// fence) across the namespace lease reacquisition: neither recovery section
+/// may release it or replace it with a reacquired owner, which would leave a
+/// window with no fence over a cleared or partially imported namespace. Both
+/// rollback finalizers must gate their explicit release on the restore phase.
+#[test]
+fn mtls_dns_restore_recovery_paths_keep_phase_gated_fence() {
+    let source = include_str!("../../../src/admin/mod.rs");
+    let handler = admin_source_section(source, "async fn handle_restore(", "\nasync fn ");
+
+    let lost_clear = admin_source_section(
+        handler,
+        "if let Some(_error) = delete_admission_error {",
+        "if let Err(e) = delete_result {",
+    );
+    let lost_import = admin_source_section(
+        handler,
+        "error_persistence_failure_redacted(\"restore_namespace_admission_lost_during_import\");",
+        "let rollback = finish_failed_restore(",
+    );
+    for (site, section) in [("lost clear", lost_clear), ("lost import", lost_import)] {
+        assert!(
+            !section.contains("restore_guard.release()"),
+            "{site} recovery must not release the restore guard before recovery"
+        );
+        assert!(
+            !section.contains("restore_guard = "),
+            "{site} recovery must keep the original restore guard, not reacquire one"
+        );
+        let reacquire = section
+            .find("crud::lock_namespace_config_admission(")
+            .unwrap_or_else(|| panic!("{site} recovery must reacquire namespace admission"));
+        assert!(
+            section[..reacquire].contains("drop(namespace_config_admission_guard);"),
+            "{site} recovery drops only the lost namespace lease before reacquiring it"
+        );
+    }
+    let failed_import_phase = lost_import
+        .find("restore_guard.retain_restore_import_failed();")
+        .expect("the lost import must record the failed-import phase");
+    assert!(
+        failed_import_phase
+            < lost_import
+                .find("crud::lock_namespace_config_admission(")
+                .expect("lost import reacquisition"),
+        "the lost import must record the failed-import phase before any await"
+    );
+    assert!(
+        lost_clear.contains("restore_guard.retain_restore_cleared();"),
+        "a lost clear that may have removed rows must enter the cleared phase"
+    );
+
+    assert!(
+        handler.contains("if !restore_guard.restore_phase_allows_release() {"),
+        "the successful-import release must be phase gated"
+    );
+
+    for (start, end) in [
+        (
+            "async fn finish_failed_restore(",
+            "async fn finish_failed_restore_after_intervening_clear(",
+        ),
+        (
+            "async fn finish_failed_restore_after_intervening_clear(",
+            "async fn finish_atomic_delete_failure(",
+        ),
+    ] {
+        let finalizer = admin_source_section(source, start, end);
+        let gate = finalizer
+            .find("let fence_retained = !guard.restore_phase_allows_release();")
+            .unwrap_or_else(|| panic!("{start} must gate its release on the restore phase"));
+        let retained = finalizer.find("if fence_retained {").unwrap_or_else(|| {
+            panic!("{start} must retain the fence when the phase forbids release")
+        });
+        let release = finalizer
+            .find("} else if let Err(_error) = guard.release().await {")
+            .unwrap_or_else(|| panic!("{start} must release only in the gated else branch"));
+        assert!(gate < retained && retained < release, "{start} gate order");
+        assert_eq!(
+            finalizer.matches("guard.release().await").count(),
+            1,
+            "{start} must have no ungated release"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mtls_dns_restore_lost_lease_phase_retains_until_rollback_completes() {
+    // Lease lost during clear or import: the original owner stays in the
+    // incomplete phase until its rollback completes.
+    let after_clear = AdminMtlsDnsAdmissionHoldProbe::new();
+    after_clear.mark_restore_cleared();
+    assert!(!after_clear.drop_releases());
+    after_clear
+        .run_restore_rollback(async { Ok::<(), Vec<String>>(()) })
+        .await
+        .unwrap();
+    assert!(after_clear.drop_releases());
+
+    let after_import = AdminMtlsDnsAdmissionHoldProbe::new();
+    after_import.mark_restore_import_failed();
+    assert!(!after_import.drop_releases());
+    drop(after_import.run_restore_rollback(async { Ok::<(), Vec<String>>(()) }));
+    assert!(!after_import.drop_releases());
+}
+
 #[tokio::test]
 async fn mtls_dns_admission_contention_is_retryable_and_redacted() {
     let raw_detail = "mysql topology secret-admission-owner";
@@ -91,6 +422,7 @@ async fn persistence_failures_are_redacted_from_admin_responses_and_logs() {
         .with_writer(writer.clone())
         .finish();
 
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let (
         batch_message,
         recovery_message,
@@ -322,7 +654,7 @@ fn generate_test_token_with_role(config: &TestConfig, subject: &str, role: &str)
     });
 
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes()).unwrap();
 
     encode(&header, &claims, &key).unwrap()
 }
@@ -387,7 +719,7 @@ fn generate_invalid_token(config: &TestConfig, subject: &str) -> String {
     });
 
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret("wrong-secret".as_bytes());
+    let key = EncodingKey::from_secret("wrong-secret".as_bytes()).unwrap();
 
     encode(&header, &claims, &key).unwrap()
 }
@@ -761,4 +1093,72 @@ fn admin_namespace_claim_derivation_matches_cp_scope() {
         CpScope::All.namespace_claim_required(false),
         "a cluster-wide CP engages enforcement without the env flag"
     );
+}
+
+/// Headers of every block enclosing byte offset `at` in `source`, innermost
+/// first. A header is the text between the previous statement boundary
+/// (`;`, `{` or `}`) and the block's opening brace.
+fn enclosing_block_headers(source: &str, at: usize) -> Vec<&str> {
+    let bytes = source.as_bytes();
+    let mut headers = Vec::new();
+    let mut depth = 0usize;
+    let mut index = at;
+    while index > 0 {
+        index -= 1;
+        match bytes[index] {
+            b'}' => depth += 1,
+            b'{' if depth > 0 => depth -= 1,
+            b'{' => {
+                let header_start = source[..index]
+                    .rfind([';', '{', '}'])
+                    .map_or(0, |boundary| boundary + 1);
+                headers.push(&source[header_start..index]);
+            }
+            _ => {}
+        }
+    }
+    headers
+}
+
+/// Issue #7216: `/health` builds its detail-only blocks (pool stats, failover
+/// topology, admission fences, cached config, polling detail, mesh state) only
+/// for the authenticated detailed tier. Unauthenticated probes receive just
+/// `status` + `ready`, so they must not pay for work whose result is
+/// discarded. These blocks have no observable effect on the minimal body, so
+/// the gate is pinned structurally: each call sits inside a block whose header
+/// tests `detailed`.
+#[test]
+fn health_detail_blocks_are_built_only_for_the_detailed_tier() {
+    let source = include_str!("../../../src/admin/mod.rs");
+    let health = admin_source_section(
+        source,
+        "if path == \"/health\" || path == \"/status\" {",
+        "// Overload status.",
+    );
+    for call in [
+        "db.pool_stats()",
+        "db.failover_topology_status()",
+        "db.mtls_dns_admission_fence_status()",
+        "state.cached_gateway_config()",
+        "\"database_polling\"",
+        "egress_scope_state()",
+        "crate::fips::status_metadata()",
+        "failures.snapshot()",
+    ] {
+        let at = health
+            .find(call)
+            .unwrap_or_else(|| panic!("/health no longer calls {call}"));
+        // The call may sit in its own block's condition
+        // (`if detailed && let Some(..) = call {`) or inside a gated block.
+        let statement_start = health[..at]
+            .rfind([';', '{', '}'])
+            .map_or(0, |boundary| boundary + 1);
+        let statement = &health[statement_start..at];
+        let headers = enclosing_block_headers(health, at);
+        assert!(
+            statement.contains("detailed")
+                || headers.iter().any(|header| header.contains("detailed")),
+            "{call} must be built only inside a `detailed` gate; enclosing headers: {headers:?}"
+        );
+    }
 }

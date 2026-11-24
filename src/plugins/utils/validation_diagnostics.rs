@@ -483,6 +483,8 @@ pub fn xml_error_category(error: &roxmltree::Error) -> &'static str {
         }
         XmlError::InvalidString(_, _) => "unexpected token in markup",
         XmlError::InvalidExternalID(_) => "external identifier is malformed",
+        // Only an `entity_resolver` raises this; every parser here passes none.
+        XmlError::EntityResolver(_, _) => "external entity could not be resolved",
         XmlError::InvalidComment(_) => "comment is malformed",
         XmlError::InvalidCharacterData(_) => "character data is malformed",
         XmlError::UnknownToken(_) => "unrecognized markup",

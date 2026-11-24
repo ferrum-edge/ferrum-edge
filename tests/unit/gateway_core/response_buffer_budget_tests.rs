@@ -2846,7 +2846,7 @@ fn the_root_review_repairs_are_pinned_in_source() {
          refused construction cannot be forwarded as `unchanged`"
     );
     assert!(
-        guard.contains("async fn on_final_response_body("),
+        guard.contains("async fn finalize_client_visible_response_body("),
         "the final verification seam must stay in place"
     );
     assert_eq!(

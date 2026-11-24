@@ -569,7 +569,10 @@ pub struct LoadedExternalDocument {
     pub content_digest: String,
     pub format: &'static str,
     pub root: Value,
-    pub raw_bytes: Vec<u8>,
+    /// Byte length of the fetched document, charged against the aggregate
+    /// external-document budget. Only the length is kept; the parsed `root`
+    /// is the document.
+    pub raw_len: usize,
 }
 
 /// Sync loader used by unit tests and the file path.
@@ -587,8 +590,6 @@ pub trait ExternalDocumentLoader: Send + Sync {
 pub struct DefaultExternalDocumentLoader {
     pub egress: crate::config::BackendEgressPolicy,
     pub dns_cache: Option<std::sync::Arc<crate::dns::DnsCache>>,
-    /// Optional in-memory fixtures keyed by canonical URI (tests only).
-    pub fixtures: HashMap<String, Vec<u8>>,
 }
 
 impl Default for DefaultExternalDocumentLoader {
@@ -598,7 +599,6 @@ impl Default for DefaultExternalDocumentLoader {
                 crate::config::BackendAllowIps::Public,
             ),
             dns_cache: None,
-            fixtures: HashMap::new(),
         }
     }
 }
@@ -614,10 +614,6 @@ impl ExternalDocumentLoader for DefaultExternalDocumentLoader {
             return Err(external_ref_error(
                 "external $ref fetch exceeded the total timeout budget",
             ));
-        }
-        let key = resource_uri_key(uri);
-        if let Some(bytes) = self.fixtures.get(&key) {
-            return parse_loaded_document(uri, bytes, policy);
         }
         match uri.scheme() {
             "file" => load_file_document(uri, policy),
@@ -661,9 +657,6 @@ impl ExternalDocumentLoader for DefaultExternalDocumentLoader {
 }
 
 /// In-memory map loader for deterministic unit tests (no filesystem / network).
-// The binary target compiles this public library module privately and therefore
-// cannot observe its integration-test consumers.
-#[allow(dead_code)]
 #[derive(Default)]
 pub struct MapExternalDocumentLoader {
     pub docs: HashMap<String, Vec<u8>>,
@@ -733,7 +726,6 @@ pub fn load_external_documents(
     local_resources.insert(resource_uri_key(&policy.document_base));
     collect_local_resource_ids(root, &policy.document_base, &mut local_resources)?;
 
-    let mut active = HashSet::new();
     collect_refs_from_value(
         root,
         &policy.document_base,
@@ -743,7 +735,6 @@ pub fn load_external_documents(
             local_resources: &local_resources,
             pending: &mut pending,
             seen_refs: &mut seen_refs,
-            active: &mut active,
         },
     )?;
 
@@ -764,7 +755,7 @@ pub fn load_external_documents(
         }
         validate_candidate_uri(&uri, policy)?;
         let doc = loader.load(&uri, policy, deadline)?;
-        aggregate_bytes = aggregate_bytes.saturating_add(doc.raw_bytes.len());
+        aggregate_bytes = aggregate_bytes.saturating_add(doc.raw_len);
         if aggregate_bytes > policy.max_aggregate_bytes {
             return Err(ExtractError::SchemaTooLarge {
                 location: "x-ferrum-external-refs".to_string(),
@@ -774,7 +765,6 @@ pub fn load_external_documents(
         let doc_base = doc.canonical_uri.clone();
         collect_local_resource_ids(&doc_root, &doc_base, &mut local_resources)?;
         loaded.insert(key, doc);
-        active.clear();
         collect_refs_from_value(
             &doc_root,
             &doc_base,
@@ -784,7 +774,6 @@ pub fn load_external_documents(
                 local_resources: &local_resources,
                 pending: &mut pending,
                 seen_refs: &mut seen_refs,
-                active: &mut active,
             },
         )?;
     }
@@ -868,7 +857,6 @@ struct CollectRefsState<'a> {
     local_resources: &'a HashSet<String>,
     pending: &'a mut VecDeque<(Url, usize)>,
     seen_refs: &'a mut usize,
-    active: &'a mut HashSet<String>,
 }
 
 fn collect_refs_from_value(
@@ -895,11 +883,7 @@ fn collect_refs_from_value(
                 if let Some(target) =
                     classify_external_target(reference, &child_base, state.local_resources)?
                 {
-                    let key = resource_uri_key(&target);
-                    if state.active.insert(key.clone()) {
-                        state.pending.push_back((target, depth));
-                        state.active.remove(&key);
-                    }
+                    state.pending.push_back((target, depth));
                 }
             }
             for (key, child) in map {
@@ -1434,7 +1418,7 @@ fn parse_loaded_document(
         content_digest: digest,
         format,
         root,
-        raw_bytes: bytes.to_vec(),
+        raw_len: bytes.len(),
     })
 }
 
@@ -1783,7 +1767,10 @@ fn origin_key(uri: &Url) -> Result<String, ExtractError> {
         .map_err(|_| external_ref_error("external $ref URI origin is invalid"))
 }
 
-fn split_ref(reference: &str) -> (Option<&str>, &str) {
+/// Split a `$ref` into its URI part (`None` for a same-document reference)
+/// and its raw fragment. Shared with the extractor so resolver and loader
+/// agree on reference identity.
+pub(super) fn split_ref(reference: &str) -> (Option<&str>, &str) {
     match reference.split_once('#') {
         Some(("", fragment)) => (None, fragment),
         Some((uri, fragment)) => (Some(uri), fragment),
@@ -1791,6 +1778,9 @@ fn split_ref(reference: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// Fragment-free resource key with percent-escape case normalized. The
+/// extractor's resolver uses this same function, so resolver keys and loader
+/// keys cannot drift apart.
 pub fn resource_uri_key(url: &Url) -> String {
     let mut owned = url.clone();
     owned.set_fragment(None);

@@ -45,7 +45,7 @@
 //!
 //! ## Foreign key constraints
 //!
-//! All six FK constraints are semantically identical across Postgres, MySQL,
+//! All seven FK constraints are semantically identical across Postgres, MySQL,
 //! and SQLite. The surface syntax differs — MySQL uses explicit
 //! `CONSTRAINT <name> FOREIGN KEY (<cols>) REFERENCES ...` while Postgres and
 //! SQLite use inline `<col> TYPE REFERENCES ...` for single-column FKs and
@@ -94,6 +94,7 @@
 //! aid `ALTER TABLE DROP CONSTRAINT` but do not change enforcement behavior.
 //! The inline tests below regression-guard this cross-dialect consistency.
 
+use super::{mysql_create_index_exists_is_benign, mysql_error_number};
 use sqlx::AnyConnection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,7 +236,10 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_upstreams_updated_at ON upstreams (updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_proxies_ns_updated ON proxies (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_consumers_ns_updated ON consumers (namespace, updated_at)",
-            "CREATE INDEX IF NOT EXISTS idx_consumer_credential_index_consumer_id ON consumer_credential_index (consumer_id)",
+            // Serves the namespace-scoped credential-row delete on consumer
+            // update/delete and satisfies MySQL's FK-column index requirement
+            // for the composite (namespace, consumer_id) foreign key.
+            "CREATE INDEX IF NOT EXISTS idx_consumer_credential_index_consumer_id ON consumer_credential_index (namespace, consumer_id)",
             // Serves the per-consumer identity-row rewrite on consumer
             // update/delete and satisfies MySQL's FK-column index requirement
             // for the composite (namespace, consumer_id) foreign key.
@@ -335,22 +339,20 @@ impl V001SqlBuilder {
     async fn execute_index_sql(
         &self,
         connection: &mut AnyConnection,
-        idx_sql: &str,
+        idx_sql: &'static str,
     ) -> Result<(), anyhow::Error> {
         if self.is_mysql() {
             // MySQL does not reliably support CREATE INDEX IF NOT EXISTS, so we
-            // strip the clause and ignore duplicate-key errors, matching the
-            // previous migration behavior.
-            let mysql_sql = idx_sql.replace("IF NOT EXISTS ", "");
-            match sqlx::query(&mysql_sql).execute(&mut *connection).await {
-                Ok(_) => {}
-                Err(e) => {
-                    let msg = e.to_string();
-                    // Error 1061: Duplicate key name (index already exists)
-                    if !msg.contains("1061") {
-                        return Err(e.into());
-                    }
-                }
+            // strip the clause and tolerate only the structured server error
+            // 1061 (ER_DUP_KEYNAME: the index already exists). Matching the
+            // error text instead would also accept any failure whose message
+            // happens to contain "1061" and record V001 with an index missing.
+            // Derived only from the static index DDL above.
+            let mysql_sql = sqlx::AssertSqlSafe(idx_sql.replace("IF NOT EXISTS ", ""));
+            if let Err(e) = sqlx::query(mysql_sql).execute(&mut *connection).await
+                && !mysql_create_index_exists_is_benign(mysql_error_number(&e))
+            {
+                return Err(e.into());
             }
         } else {
             sqlx::query(idx_sql).execute(&mut *connection).await?;
@@ -685,7 +687,6 @@ impl V001SqlBuilder {
                 pool_http2_max_frame_size INTEGER,
                 pool_http2_max_concurrent_streams INTEGER,
                 pool_http3_connections_per_backend INTEGER,
-                pool_max_requests_per_connection INTEGER,
                 listen_port INTEGER,
                 frontend_tls INTEGER NOT NULL DEFAULT 0,
                 passthrough INTEGER NOT NULL DEFAULT 0,
@@ -755,7 +756,6 @@ impl V001SqlBuilder {
                 pool_http2_max_frame_size INTEGER,
                 pool_http2_max_concurrent_streams INTEGER,
                 pool_http3_connections_per_backend INTEGER,
-                pool_max_requests_per_connection INTEGER,
                 listen_port INTEGER,
                 frontend_tls INTEGER NOT NULL DEFAULT 0,
                 passthrough INTEGER NOT NULL DEFAULT 0,

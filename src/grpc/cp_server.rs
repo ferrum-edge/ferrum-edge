@@ -12,14 +12,15 @@
 //!   (issue #6163).
 //! - `GetFullConfig` — unary: returns the current full config snapshot on demand.
 //!
-//! Authentication: HS256 JWT in the `authorization` gRPC metadata key.
+//! Authentication: JWT (HS256 shared secret, or a `kid`-selected trust-bundle
+//! credential) in the `authorization` gRPC metadata key.
 //! Required claims: `exp`, `iat`, `sub`, `iss`. The `iss` claim must exactly
 //! match the configured expected issuer (`FERRUM_CP_DP_GRPC_JWT_ISSUER`,
 //! default `"ferrum-edge-cp-dp"`); this prevents a token minted with the same
 //! shared secret for a different audience (e.g. the admin API JWT secret if
 //! it was reused) from authenticating to the gRPC channel. CP and DP must run
-//! the same build; as a safety net the CP rejects a DP whose `major.minor`
-//! version differs.
+//! the same build: the CP refuses any DP whose ConfigSync build identity
+//! (`<crate version>+configsync.r<revision>`) differs.
 //!
 //! Issuer rotation: changing `FERRUM_CP_DP_GRPC_JWT_ISSUER` is a breaking
 //! change. The CP rejects any token whose `iss` does not match its expected
@@ -79,8 +80,8 @@ use crate::config::gateway_trust::GatewayTrustPublication;
 use crate::config::types::{GatewayConfig, default_namespace};
 use crate::k8s_controller::CpPublicationGate;
 use crate::modes::mesh::config::{
-    MeshConfig, MeshSidecar, MeshSidecarEgress, NodeWaypointAssertor, PeerAuthentication,
-    PolicyScope, SidecarHostPattern, Workload, WorkloadSelector,
+    MeshConfig, MeshPolicy, MeshSidecar, MeshSidecarEgress, NodeWaypointAssertor,
+    PeerAuthentication, PolicyScope, SidecarHostPattern, Workload, WorkloadSelector,
     service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::common::MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE;
@@ -120,18 +121,44 @@ fn bounded_log_value(value: &str) -> String {
     output
 }
 
-fn bounded_tenant_rejection_reason(reason: &str) -> &'static str {
-    match reason {
+/// Closed refusal classes recorded by [`CpGrpcServer::audit_tenant_subscription`]
+/// (issue #7202). Callers pass one of these (or another compile-time label
+/// such as [`crate::grpc::admission::CpGrpcAdmissionRejection::metric_reason`])
+/// rather than a `Status` message, so the audit says why a data plane was
+/// refused without echoing request data, and the 60 s limiter keyed by
+/// `(surface, reason)` keeps one bucket per refusal class.
+pub(crate) mod tenant_rejection_reason {
+    /// The request `node_id` is not the authenticated JWT subject.
+    pub(crate) const NODE_ID_MISMATCH: &str = "node_id does not match authenticated subject";
+    /// The ConfigSync build identity differs from this CP's.
+    pub(crate) const BUILD_MISMATCH: &str = "config_sync build identity mismatch";
+    /// The advertised `FERRUM_REAL_IP_HEADER` is missing or differs.
+    pub(crate) const REAL_IP_HEADER_MISMATCH: &str = "real IP header mismatch";
+    /// The namespace is outside the token's `ns` claim or the CP scope.
+    pub(crate) const NAMESPACE_NOT_AUTHORIZED: &str = "namespace not authorized";
+    /// The CP cannot revalidate its verification trust source.
+    pub(crate) const TRUST_STALE: &str = "verification trust stale";
+    /// The token's verification credential was removed after verification.
+    pub(crate) const CREDENTIAL_REVOKED: &str = "verification credential no longer trusted";
+    /// Any other credential verification refusal.
+    pub(crate) const AUTHENTICATION_FAILED: &str = "authentication failed";
+}
+
+/// Classify a credential-verification refusal into a closed reason.
+///
+/// The verifier's fixed messages that operators already search for are kept
+/// verbatim; every other verification refusal maps to a fixed class by its
+/// gRPC code, so no token or claim text can reach the audit record.
+pub(crate) fn tenant_authentication_rejection_reason(status: &Status) -> &'static str {
+    match status.message() {
         "Invalid token: authentication failed" => "Invalid token: authentication failed",
         "Invalid token: malformed JWS header" => "Invalid token: malformed JWS header",
-        "node_id does not match authenticated subject" => {
-            "node_id does not match authenticated subject"
-        }
         "Missing authorization token" => "Missing authorization token",
-        "GetFullConfig node_id does not match authenticated subject" => {
-            "GetFullConfig node_id does not match authenticated subject"
+        "Stream verification credential is no longer trusted" => {
+            tenant_rejection_reason::CREDENTIAL_REVOKED
         }
-        _ => "request refused",
+        _ if status.code() == tonic::Code::Unavailable => tenant_rejection_reason::TRUST_STALE,
+        _ => tenant_rejection_reason::AUTHENTICATION_FAILED,
     }
 }
 
@@ -340,13 +367,11 @@ impl NamespaceBroadcasts {
 
     /// Total namespaces with active or previously-active broadcast channels.
     /// Exposed for observability and tests.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.channels.len()
     }
 
     /// Whether any broadcast channels exist.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.channels.is_empty()
     }
@@ -427,14 +452,6 @@ impl DpNodeRegistry {
         self.streams.remove(key);
     }
 
-    /// Update `last_update_at` for all live streams (called after broadcast).
-    pub fn touch_all(&self) {
-        let now = Utc::now();
-        for mut entry in self.streams.iter_mut() {
-            entry.last_update_at = now;
-        }
-    }
-
     /// Update `last_update_at` for live streams in a specific namespace.
     /// Used by the per-namespace broadcast path so a delta for namespace A
     /// does not bump the `last_update_at` of namespace B's DPs.
@@ -456,13 +473,11 @@ impl DpNodeRegistry {
     }
 
     /// Number of live DP streams.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.streams.len()
     }
 
     /// Whether the registry has no live DP streams.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.streams.is_empty()
     }
@@ -616,8 +631,7 @@ impl CpGrpcServer {
     /// Shared stream-admission controller. Production wires one controller
     /// through the BUILDER (`.admission(...)`) into ConfigSync, MeshSubscribe,
     /// and ADS; this getter exists so external tests can reach the same
-    /// controller, which is why the binary target sees it as dead code.
-    #[allow(dead_code)]
+    /// controller.
     pub fn admission(&self) -> CpGrpcAdmissionController {
         self.admission.clone()
     }
@@ -766,7 +780,7 @@ impl CpGrpcServer {
         node_id: &str,
         namespace: &str,
         result: &'static str,
-        reason: &str,
+        reason: &'static str,
     ) {
         // Record the bounded values as `&str` so the text formatter quotes
         // them and the JSON formatter stores the plain string.
@@ -784,7 +798,6 @@ impl CpGrpcServer {
             _ => {
                 if let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) {
                     let now = elapsed.as_secs();
-                    let reason = bounded_tenant_rejection_reason(reason);
                     let suppressed =
                         TENANT_SUBSCRIPTION_REJECTION_LOGS
                             .lock()
@@ -854,7 +867,6 @@ impl CpGrpcServer {
 
     /// Access the scope this CP was configured with. Used by the CP polling
     /// loop to decide which namespaces to load from the database.
-    #[allow(dead_code)]
     pub fn scope(&self) -> &CpScope {
         &self.scope
     }
@@ -891,7 +903,7 @@ impl CpGrpcServer {
     ///
     /// Compares the DP's `config_sync_build` with
     /// [`config_sync_build_identity`]. A mismatch, including a missing
-    /// identity, is audited with both identities and refused with
+    /// identity, is audited as a build mismatch and refused with
     /// `FailedPrecondition` before any configuration is streamed. The DP
     /// treats that status as a build mismatch and backs off.
     #[allow(clippy::result_large_err)]
@@ -905,7 +917,13 @@ impl CpGrpcServer {
             return Ok(());
         };
         let message = mismatch.message("CP", "DP");
-        Self::audit_tenant_subscription(surface, node_id, namespace, "failure", &message);
+        Self::audit_tenant_subscription(
+            surface,
+            node_id,
+            namespace,
+            "failure",
+            tenant_rejection_reason::BUILD_MISMATCH,
+        );
         Err(Status::failed_precondition(message))
     }
 
@@ -922,36 +940,109 @@ impl CpGrpcServer {
         config: &GatewayConfig,
         namespace: &str,
     ) -> GatewayConfig {
-        let mut filtered = config.clone();
-        Self::filter_non_mesh_config_to_namespace(&mut filtered, namespace);
+        let mut filtered = Self::clone_non_mesh_config_for_namespace(config, namespace);
         if let Some(mesh) = filtered.mesh.as_mut() {
             Self::filter_mesh_config_to_namespace(mesh, namespace);
         }
         filtered
     }
 
-    fn filter_non_mesh_config_to_namespace(config: &mut GatewayConfig, namespace: &str) {
-        config.proxies.retain(|p| p.namespace == namespace);
-        config.consumers.retain(|c| c.namespace == namespace);
-        config.plugin_configs.retain(|pc| pc.namespace == namespace);
-        config.upstreams.retain(|u| u.namespace == namespace);
-        // The Gateway-listener TLS classification is namespace-qualified, so it
-        // carries other tenants' namespace names and listener-port topology.
-        // Prune it at this PRIMARY authorization boundary — the DP-side filter
-        // is defense in depth, not the place a tenant's port map stops being
-        // serialized to another tenant's subscriber.
-        config
-            .http_tls_listen_ports
-            .retain(|(entry_namespace, _)| entry_namespace == namespace);
-        // Namespace-keyed trust records are tenant material. Pruning them at
-        // this PRIMARY authorization boundary means no later step — projection,
-        // serialization, error text, or a future addition — can observe another
-        // tenant's roots on this subscriber's path (issue #3727).
-        config
-            .gateway_trust_bundles
-            .retain(|record| record.namespace == namespace);
-        config.known_namespaces = vec![namespace.to_string()];
-        filter_frontend_tls_sources_to_namespace(config, namespace);
+    /// Clone `config` with every namespace-partitioned collection reduced to
+    /// `namespace`, cloning only the matching elements (issue #7208).
+    ///
+    /// The result is identical to cloning the whole multi-namespace config and
+    /// then `retain`ing one namespace — element order is preserved — but a CP
+    /// serving many namespaces no longer copies every other tenant's proxies,
+    /// consumers, plugins and upstreams per subscriber. The exhaustive
+    /// destructuring makes a new `GatewayConfig` field a compile error here, so
+    /// it cannot silently bypass the tenant boundary. `mesh` is cloned whole;
+    /// callers filter it for their request shape.
+    fn clone_non_mesh_config_for_namespace(
+        config: &GatewayConfig,
+        namespace: &str,
+    ) -> GatewayConfig {
+        let GatewayConfig {
+            version,
+            proxies,
+            consumers,
+            plugin_configs,
+            upstreams,
+            loaded_at,
+            known_namespaces: _,
+            frontend_tls_cert_path,
+            frontend_tls_key_path,
+            frontend_tls_source_namespace,
+            frontend_tls_certificate_sources,
+            trust_bundles,
+            gateway_trust_bundles,
+            quarantined_plugin_configs,
+            quarantined_jwt_shared_secrets,
+            mesh,
+            http_tls_listen_ports,
+            mesh_revision,
+            node_waypoint_udp_steer_destinations,
+            node_waypoint_udp_destination_routes,
+            k8s_mesh_overlay,
+        } = config;
+        let mut filtered = GatewayConfig {
+            version: version.clone(),
+            proxies: proxies
+                .iter()
+                .filter(|p| p.namespace == namespace)
+                .cloned()
+                .collect(),
+            consumers: consumers
+                .iter()
+                .filter(|c| c.namespace == namespace)
+                .cloned()
+                .collect(),
+            plugin_configs: plugin_configs
+                .iter()
+                .filter(|pc| pc.namespace == namespace)
+                .cloned()
+                .collect(),
+            upstreams: upstreams
+                .iter()
+                .filter(|u| u.namespace == namespace)
+                .cloned()
+                .collect(),
+            loaded_at: *loaded_at,
+            known_namespaces: vec![namespace.to_string()],
+            frontend_tls_cert_path: frontend_tls_cert_path.clone(),
+            frontend_tls_key_path: frontend_tls_key_path.clone(),
+            frontend_tls_source_namespace: frontend_tls_source_namespace.clone(),
+            frontend_tls_certificate_sources: frontend_tls_certificate_sources.clone(),
+            trust_bundles: trust_bundles.clone(),
+            // Namespace-keyed trust records are tenant material. Pruning them at
+            // this PRIMARY authorization boundary means no later step —
+            // projection, serialization, error text, or a future addition — can
+            // observe another tenant's roots on this subscriber's path (issue
+            // #3727).
+            gateway_trust_bundles: gateway_trust_bundles
+                .iter()
+                .filter(|record| record.namespace == namespace)
+                .cloned()
+                .collect(),
+            quarantined_plugin_configs: quarantined_plugin_configs.clone(),
+            quarantined_jwt_shared_secrets: quarantined_jwt_shared_secrets.clone(),
+            mesh: mesh.clone(),
+            // The Gateway-listener TLS classification is namespace-qualified, so
+            // it carries other tenants' namespace names and listener-port
+            // topology. Prune it at this PRIMARY authorization boundary — the
+            // DP-side filter is defense in depth, not the place a tenant's port
+            // map stops being serialized to another tenant's subscriber.
+            http_tls_listen_ports: http_tls_listen_ports
+                .iter()
+                .filter(|(entry_namespace, _)| entry_namespace == namespace)
+                .cloned()
+                .collect(),
+            mesh_revision: mesh_revision.clone(),
+            node_waypoint_udp_steer_destinations: node_waypoint_udp_steer_destinations.clone(),
+            node_waypoint_udp_destination_routes: node_waypoint_udp_destination_routes.clone(),
+            k8s_mesh_overlay: k8s_mesh_overlay.clone(),
+        };
+        filter_frontend_tls_sources_to_namespace(&mut filtered, namespace);
+        filtered
     }
 
     /// Resolve what this subscriber's snapshot should say about trust
@@ -1059,8 +1150,7 @@ impl CpGrpcServer {
         scope: &CpScope,
         bearer_namespaces: Option<&HashSet<String>>,
     ) -> GatewayConfig {
-        let mut filtered = config.clone();
-        Self::filter_non_mesh_config_to_namespace(&mut filtered, &request.namespace);
+        let mut filtered = Self::clone_non_mesh_config_for_namespace(config, &request.namespace);
         if let Some(mesh) = filtered.mesh.as_mut() {
             Self::filter_mesh_config_to_request(
                 mesh,
@@ -1106,6 +1196,14 @@ impl CpGrpcServer {
                 && bearer_namespaces.is_none_or(|allowed| allowed.contains(&policy.namespace))
                 && crate::modes::mesh::config::virtual_service_cors_policy_exported_to_namespace(
                     policy, namespace,
+                )
+        });
+        mesh.virtual_service_http_routes.retain(|routes| {
+            visible_namespaces.contains(&routes.namespace)
+                && Self::namespace_allowed_by_scope(&routes.namespace, scope)
+                && bearer_namespaces.is_none_or(|allowed| allowed.contains(&routes.namespace))
+                && crate::modes::mesh::config::virtual_service_http_routes_exported_to_namespace(
+                    routes, namespace,
                 )
         });
         // A ServiceWaypoint terminates traffic for destination-visible services,
@@ -1186,27 +1284,95 @@ impl CpGrpcServer {
         // carry mesh resources (mesh changes arrive as full snapshots, which
         // refilter from the authoritative config), so the preserved value cannot
         // go stale.
+        //
+        // Provenance is explicit (`node_waypoint_capture_inventory_state`), not
+        // inferred from emptiness: an authorized-EMPTY inventory is a complete
+        // answer, and must never let the slice builder rebuild one from the
+        // narrowed routing views below (a Sidecar egress import can keep a
+        // foreign workload routable that the capture bearer bound withheld,
+        // while its namespace's policies are narrowed away).
+        //
+        // * `Unfiltered` — this is the authoritative snapshot: resolve all three
+        //   inventories now, before any retain, and mark them `Resolved`.
+        // * `Resolved` — an incremental refilter of the stream-local config:
+        //   preserve the inventory as-is (recomputing from the already-narrowed
+        //   views would shrink it).
+        // * `NotResolved` — the config was already narrowed without an
+        //   inventory, so none can be derived: leave it empty and unresolved,
+        //   which the DP refuses / resolves nothing for (fail closed).
+        //
+        // When the request carries no workload identity (the xDS prefilter runs
+        // before the node's identity is applied), the destination inventory is
+        // every scope/bearer-authorized workload with a NodeWaypoint enrollment
+        // — an in-process candidate superset that never leaves the CP; the slice
+        // builder narrows it to the exact requesting NodeWaypoint identity.
+        use crate::modes::mesh::config::NodeWaypointCaptureInventoryState;
         if request.node_waypoint_capture_scoping {
-            if mesh.node_waypoint_capture_destinations.is_empty() {
-                let destinations = node_waypoint_capture_destinations_from_workloads(
-                    mesh.workloads.iter().filter(|workload| {
+            match mesh.node_waypoint_capture_inventory_state {
+                NodeWaypointCaptureInventoryState::Resolved => {}
+                NodeWaypointCaptureInventoryState::NotResolved => {
+                    mesh.node_waypoint_capture_destinations.clear();
+                    mesh.node_waypoint_capture_peer_authentications.clear();
+                    mesh.node_waypoint_capture_mesh_policies.clear();
+                }
+                NodeWaypointCaptureInventoryState::Unfiltered => {
+                    let authorized = mesh.workloads.iter().filter(|workload| {
                         Self::node_waypoint_capture_namespace_allowed(&workload.namespace, scope)
                             && bearer_namespaces
                                 .is_none_or(|allowed| allowed.contains(&workload.namespace))
-                    }),
-                    request.workload_spiffe_id.as_deref(),
-                );
-                mesh.node_waypoint_capture_destinations = destinations;
+                    });
+                    let identity = request
+                        .workload_spiffe_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|identity| !identity.is_empty());
+                    let destinations = match identity {
+                        Some(identity) => node_waypoint_capture_destinations_from_workloads(
+                            authorized,
+                            Some(identity),
+                        ),
+                        None => authorized
+                            .filter(|workload| workload.node_waypoint.is_some())
+                            .cloned()
+                            .collect(),
+                    };
+                    // Destination AuthorizationPolicy inventory, resolved for
+                    // the same reason and at the same point: the
+                    // `mesh_policies` retain below keeps only policies
+                    // applicable to the SUBSCRIPTION namespace, so a captured
+                    // `payments` pod's own DENY/ALLOW would be gone, and the
+                    // capture relay — which stamps that pod's exact policy
+                    // scope — would authorize against an incomplete set.
+                    // Owner-namespace bound: only policies owned by a captured
+                    // destination's namespace (already CP-scope/bearer
+                    // authorized above) or by the root namespace can ride, so
+                    // no unauthorized namespace's policy leaks. The slice
+                    // builder then narrows it to the exact per-destination set
+                    // the scoped evaluator applies.
+                    mesh.node_waypoint_capture_peer_authentications =
+                        Self::node_waypoint_capture_peer_authentications_for_destinations(
+                            &mesh.peer_authentications,
+                            &destinations,
+                            &istio_root_namespace,
+                        );
+                    mesh.node_waypoint_capture_mesh_policies =
+                        Self::node_waypoint_capture_mesh_policies_for_destinations(
+                            &mesh.mesh_policies,
+                            &destinations,
+                            &istio_root_namespace,
+                        );
+                    mesh.node_waypoint_capture_destinations = destinations;
+                    mesh.node_waypoint_capture_inventory_state =
+                        NodeWaypointCaptureInventoryState::Resolved;
+                }
             }
-            if mesh.node_waypoint_capture_peer_authentications.is_empty() {
-                let capture_peer_authentications =
-                    Self::node_waypoint_capture_peer_authentications_for_destinations(
-                        &mesh.peer_authentications,
-                        &mesh.node_waypoint_capture_destinations,
-                        &istio_root_namespace,
-                    );
-                mesh.node_waypoint_capture_peer_authentications = capture_peer_authentications;
-            }
+        } else if mesh.node_waypoint_capture_inventory_state
+            == NodeWaypointCaptureInventoryState::Unfiltered
+        {
+            // Narrowed below without an inventory: a later capture-scoped build
+            // from this config must not reconstruct one.
+            mesh.node_waypoint_capture_inventory_state =
+                NodeWaypointCaptureInventoryState::NotResolved;
         }
         mesh.workloads.retain(|workload| {
             visible_namespaces.contains(&workload.namespace)
@@ -1281,13 +1447,38 @@ impl CpGrpcServer {
                 entry.namespace == namespace
             }
         });
+        // A waypoint also needs the RequestAuthentications that select the
+        // destinations it fronts (issue #6670): the visible namespaces its
+        // routes reach and, on a NodeWaypoint, its capture destinations'
+        // namespaces. The slice builder narrows them to those exact workloads.
+        // Like the `mesh_policies` waypoint expansion above, this is NOT
+        // narrowed by the bearer namespaces: those destinations are served
+        // under the waypoint's binding, so withholding their resources would
+        // serve them with an incomplete policy set (fail open).
+        let capture_destination_namespaces: BTreeSet<&str> = mesh
+            .node_waypoint_capture_destinations
+            .iter()
+            .map(|workload| workload.namespace.as_str())
+            .collect();
+        let waypoint_destination_request_auth =
+            request.waypoint_name.is_some() || request.node_waypoint_capture_scoping;
         mesh.request_authentications.retain(|resource| {
-            Self::policy_scope_can_apply_to_namespace(
-                &resource.namespace,
-                &resource.scope,
-                namespace,
-                &istio_root_namespace,
-            )
+            let can_apply_to = |candidate_namespace: &str| {
+                Self::policy_scope_can_apply_to_namespace(
+                    &resource.namespace,
+                    &resource.scope,
+                    candidate_namespace,
+                    &istio_root_namespace,
+                )
+            };
+            can_apply_to(namespace)
+                || (waypoint_destination_request_auth
+                    && (visible_namespaces
+                        .iter()
+                        .any(|destination_namespace| can_apply_to(destination_namespace))
+                        || capture_destination_namespaces
+                            .iter()
+                            .any(|destination_namespace| can_apply_to(destination_namespace))))
         });
         mesh.telemetry_resources.retain(|resource| {
             Self::policy_scope_can_apply_to_namespace(
@@ -1355,7 +1546,6 @@ impl CpGrpcServer {
     /// `pub` so external integration tests can assert the namespace
     /// projection directly; this is the primary tenant boundary for every
     /// full-snapshot publication path.
-    #[allow(dead_code)] // Public integration-test seam is unused in the binary target.
     pub fn filter_config_to_namespace_for_scope(
         config: &GatewayConfig,
         namespace: &str,
@@ -1596,6 +1786,42 @@ impl CpGrpcServer {
             .collect()
     }
 
+    /// AuthorizationPolicy candidates the CP may hand a NodeWaypoint for its
+    /// capture destinations.
+    ///
+    /// Namespace-level applicability with the owner-namespace bound of
+    /// [`Self::policy_scope_can_apply_to_namespace`] (owner = destination
+    /// namespace or the root namespace), mirroring the PeerAuthentication
+    /// candidate hop above. The exact per-workload narrowing happens in the
+    /// slice builder, before anything leaves the CP.
+    fn node_waypoint_capture_mesh_policies_for_destinations(
+        mesh_policies: &[MeshPolicy],
+        destinations: &[Workload],
+        root_namespace: &str,
+    ) -> Vec<MeshPolicy> {
+        if destinations.is_empty() {
+            return Vec::new();
+        }
+        let destination_namespaces: BTreeSet<&str> = destinations
+            .iter()
+            .map(|workload| workload.namespace.as_str())
+            .collect();
+        mesh_policies
+            .iter()
+            .filter(|policy| {
+                destination_namespaces.iter().any(|namespace| {
+                    Self::policy_scope_can_apply_to_namespace(
+                        &policy.namespace,
+                        &policy.scope,
+                        namespace,
+                        root_namespace,
+                    )
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
     fn node_waypoint_assertors_for_request(
         mesh: &MeshConfig,
         namespace: &str,
@@ -1724,20 +1950,12 @@ impl CpGrpcServer {
         namespace: &str,
         root_namespace: &str,
     ) -> bool {
-        if let Some(scope) = &policy.scope {
-            return Self::policy_scope_can_apply_to_namespace(
-                &policy.namespace,
-                scope,
-                namespace,
-                root_namespace,
-            );
-        }
-
-        policy.namespace == namespace
-            && policy
-                .selector
-                .as_ref()
-                .is_none_or(|selector| Self::selector_can_apply_to_namespace(selector, namespace))
+        Self::policy_scope_can_apply_to_namespace(
+            &policy.namespace,
+            &policy.scope,
+            namespace,
+            root_namespace,
+        )
     }
 
     fn selector_can_apply_to_namespace(selector: &WorkloadSelector, namespace: &str) -> bool {
@@ -1793,7 +2011,7 @@ impl CpGrpcServer {
                 return;
             }
         };
-        if Self::broadcast_update_with_trust_json(&tx, &filtered, trust_json, namespace) {
+        if Self::broadcast_update_with_trust_json(&tx, filtered, trust_json, namespace) {
             registry.touch_namespace(namespace);
         }
     }
@@ -1882,7 +2100,7 @@ impl CpGrpcServer {
                 ));
             }
         };
-        match Self::config_json_for_dp(&filtered) {
+        match Self::config_json_for_dp(filtered) {
             Ok(config_json) => Ok(ConfigUpdate {
                 update_type: 0, // FULL_SNAPSHOT
                 config_json,
@@ -1934,7 +2152,12 @@ impl CpGrpcServer {
                 return false;
             }
         };
-        Self::broadcast_update_with_trust_json(tx, config, trust_bundles_json, "unpartitioned")
+        Self::broadcast_update_with_trust_json(
+            tx,
+            config.clone(),
+            trust_bundles_json,
+            "unpartitioned",
+        )
     }
 
     /// Broadcast a full config snapshot with an already-resolved trust side
@@ -1947,10 +2170,11 @@ impl CpGrpcServer {
     /// absent slot would otherwise produce (issue #3727).
     fn broadcast_update_with_trust_json(
         tx: &broadcast::Sender<ConfigUpdate>,
-        config: &GatewayConfig,
+        config: GatewayConfig,
         trust_bundles_json: String,
         namespace: &str,
     ) -> bool {
+        let version = config.loaded_at.to_rfc3339();
         let config_json = match Self::config_json_for_dp(config) {
             Ok(json) => json,
             Err(e) => {
@@ -1967,7 +2191,7 @@ impl CpGrpcServer {
         let update = ConfigUpdate {
             update_type: 0, // FULL_SNAPSHOT
             config_json,
-            version: config.loaded_at.to_rfc3339(),
+            version,
             timestamp: chrono::Utc::now().timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
@@ -1977,25 +2201,10 @@ impl CpGrpcServer {
         Self::send_bounded_update(tx, update, namespace)
     }
 
-    /// Broadcast an incremental delta to all connected DPs (with registry update).
-    #[allow(dead_code)]
-    pub fn broadcast_delta_with_registry(
-        tx: &broadcast::Sender<ConfigUpdate>,
-        result: &crate::config::db_loader::IncrementalResult,
-        version: &str,
-        registry: &DpNodeRegistry,
-        trust: GatewayTrustPublication<'_>,
-    ) {
-        if Self::broadcast_delta_with_trust_bundles(tx, result, version, trust) {
-            registry.touch_all();
-        }
-    }
-
     /// Broadcast an incremental delta to all connected DPs.
     ///
     /// Sends only the resources that changed (added/modified/removed) instead
     /// of the full config. DPs apply the delta via `ProxyState::apply_incremental`.
-    #[allow(dead_code)] // Used by integration tests and external callers without trust-bundle side-channel needs.
     pub fn broadcast_delta(
         tx: &broadcast::Sender<ConfigUpdate>,
         result: &crate::config::db_loader::IncrementalResult,
@@ -2169,10 +2378,13 @@ impl CpGrpcServer {
     /// individual resources rather than a `GatewayConfig` — but the DP applies
     /// every delta through `ProxyState::update_config`, which runs the same
     /// policy and keeps the last known-good config on rejection.
-    fn config_json_for_dp(config: &GatewayConfig) -> Result<String, String> {
-        crate::fips::policy::check_gateway_config(config)
+    ///
+    /// Takes the snapshot by value: every publication path already owns a
+    /// filtered copy, so clearing the trust slots in place avoids a second
+    /// deep clone of the whole configuration (issue #7208).
+    fn config_json_for_dp(mut snapshot: GatewayConfig) -> Result<String, String> {
+        crate::fips::policy::check_gateway_config(&snapshot)
             .map_err(|error| format!("FIPS policy rejected the configuration: {error}"))?;
-        let mut snapshot = config.clone();
         // Trust material travels exclusively through
         // `ConfigUpdate.trust_bundles_json`. BOTH trust slots are cleared here:
         // the unpartitioned `trust_bundles` set and the authoritative
@@ -2240,7 +2452,6 @@ impl CpGrpcServerBuilder {
         self
     }
 
-    #[allow(dead_code)]
     pub fn require_ns_claim(mut self, require: bool) -> Self {
         self.require_ns_claim = require;
         self
@@ -2319,7 +2530,7 @@ impl ConfigSync for CpGrpcServer {
                     &req.node_id,
                     &req.namespace,
                     "failure",
-                    status.message(),
+                    tenant_authentication_rejection_reason(&status),
                 );
                 return Err(status);
             }
@@ -2335,7 +2546,7 @@ impl ConfigSync for CpGrpcServer {
                 &identity.subject,
                 &inner.namespace,
                 "failure",
-                "node_id does not match authenticated subject",
+                tenant_rejection_reason::NODE_ID_MISMATCH,
             );
             return Err(Status::permission_denied(
                 "Subscribe node_id must match the authenticated JWT subject",
@@ -2365,7 +2576,7 @@ impl ConfigSync for CpGrpcServer {
                 &node_id,
                 &dp_namespace,
                 "failure",
-                status.message(),
+                tenant_rejection_reason::REAL_IP_HEADER_MISMATCH,
             );
             return Err(status);
         }
@@ -2381,7 +2592,7 @@ impl ConfigSync for CpGrpcServer {
                     &node_id,
                     &dp_namespace,
                     "failure",
-                    status.message(),
+                    tenant_rejection_reason::NAMESPACE_NOT_AUTHORIZED,
                 );
                 return Err(status);
             }
@@ -2403,7 +2614,7 @@ impl ConfigSync for CpGrpcServer {
                         "",
                         &dp_namespace,
                         "failure",
-                        status.message(),
+                        rejection.metric_reason(),
                     );
                     return Err(status);
                 }
@@ -2434,7 +2645,7 @@ impl ConfigSync for CpGrpcServer {
                     );
                     Status::internal("Failed to prepare configuration snapshot")
                 })?;
-        let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
+        let config_json = Self::config_json_for_dp(filtered).map_err(|e| {
             error!(
                 "{}",
                 crate::startup::sanitize_startup_cause(
@@ -2605,7 +2816,7 @@ impl ConfigSync for CpGrpcServer {
                     &rejected_request.node_id,
                     &rejected_request.namespace,
                     "failure",
-                    status.message(),
+                    tenant_authentication_rejection_reason(&status),
                 );
                 return Err(status);
             }
@@ -2620,7 +2831,7 @@ impl ConfigSync for CpGrpcServer {
                 &req.node_id,
                 &req.namespace,
                 "failure",
-                "node_id does not match authenticated subject",
+                tenant_rejection_reason::NODE_ID_MISMATCH,
             );
             return Err(Status::permission_denied(
                 "GetFullConfig node_id must match the authenticated JWT subject",
@@ -2639,7 +2850,7 @@ impl ConfigSync for CpGrpcServer {
                 &req.node_id,
                 &req.namespace,
                 "failure",
-                status.message(),
+                tenant_rejection_reason::REAL_IP_HEADER_MISMATCH,
             );
             return Err(status);
         }
@@ -2651,7 +2862,7 @@ impl ConfigSync for CpGrpcServer {
                 &req.node_id,
                 &req.namespace,
                 "failure",
-                status.message(),
+                tenant_rejection_reason::NAMESPACE_NOT_AUTHORIZED,
             );
             return Err(status);
         }
@@ -2666,7 +2877,7 @@ impl ConfigSync for CpGrpcServer {
                 &req.node_id,
                 &req.namespace,
                 "failure",
-                status.message(),
+                rejection.metric_reason(),
             );
             return Err(status);
         }
@@ -2684,7 +2895,7 @@ impl ConfigSync for CpGrpcServer {
                     &req.node_id,
                     &req.namespace,
                     "failure",
-                    status.message(),
+                    rejection.metric_reason(),
                 );
                 return Err(status);
             }
@@ -2703,7 +2914,7 @@ impl ConfigSync for CpGrpcServer {
                 );
                 Status::internal("Failed to prepare configuration snapshot")
             })?;
-        let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
+        let config_json = Self::config_json_for_dp(filtered).map_err(|e| {
             error!(
                 "{}",
                 crate::startup::sanitize_startup_cause(
@@ -2860,16 +3071,24 @@ mod tests {
             ..Default::default()
         };
         config.known_namespaces.push("ferrum".to_string());
+        let side_channel = config.trust_bundles.as_deref().expect("trust bundle");
+        let side_channel_authority = side_channel.local.x509_authorities[0].clone();
+        let record_authority = config.gateway_trust_bundles[0]
+            .bundle
+            .local
+            .x509_authorities[0]
+            .clone();
 
-        let json = CpGrpcServer::config_json_for_dp(&config).expect("DP config should serialize");
+        let json =
+            CpGrpcServer::config_json_for_dp(config.clone()).expect("DP config should serialize");
         let value: serde_json::Value =
             serde_json::from_str(&json).expect("DP config JSON should parse");
         assert!(value.get("trust_bundles").is_none());
         assert!(value.get("gateway_trust_bundles").is_none());
         // Neither trust slot's authority material may appear anywhere in the
         // ordinary DP document, nor the record's server-assigned metadata.
-        assert!(!json.contains("AQIDBA=="));
-        assert!(!json.contains("BQYHCA=="));
+        assert!(!json.contains(&side_channel_authority));
+        assert!(!json.contains(&record_authority));
         assert!(!json.contains("cluster.local"));
         assert!(!json.contains("record.internal"));
         assert!(!json.contains("trust-actor@example.test"));
@@ -2891,6 +3110,11 @@ mod tests {
             gateway_trust_bundles: vec![test_gateway_trust_record("ferrum")],
             ..Default::default()
         };
+        let record_authority = config.gateway_trust_bundles[0]
+            .bundle
+            .local
+            .x509_authorities[0]
+            .clone();
         let (tx, mut rx) = broadcast::channel(1);
 
         CpGrpcServer::broadcast_update(&tx, &config);
@@ -2901,7 +3125,7 @@ mod tests {
         assert!(value.get("trust_bundles").is_none());
         assert!(value.get("gateway_trust_bundles").is_none());
         assert!(!update.config_json.contains("record.internal"));
-        assert!(!update.config_json.contains("BQYHCA=="));
+        assert!(!update.config_json.contains(&record_authority));
         assert!(!update.config_json.contains("trust-actor@example.test"));
         // The side channel is unaffected by the wire-boundary strip.
         assert_ne!(update.trust_bundles_json, "null");
@@ -3407,6 +3631,81 @@ mod tests {
         assert_eq!(filtered.proxies[0].id, "p-a");
     }
 
+    /// Issue #7208: the per-resource partition clone must produce exactly what
+    /// cloning the whole config and `retain`ing one namespace produced.
+    #[test]
+    fn namespace_partition_clone_matches_clone_then_retain() {
+        use crate::config::types::*;
+        let proxy = |id: &str, ns: &str| {
+            serde_json::from_value::<Proxy>(serde_json::json!({
+                "id": id,
+                "namespace": ns,
+                "backend_host": "example.com",
+                "backend_port": 443,
+            }))
+            .expect("proxy fixture should deserialize")
+        };
+        let consumer = |id: &str, ns: &str| {
+            serde_json::from_value::<Consumer>(serde_json::json!({
+                "id": id,
+                "namespace": ns,
+                "username": id,
+            }))
+            .expect("consumer fixture should deserialize")
+        };
+        let upstream = |id: &str, ns: &str| {
+            serde_json::from_value::<Upstream>(serde_json::json!({
+                "id": id,
+                "namespace": ns,
+                "targets": [{"host": "10.0.0.1", "port": 80}],
+            }))
+            .expect("upstream fixture should deserialize")
+        };
+        let mut config = GatewayConfig {
+            version: CURRENT_CONFIG_VERSION.to_string(),
+            loaded_at: Utc::now(),
+            proxies: vec![
+                proxy("p-b1", "ns-b"),
+                proxy("p-a1", "ns-a"),
+                proxy("p-b2", "ns-b"),
+                proxy("p-a2", "ns-a"),
+            ],
+            consumers: vec![consumer("c-a", "ns-a"), consumer("c-b", "ns-b")],
+            upstreams: vec![upstream("u-b", "ns-b"), upstream("u-a", "ns-a")],
+            known_namespaces: vec!["ns-a".to_string(), "ns-b".to_string()],
+            quarantined_plugin_configs: vec!["q-1".to_string()],
+            ..Default::default()
+        };
+        config
+            .http_tls_listen_ports
+            .insert(("ns-a".to_string(), 8443));
+        config
+            .http_tls_listen_ports
+            .insert(("ns-b".to_string(), 9443));
+
+        let mut expected = config.clone();
+        expected.proxies.retain(|p| p.namespace == "ns-a");
+        expected.consumers.retain(|c| c.namespace == "ns-a");
+        expected.plugin_configs.retain(|pc| pc.namespace == "ns-a");
+        expected.upstreams.retain(|u| u.namespace == "ns-a");
+        expected
+            .http_tls_listen_ports
+            .retain(|(entry_namespace, _)| entry_namespace == "ns-a");
+        expected
+            .gateway_trust_bundles
+            .retain(|record| record.namespace == "ns-a");
+        expected.known_namespaces = vec!["ns-a".to_string()];
+        filter_frontend_tls_sources_to_namespace(&mut expected, "ns-a");
+
+        let filtered = CpGrpcServer::filter_config_to_namespace(&config, "ns-a");
+        assert_eq!(
+            serde_json::to_value(&filtered).expect("serialize filtered"),
+            serde_json::to_value(&expected).expect("serialize expected"),
+        );
+        let ids: Vec<&str> = filtered.proxies.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["p-a1", "p-a2"], "element order is preserved");
+    }
+
     /// The Gateway-listener TLS classification is tenant topology: it names
     /// other namespaces and the ports they terminate TLS on. It must be pruned
     /// here, at the CP's own authorization boundary — not left for the remote
@@ -3491,12 +3790,12 @@ mod tests {
                 peer_authentications: vec![PeerAuthentication {
                     name: "root-peer".to_string(),
                     namespace: "istio-system".to_string(),
-                    scope: Some(PolicyScope::MeshWide),
-                    selector: None,
+                    scope: PolicyScope::MeshWide,
                     mtls_mode: MtlsMode::Strict,
                     port_overrides: Default::default(),
                 }],
                 request_authentications: vec![MeshRequestAuthentication {
+                    refused: false,
                     name: "root-ra".to_string(),
                     namespace: "istio-system".to_string(),
                     scope: PolicyScope::MeshWide,
@@ -4371,10 +4670,9 @@ mod tests {
         let namespace_peer_auth = |namespace: &str, mode: MtlsMode| PeerAuthentication {
             name: format!("{namespace}-default"),
             namespace: namespace.to_string(),
-            scope: Some(PolicyScope::Namespace {
+            scope: PolicyScope::Namespace {
                 namespace: namespace.to_string(),
-            }),
-            selector: None,
+            },
             mtls_mode: mode,
             port_overrides: HashMap::new(),
         };
@@ -4401,6 +4699,7 @@ mod tests {
             namespace: "ferrum".to_string(),
             workload_spiffe_id: Some(this_waypoint.to_string()),
             node_waypoint_capture_scoping: true,
+            sidecar_http_routes: false,
             ..MeshSliceRequest::default()
         };
 
@@ -4511,6 +4810,416 @@ mod tests {
                     .is_empty(),
             "a non-NodeWaypoint subscription must not receive the capture inventory"
         );
+    }
+
+    /// The CP must hand a NodeWaypoint the AuthorizationPolicy of every
+    /// destination it captures for — resolved BEFORE `mesh_policies` is
+    /// narrowed to the subscription namespace — on the dedicated capture field
+    /// only, bounded by the same CP scope / bearer authorization as the
+    /// destinations themselves, and preserved across an incremental refilter.
+    /// Kept inline only because the CP filter seam is crate-private; the slice
+    /// builder's exact per-destination narrowing is pinned in
+    /// `tests/integration/mesh_node_waypoint_stream_scope_tests.rs`.
+    #[test]
+    fn mesh_request_filter_carries_capture_destination_authorization_policies() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{
+            MeshPolicy, MeshRule, NodeWaypointEndpoint, PolicyAction, Workload,
+        };
+
+        let this_waypoint = "spiffe://test.local/ns/ferrum/sa/node-waypoint-a";
+        let other_waypoint = "spiffe://test.local/ns/ferrum/sa/node-waypoint-b";
+        let workload = |namespace: &str, name: &str, waypoint: &str, address: &str| Workload {
+            spiffe_id: SpiffeId::new(format!("spiffe://test.local/ns/{namespace}/sa/{name}"))
+                .expect("fixture SPIFFE ID should be valid"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), name.to_string())]),
+                namespace: Some(namespace.to_string()),
+            },
+            service_name: name.to_string(),
+            service_namespace: None,
+            addresses: vec![address.to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("test.local")
+                .expect("fixture trust domain should be valid"),
+            namespace: namespace.to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some(name.to_string()),
+            pod_uid: None,
+            node_waypoint: Some(NodeWaypointEndpoint {
+                address: "10.0.0.1".to_string(),
+                hbone_port: 15008,
+                spiffe_id: SpiffeId::new(waypoint)
+                    .expect("fixture waypoint SPIFFE ID should be valid"),
+                node_name: None,
+                node_uid: None,
+                network: None,
+                cluster: None,
+            }),
+            remote_provenance: false,
+        };
+        let policy = |namespace: &str, name: &str, scope: PolicyScope| MeshPolicy {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            scope,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: Vec::new(),
+                when: Vec::new(),
+                request_principals: Vec::new(),
+                not_request_principals: Vec::new(),
+                source_negation: Default::default(),
+                never_matches: false,
+                action: PolicyAction::Deny,
+            }],
+        };
+        let namespace_scope = |namespace: &str| PolicyScope::Namespace {
+            namespace: namespace.to_string(),
+        };
+        let app_scope = |namespace: &str, app: &str| PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), app.to_string())]),
+                namespace: Some(namespace.to_string()),
+            },
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![
+                    // Enrolled on THIS NodeWaypoint, in another namespace.
+                    workload("payments", "ledger", this_waypoint, "10.244.1.7"),
+                    // Enrolled on ANOTHER node's NodeWaypoint.
+                    workload("payments", "reports", other_waypoint, "10.244.1.8"),
+                    // Enrolled on THIS NodeWaypoint, outside the bearer claim.
+                    workload("secrets", "vault", this_waypoint, "10.244.1.9"),
+                ],
+                mesh_policies: vec![
+                    policy("payments", "payments-deny", namespace_scope("payments")),
+                    policy("payments", "ledger-deny", app_scope("payments", "ledger")),
+                    policy("payments", "reports-deny", app_scope("payments", "reports")),
+                    policy("secrets", "secrets-deny", namespace_scope("secrets")),
+                    policy("inventory", "inventory-deny", namespace_scope("inventory")),
+                    // A non-root owner cannot reach another namespace even with
+                    // a mesh-wide scope.
+                    policy("inventory", "inventory-mesh-wide", PolicyScope::MeshWide),
+                    policy("istio-system", "root-deny", PolicyScope::MeshWide),
+                ],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let request = MeshSliceRequest {
+            namespace: "ferrum".to_string(),
+            workload_spiffe_id: Some(this_waypoint.to_string()),
+            node_waypoint_capture_scoping: true,
+            sidecar_http_routes: false,
+            ..MeshSliceRequest::default()
+        };
+        let names = |policies: &[MeshPolicy]| {
+            let mut names: Vec<String> =
+                policies.iter().map(|policy| policy.name.clone()).collect();
+            names.sort_unstable();
+            names
+        };
+
+        let filtered =
+            CpGrpcServer::filter_config_to_mesh_request_for_scope(&config, &request, &CpScope::All);
+        let mesh = filtered.mesh.as_ref().expect("mesh should remain");
+        assert_eq!(
+            names(mesh.mesh_policies.as_slice()),
+            vec!["root-deny".to_string()],
+            "the ordinary AuthorizationPolicy view must stay narrowed to `ferrum` + root"
+        );
+        assert_eq!(
+            names(mesh.node_waypoint_capture_mesh_policies.as_slice()),
+            vec![
+                "ledger-deny".to_string(),
+                "payments-deny".to_string(),
+                "reports-deny".to_string(),
+                "root-deny".to_string(),
+                "secrets-deny".to_string(),
+            ],
+            "the CP hop is namespace-level: owner = a captured destination's namespace or root"
+        );
+
+        // Incremental refilter of the stream-local config (whose
+        // `mesh_policies` is already narrowed) must PRESERVE the inventory, not
+        // recompute it from the narrowed view and drop every foreign policy.
+        let refiltered = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &filtered,
+            &request,
+            &CpScope::All,
+        );
+        let refiltered_mesh = refiltered.mesh.as_ref().expect("mesh should remain");
+        assert_eq!(
+            refiltered_mesh.node_waypoint_capture_mesh_policies,
+            mesh.node_waypoint_capture_mesh_policies,
+            "a refilter must preserve the CP-resolved destination policy inventory"
+        );
+        assert_eq!(
+            refiltered_mesh.node_waypoint_capture_destinations,
+            mesh.node_waypoint_capture_destinations
+        );
+
+        // `Single`-scope CP: no cross-namespace destination, so no foreign
+        // policy either.
+        let single = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &request,
+            &CpScope::Single("ferrum".to_string()),
+        );
+        let single_mesh = single.mesh.as_ref().expect("mesh should remain");
+        assert!(single_mesh.node_waypoint_capture_mesh_policies.is_empty());
+
+        // Explicit bearer `ns` claim: `secrets` is not authorized, so neither
+        // its destination nor its policy rides.
+        let bearer = CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            &config,
+            &request,
+            &CpScope::Set(HashSet::from([
+                "ferrum".to_string(),
+                "payments".to_string(),
+                "secrets".to_string(),
+            ])),
+            Some(&HashSet::from(["payments".to_string()])),
+        );
+        let bearer_mesh = bearer.mesh.as_ref().expect("mesh should remain");
+        assert!(
+            bearer_mesh
+                .node_waypoint_capture_mesh_policies
+                .iter()
+                .all(|policy| policy.namespace != "secrets"),
+            "an unauthorized namespace's policy must not ride the capture inventory"
+        );
+        assert!(
+            bearer_mesh
+                .node_waypoint_capture_mesh_policies
+                .iter()
+                .any(|policy| policy.name == "payments-deny")
+        );
+
+        // Without the flag the CP resolves no inventory at all.
+        let mut unflagged_request = request;
+        unflagged_request.node_waypoint_capture_scoping = false;
+        let unflagged = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &unflagged_request,
+            &CpScope::All,
+        );
+        assert!(
+            unflagged
+                .mesh
+                .as_ref()
+                .expect("mesh should remain")
+                .node_waypoint_capture_mesh_policies
+                .is_empty()
+        );
+    }
+
+    /// A capture inventory the CP resolved as EMPTY is a complete answer. A
+    /// Sidecar egress import can keep a foreign workload in the ordinary
+    /// routing view that the capture bearer bound withheld, while that
+    /// namespace's AuthorizationPolicy is narrowed away; the slice builder must
+    /// not rebuild a capture destination from that routing view and certify an
+    /// incomplete policy set. When the bearer DOES authorize the namespace, the
+    /// destination keeps its own DENY all the way through stream authorization
+    /// — including when the CP filter ran without the workload identity (the
+    /// xDS prefilter shape) and only the slice builder applies it.
+    #[tokio::test]
+    async fn capture_inventory_is_never_rebuilt_from_a_narrowed_routing_view() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{
+            MeshPolicy, MeshRule, MeshSidecarEgress, NodeWaypointCaptureInventoryState,
+            NodeWaypointEndpoint, PolicyAction, Workload,
+        };
+        use crate::modes::mesh::runtime::PolicyScopeCache;
+        use crate::modes::mesh::slice::MeshSlice;
+        use crate::plugins::Plugin;
+
+        let this_waypoint = "spiffe://test.local/ns/ferrum/sa/node-waypoint-a";
+        let ledger = Workload {
+            spiffe_id: SpiffeId::new("spiffe://test.local/ns/payments/sa/ledger")
+                .expect("fixture SPIFFE ID should be valid"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "ledger".to_string())]),
+                namespace: Some("payments".to_string()),
+            },
+            service_name: "ledger".to_string(),
+            service_namespace: None,
+            addresses: vec!["10.244.1.7".to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("test.local")
+                .expect("fixture trust domain should be valid"),
+            namespace: "payments".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("ledger".to_string()),
+            pod_uid: None,
+            node_waypoint: Some(NodeWaypointEndpoint {
+                address: "10.0.0.1".to_string(),
+                hbone_port: 15008,
+                spiffe_id: SpiffeId::new(this_waypoint)
+                    .expect("fixture waypoint SPIFFE ID should be valid"),
+                node_name: None,
+                node_uid: None,
+                network: None,
+                cluster: None,
+            }),
+            remote_provenance: false,
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![ledger.clone()],
+                mesh_policies: vec![MeshPolicy {
+                    name: "payments-deny".to_string(),
+                    namespace: "payments".to_string(),
+                    scope: PolicyScope::Namespace {
+                        namespace: "payments".to_string(),
+                    },
+                    rules: vec![MeshRule {
+                        action: PolicyAction::Deny,
+                        ..MeshRule::default()
+                    }],
+                }],
+                // A namespace-default Sidecar in `ferrum` importing `payments/*`
+                // keeps `payments` workloads routable from the subscription.
+                sidecars: vec![MeshSidecar {
+                    name: "default".to_string(),
+                    namespace: "ferrum".to_string(),
+                    workload_selector: None,
+                    egress_inherits_defaults: false,
+                    egress: vec![MeshSidecarEgress {
+                        hosts: vec!["payments/*".to_string()],
+                        port: None,
+                    }],
+                    ingress_declared: false,
+                    ingress: Vec::new(),
+                    outbound_traffic_policy: None,
+                }],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let request = MeshSliceRequest {
+            namespace: "ferrum".to_string(),
+            workload_spiffe_id: Some(this_waypoint.to_string()),
+            enforce_sidecar_egress: true,
+            node_waypoint_capture_scoping: true,
+            sidecar_http_routes: false,
+            ..MeshSliceRequest::default()
+        };
+
+        // Bearer `ns` claim authorizes only `ferrum`: no capture destination,
+        // however routable `payments/ledger` is.
+        let ferrum_only = HashSet::from(["ferrum".to_string()]);
+        let filtered = CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            &config,
+            &request,
+            &CpScope::All,
+            Some(&ferrum_only),
+        );
+        let mesh = filtered.mesh.as_ref().expect("mesh should remain");
+        assert_eq!(
+            mesh.node_waypoint_capture_inventory_state,
+            NodeWaypointCaptureInventoryState::Resolved
+        );
+        assert!(mesh.node_waypoint_capture_destinations.is_empty());
+        let slice = MeshSlice::from_gateway_config(&filtered, request.clone());
+        assert!(
+            slice.node_waypoint_capture_destinations.is_empty(),
+            "a destination the capture bearer bound withheld must not be rebuilt from the \
+             routing view"
+        );
+        assert!(slice.node_waypoint_capture_mesh_policies.is_empty());
+
+        // Incremental refilter of that stream-local config preserves the
+        // complete-empty answer rather than rebuilding it.
+        let refiltered = CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            &filtered,
+            &request,
+            &CpScope::All,
+            Some(&ferrum_only),
+        );
+        assert!(
+            MeshSlice::from_gateway_config(&refiltered, request.clone())
+                .node_waypoint_capture_destinations
+                .is_empty()
+        );
+
+        // A config narrowed for a NON-capture request cannot be turned into a
+        // capture inventory later: empty and without completeness evidence.
+        let mut non_capture = request.clone();
+        non_capture.node_waypoint_capture_scoping = false;
+        let narrowed = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &non_capture,
+            &CpScope::All,
+        );
+        let rebuilt = MeshSlice::from_gateway_config(&narrowed, request.clone());
+        assert!(rebuilt.node_waypoint_capture_destinations.is_empty());
+        assert!(!rebuilt.node_waypoint_capture_mesh_policies_resolved);
+
+        // Authorized namespace, filtered WITHOUT the identity (xDS prefilter
+        // shape): the builder narrows the CP candidates to this NodeWaypoint and
+        // the destination keeps its own DENY.
+        let mut identity_less = request.clone();
+        identity_less.workload_spiffe_id = None;
+        let authorized = HashSet::from(["ferrum".to_string(), "payments".to_string()]);
+        let filtered = CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            &config,
+            &identity_less,
+            &CpScope::All,
+            Some(&authorized),
+        );
+        assert!(
+            filtered
+                .mesh
+                .as_ref()
+                .expect("mesh should remain")
+                .mesh_policies
+                .iter()
+                .all(|policy| policy.name != "payments-deny"),
+            "precondition: the ordinary view no longer carries the destination DENY"
+        );
+        let slice = MeshSlice::from_gateway_config(&filtered, request);
+        assert_eq!(
+            slice.node_waypoint_capture_destinations,
+            vec![ledger.clone()]
+        );
+        assert!(slice.node_waypoint_capture_mesh_policies_resolved);
+        assert!(
+            slice
+                .node_waypoint_capture_mesh_policies
+                .iter()
+                .any(|policy| policy.name == "payments-deny")
+        );
+
+        let plugin = crate::plugins::mesh::authz::MeshAuthz::new(&serde_json::json!({
+            "mesh_slice": slice,
+            "per_pod_policy_scoping": true,
+        }))
+        .expect("mesh_authz builds from the CP slice");
+        let mut ctx = crate::plugins::StreamConnectionContext::new(
+            "10.244.9.9".to_string(),
+            "10.244.9.9".to_string(),
+            "__mesh-nw-capture".to_string(),
+            None,
+            15006,
+            crate::config::types::BackendScheme::Tcp,
+            Arc::new(crate::ConsumerIndex::new(&[])),
+        );
+        ctx.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::from_workload(&ledger)));
+        assert!(matches!(
+            plugin.on_stream_connect(&mut ctx).await,
+            crate::plugins::PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ));
     }
 
     #[test]

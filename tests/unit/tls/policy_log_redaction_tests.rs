@@ -36,6 +36,7 @@ fn construct_and_capture(config: &EnvConfig) -> (TlsPolicy, String) {
         .with_max_level(tracing::Level::INFO)
         .with_writer(move || writer.clone())
         .finish();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let policy = tracing::subscriber::with_default(subscriber, || {
         TlsPolicy::from_env_config(config).expect("accepted TLS policy")
     });
@@ -116,7 +117,7 @@ fn assert_policy_and_log(config: &EnvConfig, versions: &[ProtocolVersion]) {
         "FERRUM_TLS_MIN_VERSION",
         "FERRUM_TLS_MAX_VERSION",
         "FERRUM_TLS_CIPHER_SUITES",
-        "FERRUM_TLS_CURVES",
+        "FERRUM_TLS_KEY_EXCHANGE_GROUPS",
         "FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER",
     ] {
         assert!(message.contains(field), "missing {field}: {output}");
@@ -192,7 +193,7 @@ fn successful_policy_info_withholds_external_selections_and_scalars() {
     let dir = tempfile::tempdir().unwrap();
     let fixtures = [
         ("FERRUM_TLS_CIPHER_SUITES", CIPHER),
-        ("FERRUM_TLS_CURVES", CURVE),
+        ("FERRUM_TLS_KEY_EXCHANGE_GROUPS", CURVE),
         ("FERRUM_TLS_MIN_VERSION", "1.2"),
         ("FERRUM_TLS_MAX_VERSION", "1.3"),
         ("FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER", "false"),

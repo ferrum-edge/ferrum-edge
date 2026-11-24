@@ -30,6 +30,10 @@ fn per_proxy_warn() -> &'static DashMap<String, AtomicLogRateLimiter> {
 /// Emit at most one WARN per proxy (and one process-wide) per limiter
 /// window when a backend TLS handshake looks like plaintext HTTP behind
 /// `https`. No-op for non-HTTPS schemes and for unrelated TLS failures.
+///
+/// `backend_target` may be a full backend URL; its query string is dropped
+/// before logging because it can carry client credentials (a WebSocket
+/// `?access_token=`, a signed URL).
 pub(crate) fn maybe_warn_https_to_plaintext_backend(
     proxy: &Proxy,
     backend_target: &str,
@@ -53,7 +57,7 @@ pub(crate) fn maybe_warn_https_to_plaintext_backend(
 
     warn!(
         proxy_id = %proxy.id,
-        backend_target = %backend_target,
+        backend_target = %super::strip_query_params(backend_target),
         error_reason = ERROR_REASON_HTTPS_TO_PLAINTEXT,
         suppressed,
         globally_suppressed,

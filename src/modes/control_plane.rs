@@ -7,8 +7,9 @@
 //! full reload and broadcasts fresh snapshots to all subscribers.
 //!
 //! The admin API is read/write (same as database mode). The CP validates
-//! DP client JWT tokens using `FERRUM_CP_DP_GRPC_JWT_SECRET` and enforces
-//! `major.minor` version compatibility between CP and DP.
+//! DP client JWT tokens using `FERRUM_CP_DP_GRPC_JWT_SECRET` and requires
+//! ConfigSync DPs to run the same build (exact build identity); mesh data
+//! planes on MeshSubscribe are held to a `major.minor` version floor.
 
 use arc_swap::ArcSwap;
 use futures_util::StreamExt;
@@ -50,15 +51,13 @@ use crate::grpc::mesh_server::MeshGrpcServer;
 use crate::k8s_controller::{
     CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
 };
+use crate::modes::FullReloadReason;
 use crate::modes::file::ListenerJoinHandle;
 use crate::modes::mesh::revision::MeshConfigRevision;
 use crate::modes::startup_security;
 use crate::startup::{sanitize_startup_cause, sanitize_startup_scalar, wait_for_start_signals};
 use crate::util::conn_limit::{ConnLimiter, ConnPermit};
 use crate::xds::XdsAdsServer;
-
-#[cfg(test)]
-use crate::config::incremental_apply::upsert_by_id;
 
 /// Bounded grace period for the Kubernetes CRD controller's owned tasks
 /// (watchers, reconciler, CRD reprobe) to observe shutdown and return.
@@ -118,6 +117,62 @@ where
     }
 }
 
+/// Narrow incremental-load source used by the CP multi-namespace poll, so its
+/// per-namespace concurrency and merge order are testable with a scripted
+/// source. Production stores receive the blanket implementation below.
+#[doc(hidden)]
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
+#[async_trait::async_trait]
+pub trait CpIncrementalLoadSource: Send + Sync {
+    async fn load_incremental_config(
+        &self,
+        namespace: &str,
+        after_sequence: u64,
+    ) -> Result<IncrementalResult, anyhow::Error>;
+}
+
+#[async_trait::async_trait]
+impl<T> CpIncrementalLoadSource for T
+where
+    T: DatabaseBackend + ?Sized,
+{
+    async fn load_incremental_config(
+        &self,
+        namespace: &str,
+        after_sequence: u64,
+    ) -> Result<IncrementalResult, anyhow::Error> {
+        DatabaseBackend::load_incremental_config(self, namespace, after_sequence).await
+    }
+}
+
+/// Most per-namespace database loads one phase of a multi-namespace CP poll
+/// (incremental deltas, pre-load change-sequence boundaries, full reloads)
+/// runs at once. See [`cp_namespace_load_concurrency`] for the per-backend
+/// budget actually used.
+const CP_NAMESPACE_LOAD_CONCURRENCY_MAX: usize = 4;
+
+/// Per-phase namespace-load budget for a multi-namespace CP poll.
+///
+/// - SQL: each in-flight full load holds one primary pool connection for its
+///   whole snapshot transaction, and every buffered sibling starts its
+///   `FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS` deadline as soon as it is
+///   polled. On a small pool, a namespace that would have loaded serially
+///   could time out waiting for a sibling's transaction. The budget is a
+///   quarter of `FERRUM_DB_POOL_MAX_CONNECTIONS` (leaving the rest for admin
+///   traffic), capped at [`CP_NAMESPACE_LOAD_CONCURRENCY_MAX`]. Pools below 8
+///   connections load serially, as before; the default pool of 32 gets 4.
+/// - MongoDB ignores `FERRUM_DB_POOL_*` (pool size is the URI `maxPoolSize`,
+///   driver default 10), and the driver's checkout waits without a deadline,
+///   so over-subscription only queues. It uses the fixed maximum.
+#[doc(hidden)]
+pub fn cp_namespace_load_concurrency(db_type: &str, pool_max_connections: u32) -> usize {
+    if db_type == "mongodb" {
+        return CP_NAMESPACE_LOAD_CONCURRENCY_MAX;
+    }
+    let quarter_of_pool = (pool_max_connections / 4) as usize;
+    quarter_of_pool.clamp(1, CP_NAMESPACE_LOAD_CONCURRENCY_MAX)
+}
+
 /// Stream of admitted CP gRPC connections handed to tonic's
 /// `serve_with_incoming_shutdown`.
 pub type CpGrpcIncomingStream =
@@ -133,7 +188,7 @@ async fn reconcile_plugin_migrations_after_cp_reconnect(
     if !*needs_reconcile {
         return true;
     }
-    match crate::modes::handle_recovery_plugin_migrations(db, auto_apply, "cp-recovery").await {
+    match crate::modes::handle_startup_plugin_migrations(db, auto_apply, "cp-recovery").await {
         Ok(()) => {
             *needs_reconcile = false;
             true
@@ -624,17 +679,20 @@ fn retained_polled_namespaces(config: &GatewayConfig) -> Vec<String> {
 }
 
 /// Multi-namespace incremental poll. Calls `load_incremental_config` once
-/// per namespace. Load failures for one namespace are isolated: other namespaces
-/// continue and the failing namespace keeps its prior cursor (#2983).
+/// per namespace, up to `concurrency` at a time (see
+/// [`cp_namespace_load_concurrency`]). Load
+/// failures for one namespace are isolated: other namespaces continue and the
+/// failing namespace keeps its prior cursor (#2983).
 ///
 /// Returns `Err` only when every namespace fails with a non-validation error
 /// (connectivity / full-reload-required), so the poll loop can escalate to a
 /// full fallback. A mix of successes and failures returns `Ok` with
 /// `load_failures` populated.
-async fn load_incremental_config_multi(
-    db: &dyn DatabaseBackend,
+async fn load_incremental_config_multi<B: CpIncrementalLoadSource + ?Sized>(
+    db: &B,
     namespaces: &[String],
     after_sequences: &HashMap<String, u64>,
+    concurrency: usize,
 ) -> Result<IncrementalMultiLoad, anyhow::Error> {
     if namespaces.len() <= 1 {
         let ns = namespaces.first().map(|s| s.as_str()).unwrap_or("ferrum");
@@ -669,9 +727,29 @@ async fn load_incremental_config_multi(
     };
     let mut any_success = false;
     let mut last_hard_error: Option<anyhow::Error> = None;
-    for ns in namespaces {
-        let after_sequence = after_sequences.get(ns).copied().unwrap_or(0);
-        match db.load_incremental_config(ns, after_sequence).await {
+    // Each namespace's delta is a separate namespace-predicated, read-only
+    // query sequence with no transaction and no input from another namespace's
+    // result, so the loads can overlap. A window of at most `concurrency` loads
+    // is in flight; `FuturesOrdered` yields outcomes in admission order, which
+    // is namespace order, so the merge below sees exactly the sequence the
+    // serial loop did. A new load is admitted only after the oldest outcome is
+    // merged, so once an escalation is seen nothing further is admitted; at
+    // most `concurrency - 1` later loads that had already started are drained.
+    let concurrency = concurrency.max(1);
+    let mut unadmitted = namespaces.iter();
+    let mut in_flight = futures_util::stream::FuturesOrdered::new();
+    for ns in unadmitted.by_ref().take(concurrency) {
+        in_flight.push_back(
+            db.load_incremental_config(ns, after_sequences.get(ns).copied().unwrap_or(0)),
+        );
+    }
+    let mut outcome_namespaces = namespaces.iter();
+    while let Some(outcome) = in_flight.next().await {
+        // Outcomes arrive in admission order, so this never runs dry first.
+        let Some(ns) = outcome_namespaces.next() else {
+            break;
+        };
+        match outcome {
             Ok(mut delta) => {
                 any_success = true;
                 next_sequences.insert(ns.clone(), delta.sequence_cursor);
@@ -706,6 +784,9 @@ async fn load_incremental_config_multi(
                 // Consumer changes escalate to full reload for the whole CP —
                 // credential rehydration is not safe to partition.
                 if db_backend::is_incremental_full_reload_required(&error) {
+                    // Admit nothing more. Loads already started run to
+                    // completion (never dropped mid-query) and are discarded.
+                    while in_flight.next().await.is_some() {}
                     return Err(error);
                 }
                 error!(
@@ -716,6 +797,12 @@ async fn load_incremental_config_multi(
                 load_failures.push((ns.clone(), error.to_string()));
                 last_hard_error = Some(error);
             }
+        }
+        if let Some(next_ns) = unadmitted.next() {
+            in_flight.push_back(db.load_incremental_config(
+                next_ns,
+                after_sequences.get(next_ns).copied().unwrap_or(0),
+            ));
         }
     }
     if !any_success {
@@ -761,6 +848,7 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
     db: &B,
     namespaces: &[String],
     previous: &GatewayConfig,
+    concurrency: usize,
 ) -> Result<FullLoadMultiOutcome, anyhow::Error> {
     if namespaces.len() <= 1 {
         let ns = namespaces.first().map(|s| s.as_str()).unwrap_or("ferrum");
@@ -784,11 +872,25 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
     let mut acc = MultiNsFullLoadAcc::new();
     let mut last_hard_error: Option<anyhow::Error> = None;
 
-    for ns in namespaces {
-        match db
-            .load_full_config_for_purpose(ns, FullConfigLoadPurpose::ControlPlane)
-            .await
-        {
+    // Each namespace's full load is its own namespace-scoped, read-only
+    // snapshot transaction/session on its own pool connection, and the
+    // consumer-quarantine state it records is keyed by namespace, so the loads
+    // can overlap. Every load runs to completion (no fail-fast drop of an
+    // in-flight transaction) and outcomes are applied in namespace order, so
+    // resource order, the namespace lists and `last_hard_error` match the
+    // serial loop. Validation below still runs on this task, one namespace at
+    // a time.
+    let loads: Vec<_> = namespaces
+        .iter()
+        .map(|ns| db.load_full_config_for_purpose(ns, FullConfigLoadPurpose::ControlPlane))
+        .collect();
+    let outcomes: Vec<Result<GatewayConfig, anyhow::Error>> = futures_util::stream::iter(loads)
+        .buffered(concurrency.max(1))
+        .collect()
+        .await;
+
+    for (ns, outcome) in namespaces.iter().zip(outcomes) {
+        match outcome {
             Ok(raw) => match prepare_cp_full_snapshot(raw) {
                 Ok(next) => {
                     acc.apply_success(ns, next);
@@ -842,14 +944,16 @@ fn forget_consumer_quarantine_states<B: CpFullLoadSource + ?Sized>(db: &B, names
 /// Not `Debug`: the combined `GatewayConfig` carries consumer credentials.
 struct MultiNsFullLoadAcc {
     combined: Option<GatewayConfig>,
-    /// `loaded_at` of the first namespace that actually loaded. A published CP
-    /// FULL_SNAPSHOT carries `ConfigUpdate.version = config.loaded_at`, which is
-    /// the DP's monotonic ordering watermark and its cross-source staleness
-    /// fence. When the first namespaces in the list fail, `combined` is seeded
-    /// from `previous` — so without this the snapshot would be broadcast under
-    /// the *already applied* stamp, leaving the DP watermark stuck behind
-    /// content that did change. Taken from the load (not `Utc::now()`) so the
-    /// stamp still precedes every query, preserving the full-load safety margin.
+    /// Earliest `loaded_at` among the namespaces that actually loaded. A
+    /// published CP FULL_SNAPSHOT carries `ConfigUpdate.version =
+    /// config.loaded_at`, which is the DP's monotonic ordering watermark and its
+    /// cross-source staleness fence. When the first namespaces in the list fail,
+    /// `combined` is seeded from `previous` — so without this the snapshot would
+    /// be broadcast under the *already applied* stamp, leaving the DP watermark
+    /// stuck behind content that did change. Taken from the loads (not
+    /// `Utc::now()`) so the stamp still precedes every query, preserving the
+    /// full-load safety margin. The minimum, not the first in namespace order,
+    /// because namespace loads run concurrently and may stamp in any order.
     fresh_loaded_at: Option<chrono::DateTime<chrono::Utc>>,
     rejected_namespaces: Vec<(String, String)>,
     refreshed_namespaces: Vec<String>,
@@ -882,9 +986,10 @@ impl MultiNsFullLoadAcc {
     fn apply_success(&mut self, ns: &str, mut next: GatewayConfig) {
         self.any_success = true;
         self.refreshed_namespaces.push(ns.to_string());
-        if self.fresh_loaded_at.is_none() {
-            self.fresh_loaded_at = Some(next.loaded_at);
-        }
+        self.fresh_loaded_at = Some(
+            self.fresh_loaded_at
+                .map_or(next.loaded_at, |earliest| earliest.min(next.loaded_at)),
+        );
         match &mut self.combined {
             None => self.combined = Some(next),
             Some(acc) => {
@@ -934,7 +1039,7 @@ impl MultiNsFullLoadAcc {
         }
 
         let mut config = self.combined.unwrap_or_else(|| previous.clone());
-        // Stamp the snapshot with the first successful load's timestamp even when
+        // Stamp the snapshot with the earliest successful load's timestamp even when
         // the accumulator was seeded from `previous`, so the broadcast
         // `ConfigUpdate.version` advances with the content it describes.
         if let Some(loaded_at) = self.fresh_loaded_at {
@@ -1061,6 +1166,7 @@ async fn load_full_config_multi_with_sequence(
     scope: &CpScope,
     mesh_authority: Option<&str>,
     mesh_sequence_floor: u64,
+    concurrency: usize,
 ) -> Result<(FullLoadMultiOutcome, HashMap<String, u64>), anyhow::Error> {
     let boundary_namespaces = if namespaces.is_empty() {
         vec!["ferrum".to_string()]
@@ -1088,10 +1194,24 @@ async fn load_full_config_multi_with_sequence(
         0
     };
 
+    // Boundary reads are independent per-namespace autocommit reads. The
+    // required order is between phases (store-global watermark, then every
+    // namespace boundary, then every resource load), not within one, so read
+    // them with bounded concurrency and finish the whole phase before any
+    // resource load starts. Results are applied in namespace order.
+    let boundary_reads: Vec<_> = boundary_namespaces
+        .iter()
+        .map(|ns| db.latest_change_sequence(ns))
+        .collect();
+    let boundaries: Vec<Result<u64, anyhow::Error>> = futures_util::stream::iter(boundary_reads)
+        .buffered(concurrency.max(1))
+        .collect()
+        .await;
+
     let mut sequences = HashMap::new();
     let mut boundary_failed_namespaces = Vec::new();
-    for ns in &boundary_namespaces {
-        match db.latest_change_sequence(ns).await {
+    for (ns, boundary) in boundary_namespaces.iter().zip(boundaries) {
+        match boundary {
             Ok(sequence) => {
                 sequences.insert(ns.clone(), sequence);
             }
@@ -1137,7 +1257,7 @@ async fn load_full_config_multi_with_sequence(
             failed_namespaces: Vec::new(),
         }
     } else {
-        load_full_config_multi(db, &load_namespaces, previous)
+        load_full_config_multi(db, &load_namespaces, previous, concurrency)
             .await
             .inspect_err(|_| forget_consumer_quarantine_states(db, &load_namespaces))?
     };
@@ -1231,11 +1351,7 @@ async fn load_full_config_multi_with_sequence(
 
 /// External-test view of CP full-load sequencing without exposing the
 /// credential-bearing internal outcome type.
-///
-/// `#[allow(dead_code)]` because integration tests exercise this seam; the
-/// binary target does not construct it, and clippy runs with `-D warnings`.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub struct CpFullLoadSequenceOutcomeForTest {
     pub config: GatewayConfig,
     pub sequences: HashMap<String, u64>,
@@ -1245,12 +1361,9 @@ pub struct CpFullLoadSequenceOutcomeForTest {
 }
 
 /// Exercise the production full-load boundary orchestration from external
-/// integration tests with a scripted [`CpFullLoadSource`].
-///
-/// `#[allow(dead_code)]` because only external integration tests call this;
-/// the binary target does not, and clippy runs with `-D warnings`.
+/// integration tests with a scripted [`CpFullLoadSource`]. Runs at the
+/// maximum per-phase budget (the default SQL pool's and MongoDB's).
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn load_full_config_multi_with_sequence_for_test(
     db: &(impl CpFullLoadSource + ?Sized),
     namespaces: &[String],
@@ -1266,6 +1379,7 @@ pub async fn load_full_config_multi_with_sequence_for_test(
         scope,
         mesh_authority,
         mesh_sequence_floor,
+        CP_NAMESPACE_LOAD_CONCURRENCY_MAX,
     )
     .await?;
     let covers_all_namespaces = cp_full_reload_covers_all_namespaces(
@@ -1278,6 +1392,33 @@ pub async fn load_full_config_multi_with_sequence_for_test(
         refreshed_namespaces: outcome.refreshed_namespaces,
         failed_namespaces: outcome.failed_namespaces,
         covers_all_namespaces,
+    })
+}
+
+/// External-test view of the CP multi-namespace incremental poll.
+///
+/// Not `Debug`: `IncrementalResult` carries consumer credentials.
+#[doc(hidden)]
+pub struct CpIncrementalMultiLoadOutcomeForTest {
+    pub result: IncrementalResult,
+    pub next_sequences: HashMap<String, u64>,
+    pub load_failures: Vec<(String, String)>,
+}
+
+/// Exercise the production multi-namespace incremental poll from external
+/// integration tests with a scripted [`CpIncrementalLoadSource`].
+#[doc(hidden)]
+pub async fn load_incremental_config_multi_for_test(
+    db: &(impl CpIncrementalLoadSource + ?Sized),
+    namespaces: &[String],
+    after_sequences: &HashMap<String, u64>,
+    concurrency: usize,
+) -> Result<CpIncrementalMultiLoadOutcomeForTest, anyhow::Error> {
+    let load = load_incremental_config_multi(db, namespaces, after_sequences, concurrency).await?;
+    Ok(CpIncrementalMultiLoadOutcomeForTest {
+        result: load.result,
+        next_sequences: load.next_sequences,
+        load_failures: load.load_failures,
     })
 }
 
@@ -1532,7 +1673,7 @@ fn trust_publication_scope(
 ///
 /// A partial reload leaves failed or rejected namespaces on their pre-reconnect
 /// cursors, which may exceed a replacement database's sequence space. Keeping
-/// `force_full_reload = true` ensures subsequent ticks keep retrying a full
+/// `force_full_reload` armed ensures subsequent ticks keep retrying a full
 /// reload until every namespace holds an accepted snapshot and cursor from the
 /// active topology.
 pub(crate) fn cp_full_reload_covers_all_namespaces(
@@ -1563,7 +1704,7 @@ async fn attempt_cp_failover_full_reload(
     config_rejected_poll: &Arc<AtomicBool>,
     poll_auto_apply_plugin_migrations: bool,
     plugin_migrations_need_reconcile: &mut bool,
-    force_full_reload: &mut bool,
+    force_full_reload: &mut Option<FullReloadReason>,
     last_polled_namespaces: &mut Vec<String>,
     last_change_sequences: &mut HashMap<String, u64>,
     rejected_delta_tracker: &mut CpRejectedDeltaTracker,
@@ -1574,6 +1715,7 @@ async fn attempt_cp_failover_full_reload(
     mesh_update_tx: &tokio::sync::broadcast::Sender<crate::grpc::mesh_server::MeshConfigBroadcast>,
     mesh_registry_poll: &crate::grpc::mesh_registry::MeshNodeRegistry,
     poll_slow_threshold_ms: Option<u64>,
+    namespace_load_concurrency: usize,
     database_delta_poll_metrics_for_poll: &crate::modes::database::DatabaseDeltaPollMetrics,
     reconnect_failure_warning: &str,
 ) -> CpFailoverFullReloadOutcome {
@@ -1583,7 +1725,7 @@ async fn attempt_cp_failover_full_reload(
             // namespace has an accepted snapshot and sequence cursor from this
             // topology, so no namespace can poll incrementally using a stale
             // cursor from the replaced database.
-            *force_full_reload = true;
+            *force_full_reload = Some(FullReloadReason::DatabaseFailover);
             *plugin_migrations_need_reconcile = true;
             db_available_poll.store(false, Ordering::Relaxed);
             match load_full_config_multi_with_sequence(
@@ -1593,6 +1735,7 @@ async fn attempt_cp_failover_full_reload(
                 poll_scope,
                 poll_mesh_config_authority,
                 published_mesh_sequence(config_poll),
+                namespace_load_concurrency,
             )
             .await
             {
@@ -1612,7 +1755,9 @@ async fn attempt_cp_failover_full_reload(
                         &outcome.rejected_namespaces,
                         &outcome.failed_namespaces,
                     );
-                    *force_full_reload = !complete;
+                    if complete {
+                        *force_full_reload = None;
+                    }
                     db_available_poll.store(true, Ordering::Relaxed);
                     *last_polled_namespaces = nslist.to_vec();
                     merge_refreshed_change_sequences(last_change_sequences, sequences);
@@ -2169,7 +2314,7 @@ fn partition_incremental_by_namespace(
 
 pub async fn run(
     env_config: EnvConfig,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<(), anyhow::Error> {
     let effective_url = env_config
         .effective_db_url()
@@ -2205,6 +2350,10 @@ pub async fn run(
         names.push(env_config.namespace.clone());
         names
     };
+
+    // SQL admin-read replica to dial in the background once the store is
+    // shared (see below); `None` when unset, suppressed, or MongoDB.
+    let mut startup_replica_url: Option<String> = None;
 
     // Build the database backend — SQL (sqlx) or MongoDB depending on FERRUM_DB_TYPE
     let db: Box<dyn DatabaseBackend> = match db_type {
@@ -2278,24 +2427,33 @@ pub async fn run(
             retention_policy.log_if_enabled();
             store.set_audit_retention_policy(retention_policy);
 
+            // The admin-read replica is never authoritative, so it is dialed in
+            // the background below instead of delaying the primary load; admin
+            // reads use primary until its pool is published.
             if let Some(ref replica_url) = effective_replica_url {
-                match store.connect_read_replica(replica_url).await {
-                    Ok(()) if store.read_replica_suppressed() => {
-                        info!("Read replica configured but suppressed until primary failback")
-                    }
-                    Ok(()) => info!("Read replica connected for admin reads"),
-                    Err(_error) => {
-                        warn!(
-                            "Read replica connection failed for {}; admin reads will use primary until reconnect succeeds",
-                            sanitize_startup_scalar(replica_url)
-                        );
-                    }
+                store.set_read_replica_url(replica_url);
+                if store.read_replica_suppressed() {
+                    info!("Read replica configured but suppressed until primary failback");
+                } else {
+                    startup_replica_url = Some(replica_url.clone());
                 }
             }
             Box::new(store)
         }
     };
     let db: Arc<dyn DatabaseBackend> = Arc::from(db);
+    // Single-flight guard shared with the poll task, so its first tick cannot
+    // double-dial while the startup replica connect is in flight.
+    let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
+    if let Some(replica_url) = startup_replica_url {
+        crate::modes::spawn_admin_read_replica_reconnect(
+            db.clone(),
+            replica_url,
+            replica_reconnect_in_flight.clone(),
+            "startup",
+            None,
+        );
+    }
     let db_tls_reload_handle = crate::modes::db_tls_reload::start_db_tls_reload_task(
         env_config.clone(),
         db.clone(),
@@ -2348,6 +2506,11 @@ pub async fn run(
     // full reload — advertises the same authority.
     let mesh_config_authority = resolve_mesh_config_authority(&env_config);
     let empty_previous = GatewayConfig::default();
+    // Per-phase namespace-load budget: sized from the SQL pool (fixed for
+    // MongoDB) so concurrent namespace loads cannot starve one another or admin
+    // traffic of pooled connections. Used by startup and every poll phase.
+    let namespace_load_concurrency =
+        cp_namespace_load_concurrency(db_type, env_config.db_pool_max_connections);
     let (full_load, initial_change_sequences) = load_full_config_multi_with_sequence(
         db.as_ref(),
         &polled_namespaces,
@@ -2355,6 +2518,7 @@ pub async fn run(
         &cp_scope,
         mesh_config_authority.as_deref(),
         0,
+        namespace_load_concurrency,
     )
     .await?;
     // Startup fails CLOSED. Per-namespace isolation (#2983) exists so a broken
@@ -2441,23 +2605,10 @@ pub async fn run(
             })?;
             // Warn (not fail) on a served namespace no credential can reach:
             // it is a real rollout gap, but refusing to start would make adding
-            // a tenant a two-step outage.
+            // a tenant a two-step outage. The reload worker repeats the same
+            // check on every accepted change.
             if let Some(namespaces) = cp_scope.explicit_namespaces() {
-                let bound = bundle.bound_namespaces();
-                let unreachable: Vec<&str> = namespaces
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|namespace| !bound.contains(namespace))
-                    .collect();
-                if !unreachable.is_empty() {
-                    warn!(
-                        "CP/DP trust bundle binds no verification credential to {} served \
-                         namespace(s): [{}]. Data planes in those namespaces cannot subscribe \
-                         until a credential is bound to them.",
-                        unreachable.len(),
-                        sanitize_startup_scalar(unreachable.join(", "))
-                    );
-                }
+                crate::grpc::cp_trust::warn_unbound_served_namespaces(&bundle, &namespaces);
             }
             // The legacy secret stays optional here: with a trust bundle
             // configured it is no longer an authorization input, and CP mode
@@ -2551,7 +2702,7 @@ pub async fn run(
             path,
             env_config.cp_dp_grpc_jwt_secret.clone(),
             cp_dp_verifier.clone(),
-            cp_scope.requires_namespace_claim_by_default(),
+            cp_scope.explicit_namespaces(),
             trust_reload_interval,
             trust_status,
             shutdown_tx.subscribe(),
@@ -2715,6 +2866,13 @@ pub async fn run(
     // for a later mutation to lazily spawn the worker. A process that receives
     // no new mutations still has to drain the backlog it inherited.
     crate::admin::audit::start_delivery(env_config.admin_audit_enabled, db.clone());
+    // Age retention must also reach namespaces that stop receiving audit
+    // events; insert-path pruning alone never revisits them.
+    let audit_retention_sweep_handle = crate::admin::audit::start_retention_sweep(
+        env_config.audit_retention_days,
+        db.clone(),
+        shutdown_tx.subscribe(),
+    );
 
     let admin_state = AdminState {
         db: Some(db.clone()),
@@ -2754,7 +2912,6 @@ pub async fn run(
             crate::admin::api_specs::DefaultExternalDocumentLoader {
                 egress: env_config.backend_allow_ips.clone(),
                 dns_cache: None,
-                fixtures: std::collections::HashMap::new(),
             },
         ),
         runtime_config_apply: None,
@@ -3364,9 +3521,8 @@ pub async fn run(
         let mut last_db_ips: Option<Vec<IpAddr>> = None;
         let last_replica_ips: crate::modes::AdminReadReplicaDnsWatermark =
             Arc::new(tokio::sync::Mutex::new(None));
-        let mut force_full_reload = false;
+        let mut force_full_reload: Option<FullReloadReason> = None;
         let mut last_polled_namespaces = initial_polled_namespaces;
-        let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
         let mut rejected_delta_tracker =
             CpRejectedDeltaTracker::new(rejected_delta_full_reload_threshold);
         // The poll task is the sole owner. Any pool topology swap resets this
@@ -3402,7 +3558,8 @@ pub async fn run(
                             match db_poll.reconnect(&db_url_for_reconnect).await {
                                 Ok(_) => {
                                     last_db_ips = Some(ips);
-                                    force_full_reload = true;
+                                    force_full_reload =
+                                        Some(FullReloadReason::DnsReconnect);
                                     plugin_migrations_need_reconcile = true;
                                     db_available_poll.store(false, Ordering::Relaxed);
                                 }
@@ -3465,7 +3622,7 @@ pub async fn run(
                     // path in THIS tick rather than the next, and it is skipped
                     // when a full reload is already pending because that reload
                     // republishes trust anyway.
-                    if !force_full_reload {
+                    if force_full_reload.is_none() {
                         let trust_drifted = detect_gateway_trust_drift(
                             db_poll.as_ref(),
                             &nslist,
@@ -3473,11 +3630,12 @@ pub async fn run(
                         )
                         .await;
                         if !trust_drifted.is_empty() {
-                            force_full_reload = true;
+                            force_full_reload =
+                                Some(FullReloadReason::GatewayTrustDrift);
                         }
                     }
 
-                    if force_full_reload {
+                    if let Some(full_reload_reason) = force_full_reload {
                         match load_full_config_multi_with_sequence(
                             db_poll.as_ref(),
                             &nslist,
@@ -3485,6 +3643,7 @@ pub async fn run(
                             &poll_scope,
                             poll_mesh_config_authority.as_deref(),
                             published_mesh_sequence(&config_poll),
+                            namespace_load_concurrency,
                         )
                         .await
                         {
@@ -3494,7 +3653,7 @@ pub async fn run(
                                     &db_available_poll,
                                     poll_auto_apply_plugin_migrations,
                                     &mut plugin_migrations_need_reconcile,
-                                    "DB DNS reconnect",
+                                    full_reload_reason.migration_gate_context(),
                                 )
                                 .await
                                 {
@@ -3506,10 +3665,17 @@ pub async fn run(
                                     sequences,
                                 );
                                 last_polled_namespaces = nslist.clone();
-                                force_full_reload = !cp_full_reload_covers_all_namespaces(
+                                // A partial reload keeps the pending reason armed
+                                // until every namespace holds an accepted snapshot
+                                // and cursor from the active topology.
+                                force_full_reload = if cp_full_reload_covers_all_namespaces(
                                     &outcome.rejected_namespaces,
                                     &outcome.failed_namespaces,
-                                );
+                                ) {
+                                    None
+                                } else {
+                                    Some(full_reload_reason)
+                                };
                                 rejected_delta_tracker.record_accepted();
                                 db_available_poll.store(true, Ordering::Relaxed);
                                 publish_cp_full_reload(
@@ -3535,10 +3701,13 @@ pub async fn run(
                                     &config_rejected_poll,
                                     &outcome.rejected_namespaces,
                                     &outcome.failed_namespaces,
-                                    "full reload after DB DNS reconnect",
+                                    full_reload_reason.reload_context(),
                                 )
                                 .await;
-                                debug!("Full config reload complete after DB DNS reconnect");
+                                debug!(
+                                    reason = full_reload_reason.as_label(),
+                                    "Full config reload complete"
+                                );
                             }
                             Err(e) => {
                                 if crate::modes::is_poll_validation_rejection(&e) {
@@ -3547,7 +3716,7 @@ pub async fn run(
                                         &db_available_poll,
                                         poll_auto_apply_plugin_migrations,
                                         &mut plugin_migrations_need_reconcile,
-                                        "validation-rejected full load after DB DNS reconnect",
+                                        full_reload_reason.rejected_load_context(),
                                     )
                                     .await
                                     {
@@ -3563,7 +3732,7 @@ pub async fn run(
                                         &db_available_poll,
                                         &config_rejected_poll,
                                         &e,
-                                        "full reload after DB DNS reconnect",
+                                        full_reload_reason.reload_context(),
                                     )
                                     .await;
                                     database_delta_poll_metrics_for_poll.record_poll_failure(
@@ -3571,7 +3740,8 @@ pub async fn run(
                                     );
                                 } else {
                                     error!(
-                                        "Authoritative primary full config reload failed after DB DNS reconnect; attempting failover reconnect"
+                                        reason = full_reload_reason.as_label(),
+                                        "Authoritative primary full config reload failed; attempting failover reconnect"
                                     );
                                     if matches!(
                                         attempt_cp_failover_full_reload(
@@ -3596,8 +3766,9 @@ pub async fn run(
                                             &mesh_update_tx,
                                             &mesh_registry_poll,
                                             poll_slow_threshold_ms,
+                                            namespace_load_concurrency,
                                             &database_delta_poll_metrics_for_poll,
-                                            "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying",
+                                            "Authoritative primary full config reload failed; keeping existing config and retrying",
                                         )
                                         .await,
                                         CpFailoverFullReloadOutcome::ConnectivityUnavailable
@@ -3619,6 +3790,7 @@ pub async fn run(
                             db_poll.as_ref(),
                             &nslist,
                             &last_change_sequences,
+                            namespace_load_concurrency,
                         )
                         .await;
                         let load_elapsed = load_started.elapsed();
@@ -3685,7 +3857,7 @@ pub async fn run(
                                     // `config_rejected` stuck with the tracker
                                     // reset and no escalation path.
                                     if config_rejected_poll.load(Ordering::Relaxed) {
-                                        force_full_reload = true;
+                                        force_full_reload = Some(FullReloadReason::StandingRejection);
                                     }
                                     database_delta_poll_metrics_for_poll.record_poll_completed();
                                     continue;
@@ -3714,30 +3886,10 @@ pub async fn run(
                                     }
                                 }
 
-                                // Publication now flows THROUGH the partitions,
-                                // so a non-empty delta that partitions to
-                                // nothing (deletions for ids already absent
-                                // from the CP snapshot, so their namespace
-                                // cannot be resolved) has nothing to publish.
-                                // The cursor must still advance or the same
-                                // rows are re-read on every tick forever.
-                                if partitions.is_empty() {
-                                    warn!(
-                                        "CP incremental delta contained no namespace-attributable \
-                                         changes; advancing cursors for the namespaces that loaded"
-                                    );
-                                    merge_refreshed_change_sequences(
-                                        &mut last_change_sequences,
-                                        next_sequences,
-                                    );
-                                    rejected_delta_tracker.record_accepted();
-                                    if config_rejected_poll.load(Ordering::Relaxed) {
-                                        force_full_reload = true;
-                                    }
-                                    database_delta_poll_metrics_for_poll.record_poll_completed();
-                                    continue;
-                                }
-
+                                // `result` is non-empty and every change is
+                                // bucketed by its own namespace (removals carry
+                                // a NamespacedResourceId), so `partitions` is
+                                // non-empty here.
                                 // Commit + DP/mesh emission are one publication
                                 // section, so a concurrent K8s reconcile full
                                 // snapshot can never be emitted after these
@@ -3858,6 +4010,7 @@ pub async fn run(
                                             &poll_scope,
                                             poll_mesh_config_authority.as_deref(),
                                             published_mesh_sequence(&config_poll),
+                                            namespace_load_concurrency,
                                         )
                                         .await
                                         {
@@ -3941,6 +4094,7 @@ pub async fn run(
                                                             &mesh_update_tx,
                                                             &mesh_registry_poll,
                                                             poll_slow_threshold_ms,
+                                                            namespace_load_concurrency,
                                                             &database_delta_poll_metrics_for_poll,
                                                             "Authoritative full reload failed after repeated CP delta rejection; keeping the last accepted cursors and cached config",
                                                         )
@@ -4006,7 +4160,7 @@ pub async fn run(
                                     // full reload the standing signal would
                                     // never clear.
                                     if config_rejected_poll.load(Ordering::Relaxed) {
-                                        force_full_reload = true;
+                                        force_full_reload = Some(FullReloadReason::StandingRejection);
                                     }
                                 }
                             }
@@ -4029,6 +4183,7 @@ pub async fn run(
                                     &poll_scope,
                                     poll_mesh_config_authority.as_deref(),
                                     published_mesh_sequence(&config_poll),
+                                    namespace_load_concurrency,
                                 )
                                 .await
                                 {
@@ -4138,6 +4293,7 @@ pub async fn run(
                                                 &mesh_update_tx,
                                                 &mesh_registry_poll,
                                                 poll_slow_threshold_ms,
+                                                namespace_load_concurrency,
                                                 &database_delta_poll_metrics_for_poll,
                                                 "Authoritative primary full config reload also failed (serving cached)",
                                             )
@@ -4333,6 +4489,9 @@ pub async fn run(
     if let Some(handle) = db_tls_reload_handle {
         background_handles.push(handle);
     }
+    if let Some(handle) = audit_retention_sweep_handle {
+        background_handles.push(handle);
+    }
     if let Some(handle) = trust_bundle_reload_handle {
         background_handles.push(handle);
     }
@@ -4360,7 +4519,7 @@ pub async fn run(
 
 pub(crate) async fn wait_for_cp_listeners_until_shutdown_or_exit(
     listener_handles: Vec<(String, ListenerJoinHandle)>,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
     drain_timeout: Duration,
 ) -> Result<(), anyhow::Error> {
     if listener_handles.is_empty() {
@@ -4390,7 +4549,7 @@ enum CpListenerMonitorWake {
 
 async fn monitor_cp_listener_handles_until_exit(
     listener_handles: Vec<(String, ListenerJoinHandle)>,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
     drain_timeout: Duration,
 ) -> Result<(), anyhow::Error> {
     use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -4454,7 +4613,7 @@ async fn monitor_cp_listener_handles_until_exit(
                 listener = %first_name,
                 "CP listener task exited; triggering control-plane shutdown"
             );
-            let _ = shutdown_tx.send(true);
+            shutdown_tx.shutdown();
 
             let remaining_result = drain_cp_listener_futures(
                 &mut futures,
@@ -4568,7 +4727,7 @@ fn classify_cp_listener_exit(
     }
 }
 
-async fn wait_for_cp_shutdown(shutdown_tx: &tokio::sync::watch::Sender<bool>) {
+async fn wait_for_cp_shutdown(shutdown_tx: &crate::overload::ShutdownSender) {
     let mut wait_shutdown = shutdown_tx.subscribe();
     while !*wait_shutdown.borrow() {
         if wait_shutdown.changed().await.is_err() {
@@ -4716,7 +4875,6 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
-            pool_max_requests_per_connection: None,
             pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,
@@ -4783,6 +4941,127 @@ mod tests {
                 .to_string()
                 .contains("CP configuration validation failed"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// Scripted incremental source for the escalation cases. Inline because
+    /// `IncrementalFullReloadRequired`'s constructors are crate-private.
+    /// `hard-*` fails with a connectivity error, `esc-*` yields once and then
+    /// escalates, and anything else yields a few times before succeeding.
+    #[derive(Default)]
+    struct EscalatingIncrementalSource {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl EscalatingIncrementalSource {
+        fn record(&self, event: String) {
+            self.events.lock().unwrap().push(event);
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CpIncrementalLoadSource for EscalatingIncrementalSource {
+        async fn load_incremental_config(
+            &self,
+            namespace: &str,
+            after_sequence: u64,
+        ) -> Result<IncrementalResult, anyhow::Error> {
+            self.record(format!("start:{namespace}"));
+            if namespace.starts_with("hard-") {
+                return Err(anyhow::anyhow!("scripted connectivity failure"));
+            }
+            if namespace.starts_with("esc-") {
+                tokio::task::yield_now().await;
+                return Err(anyhow::Error::new(
+                    crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
+                        namespace,
+                    ),
+                ));
+            }
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            self.record(format!("done:{namespace}"));
+            Ok(IncrementalResult {
+                added_or_modified_proxies: Vec::new(),
+                removed_proxy_ids: Vec::new(),
+                added_or_modified_consumers: Vec::new(),
+                removed_consumer_ids: Vec::new(),
+                added_or_modified_plugin_configs: Vec::new(),
+                removed_plugin_config_ids: Vec::new(),
+                added_or_modified_upstreams: Vec::new(),
+                removed_upstream_ids: Vec::new(),
+                sequence_cursor: after_sequence + 1,
+                poll_timestamp: Utc::now(),
+            })
+        }
+    }
+
+    fn namespace_list(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    async fn expect_escalation(
+        source: &EscalatingIncrementalSource,
+        namespaces: &[String],
+        concurrency: usize,
+    ) {
+        let result =
+            load_incremental_config_multi(source, namespaces, &HashMap::new(), concurrency).await;
+        let Err(error) = result else {
+            panic!("an escalating namespace must fail the multi-namespace incremental poll");
+        };
+        assert!(
+            crate::config::db_backend::is_incremental_full_reload_required(&error),
+            "the escalation must be the poll's error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_multi_ns_incremental_escalation_still_wins_over_hard_errors() {
+        // A hard failure before the escalation must not mask it: the CP still
+        // runs its same-tick full reload, exactly as the serial loop did. The
+        // later namespace was already admitted in the window, so it is drained
+        // to completion rather than dropped mid-query.
+        let source = EscalatingIncrementalSource::default();
+        let namespaces = namespace_list(&["hard-a", "esc-b", "ok-c"]);
+        expect_escalation(&source, &namespaces, CP_NAMESPACE_LOAD_CONCURRENCY_MAX).await;
+        let events = source.events();
+        assert!(events.contains(&"start:hard-a".to_string()), "{events:?}");
+        assert!(events.contains(&"done:ok-c".to_string()), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn serial_budget_escalation_never_starts_later_namespaces() {
+        let source = EscalatingIncrementalSource::default();
+        let namespaces = namespace_list(&["esc-0", "ok-1"]);
+        expect_escalation(&source, &namespaces, 1).await;
+        assert_eq!(
+            source.events(),
+            vec!["start:esc-0".to_string()],
+            "a budget of one must not admit a namespace after the escalation"
+        );
+    }
+
+    #[tokio::test]
+    async fn escalation_drains_started_loads_and_admits_no_more() {
+        let source = EscalatingIncrementalSource::default();
+        let namespaces = namespace_list(&["esc-0", "ok-1", "ok-2", "ok-3"]);
+        expect_escalation(&source, &namespaces, 2).await;
+        let events = source.events();
+        assert!(
+            events.contains(&"start:ok-1".to_string()) && events.contains(&"done:ok-1".to_string()),
+            "the load already in flight must be awaited to completion: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.ends_with("ok-2") || event.ends_with("ok-3")),
+            "namespaces outside the window must never start: {events:?}"
         );
     }
 
@@ -4952,9 +5231,16 @@ mod tests {
         // Issue #2802: a CP DNS reconnect or failover can land on a database
         // whose custom-plugin schema lags the process binary.
         let source = include_str!("control_plane.rs");
+        // Only production code: `include_str!` also embeds this test module,
+        // whose needle literals would otherwise always match.
+        let test_module = source
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("test module marker");
+        let source = &source[..test_module];
         assert!(
             source.contains("async fn reconcile_plugin_migrations_after_cp_reconnect(")
-                && source.contains("handle_recovery_plugin_migrations("),
+                && source
+                    .contains("handle_startup_plugin_migrations(db, auto_apply, \"cp-recovery\")"),
             "CP recovery must share the startup custom-plugin migration policy"
         );
         assert!(
@@ -4965,8 +5251,8 @@ mod tests {
             "both DNS pool reconnect and failover must reset the migration gate"
         );
         for context in [
-            "DB DNS reconnect",
-            "validation-rejected full load after DB DNS reconnect",
+            "full_reload_reason.migration_gate_context()",
+            "full_reload_reason.rejected_load_context()",
             "incremental load after pool reconnect",
             "full fallback load after pool reconnect",
             "validation-rejected full fallback load after pool reconnect",
@@ -5065,11 +5351,11 @@ mod tests {
         // reload rather than clearing the rejection tracker and leaving the
         // standing signal permanently stuck.
         let source = include_str!("control_plane.rs");
-        let marker = "if config_rejected_poll.load(Ordering::Relaxed) {\n                                        force_full_reload = true;";
+        let marker = "if config_rejected_poll.load(Ordering::Relaxed) {\n                                        force_full_reload = Some(FullReloadReason::StandingRejection);";
         assert!(
-            source.matches(marker).count() >= 3,
-            "empty-result, empty-partition, and all-accepted incremental paths \
-             must force a full reload while config_rejected is set"
+            source.matches(marker).count() >= 2,
+            "empty-result and all-accepted incremental paths must force a full \
+             reload while config_rejected is set"
         );
     }
 
@@ -5103,47 +5389,6 @@ mod tests {
                 .removed_consumer_ids,
             vec![NamespacedResourceId::new("staging", "c1")]
         );
-    }
-
-    // ── upsert_by_id ───────────────────────────────────────────────────
-
-    #[test]
-    fn upsert_replaces_existing_by_id() {
-        let mut items = vec![("a", 1), ("b", 2)];
-        upsert_by_id(&mut items, vec![("b", 99)], |item| item.0);
-        assert_eq!(items[1].1, 99);
-        assert_eq!(items.len(), 2);
-    }
-
-    #[test]
-    fn upsert_appends_new_items() {
-        let mut items = vec![("a", 1)];
-        upsert_by_id(&mut items, vec![("c", 3)], |item| item.0);
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[1], ("c", 3));
-    }
-
-    #[test]
-    fn upsert_mixed_replace_and_append() {
-        let mut items = vec![("a", 1), ("b", 2)];
-        upsert_by_id(&mut items, vec![("b", 20), ("c", 30)], |item| item.0);
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[1].1, 20); // b replaced
-        assert_eq!(items[2], ("c", 30)); // c appended
-    }
-
-    #[test]
-    fn upsert_empty_updates_is_noop() {
-        let mut items = vec![("a", 1)];
-        upsert_by_id(&mut items, vec![], |item| item.0);
-        assert_eq!(items.len(), 1);
-    }
-
-    #[test]
-    fn upsert_into_empty_list() {
-        let mut items: Vec<(&str, i32)> = vec![];
-        upsert_by_id(&mut items, vec![("a", 1)], |item| item.0);
-        assert_eq!(items.len(), 1);
     }
 
     // apply_incremental_to_config
@@ -5321,7 +5566,8 @@ mod tests {
     // watch receivers.
     #[tokio::test]
     async fn cp_shutdown_drains_remaining_listeners_when_one_panics() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let drained_listeners = Arc::new(AtomicUsize::new(0));
 
         let mut admin_http_rx = shutdown_tx.subscribe();
@@ -5382,7 +5628,8 @@ mod tests {
     // returns Ok. This verifies the "happy path" is preserved end-to-end.
     #[tokio::test]
     async fn cp_shutdown_drains_all_listeners_on_signal() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let mut admin_http_rx = shutdown_tx.subscribe();
         let admin_http = tokio::spawn(async move {
@@ -5402,9 +5649,7 @@ mod tests {
 
         // Fire shutdown after spawning so the listeners are already
         // parked on changed() — models the SIGTERM path.
-        shutdown_tx
-            .send(true)
-            .expect("watch send must succeed with live receivers");
+        shutdown_tx.shutdown();
 
         let result = wait_for_cp_listeners_until_shutdown_or_exit(
             vec![
@@ -5421,7 +5666,8 @@ mod tests {
 
     #[tokio::test]
     async fn cp_listener_wait_does_not_apply_drain_timeout_before_shutdown() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let mut listener_rx = shutdown_tx.subscribe();
         let listener = tokio::spawn(async move {
@@ -5446,9 +5692,7 @@ mod tests {
             "CP listener wait must not return before shutdown just because the drain timeout elapsed",
         );
 
-        shutdown_tx
-            .send(true)
-            .expect("watch send must succeed with live receivers");
+        shutdown_tx.shutdown();
         let result = tokio::time::timeout(Duration::from_secs(1), wait)
             .await
             .expect("CP listener wait should complete after shutdown")
@@ -5458,7 +5702,8 @@ mod tests {
 
     #[tokio::test]
     async fn cp_listener_exit_triggers_shutdown_and_drains_siblings() {
-        let (shutdown_tx, mut observed_shutdown) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, mut observed_shutdown) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let grpc = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
 
@@ -5505,7 +5750,8 @@ mod tests {
     // the monitor, and return `Ok(())` — losing the failure.
     #[tokio::test]
     async fn cp_listener_exit_applies_drain_timeout_to_stuck_sibling() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let stuck =
             tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
@@ -5548,7 +5794,8 @@ mod tests {
 
     #[tokio::test]
     async fn cp_listener_error_with_stuck_sibling_returns_err_after_drain_timeout() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let stuck =
             tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
@@ -5584,7 +5831,8 @@ mod tests {
 
     #[tokio::test]
     async fn cp_operator_shutdown_with_stuck_listener_returns_ok_after_drain_timeout() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let stuck =
             tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
@@ -5598,9 +5846,7 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         });
 
-        shutdown_tx
-            .send(true)
-            .expect("watch send must succeed with live receivers");
+        shutdown_tx.shutdown();
 
         let started = Instant::now();
         let result = tokio::time::timeout(
@@ -5626,7 +5872,8 @@ mod tests {
 
     #[tokio::test]
     async fn cp_operator_shutdown_preserves_listener_error_when_sibling_stuck() {
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let stuck =
             tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
@@ -5634,9 +5881,7 @@ mod tests {
             Err::<(), anyhow::Error>(anyhow::anyhow!("failed during operator drain"))
         });
 
-        shutdown_tx
-            .send(true)
-            .expect("watch send must succeed with live receivers");
+        shutdown_tx.shutdown();
 
         let started = Instant::now();
         let result = tokio::time::timeout(

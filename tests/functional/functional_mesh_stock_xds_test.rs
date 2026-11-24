@@ -78,8 +78,8 @@ use tonic::{Request, Response, Status, Streaming};
 
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshConfig, MeshService, MtlsMode, PeerAuthentication, ServicePort, Workload,
-    WorkloadPort, WorkloadRef, WorkloadSelector,
+    AppProtocol, MeshConfig, MeshService, MtlsMode, PeerAuthentication, PolicyScope, ServicePort,
+    Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::xds::proto::aggregated_discovery_service_server::{
@@ -701,8 +701,9 @@ fn stock_policy_document() -> String {
         peer_authentications: vec![PeerAuthentication {
             name: "stock-xds-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -793,8 +794,9 @@ fn destination_slice(node_id: &str, backend_port: u16) -> MeshSlice {
         peer_authentications: vec![PeerAuthentication {
             name: "stock-xds-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],

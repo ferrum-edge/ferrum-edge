@@ -14,8 +14,8 @@ use tracing::{info, warn};
 
 use super::http_client::PluginHttpClient;
 use super::redis_rate_limiter::{
-    MAX_REDIS_ADMISSION_WINDOWS, RedisConfig, RedisRateLimitClient, RedisWindowCharges,
-    sub_bucket_charge_is_settled,
+    MAX_REDIS_ADMISSION_WINDOWS, REDIS_WINDOW_SUB_BUCKETS, RedisConfig, RedisRateLimitClient,
+    RedisWindowCharges, redis_sub_bucket_nanos, sub_bucket_charge_is_settled,
 };
 
 /// Transactions ONE Redis quota decision may spend before it fails closed.
@@ -297,6 +297,14 @@ pub struct RateLimitOutcome {
     pub enforcement_unavailable: bool,
     /// This decision used the per-process budget during a Redis outage.
     pub local_fallback: bool,
+    /// Whole seconds (at least one) after which the refusing window has freed
+    /// budget again, absent further traffic. Set only on request-quota
+    /// refusals (`check_http_windows` / `check_http_windows_redis`); every
+    /// other outcome leaves it `None`. An exact value where the algorithm
+    /// knows one (token bucket, local sliding aggregate) and a conservative
+    /// upper bound otherwise (the Redis sub-bucket ladder). With several
+    /// refusing windows it is the longest of their waits.
+    pub retry_after_seconds: Option<u64>,
 }
 
 impl RateLimitOutcome {
@@ -360,6 +368,18 @@ impl RateLimitOutcome {
         self.reserved_window_index = Some(reserved_window_index);
         self
     }
+
+    pub fn with_retry_after(mut self, retry_after_seconds: u64) -> Self {
+        self.retry_after_seconds = Some(retry_after_seconds.max(1));
+        self
+    }
+}
+
+/// Round a wait in nanoseconds up to whole `Retry-After` seconds, at least one.
+fn retry_after_seconds_from_nanos(nanos: u128) -> u64 {
+    u64::try_from(nanos.div_ceil(1_000_000_000))
+        .unwrap_or(u64::MAX)
+        .max(1)
 }
 
 /// One admission decision, plus WHY it was served the way it was.
@@ -442,6 +462,36 @@ pub trait RateLimitAlgorithm: Send + Sync + 'static {
     fn check_local(&self, state: &mut Self::State, op: &Self::Op, now: Instant)
     -> RateLimitOutcome;
 
+    /// Whether [`Self::check_local_shared`] can decide an existing key's
+    /// admission through a shared map reference for THIS policy. When `false`
+    /// (the default) [`LocalLimiter`] never takes the shared-reference lookup,
+    /// so the other algorithms keep their single exclusive-guard lookup
+    /// unchanged. Return `true` only when one atomic read-modify-write decides
+    /// the operation, so concurrent shared decisions still have a valid
+    /// serial order.
+    fn admits_shared_state_check(&self) -> bool {
+        false
+    }
+
+    /// Decide an existing key's admission while holding only a SHARED map
+    /// reference, so concurrent checks of one key — and of unrelated keys on
+    /// its shard — do not serialize on an exclusive shard guard.
+    ///
+    /// Return `None` whenever the decision needs exclusive access (for
+    /// example a window rollover that resets several counters together); the
+    /// caller then retries through [`Self::check_local`] under the exclusive
+    /// entry guard. Only consulted when [`Self::admits_shared_state_check`]
+    /// is true.
+    fn check_local_shared(
+        &self,
+        state: &Self::State,
+        op: &Self::Op,
+        now: Instant,
+    ) -> Option<RateLimitOutcome> {
+        let _ = (state, op, now);
+        None
+    }
+
     async fn check_redis(
         &self,
         redis: &Arc<RedisRateLimitClient>,
@@ -467,6 +517,11 @@ where
     /// never increment this; tests assert it stays flat under admission.
     #[cfg(debug_assertions)]
     all_shard_len_calls: AtomicUsize,
+    /// Counts exclusive `DashMap::entry` acquisitions. Tests assert that steady
+    /// occupied-key admission for a policy whose
+    /// [`RateLimitAlgorithm::admits_shared_state_check`] is true leaves it flat.
+    #[cfg(debug_assertions)]
+    exclusive_entry_calls: AtomicUsize,
     #[cfg(test)]
     shard_amount: usize,
 }
@@ -489,6 +544,8 @@ where
             entry_count: AtomicUsize::new(0),
             #[cfg(debug_assertions)]
             all_shard_len_calls: AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
+            exclusive_entry_calls: AtomicUsize::new(0),
             #[cfg(test)]
             shard_amount,
         }
@@ -515,6 +572,20 @@ where
         max_entries: usize,
     ) -> Option<RateLimitOutcome> {
         use dashmap::mapref::entry::Entry;
+        // Steady occupied-key fast path for algorithms whose state is fully
+        // atomic: a shared shard reference, not the exclusive entry guard.
+        // A rollover (or any decision the algorithm declines to take shared)
+        // falls through to the exclusive path below, which re-checks from
+        // scratch. Exclusive writers cannot run while this reference is held,
+        // so the shared decision never interleaves with a reset.
+        if self.algorithm.admits_shared_state_check()
+            && let Some(existing) = self.state.get(&key)
+            && let Some(outcome) = self.algorithm.check_local_shared(existing.value(), op, now)
+        {
+            return Some(outcome);
+        }
+        #[cfg(debug_assertions)]
+        self.exclusive_entry_calls.fetch_add(1, Ordering::Relaxed);
         match self.state.entry(key) {
             Entry::Occupied(mut occupied) => {
                 Some(self.algorithm.check_local(occupied.get_mut(), op, now))
@@ -537,9 +608,13 @@ where
 
     /// Drop idle entries according to the algorithm's activity predicate.
     ///
-    /// This is the below-cap periodic cleanup path: it never force-evicts
-    /// still-active keys and is safe to invoke on a sampled schedule even when
-    /// the map sits under the hard capacity ceiling.
+    /// This is the only cleanup, below the cap and under capacity pressure
+    /// alike: it never force-evicts still-active keys, which would reset
+    /// consumed windows and weaken enforcement (GHSA-3xxf-5m26-c8pv). Hard
+    /// cardinality is enforced by atomic reservation on admission
+    /// ([`Self::check_at_with_capacity`] /
+    /// [`RateLimitBackend::check_with_redis_key_and_local_capacity`]), which
+    /// refuses previously unseen keys at the configured cap.
     pub fn prune_stale_at(&self, now: Instant) {
         self.state.retain(|_, state| {
             if self.algorithm.is_state_active(state, now) {
@@ -551,23 +626,19 @@ where
         });
     }
 
-    /// Reclaim idle state under capacity pressure.
-    ///
-    /// Hard cardinality is enforced by atomic reservation on admission
-    /// ([`Self::check_at_with_capacity`] /
-    /// [`RateLimitBackend::check_with_redis_key_and_local_capacity`]). This
-    /// helper only prunes idle entries — it never deletes still-active
-    /// budgets, which would reset consumed windows and weaken enforcement
-    /// (GHSA-3xxf-5m26-c8pv). `max_entries` is retained for call-site
-    /// compatibility with shared cleanup wrappers; admission already refuses
-    /// previously unseen local/fallback keys at the configured cap.
-    pub fn enforce_capacity(&self, max_entries: usize, now: Instant) {
-        let _ = max_entries;
-        self.prune_stale_at(now);
-    }
-
     pub fn contains_key(&self, key: &K) -> bool {
         self.state.contains_key(key)
+    }
+
+    /// Drop one key's state and release its reserved capacity slot.
+    ///
+    /// Only for a key no live caller can charge again (a finished WebSocket
+    /// session's process-unique connection id). Removing a key a live caller
+    /// still charges would hand it a fresh budget.
+    pub fn remove_key(&self, key: &K) {
+        if self.state.remove(key).is_some() {
+            self.release_entry_slot();
+        }
     }
 
     fn release_entry_slot(&self) {
@@ -608,6 +679,19 @@ where
         }
     }
 
+    /// Number of exclusive entry-guard acquisitions since construction.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn exclusive_entry_calls_for_test(&self) -> usize {
+        #[cfg(debug_assertions)]
+        {
+            self.exclusive_entry_calls.load(Ordering::Relaxed)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            0
+        }
+    }
+
     /// DashMap shard count for the local token-state map. Test-only so
     /// production builds do not expose limiter debug state.
     #[cfg(test)]
@@ -628,7 +712,6 @@ pub struct RedisLimiter<A: RateLimitAlgorithm> {
 }
 
 impl<A: RateLimitAlgorithm> RedisLimiter<A> {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(
         plugin_name: &str,
         config: &Value,
@@ -764,8 +847,11 @@ where
     /// refusals. The mirror is now purely a logging latch.
     observed_available: Arc<AtomicBool>,
     fallback_warned: Arc<AtomicBool>,
-    /// Abort handle for the failover health observer; aborted on Drop.
-    health_observer_abort: Option<tokio::task::AbortHandle>,
+    /// Abort handle for the failover health observer; aborted on Drop. Set
+    /// once by [`Self::start_health_observer`] from the owning plugin's
+    /// `commit_background_tasks`, never by construction (issue #6616), so
+    /// admin / CP validation that builds and drops a limiter spawns nothing.
+    health_observer_abort: OnceLock<tokio::task::AbortHandle>,
 }
 
 impl<K, A> FailoverLimiter<K, A>
@@ -782,17 +868,15 @@ where
         let observed_available = Arc::new(AtomicBool::new(true));
         let fallback_warned = Arc::new(AtomicBool::new(false));
 
-        let mut limiter = Self {
+        Self {
             plugin_name,
             primary,
             fallback,
             failure_policy,
             observed_available,
             fallback_warned,
-            health_observer_abort: None,
-        };
-        limiter.spawn_health_observer();
-        limiter
+            health_observer_abort: OnceLock::new(),
+        }
     }
 
     /// Log the degradation once per outage and report whether admission may
@@ -922,12 +1006,13 @@ where
         self.fallback.prune_stale_at(now);
     }
 
-    pub fn enforce_local_capacity(&self, max_entries: usize, now: Instant) {
-        self.fallback.enforce_capacity(max_entries, now);
-    }
-
     pub fn contains_local_key(&self, key: &K) -> bool {
         self.fallback.contains_key(key)
+    }
+
+    /// See [`LocalLimiter::remove_key`].
+    pub fn remove_local_key(&self, key: &K) {
+        self.fallback.remove_key(key);
     }
 
     #[allow(dead_code)] // used only by external tests; dead in binary test target
@@ -953,7 +1038,7 @@ where
     /// Abort handle for the failover observer, when started (tests).
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn health_observer_abort_for_test(&self) -> Option<tokio::task::AbortHandle> {
-        self.health_observer_abort.clone()
+        self.health_observer_abort.get().cloned()
     }
 
     /// Log-only observer: reports the availability edge once per outage.
@@ -963,7 +1048,13 @@ where
     /// this task has not observed yet is already eligible for centralized
     /// enforcement; the task exists so operators still get one "recovered" line
     /// per outage even for a policy that sees no traffic in between.
-    fn spawn_health_observer(&mut self) {
+    ///
+    /// Idempotent: a second call (or a racing one) keeps the first observer
+    /// and aborts its own.
+    pub fn start_health_observer(&self) {
+        if self.health_observer_abort.get().is_some() {
+            return;
+        }
         let plugin_name = self.plugin_name;
         let observed_available = Arc::clone(&self.observed_available);
         let fallback_warned = Arc::clone(&self.fallback_warned);
@@ -994,7 +1085,9 @@ where
                 }
             }
         });
-        self.health_observer_abort = Some(join.abort_handle());
+        if let Err(duplicate) = self.health_observer_abort.set(join.abort_handle()) {
+            duplicate.abort();
+        }
     }
 }
 
@@ -1107,7 +1200,6 @@ where
     }
 
     /// Number of still-live semantic generations retained for `identity`.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     fn live_generations(&self, identity: &str) -> usize {
         let mut guard = self.locked();
         prune_dead_generations(&mut guard);
@@ -1341,7 +1433,6 @@ fn local_limiter_fingerprint(
 
 /// Number of retained live generations for one policy identity. Test-only
 /// lifecycle probe; production code never inspects the registry.
-#[allow(dead_code)] // used only by external tests; dead in binary test target
 pub(crate) fn shared_local_limiter_generations_for_test<A>(
     namespace: &str,
     plugin_name: &str,
@@ -1375,20 +1466,23 @@ impl SharedLocalLimiterState for AiTokenRateAlgorithm {
 }
 
 impl SharedLocalLimiterState for WsFrameRateAlgorithm {
-    type Key = u64;
+    type Key = WsRateLimitKey;
 
-    fn registry() -> &'static LocalLimiterRegistry<u64, Self> {
-        static REGISTRY: LocalLimiterRegistry<u64, WsFrameRateAlgorithm> =
+    fn registry() -> &'static LocalLimiterRegistry<WsRateLimitKey, Self> {
+        static REGISTRY: LocalLimiterRegistry<WsRateLimitKey, WsFrameRateAlgorithm> =
             LocalLimiterRegistry::new();
         &REGISTRY
     }
 }
 
 impl SharedLocalLimiterState for UdpRateLimitAlgorithm {
-    type Key = Arc<str>;
+    /// The masked client address itself (IPv4 host, IPv6 `ipv6_prefix`
+    /// network): fixed-size and `Copy`, so a datagram's key is never parsed,
+    /// formatted, or allocated on the hot path.
+    type Key = std::net::IpAddr;
 
-    fn registry() -> &'static LocalLimiterRegistry<Arc<str>, Self> {
-        static REGISTRY: LocalLimiterRegistry<Arc<str>, UdpRateLimitAlgorithm> =
+    fn registry() -> &'static LocalLimiterRegistry<std::net::IpAddr, Self> {
+        static REGISTRY: LocalLimiterRegistry<std::net::IpAddr, UdpRateLimitAlgorithm> =
             LocalLimiterRegistry::new();
         &REGISTRY
     }
@@ -1555,6 +1649,12 @@ where
         Arc::ptr_eq(self.local_state_arc(), other.local_state_arc())
     }
 
+    /// Exclusive entry-guard acquisitions on the local/fallback map.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn exclusive_entry_calls_for_test(&self) -> usize {
+        self.local_state_arc().exclusive_entry_calls_for_test()
+    }
+
     fn local_state_arc(&self) -> &Arc<LocalLimiter<K, A>> {
         match self {
             Self::Local(local) => local,
@@ -1652,6 +1752,33 @@ where
         }
     }
 
+    /// Same as [`Self::check_with_redis_key_and_local_capacity_attributed`] when
+    /// the local key and Redis key are identical `String`s, avoiding an extra
+    /// `String::clone()` on the local hot path.
+    pub async fn check_same_key_with_local_capacity_attributed(
+        &self,
+        key: String,
+        op: &A::Op,
+        max_entries: usize,
+    ) -> RateLimitDecision
+    where
+        K: From<String>,
+    {
+        match self {
+            Self::Local(local) => {
+                let outcome =
+                    local.check_at_with_capacity(K::from(key), op, Instant::now(), max_entries);
+                RateLimitDecision::local_only(outcome)
+            }
+            Self::Failover(failover) => {
+                let redis_key = key.clone();
+                failover
+                    .check_with_local_capacity_attributed(K::from(key), &redis_key, op, max_entries)
+                    .await
+            }
+        }
+    }
+
     /// [`Self::check_with_redis_key_and_local_capacity_attributed`] without the
     /// provenance. None denies only a previously unseen local key.
     pub async fn check_with_redis_key_and_local_capacity<F>(
@@ -1687,17 +1814,9 @@ where
         }
     }
 
-    pub fn enforce_capacity(&self, max_entries: usize, now: Instant) {
-        match self {
-            Self::Local(local) => local.enforce_capacity(max_entries, now),
-            Self::Failover(failover) => failover.enforce_local_capacity(max_entries, now),
-        }
-    }
-
     /// Seed or refresh a local/fallback key at a controllable instant.
     ///
     /// Test-support only: production admission always uses wall-clock `check`.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn check_local_at(&self, key: K, op: &A::Op, now: Instant) -> RateLimitOutcome {
         match self {
             Self::Local(local) => local.check_at(key, op, now),
@@ -1729,6 +1848,16 @@ where
         match self {
             Self::Local(local) => local.contains_key(key),
             Self::Failover(failover) => failover.contains_local_key(key),
+        }
+    }
+
+    /// Release one local/fallback key that can never be charged again. See
+    /// [`LocalLimiter::remove_key`]; centralized Redis counters are left to
+    /// their own TTL.
+    pub fn remove_local_key(&self, key: &K) {
+        match self {
+            Self::Local(local) => local.remove_key(key),
+            Self::Failover(failover) => failover.remove_local_key(key),
         }
     }
 
@@ -1778,6 +1907,15 @@ where
         }
     }
 
+    /// Start the Redis failover health observer, if this backend has one.
+    /// Owning plugins call it from `Plugin::commit_background_tasks`, so only
+    /// an installed generation runs it (issue #6616). Idempotent.
+    pub fn commit_background_tasks(&self) {
+        if let Self::Failover(failover) = self {
+            failover.start_health_observer();
+        }
+    }
+
     /// Failover health-observer abort handle for lifecycle tests (issue #2305).
     #[allow(dead_code)] // used by the external unit-test target
     pub fn health_observer_abort_for_test(&self) -> Option<tokio::task::AbortHandle> {
@@ -1788,31 +1926,11 @@ where
     }
 }
 
-/// Shared consumer cleanup branch: below-cap prune vs over-cap stale reclaim.
+/// Inline-test view of [`weighted_window_count`] over one configured limit.
 ///
-/// Every rate-limit consumer wrapper routes through this helper so omitted or
-/// reversed `prune_stale_at` / `enforce_capacity` wiring is a single shared
-/// failure mode rather than six divergent copies. Both arms only drop idle
-/// state — live budgets are never force-evicted. Hard cardinality is enforced
-/// by atomic admission reservation, not by deleting active keys.
-#[inline]
-pub fn apply_rate_limit_cleanup<K, A>(
-    limiter: &RateLimitBackend<K, A>,
-    max_entries: usize,
-    now: Instant,
-    over_capacity: bool,
-) where
-    K: Eq + Hash + Clone + Send + Sync + 'static,
-    A: RateLimitAlgorithm + Clone,
-{
-    if over_capacity {
-        limiter.enforce_capacity(max_entries, now);
-    } else {
-        limiter.prune_stale_at(now);
-    }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
+/// No plugin constructs it; the decay tests in this module use it to exercise
+/// the shared formula. Production paths call [`weighted_window_count`] directly.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct FixedWindow {
     limit: u64,
@@ -1824,10 +1942,10 @@ pub struct FixedWindow {
 ///
 /// This is the TOKEN-ACCOUNTING estimate, and it is the ONLY place the formula
 /// is written down. Every production caller reasons in it through this
-/// function — [`FixedWindow`], the three `ai_rate_limiter` `INCRBY` arms
-/// (`Check`, `Reserve`, `AdjustUsage`), and the `ws_rate_limiting` frame
-/// budget — so a change to the formula cannot leave one path on the old shape
-/// and a test green on another. Those paths reserve an estimate under one
+/// function — the three `ai_rate_limiter` `INCRBY` arms (`Check`, `Reserve`,
+/// `AdjustUsage`) and the `ws_rate_limiting` frame budget, plus the inline-test
+/// `FixedWindow` helper — so a change to the formula cannot leave one path on
+/// the old shape and a test green on another. Those paths reserve an estimate under one
 /// window index and reconcile it against that same index after the response,
 /// so the count has to be a continuous function of one `(previous, current)`
 /// pair.
@@ -1847,7 +1965,7 @@ pub(crate) fn weighted_window_count(previous: i64, current: i64, elapsed_fractio
     previous as f64 * (1.0 - elapsed_fraction.clamp(0.0, 1.0)) + current as f64
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl FixedWindow {
     pub fn new(limit: u64, window_seconds: u64) -> Self {
         Self {
@@ -1915,21 +2033,18 @@ impl SlidingWindow {
 
     /// Fixed upper bound on retained aggregate buckets for any key/window.
     #[inline]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub const fn bucket_capacity() -> usize {
         SLIDING_WINDOW_BUCKET_COUNT
     }
 
     /// Number of aggregate bucket slots retained (always [`bucket_capacity`]).
     #[inline]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn retained_buckets(&self) -> usize {
         self.buckets.len()
     }
 
     /// Admissions currently counted inside the live window.
     #[inline]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn counted_requests(&self) -> u64 {
         self.total
     }
@@ -1969,6 +2084,42 @@ impl SlidingWindow {
 
     pub fn remaining(&self) -> u64 {
         self.limit.saturating_sub(self.total)
+    }
+
+    /// Whole seconds (at least one) until the oldest counted bucket leaves the
+    /// ring, which frees at least one admission. Call after
+    /// [`Self::would_allow`] refused at `now`, so the ring already reflects it.
+    ///
+    /// A refusal means `total == limit` (an increment only follows an allowed
+    /// check), so dropping any non-empty bucket brings the window back under
+    /// its limit. Bucket `j` is counted until the ring advances to `j + 64`,
+    /// i.e. until `elapsed >= (j + 64) * window / 63`. Falls back to the full
+    /// retention horizon (`ceil(window * 64 / 63)`) when there is no epoch or
+    /// the clock appears to run backwards.
+    pub fn retry_after_seconds(&self, now: Instant) -> u64 {
+        let horizon = retry_after_seconds_from_nanos(
+            sliding_window_retention(self.window_duration).as_nanos(),
+        );
+        let Some(epoch) = self.epoch else {
+            return horizon;
+        };
+        let Some(elapsed) = now.checked_duration_since(epoch) else {
+            return horizon;
+        };
+        let ring = SLIDING_WINDOW_BUCKET_COUNT as u64;
+        let oldest_live = self.current_bucket.saturating_sub(ring - 1);
+        let Some(oldest_counted) = (oldest_live..=self.current_bucket)
+            .find(|bucket| self.buckets[(bucket % ring) as usize] > 0)
+        else {
+            // Nothing is counted, so the refusal is already stale.
+            return 1;
+        };
+        let window_nanos = self.window_duration.as_nanos().max(1);
+        let freed_at_nanos = u128::from(oldest_counted.saturating_add(ring))
+            .saturating_mul(window_nanos)
+            .div_ceil(SLIDING_WINDOW_INTERVALS_PER_WINDOW);
+        retry_after_seconds_from_nanos(freed_at_nanos.saturating_sub(elapsed.as_nanos()))
+            .min(horizon)
     }
 
     pub fn has_recent_activity(&self, now: Instant) -> bool {
@@ -2108,6 +2259,21 @@ impl TokenBucket {
     pub fn remaining(&self) -> u64 {
         self.tokens.max(0.0) as u64
     }
+
+    /// Whole seconds (at least one, at most `window_seconds`) until one more
+    /// token has refilled. Call after [`Self::would_allow`] refused, so the
+    /// bucket was just refilled to `now`.
+    pub fn retry_after_seconds(&self, window_seconds: u64) -> u64 {
+        let ceiling = window_seconds.max(1);
+        let missing = (1.0 - self.tokens).max(0.0);
+        let wait = missing / self.refill_rate;
+        if !wait.is_finite() {
+            return ceiling;
+        }
+        // `as` saturates; `wait` is finite and non-negative here.
+        (wait.ceil() as u64).clamp(1, ceiling)
+    }
+
     pub fn is_active(&self, now: Instant) -> bool {
         if self.refill_rate <= 0.0 || self.capacity <= 0.0 {
             return false;
@@ -2182,7 +2348,13 @@ fn check_http_windows(
     // window 0's counter is inflated — the request was never served but
     // the rate limit budget is consumed.
 
-    // First pass: check all windows without modifying counters.
+    // First pass: check all windows without modifying counters. A refusal
+    // still checks the remaining windows (checking only refills / advances,
+    // it never charges), so `Retry-After` can name the LONGEST wait over every
+    // refusing window: retrying when only the first refusing window has freed
+    // budget would be refused again by a longer one. The refusal still names
+    // the first refusing window in `limit` / `window_seconds`.
+    let mut refused: Option<(u64, u64, u64)> = None;
     for (idx, window) in state.iter_mut().enumerate() {
         let spec = &specs[idx];
         let allowed = match window {
@@ -2190,10 +2362,25 @@ fn check_http_windows(
             HttpWindowState::Bucket(bucket) => bucket.would_allow(now, 1),
         };
         if !allowed {
-            return RateLimitOutcome::deny()
-                .with_limit(spec.limit)
-                .with_window(spec.duration.as_secs());
+            let retry_after = match window {
+                HttpWindowState::Sliding(sliding) => sliding.retry_after_seconds(now),
+                HttpWindowState::Bucket(bucket) => {
+                    bucket.retry_after_seconds(spec.duration.as_secs())
+                }
+            };
+            refused = Some(match refused {
+                Some((limit, window_seconds, longest)) => {
+                    (limit, window_seconds, longest.max(retry_after))
+                }
+                None => (spec.limit, spec.duration.as_secs(), retry_after),
+            });
         }
+    }
+    if let Some((limit, window_seconds, retry_after)) = refused {
+        return RateLimitOutcome::deny()
+            .with_limit(limit)
+            .with_window(window_seconds)
+            .with_retry_after(retry_after);
     }
 
     // Second pass: all windows allow — now increment all counters.
@@ -2224,6 +2411,73 @@ fn check_http_windows(
     outcome
 }
 
+/// Run one request-quota admission ([`check_http_windows_redis`]) on its OWN
+/// task, so that cancelling the request future cannot cancel the decision.
+///
+/// The charge transaction increments every configured window before its reply
+/// is read, and only the code that reads the reply can decide that the charge
+/// was over the limit and must be handed back. Plugin hooks run under
+/// `tokio::time::timeout_at` (a gRPC deadline) and are dropped on a client
+/// disconnect or a reload, so awaiting the transaction inline let a dropped
+/// request strand an over-limit `INCR` with no compensation, no failure
+/// accounting, and no `redis_failure_policy` involvement — a short-deadline
+/// caller could keep re-arming a shared key's exhaustion for everyone else
+/// behind it. The spawned task owns the charge, the reply, the decision, and
+/// any hand-back, and the caller only awaits its result: dropping the
+/// `JoinHandle` detaches the task rather than aborting it.
+///
+/// The task is bounded exactly as the inline path was: every command it issues
+/// runs on a screened pooled connection with the per-command response deadline,
+/// a rebuild is limited to `MAX_REDIS_CHARGE_PASSES`, and the hand-back is
+/// itself a bounded detached transaction. A task that fails to complete (a
+/// panic) is reported as a failed Redis decision, which the caller routes
+/// through `redis_failure_policy`. Without a Tokio runtime (direct
+/// construction under a non-Tokio executor) the decision runs inline, as the
+/// compensation spawner already does; spawning would panic, and a proxy path
+/// never panics.
+async fn check_http_windows_redis_detached(
+    specs: &Arc<[RateLimitWindowSpec]>,
+    redis: &Arc<RedisRateLimitClient>,
+    key: &str,
+) -> Result<RateLimitOutcome, ()> {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return check_http_windows_redis(specs, redis, key).await;
+    };
+    let specs = Arc::clone(specs);
+    let redis = Arc::clone(redis);
+    let key = key.to_owned();
+    let decision =
+        runtime.spawn(async move { check_http_windows_redis(&specs, &redis, &key).await });
+    decision.await.unwrap_or(Err(()))
+}
+
+/// Conservative `Retry-After` for a refusal the Redis server settled at
+/// `settled_at` on a `window_seconds` ladder.
+///
+/// Settlement keeps every retained charge keyed at the server bucket it
+/// executed in or the one before it, so no charge counted against this
+/// request is keyed later than `server_bucket`. A reader that SELECTED bucket
+/// `r` counts `[r - K - 1, r + 1]`, and settlement admits a retrying reader
+/// whose selection lags its execution by one bucket (`r = exec - 1`, a
+/// gateway whose learned offset trails Redis by its reply latency). So the
+/// newest charge — and with it every older one — has left every settled
+/// reader's ladder only once readers EXECUTE in `server_bucket + K + 3`
+/// (selecting `server_bucket + K + 2`, whose ladder starts at
+/// `server_bucket + 1`). That is an upper bound on when the window has budget
+/// again (absent new traffic): `settled_at` lies inside `server_bucket`, so
+/// the wait is more than `K + 2` and at most `K + 3` sub-buckets — up to
+/// three sub-buckets (`3/16` of the window) longer than the window itself,
+/// the same three-sub-bucket over-count the ladder documents.
+fn redis_quota_retry_after_seconds(settled_at: Duration, window_seconds: u64) -> u64 {
+    let sub_bucket_nanos = redis_sub_bucket_nanos(window_seconds);
+    let settled_nanos = settled_at.as_nanos();
+    let server_bucket = settled_nanos / sub_bucket_nanos;
+    let freed_at_nanos = server_bucket
+        .saturating_add(REDIS_WINDOW_SUB_BUCKETS as u128 + 3)
+        .saturating_mul(sub_bucket_nanos);
+    retry_after_seconds_from_nanos(freed_at_nanos.saturating_sub(settled_nanos))
+}
+
 /// Distributed (Redis-backed) multi-window admission check.
 ///
 /// Charge-then-compensate on the shared pooled multiplexed connections, using
@@ -2231,7 +2485,7 @@ fn check_http_windows(
 /// Lua, no `EVAL*`, no `WATCH`, no per-request connection, and no retry budget
 /// a hot key can exhaust:
 ///
-/// 1. ONE atomic `MULTI`/`EXEC` charges EVERY configured window (`GET` on each
+/// 1. ONE atomic `MULTI`/`EXEC` charges EVERY configured window (`GETRANGE` on each
 ///    older sub-bucket and on the one after the charged bucket, `INCR` +
 ///    `EXPIRE` on the sub-bucket this request lands in) and returns each
 ///    window's trailing-window count. The decision is read off the caller's own
@@ -2264,14 +2518,16 @@ fn check_http_windows(
 /// the window's TTL elapses and is reported as a Redis failure, so the
 /// configured `redis_failure_policy` governs the next decision.
 ///
-/// Cancelling this request does NOT strand a charge. The hand-back runs on its
-/// own task owning the client `Arc`
-/// ([`RedisRateLimitClient::spawn_uncharge_rate_limit_windows`]), so a dropped
-/// plugin future — a gRPC deadline elapsing under `timeout_at`, a client
-/// disconnect, a config reload retiring this instance — cannot take the
-/// compensation with it. The one remaining exception is a process exit between
-/// the charge and the compensation: the increment is already on the server and
-/// stays until its window's TTL elapses.
+/// Cancelling this request does NOT strand a charge. Production admission runs
+/// this whole function on its own task ([`check_http_windows_redis_detached`]),
+/// so a dropped plugin future — a gRPC deadline elapsing under `timeout_at`, a
+/// client disconnect, a config reload retiring this instance — cannot cancel
+/// the charge between its `INCR` and the decision that would hand it back, and
+/// the hand-back itself runs on another task owning the client `Arc`
+/// ([`RedisRateLimitClient::spawn_uncharge_rate_limit_windows`]). The one
+/// remaining exception is a process exit between the charge and the
+/// compensation: the increment is already on the server and stays until its
+/// window's TTL elapses.
 ///
 /// # Algorithm
 ///
@@ -2392,7 +2648,7 @@ fn check_http_windows(
 ///
 /// Bucket selection precedes connection acquisition, so every charge is
 /// slightly stale when the server executes it. One sub-bucket of that is
-/// covered by the forward `GET`: a request that selected bucket `b` sees a peer
+/// covered by the forward `GETRANGE`: a request that selected bucket `b` sees a peer
 /// that selected `b + 1` and vice versa, so the pair's decision does not depend
 /// on which transaction reached the server first. Past one sub-bucket it is not
 /// covered, so the server clock returned by that same `EXEC` settles it, in
@@ -2586,6 +2842,11 @@ async fn check_http_windows_redis(
 
     let mut tightest: Option<(u64, u64, u64)> = None;
     let mut refused: Option<&RateLimitWindowSpec> = None;
+    // The longest `Retry-After` bound over EVERY refusing window, not just the
+    // first: a client that waits only for the shortest refusing window to free
+    // budget is refused again by a longer one.
+    let settled_at = charged.settled_at();
+    let mut retry_after = 0_u64;
     for (index, spec) in specs.iter().enumerate() {
         // Already the full trailing-window sum, with each sub-bucket floored at
         // zero (a counter can only be negative when a compensation raced its
@@ -2593,8 +2854,15 @@ async fn check_http_windows_redis(
         // it must never be a rounded float.
         let usage = counts[index];
         if usage > spec.limit {
-            refused = Some(spec);
-            break;
+            if refused.is_none() {
+                refused = Some(spec);
+            }
+            let window_seconds = spec.duration.as_secs();
+            let bound = settled_at.map_or(window_seconds, |settled_at| {
+                redis_quota_retry_after_seconds(settled_at, window_seconds)
+            });
+            retry_after = retry_after.max(bound);
+            continue;
         }
 
         let remaining = spec.limit.saturating_sub(usage);
@@ -2622,7 +2890,8 @@ async fn check_http_windows_redis(
             .await;
         return Ok(RateLimitOutcome::deny()
             .with_limit(spec.limit)
-            .with_window(spec.duration.as_secs()));
+            .with_window(spec.duration.as_secs())
+            .with_retry_after(retry_after));
     }
 
     let mut outcome = RateLimitOutcome::allow();
@@ -2683,7 +2952,7 @@ impl RateLimitAlgorithm for HttpRateLimitAlgorithm {
         key: &str,
         _op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
-        check_http_windows_redis(&self.specs, redis, key).await
+        check_http_windows_redis_detached(&self.specs, redis, key).await
     }
 
     fn is_state_active(&self, state: &Self::State, now: Instant) -> bool {
@@ -2728,8 +2997,10 @@ impl RateLimitAlgorithm for DynamicHttpRateLimitAlgorithm {
     type State = DynamicHttpRateLimitState;
     type Op = DynamicRateLimitOp;
 
-    /// Same ladder as [`HttpRateLimitAlgorithm`], with the windows resolved
-    /// per request (`graphql`, `grpc_method_router`).
+    /// The request-quota sub-bucket ladder (`check_http_windows`), with the
+    /// windows resolved per request. This is the only request-quota algorithm
+    /// in production (`rate_limiting`, `graphql`, `grpc_method_router`); the
+    /// `#[cfg(test)]` `HttpRateLimitAlgorithm` is an inline-test fixture.
     const REQUIRES_SERVER_CLOCK: bool = true;
 
     fn new_state(&self) -> Self::State {
@@ -2779,7 +3050,7 @@ impl RateLimitAlgorithm for DynamicHttpRateLimitAlgorithm {
         key: &str,
         op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
-        check_http_windows_redis(op.specs(), redis, key).await
+        check_http_windows_redis_detached(&op.specs, redis, key).await
     }
 
     fn is_state_active(&self, state: &Self::State, now: Instant) -> bool {
@@ -2820,10 +3091,25 @@ const MAX_TOKEN_WINDOW_ENTRIES: usize = 1_024;
 
 /// [`MAX_TOKEN_WINDOW_ENTRIES`] for external bounded-history tests.
 #[doc(hidden)]
-#[allow(dead_code)] // used only by external tests; dead in binary test target
 pub const fn max_token_window_entries_for_test() -> usize {
     MAX_TOKEN_WINDOW_ENTRIES
 }
+
+/// Process-wide source of local token-window reservation ids.
+///
+/// Ids must stay unique across the WHOLE lifetime of an identity, not just one
+/// `TokenUsageWindow` value. Idle cleanup deletes a window whose last activity
+/// is older than the window length even while a request it admitted is still
+/// in flight; the next request for that identity then constructs a fresh
+/// window. A per-window counter restarted at `1` there, so the late request's
+/// correction carried an id that now named the NEW request's live
+/// reservation and released it — letting the identity reserve the budget a
+/// second time while the first call was still running. Drawing every id from
+/// one monotonic counter means a stale id can never match a reservation it did
+/// not create; it takes the documented "reservation already gone" path.
+///
+/// `0` is the "no reservation" sentinel and is never handed out.
+static NEXT_TOKEN_RESERVATION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct TokenUsageWindow {
@@ -2835,9 +3121,6 @@ pub struct TokenUsageWindow {
     /// forward so reverse-ordered `now` samples (captured before the per-key
     /// write guard) cannot make still-live newer usage look stale.
     last_activity: Option<Instant>,
-    /// Monotonic per-window source of reservation ids. `0` is reserved as the
-    /// "no reservation" sentinel, so ids handed out start at `1`.
-    next_reservation_id: u64,
 }
 
 impl TokenUsageWindow {
@@ -2848,7 +3131,6 @@ impl TokenUsageWindow {
             limit,
             total: 0,
             last_activity: None,
-            next_reservation_id: 1,
         }
     }
 
@@ -2930,32 +3212,38 @@ impl TokenUsageWindow {
     }
 
     fn allocate_id(&mut self) -> u64 {
-        let id = self.next_reservation_id;
-        // Wrap past u64::MAX back to 1 (never 0, the sentinel). Collisions
-        // after 2^64 reservations in a single window are not a practical
-        // concern, and a stale collision only degrades to the back-pop
-        // fallback, never an over-count.
-        self.next_reservation_id = self.next_reservation_id.checked_add(1).unwrap_or(1);
-        id
+        // One shared monotonic counter (see `NEXT_TOKEN_RESERVATION_ID`), so an
+        // id outlives the window value that issued it. Skip the `0` sentinel
+        // if the counter ever wraps past `u64::MAX`; a collision after 2^64
+        // process-wide reservations is not a practical concern.
+        loop {
+            let id = NEXT_TOKEN_RESERVATION_ID.fetch_add(1, Ordering::Relaxed);
+            if id != 0 {
+                return id;
+            }
+        }
     }
 
-    fn reserve(&mut self, now: Instant, tokens: u64) -> RateLimitOutcome {
+    /// Reserve `tokens` against `limit`, the effective ceiling for this
+    /// identity (the configured `token_limit`, or a per-consumer / per-model
+    /// override the caller resolved).
+    fn reserve(&mut self, now: Instant, tokens: u64, limit: u64) -> RateLimitOutcome {
         let usage = self.current_usage(now);
         let reserved_usage = usage.saturating_add(tokens);
-        if reserved_usage > self.limit {
+        if reserved_usage > limit {
             return RateLimitOutcome::deny()
-                .with_limit(self.limit)
+                .with_limit(limit)
                 .with_window(self.window_duration.as_secs())
                 .with_usage(usage)
-                .with_remaining(self.limit.saturating_sub(usage));
+                .with_remaining(limit.saturating_sub(usage));
         }
 
         let reservation_id = self.record_usage(now, tokens);
         RateLimitOutcome::allow()
-            .with_limit(self.limit)
+            .with_limit(limit)
             .with_window(self.window_duration.as_secs())
             .with_usage(reserved_usage)
-            .with_remaining(self.limit.saturating_sub(reserved_usage))
+            .with_remaining(limit.saturating_sub(reserved_usage))
             .with_reservation_id(reservation_id)
     }
 
@@ -2972,28 +3260,38 @@ impl TokenUsageWindow {
     /// When a non-zero `reservation_id` is supplied but no matching entry
     /// remains (the reservation already aged out of the window, or a non-2xx
     /// release already removed it and a later final-body rejection re-runs
-    /// reconciliation), the outcome depends on the delta sign:
+    /// reconciliation), nothing is ever released and the outcome depends on
+    /// `actual_tokens`:
     ///
-    /// - **Negative delta → no-op.** The reservation this correction targets is
-    ///   already gone, so there is nothing of *this request's* to release.
-    ///   Falling through to the back-of-queue release here would pop tokens from
-    ///   an unrelated, still-live reservation for the same key and under-count
-    ///   the budget (the bug a stale/duplicate reconciliation would otherwise
-    ///   cause). The expired reservation's own usage was already dropped by the
-    ///   window/TTL or the earlier release, so dropping the delta is correct.
-    /// - **Positive delta → append a fresh entry.** Actual usage exceeded the
-    ///   (now-expired) reservation; recording the extra consumption never
-    ///   under-counts, so it is safe to add it back as new usage.
+    /// - **No actual usage (a release) → no-op.** The reservation this
+    ///   correction targets is already gone, so there is nothing of *this
+    ///   request's* to release. Falling through to the back-of-queue release
+    ///   here would pop tokens from an unrelated, still-live reservation for
+    ///   the same key and under-count the budget (the bug a stale/duplicate
+    ///   reconciliation would otherwise cause). The expired reservation's own
+    ///   usage was already dropped by the window/TTL or the earlier release.
+    /// - **Actual usage → charged in full as fresh usage.** A request that
+    ///   outlived its window still consumed `actual_tokens`, and the expired
+    ///   reservation no longer counts anywhere, so the whole actual usage (not
+    ///   just `actual - reserved`) is recorded at `now`. Recording only the
+    ///   positive excess dropped the reserved portion entirely, and a request
+    ///   whose actual usage was at or below its expired estimate was charged
+    ///   nothing at all (`ai_rate_limiter-MUSE-1`). When the entry was instead
+    ///   absorbed by history coalescing (more than `MAX_TOKEN_WINDOW_ENTRIES`
+    ///   unreconciled requests for one identity), its reserved tokens are still
+    ///   retained, so this over-counts by at most that reservation — the
+    ///   conservative direction.
     ///
     /// When `reservation_id` is `None` (the legacy / anonymous path with no
     /// per-entry identity), positive deltas append a fresh entry and negative
     /// deltas release from the back of the queue, floored at zero.
-    fn adjust_usage(&mut self, now: Instant, reservation_id: Option<u64>, delta: i64) {
-        if delta == 0 {
-            self.current_usage(now);
-            return;
-        }
-
+    fn adjust_usage(
+        &mut self,
+        now: Instant,
+        reservation_id: Option<u64>,
+        delta: i64,
+        actual_tokens: u64,
+    ) {
         self.current_usage(now);
 
         if let Some(id) = reservation_id.filter(|id| *id != 0) {
@@ -3007,6 +3305,9 @@ impl TokenUsageWindow {
             // and off the request-admission hot path. Documented in
             // docs/plugins.md (Local-mode performance).
             if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+                if delta == 0 {
+                    return;
+                }
                 let new_tokens = if delta >= 0 {
                     entry.tokens.saturating_add(delta as u64)
                 } else {
@@ -3027,13 +3328,16 @@ impl TokenUsageWindow {
 
             // A reservation id was supplied but the entry is gone. Do NOT fall
             // through to the anonymous back-of-queue release: that would steal a
-            // different in-flight reservation's tokens. Only a positive delta
-            // (extra usage above an expired reservation) is recorded; a negative
-            // delta is a no-op because the reservation it targeted is already
-            // released/expired.
-            if delta > 0 {
-                self.record_usage(now, delta as u64);
+            // different in-flight reservation's tokens. The expired reservation
+            // no longer counts, so the request's whole actual usage is charged
+            // as fresh usage; a release (`actual_tokens == 0`) is a no-op.
+            if actual_tokens > 0 {
+                self.record_usage(now, actual_tokens);
             }
+            return;
+        }
+
+        if delta == 0 {
             return;
         }
 
@@ -3072,7 +3376,6 @@ impl TokenUsageWindow {
     /// records stop growing as completed requests increase, without standing up
     /// a live workload.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn retained_records_for_test(&self) -> (usize, usize) {
         (
             self.entries.len(),
@@ -3119,6 +3422,19 @@ pub enum AiRateLimitOp {
     CheckBudget,
     Reserve {
         tokens: u64,
+    },
+    /// [`Self::CheckBudget`] against an explicit ceiling instead of the
+    /// algorithm's configured `token_limit` — a per-consumer or per-model
+    /// budget override resolved by the caller. The identity's key already
+    /// selects its own window, so only the comparison changes.
+    CheckBudgetWithLimit {
+        limit: u64,
+    },
+    /// [`Self::Reserve`] against an explicit ceiling (see
+    /// [`Self::CheckBudgetWithLimit`]).
+    ReserveWithLimit {
+        tokens: u64,
+        limit: u64,
     },
     AdjustUsage {
         /// Id returned by the `Reserve` outcome, so the local window can release
@@ -3170,6 +3486,18 @@ impl AiTokenRateAlgorithm {
             window_seconds: window_seconds.max(1),
         }
     }
+
+    /// The ceiling an admission op is evaluated against: an explicit
+    /// per-request override, or the configured `token_limit`.
+    fn admission_limit(&self, op: &AiRateLimitOp) -> u64 {
+        match *op {
+            AiRateLimitOp::CheckBudgetWithLimit { limit }
+            | AiRateLimitOp::ReserveWithLimit { limit, .. } => limit,
+            AiRateLimitOp::CheckBudget
+            | AiRateLimitOp::Reserve { .. }
+            | AiRateLimitOp::AdjustUsage { .. } => self.token_limit,
+        }
+    }
 }
 
 #[async_trait]
@@ -3194,22 +3522,25 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
         op: &Self::Op,
         now: Instant,
     ) -> RateLimitOutcome {
+        let limit = self.admission_limit(op);
         match *op {
-            AiRateLimitOp::CheckBudget => {
+            AiRateLimitOp::CheckBudget | AiRateLimitOp::CheckBudgetWithLimit { .. } => {
                 let usage = state.current_usage(now);
-                let remaining = state.remaining(now);
-                let outcome = if usage >= self.token_limit {
+                let remaining = limit.saturating_sub(usage);
+                let outcome = if usage >= limit {
                     RateLimitOutcome::deny()
                 } else {
                     RateLimitOutcome::allow()
                 };
                 outcome
-                    .with_limit(self.token_limit)
+                    .with_limit(limit)
                     .with_window(self.window_seconds)
                     .with_usage(usage)
                     .with_remaining(remaining)
             }
-            AiRateLimitOp::Reserve { tokens } => state.reserve(now, tokens),
+            AiRateLimitOp::Reserve { tokens } | AiRateLimitOp::ReserveWithLimit { tokens, .. } => {
+                state.reserve(now, tokens, limit)
+            }
             AiRateLimitOp::AdjustUsage {
                 reservation_id,
                 // The local window pins the correction to the right window via
@@ -3240,7 +3571,7 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                         state.current_usage(now);
                     }
                 } else {
-                    state.adjust_usage(now, reservation_id, delta);
+                    state.adjust_usage(now, reservation_id, delta, actual_tokens);
                 }
                 // Surface post-reconcile bucket state so `expose_headers` can
                 // refresh `x-ai-ratelimit-usage` / `remaining` after admission.
@@ -3261,8 +3592,9 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
         key: &str,
         op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
+        let limit = self.admission_limit(op);
         match *op {
-            AiRateLimitOp::CheckBudget => {
+            AiRateLimitOp::CheckBudget | AiRateLimitOp::CheckBudgetWithLimit { .. } => {
                 let progress = RedisRateLimitClient::window_progress(self.window_seconds);
                 let curr_idx = progress.index;
                 let prev_idx = curr_idx.saturating_sub(1);
@@ -3272,19 +3604,19 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 let (prev_count, curr_count) = redis.get_two_counters(&prev_key, &curr_key).await?;
                 let weighted = weighted_window_count(prev_count, curr_count, elapsed_fraction);
                 let usage = weighted as u64;
-                let remaining = self.token_limit.saturating_sub(usage);
-                let outcome = if usage >= self.token_limit {
+                let remaining = limit.saturating_sub(usage);
+                let outcome = if usage >= limit {
                     RateLimitOutcome::deny()
                 } else {
                     RateLimitOutcome::allow()
                 };
                 Ok(outcome
-                    .with_limit(self.token_limit)
+                    .with_limit(limit)
                     .with_window(self.window_seconds)
                     .with_usage(usage)
                     .with_remaining(remaining))
             }
-            AiRateLimitOp::Reserve { tokens } => {
+            AiRateLimitOp::Reserve { tokens } | AiRateLimitOp::ReserveWithLimit { tokens, .. } => {
                 let progress = RedisRateLimitClient::window_progress(self.window_seconds);
                 let curr_idx = progress.index;
                 let prev_idx = curr_idx.saturating_sub(1);
@@ -3293,12 +3625,25 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 let prev_key = redis.make_slot_key(key, &[&prev_idx.to_string()]);
                 let ttl = two_window_ttl_seconds(self.window_seconds);
                 let increment = u64_to_i64_saturating(tokens);
-                let new_curr_count = redis.incrby_with_expire(&curr_key, increment, ttl).await?;
-                let (prev_count, _) = redis.get_two_counters(&prev_key, &curr_key).await?;
+                // One `MULTI`/`EXEC` reads the previous window and charges the
+                // current one: the read never depended on the charge's reply,
+                // so a second round trip bought nothing. That primitive clamps
+                // its amount to at least 1, so a zero reservation (public op;
+                // `admit` itself sends `CheckBudget` instead) takes the
+                // read-only pair and charges nothing, exactly as `INCRBY 0`
+                // did. The deny rollback below therefore always subtracts
+                // exactly what was added.
+                let (prev_count, new_curr_count) = if increment > 0 {
+                    redis
+                        .sliding_window_increment_by(&prev_key, &curr_key, increment, ttl)
+                        .await?
+                } else {
+                    redis.get_two_counters(&prev_key, &curr_key).await?
+                };
                 let weighted = weighted_window_count(prev_count, new_curr_count, elapsed_fraction);
                 let usage = weighted.max(0.0) as u64;
-                let remaining = self.token_limit.saturating_sub(usage);
-                if weighted > self.token_limit as f64 {
+                let remaining = limit.saturating_sub(usage);
+                if weighted > limit as f64 {
                     // Roll back the speculative reservation we just added. Use
                     // the floor-at-zero variant (not a raw negative INCRBY): a
                     // concurrent reconciliation racing this rollback on the same
@@ -3307,10 +3652,12 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     // re-reserve the full limit — the exact bypass class the
                     // floor closes for the reconciliation path. Surface a failed
                     // rollback (Redis blip) so a leaked reservation is
-                    // observable rather than silently charged until TTL.
-                    if let Err(()) = redis
-                        .incrby_with_expire_floor_zero(&curr_key, -increment, ttl)
-                        .await
+                    // observable rather than silently charged until TTL. A zero
+                    // reservation charged nothing, so it has nothing to hand back.
+                    if increment > 0
+                        && let Err(()) = redis
+                            .incrby_with_expire_floor_zero(&curr_key, -increment, ttl)
+                            .await
                     {
                         // `curr_key` embeds the caller-supplied identity
                         // dimension, so it is not logged.
@@ -3320,16 +3667,13 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                         );
                     }
                     return Ok(RateLimitOutcome::deny()
-                        .with_limit(self.token_limit)
+                        .with_limit(limit)
                         .with_window(self.window_seconds)
                         .with_usage(usage.saturating_sub(tokens))
-                        .with_remaining(
-                            self.token_limit
-                                .saturating_sub(usage.saturating_sub(tokens)),
-                        ));
+                        .with_remaining(limit.saturating_sub(usage.saturating_sub(tokens))));
                 }
                 Ok(RateLimitOutcome::allow()
-                    .with_limit(self.token_limit)
+                    .with_limit(limit)
                     .with_window(self.window_seconds)
                     .with_usage(usage)
                     .with_remaining(remaining)
@@ -3385,6 +3729,21 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     // `actual_tokens == 0` (full release of a local reservation)
                     // is a no-op against Redis — there is nothing on this backend
                     // to release, and the local reservation expires on its own.
+                } else if reserved_window_index.is_some_and(|reserved| reserved < prev_idx) {
+                    // The reservation's window is older than the previous
+                    // window: no admission reads it any more and its key is past
+                    // (or about to pass) its TTL, so the reservation no longer
+                    // counts anywhere. A request that outlived two windows — a
+                    // long reasoning stream is routine — must not write its
+                    // correction into that dead key, or its whole positive
+                    // correction is invisible to enforcement
+                    // (`ai_rate_limiter-MUSE-1`). Treat it like a backend switch:
+                    // charge the FULL actual usage to the current window. A
+                    // release (`actual_tokens == 0`) has nothing live to debit.
+                    if actual_tokens > 0 {
+                        let increment = u64_to_i64_saturating(actual_tokens);
+                        curr_count = redis.incrby_with_expire(&curr_key, increment, ttl).await?;
+                    }
                 } else if delta != 0 {
                     // Debit the window the reservation actually credited (carried
                     // back from the `Reserve` outcome) so a request that
@@ -3460,6 +3819,20 @@ impl WsRateLimitOp {
     }
 }
 
+/// Local/fallback state key for `ws_rate_limiting`.
+///
+/// `Connection` is the default per-session budget, keyed by the process-local
+/// monotonic WebSocket connection id (never reused within a process).
+/// `Aggregate` is a budget shared by every session bound to one
+/// `limit_by` identity (`consumer:…`, `ip:…`, `service:…`), captured once at
+/// upgrade admission; cloning it per frame is a reference-count bump, never an
+/// allocation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum WsRateLimitKey {
+    Connection(u64),
+    Aggregate(Arc<str>),
+}
+
 #[derive(Debug, Clone)]
 pub struct WsFrameRateAlgorithm {
     frames_per_second: f64,
@@ -3492,26 +3865,15 @@ pub const WS_FRAME_REDIS_MAX_WINDOW_SECONDS: u64 = 3600;
 /// Rejecting unrepresentable configs is fail-closed: Redis never silently
 /// raises the configured frame rate, and Redis failure/recovery cannot change
 /// the effective sustained-rate policy for an accepted config.
+///
+/// The burst/refill relations exist only for the Redis two-window
+/// approximation. A `sync_mode: local` policy runs the token bucket alone and
+/// validates with [`validate_ws_frame_rate_bounds`] instead.
 pub fn validate_ws_frame_rate_params(
     frames_per_second: u64,
     burst_size: u64,
 ) -> Result<(), String> {
-    if frames_per_second == 0 {
-        return Err("ws_rate_limiting: `frames_per_second` must be greater than zero".to_string());
-    }
-    if burst_size == 0 {
-        return Err("ws_rate_limiting: `burst_size` must be greater than zero".to_string());
-    }
-    if frames_per_second > MAX_RATE_LIMIT_MAX_REQUESTS {
-        return Err(format!(
-            "ws_rate_limiting: `frames_per_second` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{frames_per_second}\""
-        ));
-    }
-    if burst_size > MAX_RATE_LIMIT_MAX_REQUESTS {
-        return Err(format!(
-            "ws_rate_limiting: `burst_size` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{burst_size}\""
-        ));
-    }
+    validate_ws_frame_rate_bounds(frames_per_second, burst_size)?;
     if burst_size < frames_per_second {
         return Err("ws_rate_limiting: `burst_size` must be >= `frames_per_second`".to_string());
     }
@@ -3531,6 +3893,66 @@ pub fn validate_ws_frame_rate_params(
         ));
     }
     Ok(())
+}
+
+/// Operational bounds every `ws_rate_limiting` policy must satisfy, whatever
+/// its `sync_mode`: both values in `1..=MAX_RATE_LIMIT_MAX_REQUESTS`.
+///
+/// A local token bucket represents any capacity/refill pair, so a
+/// `sync_mode: local` policy needs nothing more; the Redis-only relations live
+/// in [`validate_ws_frame_rate_params`].
+pub fn validate_ws_frame_rate_bounds(
+    frames_per_second: u64,
+    burst_size: u64,
+) -> Result<(), String> {
+    if frames_per_second == 0 {
+        return Err("ws_rate_limiting: `frames_per_second` must be greater than zero".to_string());
+    }
+    if burst_size == 0 {
+        return Err("ws_rate_limiting: `burst_size` must be greater than zero".to_string());
+    }
+    if frames_per_second > MAX_RATE_LIMIT_MAX_REQUESTS {
+        return Err(format!(
+            "ws_rate_limiting: `frames_per_second` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{frames_per_second}\""
+        ));
+    }
+    if burst_size > MAX_RATE_LIMIT_MAX_REQUESTS {
+        return Err(format!(
+            "ws_rate_limiting: `burst_size` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{burst_size}\""
+        ));
+    }
+    Ok(())
+}
+
+/// Hand back a refused `ws_rate_limiting` frame charge.
+///
+/// Issued from a DETACHED task that owns a clone of the client `Arc`, so a
+/// session teardown that drops the frame hook cannot strand the charge, and the
+/// refused frame does not wait a second round trip. `INCRBY -charge` rides with
+/// `EXPIRE` in one transaction so a key that expired in between is recreated
+/// with a TTL (its negative value reads as zero usage). A hand-back that cannot
+/// be delivered is reported through the client's ordinary command-failure path,
+/// so `redis_failure_policy` governs the next decision; the refusal itself
+/// already stands. Without a Tokio runtime the hand-back is awaited inline,
+/// because spawning would panic.
+async fn uncharge_ws_frames(
+    redis: &Arc<RedisRateLimitClient>,
+    current_key: String,
+    charge: i64,
+    ttl_seconds: u64,
+) {
+    let client = Arc::clone(redis);
+    let refund = async move {
+        let _ = client
+            .incrby_with_expire(&current_key, charge.saturating_neg(), ttl_seconds)
+            .await;
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(refund);
+        }
+        Err(_) => refund.await,
+    }
 }
 
 impl WsFrameRateAlgorithm {
@@ -3624,6 +4046,16 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
         // than the configured sustained rate.
         let (window_seconds, limit) = self.redis_window_derivation();
 
+        // A batch larger than the whole window budget can never be admitted
+        // (the local bucket refuses it the same way), so it is refused before
+        // it can touch the shared counter at all.
+        if op.frame_count() > limit {
+            return Ok(RateLimitOutcome::deny()
+                .with_limit(limit)
+                .with_window(window_seconds)
+                .with_remaining(0));
+        }
+
         let progress = RedisRateLimitClient::window_progress(window_seconds);
         let curr_idx = progress.index;
         let prev_idx = curr_idx.saturating_sub(1);
@@ -3639,13 +4071,24 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
         let (prev_count, curr_count) = redis
             .sliding_window_increment_by(&prev_key, &curr_key, charge, ttl)
             .await?;
-        let weighted = weighted_window_count(prev_count, curr_count, elapsed_fraction);
+        // A counter recreated by a hand-back that outlived its key reads
+        // negative; it is zero usage, never credit.
+        let weighted =
+            weighted_window_count(prev_count.max(0), curr_count.max(0), elapsed_fraction);
         let allowed = weighted <= limit as f64;
         let remaining = ((limit as f64) - weighted).max(0.0) as u64;
 
         let outcome = if allowed {
             RateLimitOutcome::allow()
         } else {
+            // Charge-then-compensate, like request-quota admission: the charge
+            // precedes the decision so racing sessions and replicas cannot all
+            // admit against one stale read, and a refusal then hands back
+            // exactly what it charged. Without this, every refused batch stayed
+            // on the shared counter, and on an aggregate `limit_by` key (shared
+            // by reconnects and replicas) each refusal fed the next one,
+            // starving the budget for every session that shares it.
+            uncharge_ws_frames(redis, curr_key, charge, ttl).await;
             RateLimitOutcome::deny()
         };
         Ok(outcome
@@ -3709,28 +4152,29 @@ impl UdpRateLimitAlgorithm {
             epoch_base,
         }
     }
-}
 
-#[async_trait]
-impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
-    type State = UdpWindowState;
-    type Op = UdpRateLimitOp;
-
-    /// A plain fixed window with no previous-window term and no sub-buckets.
-    const REQUIRES_SERVER_CLOCK: bool = false;
-
-    fn new_state(&self) -> Self::State {
-        UdpWindowState::new(0, 0)
+    /// Seconds since this algorithm's epoch base, and the fixed window index
+    /// they fall in.
+    #[inline]
+    fn window_position(&self, now: Instant) -> (u64, u64) {
+        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
+        (now_secs, now_secs / self.window_seconds)
     }
 
-    fn check_local(
+    /// Charge one datagram to `state` and decide it.
+    ///
+    /// The rollover reset (`window_epoch` CAS, then zeroing `count` and
+    /// `bytes`) is a multi-atomic step that is only race-free under the
+    /// map's exclusive entry guard. [`RateLimitAlgorithm::check_local_shared`]
+    /// therefore calls this only after proving no rollover is due, and
+    /// rollover is never attempted while another holder has the state shared.
+    fn charge_window(
         &self,
-        state: &mut Self::State,
-        op: &Self::Op,
-        now: Instant,
+        state: &UdpWindowState,
+        op: &UdpRateLimitOp,
+        now_secs: u64,
+        current_epoch: u64,
     ) -> RateLimitOutcome {
-        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
-        let current_epoch = now_secs / self.window_seconds;
         let stored_epoch = state.window_epoch.load(Ordering::Acquire);
 
         if current_epoch > stored_epoch
@@ -3778,6 +4222,62 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
         }
 
         RateLimitOutcome::allow()
+    }
+}
+
+#[async_trait]
+impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
+    type State = UdpWindowState;
+    type Op = UdpRateLimitOp;
+
+    /// A plain fixed window with no previous-window term and no sub-buckets.
+    const REQUIRES_SERVER_CLOCK: bool = false;
+
+    fn new_state(&self) -> Self::State {
+        UdpWindowState::new(0, 0)
+    }
+
+    fn check_local(
+        &self,
+        state: &mut Self::State,
+        op: &Self::Op,
+        now: Instant,
+    ) -> RateLimitOutcome {
+        let (now_secs, current_epoch) = self.window_position(now);
+        self.charge_window(state, op, now_secs, current_epoch)
+    }
+
+    /// Every field of [`UdpWindowState`] is atomic, but a datagram charges the
+    /// count and the byte total with two separate atomic additions. With ONE
+    /// axis bounded, the decision rests on a single read-modify-write, so
+    /// concurrent shared decisions serialize in that counter's order. With
+    /// BOTH bounded, two datagrams could each take an earlier position on a
+    /// different counter and both be refused where every serial order admits
+    /// one of them, so a two-axis policy keeps the exclusive entry guard.
+    fn admits_shared_state_check(&self) -> bool {
+        self.datagrams_per_window.is_none() || self.bytes_per_window.is_none()
+    }
+
+    fn check_local_shared(
+        &self,
+        state: &Self::State,
+        op: &Self::Op,
+        now: Instant,
+    ) -> Option<RateLimitOutcome> {
+        // Defensive: a caller that skipped `admits_shared_state_check` still
+        // cannot take an incoherent two-axis decision here.
+        if !self.admits_shared_state_check() {
+            return None;
+        }
+        let (now_secs, current_epoch) = self.window_position(now);
+        // A due rollover resets several counters together; leave it to the
+        // exclusive path. Under this shared reference no exclusive holder can
+        // advance the epoch, so `charge_window` sees the same stored epoch and
+        // never attempts the reset itself.
+        if current_epoch > state.window_epoch.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(self.charge_window(state, op, now_secs, current_epoch))
     }
 
     async fn check_redis(
@@ -4058,6 +4558,38 @@ mod tests {
         let outcome = window.outcome(8, 4, 0.25);
         assert!(outcome.allowed);
         assert_eq!(outcome.remaining, Some(0));
+    }
+
+    #[test]
+    fn redis_one_second_prior_bucket_decays_instead_of_full_suppression() {
+        use crate::_test_support::redis_window_progress_at;
+
+        // TOKEN-ACCOUNTING path only (`ai_rate_limiter` budgets, `ws_rate_limiting`
+        // frames): prev bucket full (10), current has the candidate request (1). At
+        // fraction 0.0 the old code always denied; with subsecond decay the
+        // mid-window candidate is admitted. Request quotas moved off this estimate
+        // onto the sub-bucket ladder covered below.
+        let window = FixedWindow::new(10, 1);
+        let start = redis_window_progress_at(Duration::from_secs(50), 1);
+        let mid = redis_window_progress_at(Duration::from_millis(50_500), 1);
+        let near_end = redis_window_progress_at(Duration::from_nanos(50_900_000_000), 1);
+
+        assert!(
+            !window.outcome(10, 1, start.elapsed_fraction).allowed,
+            "at window start a full prior bucket still suppresses (weighted=11)"
+        );
+        assert!(
+            window.outcome(10, 1, mid.elapsed_fraction).allowed,
+            "mid one-second window must decay prior bucket (weighted=6)"
+        );
+        assert!(
+            window.outcome(10, 1, near_end.elapsed_fraction).allowed,
+            "near end of one-second window prior bucket is nearly gone"
+        );
+        assert!(
+            (window.weighted_count(10, 0, mid.elapsed_fraction) - 5.0).abs() < 1e-12,
+            "half-elapsed prior bucket of 10 contributes exactly 5"
+        );
     }
 
     #[test]
@@ -4750,7 +5282,7 @@ mod tests {
     }
 
     #[test]
-    fn local_limiter_enforce_capacity_preserves_active_entries() {
+    fn local_limiter_prune_at_capacity_preserves_active_entries() {
         let limiter = LocalLimiter::new(
             TestAlgorithm {
                 redis_ok: Arc::new(AtomicBool::new(true)),
@@ -4778,7 +5310,7 @@ mod tests {
         );
 
         // Cleanup must not delete still-active budgets to make room.
-        limiter.enforce_capacity(3, now);
+        limiter.prune_stale_at(now);
         assert_eq!(limiter.tracked_keys_count(), 5);
         for idx in 0..5 {
             assert!(limiter.contains_key(&format!("key:{idx}")));
@@ -4812,34 +5344,6 @@ mod tests {
         assert!(limiter.contains_key(&"active".to_string()));
         assert!(!limiter.contains_key(&"stale-a".to_string()));
         assert!(!limiter.contains_key(&"stale-b".to_string()));
-    }
-
-    #[test]
-    fn local_limiter_enforce_capacity_prunes_stale_below_cap() {
-        let limiter = LocalLimiter::new(
-            TestAlgorithm {
-                redis_ok: Arc::new(AtomicBool::new(true)),
-            },
-            crate::util::sharding::pool_shard_amount(0),
-        );
-        let op = TestOp;
-        let t0 = Instant::now();
-
-        for idx in 0..4 {
-            assert!(limiter.check_at(format!("stale:{idx}"), &op, t0).allowed);
-        }
-        let t_active = t0 + Duration::from_secs(20);
-        assert!(
-            limiter
-                .check_at("active".to_string(), &op, t_active)
-                .allowed
-        );
-        assert_eq!(limiter.tracked_keys_count(), 5);
-
-        // Cap is above current length; stale pruning must still run.
-        limiter.enforce_capacity(100, t_active);
-        assert_eq!(limiter.tracked_keys_count(), 1);
-        assert!(limiter.contains_key(&"active".to_string()));
     }
 
     #[tokio::test]
@@ -5250,8 +5754,8 @@ mod tests {
                         limiter.prune_stale_at(Instant::now() + Duration::from_secs(30));
                     }
                     if i.is_multiple_of(23) {
-                        // Over-cap cleanup must only prune idle state.
-                        limiter.enforce_capacity(max_entries, Instant::now());
+                        // Pressure cleanup must only prune idle state.
+                        limiter.prune_stale_at(Instant::now());
                     }
                 }
             }));
@@ -5263,7 +5767,7 @@ mod tests {
             handle.join().expect("worker joins");
         }
 
-        limiter.enforce_capacity(max_entries, Instant::now());
+        limiter.prune_stale_at(Instant::now());
         let tracked = limiter.tracked_keys_count();
         let map_len = limiter.map_len_for_test();
         assert_eq!(

@@ -945,11 +945,8 @@ impl CapsuleDecoder {
     /// 9297 §3.3 "closed in the middle of a capsule" predicate, which a skip in
     /// progress also satisfies.
     ///
-    /// `#[allow(dead_code)]` because the binary target compiles this module
-    /// tree separately from the library and only the external test crates read
-    /// this accessor; production asks the same question via
-    /// [`Self::finish_stream`].
-    #[allow(dead_code)]
+    /// Read by the external tests to bound decoder memory; production asks the
+    /// end-of-stream question through [`Self::finish_stream`].
     pub fn buffered_len(&self) -> usize {
         self.buf.len()
     }
@@ -1689,6 +1686,23 @@ enum ClientRelayStep {
     CapsuleFault(CapsuleDecodeError),
     /// The connected UDP socket is unusable (see [`UdpSendFault::Terminal`]).
     SocketUnusable,
+    /// The supervisor ended the session with this close (issue #7188). Halt
+    /// the receive half with the matching code instead of dropping it, which
+    /// would surface as `STOP_SENDING(0)` on a clean end.
+    SupervisorClose(StreamCloseKind),
+}
+
+/// The `STOP_SENDING` code that halts the client's request direction when the
+/// supervisor ends a tunnel (issue #7188): `H3_NO_ERROR` for a clean end, the
+/// same code the send half resets with otherwise. A close channel dropped
+/// without a verdict (the session future itself was dropped) is the internal
+/// failure arm, never a claim of an orderly end.
+pub fn receive_half_halt_code(close: Option<StreamCloseKind>) -> h3::error::Code {
+    match close {
+        Some(StreamCloseKind::Clean) => h3::error::Code::H3_NO_ERROR,
+        Some(StreamCloseKind::MessageError) => h3::error::Code::H3_MESSAGE_ERROR,
+        Some(StreamCloseKind::InternalError) | None => h3::error::Code::H3_INTERNAL_ERROR,
+    }
 }
 
 /// Key one resolved client identity for the per-client CONNECT-UDP tunnel cap.
@@ -1733,7 +1747,9 @@ pub fn try_acquire_connect_udp_client_slot(
         return Ok(None);
     }
     let key = connect_udp_client_key(client_ip, ipv6_prefix);
-    crate::proxy::try_acquire_per_ip_slot(Some(counts), &key, max)
+    // Keep the configured prefix: the fixed-/64 `try_acquire_per_ip_slot`
+    // would re-mask a finer key (/96, /128) back to its /64.
+    crate::proxy::try_acquire_per_ip_slot_with_prefix(Some(counts), &key, max, ipv6_prefix)
 }
 
 /// Everything the handler needs that is not already an `Arc` on `ProxyState`.
@@ -2458,10 +2474,12 @@ pub(crate) async fn handle_h3_connect_udp(
     match header_write {
         crate::http3::stream_util::H3AuthorizedHeadersWrite::Written => {}
         crate::http3::stream_util::H3AuthorizedHeadersWrite::AuthorizationExpired(termination) => {
-            // The helper already recorded the counter through the request latch.
-            // Latch the class into the summary, abort/reset without attempting
-            // another blocking terminal write, and release permit/socket/guards
-            // on return. A 200 was never committed, so it is not counted.
+            // The helper already recorded the termination counter through the
+            // request latch. Latch the class into the summary, abort/reset
+            // without attempting another blocking terminal write, and release
+            // permit/socket/guards on return. A 200 was never committed, so the
+            // request is counted once as the 401 its access log records, like
+            // every other terminal of this handler.
             ctx.record_authorization_termination_once(
                 termination,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,
@@ -2483,6 +2501,7 @@ pub(crate) async fn handle_h3_connect_udp(
                 Some(&request_path),
             )
             .await;
+            crate::proxy::record_request(&state, StatusCode::UNAUTHORIZED.as_u16());
             drop(session_permit);
             drop(client_tunnel_guard);
             drop(request_guard);
@@ -2672,15 +2691,32 @@ async fn relay(
     let to_target_socket = Arc::clone(&socket);
     let to_target_activity = Arc::clone(&last_activity);
     let to_target_proxy_id = proxy.id.clone();
+    // The supervisor's close for the receive half (issue #7188). Teardown sends
+    // the close kind it decided, so this task halts the client's request
+    // direction with an explicit code instead of being aborted with the half
+    // still open (a drop is `STOP_SENDING(0)`, not an HTTP/3 code).
+    let (recv_halt_tx, mut recv_halt_rx) = tokio::sync::oneshot::channel::<StreamCloseKind>();
     // client → target: decode capsules off the CONNECT stream.
     let mut to_target = tokio::spawn(async move {
         let mut decoder = CapsuleDecoder::new(max_payload);
         loop {
             // The chunk `recv_data` yields captures `&mut h3_recv`, so the
             // decision it produces has to be a borrow-free value: the halt
-            // calls below need the receive half back.
-            let step = match h3_recv.recv_data().await {
-                Ok(Some(mut chunk)) => {
+            // calls below need the receive half back. Biased: a supervisor
+            // close that is already pending wins over more client data. The
+            // vendored h3-quinn keeps the stream owned during a cancelled
+            // read, so halting after one is sound
+            // (`stream_util::halt_request_body`).
+            let received = tokio::select! {
+                biased;
+                close = &mut recv_halt_rx => Err(close.ok()),
+                received = h3_recv.recv_data() => Ok(received),
+            };
+            let step = match received {
+                Err(close) => ClientRelayStep::SupervisorClose(
+                    close.unwrap_or(StreamCloseKind::InternalError),
+                ),
+                Ok(Ok(Some(mut chunk))) => {
                     relay_client_chunk(
                         &mut decoder,
                         &mut chunk,
@@ -2695,11 +2731,11 @@ async fn relay(
                 // a FIN on a capsule boundary is an EOF. RFC 9297 §3.3: a
                 // stream closed in the middle of a capsule is a malformed
                 // message, never a successful end of the capsule stream.
-                Ok(None) => match decoder.finish_stream() {
+                Ok(Ok(None)) => match decoder.finish_stream() {
                     Ok(()) => ClientRelayStep::ClientFin,
                     Err(error) => ClientRelayStep::CapsuleFault(error),
                 },
-                Err(error) => {
+                Ok(Err(error)) => {
                     debug!(
                         proxy_id = %to_target_proxy_id,
                         "H3 CONNECT-UDP client relay: stream error: {error}"
@@ -2728,6 +2764,12 @@ async fn relay(
                 ClientRelayStep::SocketUnusable => {
                     h3_recv.stop_sending(h3::error::Code::H3_INTERNAL_ERROR);
                     return SessionEnd::TargetSocketUnusable;
+                }
+                ClientRelayStep::SupervisorClose(close) => {
+                    // The supervisor already decided the session's outcome;
+                    // this return value is only joined for panic logging.
+                    h3_recv.stop_sending(receive_half_halt_code(Some(close)));
+                    return SessionEnd::ClientClosed;
                 }
             }
         }
@@ -3057,7 +3099,10 @@ async fn relay(
     // the capsule stream.
     let supervisor_verdict = end;
     if !to_target_finished {
-        to_target.abort();
+        // Halt the client's request direction with the code of the close the
+        // supervisor decided (issue #7188): `H3_NO_ERROR` for a clean end. The
+        // task is joined below, with an abort only as the bounded fallback.
+        let _ = recv_halt_tx.send(supervisor_verdict.close_kind());
     }
     // The oneshot carries the supervisor [`SessionEnd`], not only its
     // close-kind. If the send-half task consumes it, that is the outcome it
@@ -3104,16 +3149,26 @@ async fn relay(
         );
     }
     if !to_target_finished {
-        // Aborted above and never polled to completion, so joining it here is
-        // both safe and the point at which the receive half and the socket
-        // clone are provably gone. This relay owns no send half, so its panic
-        // does not change what the client saw — it is logged, not promoted.
-        join_panicked(to_target.await, RelayDirection::ClientToTarget, &proxy.id);
+        // Signalled above and never polled to completion, so joining it here
+        // is both safe and the point at which the receive half and the socket
+        // clone are provably gone. It halts as soon as it observes the signal;
+        // one still parked in a target send after `CLOSE_GRACE` is aborted and
+        // the cancellation awaited, so teardown stays bounded and never
+        // detaches it. This relay owns no send half, so its panic does not
+        // change what the client saw — it is logged, not promoted.
+        let joined = match tokio::time::timeout(CLOSE_GRACE, &mut to_target).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                to_target.abort();
+                to_target.await
+            }
+        };
+        join_panicked(joined, RelayDirection::ClientToTarget, &proxy.id);
     }
     end
 }
 
-/// Log a receive-half teardown join and report whether the task PANICKED.
+/// Log a receive-half teardown join if the task PANICKED.
 ///
 /// This relay owns no send half, so a panic does not change what the client
 /// saw — it is logged, not promoted. A `cancelled` join is the acknowledgement
@@ -3124,19 +3179,16 @@ fn join_panicked(
     joined: Result<SessionEnd, tokio::task::JoinError>,
     relay: RelayDirection,
     proxy_id: &str,
-) -> bool {
-    match joined {
-        Ok(_) => false,
-        Err(error) if error.is_panic() => {
-            warn!(
-                proxy_id = %proxy_id,
-                relay = relay.as_str(),
-                reason = SessionEnd::RelayTaskFailed.as_str(),
-                "H3 CONNECT-UDP relay task panicked during teardown"
-            );
-            true
-        }
-        Err(_) => false,
+) {
+    if let Err(error) = joined
+        && error.is_panic()
+    {
+        warn!(
+            proxy_id = %proxy_id,
+            relay = relay.as_str(),
+            reason = SessionEnd::RelayTaskFailed.as_str(),
+            "H3 CONNECT-UDP relay task panicked during teardown"
+        );
     }
 }
 
@@ -3295,6 +3347,7 @@ async fn emit_session_summary(
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
         consumer_username: ctx.effective_identity().map(str::to_owned),
+        principal_origin: ctx.principal_origin(),
         auth_method: ctx.auth_method,
         http_method: "CONNECT".to_string(),
         request_path: request_path.to_owned(),

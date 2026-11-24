@@ -50,7 +50,7 @@ use super::{
     OtelTracing, SUPPORTED_TRACEPARENT_VERSION, SpanData, SpanKind, TRACEPARENT_HEADER,
     TraceExporter, build_traceparent, http_method_for_span_name, is_lowercase_hex, otlp_attribute,
     otlp_attribute_bool, otlp_attribute_double, otlp_attribute_int, parse_backend_host_port,
-    timestamp_before_now, timestamp_nanos, trace_is_sampled, truncate_attr,
+    record_span_admission, timestamp_before_now, timestamp_nanos, trace_is_sampled, truncate_attr,
 };
 
 /// Exporter handle shared by every trace one `otel_tracing` instance installs.
@@ -87,7 +87,8 @@ impl AttemptSpanSink {
 
     /// Hand `span` to the exporter's bounded, non-blocking queue.
     fn export_with(&self, span: SpanData, without_blocking: bool) {
-        let Err(error) = self.exporter.try_export(span) else {
+        // Attempt spans share the plugin's export accounting.
+        let Err(error) = record_span_admission(self.exporter.try_export(span)) else {
             return;
         };
         let now_ms = crate::socket_opts::monotonic_now_ms();
@@ -218,9 +219,9 @@ impl BackendAttemptTrace {
     /// The attempt recorder for a request `otel_tracing` has decided to sample,
     /// parented under the request's SERVER span. `None` for an unsampled
     /// request or trace metadata that is not W3C-shaped.
-    pub(crate) fn for_request(
+    pub(crate) fn for_request<MS: std::hash::BuildHasher>(
         sink: &Arc<AttemptSpanSink>,
-        metadata: &HashMap<String, String>,
+        metadata: &HashMap<String, String, MS>,
         method: &str,
     ) -> Option<Arc<Self>> {
         if !trace_is_sampled(metadata) {
@@ -474,6 +475,21 @@ impl BackendAttemptSpan {
                 headers: AttemptHeaders::Map(headers),
                 ..
             }) => headers,
+            _ => base,
+        }
+    }
+
+    /// [`Self::headers`] over a dispatch header view: the traced copy when
+    /// this attempt is traced, otherwise `base` unchanged.
+    pub(crate) fn headers_view<'a>(
+        &'a self,
+        base: crate::proxy::request_headers::RequestHeaders<'a>,
+    ) -> crate::proxy::request_headers::RequestHeaders<'a> {
+        match self.0.as_deref() {
+            Some(BegunAttempt {
+                headers: AttemptHeaders::Map(headers),
+                ..
+            }) => crate::proxy::request_headers::RequestHeaders::Materialized(headers),
             _ => base,
         }
     }

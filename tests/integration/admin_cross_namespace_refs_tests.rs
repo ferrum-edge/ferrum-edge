@@ -86,7 +86,7 @@ fn make_token(config: &TestConfig) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(config.jwt_secret.as_bytes()),
+        &EncodingKey::from_secret(config.jwt_secret.as_bytes()).unwrap(),
     )
     .unwrap()
 }
@@ -479,6 +479,65 @@ async fn mesh_route_dispatch_missing_destination_upstream_is_rejected() {
     assert!(
         err.contains("mesh_route_dispatch") && err.contains("missing-upstream"),
         "error must mention plugin type and upstream id; got: {}",
+        err
+    );
+}
+
+/// Issue #7387 review (sol F1 sweep): a `weighted_splits` leg is checked at
+/// admin write time like a rule destination, so a missing leg is refused
+/// before it can ever reach a data plane.
+#[tokio::test]
+async fn mesh_route_dispatch_missing_weighted_split_leg_is_rejected() {
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    let (status, body) = ns_post(
+        &base_url,
+        "/upstreams",
+        NAMESPACE_A,
+        &token,
+        &upstream_payload("up-split", "up-split"),
+    )
+    .await;
+    assert_eq!(status, 201, "seed upstream failed: {:?}", body);
+    let (status, body) = ns_post(
+        &base_url,
+        "/proxies",
+        NAMESPACE_A,
+        &token,
+        &proxy_with_upstream("p-a-split", "/split", "up-split"),
+    )
+    .await;
+    assert_eq!(status, 201, "seed proxy failed: {:?}", body);
+
+    let plugin = json!({
+        "id": "pc-split",
+        "plugin_name": "mesh_route_dispatch",
+        "scope": "proxy",
+        "proxy_id": "p-a-split",
+        "config": {
+            "rules": [],
+            "weighted_splits": [{
+                "upstream_id": "up-split",
+                "legs": [{"upstream_id": "missing-leg", "weight": 1}]
+            }]
+        },
+        "enabled": true,
+    });
+    let (status, body) = ns_post(&base_url, "/plugins/config", NAMESPACE_A, &token, &plugin).await;
+    assert_eq!(
+        status, 400,
+        "a missing weighted-split leg must be rejected: {:?}",
+        body
+    );
+    let err = err_string(&body);
+    assert!(
+        err.contains("mesh_route_dispatch")
+            && err.contains("weighted_splits[0].legs[0]")
+            && err.contains("missing-leg"),
+        "error must name the leg; got: {}",
         err
     );
 }
@@ -999,6 +1058,7 @@ fn ns_upstream(namespace: &str, id: &str) -> Upstream {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -1063,7 +1123,6 @@ fn ns_proxy(namespace: &str, id: &str, listen_path: &str) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,

@@ -1,6 +1,7 @@
 # Native compiler-cache transport proof
 
-Issue #4643 still requires native Rust cache retention after later main runs.
+Issue #4643 (native Rust cache retention after later main runs) was closed on
+2026-09-08.
 The Docker BuildKit registry caches do not automatically preserve a native
 runner's compiler store. This proof tests a container-image envelope for those
 bytes before connecting any compiler or changing an Actions cache lane.

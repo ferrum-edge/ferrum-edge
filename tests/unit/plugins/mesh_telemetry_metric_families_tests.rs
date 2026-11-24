@@ -32,7 +32,7 @@ fn mesh_http_summary(
         body_completed: true,
         bytes_sent,
         bytes_received,
-        metadata: HashMap::from([
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([
             ("mesh.source.workload".into(), "frontend".into()),
             ("mesh.source.namespace".into(), "default".into()),
             (
@@ -229,6 +229,7 @@ fn tcp_opened_closed_and_bytes_follow_connect_disconnect_lifecycle() {
         proxy_name: Some("db".into()),
         client_ip: "10.0.0.1".into(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: "10.0.0.9:5432".into(),
         backend_resolved_ip: None,
@@ -244,7 +245,7 @@ fn tcp_opened_closed_and_bytes_follow_connect_disconnect_lifecycle() {
         timestamp_connected: "2026-08-05T00:00:00Z".into(),
         timestamp_disconnected: "2026-08-05T00:00:01Z".into(),
         sni_hostname: None,
-        metadata: metadata.clone(),
+        metadata: metadata.clone().into_iter().collect(),
         proxy_lifecycle_generation: None,
     };
     registry.record_stream(&summary);
@@ -443,7 +444,7 @@ fn grpc_web_text_scanner_stops_counting_at_malformed_base64() {
 #[tokio::test]
 async fn complete_grpc_message_count_uses_fetch_max_not_additive_retry() {
     use ferrum_edge::plugins::mesh::prometheus_helpers::{
-        metadata_observes_grpc_messages, record_complete_grpc_message_count,
+        record_complete_grpc_message_count, request_observes_grpc_messages,
     };
 
     let prometheus = PrometheusMetrics::new(&serde_json::Value::Null, "default")
@@ -453,17 +454,18 @@ async fn complete_grpc_message_count_uses_fetch_max_not_additive_retry() {
         .metadata
         .insert("request_protocol".into(), "grpc".into());
     assert!(
-        !metadata_observes_grpc_messages(&request.metadata),
+        !request_observes_grpc_messages(&request),
         "protocol alone must not enable scanners without prometheus_metrics observation"
     );
     assert!(matches!(
         prometheus.on_request_received(&mut request).await,
         PluginResult::Continue
     ));
-    let mut metadata = request.metadata;
-    assert!(metadata_observes_grpc_messages(&metadata));
-    metadata.insert("request_protocol".into(), "http".into());
-    assert!(!metadata_observes_grpc_messages(&metadata));
+    assert!(request_observes_grpc_messages(&request));
+    request
+        .metadata
+        .insert("request_protocol".into(), "http".into());
+    assert!(!request_observes_grpc_messages(&request));
 
     let counter = Arc::new(AtomicU64::new(0));
     let body = [0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1, 2, 3]; // two messages
@@ -568,6 +570,7 @@ async fn tcp_sent_bytes_tag_override_and_disable_are_honored() {
         proxy_name: Some("db".into()),
         client_ip: "10.0.0.1".into(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: "10.0.0.9:5432".into(),
         backend_resolved_ip: None,
@@ -664,6 +667,7 @@ fn stream_summary_from(metadata: HashMap<String, String>) -> StreamTransactionSu
         proxy_name: Some("db".into()),
         client_ip: "10.0.0.1".into(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: "10.0.0.9:5432".into(),
         backend_resolved_ip: None,
@@ -679,7 +683,7 @@ fn stream_summary_from(metadata: HashMap<String, String>) -> StreamTransactionSu
         timestamp_connected: "2026-08-05T00:00:00Z".into(),
         timestamp_disconnected: "2026-08-05T00:00:01Z".into(),
         sni_hostname: None,
-        metadata,
+        metadata: metadata.into_iter().collect(),
         proxy_lifecycle_generation: None,
     }
 }
@@ -752,7 +756,7 @@ async fn multiple_workload_metrics_applications_record_one_tcp_opened_under_fina
 
     // The disconnect half stays balanced: one open, one close.
     let metadata = ctx.metadata.clone().expect("mesh stream metadata");
-    registry.record_stream(&stream_summary_from(metadata));
+    registry.record_stream(&stream_summary_from(metadata.into_iter().collect()));
     let after_close = registry.render_uncached();
     assert_eq!(
         series_lines(&after_close, "ferrum_mesh_tcp_connections_opened_total").len(),
@@ -791,7 +795,7 @@ async fn disabled_final_tcp_opened_policy_records_no_opened_but_keeps_closed() {
     // Disabling opened is per-family: the connection was still finalized, so the
     // closed/byte families keep reporting.
     let metadata = ctx.metadata.clone().expect("mesh stream metadata");
-    registry.record_stream(&stream_summary_from(metadata));
+    registry.record_stream(&stream_summary_from(metadata.into_iter().collect()));
     let after_close = registry.render_uncached();
     assert_eq!(
         series_lines(&after_close, "ferrum_mesh_tcp_connections_closed_total").len(),
@@ -828,7 +832,7 @@ async fn rejected_stream_chain_finalizes_balanced_tcp_lifecycle() {
         "rejected path must count exactly one opened:\n{after_open}"
     );
 
-    let mut summary = stream_summary_from(metadata.clone());
+    let mut summary = stream_summary_from(metadata.clone().into_iter().collect());
     summary.bytes_sent = 0;
     summary.bytes_received = 0;
     registry.record_stream(&summary);
@@ -961,7 +965,7 @@ async fn captured_egress_tcp_opened_closed_share_destination_principal() {
         "opened must carry destination principal:\n{after_open}"
     );
 
-    registry.record_stream(&stream_summary_from(metadata.clone()));
+    registry.record_stream(&stream_summary_from(metadata.clone().into_iter().collect()));
     let after_close = registry.render_uncached();
     let closed = series_lines(&after_close, "ferrum_mesh_tcp_connections_closed_total");
     assert_eq!(closed.len(), 1, "one closed series:\n{after_close}");
@@ -1011,7 +1015,7 @@ async fn captured_egress_no_target_setup_failure_finalizes_balanced_lifecycle() 
         "no-target path must keep the default unknown principal:\n{after_open}"
     );
 
-    let mut summary = stream_summary_from(metadata.clone());
+    let mut summary = stream_summary_from(metadata.clone().into_iter().collect());
     summary.bytes_sent = 0;
     summary.bytes_received = 0;
     summary.connection_error = Some("captured mesh egress setup failed".into());
@@ -1058,7 +1062,13 @@ async fn udp_stream_finalize_records_no_tcp_series() {
         "a UDP stream must not be stamped as a finalized mesh TCP connection"
     );
 
-    let mut summary = stream_summary_from(ctx.metadata.clone().expect("metadata"));
+    let mut summary = stream_summary_from(
+        ctx.metadata
+            .clone()
+            .expect("metadata")
+            .into_iter()
+            .collect(),
+    );
     summary.protocol = "udp".into();
     registry.record_stream(&summary);
 

@@ -15,24 +15,46 @@
 //! as a fail-closed control for unary or streaming native gRPC traffic.
 //!
 //! gRPC-Web still rides the composed HTTP/gRPC-Web view. Ordinary scan modes
-//! skip its framed `application/grpc-web*` bodies. In `mcp_arguments` mode,
+//! skip its framed bodies, recognized by the proxy's own delimiter-aware
+//! gRPC / gRPC-Web classifiers (`utils::body_transform::is_framed_grpc_content_type`),
+//! so a lookalike such as `application/grpc-webhook+json` is ordinary JSON and
+//! stays in scope. In `mcp_arguments` mode,
 //! `+json` gRPC-Web media types are in scope only when the body is bare JSON.
 //! Framed payloads fail JSON parsing and pass uninspected unless they look
 //! like a JSON document that could carry a `tools/call` (see "MCP tool
 //! arguments"); `mcp_gateway` refuses frames.
+//!
+//! ## Request scope in the ordinary modes
+//!
+//! `content` and `all` select every `POST`, `PUT`, and `PATCH` that is not
+//! framed gRPC (`mcp_arguments` keeps `POST`); the `Content-Type` decides only
+//! HOW the body is treated, never WHETHER it is looked at, because a client can
+//! omit or relabel that header while an upstream decodes the body as JSON
+//! anyway:
+//!
+//! * a JSON media type (`application/json`, `+json`) is **declared JSON**: a
+//!   body the shield cannot read as UTF-8 JSON — non-UTF-8 bytes, a strict
+//!   parse failure, or a non-UTF-8 `charset` declaration — is refused by
+//!   `reject` / `redact` and recorded by `warn` (a lenient upstream decoder may
+//!   read content the shield never inspected);
+//! * no `Content-Type`, or any other media type, is **sniffed**: the body is
+//!   held to exactly the declared-JSON rules whenever it may be a JSON document
+//!   (see `may_be_json_document`), and anything else (a binary upload, plain
+//!   text) is left alone. Enforcing actions claim an encoded sniffed body so
+//!   the representation gate decodes it before that decision.
 //!
 //! ## The final backend-visible body is authoritative
 //!
 //! `before_proxy` is not the last word on the bytes a backend receives: every
 //! `transform_request_body` hook — a `request_transformer` body rule, a
 //! header-to-body overlay, a custom body plugin — runs afterwards and can put
-//! content back that the shield already decided about. Every request this
-//! shield admits into scope therefore carries an instance-private marker into
-//! `on_final_request_body`, where the same detection runs again over the exact
-//! dispatched representation. Reject and warn re-decide there; redact fails the
-//! request closed, because that hook can refuse a request but cannot rewrite
-//! wire bytes. A rejection there precedes backend dispatch and finalized-request
-//! egress.
+//! content back that the shield already decided about, and a header rewrite can
+//! bring a request into scope the early hook skipped. `on_final_request_body`
+//! therefore decides scope again from the FINAL headers and runs the same
+//! detection over the exact dispatched representation. Reject and warn
+//! re-decide there; redact fails the request closed, because that hook can
+//! refuse a request but cannot rewrite wire bytes. A rejection there precedes
+//! backend dispatch and finalized-request egress.
 //!
 //! Reject/redact instances additionally claim the finalized representation
 //! (`Plugin::enforces_final_request_body_policy`), so the shared request
@@ -63,9 +85,9 @@
 //! a batch — and nothing else in the envelope (issue #5908). Recognition is
 //! shared with `mcp_gateway` (`utils::mcp_jsonrpc`), so the shield accepts the
 //! same request media types the gateway does, including a request with no
-//! `Content-Type`, and a body with duplicate member names is refused by
-//! enforcing actions instead of being read one way here and another way by the
-//! server that executes the call. `+json` gRPC-Web media types are accepted
+//! `Content-Type`. In every scan mode, a body with duplicate member names is
+//! refused by enforcing actions (and recorded by `warn`) instead of being read
+//! one way here and another way by the upstream that consumes it. `+json` gRPC-Web media types are accepted
 //! only for bare JSON bodies (`mcp_gateway` refuses framed payloads).
 //!
 //! A body the whole-document JSON parse refuses passes uninspected only when it
@@ -107,6 +129,17 @@
 //! aggregate per-request growth budget and stops before allocating past it;
 //! `custom_patterns` that match the empty string are refused at construction so
 //! a zero-width rule cannot amplify at every position.
+//!
+//! ## Bounded match iteration
+//!
+//! Enumerating every match of a regex can cost quadratic time even though each
+//! single search is linear: a pattern such as `.*[^A-Z]|[A-Z]` scans to the end
+//! of the haystack before reporting each one-byte match. A custom pattern whose
+//! longest match is unbounded (or long) is therefore charged, per match walk, an
+//! upper bound of the bytes each search could have scanned, against an
+//! allowance proportional to the haystack (see [`BoundedMatches`]). Exhausting
+//! it fails closed: redaction refuses the request with `413`, and a detection
+//! walk treats the pattern as matched.
 
 use async_trait::async_trait;
 use regex::{Regex, RegexSet};
@@ -120,7 +153,7 @@ use tracing::debug;
 
 use crate::plugins::utils::log_sampling::warn_sampled;
 
-use super::utils::body_transform::is_json_content_type;
+use super::utils::body_transform::{is_framed_grpc_content_type, is_json_content_type};
 use super::utils::mcp_jsonrpc;
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -226,6 +259,15 @@ const ALLOWED_CUSTOM_PATTERN_KEYS: &[&str] = &["name", "regex"];
 /// separately and precisely by [`MAX_REDACTION_PLACEHOLDER_BYTES`].
 const MAX_CUSTOM_PATTERN_NAME_CHARS: usize = 128;
 
+/// Hard ceiling on `custom_patterns` entries. Each entry compiles into its own
+/// `Regex` and into the shared detection `RegexSet`, so the count is a
+/// construction-cost bound. Same bound as `ai_response_guard`.
+const MAX_CUSTOM_PATTERNS: usize = 256;
+
+/// Hard ceiling on `max_scan_bytes`: the request body this plugin regex-scans
+/// and may rewrite synchronously. Same bound as `ai_response_guard`.
+const MAX_SCAN_BYTES_CEILING: usize = 64 * 1024 * 1024;
+
 /// Upper bound on the RENDERED per-pattern redaction placeholder — the
 /// configured template with `{type}` already substituted. Bounding the rendered
 /// form rather than the template is what actually caps amplification: a
@@ -249,12 +291,16 @@ const MIN_REDACTION_OUTPUT_GROWTH_BYTES: usize = 64 * 1024;
 /// Absolute ceiling on the growth allowance, independent of `max_scan_bytes`.
 const MAX_REDACTION_OUTPUT_GROWTH_BYTES: usize = 64 * 1024 * 1024;
 
-/// Prefix for the instance-specific marker recording that `before_proxy`
-/// admitted a request into this shield instance's scope, so
-/// `on_final_request_body` revalidates the exact backend-visible body it
-/// decided about. Instance-scoped for the same reason the deferral marker is:
-/// co-located shield instances must not consume each other's final check.
-const FINAL_INSPECTION_MARKER_PREFIX: &str = "ai_prompt_shield.final_inspection.";
+/// Multiplier on a haystack's length that sets how many bytes of regex search
+/// work one match walk over it may be charged (see [`BoundedMatches`]). A
+/// pattern whose longest match is at most `SEARCH_WORK_FACTOR - 1` bytes can
+/// never exhaust it, so only open-ended or very long custom patterns that
+/// produce many matches in one string are ever refused.
+const SEARCH_WORK_FACTOR: usize = 256;
+
+/// Floor for the per-walk search-work allowance, so a short haystack never
+/// refuses an ordinary number of matches.
+const MIN_SEARCH_WORK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Prefix for the instance-specific marker used to defer compressed request
 /// inspection until after all request-body transforms. Multiple shield
@@ -275,6 +321,22 @@ enum ShieldAction {
     Reject,
     Redact,
     Warn,
+}
+
+/// How one request's declared media type is treated by this instance (see the
+/// "Request scope in the ordinary modes" module note).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyScope {
+    /// Never inspected: framed native gRPC / gRPC-Web, or (in `mcp_arguments`)
+    /// a media type `mcp_gateway` does not admit.
+    Out,
+    /// A JSON media type (or, in `mcp_arguments`, no `Content-Type`). The body
+    /// is inspected, and one the shield cannot read as UTF-8 JSON is
+    /// uninspectable rather than silently forwarded.
+    Declared,
+    /// Ordinary modes only: no `Content-Type`, or a non-JSON one. The body is
+    /// inspected when it parses as JSON and left alone otherwise.
+    Sniffed,
 }
 
 /// How to scan the request body.
@@ -388,18 +450,6 @@ impl RedactionBudget {
     }
 }
 
-/// Append `value` to `output` only while the result stays within `ceiling`,
-/// so an expanding rewrite is refused BEFORE it allocates rather than after.
-fn push_within_ceiling(output: &mut String, value: &str, ceiling: usize) -> bool {
-    match output.len().checked_add(value.len()) {
-        Some(next) if next <= ceiling => {
-            output.push_str(value);
-            true
-        }
-        _ => false,
-    }
-}
-
 /// Replace every configured pattern's matches in `text` with that pattern's
 /// pre-rendered placeholder, under `budget`.
 ///
@@ -417,46 +467,168 @@ fn redact_text_bounded(text: &str, patterns: &[PiiPattern], budget: &RedactionBu
     if budget.is_exhausted() {
         return text.to_string();
     }
-    // Every intermediate pass over this one string is bounded by what the
-    // aggregate allowance can still pay for.
-    let ceiling = text.len().saturating_add(budget.remaining());
-    let mut result = text.to_string();
-    for pattern in patterns {
-        let mut matches = pattern.regex.find_iter(&result);
-        let Some(first_match) = matches.next() else {
-            continue;
-        };
-        let mut replaced = String::with_capacity(result.len());
-        let mut cursor = 0usize;
-        for matched in std::iter::once(first_match).chain(matches) {
-            // A zero-width match inserts the placeholder at every position and
-            // amplifies a bounded body without bound. Config admission already
-            // refuses patterns that match the empty string; a contextual
-            // assertion can still produce an empty span beside non-empty input,
-            // so refuse those here too.
-            if matched.start() == matched.end() {
-                budget.fail();
-                return text.to_string();
-            }
-            if !push_within_ceiling(&mut replaced, &result[cursor..matched.start()], ceiling)
-                || !push_within_ceiling(&mut replaced, &pattern.placeholder, ceiling)
-            {
-                budget.fail();
-                return text.to_string();
-            }
-            cursor = matched.end();
-        }
-        if !push_within_ceiling(&mut replaced, &result[cursor..], ceiling) {
-            budget.fail();
-            return text.to_string();
-        }
-        result = replaced;
-    }
-    let growth = result.len().saturating_sub(text.len());
+    // Live allocations (the still-resident intermediate plus the buffer being
+    // written) are bounded by what the aggregate allowance can still pay for,
+    // and the retained result is compacted to its length.
+    let limit = text.len().saturating_add(budget.remaining());
+    let Some(result) = replace_patterns_bounded(text, patterns, limit) else {
+        budget.fail();
+        return text.to_string();
+    };
+    // Charged on the JSON-escaped form: the rewritten prompt is serialized
+    // back into a JSON document, where a control-character placeholder grows
+    // six-fold.
+    let growth = super::ai_response_guard::json_escaped_len(&result)
+        .saturating_sub(super::ai_response_guard::json_escaped_len(text));
     if growth > 0 && !budget.charge_growth(growth) {
         return text.to_string();
     }
     result
+}
+
+/// Sequential literal replacement of every pattern's matches under a
+/// live-capacity bound AND a per-walk search-work bound.
+///
+/// The allocation contract is exactly
+/// `ai_response_guard`'s sequential bounded replacement: each pass
+/// reads the previous pass's output while writing the next, so the new buffer
+/// may use only `limit` minus the capacity of the still-resident intermediate;
+/// replacement is literal; a zero-width match is refused; the result is
+/// compacted. Match enumeration additionally goes through [`BoundedMatches`],
+/// so an open-ended custom pattern cannot turn one pass into quadratic search
+/// work. `None` is a refusal for either reason.
+fn replace_patterns_bounded(text: &str, patterns: &[PiiPattern], limit: usize) -> Option<String> {
+    let mut current: Option<String> = None;
+    for pattern in patterns {
+        let replaced = {
+            let input: &str = current.as_deref().unwrap_or(text);
+            let mut matches = BoundedMatches::new(pattern, input);
+            let Some(first_match) = matches.next() else {
+                if matches.exceeded() {
+                    return None;
+                }
+                continue;
+            };
+            let room = limit.checked_sub(current.as_ref().map_or(0, String::capacity))?;
+            let mut replaced = String::new();
+            replaced.try_reserve_exact(input.len().min(room)).ok()?;
+            let mut cursor = 0usize;
+            let mut next_match = Some(first_match);
+            while let Some(matched) = next_match {
+                if matched.start() == matched.end() {
+                    return None;
+                }
+                let gap = input.get(cursor..matched.start())?;
+                if !super::ai_response_guard::push_within_capacity(&mut replaced, gap, room)
+                    || !super::ai_response_guard::push_within_capacity(
+                        &mut replaced,
+                        &pattern.placeholder,
+                        room,
+                    )
+                {
+                    return None;
+                }
+                cursor = matched.end();
+                next_match = matches.next();
+            }
+            if matches.exceeded() {
+                return None;
+            }
+            let tail = input.get(cursor..)?;
+            if !super::ai_response_guard::push_within_capacity(&mut replaced, tail, room) {
+                return None;
+            }
+            replaced
+        };
+        current = Some(replaced);
+    }
+    let mut result = current.unwrap_or_else(|| text.to_string());
+    result.shrink_to_fit();
+    Some(result)
+}
+
+/// `Regex::find_iter` with a deterministic ceiling on the search work it may
+/// spend over one haystack.
+///
+/// Each search the iterator runs is linear, but enumerating every match is
+/// not: a search that starts at `p` may scan to the end of the haystack before
+/// reporting a short match, and the next search starts again just after it. A
+/// match found at `start` cannot have been decided by scanning past
+/// `start + max_match_len`, so each yielded match is charged
+/// `min(haystack_len, start + horizon) - previous_match_end` against an
+/// allowance of `SEARCH_WORK_FACTOR` times the haystack length (floored at
+/// [`MIN_SEARCH_WORK_BYTES`]). Built-in patterns carry no horizon and are never
+/// charged: they are fixed expressions with no late-dying preferred
+/// alternative. When the allowance runs out the iterator stops and
+/// [`BoundedMatches::exceeded`] reports it, so the caller fails closed instead
+/// of treating the truncated walk as complete.
+struct BoundedMatches<'r, 'h> {
+    matches: regex::Matches<'r, 'h>,
+    haystack_len: usize,
+    search_start: usize,
+    horizon: Option<usize>,
+    remaining: usize,
+    exceeded: bool,
+}
+
+impl<'r, 'h> BoundedMatches<'r, 'h> {
+    fn new(pattern: &'r PiiPattern, haystack: &'h str) -> Self {
+        Self {
+            matches: pattern.regex.find_iter(haystack),
+            haystack_len: haystack.len(),
+            search_start: 0,
+            horizon: pattern.search_horizon,
+            remaining: haystack
+                .len()
+                .saturating_mul(SEARCH_WORK_FACTOR)
+                .max(MIN_SEARCH_WORK_BYTES),
+            exceeded: false,
+        }
+    }
+
+    /// Whether the walk stopped because the search-work allowance ran out, so
+    /// the matches seen so far are NOT every match in the haystack.
+    fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+}
+
+impl<'h> Iterator for BoundedMatches<'_, 'h> {
+    type Item = regex::Match<'h>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.exceeded {
+            return None;
+        }
+        let matched = self.matches.next()?;
+        if let Some(horizon) = self.horizon {
+            let scanned_to = matched
+                .start()
+                .saturating_add(horizon)
+                .min(self.haystack_len);
+            let cost = scanned_to.saturating_sub(self.search_start);
+            match self.remaining.checked_sub(cost) {
+                Some(left) => self.remaining = left,
+                None => {
+                    self.exceeded = true;
+                    return None;
+                }
+            }
+        }
+        self.search_start = matched.end().max(self.search_start);
+        Some(matched)
+    }
+}
+
+/// The search horizon charged for a custom pattern by [`BoundedMatches`]: the
+/// longest match its syntax admits, in bytes, or `usize::MAX` when that length
+/// is unbounded (`+`, `*`, `{n,}`) or cannot be computed. Decided once at
+/// construction from the same pattern string the `Regex` compiled.
+fn custom_pattern_search_horizon(regex: &str) -> usize {
+    regex_syntax::parse(regex)
+        .ok()
+        .and_then(|hir| hir.properties().maximum_len())
+        .unwrap_or(usize::MAX)
 }
 
 /// A named regex pattern for PII detection.
@@ -468,6 +640,10 @@ struct PiiPattern {
     /// already substituted with `name`. Built once at config-load time so
     /// `redact_text` does not re-render the template per pattern per call.
     placeholder: String,
+    /// Search horizon charged by [`BoundedMatches`] for every match this
+    /// pattern yields; `None` (built-ins) is never charged. See
+    /// [`custom_pattern_search_horizon`].
+    search_horizon: Option<usize>,
 }
 
 pub struct AiPromptShield {
@@ -481,14 +657,10 @@ pub struct AiPromptShield {
     max_scan_bytes: usize,
     /// True when action is Redact — enables transform_request_body.
     needs_body_transform: bool,
-    /// True when the plugin has valid patterns and may need to inspect bodies.
-    requires_request_body: bool,
+    /// Monotonic per-instance id for private request-state witness entries.
+    instance_id: u64,
     /// Instance-specific metadata marker for compressed-body deferral.
     deferred_compressed_marker: String,
-    /// Instance-specific metadata marker recording that `before_proxy` admitted
-    /// this request into scope, so `on_final_request_body` revalidates the
-    /// backend-visible body this instance already decided about.
-    final_inspection_marker: String,
 }
 
 /// Built-in PII pattern definitions.
@@ -499,21 +671,6 @@ fn builtin_pattern(name: &str) -> Option<&'static str> {
     crate::plugins::utils::ai_pii::builtin_pii_pattern(name)
 }
 
-/// True when a JSON-looking media type actually carries framed native gRPC or
-/// gRPC-Web bytes instead of a bare JSON document. This mirrors the explicit
-/// scope guard in `ai_request_guard`.
-fn is_framed_grpc_content_type(content_type: &str) -> bool {
-    if crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes()) {
-        return true;
-    }
-
-    const GRPC_WEB_PREFIX: &[u8] = b"application/grpc-web";
-    let bytes = content_type.as_bytes();
-    bytes
-        .get(..GRPC_WEB_PREFIX.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(GRPC_WEB_PREFIX))
-}
-
 /// True when any comma-separated content-encoding token is non-identity.
 fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool {
     headers.get("content-encoding").is_some_and(|value| {
@@ -522,6 +679,150 @@ fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool 
             .map(str::trim)
             .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
     })
+}
+
+/// True when `body` consists only of JSON insignificant whitespace (or is
+/// empty): there is nothing in it for any decoder to read.
+fn is_json_whitespace_only(body: &[u8]) -> bool {
+    body.iter()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+}
+
+/// Whether `body` may be a JSON document some upstream decoder would read,
+/// even when the shield's strict UTF-8 parser refuses it. A sniffed request
+/// (no or a non-JSON `Content-Type`) is inspected exactly like declared JSON
+/// when this holds, and left alone otherwise, so relabelling the header cannot
+/// switch off a fail-closed disposition the body itself still triggers.
+///
+/// Every strict JSON text satisfies it. Beyond that it is deliberately
+/// conservative toward what lenient decoders accept: a byte-order mark,
+/// UTF-16 / UTF-32 (NUL bytes ahead of a JSON-shaped first character), a
+/// leading comment (`/`, `#`), leading Unicode whitespace, an object or array
+/// opener, a root string (a body that opens and closes with `"`), a root
+/// number, and the `true` / `false` / `null` / `NaN` / `Infinity` literals.
+/// Ordinary text and binary uploads do not satisfy it. Linear in the body and
+/// allocation-free.
+fn may_be_json_document(body: &[u8]) -> bool {
+    const BYTE_ORDER_MARKS: [&[u8]; 4] = [
+        b"\xEF\xBB\xBF",
+        b"\xFE\xFF",
+        b"\xFF\xFE",
+        b"\x00\x00\xFE\xFF",
+    ];
+    if BYTE_ORDER_MARKS.iter().any(|bom| body.starts_with(bom)) {
+        return true;
+    }
+    if body.contains(&0) {
+        let lead = body
+            .iter()
+            .copied()
+            .find(|byte| !matches!(byte, 0 | b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C));
+        if matches!(lead, Some(b'{' | b'[' | b'"' | b'/' | b'#')) {
+            return true;
+        }
+        // A BOM-less wide-encoded root number or literal (`4\0 1\0 …`).
+        if is_wide_encoded_scalar(body) {
+            return true;
+        }
+    }
+    let rest = trim_trailing_lenient_whitespace(skip_leading_lenient_whitespace(body));
+    match rest.first().copied() {
+        None => false,
+        Some(b'{' | b'[' | b'/' | b'#') => true,
+        Some(b'"') => rest.len() > 1 && rest.ends_with(b"\""),
+        Some(_) => is_json_like_scalar(rest),
+    }
+}
+
+/// Whether `body`, read with every NUL byte dropped, is one root JSON number or
+/// literal surrounded only by whitespace — the shape of a BOM-less UTF-16 /
+/// UTF-32 scalar document. Single pass, no allocation: the token is retained in
+/// a fixed buffer only as long as a literal can be.
+fn is_wide_encoded_scalar(body: &[u8]) -> bool {
+    const LONGEST_LITERAL: usize = 9;
+    let mut token = [0u8; LONGEST_LITERAL];
+    let mut token_len = 0usize;
+    let mut numeric = true;
+    let mut has_digit = false;
+    // 0: leading whitespace, 1: inside the token, 2: trailing whitespace.
+    let mut state = 0u8;
+    for byte in body.iter().copied().filter(|byte| *byte != 0) {
+        let whitespace = matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C);
+        match (state, whitespace) {
+            (0 | 2, true) => {}
+            (0 | 1, false) => {
+                state = 1;
+                has_digit |= byte.is_ascii_digit();
+                numeric &= matches!(byte, b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E');
+                if let Some(slot) = token.get_mut(token_len) {
+                    *slot = byte;
+                }
+                token_len = token_len.saturating_add(1);
+                if !numeric && token_len > LONGEST_LITERAL {
+                    return false;
+                }
+            }
+            (1, true) => state = 2,
+            _ => return false,
+        }
+    }
+    if token_len == 0 {
+        return false;
+    }
+    (numeric && has_digit) || token.get(..token_len).is_some_and(is_json_like_scalar)
+}
+
+/// A root JSON scalar other than a string, under strict or lenient spelling.
+fn is_json_like_scalar(text: &[u8]) -> bool {
+    if matches!(
+        text,
+        b"true" | b"false" | b"null" | b"NaN" | b"Infinity" | b"-Infinity" | b"+Infinity"
+    ) {
+        return true;
+    }
+    text.iter().any(u8::is_ascii_digit)
+        && text
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E'))
+}
+
+/// `body` without its leading ASCII whitespace (including JSON5's `\v` and
+/// `\f`) and leading Unicode whitespace / byte-order-mark characters, which a
+/// lenient decoder may skip.
+fn skip_leading_lenient_whitespace(mut body: &[u8]) -> &[u8] {
+    loop {
+        match body.first().copied() {
+            Some(b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) => body = &body[1..],
+            Some(0x80..=0xFF) => match leading_char(body) {
+                Some(ch) if ch.is_whitespace() || ch == '\u{FEFF}' => {
+                    body = body.get(ch.len_utf8()..).unwrap_or_default();
+                }
+                _ => return body,
+            },
+            _ => return body,
+        }
+    }
+}
+
+/// `body` without its trailing ASCII whitespace.
+fn trim_trailing_lenient_whitespace(mut body: &[u8]) -> &[u8] {
+    while let Some((last, rest)) = body.split_last() {
+        if !matches!(last, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) {
+            break;
+        }
+        body = rest;
+    }
+    body
+}
+
+/// The first UTF-8 character of `bytes`, when it opens with a valid one.
+fn leading_char(bytes: &[u8]) -> Option<char> {
+    let prefix = bytes.get(..4).unwrap_or(bytes);
+    let valid = match std::str::from_utf8(prefix) {
+        Ok(text) => text,
+        Err(error) => std::str::from_utf8(prefix.get(..error.valid_up_to())?).ok()?,
+    };
+    valid.chars().next()
 }
 
 impl AiPromptShield {
@@ -548,15 +849,12 @@ impl AiPromptShield {
             return Err("ai_prompt_shield: config must be an object".to_string());
         };
 
-        if let Some(unknown) = config_object
-            .keys()
-            .find(|key| !ALLOWED_CONFIG_KEYS.contains(&key.as_str()))
-        {
-            return Err(format!(
-                "ai_prompt_shield: unknown config field {unknown:?}; allowed fields: `{}`",
-                ALLOWED_CONFIG_KEYS.join("`, `")
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            ALLOWED_CONFIG_KEYS,
+            "ai_prompt_shield: `config`: ",
+        )?;
 
         let action = match optional_string(config, "action")?.unwrap_or("reject") {
             "reject" => ShieldAction::Reject,
@@ -588,6 +886,11 @@ impl AiPromptShield {
 
         let max_scan_bytes =
             optional_positive_usize(config, "max_scan_bytes")?.unwrap_or(1_048_576);
+        if max_scan_bytes > MAX_SCAN_BYTES_CEILING {
+            return Err(format!(
+                "ai_prompt_shield: `max_scan_bytes` must be at most {MAX_SCAN_BYTES_CEILING}"
+            ));
+        }
 
         // Build pattern list from config
         let pattern_names: Vec<String> =
@@ -599,6 +902,14 @@ impl AiPromptShield {
                     "aws_key".to_string(),
                 ]
             });
+
+        // Refuse duplicates before anything is compiled: with unknown names
+        // already fatal, this bounds the list by the built-in catalog.
+        super::ai_response_guard::reject_duplicate_names(
+            &pattern_names,
+            "ai_prompt_shield",
+            "patterns",
+        )?;
 
         let mut patterns: Vec<PiiPattern> = Vec::new();
 
@@ -614,6 +925,7 @@ impl AiPromptShield {
                             name: name.clone(),
                             regex,
                             placeholder,
+                            search_horizon: None,
                         });
                     }
                     Err(_) => {
@@ -632,6 +944,11 @@ impl AiPromptShield {
 
         // Add custom patterns
         if let Some(custom) = optional_array(config, "custom_patterns")? {
+            if custom.len() > MAX_CUSTOM_PATTERNS {
+                return Err(format!(
+                    "ai_prompt_shield: `custom_patterns` must have at most {MAX_CUSTOM_PATTERNS} entries"
+                ));
+            }
             for (index, entry) in custom.iter().enumerate() {
                 // Closed member set, exactly like the top-level gate: an
                 // unsupported nested option must be diagnosed at admission
@@ -641,15 +958,12 @@ impl AiPromptShield {
                         "ai_prompt_shield: `custom_patterns[{index}]` must be an object"
                     ));
                 };
-                if let Some(unknown) = entry_object
-                    .keys()
-                    .find(|key| !ALLOWED_CUSTOM_PATTERN_KEYS.contains(&key.as_str()))
-                {
-                    return Err(format!(
-                        "ai_prompt_shield: unknown config field `custom_patterns[{index}]` key {unknown:?}; allowed fields: `{}`",
-                        ALLOWED_CUSTOM_PATTERN_KEYS.join("`, `")
-                    ));
-                }
+                crate::util::unknown_keys::reject_unknown_keys(
+                    entry_object,
+                    &format!("custom_patterns[{index}]"),
+                    ALLOWED_CUSTOM_PATTERN_KEYS,
+                    &format!("ai_prompt_shield: `custom_patterns[{index}]`: "),
+                )?;
                 let name = entry_object
                     .get("name")
                     .and_then(Value::as_str)
@@ -679,6 +993,7 @@ impl AiPromptShield {
                             name: name.to_string(),
                             regex,
                             placeholder,
+                            search_horizon: Some(custom_pattern_search_horizon(regex_str)),
                         });
                     }
                     Err(_) => {
@@ -698,7 +1013,6 @@ impl AiPromptShield {
         }
 
         let needs_body_transform = action == ShieldAction::Redact;
-        let requires_request_body = !patterns.is_empty();
 
         // Build a single combined RegexSet for O(text_len) detection.
         // Each pattern was already validated above (compiled as a Regex), so
@@ -711,7 +1025,6 @@ impl AiPromptShield {
             })?;
         let marker_id = DEFERRED_MARKER_COUNTER.fetch_add(1, Ordering::Relaxed);
         let deferred_compressed_marker = format!("{DEFERRED_COMPRESSED_MARKER_PREFIX}{marker_id}");
-        let final_inspection_marker = format!("{FINAL_INSPECTION_MARKER_PREFIX}{marker_id}");
 
         Ok(Self {
             action,
@@ -721,9 +1034,8 @@ impl AiPromptShield {
             exclude_roles,
             max_scan_bytes,
             needs_body_transform,
-            requires_request_body,
+            instance_id: marker_id,
             deferred_compressed_marker,
-            final_inspection_marker,
         })
     }
 
@@ -764,6 +1076,10 @@ impl AiPromptShield {
                                 }
                             }
                         }
+                        // OpenAI Chat Completions tool calls the client replays
+                        // in its history: their arguments reach the model on
+                        // the next turn exactly like content does.
+                        collect_message_tool_call_arguments(msg, &mut texts);
                     }
                 }
                 // Many widely-used LLM request shapes do not use a `messages`
@@ -817,9 +1133,6 @@ impl AiPromptShield {
     /// (`ScanMode::Content`) or owned/`Cow` text (`ScanMode::All`, which must
     /// collect stringified JSON numbers that have no backing `&str`).
     fn detect_pii<S: AsRef<str>>(&self, texts: &[S]) -> Vec<String> {
-        if self.patterns.is_empty() {
-            return Vec::new();
-        }
         let mut hit = vec![false; self.patterns.len()];
         for text in texts {
             for idx in self.detection_set.matches(text.as_ref()).into_iter() {
@@ -848,10 +1161,6 @@ impl AiPromptShield {
     /// strings, and text runs separated by an image/non-text part are never
     /// joined.
     fn detect_pii_content_mode(&self, json: &Value) -> Vec<String> {
-        if self.patterns.is_empty() {
-            return Vec::new();
-        }
-
         let mut hit = vec![false; self.patterns.len()];
         let texts = self.extract_scan_text(json);
         for text in texts {
@@ -1017,13 +1326,23 @@ impl AiPromptShield {
     /// Mark patterns with at least one occurrence crossing a retained part
     /// boundary. Regex matches and boundary offsets are both ordered, so the
     /// inner walk is monotonic rather than restarting for each match.
+    ///
+    /// A pattern a fragment scan already matched needs no walk at all. A walk
+    /// that exhausts its search-work allowance ([`BoundedMatches`]) marks the
+    /// pattern as matched: the joined text does match it, and an unproven
+    /// boundary verdict must fail closed rather than open.
     fn mark_joined_boundary_hits(&self, joined: &str, boundaries: &[usize], hit: &mut [bool]) {
         for pattern_index in self.detection_set.matches(joined).into_iter() {
+            if hit.get(pattern_index).copied().unwrap_or(true) {
+                continue;
+            }
             let Some(pattern) = self.patterns.get(pattern_index) else {
                 continue;
             };
             let mut boundary_index = 0usize;
-            for matched in pattern.regex.find_iter(joined) {
+            let mut crossed = false;
+            let mut matches = BoundedMatches::new(pattern, joined);
+            for matched in matches.by_ref() {
                 while boundaries
                     .get(boundary_index)
                     .is_some_and(|boundary| *boundary <= matched.start())
@@ -1034,29 +1353,31 @@ impl AiPromptShield {
                     .get(boundary_index)
                     .is_some_and(|boundary| *boundary < matched.end())
                 {
-                    if let Some(slot) = hit.get_mut(pattern_index) {
-                        *slot = true;
-                    }
+                    crossed = true;
                     break;
                 }
+            }
+            if (crossed || matches.exceeded())
+                && let Some(slot) = hit.get_mut(pattern_index)
+            {
+                *slot = true;
             }
         }
     }
 
-    /// Fallback PII scan for a `ScanMode::All` body that failed to parse as
-    /// JSON. The decoded walker (`collect_json_strings`) needs a parsed
-    /// `Value`; a malformed JSON body has none, so without this the request
-    /// short-circuited to `Continue` and raw PII in a broken body failed open.
+    /// Fallback PII scan for a declared-JSON `ScanMode::All` body that failed
+    /// to parse. The decoded walker (`collect_json_strings`) needs a parsed
+    /// `Value`; a malformed JSON body has none.
     ///
     /// For `Reject`/`Warn` the documented all-mode contract is "scans the
-    /// entire body", so we scan the raw bytes as text — this is the same
-    /// coverage the original raw-body scan provided and cannot decode JSON
-    /// escapes, which is acceptable for an already-malformed body. For
-    /// `Redact` we return no detections: an unparseable body cannot be
-    /// re-serialized after redaction, so reporting PII we cannot remove would
-    /// be misleading; the request is forwarded unchanged as before.
+    /// entire body", so the raw text is scanned first and a hit is reported by
+    /// pattern name, exactly like a parsed body's. It returns nothing for
+    /// Content mode (there are no prompt fields to locate) and for `Redact` (an
+    /// unparseable body cannot be rewritten). Callers treat an empty result on
+    /// such a body as uninspectable ([`Self::handle_uninspectable_body`]), never
+    /// as clean: a lenient upstream decoder may still read it.
     fn detect_pii_raw_fallback(&self, body: &str) -> Vec<String> {
-        if self.action == ShieldAction::Redact {
+        if self.scan_mode != ScanMode::All || self.action == ShieldAction::Redact {
             return Vec::new();
         }
         self.detect_pii(std::slice::from_ref(&body))
@@ -1094,9 +1415,6 @@ impl AiPromptShield {
     /// rewrite cannot remove fails closed rather than forwarding PII while
     /// claiming redaction succeeded.
     fn detect_pii_all_mode(&self, json: &Value, raw: &str) -> Vec<String> {
-        if self.patterns.is_empty() {
-            return Vec::new();
-        }
         let mut hit = vec![false; self.patterns.len()];
         // Pass 1: decoded tokens.
         let mut texts: Vec<Cow<'_, str>> = Vec::new();
@@ -1114,6 +1432,9 @@ impl AiPromptShield {
         // the scalar's byte range.
         let preserved_spans = collect_preserved_top_level_scalar_spans(raw, json);
         for idx in self.detection_set.matches(raw).into_iter() {
+            if hit[idx] {
+                continue;
+            }
             if preserved_spans.is_empty() {
                 hit[idx] = true;
                 continue;
@@ -1122,13 +1443,17 @@ impl AiPromptShield {
                 continue;
             };
             let mut span_index = 0usize;
-            if pattern.regex.find_iter(raw).any(|matched| {
+            let mut matches = BoundedMatches::new(pattern, raw);
+            let outside_preserved = matches.by_ref().any(|matched| {
                 !match_is_inside_ordered_span(
                     matched.start()..matched.end(),
                     &preserved_spans,
                     &mut span_index,
                 )
-            }) {
+            });
+            // An exhausted walk proved nothing about the remaining matches, so
+            // it counts as a hit (fail closed).
+            if outside_preserved || matches.exceeded() {
                 hit[idx] = true;
             }
         }
@@ -1160,9 +1485,6 @@ impl AiPromptShield {
     /// every argument is caller-supplied tool input. Other members, other
     /// methods, and the rest of the envelope are not scanned.
     fn detect_pii_mcp_arguments(&self, json: &Value) -> Vec<String> {
-        if self.patterns.is_empty() {
-            return Vec::new();
-        }
         let mut hit = vec![false; self.patterns.len()];
         for call in mcp_jsonrpc::tool_calls_in_value(json) {
             let Some(arguments) = call.arguments else {
@@ -1192,28 +1514,98 @@ impl AiPromptShield {
             .collect()
     }
 
-    /// Whether a request `Content-Type` is in this instance's JSON scope.
+    /// How this instance treats a request with this `Content-Type`.
     ///
     /// `mcp_arguments` accepts exactly what `mcp_gateway` accepts — the MCP
     /// JSON media types (`application/json`, `application/json-rpc`, `+json`)
     /// or no `Content-Type` at all — so omitting the header cannot carry a
-    /// tool call past the shield. The other modes keep their JSON scope;
-    /// framed gRPC-Web stays out of scope except for `+json` in this mode.
-    fn content_type_in_scope(&self, content_type: Option<&str>) -> bool {
+    /// tool call past the shield; anything else is out of scope.
+    ///
+    /// The ordinary modes never let the header remove a body from inspection:
+    /// framed native gRPC / gRPC-Web (by the proxy's own delimiter-aware
+    /// classifiers, so `application/grpc-webhook+json` is NOT framed) is out of
+    /// scope, a JSON media type is declared JSON, and everything else —
+    /// including no `Content-Type` — is sniffed.
+    fn body_scope(&self, content_type: Option<&str>) -> BodyScope {
+        if self.scan_mode == ScanMode::McpArguments {
+            return match content_type {
+                None => BodyScope::Declared,
+                Some(value) if mcp_jsonrpc::content_type_is_json(value) => BodyScope::Declared,
+                Some(_) => BodyScope::Out,
+            };
+        }
         match content_type {
-            None => self.scan_mode == ScanMode::McpArguments,
-            Some(value) if self.scan_mode == ScanMode::McpArguments => {
-                mcp_jsonrpc::content_type_is_json(value)
-            }
-            Some(value) if is_framed_grpc_content_type(value) => false,
-            Some(value) => is_json_content_type(value),
+            Some(value) if is_framed_grpc_content_type(value) => BodyScope::Out,
+            Some(value) if is_json_content_type(value) => BodyScope::Declared,
+            _ => BodyScope::Sniffed,
         }
     }
 
-    /// Refuse (or, in warn mode, record) an MCP body whose member names are
-    /// duplicated: which `params.arguments` a server executes would then depend
-    /// on its JSON parser.
-    fn handle_ambiguous_mcp_body(&self, ctx: &mut RequestContext) -> PluginResult {
+    /// Whether a request method carries a body this instance inspects. The
+    /// ordinary modes cover every body-carrying write method an inference or
+    /// prompt endpoint uses (`POST`, `PUT`, `PATCH`); `mcp_arguments` keeps the
+    /// MCP transport's `POST`. One predicate for buffering, both inspection
+    /// hooks, the representation claim, and both transform variants, so another
+    /// body plugin forcing a buffer can never widen the shield's rewrites.
+    fn method_in_scope(&self, method: &str) -> bool {
+        method.eq_ignore_ascii_case("POST")
+            || (self.scan_mode != ScanMode::McpArguments
+                && (method.eq_ignore_ascii_case("PUT") || method.eq_ignore_ascii_case("PATCH")))
+    }
+
+    /// Refuse an in-scope body this instance cannot read for inspection, with
+    /// a fixed low-cardinality reason that never echoes a body byte.
+    fn reject_uninspectable_body(&self, ctx: &mut RequestContext, reason: &str) -> PluginResult {
+        ctx.metadata
+            .insert("ai_shield_rejected".to_string(), reason.to_string());
+        PluginResult::Reject {
+            status_code: 400,
+            body: serde_json::json!({
+                "error": "Request body could not be inspected",
+                "message": reason
+            })
+            .to_string(),
+            headers: HashMap::new(),
+        }
+    }
+
+    /// Refuse (or, in warn mode, record) a declared-JSON body in an ordinary
+    /// scan mode that cannot be read as UTF-8 JSON (`non_utf8_body`,
+    /// `malformed_json`). Forwarding it would hand a lenient upstream decoder
+    /// (BOM / UTF-16 / UTF-32 auto-detection, `NaN`, comments, trailing commas)
+    /// content this shield never inspected.
+    fn handle_uninspectable_body(
+        &self,
+        ctx: &mut RequestContext,
+        reason: &'static str,
+    ) -> PluginResult {
+        if self.action == ShieldAction::Warn {
+            warn_sampled!(
+                reason,
+                "ai_prompt_shield: request body could not be inspected (warn mode)"
+            );
+            ctx.metadata
+                .insert("ai_shield_warnings".to_string(), reason.to_string());
+            return PluginResult::Continue;
+        }
+        warn_sampled!(
+            reason,
+            "ai_prompt_shield: rejecting request body that could not be inspected"
+        );
+        self.reject_uninspectable_body(ctx, reason)
+    }
+
+    /// Refuse (or, in warn mode, record) a body whose member names are
+    /// duplicated, in every scan mode. `serde_json` keeps the LAST duplicate
+    /// while many upstream parsers keep the FIRST, so the shield would scan one
+    /// document and forward another: `{"content":"<PII>","content":"hi"}` is
+    /// scanned as `hi` and delivered as the PII (GHSA-c78j-5w9p-cpq6,
+    /// GHSA-49cr-v28q-9hgp). In `mcp_arguments` mode it decides which
+    /// `params.arguments` a server executes. Reject and redact refuse rather
+    /// than canonicalize: reject forwards the original bytes, and a redact
+    /// rewrite that collapsed the duplicates would silently change the
+    /// request.
+    fn handle_ambiguous_body(&self, ctx: &mut RequestContext) -> PluginResult {
         if self.action == ShieldAction::Warn {
             ctx.metadata.insert(
                 "ai_shield_warnings".to_string(),
@@ -1229,34 +1621,40 @@ impl AiPromptShield {
             status_code: 400,
             body: serde_json::json!({
                 "error": "Request body could not be inspected",
-                "message": "Request blocked because the MCP request body has duplicate member names."
+                "message": if self.scan_mode == ScanMode::McpArguments {
+                    "Request blocked because the MCP request body has duplicate member names."
+                } else {
+                    "Request blocked because the JSON request body has duplicate member names."
+                }
             })
             .to_string(),
             headers: HashMap::new(),
         }
     }
 
-    /// Whether this `mcp_arguments` instance must refuse the request's
-    /// declared `charset`: anything other than UTF-8 (see
-    /// [`mcp_jsonrpc::content_type_charset_is_utf8`]).
-    fn has_unsupported_mcp_charset(&self, headers: &HashMap<String, String>) -> bool {
-        self.scan_mode == ScanMode::McpArguments
+    /// Whether a declared-JSON request (every in-scope `mcp_arguments`
+    /// request, or a JSON media type in the ordinary modes) declares a
+    /// `charset` other than UTF-8 (see
+    /// [`mcp_jsonrpc::content_type_charset_is_utf8`]). A sniffed request is
+    /// never refused on its `charset`: its label is not a JSON claim.
+    fn has_unsupported_charset(&self, scope: BodyScope, headers: &HashMap<String, String>) -> bool {
+        scope == BodyScope::Declared
             && headers
                 .get("content-type")
                 .is_some_and(|value| !mcp_jsonrpc::content_type_charset_is_utf8(value))
     }
 
-    /// Refuse (or, in warn mode, record) an `mcp_arguments` request whose
+    /// Refuse (or, in warn mode, record) a declared-JSON request whose
     /// `Content-Type` declares a non-UTF-8 `charset`. The shield reads the body
     /// as UTF-8; an upstream that decodes by the declared charset (UTF-7 is
-    /// plain ASCII JSON) would execute arguments this shield never saw
+    /// plain ASCII JSON) would read content this shield never saw
     /// (GHSA-4f9m-cfqg-fhx9). Decided from headers alone, before any parse.
-    fn handle_unsupported_mcp_charset(&self, ctx: &mut RequestContext) -> PluginResult {
+    fn handle_unsupported_charset(&self, ctx: &mut RequestContext) -> PluginResult {
         const REASON: &str = "unsupported_charset";
         if self.action == ShieldAction::Warn {
             warn_sampled!(
                 reason = REASON,
-                "ai_prompt_shield: MCP request declares a non-UTF-8 charset (warn mode)"
+                "ai_prompt_shield: request declares a non-UTF-8 charset (warn mode)"
             );
             ctx.metadata
                 .insert("ai_shield_warnings".to_string(), REASON.to_string());
@@ -1264,9 +1662,12 @@ impl AiPromptShield {
         }
         warn_sampled!(
             reason = REASON,
-            "ai_prompt_shield: rejecting MCP request that declares a non-UTF-8 charset"
+            "ai_prompt_shield: rejecting request that declares a non-UTF-8 charset"
         );
-        self.reject_uninspectable_mcp_body(ctx, REASON)
+        if self.scan_mode == ScanMode::McpArguments {
+            return self.reject_uninspectable_mcp_body(ctx, REASON);
+        }
+        self.reject_uninspectable_body(ctx, REASON)
     }
 
     /// Refuse (or, in warn mode, record) an `mcp_arguments` body whose
@@ -1338,9 +1739,6 @@ impl AiPromptShield {
     /// survives minification unchanged — so it does not need to drive this
     /// contextual verdict as well.
     fn original_has_unredactable_contextual_match(&self, raw: &str) -> bool {
-        if self.patterns.is_empty() {
-            return false;
-        }
         // Cheap DFA pre-check: nothing fired on the raw body at all.
         if !self.detection_set.is_match(raw) {
             return false;
@@ -1358,7 +1756,8 @@ impl AiPromptShield {
         for pattern in &self.patterns {
             let mut removable_by_value_span = vec![None; value_spans.len()];
             let mut span_index = 0usize;
-            for m in pattern.regex.find_iter(raw) {
+            let mut matches = BoundedMatches::new(pattern, raw);
+            for m in matches.by_ref() {
                 while value_spans
                     .get(span_index)
                     .is_some_and(|span| span.end < m.start())
@@ -1389,6 +1788,11 @@ impl AiPromptShield {
                     return true;
                 }
             }
+            // A walk that ran out of search work never saw the remaining
+            // matches, so their removability is unproven: fail closed.
+            if matches.exceeded() {
+                return true;
+            }
         }
         false
     }
@@ -1412,10 +1816,16 @@ impl AiPromptShield {
         if body.len() > self.max_scan_bytes {
             return RedactionOutcome::NoChange;
         }
-        let Ok(mut json) = serde_json::from_str::<Value>(body) else {
+        let Ok(json) = serde_json::from_str::<Value>(body) else {
             return RedactionOutcome::NoChange;
         };
+        self.redact_parsed_document(body, json)
+    }
 
+    /// [`Self::apply_redaction_in_place`] for a caller that already parsed
+    /// `body` into `json` (and checked it against `max_scan_bytes`), so the
+    /// request path does not parse the same bytes twice.
+    fn redact_parsed_document(&self, body: &str, mut json: Value) -> RedactionOutcome {
         // One aggregate output/work allowance for this whole pass. Every
         // rewritten string is charged against it, so an expanding policy cannot
         // turn a bounded body into an unbounded rewrite (see
@@ -1550,9 +1960,6 @@ impl AiPromptShield {
     /// patterns that have no single rewritable token — all genuine
     /// "detected but not removed" cases.
     fn redacted_body_has_residual_pii(&self, json: &Value) -> bool {
-        if self.patterns.is_empty() {
-            return false;
-        }
         let mut check = json.clone();
         if let Value::Object(map) = &mut check {
             for (key, value) in map.iter_mut() {
@@ -1598,6 +2005,9 @@ impl AiPromptShield {
                         }
                     }
                 }
+
+                // Mirrors `collect_message_tool_call_arguments`.
+                redact_message_tool_call_arguments(msg, &|text| self.redact_text(text, budget));
             }
         }
 
@@ -1913,8 +2323,16 @@ impl Plugin for AiPromptShield {
         "ai_prompt_shield"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::AI_PROMPT_SHIELD
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -1940,13 +2358,19 @@ impl Plugin for AiPromptShield {
     }
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
-        self.requires_request_body
+        // The constructor refuses an instance without patterns, so every
+        // instance may need to inspect bodies.
+        true
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        self.requires_request_body
-            && ctx.method.eq_ignore_ascii_case("POST")
-            && self.content_type_in_scope(ctx.headers.get("content-type").map(String::as_str))
+        // Every request this instance may inspect is buffered — in the
+        // ordinary modes that is every `POST` / `PUT` / `PATCH` that is not
+        // framed gRPC, whatever its `Content-Type` says, so omitting or
+        // relabelling the header cannot keep a JSON body away from the shield.
+        self.method_in_scope(&ctx.method)
+            && self.body_scope(ctx.headers.get("content-type").map(String::as_str))
+                != BodyScope::Out
     }
 
     async fn before_proxy(
@@ -1954,16 +2378,18 @@ impl Plugin for AiPromptShield {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Only process POST requests
-        if !ctx.method.eq_ignore_ascii_case("POST") {
+        // Only process body-carrying methods in scope (see `method_in_scope`).
+        if !self.method_in_scope(&ctx.method) {
             return PluginResult::Continue;
         }
 
         // Check content-type. In `mcp_arguments` mode, `+json` media types
         // (including `application/grpc-web+json`) are explicitly in scope.
         // Other modes skip framed native gRPC / gRPC-Web bodies so framing is
-        // preserved; native gRPC requests are excluded via HTTP_ONLY_PROTOCOLS.
-        if !self.content_type_in_scope(headers.get("content-type").map(String::as_str)) {
+        // preserved (native gRPC requests are excluded via HTTP_ONLY_PROTOCOLS),
+        // and sniff every other body (see `body_scope`).
+        let scope = self.body_scope(headers.get("content-type").map(String::as_str));
+        if scope == BodyScope::Out {
             return PluginResult::Continue;
         }
 
@@ -1972,74 +2398,109 @@ impl Plugin for AiPromptShield {
         }
 
         // A non-UTF-8 `charset` is decided from headers, before any parse. Warn
-        // mode records it and leaves the request unmarked: the body is not read
-        // as the text an upstream will decode, so there is nothing to scan.
-        if self.has_unsupported_mcp_charset(headers) {
-            return self.handle_unsupported_mcp_charset(ctx);
+        // mode records it and scans nothing: the body is not read as the text
+        // an upstream will decode.
+        if self.has_unsupported_charset(scope, headers) {
+            return self.handle_unsupported_charset(ctx);
         }
 
-        // This instance owns the request from here on. Carry that scope into
-        // `on_final_request_body` so a later body transform cannot change
-        // policy-relevant content after this hook decided (see the
-        // "final backend-visible body is authoritative" note above). The marker
-        // is instance-private, so co-located shield instances never consume each
-        // other's final check.
-        ctx.metadata
-            .insert(self.final_inspection_marker.clone(), "true".to_string());
-
-        // Decompression may occur later in request-body transforms. Mark this
-        // instance for deferred inspection instead of parsing compressed bytes
-        // and silently allowing the request.
+        // Decompression may occur later in request-body transforms. Mark a
+        // declared-JSON request for deferred inspection instead of parsing
+        // compressed bytes and silently allowing it. A sniffed body that is
+        // still encoded here is decided by the final hook, over the plaintext
+        // the representation gate stages for an enforcing instance (see
+        // `enforces_final_request_body_policy`).
         if has_non_identity_content_encoding(headers) {
-            ctx.metadata
-                .insert(self.deferred_compressed_marker.clone(), "true".to_string());
+            if scope == BodyScope::Declared {
+                ctx.metadata
+                    .insert(self.deferred_compressed_marker.clone(), "true".to_string());
+            }
             return PluginResult::Continue;
         }
 
-        // Get request body
+        // Get request body. The proxy publishes no UTF-8 view of a buffered
+        // body that is not valid UTF-8, but always records its size, so a
+        // missing view beside a recorded size is a non-UTF-8 body, not an
+        // absent one. A declared-JSON body in an ordinary mode is then
+        // uninspectable; `mcp_arguments` leaves that verdict to the final hook
+        // (see the "MCP tool arguments" module note), and so does a sniffed
+        // body, whose bytes only the final hook sees.
         let body = match ctx.metadata.get("request_body") {
             Some(b) if !b.is_empty() => b.as_str(),
-            _ => return PluginResult::Continue,
+            Some(_) => return PluginResult::Continue,
+            None => {
+                if scope == BodyScope::Declared
+                    && self.scan_mode != ScanMode::McpArguments
+                    && ctx.metadata.contains_key("request_body_size_bytes")
+                {
+                    return self.handle_uninspectable_body(ctx, "non_utf8_body");
+                }
+                return PluginResult::Continue;
+            }
         };
 
-        // Size limit check
+        // A sniffed body is held to exactly the declared-JSON rules once it may
+        // be a JSON document at all — including its `charset`, its size, and
+        // a strict-parse failure — and left alone otherwise (a text or binary
+        // upload), so relabelling the header changes nothing about a JSON
+        // prompt (see `may_be_json_document`).
+        if scope == BodyScope::Sniffed {
+            if !may_be_json_document(body.as_bytes()) {
+                return PluginResult::Continue;
+            }
+            if self.has_unsupported_charset(BodyScope::Declared, headers) {
+                return self.handle_unsupported_charset(ctx);
+            }
+        }
+
+        // Size limit check.
         if body.len() > self.max_scan_bytes {
             let body_size = body.len();
             return self.handle_oversize_body(ctx, body_size);
         }
 
-        // An MCP body whose member names are duplicated is read one way here
-        // and possibly another way by the server that executes the call.
-        if self.scan_mode == ScanMode::McpArguments
-            && crate::util::json_dup_keys::slice_ambiguity(body.as_bytes()).is_some()
-        {
-            return self.handle_ambiguous_mcp_body(ctx);
+        // A body whose member names are duplicated is read one way here and
+        // possibly another way by the upstream that consumes it, in every scan
+        // mode (see `handle_ambiguous_body`). Screen the exact bytes before any
+        // parse; ordinary malformed JSON keeps its own disposition below.
+        if ctx.json_scan_memo.ambiguity_str(body).is_some() {
+            return self.handle_ambiguous_body(ctx);
         }
 
         // Detect PII and capture streaming intent from the same parsed JSON.
         // Scan-all mode walks decoded JSON string values instead of raw bytes
         // so JSON escapes cannot hide PII or prompt-injection payloads from the
-        // detector while the backend sees the decoded text.
+        // detector while the backend sees the decoded text. The parsed document
+        // is kept so redaction does not parse the same bytes again.
         //
         // The streaming flag is captured before mutating `ctx.metadata`
         // because `body` borrows from `ctx.metadata.get("request_body")`.
-        let (detected, is_streaming_request) = match self.scan_mode {
-            ScanMode::All => match serde_json::from_str::<Value>(body) {
+        let (detected, is_streaming_request, parsed) = match self.scan_mode {
+            ScanMode::All | ScanMode::Content => match serde_json::from_str::<Value>(body) {
                 Ok(json) => {
                     let is_streaming = json.get("stream").and_then(|s| s.as_bool()) == Some(true);
-                    (self.detect_pii_all_mode(&json, body), is_streaming)
+                    let detected = if self.scan_mode == ScanMode::All {
+                        self.detect_pii_all_mode(&json, body)
+                    } else {
+                        self.detect_pii_content_mode(&json)
+                    };
+                    (detected, is_streaming, Some(json))
                 }
-                // Malformed JSON in all-mode: handled below for non-redact
-                // actions by falling back to a raw-body scan so PII in an
-                // unparseable body cannot fail open.
-                Err(_) => (self.detect_pii_raw_fallback(body), false),
-            },
-            ScanMode::Content => match serde_json::from_str::<Value>(body) {
-                Ok(json) => {
-                    let is_streaming = json.get("stream").and_then(|s| s.as_bool()) == Some(true);
-                    (self.detect_pii_content_mode(&json), is_streaming)
+                Err(_) => {
+                    // A body consisting only of whitespace carries nothing for
+                    // any decoder to read.
+                    if is_json_whitespace_only(body.as_bytes()) {
+                        return PluginResult::Continue;
+                    }
+                    // Declared JSON the strict parser refuses: all-mode
+                    // reject/warn still report raw PII by name, and anything
+                    // else is uninspectable rather than silently forwarded.
+                    let raw = self.detect_pii_raw_fallback(body);
+                    if raw.is_empty() {
+                        return self.handle_uninspectable_body(ctx, "malformed_json");
+                    }
+                    (raw, false, None)
                 }
-                Err(_) => return PluginResult::Continue,
             },
             // A JSON-RPC envelope carries no `stream` flag. A body the
             // whole-document parse refuses passes only when it is not
@@ -2048,7 +2509,14 @@ impl Plugin for AiPromptShield {
             // budget (GHSA-f2jp-59r9-fp64), and a lenient upstream parser
             // accepts what serde refuses.
             ScanMode::McpArguments => match serde_json::from_str::<Value>(body) {
-                Ok(json) => (self.detect_pii_mcp_arguments(&json), false),
+                Ok(json) => {
+                    let is_streaming = json.get("stream").and_then(|s| s.as_bool()) == Some(true);
+                    (
+                        self.detect_pii_mcp_arguments(&json),
+                        is_streaming,
+                        Some(json),
+                    )
+                }
                 Err(_) => {
                     if mcp_body_may_carry_tool_call(body.as_bytes()) {
                         return self.handle_unparseable_mcp_body(ctx);
@@ -2058,13 +2526,26 @@ impl Plugin for AiPromptShield {
             },
         };
 
+        let clean_body_digest = if detected.is_empty() {
+            Some(crate::fips::approved::Sha256::digest(body.as_bytes()))
+        } else {
+            None
+        };
+
         // `body` borrow released — safe to mutate ctx.metadata now.
-        if is_streaming_request {
+        // In `mcp_arguments` mode, defer publishing `ai_request_streaming` to
+        // `on_final_request_body_with_context` (via the private witness or the
+        // re-parsed final body) so a later body transform changing `stream`
+        // from `true` to `false` cannot leave a stale streaming marker behind.
+        if is_streaming_request && self.scan_mode != ScanMode::McpArguments {
             ctx.metadata
                 .insert("ai_request_streaming".to_string(), "true".to_string());
         }
 
-        if detected.is_empty() {
+        if let Some(digest) = clean_body_digest {
+            ctx.plugin_state_mut()
+                .ai_prompt_shield_clean_hashes
+                .insert(self.instance_id, (digest, is_streaming_request));
             return PluginResult::Continue;
         }
 
@@ -2117,8 +2598,9 @@ impl Plugin for AiPromptShield {
                 // reusing the earlier `&str` borrow on `ctx.metadata`:
                 // the borrow checker can't see that the existing borrow
                 // ends before the upcoming mutations, and cloning the
-                // body once on this path is cheap relative to the JSON
-                // parse + regex walk we're about to do.
+                // body once on this path is cheap relative to the regex
+                // walk we're about to do. The document parsed above is
+                // reused rather than parsed a second time.
                 //
                 // `transform_request_body` still runs on the normal
                 // backend dispatch path and re-applies the same redaction
@@ -2131,7 +2613,11 @@ impl Plugin for AiPromptShield {
                     .get("request_body")
                     .cloned()
                     .unwrap_or_default();
-                match self.apply_redaction_in_place(&original_body) {
+                let outcome = match parsed {
+                    Some(json) => self.redact_parsed_document(&original_body, json),
+                    None => self.apply_redaction_in_place(&original_body),
+                };
+                match outcome {
                     RedactionOutcome::Redacted(json) => {
                         // Only claim redaction once the rewritten body is
                         // verified free of detectable PII (see
@@ -2271,7 +2757,7 @@ impl Plugin for AiPromptShield {
     }
 
     fn needs_final_request_body_context(&self) -> bool {
-        self.requires_request_body
+        true
     }
 
     /// Claim the finalized backend-visible representation for an enforcing
@@ -2281,72 +2767,72 @@ impl Plugin for AiPromptShield {
     ///
     /// The claim is decided from configuration and request state only, never by
     /// decoding `body`. `warn` never claims: it cannot refuse anything, so a
-    /// body it merely fails to observe must not become a `400`. Requests outside
-    /// the documented JSON `POST` scope are not claimed either, so an ordinary
-    /// compressed upload on an unrelated route is unaffected.
+    /// body it merely fails to observe must not become a `400`. Every in-scope
+    /// request is claimed, sniffed ones included: whether an encoded sniffed
+    /// body is a JSON prompt can only be decided over its plaintext, so the
+    /// `Content-Type` must not decide whether a decoder runs. An enforcing
+    /// shield therefore refuses a compressed upload on its route that the gate
+    /// cannot decode, whatever its media type.
     fn enforces_final_request_body_policy(
         &self,
         ctx: &RequestContext,
         headers: &HashMap<String, String>,
         _body: &[u8],
     ) -> bool {
-        if !self.requires_request_body || self.action == ShieldAction::Warn {
+        if self.action == ShieldAction::Warn {
             return false;
         }
-        if !ctx.method.eq_ignore_ascii_case("POST") {
+        if !self.method_in_scope(&ctx.method) {
             return false;
         }
-        self.content_type_in_scope(headers.get("content-type").map(String::as_str))
+        self.body_scope(headers.get("content-type").map(String::as_str)) != BodyScope::Out
     }
 
     /// The authoritative policy decision over the exact backend-visible request
     /// body, after every `transform_request_body` hook has run.
     ///
-    /// Two request classes reach substantive inspection here:
+    /// Scope is decided again from the FINAL headers rather than inherited from
+    /// `before_proxy`: a later header rewrite (`text/plain` relabelled to
+    /// `application/json`, say) can bring a request into scope that the early
+    /// hook skipped, and the core buffers it for exactly that reason. Every
+    /// in-scope request therefore gets substantive inspection here:
     ///
-    /// * **Revalidation.** `before_proxy` already decided an ordinary plaintext
-    ///   body, but later body transforms can put policy-relevant content back
-    ///   into it. Re-running detection over the dispatched bytes is what keeps
-    ///   the shield's verdict a statement about what the backend receives rather
-    ///   than about a pre-transform approximation. `redact` fails closed here:
-    ///   this hook can refuse a request but cannot rewrite wire bytes, so PII
-    ///   surviving to this point is an unfulfilled redaction obligation.
+    /// * **Revalidation.** Later body transforms can put policy-relevant
+    ///   content back into a body `before_proxy` decided. Re-running detection
+    ///   over the dispatched bytes is what keeps the shield's verdict a
+    ///   statement about what the backend receives rather than about a
+    ///   pre-transform approximation. `redact` fails closed here: this hook can
+    ///   refuse a request but cannot rewrite wire bytes, so PII surviving to
+    ///   this point is an unfulfilled redaction obligation.
     /// * **Deferred compressed bodies.** The body was still encoded during
     ///   `before_proxy` and was never inspected, so an unreadable representation
     ///   is itself a fail-closed condition for enforcing actions.
     ///
-    /// The two classes differ only in how an UNREADABLE body is treated. A
-    /// deferred body that cannot be reduced to plaintext JSON was never
-    /// inspected at all and fails closed; a revalidated body reuses exactly the
-    /// disposition `before_proxy` applied to the same condition, so this hook
-    /// can never invent a rejection class the early hook would have waved
-    /// through.
+    /// A declared-JSON body that is not readable UTF-8 JSON is uninspectable in
+    /// both classes and fails closed for enforcing actions, exactly as it does
+    /// in `before_proxy`. A sniffed body gets exactly the same treatment when
+    /// it may be a JSON document ([`may_be_json_document`]) and is left alone
+    /// otherwise.
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // Both markers are instance-private and are CONSUMED here: a
-        // re-finalization that skips the transform pass must not re-decide a
-        // body this instance already governed.
+        // The deferral marker is instance-private and CONSUMED here, so
+        // co-located shield instances never consume each other's deferred
+        // check.
         let deferred = ctx
             .metadata
             .remove(&self.deferred_compressed_marker)
             .is_some();
-        let in_scope = ctx.metadata.remove(&self.final_inspection_marker).is_some();
-        if !deferred && !in_scope {
+
+        if !self.method_in_scope(&ctx.method) {
             return PluginResult::Continue;
         }
 
-        // The markers can only be set by `before_proxy` on a POST. Keep the
-        // method check defensive for direct hook callers and future runner
-        // changes.
-        if !ctx.method.eq_ignore_ascii_case("POST") {
-            return PluginResult::Continue;
-        }
-
-        if !self.content_type_in_scope(headers.get("content-type").map(String::as_str)) {
+        let scope = self.body_scope(headers.get("content-type").map(String::as_str));
+        if scope == BodyScope::Out {
             return PluginResult::Continue;
         }
 
@@ -2354,8 +2840,8 @@ impl Plugin for AiPromptShield {
         // `before_proxy`: a request that hook passed still passes, one it
         // refused never reaches here, and only a header a later transform
         // rewrote to a non-UTF-8 charset is refused at this point.
-        if self.has_unsupported_mcp_charset(headers) {
-            return self.handle_unsupported_mcp_charset(ctx);
+        if self.has_unsupported_charset(scope, headers) {
+            return self.handle_unsupported_charset(ctx);
         }
 
         // Read through the shared gate: when a content coding is present on a
@@ -2366,6 +2852,14 @@ impl Plugin for AiPromptShield {
             Some(plaintext) => plaintext,
             None => {
                 if has_non_identity_content_encoding(headers) {
+                    // `warn` never claims, so an encoded sniffed body has no
+                    // plaintext view and nothing says it is JSON at all; it is
+                    // left alone rather than recorded on every compressed
+                    // upload. Enforcing actions claimed it and fail closed.
+                    if scope == BodyScope::Sniffed && !deferred && self.action == ShieldAction::Warn
+                    {
+                        return PluginResult::Continue;
+                    }
                     // Nothing reduced this body to plaintext — no `compression`
                     // instance decoded it and (for `warn`, which never claims)
                     // the gate did not either.
@@ -2375,51 +2869,98 @@ impl Plugin for AiPromptShield {
             }
         };
 
+        // A sniffed body is held to exactly the declared-JSON rules below once
+        // it may be a JSON document at all — its `charset`, its size, UTF-8,
+        // and a strict-parse failure — and left alone otherwise (a text or
+        // binary upload), mirroring `before_proxy`.
+        // A request already selected by the compressed-body deferral is a JSON
+        // candidate by that selection, so it skips the sniff — but never the
+        // charset rule its final headers now impose.
+        if scope == BodyScope::Sniffed {
+            if !deferred && !may_be_json_document(body) {
+                return PluginResult::Continue;
+            }
+            if self.has_unsupported_charset(BodyScope::Declared, headers) {
+                return self.handle_unsupported_charset(ctx);
+            }
+        }
+
         if body.len() > self.max_scan_bytes {
             return self.handle_oversize_body(ctx, body.len());
+        }
+
+        // Fast path: if `before_proxy` already scanned these exact bytes and
+        // proved them clean (zero PII matches, valid UTF-8, unambiguous JSON),
+        // skip the duplicate duplicate-key scan, JSON DOM parse, and RegexSet
+        // walk in the final-body phase.
+        if !deferred
+            && let Some((expected, is_streaming)) = ctx.plugin_state_opt_mut().and_then(|state| {
+                state
+                    .ai_prompt_shield_clean_hashes
+                    .remove(&self.instance_id)
+            })
+            && expected == crate::fips::approved::Sha256::digest(body)
+        {
+            if is_streaming {
+                ctx.metadata
+                    .insert("ai_request_streaming".to_string(), "true".to_string());
+            }
+            return PluginResult::Continue;
         }
 
         let Ok(body_text) = std::str::from_utf8(body) else {
             if deferred {
                 return self.handle_uninspectable_deferred_body(ctx, "non_utf8_body");
             }
-            // A non-UTF-8 `mcp_arguments` body (UTF-16 / UTF-32, a UTF-16 BOM,
-            // Latin-1) may be decoded by a lenient upstream into a call this
-            // shield never inspected, so it takes the unparseable-body path.
-            // This does not contradict `before_proxy`: the proxy publishes no
-            // UTF-8 `request_body` view for such bytes, so `before_proxy` never
-            // inspected them and decided nothing about them (it continued for
-            // want of a body); this hook is the first to see them.
+            // A non-UTF-8 declared-JSON body (UTF-16 / UTF-32, a UTF-16 BOM,
+            // Latin-1) may be decoded by a lenient upstream into content this
+            // shield never inspected. `mcp_arguments` takes its unparseable-body
+            // path; the ordinary modes refuse it as uninspectable, which is the
+            // verdict `before_proxy` already reached when the proxy recorded the
+            // body without a UTF-8 view.
             if self.scan_mode == ScanMode::McpArguments {
                 return self.handle_unparseable_mcp_body(ctx);
             }
-            // Other modes mirror `before_proxy`, which continued on exactly
-            // this condition, rather than inventing a new rejection class on
-            // revalidation.
-            return PluginResult::Continue;
+            return self.handle_uninspectable_body(ctx, "non_utf8_body");
         };
+        // The backend receives exactly these bytes, so they must be one
+        // unambiguous document (see the matching screen in `before_proxy`).
+        // This is also the first screen a deferred compressed body gets.
+        if ctx.json_scan_memo.ambiguity_str(body_text).is_some() {
+            return self.handle_ambiguous_body(ctx);
+        }
         let json = match serde_json::from_str::<Value>(body_text) {
             Ok(json) => json,
             Err(_) => {
                 if deferred {
                     return self.handle_uninspectable_deferred_body(ctx, "malformed_json");
                 }
-                // Same mirroring: `ScanMode::All` falls back to a raw-body scan
-                // for non-redact actions, Content mode continues, and
                 // `mcp_arguments` applies exactly the `before_proxy` test — an
                 // empty bridged body or one not recognizable as a document that
                 // could carry a `tools/call` continues; one that may is refused.
-                let detected = match self.scan_mode {
-                    ScanMode::All => self.detect_pii_raw_fallback(body_text),
-                    ScanMode::Content => Vec::new(),
+                // The ordinary modes apply the `before_proxy` disposition too: an
+                // all-whitespace body continues, all-mode reject/warn report raw
+                // PII by name, and anything else is uninspectable.
+                return match self.scan_mode {
                     ScanMode::McpArguments => {
                         if mcp_body_may_carry_tool_call(body) {
-                            return self.handle_unparseable_mcp_body(ctx);
+                            self.handle_unparseable_mcp_body(ctx)
+                        } else {
+                            PluginResult::Continue
                         }
-                        Vec::new()
+                    }
+                    ScanMode::All | ScanMode::Content => {
+                        if is_json_whitespace_only(body) {
+                            return PluginResult::Continue;
+                        }
+                        let detected = self.detect_pii_raw_fallback(body_text);
+                        if detected.is_empty() {
+                            self.handle_uninspectable_body(ctx, "malformed_json")
+                        } else {
+                            self.decide_final_request_body(ctx, detected)
+                        }
                     }
                 };
-                return self.decide_final_request_body(ctx, detected);
             }
         };
 
@@ -2452,7 +2993,7 @@ impl Plugin for AiPromptShield {
         content_type: Option<&str>,
         request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if !ctx.method.eq_ignore_ascii_case("POST") {
+        if !self.method_in_scope(&ctx.method) {
             return None;
         }
         // A later compression plugin may already have stripped the encoding
@@ -2478,7 +3019,7 @@ impl Plugin for AiPromptShield {
         // paths use the context-aware variant.
         if !request_headers
             .get(":method")
-            .is_some_and(|method| method.eq_ignore_ascii_case("POST"))
+            .is_some_and(|method| self.method_in_scope(method))
         {
             return None;
         }
@@ -2499,9 +3040,11 @@ impl AiPromptShield {
             return None;
         }
 
-        // Only transform JSON
+        // Never rewrite framed gRPC (or, in `mcp_arguments`, a media type the
+        // gateway does not admit). A sniffed body is rewritten only when it
+        // parses as JSON, which `apply_redaction_in_place` decides.
         if let Some(ct) = content_type
-            && !self.content_type_in_scope(Some(ct))
+            && self.body_scope(Some(ct)) == BodyScope::Out
         {
             return None;
         }
@@ -3077,9 +3620,12 @@ fn redact_content_part_text(part: &mut Value, redact: &impl Fn(&str) -> String) 
 ///   the untyped union spelling of a tool call, whose `input` arguments are
 ///   replayed to the model on the next turn and are often the largest text in
 ///   it. Only `input` is scanned: the sibling `toolUseId`/`name` fields are
-///   call plumbing, not prose. The Anthropic `type: "tool_use"` spelling is
-///   deliberately NOT read here — a declared non-text block type stays outside
-///   Content-mode scanning, as `text_content_part_text` and its tests record.
+///   call plumbing, not prose.
+/// * Anthropic `{"type": "tool_use" | "server_tool_use" | "mcp_tool_use",
+///   "id", "name", "input"}` — the same tool call in the typed spelling. Only
+///   `input` is read, through the same bounded argument walk; the block's own
+///   `text` (it has none in the documented shape) stays outside scanning like
+///   any other declared non-text block.
 ///
 /// Tool-result content is text the model reads verbatim from a third party,
 /// which is exactly where a smuggled payload hides; the sibling
@@ -3107,6 +3653,67 @@ fn collect_content_block_nested_text<'a>(block: &'a Value, texts: &mut Vec<&'a s
         .and_then(|tool_use| tool_use.get("input"))
     {
         collect_tool_argument_text(input, texts, 0);
+    } else if is_anthropic_tool_use_block(block)
+        && let Some(input) = block.get("input")
+    {
+        collect_tool_argument_text(input, texts, 0);
+    }
+}
+
+/// Whether a content block is an Anthropic tool call (`tool_use`, or the
+/// server-executed `server_tool_use` / `mcp_tool_use` spellings), whose `input`
+/// arguments are replayed to the model on the next turn.
+fn is_anthropic_tool_use_block(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("tool_use" | "server_tool_use" | "mcp_tool_use")
+    )
+}
+
+/// OpenAI Chat Completions `messages[].tool_calls[].function.arguments` and the
+/// legacy `messages[].function_call.arguments` of one message. A client replays
+/// the assistant's earlier calls in its history, so those arguments are
+/// model-visible on the next turn. The documented spelling is a JSON-encoded
+/// string, scanned as opaque text; an object spelling (Ollama and several
+/// OpenAI-compatible servers) goes through the bounded argument walk. Function
+/// names and call ids are plumbing and are not read. The mutating counterpart
+/// is [`redact_message_tool_call_arguments`].
+fn collect_message_tool_call_arguments<'a>(message: &'a Value, texts: &mut Vec<&'a str>) {
+    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for call in calls {
+            if let Some(arguments) = call
+                .get("function")
+                .and_then(|function| function.get("arguments"))
+            {
+                collect_tool_argument_text(arguments, texts, 0);
+            }
+        }
+    }
+    if let Some(arguments) = message
+        .get("function_call")
+        .and_then(|function| function.get("arguments"))
+    {
+        collect_tool_argument_text(arguments, texts, 0);
+    }
+}
+
+/// Mutable mirror of [`collect_message_tool_call_arguments`].
+fn redact_message_tool_call_arguments(message: &mut Value, redact: &impl Fn(&str) -> String) {
+    if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+        for call in calls.iter_mut() {
+            if let Some(arguments) = call
+                .get_mut("function")
+                .and_then(|function| function.get_mut("arguments"))
+            {
+                redact_tool_argument_text(arguments, redact, 0);
+            }
+        }
+    }
+    if let Some(arguments) = message
+        .get_mut("function_call")
+        .and_then(|function| function.get_mut("arguments"))
+    {
+        redact_tool_argument_text(arguments, redact, 0);
     }
 }
 
@@ -3182,6 +3789,12 @@ fn redact_content_block_nested_text(block: &mut Value, redact: &impl Fn(&str) ->
     if let Some(input) = block
         .get_mut("toolUse")
         .and_then(|tool_use| tool_use.get_mut("input"))
+    {
+        redact_tool_argument_text(input, redact, 0);
+        return;
+    }
+    if is_anthropic_tool_use_block(block)
+        && let Some(input) = block.get_mut("input")
     {
         redact_tool_argument_text(input, redact, 0);
     }
@@ -3306,6 +3919,25 @@ fn is_function_call_output_item(object: &serde_json::Map<String, Value>) -> bool
     object.get("type").and_then(Value::as_str) == Some("function_call_output")
 }
 
+/// The `arguments` of an OpenAI Responses tool-call input item
+/// (`{"type": "function_call", "call_id", "name", "arguments"}`), which the
+/// client replays to the model on the next turn, or `None` for anything else.
+/// Read through the bounded argument walk (a JSON-encoded string in the
+/// documented shape); `name` and `call_id` are plumbing. Like the
+/// function-result item it carries no `role`, so `exclude_roles` does not
+/// suppress it.
+fn function_call_arguments_payload(object: &serde_json::Map<String, Value>) -> Option<&Value> {
+    if !is_function_call_item(object) {
+        return None;
+    }
+    object.get("arguments")
+}
+
+/// Whether this object is an OpenAI Responses tool-call input item.
+fn is_function_call_item(object: &serde_json::Map<String, Value>) -> bool {
+    object.get("type").and_then(Value::as_str) == Some("function_call")
+}
+
 /// Collect scannable text from a top-level LLM content field
 /// (`prompt`/`input`/`instructions`/`system`/`inputText`). Handles a plain
 /// string, an array of strings, an array of content parts (see
@@ -3331,6 +3963,9 @@ fn collect_field_text<'a>(
                             // Responses function-result item: model-visible text
                             // lives under `output`.
                             collect_tool_result_content_text(Some(output), texts);
+                        } else if let Some(arguments) = function_call_arguments_payload(obj) {
+                            // Responses tool-call item replayed in the history.
+                            collect_tool_argument_text(arguments, texts, 0);
                         } else if let Some(content) = obj.get("content") {
                             if obj
                                 .get("role")
@@ -3353,6 +3988,10 @@ fn collect_field_text<'a>(
         Value::Object(obj) => {
             if let Some(output) = function_call_output_payload(obj) {
                 collect_tool_result_content_text(Some(output), texts);
+                return;
+            }
+            if let Some(arguments) = function_call_arguments_payload(obj) {
+                collect_tool_argument_text(arguments, texts, 0);
                 return;
             }
             if let Some(content) = obj.get("content") {
@@ -3416,6 +4055,12 @@ fn redact_field_text(
                     redact_tool_result_content_text(obj.get_mut("output"), redact);
                     continue;
                 }
+                if is_function_call_item(obj)
+                    && let Some(arguments) = obj.get_mut("arguments")
+                {
+                    redact_tool_argument_text(arguments, redact, 0);
+                    continue;
+                }
                 if obj
                     .get("role")
                     .and_then(|r| r.as_str())
@@ -3431,6 +4076,12 @@ fn redact_field_text(
         Value::Object(obj) => {
             if is_function_call_output_item(obj) {
                 redact_tool_result_content_text(obj.get_mut("output"), redact);
+                return;
+            }
+            if is_function_call_item(obj)
+                && let Some(arguments) = obj.get_mut("arguments")
+            {
+                redact_tool_argument_text(arguments, redact, 0);
                 return;
             }
             let excluded = obj
@@ -3509,10 +4160,22 @@ fn collect_gemini_prompt_text<'a>(
         for part in parts {
             if let Some(text) = text_content_part_text(part) {
                 texts.push(text);
+                continue;
+            }
+            // A model turn's `functionCall` is replayed with its `args`; read
+            // both the JSON and proto casings, like the system instruction.
+            for key in GEMINI_FUNCTION_CALL_KEYS {
+                if let Some(args) = part.get(key).and_then(|call| call.get("args")) {
+                    collect_tool_argument_text(args, texts, 0);
+                }
             }
         }
     });
 }
+
+/// The JSON (`functionCall`) and proto (`function_call`) casings of a Gemini
+/// tool-call part. Either reaches the model, so both are read.
+const GEMINI_FUNCTION_CALL_KEYS: [&str; 2] = ["functionCall", "function_call"];
 
 /// Redact PII in every Gemini / Vertex prompt part scanned by
 /// [`collect_gemini_prompt_text`], keeping Content-mode detection and
@@ -3554,7 +4217,14 @@ fn redact_parts_text(parts: Option<&mut Value>, redact: &impl Fn(&str) -> String
         return;
     };
     for part in parts.iter_mut() {
-        redact_content_part_text(part, redact);
+        if redact_content_part_text(part, redact) {
+            continue;
+        }
+        for key in GEMINI_FUNCTION_CALL_KEYS {
+            if let Some(args) = part.get_mut(key).and_then(|call| call.get_mut("args")) {
+                redact_tool_argument_text(args, redact, 0);
+            }
+        }
     }
 }
 
@@ -3910,8 +4580,11 @@ fn redact_json_strings(
             let rendered = n.to_string();
             if let Some(pattern) = patterns.iter().find(|p| p.regex.is_match(&rendered)) {
                 // Replacing a scalar can grow the document just like rewriting
-                // a string, so charge the same aggregate allowance.
-                let growth = pattern.placeholder.len().saturating_sub(rendered.len());
+                // a string, so charge the same aggregate allowance, measured
+                // as serialized: the escaped placeholder plus its quotes.
+                let growth = super::ai_response_guard::json_escaped_len(&pattern.placeholder)
+                    .saturating_add(2)
+                    .saturating_sub(rendered.len());
                 if growth > 0 && !budget.charge_growth(growth) {
                     return;
                 }

@@ -86,7 +86,8 @@ async fn readiness_admin(
                     && bearer.is_some_and(|token| {
                         jsonwebtoken::decode::<serde_json::Value>(
                             token,
-                            &jsonwebtoken::DecodingKey::from_secret(identity.jwt_secret.as_bytes()),
+                            &jsonwebtoken::DecodingKey::from_secret(identity.jwt_secret.as_bytes())
+                                .unwrap(),
                             &validation,
                         )
                         .is_ok()

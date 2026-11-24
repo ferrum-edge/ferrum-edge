@@ -24,6 +24,12 @@ pub fn register_global_allocator() {
     ALLOCATOR_INSTALLED.store(true, Ordering::Relaxed);
 }
 
+/// Whether this process registered `ForwardingAllocator` as its global
+/// allocator. Every profile that reports allocator coverage reads this one flag.
+pub fn allocator_installed() -> bool {
+    ALLOCATOR_INSTALLED.load(Ordering::Relaxed)
+}
+
 pub fn count(counter: usize, amount: usize) {
     store::with_local(|local| local.add(counter, amount as u64));
 }
@@ -150,10 +156,7 @@ pub fn render_prometheus() -> String {
         ("unpublished_events", snapshot.unpublished_events),
         ("lost_events", snapshot.lost_events),
         ("slot_capacity", store::THREAD_SLOTS as u64),
-        (
-            "allocator_installed",
-            u64::from(ALLOCATOR_INSTALLED.load(Ordering::Relaxed)),
-        ),
+        ("allocator_installed", u64::from(allocator_installed())),
     ];
     for (name, value) in metadata {
         let _ = writeln!(text, "ferrum_h1_profile_{name} {value}");

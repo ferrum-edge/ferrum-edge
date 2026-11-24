@@ -111,6 +111,14 @@
 //! cost is at most one relist sweep per floor interval, and only while mesh
 //! content is being withheld — a state that is otherwise a config outage.
 //!
+//! Withholding can also be persistent: a scope that can never list (an
+//! authorization refusal held by the watcher, a list that keeps failing) keeps
+//! the watermark unavailable, so every reconcile retains and asks again. A
+//! refresh cannot produce that proof, so each watcher doubles its spacing
+//! whenever a refresh fired without [`K8sConfigRevisionTracker::published_floor`]
+//! advancing since its previous one, up to the default idle-relist window, and
+//! returns to the floor as soon as the sequence advances (issue #7259).
+//!
 //! # Monotonicity
 //!
 //! Per scope the watermark is a running maximum, so it never falls. The
@@ -303,6 +311,14 @@ impl K8sConfigRevisionTracker {
         self.refresh_requests.send_modify(|generation| {
             *generation = generation.wrapping_add(1);
         });
+    }
+
+    /// The highest sequence this tracker has published (`0` before any).
+    ///
+    /// Watchers compare it across demand-driven refreshes to back off while
+    /// their refreshes are not letting the sequence advance (issue #7259).
+    pub fn published_floor(&self) -> u64 {
+        self.floor.load(Ordering::Acquire)
     }
 
     /// Whether this tracker publishes revisions at all.

@@ -35,8 +35,8 @@
 //! (DP side, `xds_client::reverse_translate`) both go through the
 //! [`MeshSliceCarrier`] enum here so the two halves cannot drift. Adding a new
 //! carried field is a single edit: add a variant + its `type_url` + its
-//! encode/decode arm, and the round-trip test in this module will fail until
-//! both halves are wired.
+//! encode/decode arm, and add it to the round-trip test in this module, which
+//! fails until both halves are wired.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -49,13 +49,15 @@ use crate::modes::mesh::config::{
     TrustBundleSet, Workload,
 };
 use crate::modes::mesh::revision::MeshConfigRevision;
-use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
+use crate::modes::mesh::slice::{
+    DestinationRuleHostExclusion, MeshEgressScopeSnapshot, MeshHttpRouteSet, MeshSlice,
+};
 
 /// Common inner `type_url` prefix for every Ferrum mesh-slice carrier.
 pub const FERRUM_CARRIER_TYPE_URL_PREFIX: &str = "type.googleapis.com/ferrum.config.extension.v3.";
 
 /// Inner `type_url` for the full `MeshService` carrier (protocol + per-service
-/// workload refs that the name-only CDS/EDS reconstruction cannot express).
+/// workload refs). The DP's only source of slice `services` over xDS.
 pub const FERRUM_ECDS_SERVICES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.ServicesCarrier";
 /// Inner `type_url` for the inbound-only view of the local workload's own
@@ -106,6 +108,10 @@ pub const FERRUM_ECDS_WORKLOADS_TYPE_URL: &str =
 /// Inner `type_url` for the Ambient UDP source-evidence workload inventory.
 pub const FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.AmbientUdpSourceWorkloadsCarrier";
+/// Inner `type_url` for the control-plane-resolved DestinationRule host
+/// exclusions (`MeshSlice::destination_rule_host_exclusions`, issue #7395).
+pub const FERRUM_ECDS_DESTINATION_RULE_HOST_EXCLUSIONS_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.DestinationRuleHostExclusionsCarrier";
 /// Inner `type_url` for the exact NodeWaypoint assertor SPIFFE inventory.
 pub const FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.NodeWaypointAssertorsCarrier";
@@ -123,6 +129,16 @@ pub const FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_DESTINATIONS_TYPE_URL: &str =
 /// resolver would default PERMISSIVE.
 pub const FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.NodeWaypointCapturePeerAuthenticationsCarrier";
+/// Inner `type_url` for the AuthorizationPolicy (`MeshPolicy`) entries
+/// applicable to the NodeWaypoint capture destinations. Carried SEPARATELY from
+/// `MeshPoliciesCarrier`, which is the subscription-namespace view; without this
+/// carrier a captured pod's cross-namespace DENY/ALLOW never reaches an xDS DP
+/// and the scoped evaluator would judge the connection against an incomplete
+/// policy set. Its PRESENCE is the inventory's completeness evidence (emitted
+/// even when empty); a DP that recovers capture destinations without it refuses
+/// the slice.
+pub const FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_MESH_POLICIES_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.NodeWaypointCaptureMeshPoliciesCarrier";
 /// Inner `type_url` for the effective workload-label context carrier.
 pub const FERRUM_ECDS_LABELS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.WorkloadLabelsCarrier";
@@ -145,6 +161,12 @@ pub const FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL: &str =
 /// beside the L4 proxies.
 pub const FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.VirtualServiceL4UpstreamsCarrier";
+/// Inner `type_url` for the VirtualService HTTP routes a NodeWaypoint serves
+/// (issue #7233): route proxies, their weighted-split upstreams and their
+/// route plugin configs (`MeshSlice::http_routes`). The DP re-checks the set
+/// when it decodes the slice, before anything is materialized.
+pub const FERRUM_ECDS_HTTP_ROUTES_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.HttpRoutesCarrier";
 /// Inner `type_url` for the authorization-policy carrier (`MeshPolicy` list).
 pub const FERRUM_ECDS_MESH_POLICIES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.MeshPoliciesCarrier";
@@ -263,6 +285,9 @@ pub enum MeshSliceCarrier {
     ConfigRevision(MeshConfigRevision),
     Workloads(Vec<Workload>),
     AmbientUdpSourceWorkloads(Vec<Workload>),
+    /// Control-plane-resolved DestinationRule host exclusions (issue #7395);
+    /// see [`FERRUM_ECDS_DESTINATION_RULE_HOST_EXCLUSIONS_TYPE_URL`].
+    DestinationRuleHostExclusions(Vec<DestinationRuleHostExclusion>),
     NodeWaypointAssertors(Vec<NodeWaypointAssertor>),
     /// Cross-namespace NodeWaypoint capture destination workloads (issue #3287);
     /// see [`FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_DESTINATIONS_TYPE_URL`].
@@ -270,6 +295,9 @@ pub enum MeshSliceCarrier {
     /// PeerAuthentication candidates for those destinations (issue #3287); see
     /// [`FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL`].
     NodeWaypointCapturePeerAuthentications(Vec<PeerAuthentication>),
+    /// AuthorizationPolicy entries for those destinations; see
+    /// [`FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_MESH_POLICIES_TYPE_URL`].
+    NodeWaypointCaptureMeshPolicies(Vec<MeshPolicy>),
     WorkloadLabels(BTreeMap<String, String>),
     /// Marker: `WorkloadLabels` is an ambiguous shared-SPIFFE intersection, not
     /// the workload's authoritative labels. Always `true` when emitted (the CP
@@ -277,6 +305,9 @@ pub enum MeshSliceCarrier {
     LabelsAmbiguous(bool),
     VirtualServiceL4Proxies(Vec<serde_json::Value>),
     VirtualServiceL4Upstreams(Vec<serde_json::Value>),
+    /// VirtualService HTTP routes for a NodeWaypoint (issue #7233); see
+    /// [`FERRUM_ECDS_HTTP_ROUTES_TYPE_URL`]. Emitted only when non-empty.
+    HttpRoutes(MeshHttpRouteSet),
     MeshPolicies(Vec<MeshPolicy>),
     ExtAuthzProviders(Vec<crate::modes::mesh::config::MeshExtAuthzProvider>),
     VirtualServiceCorsPolicies(Vec<MeshVirtualServiceCorsPolicy>),
@@ -336,6 +367,9 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::AmbientUdpSourceWorkloads(_) => {
                 FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL
             }
+            MeshSliceCarrier::DestinationRuleHostExclusions(_) => {
+                FERRUM_ECDS_DESTINATION_RULE_HOST_EXCLUSIONS_TYPE_URL
+            }
             MeshSliceCarrier::NodeWaypointAssertors(_) => {
                 FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL
             }
@@ -345,10 +379,14 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(_) => {
                 FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL
             }
+            MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(_) => {
+                FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_MESH_POLICIES_TYPE_URL
+            }
             MeshSliceCarrier::WorkloadLabels(_) => FERRUM_ECDS_LABELS_TYPE_URL,
             MeshSliceCarrier::LabelsAmbiguous(_) => FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL,
             MeshSliceCarrier::VirtualServiceL4Proxies(_) => FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL,
             MeshSliceCarrier::VirtualServiceL4Upstreams(_) => FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL,
+            MeshSliceCarrier::HttpRoutes(_) => FERRUM_ECDS_HTTP_ROUTES_TYPE_URL,
             MeshSliceCarrier::MeshPolicies(_) => FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
             MeshSliceCarrier::ExtAuthzProviders(_) => FERRUM_ECDS_EXT_AUTHZ_PROVIDERS_TYPE_URL,
             MeshSliceCarrier::VirtualServiceCorsPolicies(_) => {
@@ -388,6 +426,9 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::ConfigRevision(_) => "config-revision",
             MeshSliceCarrier::Workloads(_) => "workloads",
             MeshSliceCarrier::AmbientUdpSourceWorkloads(_) => "ambient-udp-source-workloads",
+            MeshSliceCarrier::DestinationRuleHostExclusions(_) => {
+                "destination-rule-host-exclusions"
+            }
             MeshSliceCarrier::NodeWaypointAssertors(_) => "node-waypoint-assertors",
             MeshSliceCarrier::NodeWaypointCaptureDestinations(_) => {
                 "node-waypoint-capture-destinations"
@@ -395,10 +436,14 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(_) => {
                 "node-waypoint-capture-peer-authentications"
             }
+            MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(_) => {
+                "node-waypoint-capture-mesh-policies"
+            }
             MeshSliceCarrier::WorkloadLabels(_) => "workload-labels",
             MeshSliceCarrier::LabelsAmbiguous(_) => "workload-labels-ambiguous",
             MeshSliceCarrier::VirtualServiceL4Proxies(_) => "virtual-service-l4-proxies",
             MeshSliceCarrier::VirtualServiceL4Upstreams(_) => "virtual-service-l4-upstreams",
+            MeshSliceCarrier::HttpRoutes(_) => "http-routes",
             MeshSliceCarrier::MeshPolicies(_) => "mesh-policies",
             MeshSliceCarrier::ExtAuthzProviders(_) => "ext-authz-providers",
             MeshSliceCarrier::VirtualServiceCorsPolicies(_) => "virtual-service-cors-policies",
@@ -431,13 +476,16 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::ConfigRevision(value) => encode(value),
             MeshSliceCarrier::Workloads(value) => encode(value),
             MeshSliceCarrier::AmbientUdpSourceWorkloads(value) => encode(value),
+            MeshSliceCarrier::DestinationRuleHostExclusions(value) => encode(value),
             MeshSliceCarrier::NodeWaypointAssertors(value) => encode(value),
             MeshSliceCarrier::NodeWaypointCaptureDestinations(value) => encode(value),
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(value) => encode(value),
+            MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(value) => encode(value),
             MeshSliceCarrier::WorkloadLabels(value) => encode(value),
             MeshSliceCarrier::LabelsAmbiguous(value) => encode(value),
             MeshSliceCarrier::VirtualServiceL4Proxies(value) => encode(value),
             MeshSliceCarrier::VirtualServiceL4Upstreams(value) => encode(value),
+            MeshSliceCarrier::HttpRoutes(value) => encode(value),
             MeshSliceCarrier::MeshPolicies(value) => encode(value),
             MeshSliceCarrier::ExtAuthzProviders(value) => encode(value),
             MeshSliceCarrier::VirtualServiceCorsPolicies(value) => encode(value),
@@ -503,6 +551,9 @@ impl MeshSliceCarrier {
             FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL => {
                 MeshSliceCarrier::AmbientUdpSourceWorkloads(decode_json(value)?)
             }
+            FERRUM_ECDS_DESTINATION_RULE_HOST_EXCLUSIONS_TYPE_URL => {
+                MeshSliceCarrier::DestinationRuleHostExclusions(decode_json(value)?)
+            }
             FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL => {
                 MeshSliceCarrier::NodeWaypointAssertors(decode_json(value)?)
             }
@@ -511,6 +562,9 @@ impl MeshSliceCarrier {
             }
             FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL => {
                 MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(decode_json(value)?)
+            }
+            FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_MESH_POLICIES_TYPE_URL => {
+                MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(decode_json(value)?)
             }
             FERRUM_ECDS_LABELS_TYPE_URL => MeshSliceCarrier::WorkloadLabels(decode_json(value)?),
             FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL => {
@@ -522,6 +576,7 @@ impl MeshSliceCarrier {
             FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL => {
                 MeshSliceCarrier::VirtualServiceL4Upstreams(decode_json(value)?)
             }
+            FERRUM_ECDS_HTTP_ROUTES_TYPE_URL => MeshSliceCarrier::HttpRoutes(decode_json(value)?),
             FERRUM_ECDS_MESH_POLICIES_TYPE_URL => {
                 MeshSliceCarrier::MeshPolicies(decode_json(value)?)
             }
@@ -626,6 +681,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL => {
             Some("ferrum-mesh-carrier/ambient-udp-source-workloads")
         }
+        FERRUM_ECDS_DESTINATION_RULE_HOST_EXCLUSIONS_TYPE_URL => {
+            Some("ferrum-mesh-carrier/destination-rule-host-exclusions")
+        }
         FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL => {
             Some("ferrum-mesh-carrier/node-waypoint-assertors")
         }
@@ -634,6 +692,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         }
         FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL => {
             Some("ferrum-mesh-carrier/node-waypoint-capture-peer-authentications")
+        }
+        FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_MESH_POLICIES_TYPE_URL => {
+            Some("ferrum-mesh-carrier/node-waypoint-capture-mesh-policies")
         }
         FERRUM_ECDS_LABELS_TYPE_URL => Some("ferrum-mesh-carrier/workload-labels"),
         FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL => {
@@ -645,6 +706,7 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL => {
             Some("ferrum-mesh-carrier/virtual-service-l4-upstreams")
         }
+        FERRUM_ECDS_HTTP_ROUTES_TYPE_URL => Some("ferrum-mesh-carrier/http-routes"),
         FERRUM_ECDS_MESH_POLICIES_TYPE_URL => Some("ferrum-mesh-carrier/mesh-policies"),
         FERRUM_ECDS_EXT_AUTHZ_PROVIDERS_TYPE_URL => Some("ferrum-mesh-carrier/ext-authz-providers"),
         FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL => {
@@ -830,6 +892,11 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
             slice.ambient_udp_source_workloads.clone(),
         ));
     }
+    if !slice.destination_rule_host_exclusions.is_empty() {
+        carriers.push(MeshSliceCarrier::DestinationRuleHostExclusions(
+            slice.destination_rule_host_exclusions.clone(),
+        ));
+    }
     if !slice.node_waypoint_assertors.is_empty() {
         carriers.push(MeshSliceCarrier::NodeWaypointAssertors(
             slice.node_waypoint_assertors.clone(),
@@ -849,16 +916,18 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
             slice.node_waypoint_capture_peer_authentications.clone(),
         ));
     }
+    // The destination AuthorizationPolicy carrier doubles as the inventory's
+    // COMPLETENESS evidence: it is emitted whenever the producer resolved the
+    // inventory, INCLUDING an empty result, so the DP can tell "resolved, no
+    // applicable policy" from "never resolved" and refuse the latter.
+    if slice.node_waypoint_capture_mesh_policies_resolved {
+        carriers.push(MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(
+            slice.node_waypoint_capture_mesh_policies.clone(),
+        ));
+    }
     // Emitted UNCONDITIONALLY (unlike the other field groups, which are gated
-    // on non-empty), even when `slice.labels` is empty. This push is
-    // load-bearing: it is what makes `recovered.slice_carrier_seen` reliably
-    // true for any Ferrum CP, which is the DP's "this CP is carrier-aware"
-    // sentinel that selects the carried `services` over the name-only CDS/EDS
-    // reconstruction (see `reverse_translate`). Do NOT make this conditional
-    // (e.g. "skip when empty") without introducing an explicit carrier-aware
-    // flag — otherwise a Ferrum CP with empty labels AND empty services would
-    // set `slice_carrier_seen=false` and silently fall back to reconstructing
-    // services the carrier path intended to be empty.
+    // on non-empty), even when `slice.labels` is empty; `docs/mesh.md` lists
+    // it among the carriers whose presence is evidence.
     carriers.push(MeshSliceCarrier::WorkloadLabels(slice.labels.clone()));
     // Ambiguous-labels marker: emitted only when set (the DP defaults it to
     // false). It tells the DP that the `WorkloadLabels` carrier above is a
@@ -877,6 +946,9 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
         carriers.push(MeshSliceCarrier::VirtualServiceL4Upstreams(
             slice.virtual_service_l4_upstreams.clone(),
         ));
+    }
+    if !slice.http_routes.is_empty() {
+        carriers.push(MeshSliceCarrier::HttpRoutes(slice.http_routes.clone()));
     }
     if !slice.mesh_policies.is_empty() {
         carriers.push(MeshSliceCarrier::MeshPolicies(slice.mesh_policies.clone()));
@@ -972,79 +1044,6 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     carriers
 }
 
-/// Apply a decoded carrier onto the in-progress reverse-translated slice.
-///
-/// The DP collects every carrier it decodes off the ECDS stream, then applies
-/// them onto the slice it is rebuilding from CDS/EDS/LDS/RDS. Each variant
-/// overwrites the corresponding slice field; a slice never sees a partially
-/// applied carrier because apply happens after the whole ECDS resource list is
-/// decoded.
-pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
-    match carrier {
-        MeshSliceCarrier::Services(value) => slice.services = value,
-        MeshSliceCarrier::LocalInboundServices(value) => slice.local_inbound_services = value,
-        MeshSliceCarrier::LocalInboundWorkloads(value) => {
-            slice.local_inbound_workloads = Some(value)
-        }
-        MeshSliceCarrier::LocalIngressListeners(value) => slice.local_ingress_listeners = value,
-        MeshSliceCarrier::SidecarIngressDeclared(value) => slice.sidecar_ingress_declared = value,
-        MeshSliceCarrier::SidecarIngressDeclaredPorts(value) => {
-            slice.declared_ingress_http_ports = value
-        }
-        MeshSliceCarrier::ConfigRevision(value) => slice.revision = Some(value),
-        MeshSliceCarrier::Workloads(value) => slice.workloads = value,
-        MeshSliceCarrier::AmbientUdpSourceWorkloads(value) => {
-            slice.ambient_udp_source_workloads = value
-        }
-        MeshSliceCarrier::NodeWaypointAssertors(value) => slice.node_waypoint_assertors = value,
-        MeshSliceCarrier::NodeWaypointCaptureDestinations(value) => {
-            slice.node_waypoint_capture_destinations = value
-        }
-        MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(value) => {
-            slice.node_waypoint_capture_peer_authentications = value
-        }
-        MeshSliceCarrier::WorkloadLabels(value) => slice.labels = value,
-        MeshSliceCarrier::LabelsAmbiguous(value) => slice.labels_ambiguous = value,
-        MeshSliceCarrier::VirtualServiceL4Proxies(value) => {
-            slice.virtual_service_l4_proxies = value
-        }
-        MeshSliceCarrier::VirtualServiceL4Upstreams(value) => {
-            slice.virtual_service_l4_upstreams = value
-        }
-        MeshSliceCarrier::MeshPolicies(value) => slice.mesh_policies = value,
-        MeshSliceCarrier::ExtAuthzProviders(value) => slice.ext_authz_providers = value,
-        MeshSliceCarrier::VirtualServiceCorsPolicies(value) => {
-            slice.virtual_service_cors_policies = value
-        }
-        MeshSliceCarrier::PeerAuthentications(value) => slice.peer_authentications = value,
-        MeshSliceCarrier::RequestAuthentications(value) => slice.request_authentications = value,
-        MeshSliceCarrier::ServiceEntries(value) => slice.service_entries = value,
-        MeshSliceCarrier::TelemetryResources(value) => slice.telemetry_resources = value,
-        MeshSliceCarrier::ProxyConfigs(value) => slice.proxy_configs = value,
-        MeshSliceCarrier::TrustBundles(value) => slice.trust_bundles = Some(value),
-        MeshSliceCarrier::OutboundTrafficPolicy(value) => {
-            slice.outbound_traffic_policy = Some(value)
-        }
-        MeshSliceCarrier::SidecarOutboundTrafficPolicy(value) => {
-            slice.sidecar_outbound_traffic_policy = Some(value)
-        }
-        MeshSliceCarrier::MultiCluster(value) => slice.multi_cluster = Some(value),
-        MeshSliceCarrier::SidecarEgressScope(value) => slice.sidecar_egress_scope = Some(value),
-        MeshSliceCarrier::WaypointGatewayClass(value) => slice.waypoint_gateway_class = Some(value),
-        MeshSliceCarrier::ServiceWaypointBoundServices(value) => {
-            slice.service_waypoint_bound_services = value
-        }
-        // Decode already rejects blank values; defend in depth so an empty
-        // variant constructed in-process cannot clear trustworthy provenance.
-        MeshSliceCarrier::IstioRootNamespace(value) => {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                slice.istio_root_namespace = trimmed.to_string();
-            }
-        }
-    }
-}
-
 /// Workload identity a Ferrum DP communicates to the CP via the xDS
 /// `Node.metadata` bytes shim (the minimal proto carries `bytes`, a placeholder
 /// for Envoy's `google.protobuf.Struct`). JSON-encoded so it stays
@@ -1067,6 +1066,11 @@ pub struct XdsNodeMetadata {
     /// legacy DPs, which then receive no inventory and fail closed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub node_waypoint_capture_scoping: bool,
+    /// This node is a Sidecar that serves mesh-bound VirtualService `http[]`
+    /// routes (issue #7423), so the CP carries them on its slice
+    /// (`HttpRoutesCarrier`). Absent on other topologies, which receive none.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sidecar_http_routes: bool,
 }
 
 /// Per-node scoping flags the CP remembers for an ADS stream and replays into
@@ -1080,12 +1084,19 @@ pub struct XdsNodeMetadata {
 pub struct XdsNodeScoping {
     pub ambient_udp_source_scoping: bool,
     pub node_waypoint_capture_scoping: bool,
+    /// Sidecar VirtualService `http[]` route carriage (issue #7423). Not a
+    /// cross-namespace inventory: it only selects whether the slice carries
+    /// the routes already visible to the subscription namespace.
+    pub sidecar_http_routes: bool,
 }
 
 impl XdsNodeScoping {
-    /// `true` when the node requested no cross-namespace inventory at all.
+    /// `true` when the node requested no cross-namespace inventory and no
+    /// Sidecar route carriage.
     pub fn is_default(&self) -> bool {
-        !self.ambient_udp_source_scoping && !self.node_waypoint_capture_scoping
+        !self.ambient_udp_source_scoping
+            && !self.node_waypoint_capture_scoping
+            && !self.sidecar_http_routes
     }
 }
 
@@ -1094,38 +1105,13 @@ impl From<&XdsNodeMetadata> for XdsNodeScoping {
         Self {
             ambient_udp_source_scoping: metadata.ambient_udp_source_scoping,
             node_waypoint_capture_scoping: metadata.node_waypoint_capture_scoping,
+            sidecar_http_routes: metadata.sidecar_http_routes,
         }
     }
 }
 
 /// Encode `Node.metadata` bytes for an outgoing DP request. Returns empty when
 /// there is nothing to carry, matching the prior no-metadata wire shape.
-pub fn encode_node_metadata(workload_spiffe_id: Option<&str>) -> Vec<u8> {
-    encode_node_metadata_with_waypoint(workload_spiffe_id, None)
-}
-
-pub fn encode_node_metadata_with_waypoint(
-    workload_spiffe_id: Option<&str>,
-    waypoint_name: Option<&str>,
-) -> Vec<u8> {
-    encode_node_metadata_with_waypoint_and_udp_scope(workload_spiffe_id, waypoint_name, false)
-}
-
-pub fn encode_node_metadata_with_waypoint_and_udp_scope(
-    workload_spiffe_id: Option<&str>,
-    waypoint_name: Option<&str>,
-    ambient_udp_source_scoping: bool,
-) -> Vec<u8> {
-    encode_node_metadata_with_scoping(
-        workload_spiffe_id,
-        waypoint_name,
-        XdsNodeScoping {
-            ambient_udp_source_scoping,
-            node_waypoint_capture_scoping: false,
-        },
-    )
-}
-
 pub fn encode_node_metadata_with_scoping(
     workload_spiffe_id: Option<&str>,
     waypoint_name: Option<&str>,
@@ -1140,6 +1126,7 @@ pub fn encode_node_metadata_with_scoping(
             .map(ToString::to_string),
         ambient_udp_source_scoping: scoping.ambient_udp_source_scoping,
         node_waypoint_capture_scoping: scoping.node_waypoint_capture_scoping,
+        sidecar_http_routes: scoping.sidecar_http_routes,
     };
     if metadata.workload_spiffe_id.is_none()
         && metadata.waypoint_name.is_none()
@@ -1180,7 +1167,8 @@ mod tests {
     }
 
     /// Every carrier variant round-trips through its own `type_url` and JSON
-    /// bytes. If a future variant forgets to wire a decode arm, this fails.
+    /// bytes. The list is hand-maintained: a new variant must be added here
+    /// (and to `resource_names_are_unique_per_variant`) to be covered.
     #[test]
     fn slice_carrier_round_trip() {
         let carriers = vec![
@@ -1203,6 +1191,12 @@ mod tests {
             MeshSliceCarrier::ConfigRevision(MeshConfigRevision::new("db", 42)),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::AmbientUdpSourceWorkloads(Vec::new()),
+            MeshSliceCarrier::DestinationRuleHostExclusions(vec![DestinationRuleHostExclusion {
+                namespace: "beta".to_string(),
+                name: "owner-wildcard".to_string(),
+                rule_host: "*.example.com".to_string(),
+                host: "api.example.com".to_string(),
+            }]),
             MeshSliceCarrier::NodeWaypointAssertors(vec![NodeWaypointAssertor {
                 spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint")
                     .unwrap(),
@@ -1210,6 +1204,7 @@ mod tests {
             }]),
             MeshSliceCarrier::NodeWaypointCaptureDestinations(Vec::new()),
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(Vec::new()),
+            MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
                 "app".to_string(),
                 "api".to_string(),
@@ -1221,7 +1216,13 @@ mod tests {
             MeshSliceCarrier::VirtualServiceL4Upstreams(vec![serde_json::json!({
                 "id": "istio-vs-l4-upstream-default-db-tcp-0"
             })]),
+            MeshSliceCarrier::HttpRoutes(MeshHttpRouteSet {
+                proxies: vec![serde_json::json!({"id": "istio-vs-default-api-0"})],
+                upstreams: vec![serde_json::json!({"id": "istio-vs-upstream-default-api-0"})],
+                plugin_configs: vec![serde_json::json!({"id": "istio-vs-mrd-default-api-0"})],
+            }),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
+            MeshSliceCarrier::ExtAuthzProviders(Vec::new()),
             MeshSliceCarrier::VirtualServiceCorsPolicies(Vec::new()),
             MeshSliceCarrier::PeerAuthentications(Vec::new()),
             MeshSliceCarrier::RequestAuthentications(Vec::new()),
@@ -1230,6 +1231,7 @@ mod tests {
             MeshSliceCarrier::ProxyConfigs(Vec::new()),
             MeshSliceCarrier::TrustBundles(sample_trust_bundle_set()),
             MeshSliceCarrier::OutboundTrafficPolicy(OutboundTrafficPolicy::RegistryOnly),
+            MeshSliceCarrier::SidecarOutboundTrafficPolicy(OutboundTrafficPolicy::AllowAny),
             MeshSliceCarrier::MultiCluster(MultiClusterConfig::default()),
             MeshSliceCarrier::SidecarEgressScope(MeshEgressScopeSnapshot::default()),
             MeshSliceCarrier::WaypointGatewayClass("istio-waypoint".to_string()),
@@ -1282,20 +1284,40 @@ mod tests {
     #[test]
     fn node_metadata_round_trips_workload_spiffe() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
-        let bytes = encode_node_metadata_with_waypoint(Some(spiffe), Some("waypoint"));
+        let none = XdsNodeScoping::default();
+        let bytes = encode_node_metadata_with_scoping(Some(spiffe), Some("waypoint"), none);
         assert!(!bytes.is_empty());
         let metadata = decode_node_metadata(&bytes);
         assert_eq!(metadata.workload_spiffe_id.as_deref(), Some(spiffe));
         assert_eq!(metadata.waypoint_name.as_deref(), Some("waypoint"));
-        let udp_scope = decode_node_metadata(&encode_node_metadata_with_waypoint_and_udp_scope(
-            None, None, true,
+        let udp_scope = decode_node_metadata(&encode_node_metadata_with_scoping(
+            None,
+            None,
+            XdsNodeScoping {
+                ambient_udp_source_scoping: true,
+                node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
+            },
         ));
         assert!(udp_scope.ambient_udp_source_scoping);
+        assert!(!udp_scope.sidecar_http_routes);
+        // Issue #7423: the Sidecar route-carriage flag rides node metadata on
+        // its own, even with no identity, and reaches the CP's scoping.
+        let sidecar_routes = XdsNodeScoping {
+            ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
+            sidecar_http_routes: true,
+        };
+        let sidecar_bytes = encode_node_metadata_with_scoping(None, None, sidecar_routes);
+        assert!(!sidecar_bytes.is_empty());
+        let sidecar_metadata = decode_node_metadata(&sidecar_bytes);
+        assert!(sidecar_metadata.sidecar_http_routes);
+        assert_eq!(XdsNodeScoping::from(&sidecar_metadata), sidecar_routes);
         // Absent / empty identity encodes to empty bytes (prior no-metadata
         // wire shape) and decodes to no identity.
-        assert!(encode_node_metadata(None).is_empty());
-        assert!(encode_node_metadata(Some("")).is_empty());
-        assert!(encode_node_metadata_with_waypoint(None, Some(" \t")).is_empty());
+        assert!(encode_node_metadata_with_scoping(None, None, none).is_empty());
+        assert!(encode_node_metadata_with_scoping(Some(""), None, none).is_empty());
+        assert!(encode_node_metadata_with_scoping(None, Some(" \t"), none).is_empty());
         assert_eq!(decode_node_metadata(&[]).workload_spiffe_id, None);
         // Malformed metadata never errors/panics — it is advisory, so it
         // decodes to no identity rather than rejecting the stream.
@@ -1314,6 +1336,7 @@ mod tests {
             MeshSliceCarrier::ConfigRevision(MeshConfigRevision::new("db", 42)),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::AmbientUdpSourceWorkloads(Vec::new()),
+            MeshSliceCarrier::DestinationRuleHostExclusions(Vec::new()),
             MeshSliceCarrier::NodeWaypointAssertors(vec![NodeWaypointAssertor {
                 spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint")
                     .unwrap(),
@@ -1321,6 +1344,7 @@ mod tests {
             }]),
             MeshSliceCarrier::NodeWaypointCaptureDestinations(Vec::new()),
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(Vec::new()),
+            MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
                 "app".to_string(),
                 "api".to_string(),
@@ -1328,6 +1352,7 @@ mod tests {
             MeshSliceCarrier::LabelsAmbiguous(true),
             MeshSliceCarrier::VirtualServiceL4Proxies(Vec::new()),
             MeshSliceCarrier::VirtualServiceL4Upstreams(Vec::new()),
+            MeshSliceCarrier::HttpRoutes(MeshHttpRouteSet::default()),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::ExtAuthzProviders(Vec::new()),
             MeshSliceCarrier::VirtualServiceCorsPolicies(Vec::new()),
@@ -1338,6 +1363,7 @@ mod tests {
             MeshSliceCarrier::ProxyConfigs(Vec::new()),
             MeshSliceCarrier::TrustBundles(sample_trust_bundle_set()),
             MeshSliceCarrier::OutboundTrafficPolicy(OutboundTrafficPolicy::AllowAny),
+            MeshSliceCarrier::SidecarOutboundTrafficPolicy(OutboundTrafficPolicy::RegistryOnly),
             MeshSliceCarrier::MultiCluster(MultiClusterConfig::default()),
             MeshSliceCarrier::SidecarEgressScope(MeshEgressScopeSnapshot::default()),
             MeshSliceCarrier::WaypointGatewayClass("ferrum-waypoint".to_string()),
@@ -1478,8 +1504,8 @@ mod tests {
     }
 
     /// Blank / whitespace-only root-namespace carriers are not trustworthy
-    /// provenance: decode ignores them, apply cannot clear a prior value, and
-    /// emission omits empty/whitespace slice fields (issue #2469).
+    /// provenance: decode ignores them and emission omits empty/whitespace
+    /// slice fields (issue #2469).
     #[test]
     fn blank_istio_root_namespace_carrier_is_ignored() {
         for blank in ["", "   ", "\t\n"] {
@@ -1492,19 +1518,6 @@ mod tests {
                 "blank root carrier {blank:?} must be ignored at decode"
             );
         }
-
-        let mut slice = MeshSlice {
-            istio_root_namespace: "istio-system".to_string(),
-            ..MeshSlice::default()
-        };
-        apply_carrier(
-            &mut slice,
-            MeshSliceCarrier::IstioRootNamespace("   ".to_string()),
-        );
-        assert_eq!(
-            slice.istio_root_namespace, "istio-system",
-            "blank apply must not clear trustworthy root provenance"
-        );
 
         for blank in ["", "  \t "] {
             let carriers = build_slice_carriers(&MeshSlice {

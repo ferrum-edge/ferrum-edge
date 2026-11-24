@@ -426,3 +426,272 @@ fn blocked_writer_produces_bounded_shutdown_and_incomplete_drain_count() {
     wake.notify_all();
     wait_until(|| sink.snapshot().queued_records == 0);
 }
+
+/// Thread-safe in-memory `MakeWriter` for the filter tests below.
+#[derive(Clone, Default)]
+struct FilterCapture(Arc<Mutex<Vec<u8>>>);
+
+impl FilterCapture {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap_or_default()
+    }
+}
+
+impl Write for FilterCapture {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FilterCapture {
+    type Writer = FilterCapture;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Emit, through an output layer filtered by `directives` AND the gateway's
+/// credential-dumping filter (the same composition `init_logging` builds),
+/// the dependency records that render credentials plus sibling controls, and
+/// return what reached the output.
+fn render_under_gateway_filter(directives: &str) -> String {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let writer = FilterCapture::default();
+    let layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(writer.clone());
+    let layer = ferrum_edge::logging::filter_output_layer(
+        layer,
+        tracing_subscriber::EnvFilter::new(directives),
+    );
+    let subscriber = tracing_subscriber::registry().with(layer);
+    crate::diagnostic_test_interest::ensure_interest_floor();
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!("ws_connect");
+        let _entered = span.enter();
+        tracing::trace!(
+            target: "tungstenite::handshake::client",
+            "Request: GET /ingest?stream=handshake-path-canary HTTP/1.1 authorization: Bearer handshake-header-canary"
+        );
+        tracing::debug!(
+            target: "tungstenite::handshake::client",
+            "Client handshake done."
+        );
+        tracing::trace!(
+            target: "tungstenite::protocol",
+            "Received message {{\"token\":\"protocol-payload-canary\"}}"
+        );
+        tracing::trace!(
+            target: "tungstenite::protocol::frame",
+            "writing frame frame-payload-canary"
+        );
+        tracing::debug!(target: "tungstenite::protocol", "close-frame-debug-visible");
+        tracing::trace!(target: "tungstenite::handshake::server", "sibling-target-visible");
+        tracing::trace!(target: "tungstenite::protocolx", "lookalike-target-visible");
+    });
+    writer.contents()
+}
+
+#[test]
+fn credential_dumping_records_stay_off_under_every_directive_shape() {
+    for directives in [
+        "trace",
+        "tungstenite=trace",
+        "warn,tungstenite::handshake::client=trace",
+        // Field-scoped and span-scoped directives are more specific than any
+        // target directive; the AND-composed filter must still drop them.
+        "warn,tungstenite::handshake::client[{message}]=trace,tungstenite::protocol[{message}]=trace",
+        "warn,tungstenite::handshake::client[ws_connect]=trace,tungstenite::protocol[ws_connect]=trace",
+        // A target-less span directive really enters the `ws_connect` scope
+        // (the span's target is this test module), so span tracking runs in
+        // the outer level filter while the credential filter still vetoes.
+        "warn,[ws_connect]=trace",
+    ] {
+        let output = render_under_gateway_filter(directives);
+        for canary in [
+            "handshake-path-canary",
+            "handshake-header-canary",
+            "Client handshake done.",
+            "protocol-payload-canary",
+            "frame-payload-canary",
+        ] {
+            assert!(
+                !output.contains(canary),
+                "{directives}: {canary} leaked: {output}"
+            );
+        }
+    }
+
+    // Controls: the filter is target- and level-scoped, so other tungstenite
+    // records keep their configured verbosity...
+    let output = render_under_gateway_filter("trace");
+    assert!(output.contains("sibling-target-visible"), "{output}");
+    assert!(output.contains("close-frame-debug-visible"), "{output}");
+    assert!(output.contains("lookalike-target-visible"), "{output}");
+    // ...and the field-scoped directive shape really does enable records,
+    // so its suppression assertion above is not vacuous.
+    let output =
+        render_under_gateway_filter("warn,tungstenite::handshake::server[{message}]=trace");
+    assert!(output.contains("sibling-target-visible"), "{output}");
+    // ...and so does the target-less span-scoped shape.
+    let output = render_under_gateway_filter("warn,[ws_connect]=trace");
+    assert!(output.contains("sibling-target-visible"), "{output}");
+    assert!(output.contains("close-frame-debug-visible"), "{output}");
+}
+
+#[test]
+fn credential_dumping_filter_never_raises_verbosity() {
+    let output = render_under_gateway_filter("warn");
+    for record in [
+        "sibling-target-visible",
+        "close-frame-debug-visible",
+        "lookalike-target-visible",
+    ] {
+        assert!(!output.contains(record), "{record}: {output}");
+    }
+}
+
+/// Every output layer the binary installs must go through
+/// `filter_output_layer`: a layer without the credential filter would let any
+/// directive or RTDS reload re-enable the records, and a layer that nests the
+/// filters the other way round loses the level filter's static hint.
+/// `init_logging` in `src/gateway_entry.rs` is the only sanctioned place that
+/// installs output layers; this scan covers that file only.
+#[test]
+fn every_gateway_output_layer_composes_the_credential_dumping_filter() {
+    let source = include_str!("../../src/gateway_entry.rs");
+    let output_layers = source.matches("tracing_subscriber::fmt::layer()").count();
+    let filtered = source.matches("logging::filter_output_layer(").count();
+    assert!(output_layers >= 2, "expected both init_logging branches");
+    assert_eq!(
+        filtered, output_layers,
+        "every fmt output layer must be built through logging::filter_output_layer"
+    );
+    assert!(
+        !source.contains(".with_filter(logging::credential_dumping_log_filter())"),
+        "compose the credential filter only through logging::filter_output_layer"
+    );
+    assert!(
+        ferrum_edge::logging::CREDENTIAL_DUMPING_LOG_TARGETS
+            .iter()
+            .any(|(target, _)| *target == "tungstenite::handshake::client")
+    );
+}
+
+struct ProbeCallsite(&'static tracing::Metadata<'static>);
+
+impl tracing::callsite::Callsite for ProbeCallsite {
+    fn set_interest(&self, _: tracing::subscriber::Interest) {}
+
+    fn metadata(&self) -> &tracing::Metadata<'_> {
+        self.0
+    }
+}
+
+static H2_TRACE_PROBE_CALLSITE: ProbeCallsite = ProbeCallsite(&H2_TRACE_PROBE);
+static H2_TRACE_PROBE: tracing::Metadata<'static> = tracing::Metadata::new(
+    "h2 trace probe",
+    "h2::proto::streams::prioritize",
+    tracing::Level::TRACE,
+    None,
+    None,
+    None,
+    tracing::field::FieldSet::new(&[], tracing::callsite::Identifier(&H2_TRACE_PROBE_CALLSITE)),
+    tracing::metadata::Kind::EVENT,
+);
+
+/// The credential filter must not cost the hot path anything at the
+/// configured level. The outermost per-layer filter alone supplies a layer's
+/// max-level hint (feeding the process-wide `LevelFilter::current()`), and
+/// nesting an outer `always` over an inner `never` caches `sometimes`. With
+/// the hint-less credential filter outside the level filter (#6852), every
+/// TRACE/DEBUG callsite in hyper and h2 was evaluated on each hit at
+/// `FERRUM_LOG_LEVEL=error`. Both `init_logging` stacks are rebuilt here with
+/// the production filter type (`reload::Layer<EnvFilter>`); the counting
+/// variant adds the real `CountingLayer` with its own filters, as installed.
+#[test]
+fn gateway_output_filter_keeps_the_level_filters_static_hint_and_interest() {
+    use tracing::Subscriber as _;
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    fn output_layer<S>(directives: &str) -> impl tracing_subscriber::Layer<S> + use<S>
+    where
+        S: tracing::Subscriber
+            + for<'span> tracing_subscriber::registry::LookupSpan<'span>
+            + 'static,
+    {
+        let (level_filter, _handle) =
+            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new(directives));
+        ferrum_edge::logging::filter_output_layer(
+            tracing_subscriber::fmt::layer().with_writer(io::sink),
+            level_filter,
+        )
+    }
+    let fallback = |directives: &str| tracing_subscriber::registry().with(output_layer(directives));
+    let counting = |directives: &str| {
+        tracing_subscriber::registry()
+            .with(output_layer(directives))
+            .with(
+                ferrum_edge::runtime_metrics_tracing_layer::CountingLayer::new(
+                    std::sync::Arc::new(ferrum_edge::runtime_metrics::RuntimeMetrics::new()),
+                )
+                .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                    ferrum_edge::runtime_metrics_tracing_layer::should_count_target(
+                        metadata.target(),
+                    )
+                }))
+                .with_filter(tracing_subscriber::EnvFilter::new(directives)),
+            )
+    };
+
+    for (directives, level) in [
+        ("error", tracing::level_filters::LevelFilter::ERROR),
+        ("warn", tracing::level_filters::LevelFilter::WARN),
+        ("info,h2=debug", tracing::level_filters::LevelFilter::DEBUG),
+    ] {
+        assert_eq!(
+            fallback(directives).max_level_hint(),
+            Some(level),
+            "{directives}: the level filter's hint must reach the subscriber"
+        );
+        assert_eq!(
+            counting(directives).max_level_hint(),
+            Some(level),
+            "{directives}: the hint must survive the counting layer's merge"
+        );
+        assert!(
+            fallback(directives)
+                .register_callsite(&H2_TRACE_PROBE)
+                .is_never(),
+            "{directives}: a TRACE callsite the level filter disables must stay `never`"
+        );
+        assert!(
+            counting(directives)
+                .register_callsite(&H2_TRACE_PROBE)
+                .is_never(),
+            "{directives}: the counting stack must keep the disabled callsite `never`"
+        );
+    }
+
+    // The probe is a real callsite: a level filter that enables it still
+    // registers interest, so the `never` above is not vacuous.
+    assert!(
+        !fallback("trace")
+            .register_callsite(&H2_TRACE_PROBE)
+            .is_never()
+    );
+    assert!(
+        !counting("trace")
+            .register_callsite(&H2_TRACE_PROBE)
+            .is_never()
+    );
+}

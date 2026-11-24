@@ -26,6 +26,10 @@ use ferrum_edge::plugins::mesh::ext_authz::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+#[allow(dead_code)]
+#[path = "../unit/plugins/jwks_auth_support.rs"]
+mod jwks_auth_support;
+
 /// How the stub authorizer answers one check.
 #[derive(Clone, Copy)]
 enum StubBehavior {
@@ -45,6 +49,8 @@ enum StubBehavior {
     TruncatedDenialBody,
     /// Close the connection without writing a response.
     Reset,
+    /// Reply with exactly these bytes (one complete HTTP/1.1 response).
+    Raw(&'static str),
 }
 
 struct Stub {
@@ -121,6 +127,9 @@ async fn start_stub(behavior: StubBehavior) -> Stub {
                     StubBehavior::Reset => {
                         let _ = stream.shutdown().await;
                     }
+                    StubBehavior::Raw(response) => {
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
                 }
             });
         }
@@ -170,6 +179,8 @@ async fn check(
                 path: "/admin/reports",
                 headers,
                 authority: Some("api.example.com"),
+                source_principal: None,
+                request_principal: None,
                 body: None,
                 body_proven_empty: true,
                 proxy_hops: None,
@@ -594,7 +605,7 @@ async fn a_five_hundred_with_fail_open_allows() {
     source.fail_open = true;
     let executor = executor(vec![source]);
     match check(&executor, "sample-ext-authz", &request_headers()).await {
-        MeshExtAuthzOutcome::Allow { reason } => {
+        MeshExtAuthzOutcome::Allow { reason, .. } => {
             assert_eq!(
                 reason,
                 MeshExtAuthzReason::ProviderError,
@@ -683,6 +694,8 @@ async fn a_check_is_never_retried_even_when_shared_plugin_retries_are_configured
                 path: "/admin/reports",
                 headers: &headers,
                 authority: Some("api.example.com"),
+                source_principal: None,
+                request_principal: None,
                 body: None,
                 body_proven_empty: true,
                 proxy_hops: None,
@@ -720,6 +733,8 @@ async fn check_with_body(
                 path: "/admin/reports",
                 headers: &headers,
                 authority: Some("api.example.com"),
+                source_principal: None,
+                request_principal: None,
                 body: Some(body),
                 body_proven_empty: false,
                 proxy_hops: None,
@@ -814,6 +829,8 @@ async fn an_unavailable_body_remains_a_failed_check_distinct_from_an_oversize_on
                 path: "/admin/reports",
                 headers: &headers,
                 authority: Some("api.example.com"),
+                source_principal: None,
+                request_principal: None,
                 body: None,
                 body_proven_empty: false,
                 proxy_hops: None,
@@ -822,7 +839,7 @@ async fn an_unavailable_body_remains_a_failed_check_distinct_from_an_oversize_on
         )
         .await;
     match outcome {
-        MeshExtAuthzOutcome::Allow { reason } => {
+        MeshExtAuthzOutcome::Allow { reason, .. } => {
             assert_eq!(
                 reason,
                 MeshExtAuthzReason::BodyUnavailable,
@@ -862,6 +879,8 @@ async fn an_oversize_body_and_a_missing_body_fail_closed_with_distinct_reasons()
                 path: "/admin/reports",
                 headers: &headers,
                 authority: None,
+                source_principal: None,
+                request_principal: None,
                 body: None,
                 body_proven_empty: false,
                 proxy_hops: None,
@@ -1536,6 +1555,8 @@ async fn a_reload_generation_cannot_reopen_a_fresh_budget() {
         allowed,
         MeshExtAuthzOutcome::Allow {
             reason: MeshExtAuthzReason::Allowed,
+            upstream_headers: Vec::new(),
+            downstream_headers: Vec::new(),
         },
         "capacity restored, so the check runs"
     );
@@ -1574,6 +1595,8 @@ async fn a_check_carries_the_proxy_hop_count() {
                     path: "/admin/reports",
                     headers: &headers,
                     authority: Some("api.example.com"),
+                    source_principal: None,
+                    request_principal: None,
                     body: None,
                     body_proven_empty: true,
                     proxy_hops,
@@ -1592,5 +1615,1058 @@ async fn a_check_carries_the_proxy_hop_count() {
             expected,
             "proxy_hops={proxy_hops:?}"
         );
+    }
+}
+
+// ── Repeated provider response headers (deny forwarding) ──────────────────
+
+/// A login-redirect denial that sets TWO cookies and advertises TWO auth
+/// challenges, each as its own field line.
+const MULTI_LINE_DENIAL: &str = "HTTP/1.1 302 Found\r\n\
+location: https://login.example.com/start\r\n\
+set-cookie: oauth_state=s1; Path=/\r\n\
+set-cookie: csrf_nonce=n1; Path=/\r\n\
+www-authenticate: Bearer realm=\"mesh\"\r\n\
+www-authenticate: Basic realm=\"mesh\"\r\n\
+content-length: 0\r\n\r\n";
+
+#[tokio::test]
+async fn a_denial_keeps_every_repeated_set_cookie_and_challenge_line() {
+    let stub = start_stub(StubBehavior::Raw(MULTI_LINE_DENIAL)).await;
+    let mut source = provider(stub.port);
+    source.headers_to_downstream_on_deny = vec![
+        "location".to_string(),
+        "set-cookie".to_string(),
+        "www-authenticate".to_string(),
+    ];
+    let executor = executor(vec![source]);
+    let headers = match check(&executor, "sample-ext-authz", &request_headers()).await {
+        MeshExtAuthzOutcome::Deny {
+            status, headers, ..
+        } => {
+            assert_eq!(status, 302, "a redirect denial keeps the provider's status");
+            headers.into_iter().collect::<HashMap<_, _>>()
+        }
+        other => panic!("expected a denial, got {other:?}"),
+    };
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some("oauth_state=s1; Path=/\ncsrf_nonce=n1; Path=/"),
+        "BOTH cookies must survive, in the proxy's newline-joined multi-cookie form"
+    );
+    assert_eq!(
+        headers.get("www-authenticate").map(String::as_str),
+        Some("Bearer realm=\"mesh\", Basic realm=\"mesh\""),
+        "every advertised challenge must survive"
+    );
+    assert_eq!(
+        headers.get("location").map(String::as_str),
+        Some("https://login.example.com/start")
+    );
+
+    // The client-visible response builder every protocol shares splits the
+    // cookies back into one `Set-Cookie` field each.
+    let response = ferrum_edge::proxy::headers::apply_response_headers(
+        http::Response::builder().status(302),
+        &headers,
+    )
+    .body(())
+    .expect("response builds");
+    let cookies: Vec<&str> = response
+        .headers()
+        .get_all(http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    assert_eq!(
+        cookies,
+        vec!["oauth_state=s1; Path=/", "csrf_nonce=n1; Path=/"]
+    );
+}
+
+// ── Gateway-asserted caller identity on the check ─────────────────────────
+
+/// Every field line named `name` in the raw check request the stub saw.
+fn seen_header_lines(seen: &str, name: &str) -> Vec<String> {
+    seen.split("\r\n")
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(field, _)| field.trim().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_check_carries_the_gateway_asserted_caller_identity() {
+    let stub = start_stub(StubBehavior::Allow).await;
+    let executor = executor(vec![provider(stub.port)]);
+    let principal =
+        ferrum_edge::identity::SpiffeId::new("spiffe://cluster.local/ns/shop/sa/frontend")
+            .expect("valid spiffe id");
+    let mut headers = request_headers();
+    // A client copy can never be forwarded: admission refuses `x-ferrum-*`
+    // in `includeRequestHeadersInCheck`, and the stamp replaces the name.
+    headers.insert(
+        "x-ferrum-source-principal".to_string(),
+        "spiffe://cluster.local/ns/evil/sa/forged".to_string(),
+    );
+    let accumulator = AtomicU64::new(0);
+    let outcome = executor
+        .check(
+            "sample-ext-authz",
+            MeshExtAuthzCheckRequest {
+                method: "GET",
+                path: "/admin/reports",
+                headers: &headers,
+                authority: Some("api.example.com"),
+                source_principal: Some(&principal),
+                request_principal: Some("https://issuer.example.com/alice"),
+                body: None,
+                body_proven_empty: true,
+                proxy_hops: None,
+            },
+            &accumulator,
+        )
+        .await;
+    assert!(
+        matches!(outcome, MeshExtAuthzOutcome::Allow { .. }),
+        "unexpected outcome: {outcome:?}"
+    );
+    let seen = stub.last_request.lock().expect("stub request").clone();
+    assert_eq!(
+        seen_header_lines(&seen, "x-ferrum-source-principal"),
+        vec!["spiffe://cluster.local/ns/shop/sa/frontend".to_string()],
+        "exactly one, gateway-authored source principal"
+    );
+    assert_eq!(
+        seen_header_lines(&seen, "x-ferrum-source-namespace"),
+        vec!["shop".to_string()]
+    );
+    assert_eq!(
+        seen_header_lines(&seen, "x-ferrum-source-service-account"),
+        vec!["frontend".to_string()]
+    );
+    assert_eq!(
+        seen_header_lines(&seen, "x-ferrum-request-principal"),
+        vec!["https://issuer.example.com/alice".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_caller_identity_is_absent_from_the_check() {
+    let stub = start_stub(StubBehavior::Allow).await;
+    let executor = executor(vec![provider(stub.port)]);
+    let _ = check(&executor, "sample-ext-authz", &request_headers()).await;
+    let seen = stub.last_request.lock().expect("stub request").clone();
+    for name in [
+        "x-ferrum-source-principal",
+        "x-ferrum-source-namespace",
+        "x-ferrum-source-service-account",
+        "x-ferrum-request-principal",
+    ] {
+        assert!(
+            seen_header_lines(&seen, name).is_empty(),
+            "{name} must be absent, never empty, when the gateway holds no identity"
+        );
+    }
+}
+
+// ── headersToUpstreamOnAllow / headersToDownstreamOnAllow ─────────────────
+
+/// An allowing provider that exchanges the token, names the user, refreshes
+/// the session cookie, and returns a header nobody listed.
+const ALLOW_WITH_MUTATIONS: &str = "HTTP/1.1 200 OK\r\n\
+x-auth-request-user: alice\r\n\
+authorization: Bearer exchanged-token\r\n\
+set-cookie: session=refreshed; Path=/\r\n\
+x-unlisted: provider-internal\r\n\
+content-length: 0\r\n\r\n";
+
+#[tokio::test]
+async fn an_allowed_check_returns_only_the_listed_provider_headers() {
+    let stub = start_stub(StubBehavior::Raw(ALLOW_WITH_MUTATIONS)).await;
+    let mut source = provider(stub.port);
+    source.headers_to_upstream_on_allow = vec![
+        "x-auth-request-user".to_string(),
+        "authorization".to_string(),
+    ];
+    source.headers_to_downstream_on_allow = vec!["set-cookie".to_string()];
+    let executor = executor(vec![source]);
+    match check(&executor, "sample-ext-authz", &request_headers()).await {
+        MeshExtAuthzOutcome::Allow {
+            reason,
+            upstream_headers,
+            downstream_headers,
+        } => {
+            assert_eq!(reason, MeshExtAuthzReason::Allowed);
+            assert_eq!(
+                upstream_headers,
+                vec![
+                    ("x-auth-request-user".to_string(), "alice".to_string()),
+                    (
+                        "authorization".to_string(),
+                        "Bearer exchanged-token".to_string()
+                    ),
+                ]
+            );
+            assert_eq!(
+                downstream_headers,
+                vec![(
+                    "set-cookie".to_string(),
+                    "session=refreshed; Path=/".to_string()
+                )]
+            );
+        }
+        other => panic!("expected an allow, got {other:?}"),
+    }
+}
+
+mod allowed_request_mutations {
+    use super::*;
+    use ferrum_edge::plugins::mesh::authz::MeshAuthz;
+    use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+    use serde_json::json;
+
+    fn plugin(port: u16, fail_open: bool) -> MeshAuthz {
+        let slice = json!({
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "mesh_policies": [{
+                "name": "delegate-admin",
+                "namespace": "default",
+                "scope": { "kind": "mesh_wide" },
+                "rules": [{
+                    "to": [{ "paths": ["/admin/*"] }],
+                    "action": { "custom": { "provider": "mutating-ext-authz" } },
+                }],
+            }],
+            "ext_authz_providers": [{
+                "name": "mutating-ext-authz",
+                "service": "127.0.0.1",
+                "port": port,
+                "timeout_ms": 500,
+                "fail_open": fail_open,
+                "status_on_error": 403,
+                "headers_to_upstream_on_allow": ["x-auth-request-user", "authorization"],
+                "headers_to_downstream_on_allow": ["set-cookie"],
+            }],
+        });
+        match MeshAuthz::new_with_http_client(
+            &json!({ "mesh_slice": slice }),
+            Some(PluginHttpClient::default()),
+        ) {
+            Ok(plugin) => plugin,
+            Err(error) => panic!("generation builds: {error}"),
+        }
+    }
+
+    fn ctx() -> RequestContext {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/admin/reports".to_string(),
+        );
+        ctx.headers
+            .insert("host".to_string(), "api.example.com".to_string());
+        ctx
+    }
+
+    /// The backend-bound header map a client forging the provider-owned
+    /// identity would produce, in both spellings a CGI-style backend folds.
+    fn forged_upstream_headers() -> HashMap<String, String> {
+        HashMap::from([
+            ("x-auth-request-user".to_string(), "mallory".to_string()),
+            ("X_Auth_Request_User".to_string(), "mallory".to_string()),
+            (
+                "authorization".to_string(),
+                "Bearer client-token".to_string(),
+            ),
+            ("x-request-id".to_string(), "abc-123".to_string()),
+        ])
+    }
+
+    #[tokio::test]
+    async fn provider_headers_replace_client_copies_upstream_and_refresh_the_cookie_downstream() {
+        let stub = start_stub(StubBehavior::Raw(ALLOW_WITH_MUTATIONS)).await;
+        let plugin = plugin(stub.port, false);
+        assert!(plugin.modifies_request_headers());
+        let declared = plugin
+            .modified_request_header_names()
+            .expect("a bounded spelling set is declared, not `any header`");
+        // `before_proxy` removes every `_` / `-` spelling of an owned name, so
+        // the declaration must name every one of them: 1 for `authorization`,
+        // 2^3 for `x-auth-request-user`.
+        assert_eq!(declared.len(), 9, "unexpected declaration: {declared:?}");
+        for spelling in [
+            "authorization",
+            "x-auth-request-user",
+            "x_auth_request_user",
+            "x-auth_request-user",
+            "x_auth-request_user",
+        ] {
+            assert!(
+                declared.iter().any(|name| name == spelling),
+                "{spelling} must be declared mutable: {declared:?}"
+            );
+        }
+
+        let mut ctx = ctx();
+        assert!(matches!(
+            plugin.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+
+        let mut upstream = forged_upstream_headers();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut upstream).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            upstream.get("x-auth-request-user").map(String::as_str),
+            Some("alice"),
+            "the provider's value replaces the client's"
+        );
+        assert!(
+            !upstream.contains_key("X_Auth_Request_User"),
+            "a folded-spelling client copy must not ride beside the provider's value"
+        );
+        assert_eq!(
+            upstream.get("authorization").map(String::as_str),
+            Some("Bearer exchanged-token"),
+            "the exchanged token replaces the client's"
+        );
+        assert_eq!(
+            upstream.get("x-request-id").map(String::as_str),
+            Some("abc-123"),
+            "headers the provider does not own are untouched"
+        );
+        assert!(!upstream.contains_key("x-unlisted"));
+
+        let mut response = HashMap::from([("set-cookie".to_string(), "backend=1".to_string())]);
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut response).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            response.get("set-cookie").map(String::as_str),
+            Some("backend=1\nsession=refreshed; Path=/"),
+            "the refreshed session cookie is appended beside the backend's own cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fail_open_allow_strips_provider_owned_names_and_installs_nothing() {
+        // The provider could not decide (5xx) and `failOpen` admitted the
+        // request: nothing vouched for the identity, so the client's copies of
+        // the provider-owned names must not reach the backend either.
+        let stub = start_status_stub(503).await;
+        let plugin = plugin(stub.port, true);
+        let mut ctx = ctx();
+        assert!(matches!(
+            plugin.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let mut upstream = forged_upstream_headers();
+        let _ = plugin.before_proxy(&mut ctx, &mut upstream).await;
+        assert!(!upstream.contains_key("x-auth-request-user"));
+        assert!(!upstream.contains_key("X_Auth_Request_User"));
+        assert!(!upstream.contains_key("authorization"));
+        assert_eq!(
+            upstream.get("x-request-id").map(String::as_str),
+            Some("abc-123")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_no_custom_rule_matches_keeps_its_headers() {
+        // No delegation ran, so there is no provider-owned contract for this
+        // request: the backend sees exactly what the client sent.
+        let stub = start_stub(StubBehavior::Raw(ALLOW_WITH_MUTATIONS)).await;
+        let plugin = plugin(stub.port, false);
+        let mut ctx = ctx();
+        ctx.path = "/public".to_string();
+        assert!(matches!(
+            plugin.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let mut upstream = forged_upstream_headers();
+        let _ = plugin.before_proxy(&mut ctx, &mut upstream).await;
+        assert_eq!(upstream, forged_upstream_headers());
+        assert_eq!(stub.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A second allowing provider: a tenant header upstream and its own cookie.
+    const TENANT_ALLOW: &str = "HTTP/1.1 200 OK\r\n\
+x-tenant: tenant-b\r\n\
+set-cookie: b-session=1; Path=/\r\n\
+content-length: 0\r\n\r\n";
+
+    fn plugin_with(
+        provider_name: &str,
+        port: u16,
+        fail_open: bool,
+        upstream: &[&str],
+        downstream: &[&str],
+    ) -> MeshAuthz {
+        let slice = json!({
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "mesh_policies": [{
+                "name": "delegate-admin",
+                "namespace": "default",
+                "scope": { "kind": "mesh_wide" },
+                "rules": [{
+                    "to": [{ "paths": ["/admin/*"] }],
+                    "action": { "custom": { "provider": provider_name } },
+                }],
+            }],
+            "ext_authz_providers": [{
+                "name": provider_name,
+                "service": "127.0.0.1",
+                "port": port,
+                "timeout_ms": 500,
+                "fail_open": fail_open,
+                "status_on_error": 403,
+                "headers_to_upstream_on_allow": upstream,
+                "headers_to_downstream_on_allow": downstream,
+            }],
+        });
+        match MeshAuthz::new_with_http_client(
+            &json!({ "mesh_slice": slice }),
+            Some(PluginHttpClient::default()),
+        ) {
+            Ok(plugin) => plugin,
+            Err(error) => panic!("generation builds: {error}"),
+        }
+    }
+
+    /// Two effective `mesh_authz` instances on one request (an operator global
+    /// beside the force-injected `__mesh_authz`) must each apply ONLY their own
+    /// allowed result: a shared staging slot let the second check overwrite the
+    /// first, so instance A consumed B's result and a forged A-owned header
+    /// reached the backend.
+    #[tokio::test]
+    async fn two_instances_apply_only_their_own_allowed_results() {
+        let stub_a = start_stub(StubBehavior::Raw(ALLOW_WITH_MUTATIONS)).await;
+        let stub_b = start_stub(StubBehavior::Raw(TENANT_ALLOW)).await;
+        let a = plugin_with(
+            "instance-a-ext-authz",
+            stub_a.port,
+            false,
+            &["x-auth-request-user"],
+            &["set-cookie"],
+        );
+        let b = plugin_with(
+            "instance-b-ext-authz",
+            stub_b.port,
+            false,
+            &["x-tenant"],
+            &["set-cookie"],
+        );
+        let mut ctx = ctx();
+        assert!(matches!(
+            a.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        assert!(matches!(
+            b.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+
+        let mut upstream = HashMap::from([
+            ("x-auth-request-user".to_string(), "mallory".to_string()),
+            ("X_Auth_Request_User".to_string(), "mallory".to_string()),
+            ("x-tenant".to_string(), "forged".to_string()),
+            ("x-request-id".to_string(), "abc-123".to_string()),
+        ]);
+        let _ = a.before_proxy(&mut ctx, &mut upstream).await;
+        let _ = b.before_proxy(&mut ctx, &mut upstream).await;
+        assert_eq!(
+            upstream.get("x-auth-request-user").map(String::as_str),
+            Some("alice"),
+            "instance A installs its own provider's value"
+        );
+        assert!(!upstream.contains_key("X_Auth_Request_User"));
+        assert_eq!(
+            upstream.get("x-tenant").map(String::as_str),
+            Some("tenant-b"),
+            "instance B installs its own provider's value"
+        );
+        assert_eq!(
+            upstream.get("x-request-id").map(String::as_str),
+            Some("abc-123")
+        );
+
+        // The WebSocket handshake hook reads (does not consume) the staging:
+        // each instance applies only its own cookie, exactly once.
+        let mut handshake = HashMap::new();
+        a.apply_websocket_handshake_response_headers(&ctx, 101, &mut handshake);
+        b.apply_websocket_handshake_response_headers(&ctx, 101, &mut handshake);
+        assert_eq!(
+            handshake.get("set-cookie").map(String::as_str),
+            Some("session=refreshed; Path=/\nb-session=1; Path=/")
+        );
+
+        let mut response = HashMap::from([("set-cookie".to_string(), "backend=1".to_string())]);
+        let _ = a.after_proxy(&mut ctx, 200, &mut response).await;
+        let _ = b.after_proxy(&mut ctx, 200, &mut response).await;
+        assert_eq!(
+            response.get("set-cookie").map(String::as_str),
+            Some("backend=1\nsession=refreshed; Path=/\nb-session=1; Path=/"),
+            "each provider's cookie appears exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_downstream_only_instance_cannot_erase_another_instances_fail_open_strip() {
+        // A's provider fails open: A must still strip the forged A-owned
+        // header. B is downstream-only; its staging must not overwrite A's.
+        let stub_a = start_status_stub(503).await;
+        let stub_b = start_stub(StubBehavior::Raw(TENANT_ALLOW)).await;
+        let a = plugin_with(
+            "fail-open-a-ext-authz",
+            stub_a.port,
+            true,
+            &["x-auth-request-user"],
+            &[],
+        );
+        let b = plugin_with(
+            "downstream-only-b-ext-authz",
+            stub_b.port,
+            false,
+            &[],
+            &["set-cookie"],
+        );
+        let mut ctx = ctx();
+        assert!(matches!(
+            a.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        assert!(matches!(
+            b.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let mut upstream = forged_upstream_headers();
+        let _ = a.before_proxy(&mut ctx, &mut upstream).await;
+        let _ = b.before_proxy(&mut ctx, &mut upstream).await;
+        assert!(!upstream.contains_key("x-auth-request-user"));
+        assert!(!upstream.contains_key("X_Auth_Request_User"));
+        let mut response = HashMap::new();
+        let _ = a.after_proxy(&mut ctx, 200, &mut response).await;
+        let _ = b.after_proxy(&mut ctx, 200, &mut response).await;
+        assert_eq!(
+            response.get("set-cookie").map(String::as_str),
+            Some("b-session=1; Path=/")
+        );
+    }
+
+    /// A header an earlier plugin removed from the materialized request view is
+    /// not forwarded to the provider from the retained raw block.
+    #[tokio::test]
+    async fn a_header_removed_before_authorization_is_not_forwarded_to_the_provider() {
+        let stub = start_stub(StubBehavior::Allow).await;
+        let slice = json!({
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "mesh_policies": [{
+                "name": "delegate-admin",
+                "namespace": "default",
+                "scope": { "kind": "mesh_wide" },
+                "rules": [{
+                    "to": [{ "paths": ["/admin/*"] }],
+                    "action": { "custom": { "provider": "removal-ext-authz" } },
+                }],
+            }],
+            "ext_authz_providers": [{
+                "name": "removal-ext-authz",
+                "service": "127.0.0.1",
+                "port": stub.port,
+                "timeout_ms": 500,
+                "status_on_error": 403,
+                "include_request_headers_in_check": ["x-role", "x-request-id"],
+            }],
+        });
+        let plugin = match MeshAuthz::new_with_http_client(
+            &json!({ "mesh_slice": slice }),
+            Some(PluginHttpClient::default()),
+        ) {
+            Ok(plugin) => plugin,
+            Err(error) => panic!("generation builds: {error}"),
+        };
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/admin/reports".to_string(),
+        );
+        let mut raw = http::HeaderMap::new();
+        raw.insert("host", "api.example.com".parse().expect("header value"));
+        raw.insert("x-role", "admin".parse().expect("header value"));
+        raw.insert("x-request-id", "abc-123".parse().expect("header value"));
+        ctx.set_raw_headers(raw);
+        ctx.materialize_headers();
+        // An earlier plugin strips the untrusted client field.
+        ctx.headers.remove("x-role");
+        assert!(matches!(
+            plugin.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let seen = stub.last_request.lock().expect("stub request").clone();
+        assert!(
+            seen_header_lines(&seen, "x-role").is_empty(),
+            "a removed header must not be resurrected for the provider: {seen}"
+        );
+        assert_eq!(
+            seen_header_lines(&seen, "x-request-id"),
+            vec!["abc-123".to_string()]
+        );
+    }
+
+    /// A vetted value an earlier plugin published under an operator-cased key
+    /// reaches the provider, read the same way the policy matchers read it.
+    #[tokio::test]
+    async fn plugin_inserted_case_variants_are_forwarded_with_the_same_egress_value() {
+        let stub = start_stub(StubBehavior::Allow).await;
+        let slice = json!({
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "mesh_policies": [{
+                "name": "delegate-admin",
+                "namespace": "default",
+                "scope": { "kind": "mesh_wide" },
+                "rules": [{
+                    "to": [{ "paths": ["/admin/*"] }],
+                    "action": { "custom": { "provider": "mixed-case-ext-authz" } },
+                }],
+            }],
+            "ext_authz_providers": [{
+                "name": "mixed-case-ext-authz",
+                "service": "127.0.0.1",
+                "port": stub.port,
+                "timeout_ms": 500,
+                "status_on_error": 403,
+                "include_request_headers_in_check": ["x-tenant"],
+            }],
+        });
+        let plugin = match MeshAuthz::new_with_http_client(
+            &json!({ "mesh_slice": slice }),
+            Some(PluginHttpClient::default()),
+        ) {
+            Ok(plugin) => plugin,
+            Err(error) => panic!("generation builds: {error}"),
+        };
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/admin/reports".to_string(),
+        );
+        let mut raw = http::HeaderMap::new();
+        raw.insert("host", "api.example.com".parse().expect("header value"));
+        raw.insert("x-tenant", "client-forged".parse().expect("header value"));
+        ctx.set_raw_headers(raw);
+        ctx.materialize_headers();
+        ctx.headers.remove("x-tenant");
+        ctx.headers
+            .insert("X-Tenant".to_string(), "blocked".to_string());
+        assert!(matches!(
+            plugin.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let seen = stub.last_request.lock().expect("stub request").clone();
+        assert_eq!(
+            seen_header_lines(&seen, "x-tenant"),
+            vec!["blocked".to_string()],
+            "the provider sees the plugin-published value, not the removed client one"
+        );
+
+        // A second operator-cased spelling must be folded, not selected by
+        // either the provider check or egress in their own iteration order.
+        ctx.headers
+            .insert("x-TENANT".to_string(), "second".to_string());
+        assert!(matches!(
+            plugin.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let seen = stub.last_request.lock().expect("stub request").clone();
+        assert_eq!(
+            seen_header_lines(&seen, "x-tenant"),
+            vec!["blocked, second".to_string()]
+        );
+        let mut outbound = http::HeaderMap::new();
+        ferrum_edge::proxy::headers::merge_proxy_headers_preserving_repeated(
+            &mut outbound,
+            &ctx.headers,
+        );
+        assert_eq!(outbound["x-tenant"], "blocked, second");
+        assert_eq!(outbound.get_all("x-tenant").iter().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_live_datapath_stamps_the_peer_identity_and_merges_denial_cookies() {
+        let stub = start_stub(StubBehavior::Raw(MULTI_LINE_DENIAL)).await;
+        let slice = json!({
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "mesh_policies": [{
+                "name": "delegate-admin",
+                "namespace": "default",
+                "scope": { "kind": "mesh_wide" },
+                "rules": [{
+                    "to": [{ "paths": ["/admin/*"] }],
+                    "action": { "custom": { "provider": "sample-ext-authz" } },
+                }],
+            }],
+            "ext_authz_providers": [{
+                "name": "sample-ext-authz",
+                "service": "127.0.0.1",
+                "port": stub.port,
+                "timeout_ms": 500,
+                "status_on_error": 403,
+                "headers_to_downstream_on_deny": ["set-cookie", "www-authenticate"],
+            }],
+        });
+        let plugin = match MeshAuthz::new_with_http_client(
+            &json!({ "mesh_slice": slice }),
+            Some(PluginHttpClient::default()),
+        ) {
+            Ok(plugin) => plugin,
+            Err(error) => panic!("generation builds: {error}"),
+        };
+        let mut ctx = ctx();
+        ctx.peer_spiffe_id = Some(
+            ferrum_edge::identity::SpiffeId::new("spiffe://cluster.local/ns/shop/sa/frontend")
+                .expect("valid spiffe id"),
+        );
+        // A client-supplied copy of the identity header is never what the
+        // provider sees.
+        ctx.headers.insert(
+            "x-ferrum-source-principal".to_string(),
+            "spiffe://cluster.local/ns/evil/sa/forged".to_string(),
+        );
+        match plugin.authorize(&mut ctx).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 302);
+                assert_eq!(
+                    headers.get("set-cookie").map(String::as_str),
+                    Some("oauth_state=s1; Path=/\ncsrf_nonce=n1; Path=/")
+                );
+                assert_eq!(
+                    headers.get("www-authenticate").map(String::as_str),
+                    Some("Bearer realm=\"mesh\", Basic realm=\"mesh\"")
+                );
+            }
+            other => panic!("expected the provider's denial, got {other:?}"),
+        }
+        let seen = stub.last_request.lock().expect("stub request").clone();
+        assert_eq!(
+            seen_header_lines(&seen, "x-ferrum-source-principal"),
+            vec!["spiffe://cluster.local/ns/shop/sa/frontend".to_string()]
+        );
+    }
+}
+
+// ── Per-provider attribution ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn checks_are_attributed_to_their_admitted_provider_with_a_duration() {
+    // A provider name no other test uses: the registry is process-wide.
+    const NAME: &str = "attribution-ext-authz";
+    let allow = start_stub(StubBehavior::Allow).await;
+    let mut allowing = provider(allow.port);
+    allowing.name = NAME.to_string();
+    let executor = executor(vec![allowing]);
+    let _ = check(&executor, NAME, &request_headers()).await;
+    let _ = check(&executor, NAME, &request_headers()).await;
+
+    let (outcomes, timed) = ferrum_edge::plugins::mesh::ext_authz::provider_snapshot(NAME)
+        .expect("the admitted provider is registered");
+    // The stub closes each connection after answering, so a pooled second
+    // check can race that close; what is pinned here is attribution, not the
+    // stub's keep-alive behaviour.
+    assert_eq!(
+        outcomes.iter().map(|(_, count)| *count).sum::<u64>(),
+        2,
+        "both checks are attributed to the provider: {outcomes:?}"
+    );
+    assert!(
+        outcomes.iter().any(|(outcome, _)| *outcome == "allowed"),
+        "{outcomes:?}"
+    );
+    assert_eq!(timed, 2, "every dispatched check records one duration");
+
+    let mut rendered = String::new();
+    ferrum_edge::plugins::mesh::ext_authz::render_prometheus(&mut rendered, "");
+    assert!(
+        rendered.contains(&format!(
+            "ferrum_mesh_ext_authz_provider_checks_total{{provider=\"{NAME}\",outcome=\"allowed\"}}"
+        )),
+        "per-provider outcome series missing:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(&format!(
+            "ferrum_mesh_ext_authz_check_duration_seconds_count{{provider=\"{NAME}\"}} 2"
+        )),
+        "per-provider duration histogram missing:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(&format!(
+            "ferrum_mesh_ext_authz_check_duration_seconds_bucket{{provider=\"{NAME}\",le=\"+Inf\"}} 2"
+        )),
+        "histogram +Inf bucket must equal the count:\n{rendered}"
+    );
+}
+
+/// A scrape racing live checks must never emit a finite bucket above `+Inf`,
+/// and `+Inf` must always equal `_count`: both are derived from one read of
+/// the bucket slots.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scrape_racing_live_checks_keeps_the_histogram_consistent() {
+    const NAME: &str = "histogram-race-ext-authz";
+    let stub = start_stub(StubBehavior::Allow).await;
+    let mut source = provider(stub.port);
+    source.name = NAME.to_string();
+    let executor = Arc::new(executor(vec![source]));
+    let mut workers = Vec::new();
+    for _ in 0..8 {
+        let executor = Arc::clone(&executor);
+        workers.push(tokio::spawn(async move {
+            let headers = request_headers();
+            for _ in 0..25 {
+                let _ = check(&executor, NAME, &headers).await;
+            }
+        }));
+    }
+
+    let bucket_prefix =
+        format!("ferrum_mesh_ext_authz_check_duration_seconds_bucket{{provider=\"{NAME}\",le=\"");
+    let count_prefix =
+        format!("ferrum_mesh_ext_authz_check_duration_seconds_count{{provider=\"{NAME}\"}} ");
+    let mut scrapes = 0usize;
+    loop {
+        let done = workers.iter().all(|worker| worker.is_finished());
+        let mut rendered = String::new();
+        ferrum_edge::plugins::mesh::ext_authz::render_prometheus(&mut rendered, "");
+        let mut finite = Vec::new();
+        let mut inf = None;
+        let mut count = None;
+        for line in rendered.lines() {
+            if let Some(rest) = line.strip_prefix(&bucket_prefix) {
+                let (le, value) = rest.split_once("\"} ").expect("bucket line shape");
+                let value: u64 = value.parse().expect("bucket value");
+                if le == "+Inf" {
+                    inf = Some(value);
+                } else {
+                    finite.push(value);
+                }
+            } else if let Some(value) = line.strip_prefix(&count_prefix) {
+                count = Some(value.parse::<u64>().expect("count value"));
+            }
+        }
+        if let (Some(inf), Some(count)) = (inf, count) {
+            assert_eq!(inf, count, "+Inf must equal _count:\n{rendered}");
+            assert!(
+                finite.windows(2).all(|pair| pair[0] <= pair[1]),
+                "finite buckets must be cumulative:\n{rendered}"
+            );
+            assert!(
+                finite.iter().all(|bucket| *bucket <= inf),
+                "no finite bucket may exceed +Inf:\n{rendered}"
+            );
+            scrapes += 1;
+        }
+        if done {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    for worker in workers {
+        worker.await.expect("worker completes");
+    }
+    assert!(scrapes > 0, "at least one scrape observed the histogram");
+}
+
+/// A claim owner (`jwks_auth`) and a CUSTOM-checked `mesh_authz` naming the
+/// same upstream header, published through the real plugin cache and run
+/// through the final gateway-assertion pass.
+///
+/// Kept in this binary, beside the other live CUSTOM round trips: every check
+/// bumps the process-static `ferrum_mesh_ext_authz_*` counters, which each
+/// metrics render in the same test process then includes.
+mod route_owned_assertion_state {
+    use super::*;
+    use ferrum_edge::PluginCache;
+    use ferrum_edge::config::types::{AuthMode, GatewayConfig, PluginConfig, Proxy};
+    use ferrum_edge::plugins::{PluginResult, ProxyProtocol, RequestContext};
+    use serde_json::{Value, json};
+
+    use super::jwks_auth_support::{build_rsa_jwks_from_pem, create_rs256_token};
+
+    /// A proxy-scoped plugin on `p1`; `skipped` adds a trigger admitting only
+    /// `POST`, so the `GET` below skips the instance.
+    fn plugin_config(id: &str, plugin_name: &str, config: Value, skipped: bool) -> PluginConfig {
+        let mut value = json!({
+            "id": id,
+            "plugin_name": plugin_name,
+            "scope": "proxy",
+            "proxy_id": "p1",
+            "config": config,
+        });
+        if skipped {
+            value["trigger"] = json!({"when": {"match": {"method": ["POST"]}}});
+        }
+        serde_json::from_value(value).expect("plugin config fixture")
+    }
+
+    /// Publishes `jwks_auth` owning `x-auth-request-user` as a claim
+    /// destination (trigger-skipped unless `jwks_user` names the verified user)
+    /// beside `mesh_authz` delegating `/admin/*` to a CUSTOM provider that
+    /// lists the same name in `headersToUpstreamOnAllow`, runs a request
+    /// forging the header, and returns the value that reaches the backend.
+    async fn owned_header_at_backend(
+        provider_port: u16,
+        path: &str,
+        mesh_skipped: bool,
+        jwks_user: Option<&str>,
+    ) -> Option<String> {
+        use ferrum_edge::_test_support::{
+            apply_request_view_trailer_policy_for_test, run_before_proxy_hooks_for_test,
+            run_final_backend_header_policy_hooks_for_test,
+        };
+
+        let private_key_pem = include_bytes!("../fixtures/test_rsa_private.pem");
+        let public_key_pem = include_bytes!("../fixtures/test_rsa_public.pem");
+        let auth = plugin_config(
+            "auth",
+            "jwks_auth",
+            json!({"providers": [{
+                "jwks": build_rsa_jwks_from_pem(public_key_pem),
+                "claim_headers": {"user": "x-auth-request-user"}
+            }]}),
+            jwks_user.is_none(),
+        );
+        let slice = json!({
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "mesh_policies": [{
+                "name": "delegate-admin",
+                "namespace": "default",
+                "scope": {"kind": "mesh_wide"},
+                "rules": [{
+                    "to": [{"paths": ["/admin/*"]}],
+                    "action": {"custom": {"provider": "user-ext-authz"}}
+                }]
+            }],
+            "ext_authz_providers": [{
+                "name": "user-ext-authz",
+                "service": "127.0.0.1",
+                "port": provider_port,
+                "timeout_ms": 500,
+                "fail_open": false,
+                "status_on_error": 403,
+                "headers_to_upstream_on_allow": ["x-auth-request-user"]
+            }]
+        });
+        let mesh = plugin_config(
+            "mesh",
+            "mesh_authz",
+            json!({"mesh_slice": slice}),
+            mesh_skipped,
+        );
+        let proxy: Proxy = serde_json::from_value(json!({
+            "id": "p1",
+            "listen_path": "/",
+            "backend_host": "localhost",
+            "backend_port": 3000,
+            "backend_scheme": "http",
+            "plugins": [{"plugin_config_id": "auth"}, {"plugin_config_id": "mesh"}],
+        }))
+        .expect("proxy fixture");
+        let mut config = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![proxy],
+            plugin_configs: vec![auth, mesh],
+            ..GatewayConfig::default()
+        };
+        config.normalize_fields();
+        let cache = PluginCache::new(&config).expect("the route publishes");
+        let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+        let plugins = view.plugins();
+        let consumer_index = ferrum_edge::consumer_index::ConsumerIndex::new(&[]);
+
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
+        ctx.headers
+            .insert("host".to_string(), "api.example.com".to_string());
+        ctx.headers
+            .insert("x-auth-request-user".to_string(), "mallory".to_string());
+        if let Some(user) = jwks_user {
+            let token = create_rs256_token(&json!({"sub": user, "user": user}), private_key_pem);
+            ctx.headers
+                .insert("authorization".to_string(), format!("Bearer {token}"));
+        }
+        apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+        for plugin in plugins.iter() {
+            plugin.on_request_received(&mut ctx).await;
+        }
+        let rejection = ferrum_edge::proxy::run_authentication_phase(
+            AuthMode::Multi,
+            plugins.as_slice(),
+            &mut ctx,
+            &consumer_index,
+        )
+        .await;
+        assert!(rejection.is_none(), "{path}");
+        for plugin in plugins.iter() {
+            let result = plugin.authorize(&mut ctx).await;
+            assert!(matches!(result, PluginResult::Continue), "{path}");
+        }
+        let mut headers = ctx.headers.clone();
+        let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue), "{path}");
+        run_final_backend_header_policy_hooks_for_test(&plugins, &ctx, &mut headers);
+        headers.get("x-auth-request-user").cloned()
+    }
+
+    /// `mesh_authz` keeps Istio ext_authz semantics and owns nothing, but when
+    /// a CUSTOM check it actually ran allows the request, the provider's
+    /// decision on a header another plugin owns as a gateway assertion is that
+    /// header's current authorized value: the final pass forwards the
+    /// provider's value (replacing a verified claim too), and a provider that
+    /// returned none leaves the header absent. A request no CUSTOM rule
+    /// matched, or a trigger-skipped `mesh_authz`, changes nothing: the
+    /// owner's own decision stands.
+    #[tokio::test]
+    async fn a_custom_checked_value_is_the_current_state_of_an_owned_header() {
+        let allowing = start_stub(StubBehavior::Raw(ALLOW_WITH_MUTATIONS)).await;
+        let omitting = start_stub(StubBehavior::Allow).await;
+        let admin = "/admin/reports";
+        let public = "/public";
+
+        let value = owned_header_at_backend(allowing.port, admin, false, None).await;
+        assert_eq!(value.as_deref(), Some("alice"), "skipped owner");
+        let value = owned_header_at_backend(allowing.port, admin, false, Some("bob")).await;
+        assert_eq!(value.as_deref(), Some("alice"), "replaced claim");
+        let value = owned_header_at_backend(omitting.port, admin, false, None).await;
+        assert_eq!(value.as_deref(), None, "provider omitted, skipped owner");
+        let value = owned_header_at_backend(omitting.port, admin, false, Some("bob")).await;
+        assert_eq!(value.as_deref(), None, "provider omitted, admitted owner");
+
+        let value = owned_header_at_backend(allowing.port, public, false, None).await;
+        assert_eq!(value.as_deref(), None, "unmatched CUSTOM, skipped owner");
+        let value = owned_header_at_backend(allowing.port, public, false, Some("bob")).await;
+        assert_eq!(value.as_deref(), Some("bob"), "unmatched CUSTOM");
+        let value = owned_header_at_backend(allowing.port, admin, true, None).await;
+        assert_eq!(value.as_deref(), None, "skipped mesh_authz and owner");
+        let value = owned_header_at_backend(allowing.port, admin, true, Some("bob")).await;
+        assert_eq!(value.as_deref(), Some("bob"), "skipped mesh_authz");
     }
 }

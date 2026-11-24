@@ -12,6 +12,9 @@ import pool_internal_profile as profile
 from h2_diagnostics import annotate, parse_gauges
 
 
+_QUOTED_NAME_RE = re.compile(r'"([a-z0-9_]+)"')
+
+
 def values():
     result = dict.fromkeys(profile.FIELDS, 0)
     result.update(schema=1, sample_every=64, pid=1, allocator_installed=1, slot_capacity=128)
@@ -67,7 +70,7 @@ def traffic_sample(pair, gateway, size):
 class PoolInternalProfileTests(unittest.TestCase):
     def test_rust_schema_is_the_fixed_cartesian_product(self):
         source = (profile.ROOT.parents[2] / "src/pool_profile/schema.rs").read_text()
-        arrays = {name: re.findall(r'"([a-z0-9_]+)"', re.search(
+        arrays = {name: _QUOTED_NAME_RE.findall(re.search(
             r"pub const " + name + r": .*?= \[(.*?)\];", source, re.S)[1])
                   for name in ["FAMILIES", "PURPOSES", "EVENTS", "PHASES", "FIELDS", "PROBES"]}
         names = []

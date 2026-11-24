@@ -13,11 +13,11 @@ use tracing::info;
 use super::aws;
 #[cfg(feature = "secrets-azure")]
 use super::azure;
+use super::file;
 #[cfg(feature = "secrets-gcp")]
 use super::gcp;
 #[cfg(feature = "secrets-vault")]
 use super::vault;
-use super::{env, file};
 use crate::config::env_config::{SECRET_FETCH_TIMEOUT_SECONDS_KEY, parse_secret_fetch_timeout};
 
 /// Only scan environment variables with this prefix.
@@ -157,6 +157,17 @@ fn source_reference_candidates(reference: &str) -> Vec<String> {
                     candidates.push(format!("{vault_url}/secrets/{secret_name}/{version}"));
                     candidates.push(version);
                 }
+                // The SDK's challenge-resource check echoes the bare request
+                // host (and transport errors may echo `host:port`), neither of
+                // which contains the `https://` prefix of `vault_url`.
+                if let Some(authority) = vault_url.strip_prefix("https://") {
+                    candidates.push(authority.to_string());
+                    if let Ok(url) = url::Url::parse(&vault_url)
+                        && let Some(host) = url.host_str()
+                    {
+                        candidates.push(host.to_string());
+                    }
+                }
                 candidates.push(vault_url);
                 candidates.push(secret_name);
             }
@@ -166,9 +177,9 @@ fn source_reference_candidates(reference: &str) -> Vec<String> {
     candidates
 }
 
-/// Read the secret fetch timeout for the *runtime* single-key paths
-/// ([`resolve_secret`], [`resolve_external_reference`]), which run long after
-/// settings are loaded and where the conf file is a legitimate source.
+/// Read the secret fetch timeout for the *runtime* direct-reference path
+/// ([`resolve_external_reference`]), which runs long after settings are loaded
+/// and where the conf file is a legitimate source.
 ///
 /// A configured value that is malformed, zero, or above the documented maximum
 /// is an error, never a silent fallback to the default: see
@@ -198,7 +209,7 @@ fn secret_fetch_timeout() -> Result<Duration, String> {
 /// The documented `env > conf file` precedence is therefore deliberately narrowed
 /// for this one variable at this one stage: to change the startup fetch timeout,
 /// set `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` in the environment. A `ferrum.conf`
-/// value still applies to the runtime single-key fetches above. See
+/// value still applies to the runtime direct-reference fetches above. See
 /// `docs/configuration.md`.
 ///
 /// The value is validated by the same [`parse_secret_fetch_timeout`] rule as
@@ -212,7 +223,6 @@ fn startup_secret_fetch_timeout() -> Result<Duration, String> {
 
 /// A successfully resolved secret value with its source for logging.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ResolvedSecret {
     pub value: String,
     /// Human-readable source description (e.g. "env", "file:/run/secrets/jwt").
@@ -247,10 +257,6 @@ pub struct ResolvedEnvSecrets {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum BackendKind {
-    // Used by the intentionally retained single-key `resolve_secret` path,
-    // which is not referenced by the production binary in every target.
-    #[allow(dead_code)]
-    DirectEnv,
     File,
     #[cfg(feature = "secrets-vault")]
     Vault,
@@ -286,13 +292,7 @@ pub(crate) trait SecretBackend: Sync + Send {
     fn suffix(&self) -> Option<&'static str> {
         None
     }
-    #[allow(dead_code)]
-    fn resolve_ref(&self, key: &str) -> Option<String>;
-    #[allow(dead_code)]
     fn source(&self, reference: &str) -> String;
-    fn log_loaded(&self) -> bool {
-        self.name() != "environment"
-    }
 
     fn matches_suffix<'a>(&self, raw_key: &'a str) -> Option<&'a str> {
         self.suffix()
@@ -334,8 +334,6 @@ pub(crate) trait SecretBackend: Sync + Send {
     }
 }
 
-#[allow(dead_code)]
-struct DirectEnvBackend;
 struct FileBackend;
 
 #[cfg(feature = "secrets-vault")]
@@ -347,8 +345,6 @@ struct GcpBackend;
 #[cfg(feature = "secrets-azure")]
 struct AzureBackend;
 
-#[allow(dead_code)]
-static DIRECT_ENV_BACKEND: DirectEnvBackend = DirectEnvBackend;
 static FILE_BACKEND: FileBackend = FileBackend;
 #[cfg(feature = "secrets-vault")]
 static VAULT_BACKEND: VaultBackend = VaultBackend;
@@ -358,21 +354,6 @@ static AWS_BACKEND: AwsBackend = AwsBackend;
 static GCP_BACKEND: GcpBackend = GcpBackend;
 #[cfg(feature = "secrets-azure")]
 static AZURE_BACKEND: AzureBackend = AzureBackend;
-
-#[allow(dead_code)]
-fn all_backends() -> Vec<&'static dyn SecretBackend> {
-    #[allow(unused_mut)]
-    let mut backends: Vec<&'static dyn SecretBackend> = vec![&DIRECT_ENV_BACKEND, &FILE_BACKEND];
-    #[cfg(feature = "secrets-vault")]
-    backends.push(&VAULT_BACKEND);
-    #[cfg(feature = "secrets-aws")]
-    backends.push(&AWS_BACKEND);
-    #[cfg(feature = "secrets-gcp")]
-    backends.push(&GCP_BACKEND);
-    #[cfg(feature = "secrets-azure")]
-    backends.push(&AZURE_BACKEND);
-    backends
-}
 
 fn startup_backends() -> Vec<&'static dyn SecretBackend> {
     #[allow(unused_mut)]
@@ -408,7 +389,6 @@ fn suffix_backends() -> Vec<&'static dyn SecretBackend> {
     backends
 }
 
-#[allow(dead_code)]
 fn timeout_error(key: &str, backend_name: &str, timeout: Duration) -> String {
     format!(
         "Timeout resolving {} from {} after {}s",
@@ -423,7 +403,12 @@ fn timeout_error(key: &str, backend_name: &str, timeout: Duration) -> String {
 /// Deterministic and reference-free: client/credential discovery can stall on
 /// ADC or instance-metadata without ever touching a source reference, so the
 /// message names only the backend and the configured bound.
-#[cfg(any(feature = "secrets-aws", feature = "secrets-gcp"))]
+#[cfg(any(
+    feature = "secrets-aws",
+    feature = "secrets-gcp",
+    feature = "secrets-azure",
+    feature = "secrets-vault"
+))]
 fn client_init_timeout_error(backend_name: &str, timeout: Duration) -> String {
     format!(
         "Timeout initializing {} client after {}s",
@@ -566,17 +551,6 @@ fn sanitize_env_key(key: &std::ffi::OsStr) -> String {
 /// documented "only one source is allowed" check.
 fn env_var_os_is_set(key: &str) -> bool {
     std::env::var_os(key).is_some_and(|value| !value.is_empty())
-}
-
-fn unsupported_cloud_suffix_for_base_key(key: &str) -> Option<(&'static str, &'static str)> {
-    for suffix in ["_AZURE", "_VAULT", "_AWS", "_GCP"] {
-        let suffixed_key = format!("{key}{suffix}");
-        let is_set = env_var_os_is_set(&suffixed_key);
-        if is_set && let Some(unsupported) = unsupported_cloud_suffix(&suffixed_key) {
-            return Some(unsupported);
-        }
-    }
-    None
 }
 
 pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
@@ -835,11 +809,9 @@ async fn resolve_env_secrets(keys: Option<&[&str]>) -> Result<ResolvedEnvSecrets
                     backend.display_name()
                 ));
             }
-            if backend.log_loaded() {
-                results
-                    .loaded_sources
-                    .push((item.base_key.clone(), backend.display_name()));
-            }
+            results
+                .loaded_sources
+                .push((item.base_key.clone(), backend.display_name()));
             results.vars.push((item.base_key, item.value));
             results.source_keys_to_remove.push(item.suffixed_key);
         }
@@ -858,62 +830,12 @@ async fn resolve_env_secrets(keys: Option<&[&str]>) -> Result<ResolvedEnvSecrets
     Ok(results)
 }
 
-#[allow(dead_code)]
-/// Resolve a single secret key across all configured backends.
-///
-/// Startup uses `resolve_all_env_secrets()` for bulk env injection; this helper
-/// remains for the existing single-key tests and ad-hoc secret lookups.
-pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String> {
-    if let Some((suffix, backend_name)) = unsupported_cloud_suffix_for_base_key(key) {
-        return Err(format!(
-            "Unsupported secret suffix {suffix} on {key}{suffix}: {backend_name} support is not enabled in this build."
-        ));
-    }
-
-    let mut sources: Vec<(&'static dyn SecretBackend, String)> = Vec::new();
-
-    for backend in all_backends() {
-        if let Some(reference) = backend.resolve_ref(key) {
-            sources.push((backend, reference));
-        }
-    }
-
-    if sources.len() > 1 {
-        let names: Vec<&str> = sources.iter().map(|(backend, _)| backend.name()).collect();
-        return Err(format!(
-            "Multiple secret sources configured for {}: {}. Only one source is allowed.",
-            key,
-            names.join(", ")
-        ));
-    }
-
-    let Some((backend, reference)) = sources.into_iter().next() else {
-        return Ok(None);
-    };
-
-    let fetch_timeout = secret_fetch_timeout()?;
-    let value = tokio::time::timeout(fetch_timeout, backend.resolve_one(&reference, key))
-        .await
-        .map_err(|_| timeout_error(key, backend.display_name(), fetch_timeout))?
-        .map_err(|error| redact_source_reference(error, &reference, key))?;
-
-    if backend.log_loaded() {
-        info!("Loaded {} from {}", key, backend.display_name());
-    }
-
-    Ok(Some(ResolvedSecret {
-        value,
-        source: backend.source(&reference),
-        version: None,
-    }))
-}
-
 /// Resolve a direct provider reference such as a `vault://...` or `aws://...`
 /// TLS material URI.
 ///
-/// Unlike [`resolve_secret`], this does not inspect environment variables for
-/// suffixed variants; the caller has already selected the provider and passed
-/// its backend-specific reference. The same backend clients, timeouts, and
+/// This does not inspect environment variables for suffixed variants (startup
+/// resolution, [`resolve_all_env_secrets`], owns those); the caller has already
+/// selected the provider and passed its backend-specific reference. The same backend clients, timeouts, and
 /// feature gates are used so typed TLS source URIs do not duplicate provider
 /// setup logic.
 pub async fn resolve_external_reference(
@@ -947,9 +869,7 @@ pub async fn resolve_external_reference(
             .map_err(|_| timeout_error(key, backend.display_name(), fetch_timeout))?
             .map_err(|error| redact_source_reference(error, reference, key))?;
 
-        if backend.log_loaded() {
-            info!("Loaded {} from {}", key, backend.display_name());
-        }
+        info!("Loaded {} from {}", key, backend.display_name());
 
         return Ok(ResolvedSecret {
             value: secret.value,
@@ -963,9 +883,7 @@ pub async fn resolve_external_reference(
         .map_err(|_| timeout_error(key, backend.display_name(), fetch_timeout))?
         .map_err(|error| redact_source_reference(error, reference, key))?;
 
-    if backend.log_loaded() {
-        info!("Loaded {} from {}", key, backend.display_name());
-    }
+    info!("Loaded {} from {}", key, backend.display_name());
 
     Ok(ResolvedSecret {
         value,
@@ -981,42 +899,6 @@ fn unsupported_provider_name(provider: &str) -> Option<&'static str> {
         "gcp" if !cfg!(feature = "secrets-gcp") => Some("GCP Secret Manager"),
         "azure" if !cfg!(feature = "secrets-azure") => Some("Azure Key Vault"),
         _ => None,
-    }
-}
-
-#[async_trait]
-impl SecretBackend for DirectEnvBackend {
-    fn kind(&self) -> BackendKind {
-        BackendKind::DirectEnv
-    }
-
-    fn name(&self) -> &'static str {
-        "direct"
-    }
-
-    fn display_name(&self) -> &'static str {
-        "environment"
-    }
-
-    fn log_loaded(&self) -> bool {
-        false
-    }
-
-    fn resolve_ref(&self, key: &str) -> Option<String> {
-        env::resolve(key)
-    }
-
-    fn source(&self, _reference: &str) -> String {
-        "env".to_string()
-    }
-
-    async fn resolve_one(&self, _reference: &str, key: &str) -> Result<String, String> {
-        env::resolve(key).ok_or_else(|| {
-            format!(
-                "Environment variable {} was not set when resolving direct env secret",
-                key
-            )
-        })
     }
 }
 
@@ -1038,16 +920,12 @@ impl SecretBackend for FileBackend {
         Some("_FILE")
     }
 
-    fn resolve_ref(&self, key: &str) -> Option<String> {
-        file::resolve_ref(key)
-    }
-
     fn source(&self, reference: &str) -> String {
         format!("file:{}", reference)
     }
 
     /// Delegate to [`file::read_secret_detached`]: every `_FILE` path (startup
-    /// batch and single-key/runtime) shares the detached-OS-thread read so a
+    /// batch and runtime direct reference) shares the detached-OS-thread read so a
     /// FIFO/stalled mount cannot pin Tokio runtime teardown after the fetch
     /// timeout. Do not reintroduce `tokio::task::spawn_blocking` here.
     async fn resolve_one(&self, reference: &str, key: &str) -> Result<String, String> {
@@ -1074,10 +952,6 @@ impl SecretBackend for VaultBackend {
         Some("_VAULT")
     }
 
-    fn resolve_ref(&self, key: &str) -> Option<String> {
-        vault::resolve_ref(key)
-    }
-
     fn source(&self, reference: &str) -> String {
         format!("vault:{}", reference)
     }
@@ -1091,7 +965,11 @@ impl SecretBackend for VaultBackend {
         secrets: &[PendingSecret],
         timeout: Duration,
     ) -> Result<Vec<ResolvedPendingSecret>, String> {
-        let client = vault::VaultClientWrapper::new()?;
+        // Client construction reads `FERRUM_TLS_CA_BUNDLE_PATH`; bound it
+        // with the same timeout as the fetches (once per provider batch).
+        let client = tokio::time::timeout(timeout, vault::VaultClientWrapper::new())
+            .await
+            .map_err(|_| client_init_timeout_error(self.display_name(), timeout))??;
         resolve_many_concurrent(
             secrets,
             timeout,
@@ -1120,10 +998,6 @@ impl SecretBackend for AwsBackend {
 
     fn suffix(&self) -> Option<&'static str> {
         Some("_AWS")
-    }
-
-    fn resolve_ref(&self, key: &str) -> Option<String> {
-        aws::resolve_ref(key)
     }
 
     fn source(&self, reference: &str) -> String {
@@ -1173,10 +1047,6 @@ impl SecretBackend for GcpBackend {
 
     fn suffix(&self) -> Option<&'static str> {
         Some("_GCP")
-    }
-
-    fn resolve_ref(&self, key: &str) -> Option<String> {
-        gcp::resolve_ref(key)
     }
 
     fn source(&self, reference: &str) -> String {
@@ -1233,10 +1103,6 @@ impl SecretBackend for AzureBackend {
         Some("_AZURE")
     }
 
-    fn resolve_ref(&self, key: &str) -> Option<String> {
-        azure::resolve_ref(key)
-    }
-
     fn source(&self, reference: &str) -> String {
         format!("azure:{}", reference)
     }
@@ -1250,7 +1116,11 @@ impl SecretBackend for AzureBackend {
         secrets: &[PendingSecret],
         timeout: Duration,
     ) -> Result<Vec<ResolvedPendingSecret>, String> {
-        let creds = azure::AzureCredentials::new()?;
+        // Credential construction reads `FERRUM_TLS_CA_BUNDLE_PATH`; bound it
+        // with the same timeout as the fetches (once per provider batch).
+        let creds = tokio::time::timeout(timeout, azure::AzureCredentials::new())
+            .await
+            .map_err(|_| client_init_timeout_error(self.display_name(), timeout))??;
         resolve_many_concurrent(
             secrets,
             timeout,
@@ -1375,11 +1245,14 @@ mod tests {
         const REFERENCE: &str =
             "https://ferrum-vault-sentinel.vault.azure.net:8443/secrets/jwt-name-sentinel/v9abc";
         // Shaped like an `azure_core` transport error, which may echo either the
-        // unversioned or versioned URL plus the secret name.
+        // unversioned or versioned URL plus the secret name, and like the Key
+        // Vault challenge check, which echoes the bare host (or `host:port`).
         let sdk_error = "Failed to get Azure secret for FERRUM_ADMIN_JWT_SECRET: \
              HTTP 404 from https://ferrum-vault-sentinel.vault.azure.net:8443\
              /secrets/jwt-name-sentinel/v9abc?api-version=7.4 (secret 'jwt-name-sentinel' \
-             in https://ferrum-vault-sentinel.vault.azure.net:8443)"
+             in https://ferrum-vault-sentinel.vault.azure.net:8443); challenge resource \
+             doesn't match the requested domain 'ferrum-vault-sentinel.vault.azure.net' \
+             (connect ferrum-vault-sentinel.vault.azure.net:8443)"
             .to_string();
 
         let redacted = redact_source_reference(sdk_error, REFERENCE, "FERRUM_ADMIN_JWT_SECRET");

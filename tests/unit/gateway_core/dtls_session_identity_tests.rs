@@ -247,3 +247,28 @@ fn an_isolated_dtls_handshake_timeout_still_logs() {
         "a single timeout in a window is emitted immediately, not suppressed"
     );
 }
+
+/// GHSA-7464-frfx-85p6: errors a single unauthenticated datagram can provoke
+/// drop that datagram; authenticated or engine-level failures still end the
+/// session.
+#[test]
+fn dtls_packet_errors_forgeable_by_one_datagram_are_dropped_not_fatal() {
+    let droppable = ferrum_edge::_test_support::dtls_packet_error_is_droppable_for_test;
+    for error in [
+        dimpl::Error::ParseIncomplete,
+        dimpl::Error::CryptoError("bad record tag".to_string()),
+        dimpl::Error::TooManyRecords,
+        dimpl::Error::ReceiveQueueFull,
+        dimpl::Error::RenegotiationAttempt,
+    ] {
+        assert!(droppable(&error), "{error} must drop the datagram");
+    }
+    for error in [
+        dimpl::Error::ConnectionClosed,
+        dimpl::Error::SecurityError("Received fatal alert: level=2, description=40".to_string()),
+        dimpl::Error::CertificateError("untrusted".to_string()),
+        dimpl::Error::UnexpectedMessage("unexpected".to_string()),
+    ] {
+        assert!(!droppable(&error), "{error} must stay fatal");
+    }
+}

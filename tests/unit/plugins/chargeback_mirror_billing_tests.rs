@@ -5,7 +5,6 @@
 //! mirror summary with `mirror: true`. Both `api_chargeback` and
 //! `api_chargeback_sink` must record exactly one client charge.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
@@ -55,6 +54,7 @@ fn primary_summary(consumer: &str, proxy_id: &str, status: u16) -> TransactionSu
         timestamp_received: "2025-01-01T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: Some(consumer.to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/chargeback-mirror".to_string(),
@@ -76,12 +76,13 @@ fn primary_summary(consumer: &str, proxy_id: &str, status: u16) -> TransactionSu
         error_class: None,
         body_error_class: None,
         body_completed: true,
+        response_delivery: Default::default(),
         bytes_sent: 32,
         bytes_received: 64,
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -97,7 +98,11 @@ fn chargeback_key(
 ) -> String {
     let scope = InstanceScope::new("USD", "ferrum");
     format!(
-        "{}|{}|{}|{}|http|{}|{:016x}|{:016x}|{:016x}",
+        "{}.{}.{}.{}|{}|{}|{}|{}|http|{}|{:016x}|{:016x}|{:016x}",
+        consumer.len(),
+        scope.namespace.len(),
+        proxy_id.len(),
+        scope.currency.len(),
         consumer,
         scope.namespace,
         proxy_id,
@@ -338,6 +343,7 @@ async fn in_memory_chargeback_bills_each_primary_once_below_100_percent() {
     let plugins: Vec<Arc<dyn Plugin>> = vec![plugin];
     let sampler = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "shadow.local",
             "percentage": 50.0,
             "mirror_request_body": false

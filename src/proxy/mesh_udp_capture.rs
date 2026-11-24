@@ -158,11 +158,9 @@ pub struct MeshUdpCaptureConfig {
     /// Address+port to bind. The port is the Stage-2 TPROXY listener port
     /// (`FERRUM_MESH_CAPTURE_UDP_PORT`, default 15011).
     pub addr: StdSocketAddr,
-    /// Shared proxy state — threaded in for Stage 4 so the listener can consult
-    /// the `mesh_udp_egress` route table, LB-select a workload, gate on the
-    /// gateway SVID + HBONE capability, and open the datagram-over-HBONE tunnel.
-    /// (Stage 3 dropped captured datagrams and needed no state; this is the
-    /// enabling refactor.)
+    /// Shared proxy state, so the listener can consult the `mesh_udp_egress`
+    /// route table, LB-select a workload, gate on the gateway SVID and
+    /// transport capability, and open the egress tunnel.
     pub state: std::sync::Arc<super::ProxyState>,
     /// Per-listener shutdown receiver (config-driven removal).
     pub shutdown: watch::Receiver<bool>,
@@ -443,9 +441,8 @@ pub(crate) fn bind_mesh_udp_capture_socket_with_pktinfo(
             if !v4_origdst && !v6_origdst {
                 // Without orig-dst recovery a captured datagram cannot be routed
                 // to its real destination, so refuse rather than bind a listener
-                // that can only drop-without-knowing-where. (Stage 3 drops anyway,
-                // but Stage 4 relies on this; failing here surfaces a bad kernel
-                // early.)
+                // that can only drop-without-knowing-where. Failing here surfaces
+                // a bad kernel early.
                 return Err(anyhow::anyhow!(
                     "mesh UDP capture: IP_RECVORIGDSTADDR setsockopt failed on both v4 and v6 (kernel lacks orig-dst recovery)"
                 ));
@@ -628,13 +625,13 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
         addr = %addr,
         v4_origdst,
         v6_origdst,
-        "Mesh UDP capture listener started (capture→datagram-over-HBONE egress; Ambient only)"
+        "Mesh UDP capture listener started (capture→datagram-over-mesh egress)"
     );
 
     // Idle-session sweep — reaps captured sessions whose last datagram is older
     // than the idle timeout, so a spoofed-source flood ages out instead of
     // accumulating. Mirrors `udp_proxy::spawn_session_cleanup`'s identity-aware
-    // expiry, simplified (no backend leg / plugins in Stage 3).
+    // expiry, simplified (no backend leg or plugins).
     spawn_capture_session_cleanup(
         sessions.clone(),
         session_limiter.clone(),
@@ -652,7 +649,7 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
         tokio::select! {
             completed = session_tasks.join_next(), if !session_tasks.is_empty() => {
                 if let Some(Err(error)) = completed {
-                    warn!(%error, "Ambient UDP capture session task failed");
+                    warn!(%error, "Mesh UDP capture session task failed");
                 }
             }
             _ = shutdown_rx.changed() => {
@@ -894,12 +891,10 @@ struct CaptureSession {
     /// this task observing the closed channel is never clobbered (codex r1 P2:
     /// remove-after-replace race).
     session_id: u64,
-    /// Egress channel to the per-session task. `None` for a session whose
-    /// orig-dst matched no routable `mesh_udp_egress` entry — but such flows are
-    /// never inserted (they drop without a session), so in practice this is
-    /// always `Some` for a live session. Kept as `Option` only so the unit
-    /// tests can exercise the keying/cap logic without a live tunnel.
-    tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
+    /// Egress channel to the per-session task. A flow whose orig-dst matches
+    /// no routable `mesh_udp_egress` entry is dropped without a session, so
+    /// every inserted session has one.
+    tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
     /// SHARED count of bytes currently queued in the egress channel (codex r3).
     /// Bumped by the recv loop on a successful enqueue, decremented by the egress
     /// task as it drains each datagram, so a per-session BYTE cap
@@ -1137,12 +1132,16 @@ where
             let session = occupied.get_mut();
             // Refresh the SHARED clock (the sweep + watchdog both read it).
             session.last_activity.store(now, Ordering::Relaxed);
-            if let Some(tx) = session.tx.as_ref() {
-                // Drop-on-full by datagram COUNT (the channel bound) OR by queued
-                // BYTES (the per-session memory cap) — UDP backpressure is "drop",
-                // and we must never block the bounded recv-loop drain.
-                enqueue_egress_datagram(tx, &session.queued_bytes, data, key.client, key.orig_dst);
-            }
+            // Drop-on-full by datagram COUNT (the channel bound) OR by queued
+            // BYTES (the per-session memory cap) — UDP backpressure is "drop",
+            // and we must never block the bounded recv-loop drain.
+            enqueue_egress_datagram(
+                &session.tx,
+                &session.queued_bytes,
+                data,
+                key.client,
+                key.orig_dst,
+            );
             SessionAdmission::Refreshed
         }
         Entry::Vacant(vacant) => {
@@ -1191,7 +1190,7 @@ where
             vacant.insert(CaptureSession {
                 last_activity: last_activity.clone(),
                 session_id,
-                tx: Some(tx),
+                tx,
                 queued_bytes: queued_bytes.clone(),
                 outcome_signal: outcome_signal.clone(),
                 idle_timeout_ms,
@@ -1259,9 +1258,8 @@ fn enqueue_egress_datagram(
 ///
 /// All the fail-closed gates from the raw-TCP egress path apply (LB selection,
 /// gateway SVID present, HBONE capability proven, pinned-peer identity intact);
-/// any gate failure logs and ends the session (the recv loop already created the
-/// map entry, so it is cleaned up by the idle sweep — the channel just goes
-/// undrained and fills, which drop-on-full handles harmlessly).
+/// any gate failure logs and ends the session, and the task then removes its own
+/// map entry (the idle sweep is only a backstop for a live but quiescent task).
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn spawn_udp_egress_session(
@@ -1421,39 +1419,36 @@ async fn run_udp_egress_session(
             &entry.upstream_id,
             override_port,
         );
-        let port_lane = (health_port_scope.is_some()
-            && match mesh_stream_port_lane_supported(proxy, override_port) {
-                Ok(supported) => supported,
-                Err(message) => {
-                    warn!(
-                        service = %entry.service_fqdn,
-                        port = override_port,
-                        orig_dst = %key.orig_dst,
-                        %message,
-                        "Mesh UDP egress per-port LB policy is unsupported; ending session"
-                    );
-                    return;
-                }
-            })
-        .then_some(override_port);
-        if let Some(port) = port_lane {
-            let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
-                lb,
-                &proxy.namespace,
-                &entry.upstream_id,
-                Some(port),
-                None,
-            );
-            if !matches!(strategy, crate::load_balancer::HashOnStrategy::Ip) {
+        // Mesh relay proxies select from the entry upstream, never a subset.
+        let port_lane = match backend_dispatch::stream_port_lane(
+            proxy,
+            lb,
+            &entry.upstream_id,
+            health_port_scope,
+            None,
+        ) {
+            Ok(port_lane) => port_lane,
+            Err(backend_dispatch::StreamPortLaneRefusal::LeastLatency) => {
+                let message = "per-port LEAST_LATENCY requires stream latency accounting";
                 warn!(
                     service = %entry.service_fqdn,
-                    port,
+                    port = override_port,
+                    orig_dst = %key.orig_dst,
+                    %message,
+                    "Mesh UDP egress per-port LB policy is unsupported; ending session"
+                );
+                return;
+            }
+            Err(backend_dispatch::StreamPortLaneRefusal::NonIpHashKey) => {
+                warn!(
+                    service = %entry.service_fqdn,
+                    port = override_port,
                     orig_dst = %key.orig_dst,
                     "Mesh UDP egress per-port consistent hashing supports only source-IP hash keys; ending session"
                 );
                 return;
             }
-        }
+        };
         let lb_hash_key = mesh_udp_lb_hash_key_for_client_ip(key.client.ip());
         let health_ctx = backend_dispatch::health_context_for_selection(
             proxy,
@@ -2125,40 +2120,6 @@ fn spawn_capture_session_cleanup(
     });
 }
 
-#[cfg(target_os = "linux")]
-fn stream_port_override_affects_selection(proxy: &crate::config::types::Proxy, port: u16) -> bool {
-    let Some(override_config) = proxy
-        .dispatch_port_overrides
-        .as_ref()
-        .and_then(|overrides| overrides.get(&port))
-    else {
-        return false;
-    };
-    override_config.algorithm.is_some()
-        || override_config.hash_on.is_some()
-        || override_config.locality_lb_setting.is_some()
-}
-
-#[cfg(target_os = "linux")]
-fn mesh_stream_port_lane_supported(
-    proxy: &crate::config::types::Proxy,
-    port: u16,
-) -> Result<bool, &'static str> {
-    let Some(override_config) = proxy
-        .dispatch_port_overrides
-        .as_ref()
-        .and_then(|overrides| overrides.get(&port))
-    else {
-        return Ok(false);
-    };
-    match override_config.algorithm {
-        Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency) => {
-            Err("per-port LEAST_LATENCY requires stream latency accounting")
-        }
-        _ => Ok(stream_port_override_affects_selection(proxy, port)),
-    }
-}
-
 /// Non-Linux stub. `IP_TRANSPARENT` and recvmsg cmsg orig-dst recovery are
 /// Linux-only; mesh UDP capture is unsupported elsewhere, so the listener logs
 /// and returns immediately (the flag is default-off, so this is never reached
@@ -2261,31 +2222,43 @@ listen_port: 15011
         proxy
     }
 
+    /// The lane decision the mesh UDP egress path makes for port 53: entry
+    /// upstream, no selection subset.
+    fn mesh_udp_lane(
+        proxy: &crate::config::types::Proxy,
+    ) -> Result<Option<u16>, crate::proxy::backend_dispatch::StreamPortLaneRefusal> {
+        let cache = crate::load_balancer::LoadBalancerCache::new(
+            &crate::config::types::GatewayConfig::default(),
+        );
+        let snapshot = cache.load();
+        crate::proxy::backend_dispatch::stream_port_lane(proxy, &snapshot, "dns", Some(53), None)
+    }
+
     #[test]
     fn mesh_udp_stream_port_override_affects_selection_only_for_lb_fields() {
         let timeout_only = proxy_with_override(crate::config::types::ResolvedPortOverride {
             connect_timeout_ms: Some(250),
             ..Default::default()
         });
-        assert!(!stream_port_override_affects_selection(&timeout_only, 53));
+        assert_eq!(mesh_udp_lane(&timeout_only), Ok(None));
 
         let passive_only = proxy_with_override(crate::config::types::ResolvedPortOverride {
             passive_health_check: Some(crate::config::types::PassiveHealthCheck::default()),
             ..Default::default()
         });
-        assert!(!stream_port_override_affects_selection(&passive_only, 53));
+        assert_eq!(mesh_udp_lane(&passive_only), Ok(None));
 
         let locality = proxy_with_override(crate::config::types::ResolvedPortOverride {
             locality_lb_setting: Some(crate::config::types::UpstreamLocalityLbSetting::default()),
             ..Default::default()
         });
-        assert!(stream_port_override_affects_selection(&locality, 53));
+        assert_eq!(mesh_udp_lane(&locality), Ok(Some(53)));
 
         let algorithm = proxy_with_override(crate::config::types::ResolvedPortOverride {
             algorithm: Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing),
             ..Default::default()
         });
-        assert!(stream_port_override_affects_selection(&algorithm, 53));
+        assert_eq!(mesh_udp_lane(&algorithm), Ok(Some(53)));
     }
 
     #[test]
@@ -2295,8 +2268,10 @@ listen_port: 15011
             ..Default::default()
         });
 
-        assert!(stream_port_override_affects_selection(&least_latency, 53));
-        assert!(mesh_stream_port_lane_supported(&least_latency, 53).is_err());
+        assert_eq!(
+            mesh_udp_lane(&least_latency),
+            Err(crate::proxy::backend_dispatch::StreamPortLaneRefusal::LeastLatency)
+        );
     }
 
     #[test]
@@ -2990,33 +2965,22 @@ mod live_netns_tests {
             .ok()
     }
 
-    /// Build the transparent capture socket EXACTLY as the production listener's
-    /// `build_bound_socket` does (`SO_REUSEADDR` + `IP_TRANSPARENT` +
-    /// `IP_RECVORIGDSTADDR`, options before bind), bound to the v4 wildcard on
-    /// `CAPTURE_PORT`. Returns the bound std socket so the test can drain it with
-    /// the listener's own `RecvMmsgBatch` primitive.
+    /// Bind the production transparent capture socket
+    /// ([`super::bind_mesh_udp_capture_socket`]) to the v4 wildcard on
+    /// `CAPTURE_PORT`, so a regression in the production recipe surfaces here.
+    /// Returns the bound std socket so the test can drain it with the
+    /// listener's own `RecvMmsgBatch` primitive.
     fn build_capture_socket() -> Result<std::net::UdpSocket, String> {
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )
-        .map_err(|e| format!("socket: {e}"))?;
-        socket
-            .set_reuse_address(true)
-            .map_err(|e| format!("SO_REUSEADDR: {e}"))?;
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| format!("set_nonblocking: {e}"))?;
-        let fd = socket.as_raw_fd();
-        crate::socket_opts::set_ip_transparent(fd).map_err(|e| format!("IP_TRANSPARENT: {e}"))?;
-        crate::socket_opts::set_ip_recvorigdstaddr(fd)
-            .map_err(|e| format!("IP_RECVORIGDSTADDR: {e}"))?;
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), CAPTURE_PORT);
-        socket
-            .bind(&bind_addr.into())
-            .map_err(|e| format!("bind {bind_addr}: {e}"))?;
-        Ok(socket.into())
+        let (socket, bound, v4_origdst, _) = super::bind_mesh_udp_capture_socket(bind_addr)
+            .map_err(|e| format!("bind production capture socket {bind_addr}: {e:#}"))?;
+        if bound != bind_addr || !v4_origdst {
+            return Err(format!(
+                "production capture socket bound {bound} (v4 orig-dst: {v4_origdst}), \
+                 expected {bind_addr} with v4 orig-dst recovery"
+            ));
+        }
+        Ok(socket)
     }
 
     #[test]
@@ -3314,10 +3278,9 @@ mod live_netns_tests {
         // The return-path primitive: a reply to the captured client must be
         // SOURCED from the captured original destination (the VIP:port the pod
         // dialed), which requires an IP_TRANSPARENT socket bound NON-LOCALLY to
-        // that address. This exercises `build_transparent_reply_socket`'s exact
-        // recipe (SO_REUSEADDR + IP_TRANSPARENT + non-local bind) against a real
-        // kernel inside the netns — proving the bind the egress return path
-        // depends on actually succeeds with CAP_NET_ADMIN.
+        // that address. This calls the production `build_transparent_reply_socket`
+        // against a real kernel inside the netns — proving the bind the egress
+        // return path depends on actually succeeds with CAP_NET_ADMIN.
         if !is_root() {
             skip_or_fail("not root; IP_TRANSPARENT non-local bind needs CAP_NET_ADMIN");
             return;
@@ -3354,28 +3317,12 @@ mod live_netns_tests {
             if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
                 return Err(format!("setns failed: {}", std::io::Error::last_os_error()));
             }
-            // Mirror `build_transparent_reply_socket` for a NON-LOCAL captured
-            // destination (TEST-NET-1 — never assigned to `lo`, so the bind only
-            // succeeds because IP_TRANSPARENT permits binding a non-local addr).
+            // The production reply socket for a NON-LOCAL captured destination
+            // (TEST-NET-1 — never assigned to `lo`, so the bind only succeeds
+            // because IP_TRANSPARENT permits binding a non-local addr).
             let orig_dst = SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT);
-            let socket = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::DGRAM,
-                Some(socket2::Protocol::UDP),
-            )
-            .map_err(|e| format!("socket: {e}"))?;
-            socket
-                .set_reuse_address(true)
-                .map_err(|e| format!("SO_REUSEADDR: {e}"))?;
-            socket
-                .set_nonblocking(true)
-                .map_err(|e| format!("set_nonblocking: {e}"))?;
-            crate::socket_opts::set_ip_transparent(socket.as_raw_fd())
-                .map_err(|e| format!("IP_TRANSPARENT: {e}"))?;
-            socket
-                .bind(&orig_dst.into())
+            let std_sock = super::build_transparent_reply_socket(orig_dst)
                 .map_err(|e| format!("non-local transparent bind {orig_dst}: {e}"))?;
-            let std_sock: std::net::UdpSocket = socket.into();
             std_sock
                 .local_addr()
                 .map_err(|e| format!("local_addr: {e}"))

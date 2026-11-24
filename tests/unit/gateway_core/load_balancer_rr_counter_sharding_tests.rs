@@ -86,6 +86,7 @@ fn upstream_with_locality_lb(
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -513,6 +514,7 @@ fn port_override_lane_round_robin_stays_even_under_concurrency() {
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     };
     let cache = Arc::new(LoadBalancerCache::new(&GatewayConfig {

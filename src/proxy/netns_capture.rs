@@ -45,9 +45,10 @@
 //!
 //! Linux-only (`setns`, `/proc/<pid>/ns/net`); non-Linux targets compile to a
 //! stub that reports unsupported. The reconcile bookkeeping and the registry
-//! parser are unit-tested with a mock backend; the `setns`/`bind` path and the
-//! full pod-loopback datapath are **not** unit- or CI-testable (they need a live
-//! multi-pod node) and are exercised only in a real cluster. Always on for
+//! parser are unit-tested with a mock backend; the `setns`/`bind` primitive is
+//! exercised by the privileged `live_netns_tests` module below (CI job
+//! `netns-capture-live`). The full eBPF-redirected pod-loopback datapath needs a
+//! live cluster (`node-waypoint-ebpf-live`). Always on for
 //! NodeWaypoint topology; the registry directory path is configurable via
 //! `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`.
 
@@ -911,8 +912,8 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
 /// init container WITHOUT pod-scoped `hostPID` and is handed the host's own
 /// procfs on a read-only mount instead. See
 /// [`first_pid_in_cgroup_via_proc_root_until`].
-// Only the Linux netns paths consume these; the bin target compiles this module
-// privately, so they would read as dead code on the macOS/Windows builds.
+// Only the Linux netns paths consume these, so they would read as dead code on
+// the macOS/Windows builds.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const DEFAULT_PROC_ROOT: &str = "/proc";
 
@@ -1218,14 +1219,10 @@ impl NetnsBackend for ProxyNetnsBackend {
             run_accept_loop(
                 listener,
                 Arc::new(state),
-                ListenerTlsSource::Static {
-                    tls_config: None,
-                    record_mesh_mtls_metric: false,
-                },
+                ListenerTlsSource::Static { tls_config: None },
                 conn_semaphore,
                 stop_rx,
                 mesh_direction,
-                0,
                 SourceIpOverride::Dynamic(source_ip_rx),
                 Some(expected_pod_uid),
                 None,
@@ -1423,9 +1420,11 @@ mod imp {
         .map_err(|_| std::io::Error::other("in-netns bind thread panicked"))?
     }
 
-    /// Breadth-first walk of the pod cgroup subtree, returning the first PID
-    /// from any `cgroup.procs`. Mirrors the discovery used by
-    /// `crate::ebpf::veth`. Bounded to avoid runaway traversal.
+    /// Depth-first walk of the pod cgroup subtree, returning the first nonzero
+    /// PID from any `cgroup.procs`. A `0` entry is a task outside the reader's
+    /// PID namespace (cgroup v2 prints those as `0`), never a usable PID, so it
+    /// is skipped exactly as the procfs walk skips it. Mirrors the discovery
+    /// used by `crate::ebpf::veth`. Bounded to avoid runaway traversal.
     fn first_pid_in_cgroup(cgroup_path: &str) -> io::Result<u32> {
         let root = PathBuf::from(cgroup_path);
         let metadata = std::fs::metadata(&root).map_err(|error| {
@@ -1454,7 +1453,10 @@ mod imp {
             let procs_path = dir.join("cgroup.procs");
             match std::fs::read_to_string(&procs_path) {
                 Ok(procs) => {
-                    if let Some(pid) = procs.split_whitespace().find_map(|raw| raw.parse().ok()) {
+                    if let Some(pid) = procs
+                        .split_whitespace()
+                        .find_map(|raw| raw.parse::<u32>().ok().filter(|pid| *pid != 0))
+                    {
                         return Ok(pid);
                     }
                 }
@@ -2186,6 +2188,31 @@ mod live_netns_tests {
             );
         }
         eprintln!("SKIP: {reason}");
+    }
+
+    /// Issue #7191: cgroup v2 prints a task outside the reader's PID namespace
+    /// as `0` in `cgroup.procs`. That entry must be skipped, not resolved as
+    /// `/proc/0/ns/net` (which does not exist). Needs no privileges: the live
+    /// PID is this test process, so its netns is the host netns.
+    #[test]
+    fn cgroup_procs_zero_entry_is_skipped_for_the_next_live_pid() {
+        let cgdir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cgdir.path().join("cgroup.procs"),
+            format!("0\n{}\n", std::process::id()),
+        )
+        .unwrap();
+        let cgroup_path = cgdir.path().to_string_lossy().to_string();
+
+        let inode = super::netns_inode_for_cgroup(&cgroup_path)
+            .expect("the zero entry is skipped and the live PID resolves");
+        assert_eq!(inode, super::host_netns_inode().expect("own netns inode"));
+
+        // A list holding only out-of-namespace entries has no usable PID.
+        std::fs::write(cgdir.path().join("cgroup.procs"), "0\n0\n").unwrap();
+        let error = super::netns_inode_for_cgroup(&cgroup_path)
+            .expect_err("an all-zero cgroup.procs resolves no PID");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     /// Spawn a child living in a fresh network namespace (loopback brought up),

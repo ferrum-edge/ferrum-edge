@@ -77,7 +77,6 @@ use crate::tls::shared_store::{
 };
 
 const LEASE_STORE_FILE_NAME: &str = "tls-leases.json";
-const DEFAULT_STORE_DIR: &str = "./ferrum-managed-tls";
 
 /// Expired leases are kept this long so operators can see recent ownership
 /// history, then pruned so the document cannot grow without bound.
@@ -557,26 +556,22 @@ struct HeartbeatCounters {
 
 impl HeartbeatProgress {
     /// Extensions handed to the blocking pool since the keeper started.
-    #[allow(dead_code)]
     pub fn started(&self) -> u64 {
         self.0.started.load(Ordering::SeqCst)
     }
 
     /// Extensions the loop has awaited to completion.
-    #[allow(dead_code)]
     pub fn settled(&self) -> u64 {
         self.0.settled.load(Ordering::SeqCst)
     }
 
     /// Whether an extension has been started and not yet awaited back.
-    #[allow(dead_code)]
     pub fn extension_in_flight(&self) -> bool {
         self.started() > self.settled()
     }
 
     /// Whether shutdown has already asked the heartbeat loop to stop. Set
     /// before the join is awaited, so it is true for the whole settling window.
-    #[allow(dead_code)]
     pub fn stop_requested(&self) -> bool {
         self.0.stop_requested.load(Ordering::SeqCst)
     }
@@ -633,7 +628,6 @@ impl RenewalLeaseKeeper {
 
     /// Heartbeat progress, which outlives the keeper so shutdown settlement can
     /// be checked after [`Self::finish`] has consumed it.
-    #[allow(dead_code)]
     pub fn heartbeat_progress(&self) -> HeartbeatProgress {
         self.progress.clone()
     }
@@ -1170,21 +1164,12 @@ pub fn process_instance_id() -> Result<&'static str, TlsLeaseError> {
     }
 }
 
-fn lease_store_dir_from_env() -> PathBuf {
-    let path = crate::config::env_config::tls_managed_store_path_from_env();
-    if path.is_empty() {
-        PathBuf::from(DEFAULT_STORE_DIR)
-    } else {
-        PathBuf::from(path)
-    }
-}
-
 static GLOBAL_TLS_LEASE_STORE: OnceLock<Result<Arc<TlsLeaseStore>, String>> = OnceLock::new();
 
 pub fn global_lease_store() -> Result<Arc<TlsLeaseStore>, String> {
     GLOBAL_TLS_LEASE_STORE
         .get_or_init(|| {
-            TlsLeaseStore::open(lease_store_dir_from_env())
+            TlsLeaseStore::open(crate::tls::store_dir::managed_store_dir())
                 .map(Arc::new)
                 .map_err(|error| error.to_string())
         })

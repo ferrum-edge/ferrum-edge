@@ -49,7 +49,6 @@ fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -109,6 +108,7 @@ fn make_upstream(id: &str, targets: Vec<UpstreamTarget>, updated_at: DateTime<Ut
         created_at: updated_at,
         updated_at,
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -623,169 +623,6 @@ fn test_full_mixed_delta_all_entity_types() {
     assert!(!delta.is_empty());
 }
 
-// --- AffectedRoutes::is_empty tests ---
-
-#[test]
-fn test_affected_routes_is_empty_default() {
-    use ferrum_edge::config_delta::AffectedRoutes;
-    let routes = AffectedRoutes::default();
-    assert!(routes.is_empty());
-}
-
-#[test]
-fn test_affected_routes_not_empty_with_listen_paths() {
-    use ferrum_edge::config_delta::AffectedRoutes;
-    let routes = AffectedRoutes {
-        listen_paths: vec!["/api".to_string()],
-        host_only_hosts: vec![],
-    };
-    assert!(!routes.is_empty());
-}
-
-#[test]
-fn test_affected_routes_not_empty_with_hosts() {
-    use ferrum_edge::config_delta::AffectedRoutes;
-    let routes = AffectedRoutes {
-        listen_paths: vec![],
-        host_only_hosts: vec!["example.com".to_string()],
-    };
-    assert!(!routes.is_empty());
-}
-
-// --- Host-only proxy routing tests ---
-
-#[test]
-fn test_affected_routes_host_only_proxy_added() {
-    let t = Utc::now();
-    let mut host_proxy = make_proxy("h1", "/unused", t);
-    host_proxy.listen_path = None;
-    host_proxy.hosts = vec![
-        "api.example.com".to_string(),
-        "api2.example.com".to_string(),
-    ];
-
-    let old = GatewayConfig::default();
-    let new = GatewayConfig {
-        proxies: vec![host_proxy],
-        ..Default::default()
-    };
-    let delta = ConfigDelta::compute(&old, &new);
-    let affected = delta.affected_routes(&old);
-    assert!(affected.listen_paths.is_empty());
-    assert!(
-        affected
-            .host_only_hosts
-            .contains(&"api.example.com".to_string())
-    );
-    assert!(
-        affected
-            .host_only_hosts
-            .contains(&"api2.example.com".to_string())
-    );
-}
-
-#[test]
-fn test_affected_routes_host_only_proxy_removed() {
-    let t = Utc::now();
-    let mut host_proxy = make_proxy("h1", "/unused", t);
-    host_proxy.listen_path = None;
-    host_proxy.hosts = vec!["removed.example.com".to_string()];
-
-    let old = GatewayConfig {
-        proxies: vec![host_proxy],
-        ..Default::default()
-    };
-    let new = GatewayConfig::default();
-    let delta = ConfigDelta::compute(&old, &new);
-    let affected = delta.affected_routes(&old);
-    assert!(affected.listen_paths.is_empty());
-    assert!(
-        affected
-            .host_only_hosts
-            .contains(&"removed.example.com".to_string())
-    );
-}
-
-#[test]
-fn test_affected_routes_host_only_proxy_modified() {
-    let t1 = Utc::now();
-    let t2 = t1 + chrono::Duration::seconds(5);
-
-    let mut old_proxy = make_proxy("h1", "/unused", t1);
-    old_proxy.listen_path = None;
-    old_proxy.hosts = vec!["old.example.com".to_string()];
-
-    let mut new_proxy = make_proxy("h1", "/unused", t2);
-    new_proxy.listen_path = None;
-    new_proxy.hosts = vec!["new.example.com".to_string()];
-
-    let old = GatewayConfig {
-        proxies: vec![old_proxy],
-        ..Default::default()
-    };
-    let new = GatewayConfig {
-        proxies: vec![new_proxy],
-        ..Default::default()
-    };
-    let delta = ConfigDelta::compute(&old, &new);
-    let affected = delta.affected_routes(&old);
-    assert!(affected.listen_paths.is_empty());
-    // Both old and new hosts should be recorded
-    assert!(
-        affected
-            .host_only_hosts
-            .contains(&"new.example.com".to_string())
-    );
-    assert!(
-        affected
-            .host_only_hosts
-            .contains(&"old.example.com".to_string())
-    );
-}
-
-// --- Stream proxy skipping ---
-
-#[test]
-fn test_affected_routes_skips_stream_proxies() {
-    let t = Utc::now();
-    let mut stream_proxy = make_proxy("tcp1", "/unused", t);
-    stream_proxy.listen_path = None;
-    stream_proxy.dispatch_kind = DispatchKind::TcpRaw;
-    stream_proxy.listen_port = Some(9999);
-
-    let old = GatewayConfig::default();
-    let new = GatewayConfig {
-        proxies: vec![stream_proxy],
-        ..Default::default()
-    };
-    let delta = ConfigDelta::compute(&old, &new);
-    let affected = delta.affected_routes(&old);
-    assert!(affected.is_empty());
-}
-
-#[test]
-fn test_affected_routes_mixed_http_and_stream() {
-    let t = Utc::now();
-    let http_proxy = make_proxy("http1", "/api", t);
-
-    let mut stream_proxy = make_proxy("tcp1", "/unused", t);
-    stream_proxy.listen_path = None;
-    stream_proxy.dispatch_kind = DispatchKind::TcpRaw;
-    stream_proxy.listen_port = Some(9999);
-
-    let old = GatewayConfig::default();
-    let new = GatewayConfig {
-        proxies: vec![http_proxy, stream_proxy],
-        ..Default::default()
-    };
-    let delta = ConfigDelta::compute(&old, &new);
-    let affected = delta.affected_routes(&old);
-    // Only the HTTP proxy path should appear
-    assert_eq!(affected.listen_paths.len(), 1);
-    assert!(affected.listen_paths.contains(&"/api".to_string()));
-    assert!(affected.host_only_hosts.is_empty());
-}
-
 // --- Proxy-scoped plugin rebuild ---
 
 #[test]
@@ -884,7 +721,7 @@ fn test_same_timestamp_consumer_credential_rotation_is_modification() {
     let mut consumer = make_consumer("c1", "alice", t);
     consumer.credentials.insert(
         "keyauth".to_string(),
-        serde_json::json!([{"key": "old-test-key"}]),
+        serde_json::json!([{"key": "old-test-key-0123456789"}]),
     );
     let old = GatewayConfig {
         consumers: vec![consumer],
@@ -893,7 +730,7 @@ fn test_same_timestamp_consumer_credential_rotation_is_modification() {
     let mut new = old.clone();
     new.consumers[0].credentials.insert(
         "keyauth".to_string(),
-        serde_json::json!([{"key": "new-test-key"}]),
+        serde_json::json!([{"key": "new-test-key-0123456789"}]),
     );
 
     let delta = ConfigDelta::compute(&old, &new);
@@ -1104,7 +941,7 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
         // `ConsumerIndex` reads keyauth credentials as an array of entries.
         consumer.credentials.insert(
             "keyauth".to_string(),
-            serde_json::json!([{"key": "old-test-key"}]),
+            serde_json::json!([{"key": "old-test-key-0123456789"}]),
         );
         let mut plugin = make_plugin_config("pc1", "key_auth", PluginScope::Global, None, t);
         plugin.enabled = false;
@@ -1126,7 +963,7 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
         assert!(
             state
                 .consumer_index
-                .find_by_api_key("old-test-key")
+                .find_by_api_key("old-test-key-0123456789")
                 .is_some()
         );
         assert!(
@@ -1138,7 +975,7 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
         let mut candidate = state.config.load_full().as_ref().clone();
         candidate.consumers[0].credentials.insert(
             "keyauth".to_string(),
-            serde_json::json!([{"key": "new-test-key"}]),
+            serde_json::json!([{"key": "new-test-key-0123456789"}]),
         );
         candidate.plugin_configs[0].enabled = true;
         if change_route {
@@ -1149,13 +986,13 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
         assert!(
             state
                 .consumer_index
-                .find_by_api_key("old-test-key")
+                .find_by_api_key("old-test-key-0123456789")
                 .is_none()
         );
         assert!(
             state
                 .consumer_index
-                .find_by_api_key("new-test-key")
+                .find_by_api_key("new-test-key-0123456789")
                 .is_some()
         );
         assert_eq!(
@@ -1168,7 +1005,7 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
         let epoch = state.request_epoch.load();
         assert_eq!(
             epoch.config().consumers[0].credentials["keyauth"][0]["key"],
-            "new-test-key"
+            "new-test-key-0123456789"
         );
         assert!(epoch.config().plugin_configs[0].enabled);
     }

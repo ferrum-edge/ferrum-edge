@@ -106,7 +106,10 @@ HTTP/2 request-body write-stall bound that preserves progress for every positive
 assigned capacity, or when Ferrum's HTTP/2 client moves off Hyper. Both entries
 belong to the `hyper-h2-body-progress-and-timeout` co-retirement group, with
 [patch 005](../005-h2-small-window-coalescing/README.md), which rewrites the
-same pending-body loop to coalesce small window increments. Upstream already
+same pending-body loop to coalesce small window increments, and with
+[patch 008](../008-h2-response-write-timeout/README.md) and hyper-util
+[patch 002](../../upstream-hyper-util-patches/002-forward-h2-response-write-timeout/README.md),
+which apply and forward patch 004's timer on the server response pipe. Upstream already
 permits positive-capacity progress in its ordinary body pipe; merely adopting
 that behavior does not replace Ferrum's pending-body timeout path.
 

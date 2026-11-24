@@ -122,7 +122,6 @@ fn test_proxy() -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -718,8 +717,8 @@ fn test_h1_h2_route_rejects_keep_websocket_precedence_and_grpc_web_headers() {
         .find("let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);")
         .expect("wire flavor classification must remain present");
     let websocket_precedence = handler
-        .find("let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket")
-        .expect("WebSocket must suppress hostile gRPC-Web Content-Type promotion");
+        .find("if flavor == HttpFlavor::WebSocket || req.method() == hyper::Method::CONNECT {")
+        .expect("WebSocket and CONNECT must suppress hostile gRPC-Web Content-Type promotion");
     let routed = handler
         .find("ctx.matched_proxy = Some(Arc::clone(&proxy));")
         .expect("route selection must remain present");
@@ -769,8 +768,8 @@ fn test_h1_h2_retains_the_negotiated_grpc_web_representation_before_routing() {
     const RETENTION_CALL: &str = "crate::plugins::grpc_web::retain_negotiated_response_content_type(&mut ctx, content_type);";
 
     let classification = handler
-        .find("let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket")
-        .expect("WebSocket-safe gRPC-Web negotiation must remain present");
+        .find("if flavor == HttpFlavor::WebSocket || req.method() == hyper::Method::CONNECT {")
+        .expect("WebSocket- and CONNECT-safe gRPC-Web negotiation must remain present");
     let retention = handler
         .find(RETENTION_CALL)
         .expect("H1/H2 must retain the negotiated client gRPC-Web representation");
@@ -823,14 +822,14 @@ fn test_backend_path_bound_retries_preflight_before_backoff() {
         .find("Aborting retry because the candidate would change")
         .expect("generic H1/H2 retries must reject a path-changing target");
     let generic_intermediate_record = generic_after_preflight
-        .find("permits.record_backend_outcome(BackendAdmissionOutcome {")
+        .find("record_backend_admission_retry_outcome(")
         .expect("generic H1/H2 retry accounting must remain present");
     let generic_backoff = generic_after_preflight
         .find("let delay = retry::retry_delay(retry_config, attempt);")
         .expect("generic H1/H2 retry backoff must remain present");
     assert!(
         generic_mismatch < generic_intermediate_record
-            && generic_mismatch < generic_backoff
+            && generic_intermediate_record < generic_backoff
             && generic_after_preflight[generic_mismatch..generic_intermediate_record]
                 .contains("break;"),
         "generic H1/H2 path mismatch must abort before intermediate accounting and retry backoff"
@@ -942,11 +941,11 @@ fn test_no_match() {
 
 use async_trait::async_trait;
 use ferrum_edge::_test_support::{
-    apply_request_body_plugins, can_dispatch_direct_http2_pool, can_use_direct_http2_pool,
-    direct_h2_uses_limit_adapter, extract_grpc_reject_message,
-    finalize_plugin_rejection_parts_for_test, finalized_upload_deadline_response_for_test,
-    insert_grpc_error_metadata, map_http_reject_status_to_grpc_status, normalize_reject_response,
-    request_may_have_body, set_grpc_deadline_budget_for_test,
+    apply_request_body_plugins, can_use_direct_http2_pool, direct_h2_uses_limit_adapter,
+    extract_grpc_reject_message, finalize_plugin_rejection_parts_for_test,
+    finalized_upload_deadline_response_for_test, insert_grpc_error_metadata,
+    map_http_reject_status_to_grpc_status, normalize_reject_response, request_may_have_body,
+    set_grpc_deadline_budget_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
@@ -1651,7 +1650,7 @@ async fn test_single_auth_missing_credentials_rejects_before_backend() {
     assert_eq!(&body[..], br#"{"error":"Authentication required"}"#);
     assert_eq!(
         headers.get("WWW-Authenticate").map(String::as_str),
-        Some("ferrum-edge")
+        Some(r#"ApiKey realm="ferrum-edge""#)
     );
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
@@ -1683,7 +1682,7 @@ async fn test_single_basic_auth_missing_credentials_uses_basic_challenge() {
 }
 
 #[tokio::test]
-async fn test_multi_auth_missing_credentials_uses_first_available_challenge() {
+async fn test_multi_auth_missing_credentials_advertises_every_applicable_challenge() {
     let jwt: Arc<dyn Plugin> = Arc::new(JwtAuth::new(&json!({})).unwrap());
     let basic: Arc<dyn Plugin> = Arc::new(basic_auth_plugin());
     let mut ctx = RequestContext::new(
@@ -1702,9 +1701,10 @@ async fn test_multi_auth_missing_credentials_uses_first_available_challenge() {
 
     let (status, _body, headers) = result.expect("all-missing auth chain must reject");
     assert_eq!(status, 401);
+    // Issue #6774: every applicable mechanism's challenge, in priority order.
     assert_eq!(
         headers.get("WWW-Authenticate").map(String::as_str),
-        Some(r#"Basic realm="ferrum-edge", charset="UTF-8""#)
+        Some(r#"Bearer, Basic realm="ferrum-edge", charset="UTF-8""#)
     );
 }
 
@@ -1808,7 +1808,7 @@ async fn test_multi_auth_all_missing_credentials_rejects_before_backend() {
     assert_eq!(&body[..], br#"{"error":"Authentication required"}"#);
     assert_eq!(
         headers.get("WWW-Authenticate").map(String::as_str),
-        Some("ferrum-edge")
+        Some(r#"ApiKey realm="ferrum-edge""#)
     );
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
@@ -2308,11 +2308,13 @@ fn buffered_grpc_client_disconnect_is_cancelled_not_a_gateway_error() {
         .split("\n}\n")
         .next()
         .expect("bounded client-disconnect log wrapper");
-    assert!(wrapper.contains("        true,\n        true,\n    )"));
+    // include_backend_target and client_disconnect are both set; the wrapper
+    // always has a matched proxy, so it keeps the default namespace.
+    assert!(wrapper.contains("        true,\n        true,\n        None,\n    )"));
 
     let grpc = include_str!("../../../src/proxy/grpc_proxy.rs");
     let collect = grpc
-        .split("pub(crate) async fn collect_grpc_request_body(")
+        .split("pub(crate) async fn collect_grpc_upload<B>(")
         .nth(1)
         .expect("buffered gRPC collect")
         .split("\n}\n")
@@ -2326,8 +2328,8 @@ fn buffered_grpc_client_disconnect_is_cancelled_not_a_gateway_error() {
         collect
             .matches("grpc_request_body_client_disconnected(e.as_ref())")
             .count(),
-        2,
-        "both the size-limited and unlimited collects report a client disconnect"
+        1,
+        "the charged, bounded collect reports a client disconnect"
     );
 }
 
@@ -2488,7 +2490,7 @@ fn generic_retry_backoff_uses_request_aware_grpc_deadline_response() {
         "the generic retry backoff must not regress to native-only gRPC framing"
     );
     assert!(backoff.contains("&ctx,"));
-    assert!(backoff.contains("owned_proxy_headers_ref.unwrap_or(&ctx.headers),"));
+    assert!(backoff.contains("&ctx.request_headers_view(owned_proxy_headers_ref),"));
 }
 
 #[test]
@@ -2773,6 +2775,71 @@ async fn test_auth_rejection_cookie_storage_key_preserves_extended_scopes() {
         Some(
             "non_ldh=selected; Domain=foo_bar.example; Path=/\nip_literal=selected; Domain=[::1]; Path=/\ninvalid_ip=selected; Domain=[not-an-ip]; Path=/\npartitioned_same=selected; Secure; Partitioned; Path=/\npartitioned_split=selected; Secure; Partitioned; Path=/\npartitioned_reverse=selected; Secure; Path=/\ndot_scope=selected; Domain=example.com; Path=/\ntrailing_dot=selected; Domain=example.com.; Path=/\ntrailing_dot_prior=selected; Domain=example.com; Domain=other.example.; Path=/\nempty_domain=selected; Domain=example.com; Domain=; Path=/\nbare_domain=selected; Domain=example.com; Domain; Path=/\nonly_empty=selected; Domain=; Path=/\nonly_bare=selected; Domain; Path=/\ninvalid_ip=staged; Domain=[not-an-ip]; Path=/\npartitioned_split=staged; Secure; Path=/\npartitioned_reverse=staged; Secure; PARTITIONED; Path=/\ndot_scope=staged; Path=/\ntrailing_dot=staged; Path=/\ntrailing_dot_prior=staged; Domain=example.com; Path=/"
         )
+    );
+}
+
+/// Never completes: the multi-auth deadline exit is the only way out.
+struct HangingAuth;
+
+#[async_trait]
+impl Plugin for HangingAuth {
+    fn name(&self) -> &str {
+        "hanging_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        _ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        std::future::pending().await
+    }
+}
+
+/// Issue #7162: the multi-auth deadline exit is a final rejection like every
+/// other exit, so it consumes the cookies an earlier mechanism staged and
+/// carries them, as single-mode's deadline reject does. They must never stay
+/// behind in request metadata.
+#[tokio::test]
+async fn test_multi_auth_deadline_exit_consumes_staged_rejection_cookie() {
+    let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+        cookies: "session=staged; Path=/",
+    });
+    let hanging: Arc<dyn Plugin> = Arc::new(HangingAuth);
+    let auth_plugins = [staged, hanging];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/svc.Echo/Call".to_string(),
+    );
+    ctx.request_authority = Some("127.0.0.1".to_string());
+    ferrum_edge::_test_support::set_grpc_deadline_budget_for_test(&mut ctx, Some(50));
+
+    let (status, _, headers) =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+            .await
+            .expect("the RPC deadline must end authentication with a rejection");
+
+    assert_eq!(status, 200, "the deadline reject is gRPC Trailers-Only");
+    assert_eq!(
+        headers.get("grpc-status").map(String::as_str),
+        Some("4"),
+        "the deadline exit must still answer DEADLINE_EXCEEDED"
+    );
+    assert!(ferrum_edge::_test_support::gateway_deadline_response_selected_for_test(&ctx));
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some("session=staged; Path=/"),
+        "the deadline reject must deliver the staged requester-owned cookie"
+    );
+    assert!(
+        !ctx.metadata.contains_key("auth.rejection_set_cookie"),
+        "the staged cookie must not stay in request metadata after the phase"
     );
 }
 
@@ -4025,24 +4092,6 @@ fn test_direct_http2_pool_requires_http2_without_retries_or_request_buffering() 
     assert!(!can_use_direct_http2_pool(true, false, true));
 }
 
-#[test]
-fn test_direct_http2_pool_dispatch_allows_nonzero_body_limits() {
-    // Issue #3622: nonzero body limits are enforced in-path on direct-H2
-    // (413 / 502), so they must not disqualify ordinary dispatch.
-    assert!(can_dispatch_direct_http2_pool(true, false, false, 0, 0));
-    assert!(can_dispatch_direct_http2_pool(true, false, false, 1, 0));
-    assert!(can_dispatch_direct_http2_pool(true, false, false, 0, 1));
-    assert!(can_dispatch_direct_http2_pool(
-        true, false, false, 10_485_760, 10_485_760
-    ));
-    // Retry body replay / request-body buffering still force reqwest.
-    assert!(!can_dispatch_direct_http2_pool(true, true, false, 0, 0));
-    assert!(!can_dispatch_direct_http2_pool(
-        true, false, true, 10_485_760, 10_485_760
-    ));
-    assert!(!can_dispatch_direct_http2_pool(false, false, false, 0, 0));
-}
-
 /// Issue #3942: operator `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0` is unlimited
 /// and must skip `SizeLimitedIncoming` on ordinary unauthenticated direct-H2.
 /// A real cap, an upload-completion gate, or gRPC message counting still
@@ -4360,8 +4409,13 @@ fn test_buffered_h2_request_collectors_require_h2_end_stream() {
             .find(gated)
             .unwrap_or_else(|| panic!("{signature}: the collected body must be gated"));
         // Every buffered collect in the function reads the gated body: no
-        // `Limited` or raw `collect` may be built before the gate.
-        for collect in ["Limited::new(", "BodyExt::collect("] {
+        // `Limited`, charged collect, or raw `collect` may be built before the
+        // gate.
+        for collect in [
+            "Limited::new(",
+            "BodyExt::collect(",
+            "collect_charged_request_body(",
+        ] {
             if let Some(first) = collector.find(collect) {
                 assert!(
                     gate < first,
@@ -4446,12 +4500,14 @@ fn test_native_h3_streaming_upload_requires_h2_end_stream() {
         "the END_STREAM check must run before the backend stream is finished"
     );
     // A post-wire error leaves the reset guard incomplete, so it cancels the
-    // backend stream; the message maps to the 499 client-disconnect arm.
+    // backend stream. A reset hyper reported as a clean end carries no proof
+    // the client left, so it is the typed incomplete-upload fault (`400`),
+    // never the `499` client-abort terminal (issue #7187).
     let refusal = &forward[gate..finish];
     assert!(
-        refusal.contains("H3PoolError::post_wire(")
-            && refusal.contains("Client disconnected while sending request body"),
-        "a masked client reset must be a post-wire client disconnect"
+        refusal.contains("H3PoolError::client_request(")
+            && refusal.contains("H3ClientRequestFault::MalformedBody"),
+        "a masked client reset must be a typed post-wire incomplete upload"
     );
 }
 
@@ -4539,24 +4595,6 @@ async fn masked_h2_client_reset_collects_without_end_stream() {
 }
 
 #[test]
-fn test_direct_http2_dispatch_gate_matches_body_compat_gate() {
-    // Ordinary and SNI routes share the same body-compat gate; body-size
-    // limits no longer fork the predicate.
-    assert_eq!(
-        can_use_direct_http2_pool(true, false, false),
-        can_dispatch_direct_http2_pool(true, false, false, 10_485_760, 10_485_760)
-    );
-    assert_eq!(
-        can_use_direct_http2_pool(true, true, false),
-        can_dispatch_direct_http2_pool(true, true, false, 0, 0)
-    );
-    assert_eq!(
-        can_use_direct_http2_pool(true, false, true),
-        can_dispatch_direct_http2_pool(true, false, true, 0, 0)
-    );
-}
-
-#[test]
 fn test_request_may_have_body_uses_method_and_body_headers() {
     let no_headers = HashMap::new();
     for method in ["GET", "HEAD", "OPTIONS"] {
@@ -4571,6 +4609,39 @@ fn test_request_may_have_body_uses_method_and_body_headers() {
     for method in ["GET", "HEAD", "OPTIONS"] {
         assert!(request_may_have_body(method, &content_length_zero));
         assert!(request_may_have_body(method, &chunked));
+    }
+}
+
+/// Hyper's HTTP/1.1 client sends an unknown-length GET/HEAD body as zero-length
+/// unless framing is explicit, so the dispatchers must add `chunked` exactly
+/// there. A proven-empty body must stay bodyless with no `Transfer-Encoding`,
+/// an exact-length body keeps hyper's `Content-Length`, and methods hyper
+/// already chunks are left alone.
+#[test]
+fn test_h1_explicit_chunked_framing_only_for_unknown_length_get_and_head() {
+    use ferrum_edge::_test_support::h1_request_requires_explicit_chunked_framing as needs_chunked;
+
+    let unknown_length = || {
+        http_body_util::StreamBody::new(futures_util::stream::empty::<
+            Result<http_body::Frame<bytes::Bytes>, std::convert::Infallible>,
+        >())
+    };
+    for method in ["GET", "HEAD"] {
+        assert!(needs_chunked(method, &unknown_length()), "{method}");
+        assert!(
+            !needs_chunked(method, &http_body_util::Empty::<bytes::Bytes>::new()),
+            "{method}: a proven-empty body must stay bodyless"
+        );
+        assert!(
+            !needs_chunked(
+                method,
+                &http_body_util::Full::new(bytes::Bytes::from_static(b"1234"))
+            ),
+            "{method}: an exact-length body keeps Content-Length"
+        );
+    }
+    for method in ["OPTIONS", "POST", "PUT", "DELETE", "CONNECT"] {
+        assert!(!needs_chunked(method, &unknown_length()), "{method}");
     }
 }
 
@@ -4970,6 +5041,7 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
         include_str!("../../../src/plugins/grpc_web.rs"),
         include_str!("../../../src/plugins/openapi_validator.rs"),
         include_str!("../../../src/plugins/request_size_limiting.rs"),
+        include_str!("../../../src/plugins/request_transformer.rs"),
         include_str!("../../../src/plugins/soap_ws_security.rs"),
         include_str!("../../../src/plugins/waf/mod.rs"),
     ] {
@@ -6042,4 +6114,199 @@ fn route_rebase_invalidates_offsets_but_preserves_base_path_semantics() {
             );
         }
     }
+}
+
+/// Issue #7155: the H1/H2 route-protocol admission `403` and circuit-breaker
+/// open `503` answer a gRPC-Web client in its own framing (status in a body
+/// trailer frame), like their `allowed_methods` and gRPC deadline siblings,
+/// not as a native-gRPC Trailers-Only header block it cannot read.
+#[test]
+fn route_admission_and_open_breaker_rejects_are_grpc_web_aware() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+
+    let admission = source
+        .split("if omitted_policy_exemption == Some(false) {")
+        .nth(1)
+        .expect("route-protocol admission refusal")
+        .split("// Per-proxy HTTP method filtering")
+        .next()
+        .expect("bounded route-protocol admission refusal");
+    assert!(admission.contains("build_grpc_web_reject_response("));
+    assert!(admission.contains("grpc_web_response_content_type"));
+    assert!(admission.contains("if let Some(response) = grpc_web_response {"));
+
+    let breaker = source
+        .split("match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {")
+        .nth(1)
+        .expect("H1/H2 circuit-breaker admission")
+        .split("// GHSA-4cq4-3f3f-mq76")
+        .next()
+        .expect("bounded circuit-breaker open refusal");
+    assert!(breaker.contains("finalize_reject_response_with_after_proxy_hooks_and_commit_policy("));
+    assert!(breaker.contains("grpc_web_response_content_type.is_none()"));
+    assert!(breaker.contains("build_grpc_web_reject_response("));
+    assert!(breaker.contains("if let Some(response) = grpc_web_response {"));
+}
+
+/// Issue #7155: every gateway-authored gRPC error in the H1/H2 handler is
+/// framed for a gRPC-Web client too. Each native Trailers-Only builder call
+/// sits behind a gRPC-Web check, the native-gRPC branch's size, egress and
+/// response-build refusals go through the gRPC-Web-aware helper, and the two
+/// shared reject helpers take the negotiated gRPC-Web content type and defer
+/// the committed observers to the translation.
+#[test]
+fn h1_h2_grpc_rejects_are_grpc_web_aware() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let handler = source
+        .split("async fn handle_proxy_request_inner(")
+        .nth(1)
+        .expect("H1/H2 request handler");
+    let handler = &handler[..handler
+        .find("\n}\n")
+        .expect("bounded H1/H2 request handler")];
+
+    const NATIVE: &str = "grpc_proxy::build_grpc_error_response_with_policy(";
+    for (index, _) in handler.match_indices(NATIVE) {
+        let before = &handler[..index];
+        let start = before.char_indices().rev().nth(1500).map_or(0, |(i, _)| i);
+        let window = &before[start..];
+        assert!(
+            window.contains("grpc_web_response_content_type")
+                || window.contains("grpc_request_is_web_translated"),
+            "a native gRPC reject without a gRPC-Web check: {window}"
+        );
+    }
+    assert!(
+        handler
+            .matches("build_native_grpc_branch_error_response(")
+            .count()
+            >= 8,
+        "the native-gRPC branch refusals use the gRPC-Web-aware helper"
+    );
+
+    let helper = source
+        .split("fn build_native_grpc_branch_error_response(")
+        .nth(1)
+        .expect("gRPC-Web-aware native-gRPC error helper")
+        .split("\n}\n")
+        .next()
+        .expect("bounded helper");
+    let web = helper
+        .find("build_grpc_web_error_response(")
+        .expect("negotiated gRPC-Web");
+    let translated = helper
+        .find("build_translated_grpc_web_error_response(")
+        .expect("plugin-translated gRPC-Web");
+    let native = helper.find(NATIVE).expect("native gRPC");
+    assert!(web < translated && translated < native);
+
+    for shared in [
+        "async fn reject_mesh_inbound_peer_auth_transport_mismatch(",
+        "async fn finalize_terminal_request_body_read_rejection(",
+    ] {
+        let body = source
+            .split(shared)
+            .nth(1)
+            .expect("shared reject helper")
+            .split("\n}\n")
+            .next()
+            .expect("bounded shared reject helper");
+        assert!(
+            body.contains("grpc_web_response_content_type: Option<&str>,")
+                && body.contains("grpc_web_response_content_type.is_none(),")
+                && body.contains("boxed_build_grpc_web_reject_response(")
+                && body.contains("if let Some(response) = grpc_web_response {"),
+            "{shared} must answer a gRPC-Web client in gRPC-Web framing"
+        );
+    }
+}
+
+/// Issue #7164: WebSocket disconnect metadata reports the listener the client
+/// connected to (a Gateway API / mesh listener included), not the
+/// process-global proxy port. H1/H2 and H3 share this helper.
+#[test]
+fn websocket_session_listen_port_reports_the_accepting_listener() {
+    use ferrum_edge::_test_support::websocket_session_listen_port_for_test;
+
+    let env = ferrum_edge::config::EnvConfig {
+        proxy_http_port: 8000,
+        proxy_https_port: 8443,
+        ..ferrum_edge::config::EnvConfig::default()
+    };
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/ws".to_string(),
+    );
+
+    ctx.frontend_listen_port = Some(18080);
+    assert_eq!(
+        websocket_session_listen_port_for_test(&ctx, false, &env),
+        18080
+    );
+    assert_eq!(
+        websocket_session_listen_port_for_test(&ctx, true, &env),
+        18080
+    );
+
+    ctx.frontend_listen_port = None;
+    assert_eq!(
+        websocket_session_listen_port_for_test(&ctx, false, &env),
+        8000
+    );
+    assert_eq!(
+        websocket_session_listen_port_for_test(&ctx, true, &env),
+        8443
+    );
+}
+
+/// Issue #7166: per-request work the hot paths no longer repeat. The native-H3
+/// backend TLS closures borrow the request's `Proxy` and the pool (a lookup only
+/// on a connection miss) instead of deep-cloning both per request; each mesh
+/// dispatch derives its authorization-lifetime plan once and hands it down;
+/// and the inbound HBONE relay reads the startup-resolved topology instead of
+/// re-reading and re-parsing `FERRUM_MESH_TOPOLOGY` per CONNECT.
+#[test]
+fn hot_path_dispatch_work_is_done_once() {
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert!(!proxy.contains("backend_h3_tls_config_owned("));
+    assert_eq!(
+        proxy
+            .matches("|| state.connection_pool.backend_h3_tls_config(proxy)")
+            .count(),
+        10,
+        "every native-H3 dispatch closure borrows"
+    );
+    assert!(!proxy.contains("let proxy_clone = proxy.clone();"));
+
+    for after_ready in [
+        "async fn proxy_to_backend_hbone_after_ready(",
+        "async fn proxy_to_backend_mesh_mtls_after_ready(",
+    ] {
+        let body = proxy
+            .split(after_ready)
+            .nth(1)
+            .expect("mesh dispatch after_ready")
+            .split("\n}\n")
+            .next()
+            .expect("bounded after_ready");
+        assert!(
+            body.contains("upload_auth: Option<RequestAuthLifetimePlan>,")
+                && body.contains("let send_auth_deadline = upload_auth;")
+                && !body.contains("request_upload_auth_deadline("),
+            "{after_ready} must reuse the plan its dispatcher derived"
+        );
+    }
+    let unix = proxy
+        .split("#[cfg(unix)]\nasync fn proxy_to_backend_unix(")
+        .nth(1)
+        .expect("Unix dispatcher")
+        .split("\n}\n")
+        .next()
+        .expect("bounded Unix dispatcher");
+    assert_eq!(unix.matches("request_upload_auth_deadline(").count(), 1);
+
+    let hbone = include_str!("../../../src/proxy/hbone_proxy.rs");
+    assert!(!hbone.contains("FERRUM_MESH_TOPOLOGY"));
+    assert!(hbone.contains("&& state.node_waypoint_identity_resolver.is_some())"));
 }

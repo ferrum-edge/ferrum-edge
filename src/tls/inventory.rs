@@ -15,9 +15,10 @@
 //! - [`TlsInventory::collect_public_metadata`] — the metrics-safe scope used by
 //!   the bounded background refresh behind
 //!   [`crate::tls::inventory_cache`]. It loads only public
-//!   certificate-family material (certificates, CA bundles, CRLs) and **never**
-//!   materializes private-key, JWKS, or OCSP bytes: those entries report health
-//!   from the owning validated config/reload state instead (issue #2410).
+//!   certificate and revocation material (certificates, CA bundles, CRLs, and
+//!   stapled OCSP responses) and **never** materializes private-key or JWKS
+//!   bytes: those entries report health from the owning validated
+//!   config/reload state instead (issue #2410).
 //!
 //! `/metrics` itself only ever reads the cached snapshot
 //! ([`crate::tls::inventory_cache::TlsInventoryCache::snapshot`]) and performs zero source I/O.
@@ -231,6 +232,51 @@ impl TlsInventory {
     }
 }
 
+/// One configured TLS source reference and the resource that makes it,
+/// without the material behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsSourceReference {
+    /// The configured source scheme (`managed`, `acme`, `file`, ...), the
+    /// same label an inventory entry reports before its material is loaded.
+    pub source_kind: String,
+    /// The configured source identifier, as in
+    /// [`TlsInventorySource::identifier`].
+    pub identifier: String,
+    pub usage: TlsInventoryUsage,
+}
+
+/// Every TLS source `gateway_config` references, with the referencing
+/// resource. Loads no material, so it is cheap enough for an admin request
+/// path. The managed-TLS and ACME delete guards run it over every namespace
+/// in the configuration store, not only the configuration this process
+/// serves (issue #7394).
+pub fn gateway_source_references(gateway_config: &GatewayConfig) -> Vec<TlsSourceReference> {
+    let mut sources = Vec::new();
+    collect_gateway_sources(gateway_config, &mut sources);
+    into_source_references(sources)
+}
+
+/// Every TLS source this process's environment references (`resource_type`
+/// `env`). Loads no material.
+pub fn env_source_references(env_config: &EnvConfig) -> Vec<TlsSourceReference> {
+    let mut sources = Vec::new();
+    collect_env_sources(env_config, &mut sources);
+    into_source_references(sources)
+}
+
+fn into_source_references(sources: Vec<InventorySourceRef>) -> Vec<TlsSourceReference> {
+    sources
+        .into_iter()
+        .map(|source_ref| TlsSourceReference {
+            source_kind: configured_source_kind(&source_ref.source)
+                .as_str()
+                .to_string(),
+            identifier: source_ref.source.source_id(),
+            usage: source_ref.usage,
+        })
+        .collect()
+}
+
 impl InventoryEntryBuilder {
     fn into_entry(self, scope: InventoryScope) -> TlsInventoryEntry {
         let source_kind = configured_source_kind(&self.source);
@@ -368,25 +414,11 @@ impl InventoryEntryBuilder {
 /// "no recorded failure" means the last validated owner accepted it. A recorded
 /// watcher/rebuild failure for the same configured source identity downgrades
 /// the entry without re-reading a single byte.
+/// State for a source this scope does not load (private keys and JWKS under
+/// [`InventoryScope::PublicMetadata`]): the last recorded source failure, if
+/// any. OCSP is always loaded, so a runtime-dropped staple is reported by
+/// `apply_dropped_staple_state` on the loaded path instead.
 fn populate_entry_from_reload_state(entry: &mut TlsInventoryEntry) {
-    // A staple retired at runtime is a serving-state fact, not a source-read
-    // fact, so the metrics scope — which never materializes OCSP bytes — must
-    // report it here too (issue #4505). There is no loaded `nextUpdate` to
-    // compare against on this path, so any recorded drop for this configured
-    // source applies until a later accepted load clears it.
-    if entry.material_kind == "ocsp"
-        && crate::tls::ocsp_recheck::dropped_staple_next_update(&entry.source.identifier).is_some()
-    {
-        entry.state = TlsInventoryState::Invalid;
-        entry.error = Some(
-            "stapled OCSP response was dropped at runtime after expiry or tracking-capacity \
-             retirement; refresh or reload the source to attach a tracked staple"
-                .to_string(),
-        );
-        entry.next_update = None;
-        entry.days_until_next_update = None;
-        return;
-    }
     let Some(failure) = crate::tls::events::latest_source_failure(&entry.source.identifier) else {
         return;
     };
@@ -745,6 +777,50 @@ fn collect_gateway_sources(config: &GatewayConfig, sources: &mut Vec<InventorySo
 
     for plugin in &config.plugin_configs {
         collect_mesh_route_dispatch_sources(plugin, sources);
+        collect_managed_jwks_sources(plugin, sources);
+    }
+}
+
+/// Managed JWKS records referenced by enabled JWKS consumers (issue #7277),
+/// so the inventory lists them and `DELETE /admin/tls/jwks/{id}` is refused
+/// while a consumer still reads the record.
+fn collect_managed_jwks_sources(plugin: &PluginConfig, sources: &mut Vec<InventorySourceRef>) {
+    if !plugin.enabled {
+        return;
+    }
+    let references: Vec<(String, String)> = match plugin.plugin_name.as_str() {
+        "jwks_auth" => crate::plugins::jwks_auth::managed_jwks_sources(&plugin.config)
+            .into_iter()
+            .map(|(idx, source)| (format!("{}#provider[{idx}]", plugin.id), source))
+            .collect(),
+        "oidc_relying_party" => {
+            crate::plugins::oidc_relying_party::managed_jwks_source(&plugin.config)
+                .map(|source| (format!("{}#provider[0]", plugin.id), source))
+                .into_iter()
+                .collect()
+        }
+        _ => return,
+    };
+    for (resource_id, source) in references {
+        push_optional_resource(
+            sources,
+            ResourceUsageRef {
+                surface: plugin_surface(&plugin.plugin_name),
+                role: "jwks",
+                resource_type: "plugin_config",
+                resource_id: &resource_id,
+                field: "providers[].jwks_source",
+            },
+            Some(&source),
+            MaterialKind::Jwks,
+        );
+    }
+}
+
+fn plugin_surface(plugin_name: &str) -> &'static str {
+    match plugin_name {
+        "oidc_relying_party" => "oidc_relying_party",
+        _ => "jwks_auth",
     }
 }
 

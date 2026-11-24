@@ -22,8 +22,8 @@
 //!
 //! # Phase safety
 //!
-//! A trigger that reads authenticated identity (`consumer`, `auth_method`,
-//! `spiffe_id`) is not authoritative before the authentication boundary. Such a
+//! A trigger that reads authenticated identity (`consumer`, `external_identity`,
+//! `external_identity_authority`, `auth_method`, `spiffe_id`) is not authoritative before the authentication boundary. Such a
 //! trigger simply **does not gate** hooks at or before `authenticate`
 //! ([`TriggerPhase::PreAuth`]): the instance runs, and no decision is memoized,
 //! so the first `authorize`-or-later hook makes the real decision. Failing
@@ -87,6 +87,7 @@ use crate::config::plugin_trigger::{
     CompiledPluginTrigger, FieldVisitor, PluginTrigger, PluginTriggerProtocol, TriggerFacts,
 };
 use crate::config::types::{HttpFlavor, HttpWireTransport};
+use crate::plugins::utils::principal;
 use crate::plugins::{
     RequestContext, StreamConnectionContext, StreamFrontendTransport, StreamTransactionSummary,
     StreamTriggerDecisions, TransactionSummary,
@@ -118,8 +119,11 @@ pub struct PluginTriggerCarrierCounters {
     /// session carried an explicit `false` decision for that instance.
     pub skipped_session_hooks: u64,
     /// Contextless hooks that RAN because no decision was carried for the
-    /// instance. Backward compatible by design; a sustained nonzero rate on a
-    /// triggered deployment means a summary/session path is not stamping the
+    /// instance. Backward compatible by design. Identity-reading triggers are
+    /// undecided by design on stream connections and on HTTP requests that end
+    /// at or before `authenticate`, so they are NOT counted
+    /// ([`PluginTriggerGate::missing_carrier_is_expected`]); a sustained
+    /// nonzero rate therefore means a summary/session path is not stamping the
     /// carrier.
     pub missing_decision_carriers: u64,
 }
@@ -177,11 +181,36 @@ impl PluginTriggerGate {
         self.compiled.reads_authenticated_identity()
     }
 
+    /// Whether a contextless hook can legitimately find NO carried decision
+    /// for this instance.
+    ///
+    /// An identity-reading trigger (`consumer` / `auth_method`) is undecided
+    /// by design wherever identity is not known yet: on every stream connection
+    /// ([`Self::admits_stream`]) and on an HTTP request that ends at or before
+    /// `authenticate` ([`TriggerPhase::PreAuth`]). Its missing carrier is the
+    /// documented fail-open path, not a stamping bug, so it is not counted in
+    /// `missing_decision_carriers`; the hook still runs either way.
+    pub fn missing_carrier_is_expected(&self) -> bool {
+        self.compiled.reads_authenticated_identity()
+    }
+
+    fn record_missing_carrier_unless_expected(&self) {
+        if !self.missing_carrier_is_expected() {
+            record_missing_carrier();
+        }
+    }
+
     /// First HTTP-only field the predicate reads (`method`, `path`, `host`,
     /// `header`, `query`, `cookie`), if any. Publication refuses one of these on
     /// a stream-only (TCP / UDP / DTLS) instance.
     pub fn http_only_field(&self) -> Option<&'static str> {
         self.compiled.http_only_field()
+    }
+
+    /// Whether the compiled predicate reads a `query` field. The plugin cache
+    /// folds this into `PluginCapabilities::HAS_QUERY_READING_TRIGGER`.
+    pub fn reads_query(&self) -> bool {
+        self.compiled.reads_query()
     }
 
     /// Decide whether this instance runs for `ctx`, memoizing the outcome.
@@ -258,7 +287,7 @@ impl PluginTriggerGate {
                 decision
             }
             None => {
-                record_missing_carrier();
+                self.record_missing_carrier_unless_expected();
                 true
             }
         }
@@ -292,7 +321,7 @@ impl PluginTriggerGate {
                 decision
             }
             None => {
-                record_missing_carrier();
+                self.record_missing_carrier_unless_expected();
                 true
             }
         }
@@ -314,7 +343,7 @@ impl PluginTriggerGate {
                 decision
             }
             None => {
-                record_missing_carrier();
+                self.record_missing_carrier_unless_expected();
                 true
             }
         }
@@ -481,12 +510,24 @@ impl TriggerFacts for HttpTriggerFacts<'_> {
         self.ctx.frontend_listen_port
     }
 
+    /// The mapped Consumer only: a `consumer` predicate never matches an
+    /// unmapped external identity that spells the same string
+    /// (GHSA-rxwj-x6c6-f4j5).
     fn consumer_identity(&self) -> Option<&str> {
+        principal::consumer_username(self.ctx)
+    }
+
+    fn external_identity(&self) -> Option<&str> {
+        principal::external_identity(self.ctx)
+    }
+
+    /// The private realm the authentication boundary committed with the
+    /// external identity, never anything a plugin or client can write.
+    fn external_identity_authority(&self) -> Option<[u8; 32]> {
+        principal::external_identity(self.ctx)?;
         self.ctx
-            .identified_consumer
-            .as_ref()
-            .map(|consumer| consumer.username.as_str())
-            .or(self.ctx.authenticated_identity.as_deref())
+            .authenticated_identity_realm()
+            .and_then(|realm| realm.authority().copied())
     }
 
     fn auth_method(&self) -> Option<&str> {
@@ -731,7 +772,16 @@ impl TriggerFacts for StreamTriggerFacts<'_> {
     // rather than a second, divergent definition of stream identity.
 
     fn consumer_identity(&self) -> Option<&str> {
-        self.ctx.effective_identity()
+        principal::stream_consumer_username(self.ctx)
+    }
+
+    fn external_identity(&self) -> Option<&str> {
+        principal::stream_external_identity(self.ctx)
+    }
+
+    /// Always `None`: a stream connection carries no committed realm.
+    fn external_identity_authority(&self) -> Option<[u8; 32]> {
+        None
     }
 
     fn auth_method(&self) -> Option<&str> {

@@ -224,7 +224,7 @@ Ferrum-owned rules inside every predecessor pod netns. The incoming host
 producer does not start in that release. `finalize` is admitted only after the
 node-local durable proof exists, and only then does the chart drop
 `SYS_ADMIN`/`SYS_PTRACE` and pod-wide `hostPID` from the running container. See
-the [Ambient UDP migration procedure](mesh.md#ambient-udp-placement-migration-enforced-hard-upgrade-guard).
+the [Ambient UDP migration procedure](node_agent.md#ambient-udp-placement-migration-enforced-hard-upgrade-guard).
 
 Once that migration has completed, a node with no node-local durable record —
 one that joined the cluster afterwards, or whose registry directory was
@@ -341,7 +341,7 @@ corrupt or hostile entry cannot yield a partially-scoped ruleset.
 
 | Mount | Path | Mode | Why required |
 |---|---|---|---|
-| `bpf-fs` (hostPath) | `/sys/fs/bpf` (default; override via `FERRUM_NODE_AGENT_BPF_FS_PATH`) | rw | Pinned BPF maps must live on bpffs so the mesh proxy can open `/sys/fs/bpf/ferrum/sock_ops_events`, `/sys/fs/bpf/ferrum/sock_ops_stats`, and `/sys/fs/bpf/ferrum/accept_first_byte_sockets` by path ([`src/ebpf/loader.rs::pin_sock_ops_maps`](../src/ebpf/loader.rs)). |
+| `bpf-fs` (hostPath) | `/sys/fs/bpf` in the container; host side `nodeAgent.bpfFsPath` (default `/sys/fs/bpf`) | rw | Pinned BPF maps must live on bpffs so the mesh proxy can open `/sys/fs/bpf/ferrum/sock_ops_events`, `/sys/fs/bpf/ferrum/sock_ops_stats`, and `/sys/fs/bpf/ferrum/accept_first_byte_sockets` by path ([`src/ebpf/loader.rs::pin_sock_ops_maps`](../src/ebpf/loader.rs)). |
 | `cgroup` (hostPath) | `/sys/fs/cgroup` (default; override via `FERRUM_NODE_AGENT_CGROUP_ROOT`) | ro | Opening a cgroup directory FD is required to call `BPF_PROG_ATTACH` against it (`attach_cgroup` in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs)). The directory is mounted read-only; BPF attach uses the FD via the BPF subsystem, not direct cgroup writes. |
 | ServiceAccount token | `/var/run/secrets/kubernetes.io/serviceaccount/` | ro | Automatically projected by the kubelet. Consumed by `kube::Config::incluster()` ([`build_node_agent_kube_client` in `src/modes/node_agent.rs`](../src/modes/node_agent.rs)) to authenticate the `pods`/`nodes` watcher to the API server. Operators should prefer a **projected** token with a short `expirationSeconds` (the kubelet handles rotation) over the legacy long-lived Secret token. |
 | Host route tables | `/proc/net/route`, `/proc/net/ipv6_route` (host netns via `hostNetwork: true`) | ro | Veth resolution ([`discover_dedicated_veth_for_pod` in `src/ebpf/veth.rs`](../src/ebpf/veth.rs)) accepts only an unambiguous `RTF_UP` `/32` or `/128` host route to the registry-published pod address, then requires the routed device in host `/sys/class/net/` to have a distinct non-zero peer `iflink` and no `bridge/` directory. A pod reached only through a subnet route on a shared CNI device (`cni0`, `cilium_host`) is refused rather than guarded there, because frames forwarded between pods on that device never cross it. A pod's own sysfs view (`/proc/{pid}/root/sys/class/net/`) is never read: the workload controls it. `/proc/net` follows the reading task's network namespace, not its PID namespace, so this needs `hostNetwork: true` but not `hostPID`. |
@@ -454,7 +454,7 @@ spec:
               add:
                 - BPF              # kernel >= 5.8; covered by SYS_ADMIN on older
                 - NET_ADMIN        # cgroup/tc attach, iptables fallback
-                - PERFMON          # kernel >= 5.8 BPF info/BTF
+                - PERFMON          # kernel >= 5.8 BPF prog/map info
                 # SYS_ADMIN only with dropCapSysAdmin=false (kernel < 5.8)
           volumeMounts:
             - name: bpf-fs
@@ -751,46 +751,8 @@ complete reports failure instead of success (see
 | `ferrum-mesh-cni-cleanup-wait` (pre-delete hook Job) | during `helm uninstall` | Kubernetes API only | No host mounts, runs as non-root. Its Role names one object: `get` + `delete` on `daemonsets` and `get` on `daemonsets/status`, both with `resourceNames: [ferrum-mesh-cni-cleanup]` in the release namespace — no list, no watch, no writes of any other kind. It exists because Helm's hook wait ignores DaemonSets, so without it the release could be deleted mid-cleanup; `delete` is what lets it retire that DaemonSet itself instead of relying on a Helm deletion policy that would also fire on failure. |
 | `ferrum-mesh-cni-cleanup` / `-wait` identity (ServiceAccounts, Role, RoleBinding) | for the lifetime of the release | none of their own | Ordinary release resources, deliberately not hook resources: on Helm 3.19+ and v4, a later hook's failure also deletes the earlier `hook-succeeded` hooks in that phase, so identity held that way would disappear exactly when a retry needs it. Grants are unchanged by this; the cleanup ServiceAccount still has no Role at all. |
 
-Removal is gated on evidence written at install time, never on a path guess:
+Removal and replacement are gated on ownership evidence written at install time (the in-conflist `managedBy`/`owner`/`generation` marker and the sibling ownership manifest), never on a path guess. The canonical rules — owner/generation scope, the shared-binary rule in both directions, `previousBinarySha256` / `binaryOwned` attestation, the fixed install order, failed-install chain recovery, and the lifecycle `flock` — are in [docs/node_agent.md → Ownership markers](node_agent.md#ownership-markers) and [Ordering, locking, and what the swap checks do not claim](node_agent.md#ordering-locking-and-what-the-swap-checks-do-not-claim). The security-relevant bounds on top of them:
 
-- The conflist must carry `managedBy: ferrum-edge` inside its own `ferrum-cni`
-  plugin entry, and its `owner`/`generation` must match the run's scope.
-- `<hostBinDir>/ferrum-cni` is a **shared** executable, so it is removed only
-  when all of the following hold: this run's chain is gone, no remaining
-  `.conf`/`.conflist`/`.json` in the directory still names the `ferrum-cni`
-  plugin type, the sibling ownership manifest names *these exact* artifacts
-  (`confFileName` / `binaryFileName`), and the manifest's recorded SHA-256
-  matches the bytes on disk. A directory that could not be fully scanned, or
-  manifest evidence bound to different file names, keeps the binary. Retaining
-  an unreferenced executable is inert; deleting one another release still
-  chains to is not.
-- A manifest's `previousBinarySha256` is an **attestation, not an
-  observation**. Hashing whatever already occupies the shared plugin path
-  proves nothing about who owns it, so the installer records that digest only
-  when the manifest already on disk carries this same owner, names these exact
-  artifact names, and had itself already recorded that digest. Every other
-  case records `null`: a pre-existing operator or third-party binary can never
-  be made removable merely because the installer read it. Because an
-  unreferenced binary is inert, retaining it never fails chain cleanup.
-- The manifest's `binaryOwned` bit applies the same proof to its current
-  digest. Publishing the staged inode sets it; reusing an inode sets it only
-  when prior same-owner evidence already attested that inode's digest.
-  Byte-identical operator-provided contents alone never transfer ownership.
-- Install applies the shared-binary rule in the other direction too: while any
-  remaining `.conf`/`.conflist`/`.json` still names `ferrum-cni`, the shared
-  executable is not replaced with different bytes. Byte-identical
-  republication is not a replacement and stays allowed; an installed object
-  that cannot be classified, or a directory that cannot be fully scanned,
-  fails safe by refusing the replacement with a fixed error and leaving the
-  shared binary and manifest byte-identical.
-- A failed install does not get to strand a chain. Everything that can fail on
-  uncontrolled input — locating the primary config, building the chain,
-  serializing it, staging and gating the binary — runs before any shared
-  write, and if a later step still fails the installer removes the same-owner
-  chain its preflight had classified, re-proving owner, generation, and
-  device/inode under the same lock first. A different owner, or a generation
-  that overtook the run, is retained and logged; the original failure is
-  always surfaced.
 - The configured file name is validated as a single path component, so `..`
   or an embedded separator can never redirect a delete out of the directory.
 - Artifacts are opened with `O_NOFOLLOW` and classified against the **open
@@ -804,15 +766,6 @@ Removal is gated on evidence written at install time, never on a path guess:
 - Temporary files are created `O_EXCL | O_NOFOLLOW` at mode `0600` under an
   unpredictable name in the destination directory, so a pre-planted symlink or
   file at a guessable path cannot be followed or truncated by a root process.
-- Every mutating run — install and cleanup alike — holds an exclusive `flock`
-  on `/etc/cni/net.d/.ferrum-cni-install.lock` for its whole duration, so two
-  Ferrum lifecycle steps on one node can never interleave.
-- Install fail-closes under that lock before any staging, manifest, binary, or
-  target-config write: an existing configured conflist is overwritten only when
-  it classifies as a bounded regular single-link file and its Ferrum ownership
-  marker names this same owner. Unmarked, malformed, oversized, symlinked,
-  non-regular, hard-linked, or differently-owned targets are refused with a
-  fixed error and leave those shared artifacts byte-identical.
 - Ownership tokens are bounded to 128 bytes of `[A-Za-z0-9._:/@#-]`, so
   nothing operator-supplied reaches the filesystem or a log line unchecked.
   Cleanup diagnostics report fixed reason strings and operator-configured
@@ -910,7 +863,7 @@ under the `system:serviceaccount:<ns>:ferrum-node-agent` identity.
 |---|---|---|
 | BPF program from compromised image | Sign agent images, pin digests, scan for unexpected BPF program types | Operator |
 | Capability creep in chart fork | This document + chart fields use `nodeAgent.security.*` toggles, default to least privilege | Gateway |
-| Runtime socket mount (escape vector) | Not present in upstream chart; trusted chart runtime lint in the required `Helm Chart` job (`.github/scripts/check_node_agent_chart_runtime.py`, base-extracted on PRs; the local Helm installer must match the trusted base before that scan) recursively rejects any chart template, values/example input, or chart file fragment that adds Docker/containerd/CRI-O sockets or host storage, common `runtime.sock` spellings, or a true/dynamic `privileged` assignment, and repeats these checks on Helm-rendered default, node-agent/ambient-enabled, and example-values manifests | Operator + Gateway |
+| Runtime socket mount (escape vector) | Not present in upstream chart; trusted chart runtime lint in the required `Helm Chart` job (`.github/scripts/check_node_agent_chart_runtime.py`, base-extracted on PRs; the local Helm installer must match the trusted base before that scan) recursively rejects any chart template, values/example input, or chart file fragment that adds Docker/containerd/CRI-O sockets or host storage, common `runtime.sock` spellings, or a true/dynamic `privileged` assignment, and repeats these checks on Helm-rendered manifests of every chart under `charts/`: each chart's defaults, its example values files, and the `charts/ferrum-mesh` node-agent/ambient-enabled render, so a socket path a template expression builds at render time (for example with `printf`) is caught in either chart | Operator + Gateway |
 | Read-write `/sys/fs/cgroup` (host modification) | Chart mounts `readOnly: true`; verify in your own values overlays | Operator |
 | Privileged: true (defeats seccomp) | Chart sets `privileged: false` on the node-agent container; the trusted chart-runtime lint requires every chart `privileged` assignment to remain literal false and rejects true or dynamic Helm-controlled values | Operator + Gateway |
 | /metrics exposed on cluster network | Loopback-only default and `/metrics` auth (see [`docs/node_agent.md`](node_agent.md)); explicit opt-in to broaden | Gateway |

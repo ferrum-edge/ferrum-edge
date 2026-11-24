@@ -250,17 +250,6 @@ impl UpdateNamespaceBody {
     }
 }
 
-/// Resource tables whose `namespace` column participates in derived listing
-/// and rename/delete occupancy. Keep in sync with SQL unions and Mongo
-/// `distinct_namespaces` scans.
-pub const DERIVED_NAMESPACE_RESOURCE_TABLES: &[&str] = &[
-    "proxies",
-    "consumers",
-    "plugin_configs",
-    "upstreams",
-    "gateway_trust_bundles",
-];
-
 /// Occupancy tables that block an unconfirmed DELETE. Broader than the
 /// derived-list union: API specs are admin-only metadata that still live
 /// under the tenant.
@@ -384,7 +373,6 @@ pub const NAMESPACE_RENAME_COPY_TABLES: &[(&str, &[&str])] = &[
             "pool_http2_max_frame_size",
             "pool_http2_max_concurrent_streams",
             "pool_http3_connections_per_backend",
-            "pool_max_requests_per_connection",
             "listen_port",
             "frontend_tls",
             "passthrough",

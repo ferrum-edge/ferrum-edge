@@ -24,8 +24,8 @@ use ferrum_edge::ebpf::bpf_metrics::{
 use ferrum_edge::ebpf::event_consumer::{
     BPF_DROP_REASON_COUNT, BPF_DROP_REASON_STATS_SLOTS, DrainOutcome, PollOutcome,
     RINGBUF_DRAIN_RECORD_BUDGET, RingBufAttach, RingBufCursor, SockOpsConsumer, SockOpsEvent,
-    drain_outstanding_records, drop_reason_delta, ringbuf_attach, ringbuf_outstanding_bytes,
-    seed_dropped_baseline,
+    drain_outstanding_records, drop_reason_baseline_after_reopen, drop_reason_delta,
+    ringbuf_attach, ringbuf_outstanding_bytes, seed_dropped_baseline,
 };
 use ferrum_edge::plugins::mesh::bpf_metrics::MeshBpfMetrics;
 use serde_json::json;
@@ -755,6 +755,30 @@ fn drop_reason_delta_adopts_a_reset_generation_without_stalling() {
     // Generation reset: everything the new map reports is new.
     assert_eq!(drop_reason_delta(9_000, 3), 3);
     assert_eq!(drop_reason_delta(u64::MAX, 1), 1);
+}
+
+/// After a pin rotation the new generation's decisions were all made before
+/// the consumer noticed, so none may be adopted as baseline (issue #7264):
+/// with a zero baseline the next poll publishes every one of them. A re-open
+/// of the same generation keeps the running baseline.
+#[test]
+fn reopen_baseline_publishes_a_rotated_generations_decisions() {
+    let published_old_generation = [900, 50, 0, 3];
+    let new_generation_totals = [4, 0, 2, 0];
+
+    let rotated = drop_reason_baseline_after_reopen(true, published_old_generation);
+    let deltas: Vec<u64> = rotated
+        .iter()
+        .zip(new_generation_totals)
+        .map(|(last, current)| drop_reason_delta(*last, current))
+        .collect();
+    assert_eq!(deltas, new_generation_totals.to_vec());
+
+    assert_eq!(
+        drop_reason_baseline_after_reopen(false, published_old_generation),
+        published_old_generation,
+        "a resynchronization re-reads the same generation"
+    );
 }
 
 /// Ringbuf record stride used by the fake cursor: the kernel's 8-byte record

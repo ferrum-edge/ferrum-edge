@@ -3,7 +3,7 @@
 //! These exercise the end-to-end slice → injected `workload_metrics` plugin
 //! flow: a `MeshProxyConfig` with `tracing_sampling=N` must surface as
 //! `sampling_percentage: N` in the injected `__mesh_workload_metrics` plugin
-//! config when `prepare_gateway_config_for_mesh` runs.
+//! config when `prepare_gateway_config_via_mesh_slice` runs.
 
 use chrono::Utc;
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ use ferrum_edge::modes::mesh::config::{
 };
 use ferrum_edge::modes::mesh::{
     MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
-    prepare_gateway_config_for_mesh,
+    prepare_gateway_config_via_mesh_slice,
 };
 
 fn test_addr(s: &str) -> SocketAddr {
@@ -113,7 +113,7 @@ fn proxy_config_tracing_sampling_flows_into_workload_metrics_plugin() {
     let runtime = test_runtime();
 
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
 
     let metrics_plugin = prepared
         .plugin_configs
@@ -159,7 +159,7 @@ fn proxy_config_does_not_set_sampling_when_unset() {
     let runtime = test_runtime();
 
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
 
     let metrics_plugin = prepared
         .plugin_configs
@@ -207,6 +207,7 @@ fn telemetry_tracing_sampling_overrides_proxy_config_tracing_sampling() {
                     custom_tags: HashMap::new(),
                     custom_header_tags: HashMap::new(),
                     custom_env_tags: HashMap::new(),
+                    safe_tag_sources: Vec::new(),
                     providers: Vec::new(),
                 }),
                 metrics: None,
@@ -223,7 +224,7 @@ fn telemetry_tracing_sampling_overrides_proxy_config_tracing_sampling() {
     let runtime = test_runtime();
 
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
 
     let metrics_plugin = prepared
         .plugin_configs
@@ -276,6 +277,7 @@ fn proxy_config_tracing_sampling_survives_telemetry_without_sampling_field() {
                     custom_tags: HashMap::from([("region".to_string(), "us-east".to_string())]),
                     custom_header_tags: HashMap::new(),
                     custom_env_tags: HashMap::new(),
+                    safe_tag_sources: Vec::new(),
                     providers: Vec::new(),
                 }),
                 metrics: None,
@@ -292,7 +294,7 @@ fn proxy_config_tracing_sampling_survives_telemetry_without_sampling_field() {
     let runtime = test_runtime();
 
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
 
     let metrics_plugin = prepared
         .plugin_configs
@@ -342,7 +344,7 @@ fn proxy_config_zero_sampling_is_applied_not_skipped() {
     let runtime = test_runtime();
 
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
 
     let metrics_plugin = prepared
         .plugin_configs
@@ -393,7 +395,7 @@ fn proxy_config_non_matching_selector_does_not_apply() {
     let runtime = test_runtime();
 
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
 
     let metrics_plugin = prepared
         .plugin_configs
@@ -433,7 +435,7 @@ fn mesh_wide_proxy_config_applies_to_workload_in_other_namespace() {
     let runtime = test_runtime();
 
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
 
     let metrics_plugin = prepared
         .plugin_configs
@@ -462,8 +464,13 @@ fn k8s_proxy_config_reaches_native_and_xds_equivalent_mesh_slices() {
         K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
     };
     use ferrum_edge::identity::spiffe::TrustDomain;
+    use ferrum_edge::modes::mesh::config_consumer::xds_client::{
+        XdsClientConfig, reverse_translate_xds_snapshot,
+    };
     use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
-    use ferrum_edge::xds::{MeshSliceCarrier, apply_carrier, build_slice_carriers};
+    use ferrum_edge::xds::{
+        MeshSliceCarrier, build_slice_carriers, translate_mesh_slice_to_snapshot,
+    };
 
     let proxy_config = K8sObject {
         api_version: "networking.istio.io/v1beta1".to_string(),
@@ -518,6 +525,7 @@ fn k8s_proxy_config_reaches_native_and_xds_equivalent_mesh_slices() {
         waypoint_name: None,
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     };
     let native = MeshSlice::from_gateway_config(&gateway_config, request);
     assert_eq!(native.proxy_configs.len(), 1);
@@ -528,24 +536,33 @@ fn k8s_proxy_config_reaches_native_and_xds_equivalent_mesh_slices() {
     assert_eq!(resolved.concurrency, Some(4));
     assert_eq!(resolved.image.as_deref(), Some("distroless"));
 
-    let carriers = build_slice_carriers(&native);
-    let proxy_carrier = carriers
-        .iter()
-        .find(|c| matches!(c, MeshSliceCarrier::ProxyConfigs(_)))
-        .expect("native slice must emit ProxyConfigsCarrier");
-    let encoded = proxy_carrier
-        .encode_value()
-        .expect("ProxyConfigsCarrier encodes");
-    let decoded = MeshSliceCarrier::decode(proxy_carrier.type_url(), &encoded)
-        .expect("decode succeeds")
-        .expect("recognized ProxyConfigs carrier");
+    assert!(
+        build_slice_carriers(&native)
+            .iter()
+            .any(|c| matches!(c, MeshSliceCarrier::ProxyConfigs(_))),
+        "native slice must emit ProxyConfigsCarrier"
+    );
 
-    let mut xds_equivalent = MeshSlice {
+    // Rebuild through the DP's production xDS path (SotW accumulator +
+    // reverse translation), not a hand-rolled carrier fold.
+    let dp_config = XdsClientConfig {
+        cp_urls: Vec::new(),
         node_id: native.node_id.clone(),
+        cluster: String::new(),
         namespace: native.namespace.clone(),
-        ..Default::default()
+        workload_spiffe_id: native.workload_spiffe_id.clone(),
+        waypoint_name: native.waypoint_name.clone(),
+        ambient_udp_source_scoping: false,
+        node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
+        stream_channel_capacity: 1,
+        primary_retry_secs: 0,
+        connect_timeout_seconds: 0,
+        labels: native.labels.clone(),
     };
-    apply_carrier(&mut xds_equivalent, decoded);
+    let xds_equivalent =
+        reverse_translate_xds_snapshot(&translate_mesh_slice_to_snapshot(&native), &dp_config)
+            .expect("the DP rebuilds the xDS-carried slice");
     assert_eq!(
         xds_equivalent.proxy_configs, native.proxy_configs,
         "xDS ProxyConfigsCarrier must recover the same proxy_configs as native"

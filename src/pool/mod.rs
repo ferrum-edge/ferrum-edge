@@ -11,6 +11,8 @@ use tokio::sync::{Semaphore, watch};
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 
+pub(crate) mod shard_fill;
+
 thread_local! {
     // Sized for identity fields plus the reqwest `rcfg=…` client-behavior suffix.
     static KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(192));
@@ -317,6 +319,68 @@ pub fn remaining_connect_timeout(
     connect_timeout: Duration,
 ) -> Option<Duration> {
     connect_timeout.checked_sub(connect_started.elapsed())
+}
+
+/// The hyper HTTP/2 client builder every `PoolConfig`-driven pool family
+/// constructs: direct H2 (`http2_pool`), gRPC (`grpc_proxy`), mesh mTLS
+/// (`mesh_mtls_pool`) and the nested-HBONE gRPC dial.
+///
+/// Every site gets the same wire settings (issue #7071). The mesh-mTLS and
+/// nested-HBONE keys (`hbone_pool::write_pool_config_key`) carry every
+/// `PoolConfig` field below, so their key and wire settings agree. The
+/// direct-H2/gRPC keys carry the effective stream cap but not the keepalive,
+/// window or frame-size knobs (a documented first-materializer tradeoff).
+/// The builder applies:
+///
+/// - the Tokio timer, which drives keepalive PINGs and hyper's H2 timeouts;
+/// - when `enable_http2` is set, `http2_keep_alive_interval_seconds` /
+///   `http2_keep_alive_timeout_seconds` PINGs and
+///   `max_concurrent_reset_streams(4096)`. The nested-HBONE connection takes
+///   them too: its outer carrier's PINGs prove only the tunnel to the
+///   destination relay, not the app behind it;
+/// - both initial flow-control windows,
+///   `adaptive_window(pool_config.http2_adaptive_window)` (issue #5464: the
+///   fixed-window default must reach every builder), and `max_frame_size`. The
+///   windows are set BEFORE `adaptive_window`: hyper's `initial_*_window_size`
+///   clears the adaptive flag and `adaptive_window(true)` resets both windows,
+///   so the order decides which one wins;
+/// - with a stream cap (DestinationRule `maxConcurrentStreams` or the global
+///   pool setting), the cap both as the advertised `max_concurrent_streams`
+///   and as `initial_max_send_streams`, so the operator's bound holds from the
+///   first stream until the peer's SETTINGS frame replaces it.
+pub(crate) fn hyper_h2_client_builder(
+    pool_config: &PoolConfig,
+) -> hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor> {
+    let mut builder =
+        hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+    builder.timer(hyper_util::rt::TokioTimer::new());
+
+    if pool_config.enable_http2 {
+        builder
+            .keep_alive_interval(Duration::from_secs(
+                pool_config.http2_keep_alive_interval_seconds,
+            ))
+            .keep_alive_timeout(Duration::from_secs(
+                pool_config.http2_keep_alive_timeout_seconds,
+            ))
+            .max_concurrent_reset_streams(4096);
+    }
+
+    builder
+        .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
+        .initial_connection_window_size(pool_config.http2_initial_connection_window_size)
+        .adaptive_window(pool_config.http2_adaptive_window)
+        .max_frame_size(pool_config.http2_max_frame_size);
+
+    if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
+        // Advertised to the peer as our own inbound stream cap, and our own
+        // outbound bound until the peer's SETTINGS arrive.
+        builder
+            .max_concurrent_streams(max_streams)
+            .initial_max_send_streams(max_streams as usize);
+    }
+
+    builder
 }
 
 #[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
@@ -842,6 +906,12 @@ pub struct GenericPool<M: PoolManager> {
     /// permit or queues ahead of a request-path create.
     background_inflight: Arc<Semaphore>,
     pending_creations: Arc<DashMap<String, Arc<PendingCreation>>>,
+    /// Bumped by every drain ([`Self::clear`], [`Self::invalidate_matching`]).
+    /// An acquisition samples it once, before it reads any dial input a drain
+    /// retires, and keeps that sample across coalesced waits and re-election;
+    /// a connection it creates is published only while the value is
+    /// unchanged. Written only by drains, so the sample is a shared read.
+    drain_epoch: AtomicU64,
 }
 
 /// One permit from a pool's background-create budget
@@ -887,6 +957,7 @@ impl<M: PoolManager> GenericPool<M> {
             inflight: Arc::new(Semaphore::new(inflight_limit)),
             background_inflight: Arc::new(Semaphore::new(background_limit)),
             pending_creations: Arc::new(DashMap::with_shard_amount(shards)),
+            drain_epoch: AtomicU64::new(0),
         });
         pool.clone().spawn_cleanup();
         pool
@@ -917,6 +988,16 @@ impl<M: PoolManager> GenericPool<M> {
             self.inflight.available_permits(),
             self.background_inflight.available_permits(),
         )
+    }
+
+    /// The current drain epoch (see [`Self::clear`]). A caller that captures
+    /// a dial input before it enters the pool's create path (the SVID
+    /// generation in its pool key, a detached shard fill's whole request)
+    /// samples this FIRST and hands the sample in: a drain advances what it
+    /// retires before it bumps the epoch, so an input read after the sample
+    /// is either current or fenced. One shared atomic load.
+    pub(crate) fn drain_epoch(&self) -> u64 {
+        self.drain_epoch.load(Ordering::Acquire)
     }
 
     /// Whether a create of `key` is already pending, request-path or
@@ -960,14 +1041,32 @@ impl<M: PoolManager> GenericPool<M> {
         }
     }
 
+    /// Drain every published connection, and stop every cold acquisition
+    /// already under way from publishing the connection it creates.
+    ///
+    /// A cold acquisition took its dial inputs (the backend TLS
+    /// configuration, the SVID generation) before this drain, so a connection
+    /// it establishes must not be published after it. Each one sampled the
+    /// drain epoch when it entered the pool and carries that sample across
+    /// coalesced waits and re-election, so bumping the epoch here fences the
+    /// creator in flight and every waiter that would re-elect after it. The
+    /// bump comes BEFORE the entries are removed: a creator that passed its
+    /// epoch check had already published under its entry lock, and the
+    /// removal pass below then takes that entry too. Cold path.
     pub fn clear(&self) {
+        self.drain_epoch.fetch_add(1, Ordering::AcqRel);
         let keys = self.keys_snapshot();
         for key in keys {
             self.invalidate(&key);
         }
     }
 
+    /// Drain the published connections whose key `predicate` selects. Cold
+    /// acquisitions already under way are fenced as in [`Self::clear`], for
+    /// every key: a selective drain is rare, and an acquisition it fences
+    /// needlessly only hands its connection to its own caller. Cold path.
     pub fn invalidate_matching(&self, predicate: impl Fn(&str) -> bool) {
+        self.drain_epoch.fetch_add(1, Ordering::AcqRel);
         let keys = self.keys_snapshot();
         for key in keys {
             if predicate(&key) {
@@ -1033,12 +1132,29 @@ impl<M: PoolManager> GenericPool<M> {
         C: FnOnce(String) -> Fut,
         Fut: std::future::Future<Output = Result<M::Connection>>,
     {
+        // Sampled before `build_key` reads the SVID generation the key embeds
+        // (see `drain_epoch`).
+        let drain_epoch = self.drain_epoch();
         match self.lookup_or_build_key(build_key) {
             LookupOutcome::Hit(conn) => Ok(conn),
-            LookupOutcome::Miss(key) => self.create_or_get_existing_owned(key, create).await,
+            LookupOutcome::Miss(key) => {
+                self.create_or_get_existing_owned_sampled_as(
+                    key,
+                    drain_epoch,
+                    PoolCreateCaller::Request,
+                    create,
+                )
+                .await
+            }
             LookupOutcome::Unhealthy(key) => {
                 self.invalidate(&key);
-                self.create_or_get_existing_owned(key, create).await
+                self.create_or_get_existing_owned_sampled_as(
+                    key,
+                    drain_epoch,
+                    PoolCreateCaller::Request,
+                    create,
+                )
+                .await
             }
         }
     }
@@ -1085,6 +1201,38 @@ impl<M: PoolManager> GenericPool<M> {
         self.create_or_get_existing_owned_budgeted(
             key,
             CreateBudget::Request,
+            None,
+            caller,
+            |_| {},
+            |_| {},
+            |_| None,
+            |key, _attempt| create(key),
+        )
+        .await
+    }
+
+    /// As [`Self::create_or_get_existing_owned_as`], for a caller that read a
+    /// dial input a drain retires before it reached the pool: the SVID
+    /// generation `key` was built from, or a backend TLS configuration its
+    /// `create` closure already holds. `drain_epoch` is the
+    /// [`Self::drain_epoch`] sample it took before the first such read, so a
+    /// drain between that read and this call fences the create.
+    pub(crate) async fn create_or_get_existing_owned_sampled_as<C, Fut, E>(
+        &self,
+        key: String,
+        drain_epoch: u64,
+        caller: PoolCreateCaller,
+        create: C,
+    ) -> std::result::Result<M::Connection, E>
+    where
+        C: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<M::Connection, E>>,
+        E: ShareablePoolCreateError + From<SharedPoolCreateError>,
+    {
+        self.create_or_get_existing_owned_budgeted(
+            key,
+            CreateBudget::Request,
+            Some(drain_epoch),
             caller,
             |_| {},
             |_| {},
@@ -1119,6 +1267,7 @@ impl<M: PoolManager> GenericPool<M> {
     {
         self.create_or_get_existing_owned_with_recovery(
             key,
+            self.drain_epoch(),
             PoolCreateCaller::Request,
             on_join,
             on_waiter_failure,
@@ -1133,9 +1282,15 @@ impl<M: PoolManager> GenericPool<M> {
     /// A recovered connection is returned without publishing it under `key`:
     /// it can belong to a different shard. Cancellation re-election repeats
     /// this check before another physical attempt can start.
+    ///
+    /// `drain_epoch` is the [`Self::drain_epoch`] sample the caller took
+    /// before it read the SVID generation `key` was built from, so a
+    /// generation drain between that read and this call fences the create.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_or_get_existing_owned_with_recovery<C, Fut, E, J, W, R>(
         &self,
         key: String,
+        drain_epoch: u64,
         caller: PoolCreateCaller,
         on_join: J,
         on_waiter_failure: W,
@@ -1153,6 +1308,7 @@ impl<M: PoolManager> GenericPool<M> {
         self.create_or_get_existing_owned_budgeted(
             key,
             CreateBudget::Request,
+            Some(drain_epoch),
             caller,
             on_join,
             on_waiter_failure,
@@ -1164,7 +1320,10 @@ impl<M: PoolManager> GenericPool<M> {
 
     /// As [`Self::create_or_get_existing_owned_with_recovery`], for a
     /// speculative create that holds `permit` from the background budget
-    /// instead of waiting for a request-path permit. It still coalesces with
+    /// instead of waiting for a request-path permit. `drain_epoch` is the
+    /// [`Self::drain_epoch`] sample its caller took when it scheduled the
+    /// create, before the detached task first runs, so a drain between
+    /// scheduling and the first poll fences it too. It still coalesces with
     /// request-path creates of the same key: a request that joins it waits on
     /// this attempt, and this attempt joins a request-path create in flight.
     #[allow(clippy::too_many_arguments)]
@@ -1172,6 +1331,7 @@ impl<M: PoolManager> GenericPool<M> {
         &self,
         key: String,
         permit: BackgroundCreatePermit,
+        drain_epoch: u64,
         caller: PoolCreateCaller,
         on_join: J,
         on_waiter_failure: W,
@@ -1190,6 +1350,7 @@ impl<M: PoolManager> GenericPool<M> {
             .create_or_get_existing_owned_budgeted(
                 key,
                 CreateBudget::Background,
+                Some(drain_epoch),
                 caller,
                 on_join,
                 on_waiter_failure,
@@ -1206,6 +1367,7 @@ impl<M: PoolManager> GenericPool<M> {
         &self,
         key: String,
         budget: CreateBudget,
+        entry_drain_epoch: Option<u64>,
         caller: PoolCreateCaller,
         mut on_join: J,
         mut on_waiter_failure: W,
@@ -1221,6 +1383,11 @@ impl<M: PoolManager> GenericPool<M> {
         R: Fn(&str) -> Option<M::Connection>,
     {
         let mut create = Some(create);
+        // Sampled once, before the first cache check, and kept across every
+        // coalesced wait and re-election below (see `clear`). A caller whose
+        // key embeds an SVID generation, and a detached create, bring the
+        // sample they took before reading it.
+        let drain_epoch = entry_drain_epoch.unwrap_or_else(|| self.drain_epoch());
 
         loop {
             if let Some(conn) = self.cached(&key) {
@@ -1258,7 +1425,7 @@ impl<M: PoolManager> GenericPool<M> {
             crate::profile_pool_event!(CreateOwner);
             let pending_guard = PendingCreationGuard::new(self, key.clone(), pending);
             let result = self
-                .create_after_recheck(key.clone(), budget, &recover, {
+                .create_after_recheck(key.clone(), budget, drain_epoch, &recover, {
                     let create = create
                         .take()
                         .expect("create closure should only be consumed by the creator");
@@ -1333,6 +1500,7 @@ impl<M: PoolManager> GenericPool<M> {
         &self,
         key: String,
         budget: CreateBudget,
+        drain_epoch: u64,
         recover: R,
         create: C,
     ) -> std::result::Result<M::Connection, E>
@@ -1373,7 +1541,16 @@ impl<M: PoolManager> GenericPool<M> {
         };
         let now = now_tick_ms();
 
-        match self.entries.entry(key) {
+        let slot = self.entries.entry(key);
+        // Checked under the entry lock, so it is atomic with a drain's epoch
+        // bump and removal pass (see `clear`). A connection this acquisition
+        // began before a drain serves its caller, as any request already in
+        // flight at the drain does, and is closed when that caller drops it.
+        if self.drain_epoch.load(Ordering::Acquire) != drain_epoch {
+            drop(slot);
+            return Ok(created);
+        }
+        match slot {
             dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
                 let entry = occupied.get_mut();
                 if self.manager.is_healthy(&entry.conn) {
@@ -1597,7 +1774,6 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
-            pool_max_requests_per_connection: None,
             pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,

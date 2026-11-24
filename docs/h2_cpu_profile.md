@@ -27,6 +27,76 @@ Ferrum must match the retained symbolized binary. Envoy's actual mapped ELF and
 build IDs are retained; stripped or unresolved frames stay explicit in coverage.
 The collector does not sample the whole host or collect kernel stacks.
 
+Envoy's release image ships a stripped executable, so almost none of its own
+frames have function names. After capture, the job symbolizes each Envoy CPU capture
+offline. It fetches one layer of `envoyproxy/envoy:debug-v1.39.1` by
+its pinned content digest. That layer holds `/usr/local/bin/envoy` with
+`.symtab` and the **same GNU build ID** as the measured `v1.39.1` binary.
+
+The profiler checks:
+
+- the layer member's pinned SHA-256, size and build ID;
+- the capture's recorded build ID;
+- the retained release ELF and every retained DSO hash;
+- that `perf.data`, `stacks.txt`, `perf-buildids.txt` and
+  `build-mappings.json` match their trace-manifest receipts.
+
+It then re-decodes a copy of the unchanged `perf.data` through the same bounded
+decoder. Only the `perf script` call gets wider offline bounds (600 seconds,
+64 MiB); the other decoder calls keep their 30-second bounds. In the overlay
+`--symfs`, only the executable is swapped for its debug twin.
+
+The re-decode must reproduce every sample and every unwound PC of the original
+decode, so only names may change. A capture is reported as unmatched if:
+
+- the twin's extra sections changed unwinding;
+- the original decode was incomplete;
+- the measurement window has no Envoy executable leaves;
+- some Envoy executable leaves were unresolved and the twin resolved no more of
+  them.
+
+The same overlay then decodes each sample's sampled PC with `perf script -G`,
+which skips DWARF unwinding. That names the leaf of samples whose unwind kept
+no frame. This flat decode has the same 600-second, 64 MiB bounds. It must
+reproduce every original sample (PID, TID and time), with exactly one PC each.
+Where the original decode unwound a sample, that sample's PC must equal its
+unwound leaf, and a leaf the symbolized decode named must stay named.
+Otherwise the capture is unmatched and gets no flat summary. A flat leaf is
+self time only; it has no callers.
+
+Each capture that reaches the publish step gains `envoy-symbols/`; every other
+capture appears only in `envoy-symbols.json`. The directory holds folded stacks,
+decoder coverage, the flat decode (`flat.txt`), the stack and flat decoders'
+stderr and status, and a summary. It is published whole and never overwritten. The summary
+gives measurement-window leaf coverage before and after symbols, and the top
+leaf functions with their DSOs. `flat` gives the same summary for every sampled
+PC; `flat_no_unwound_frame` restricts it to samples whose unwind kept no frame.
+The run also writes `envoy-symbols.json` after every capture, which
+`h2-cpu-report.json` includes. Only the closing write, with a row for every
+capture, can be complete. A decoder that outlives its post-kill reap bound
+stops the pass.
+
+The 881 MB debug executable is never added to the artifact. A missing or
+mismatched symbol twin fails that step but leaves the capture evidence and
+calibration unchanged.
+
+Symbols do not fix Envoy's unwinding. In retained run 40999505084, matching
+symbols named the existing Envoy leaves but did not repair the missing unwinds
+([dated counts](benchmark_h2_cpu_profile_envoy_unwind_2026_10_30.md)). Comparing
+functions for those samples requires their sampled PCs even when DWARF
+unwinding fails, which the flat decode above now supplies.
+
+The flat decode closes that gap. In hosted run 41136450150 (HTTP/2, 10 KiB), both
+Envoy captures passed the flat checks of that revision, and their retained data
+also satisfy the later named-leaf check. Flat leaves named 91.8% and 92.0% of
+window samples, against 2.9% and 19.8% from the symbolized stacks. Of the
+1,861 and 1,596 window samples that kept no unwound frame, 1,838 and 1,570 had
+their sampled PC in the Envoy executable; the other 23 and 26 were in
+`[vdso]`. Those executable PCs spread across Envoy's functions much like all of
+its samples do, so the unwind failure is not confined to a few functions. The
+remaining unnamed leaves are libc and `[vdso]` addresses. Envoy's self time is broad: no function exceeds 4% of
+window samples, and AES-GCM, tcmalloc and nghttp2 lead.
+
 `process_usage.measurement` adds `user_cpu_seconds` and `system_cpu_seconds` from
 Linux `/proc/PID/stat`. With scheduler sampling enabled, gateway/backend
 `context_switches` contains `voluntary_ctxt_switches` and

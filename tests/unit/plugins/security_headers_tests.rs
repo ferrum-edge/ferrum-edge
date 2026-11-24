@@ -364,7 +364,11 @@ fn rejects_unknown_top_level_and_nested_hsts_keys_with_paths() {
         "unknown": true
     }))
     .unwrap_err();
-    assert!(err.contains("under `security_headers`: \"fram_options, unknown\""));
+    assert!(err.contains(
+        "security_headers: `security_headers`: unknown configuration key(s): \
+         \"security_headers.fram_options\" (did you mean `frame_options`?), \
+         \"security_headers.unknown\""
+    ));
 
     let err = SecurityHeaders::new(&json!({
         "hsts": {
@@ -374,7 +378,11 @@ fn rejects_unknown_top_level_and_nested_hsts_keys_with_paths() {
         }
     }))
     .unwrap_err();
-    assert!(err.contains("under `security_headers.hsts`: \"include_subdomain, unknown\""));
+    assert!(err.contains(
+        "security_headers: `security_headers.hsts`: unknown configuration key(s): \
+         \"security_headers.hsts.include_subdomain\" (did you mean `include_subdomains`?), \
+         \"security_headers.hsts.unknown\""
+    ));
 }
 
 #[test]
@@ -546,54 +554,101 @@ fn set_rejects_every_protocol_managed_destination_case_insensitively() {
     }
 }
 
-/// The rejection is scoped to `set` destinations. `remove` of the same names
-/// stays allowed: dropping a protocol-managed field is a no-op after the origin
-/// strip and can never invent framing.
-#[tokio::test]
-async fn remove_still_accepts_protocol_managed_names() {
+/// Dropping a protocol-managed field is at best a no-op the final wire
+/// boundary re-derives, so `remove` refuses the same names as `set` rather than
+/// accepting a policy that does nothing.
+#[test]
+fn remove_rejects_every_protocol_managed_destination_case_insensitively() {
     for name in PROTOCOL_MANAGED_DESTINATIONS {
         for spelling in case_variants(name) {
-            SecurityHeaders::new(&json!({ "remove": [spelling.clone()] }))
-                .unwrap_or_else(|error| panic!("remove of {spelling} must stay allowed: {error}"));
+            let error = SecurityHeaders::new(&json!({ "remove": [spelling.clone()] }))
+                .expect_err(&format!("remove of {spelling} must be rejected"));
+            assert!(
+                error.contains("`remove` entry") && error.contains("protocol-managed"),
+                "diagnostic for remove.{spelling} must say why: {error}"
+            );
+            assert!(error.contains(name), "diagnostic must name {name}: {error}");
         }
     }
+}
 
-    // A config that removes framing names and sets an ordinary one is valid, and
-    // the ordinary header still applies.
+/// Representation metadata the gateway's response pipeline decides from.
+const REPRESENTATION_DESTINATIONS: &[&str] = &["content-type", "content-encoding", "content-range"];
+
+/// security_headers-CLAUDE-1: `set`/`remove` could relabel or unlabel the
+/// response `Content-Type` after content-type-selective body inspection had
+/// already released the body to streaming under the backend's label, and the
+/// plugin does not declare `may_modify_response_content_type`. Representation
+/// fields are refused at admission on both `set` and `remove`.
+#[test]
+fn set_and_remove_reject_representation_metadata_case_insensitively() {
+    for name in REPRESENTATION_DESTINATIONS {
+        for spelling in case_variants(name) {
+            let error = SecurityHeaders::new(&set_config(&spelling, "text/html"))
+                .expect_err(&format!("set.{spelling} must be rejected"));
+            assert!(
+                error.contains("`set` entry") && error.contains("representation metadata"),
+                "diagnostic for set.{spelling} must say why: {error}"
+            );
+            assert!(error.contains(name), "diagnostic must name {name}: {error}");
+            assert!(
+                !error.contains("text/html"),
+                "the diagnostic must not echo the configured value: {error}"
+            );
+
+            let error = SecurityHeaders::new(&json!({ "remove": [spelling.clone()] }))
+                .expect_err(&format!("remove of {spelling} must be rejected"));
+            assert!(
+                error.contains("`remove` entry") && error.contains("representation metadata"),
+                "diagnostic for remove.{spelling} must say why: {error}"
+            );
+        }
+    }
+}
+
+/// With representation metadata refused, no accepted policy can move the
+/// response content type, so the trait default (`false`) for
+/// `may_modify_response_content_type` is exact.
+#[tokio::test]
+async fn accepted_policies_never_change_the_response_content_type() {
     let plugin = SecurityHeaders::new(&json!({
-        "remove": ["Content-Length", "Transfer-Encoding"],
-        "set": { "X-Env": "prod" }
+        "hsts": true,
+        "set": { "X-Env": "prod", "Cache-Control": "no-store" },
+        "remove": ["server", "x-powered-by", "vary"]
     }))
-    .expect("mixed remove/set config must construct");
-    let mut headers = HashMap::from([("content-length".to_string(), "999".to_string())]);
+    .expect("policy");
     let mut request = ctx();
+    let mut headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    )]);
+
+    assert!(!plugin.may_modify_response_content_type(&request, Some("application/octet-stream")));
     plugin.after_proxy(&mut request, 200, &mut headers).await;
-    assert!(
-        !headers
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case("content-length")),
-        "a configured remove must still drop the field"
+
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/octet-stream")
     );
-    assert_eq!(headers.get("x-env").map(String::as_str), Some("prod"));
 }
 
 /// Ordinary and security-relevant custom destinations are unaffected — the
-/// closed set must not grow into a general-purpose name filter.
+/// closed sets must not grow into a general-purpose name filter.
 #[test]
 fn set_still_accepts_ordinary_response_header_destinations() {
     for name in [
         "X-Env",
         "Cache-Control",
-        "Content-Type",
         "Content-Security-Policy",
-        "Strict-Transport-Security",
-        "Content-Encoding",
+        "Content-Disposition",
         "Vary",
         "Set-Cookie",
     ] {
         SecurityHeaders::new(&set_config(name, "1"))
             .unwrap_or_else(|error| panic!("set.{name} must stay allowed: {error}"));
     }
+    SecurityHeaders::new(&set_config("Strict-Transport-Security", "max-age=60"))
+        .unwrap_or_else(|error| panic!("set.Strict-Transport-Security must stay allowed: {error}"));
 }
 
 #[test]
@@ -643,4 +698,545 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             );
         }
     }
+}
+
+#[test]
+fn builtin_header_strings_must_be_tokens_browsers_recognize() {
+    for valid in [
+        json!({ "content_type_options": "nosniff" }),
+        json!({ "content_type_options": " NoSniff\t" }),
+        json!({ "frame_options": "DENY" }),
+        json!({ "frame_options": "sameorigin" }),
+        json!({ "referrer_policy": "no-referrer" }),
+        json!({ "referrer_policy": "Strict-Origin-When-Cross-Origin" }),
+        json!({ "referrer_policy": "no-referrer, strict-origin-when-cross-origin" }),
+    ] {
+        SecurityHeaders::new(&valid)
+            .unwrap_or_else(|error| panic!("{valid} must be accepted: {error}"));
+    }
+
+    for invalid in [
+        json!({ "content_type_options": "nosnif" }),
+        json!({ "content_type_options": " " }),
+        json!({ "frame_options": "SAMEORGIN" }),
+        json!({ "frame_options": "ALLOW-FROM https://example.com" }),
+        json!({ "frame_options": "DENY, SAMEORIGIN" }),
+        json!({ "referrer_policy": "strict-origin-when-cross-orign" }),
+        json!({ "referrer_policy": "no-referrer," }),
+        json!({ "referrer_policy": "no-referrer; origin" }),
+    ] {
+        let error =
+            SecurityHeaders::new(&invalid).expect_err(&format!("{invalid} must be rejected"));
+        assert!(
+            error.contains("browsers ignore any other value"),
+            "unexpected error for {invalid}: {error}"
+        );
+    }
+}
+
+#[test]
+fn set_entries_for_builtin_headers_use_the_same_token_checks() {
+    for valid in [
+        json!({ "set": { "X-Frame-Options": "deny" } }),
+        json!({ "set": { "x-content-type-options": " nosniff" } }),
+        json!({ "set": { "Referrer-Policy": "no-referrer, strict-origin" } }),
+        json!({ "frame_options": "DENY", "set": { "X-FRAME-OPTIONS": "SAMEORIGIN" } }),
+        json!({ "set": { "X-Other": "SAMEORGIN" } }),
+    ] {
+        SecurityHeaders::new(&valid)
+            .unwrap_or_else(|error| panic!("{valid} must be accepted: {error}"));
+    }
+
+    for invalid in [
+        json!({ "frame_options": "DENY", "set": { "X-Frame-Options": "SAMEORGIN" } }),
+        json!({ "set": { "x-FRAME-options": "ALLOW-FROM https://example.com" } }),
+        json!({ "set": { "X-Frame-Options": "" } }),
+        json!({ "set": { "X-Content-Type-Options": "nosnif" } }),
+        json!({ "content_type_options": false, "set": { "x-content-type-options": " " } }),
+        json!({ "set": { "Referrer-Policy": "strict-origin-when-cross-orign" } }),
+        json!({ "set": { "referrer-policy": "no-referrer; origin" } }),
+    ] {
+        let error =
+            SecurityHeaders::new(&invalid).expect_err(&format!("{invalid} must be rejected"));
+        assert!(
+            error.contains("`set` entry") && error.contains("browsers ignore any other value"),
+            "unexpected error for {invalid}: {error}"
+        );
+        for leaked in ["SAMEORGIN", "ALLOW-FROM", "nosnif\"", "orign"] {
+            assert!(!error.contains(leaked), "error echoes the value: {error}");
+        }
+    }
+}
+
+/// Strict-Transport-Security values a browser honors, and ones it ignores in
+/// full (RFC 6797 §6.1).
+const VALID_HSTS_VALUES: &[&str] = &[
+    "max-age=0",
+    "max-age=31536000",
+    "max-age=31536000; includeSubDomains",
+    "max-age=31536000; includeSubDomains; preload",
+    "MAX-AGE=60;INCLUDESUBDOMAINS",
+    " max-age = 60 ; includeSubDomains ",
+    "max-age=\"60\"",
+    "includeSubDomains; max-age=60",
+    "max-age=60;;",
+    "max-age=60; ext=token; quoted=\"a=b c\"",
+];
+
+const INVALID_HSTS_VALUES: &[&str] = &[
+    " ",
+    "includeSubDomains",
+    "includeSubDomains; preload",
+    "maxage=31536000",
+    "max-age",
+    "max-age=",
+    "max-age=-1",
+    "max-age=1.5",
+    "max-age=1 2",
+    "max-age=\"\"",
+    "max-age=\"60",
+    "max-age=1; max-age=2",
+    "max-age=1; MAX-AGE=1",
+    "max-age=1, max-age=2",
+    "max-age=60; includeSubDomains; includeSubDomains",
+    "max-age=60; includeSubDomains=yes",
+    "max-age=60; ext=",
+    "max-age=60; ext=a=b",
+    "max-age=60; bad name",
+    "max-age=60; ext=\"quoted\\\\escape\"",
+];
+
+/// security_headers-CLAUDE-2: the string form of `hsts` (and a
+/// `Strict-Transport-Security` `set` entry) was accepted with syntax-only
+/// validation, so a value without a well-formed `max-age` loaded and then
+/// provided no downgrade protection at all.
+#[test]
+fn hsts_strings_and_set_entries_require_one_well_formed_max_age() {
+    for value in VALID_HSTS_VALUES {
+        let plugin = SecurityHeaders::new(&json!({ "hsts": value }))
+            .unwrap_or_else(|error| panic!("hsts {value:?} must be accepted: {error}"));
+        let mut headers = HashMap::new();
+        plugin.apply_initial_response_header_policy(&mut headers);
+        assert_eq!(
+            headers.get("strict-transport-security").map(String::as_str),
+            Some(*value),
+            "a valid string is still emitted verbatim"
+        );
+        SecurityHeaders::new(&set_config("Strict-Transport-Security", value))
+            .unwrap_or_else(|error| panic!("set STS {value:?} must be accepted: {error}"));
+    }
+
+    for value in INVALID_HSTS_VALUES {
+        let error = SecurityHeaders::new(&json!({ "hsts": value }))
+            .expect_err(&format!("hsts {value:?} must be rejected"));
+        assert!(
+            error.contains("`hsts`") && error.contains("max-age"),
+            "unexpected error for hsts {value:?}: {error}"
+        );
+        let error = SecurityHeaders::new(&set_config("strict-TRANSPORT-security", value))
+            .expect_err(&format!("set STS {value:?} must be rejected"));
+        assert!(
+            error.contains("`set` entry") && error.contains("browsers ignore any other value"),
+            "unexpected error for set STS {value:?}: {error}"
+        );
+    }
+
+    // `""` still disables the opt-in header rather than failing validation.
+    let plugin = SecurityHeaders::new(&json!({ "hsts": "" })).expect("empty hsts disables");
+    let mut headers = HashMap::new();
+    plugin.apply_initial_response_header_policy(&mut headers);
+    assert!(!headers.contains_key("strict-transport-security"));
+}
+
+fn single_copy<'a>(headers: &'a HashMap<String, String>, name: &str) -> Vec<&'a str> {
+    headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+        .collect()
+}
+
+/// The ordinary response hook, initial-header boundary (including gRPC and
+/// WebSocket handshakes), and response-header simulation share this policy.
+async fn policy_outputs(
+    plugin: &SecurityHeaders,
+    headers: &HashMap<String, String>,
+) -> [HashMap<String, String>; 3] {
+    let mut request = ctx();
+    let mut after_proxy = headers.clone();
+    let result = plugin
+        .after_proxy(&mut request, 200, &mut after_proxy)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    let mut initial = headers.clone();
+    plugin.apply_initial_response_header_policy(&mut initial);
+    let mut simulated = headers.clone();
+    plugin.simulate_after_proxy_response_headers(&mut request, &mut simulated);
+    [after_proxy, initial, simulated]
+}
+
+/// Issue #6900: an ignored spelling must not precede or combine with a valid
+/// STS/nosniff copy on the wire. Preserve the backend protection as one field.
+#[tokio::test]
+async fn override_disabled_collapses_sts_and_nosniff_case_variants() {
+    let plugin = SecurityHeaders::new(&json!({
+        "override_existing": false,
+        "hsts": "max-age=600"
+    }))
+    .expect("policy");
+
+    for (name, kept, other) in [
+        (
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+            "",
+        ),
+        (
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+            "max-age=1; max-age=2",
+        ),
+        ("Strict-Transport-Security", "max-age=0", "max-age=0"),
+        ("X-Content-Type-Options", " NOSNIFF ", ""),
+        ("X-Content-Type-Options", "nosniff", "sniff, nosniff"),
+        ("X-Content-Type-Options", "nosniff", "nosniff"),
+    ] {
+        let names = [
+            name.to_string(),
+            name.to_ascii_lowercase(),
+            name.to_ascii_uppercase(),
+        ];
+        for effective_index in 0..names.len() {
+            let headers = names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    (
+                        name.clone(),
+                        if index == effective_index {
+                            kept
+                        } else {
+                            other
+                        }
+                        .to_string(),
+                    )
+                })
+                .collect();
+            for mut output in policy_outputs(&plugin, &headers).await {
+                assert_eq!(single_copy(&output, name), vec![kept], "{headers:?}");
+                assert_eq!(
+                    output.get(&name.to_ascii_lowercase()).map(String::as_str),
+                    Some(kept)
+                );
+                for version in [Version::HTTP_11, Version::HTTP_2, Version::HTTP_3] {
+                    let response =
+                        apply_response_headers(Response::builder().version(version), &output)
+                            .body(())
+                            .expect("normalized header reaches the response builder");
+                    let values: Vec<_> = response.headers().get_all(name).iter().collect();
+                    assert_eq!(values.len(), 1, "{version:?}: {headers:?}");
+                    assert_eq!(values[0].to_str().expect("ASCII backend value"), kept);
+                }
+                let once = output.clone();
+                plugin.apply_initial_response_header_policy(&mut output);
+                assert_eq!(output, once, "policy replay must be idempotent");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn duplicate_sts_selection_is_independent_of_map_insertion_order() {
+    let plugin =
+        SecurityHeaders::new(&json!({ "override_existing": false, "hsts": true })).expect("policy");
+    let copies = [
+        ("Strict-Transport-Security", "max-age=86400"),
+        ("strict-transport-security", "max-age=0"),
+        (
+            "STRICT-TRANSPORT-SECURITY",
+            "max-age=31536000; includeSubDomains",
+        ),
+    ];
+    for reverse in [false, true] {
+        let mut headers = HashMap::new();
+        for index in 0..copies.len() {
+            let (name, value) = copies[if reverse {
+                copies.len() - 1 - index
+            } else {
+                index
+            }];
+            headers.insert(name.to_string(), value.to_string());
+        }
+        for output in policy_outputs(&plugin, &headers).await {
+            assert_eq!(
+                single_copy(&output, "strict-transport-security"),
+                vec!["max-age=31536000; includeSubDomains"]
+            );
+        }
+    }
+}
+
+/// Issue #6900: ALLOWALL alone and an unknown value alone are ignored, but
+/// their combined X-Frame-Options set blocks framing. Do not weaken it to
+/// SAMEORIGIN. Repeated ALLOWALL and wholly unknown sets remain ineffective.
+#[tokio::test]
+async fn override_disabled_classifies_frame_options_across_case_variants() {
+    let plugin = SecurityHeaders::new(&json!({ "override_existing": false })).expect("policy");
+    for (first, second, effective) in [
+        ("ALLOWALL", "unknown", true),
+        ("allowall", "", true),
+        (
+            "ALLOWALL, ALLOWALL",
+            "ALLOW-FROM https://partner.example",
+            true,
+        ),
+        ("ALLOWALL", "allowall", false),
+        ("unknown", "", false),
+    ] {
+        for reverse in [false, true] {
+            let (first, second) = if reverse {
+                (second, first)
+            } else {
+                (first, second)
+            };
+            let headers = HashMap::from([
+                ("X-Frame-Options".to_string(), first.to_string()),
+                ("x-frame-options".to_string(), second.to_string()),
+            ]);
+            for output in policy_outputs(&plugin, &headers).await {
+                if effective {
+                    assert_eq!(
+                        output.get("X-Frame-Options").map(String::as_str),
+                        Some(first)
+                    );
+                    assert_eq!(
+                        output.get("x-frame-options").map(String::as_str),
+                        Some(second)
+                    );
+                } else {
+                    assert_eq!(single_copy(&output, "x-frame-options"), vec!["SAMEORIGIN"]);
+                }
+            }
+        }
+    }
+}
+
+/// Issue #6900: quoted extension text cannot introduce a real max-age or a
+/// duplicate one. Escaped quotes/backslashes must not change that boundary.
+#[tokio::test]
+async fn override_disabled_tokenizes_backend_hsts_quoted_extensions() {
+    let plugin = SecurityHeaders::new(&json!({
+        "override_existing": false,
+        "hsts": "max-age=600"
+    }))
+    .expect("policy");
+    for (value, effective) in [
+        (r#"max-age=31536000; ext="a; max-age=0""#, true),
+        (r#"ext="a; max-age=0"; max-age=31536000"#, true),
+        (r#"max-age=31536000; ext="a\"; max-age=0""#, true),
+        (r#"ext="a\\"; max-age=31536000"#, true),
+        (r#"max-age="31536000"; ext="; max-age=0; max-age=1""#, true),
+        (r#"ext="a; max-age=31536000;""#, false),
+        (r#"ext="a\"; max-age=31536000;""#, false),
+        (r#"max-age=1; ext="a; max-age=0"; max-age=2"#, false),
+        (r#"ext="a\\"; max-age=1; max-age=2"#, false),
+    ] {
+        let headers = HashMap::from([("Strict-Transport-Security".to_string(), value.to_string())]);
+        for output in policy_outputs(&plugin, &headers).await {
+            assert_eq!(
+                single_copy(&output, "strict-transport-security"),
+                vec![if effective { value } else { "max-age=600" }],
+                "{value:?}"
+            );
+        }
+    }
+}
+
+/// security_headers-CLAUDE-3: with `override_existing: false`, a backend copy
+/// of a built-in security header that a browser ignores ENTIRELY (empty, or
+/// syntactically ineffective for that header) used to satisfy the policy, so no
+/// protection was delivered. Such a copy now counts as absent and every case
+/// variant is replaced by the configured value.
+#[tokio::test]
+async fn override_disabled_replaces_backend_values_browsers_ignore() {
+    let plugin = SecurityHeaders::new(&json!({
+        "override_existing": false,
+        "hsts": "max-age=600",
+        "content_security_policy": "default-src 'self'",
+        "permissions_policy": "geolocation=()",
+        "set": { "X-Custom": "gateway" }
+    }))
+    .expect("policy");
+
+    for (name, ignored, configured) in [
+        (
+            "X-Frame-Options",
+            "ALLOW-FROM https://partner.example",
+            "SAMEORIGIN",
+        ),
+        ("X-Frame-Options", "ALLOWALL", "SAMEORIGIN"),
+        ("X-Frame-Options", "", "SAMEORIGIN"),
+        ("X-Content-Type-Options", "", "nosniff"),
+        ("X-Content-Type-Options", "sniff, nosniff", "nosniff"),
+        (
+            "Referrer-Policy",
+            "no-referer",
+            "strict-origin-when-cross-origin",
+        ),
+        ("Referrer-Policy", " , ", "strict-origin-when-cross-origin"),
+        (
+            "Strict-Transport-Security",
+            "includeSubDomains",
+            "max-age=600",
+        ),
+        (
+            "Strict-Transport-Security",
+            "max-age=1; max-age=2",
+            "max-age=600",
+        ),
+        ("Content-Security-Policy", " ", "default-src 'self'"),
+        ("Permissions-Policy", "", "geolocation=()"),
+    ] {
+        let mut request = ctx();
+        let mut headers = HashMap::from([
+            (name.to_string(), ignored.to_string()),
+            (name.to_ascii_lowercase(), ignored.to_string()),
+        ]);
+        plugin.after_proxy(&mut request, 200, &mut headers).await;
+        assert_eq!(
+            single_copy(&headers, name),
+            vec![configured],
+            "{name}: {ignored:?} must be replaced by exactly one configured copy"
+        );
+    }
+}
+
+/// PR6864-SOL-1: any backend value a browser acts on must survive
+/// `override_existing: false`, even when the strict admission checks would
+/// refuse it as configuration and even when it differs from the configured
+/// default. Comma-folded `DENY, DENY` / `DENY, SAMEORIGIN` still block framing
+/// (HTML X-Frame-Options processing), and `no-referrer,` /
+/// `no-referrer, future-policy` still suppress the Referer (the last
+/// recognized token wins); replacing them with the default `SAMEORIGIN` /
+/// `strict-origin-when-cross-origin` would weaken the backend's protection.
+#[tokio::test]
+async fn override_disabled_keeps_every_backend_value_browsers_honor() {
+    let plugin = SecurityHeaders::new(&json!({
+        "override_existing": false,
+        "hsts": "max-age=600",
+        "content_security_policy": "default-src 'self'",
+        "set": { "X-Custom": "gateway" }
+    }))
+    .expect("policy with default SAMEORIGIN frame options");
+
+    for (name, kept) in [
+        ("X-Frame-Options", "DENY, DENY"),
+        ("X-Frame-Options", "DENY, SAMEORIGIN"),
+        ("X-Frame-Options", "deny"),
+        ("X-Frame-Options", "DENY,"),
+        ("X-Frame-Options", "SAMEORIGIN"),
+        ("X-Content-Type-Options", " NOSNIFF "),
+        ("X-Content-Type-Options", "nosniff, nosniff"),
+        ("Referrer-Policy", "no-referrer,"),
+        ("Referrer-Policy", "no-referrer, future-policy"),
+        ("Referrer-Policy", "no-referrer, same-origin"),
+        ("Strict-Transport-Security", "max-age=60; includeSubDomains"),
+        ("Strict-Transport-Security", "max-age=60; preload; preload"),
+        ("Content-Security-Policy", "default-src 'none'"),
+        ("X-Custom", ""),
+    ] {
+        let mut request = ctx();
+        let mut headers = HashMap::from([(name.to_string(), kept.to_string())]);
+        plugin.after_proxy(&mut request, 200, &mut headers).await;
+        assert_eq!(
+            single_copy(&headers, name),
+            vec![kept],
+            "{name}: effective backend value {kept:?} must be preserved"
+        );
+    }
+
+    // One effective spelling keeps the combined field view untouched.
+    let mut request = ctx();
+    let mut headers = HashMap::from([
+        ("X-Frame-Options".to_string(), "DENY".to_string()),
+        ("x-frame-options".to_string(), String::new()),
+    ]);
+    plugin.after_proxy(&mut request, 200, &mut headers).await;
+    let mut copies = single_copy(&headers, "x-frame-options");
+    copies.sort_unstable();
+    assert_eq!(copies, vec!["", "DENY"]);
+}
+
+/// security_headers-CLAUDE-4: entry counts and value lengths are bounded at
+/// admission.
+#[test]
+fn set_remove_and_value_sizes_are_bounded() {
+    use ferrum_edge::plugins::security_headers::{
+        MAX_HEADER_VALUE_BYTES, MAX_REMOVE_ENTRIES, MAX_SET_ENTRIES,
+    };
+
+    let set_of = |count: usize| {
+        let mut set = serde_json::Map::new();
+        for index in 0..count {
+            set.insert(format!("x-policy-{index}"), json!("on"));
+        }
+        json!({ "set": serde_json::Value::Object(set) })
+    };
+    SecurityHeaders::new(&set_of(MAX_SET_ENTRIES)).expect("set at the cap is accepted");
+    let error = SecurityHeaders::new(&set_of(MAX_SET_ENTRIES + 1)).expect_err("set over the cap");
+    assert!(error.contains("`set` accepts at most"), "{error}");
+
+    let remove_of = |count: usize| {
+        let names: Vec<String> = (0..count).map(|index| format!("x-strip-{index}")).collect();
+        json!({ "remove": names })
+    };
+    SecurityHeaders::new(&remove_of(MAX_REMOVE_ENTRIES)).expect("remove at the cap is accepted");
+    let error =
+        SecurityHeaders::new(&remove_of(MAX_REMOVE_ENTRIES + 1)).expect_err("remove over the cap");
+    assert!(error.contains("`remove` accepts at most"), "{error}");
+
+    let at_cap = "a".repeat(MAX_HEADER_VALUE_BYTES);
+    let over_cap = "a".repeat(MAX_HEADER_VALUE_BYTES + 1);
+    for key in ["content_security_policy", "permissions_policy"] {
+        SecurityHeaders::new(&json!({ (key): at_cap.clone() }))
+            .unwrap_or_else(|error| panic!("{key} at the cap must be accepted: {error}"));
+        let error = SecurityHeaders::new(&json!({ (key): over_cap.clone() }))
+            .expect_err("value over the cap");
+        assert!(error.contains("at most"), "{key}: {error}");
+    }
+    SecurityHeaders::new(&set_config("X-Policy", &at_cap)).expect("set value at the cap");
+    let error = SecurityHeaders::new(&set_config("X-Policy", &over_cap)).expect_err("set over cap");
+    assert!(error.contains("`set` value must be at most"), "{error}");
+    let long_hsts = format!("max-age=1; ext={}", "a".repeat(MAX_HEADER_VALUE_BYTES));
+    let error = SecurityHeaders::new(&json!({ "hsts": long_hsts })).expect_err("hsts over cap");
+    assert!(error.contains("`hsts` value must be at most"), "{error}");
+}
+
+/// Linear construction keeps the documented precedence: a `set` entry
+/// overrides the built-in of the same name, the last case variant of a `set`
+/// name wins, and the precomputed policy names stay unique.
+#[test]
+fn set_overrides_and_case_variants_resolve_to_one_entry() {
+    let plugin = SecurityHeaders::new(&json!({
+        "frame_options": "DENY",
+        "set": { "X-FRAME-OPTIONS": "SAMEORIGIN", "X-A": "first", "x-a": "second" },
+        "remove": ["x-a", "server"]
+    }))
+    .expect("policy");
+    let mut headers = HashMap::new();
+    plugin.apply_initial_response_header_policy(&mut headers);
+
+    assert_eq!(single_copy(&headers, "x-frame-options"), vec!["SAMEORIGIN"]);
+    assert_eq!(single_copy(&headers, "x-a"), vec!["second"]);
+    let names = plugin.initial_response_header_policy_names();
+    let mut unique = names.to_vec();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        names.len(),
+        "policy names must be unique: {names:?}"
+    );
+    assert!(names.iter().any(|name| name == "x-a"));
+    assert!(names.iter().any(|name| name == "x-frame-options"));
 }

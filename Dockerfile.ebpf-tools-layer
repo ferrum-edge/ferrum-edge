@@ -12,8 +12,8 @@
 # tracks the base suite rather than an exact package revision for the same
 # reason the production stage does: a point-release pin would break without
 # bounding anything the digest does not already bound.
-ARG BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
-ARG TOOLS_BASE=debian:13-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+ARG BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2
+ARG TOOLS_BASE=debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 ARG IPROUTE2_VERSION=6.15.0-1
 
 FROM ${BASE_IMAGE} AS ferrum-runtime

@@ -350,7 +350,7 @@
 //! reusable live-identity set: an H1 target whose keep-alive/reuse is off is
 //! omitted from the published live set so resident idle H1 carriers are
 //! retired synchronously before reconciliation returns — otherwise a full idle
-//! set (defaults: physical cap 64 and idle cap 64) would keep every physical
+//! set (the physical cap, default 64, binds well before the idle ceiling) would keep every physical
 //! slot occupied while new traffic must dial fresh and could receive
 //! `BackendConnectionLimit` until idle expiry. h2c is unaffected — HTTP/2 has
 //! no keep-alive negotiation and stream multiplexing is the transport's
@@ -371,9 +371,9 @@
 /// open PHYSICAL connections the Unix backend manager holds per admitted
 /// ingress target, including dedicated WebSockets.
 ///
-/// Matches the pool's own `max_idle_per_host` default, so the bound and the
-/// idle ceiling agree: every admitted carrier can be pooled, and a target
-/// cannot accumulate more physical connections than the idle set could hold.
+/// At or below the pool's `max_idle_per_host` default, so every admitted
+/// carrier can be pooled and this bound, not the idle ceiling, is what limits
+/// a target's physical connections.
 /// The bound is enforced by default rather than opt-in — an unbounded local
 /// transport is exactly the regression issue #3731 asks to prevent — and `0`
 /// is the explicit operator opt-out.
@@ -568,6 +568,10 @@ mod imp {
         /// took this lease, captured at checkout so the check-in (which has no
         /// `Proxy`) applies the same decision the checkout did.
         keep_alive: bool,
+        /// The effective `pool_idle_timeout_seconds` for the dispatch that took
+        /// this lease, captured at checkout so the check-in (which has no
+        /// `Proxy`) can stamp it on the idle entry for the periodic sweep.
+        idle_timeout_seconds: u64,
         pub sender: UnixH1Sender,
     }
 
@@ -580,14 +584,12 @@ mod imp {
         /// Whether this lease may re-enter the idle set at all. `false` when
         /// the effective `pool_enable_http_keep_alive` is off.
         #[inline]
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn keep_alive(&self) -> bool {
             self.keep_alive
         }
 
         /// The publication generation this lease is bound to.
         #[inline]
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn generation(&self) -> u64 {
             self.generation
         }
@@ -633,6 +635,12 @@ mod imp {
         sender: UnixH1Sender,
         admitted: AdmittedUnixSocket,
         last_used_at: AtomicU64,
+        /// The effective idle timeout (per-proxy override, else global) of the
+        /// dispatch that pooled this entry. The periodic sweep has no `Proxy`,
+        /// so it reads this instead of the global value; otherwise a longer
+        /// per-proxy timeout (or `0` = never) would be cut to the global one
+        /// (issue #7182).
+        idle_timeout_seconds: u64,
     }
 
     struct SharedH2c {
@@ -643,6 +651,8 @@ mod imp {
         sender: MeshMtlsSender,
         admitted: AdmittedUnixSocket,
         last_used_at: AtomicU64,
+        /// See [`IdleH1::idle_timeout_seconds`].
+        idle_timeout_seconds: u64,
     }
 
     /// The parts of a pooled entry the shared slot maintenance needs, so the
@@ -653,6 +663,7 @@ mod imp {
         fn generation(&self) -> &AtomicU64;
         fn admitted(&self) -> &AdmittedUnixSocket;
         fn last_used_at(&self) -> u64;
+        fn idle_timeout_seconds(&self) -> u64;
         fn is_closed(&self) -> bool;
     }
 
@@ -668,6 +679,9 @@ mod imp {
         }
         fn last_used_at(&self) -> u64 {
             self.last_used_at.load(Ordering::Relaxed)
+        }
+        fn idle_timeout_seconds(&self) -> u64 {
+            self.idle_timeout_seconds
         }
         fn is_closed(&self) -> bool {
             self.sender.is_closed()
@@ -686,6 +700,9 @@ mod imp {
         }
         fn last_used_at(&self) -> u64 {
             self.last_used_at.load(Ordering::Relaxed)
+        }
+        fn idle_timeout_seconds(&self) -> u64 {
+            self.idle_timeout_seconds
         }
         fn is_closed(&self) -> bool {
             self.sender.is_closed()
@@ -772,23 +789,20 @@ mod imp {
 
     /// Amortized sweep of one map: drop closed, expired, and
     /// identity-changed carriers, then reclaim slots that can no longer be
-    /// reached. Returns how many carriers were evicted.
+    /// reached. Returns how many carriers were evicted. Expiry uses each
+    /// entry's own effective idle timeout, as checkout does.
     ///
     /// Empty slots are always reclaimed. Config liveness is held once in the
     /// live-set snapshot, not repeated in an unbounded per-key tombstone map;
     /// generation fencing makes a late insertion safe even after its old slot
     /// has been reclaimed.
-    fn prune_slots<T: PooledEntry>(
-        map: &DashMap<UnixPoolKey, KeySlot<T>>,
-        idle_timeout: u64,
-        now: u64,
-    ) -> u64 {
+    fn prune_slots<T: PooledEntry>(map: &DashMap<UnixPoolKey, KeySlot<T>>, now: u64) -> u64 {
         let mut evicted = 0u64;
         map.retain(|_key, slot| {
             let before = slot.entries.len();
             slot.entries.retain(|entry| {
                 !entry.is_closed()
-                    && !entry_idle_expired(entry.last_used_at(), idle_timeout, now)
+                    && !entry_idle_expired(entry.last_used_at(), entry.idle_timeout_seconds(), now)
                     && entry
                         .admitted()
                         .still_names_checked_object()
@@ -932,7 +946,6 @@ mod imp {
         }
 
         /// Slots currently held for one target. Diagnostics and tests only.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         fn current(&self, key: &UnixPoolKey) -> u64 {
             self.counters
                 .get(key)
@@ -943,7 +956,6 @@ mod imp {
         /// Targets with a resident lane. Tests/diagnostics: proves the map
         /// drains rather than retaining a zero-count lane per socket ever
         /// dialed.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         fn resident_lanes(&self) -> usize {
             self.counters.len()
         }
@@ -1058,7 +1070,6 @@ mod imp {
 
         /// Drivers currently tracked. Diagnostics/tests only; never on the
         /// request path.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         fn entries(&self) -> usize {
             self.lock().len()
         }
@@ -1477,7 +1488,6 @@ mod imp {
 
         /// Physical connections currently held for one target identity.
         /// Diagnostics and external tests only; never on the request path.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn open_connections_for_target(
             &self,
             proxy: &Proxy,
@@ -1492,7 +1502,6 @@ mod imp {
         /// Targets with a resident connection lane. Diagnostics and external
         /// tests: proves the bound's map drains instead of retaining a
         /// zero-count lane per socket the gateway has ever dialed.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn resident_connection_lanes(&self) -> usize {
             self.conn_bound.resident_lanes()
         }
@@ -1500,7 +1509,6 @@ mod imp {
         /// Resident H1 + h2c key slots. Diagnostics and external tests: proves
         /// config churn cannot retain one empty structured key per withdrawn
         /// logical identity while a shared application socket stays alive.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn resident_key_slots(&self) -> (usize, usize) {
             (self.h1_idle.len(), self.h2c_carriers.len())
         }
@@ -1508,7 +1516,6 @@ mod imp {
         /// Entries currently held by the driver tracker. Diagnostics and
         /// external tests: proves a drain leaves no registration sentinel and
         /// no orphaned handle behind.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn tracked_drivers(&self) -> usize {
             self.drivers.entries()
         }
@@ -1517,7 +1524,6 @@ mod imp {
         /// Diagnostics and external tests: the ordering regression test reads it
         /// from inside the inter-latch interval to prove the tracker's
         /// registration latch was closed strictly first.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn shutdown_latch_published(&self) -> bool {
             self.is_shutting_down()
         }
@@ -1570,7 +1576,6 @@ mod imp {
         /// The current publication generation. Exposed for diagnostics and for
         /// the external fence regression tests.
         #[inline]
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn publication_generation(&self) -> u64 {
             self.publication_generation.load(Ordering::Acquire)
         }
@@ -1713,7 +1718,6 @@ mod imp {
         /// shutdown-path tests use this to exercise the forced-cancellation
         /// branch deterministically instead of waiting out the production
         /// budget; production goes through [`Self::shutdown_drain`].
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub async fn shutdown_drain_with_budgets(
             &self,
             driver_budget: std::time::Duration,
@@ -2192,10 +2196,9 @@ mod imp {
                 return;
             }
 
-            let idle_timeout = self.pool_config.idle_timeout_seconds;
-            let evicted_h1 = prune_slots(&self.h1_idle, idle_timeout, now);
+            let evicted_h1 = prune_slots(&self.h1_idle, now);
             Self::note_pooled_removed(&self.idle_h1_gauge, evicted_h1);
-            let evicted_h2c = prune_slots(&self.h2c_carriers, idle_timeout, now);
+            let evicted_h2c = prune_slots(&self.h2c_carriers, now);
             Self::note_pooled_removed(&self.h2c_carrier_gauge, evicted_h2c);
             let evicted = evicted_h1.saturating_add(evicted_h2c);
             if evicted > 0 {
@@ -2326,6 +2329,7 @@ mod imp {
             // fences this lease out of the pool.
             let generation = self.publication_generation.load(Ordering::Acquire);
             let keep_alive = self.keep_alive_enabled(proxy);
+            let idle_timeout_seconds = self.idle_timeout_seconds(proxy);
             let admitted = self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
             let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::Http1);
 
@@ -2346,6 +2350,7 @@ mod imp {
                 timeout_ms,
                 generation,
                 keep_alive,
+                idle_timeout_seconds,
                 before_register,
             )
             .await
@@ -2370,6 +2375,7 @@ mod imp {
             let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
             let generation = self.publication_generation.load(Ordering::Acquire);
             let keep_alive = self.keep_alive_enabled(proxy);
+            let idle_timeout_seconds = self.idle_timeout_seconds(proxy);
             let admitted = self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
             let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::Http1);
             self.misses.fetch_add(1, Ordering::Relaxed);
@@ -2380,6 +2386,7 @@ mod imp {
                 timeout_ms,
                 generation,
                 keep_alive,
+                idle_timeout_seconds,
                 || std::future::ready(()),
             )
             .await
@@ -2394,6 +2401,7 @@ mod imp {
             timeout_ms: u64,
             generation: u64,
             keep_alive: bool,
+            idle_timeout_seconds: u64,
             before_register: F,
         ) -> Result<UnixH1Checkout, UnixBackendError>
         where
@@ -2459,6 +2467,7 @@ mod imp {
                 reused: false,
                 generation,
                 keep_alive,
+                idle_timeout_seconds,
                 sender,
             })
         }
@@ -2535,6 +2544,7 @@ mod imp {
                         reused: true,
                         generation,
                         keep_alive,
+                        idle_timeout_seconds: idle_timeout,
                         sender: entry.sender,
                     });
                     break;
@@ -2582,6 +2592,7 @@ mod imp {
                 reused: _,
                 generation,
                 keep_alive,
+                idle_timeout_seconds,
                 sender,
             } = checkout;
             // Keep-alive off: the carrier served its one exchange and is
@@ -2630,6 +2641,7 @@ mod imp {
                     sender,
                     admitted,
                     last_used_at: AtomicU64::new(unix_secs()),
+                    idle_timeout_seconds,
                 });
                 // The shard guard is released HERE, before the second fence
                 // read: the release/acquire pair on that shard is what orders a
@@ -2777,7 +2789,6 @@ mod imp {
         /// seam: an async hook awaited after the handshake and BEFORE the driver
         /// is registered, so the shutdown latch/registration race is reproducible
         /// on this wire protocol too (issue #3764).
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests reach it there.
         pub(crate) async fn checkout_h2c_with_registration_seam<F, Fut>(
             &self,
             proxy: &Proxy,
@@ -2912,6 +2923,7 @@ mod imp {
                     sender: sender.clone(),
                     admitted,
                     last_used_at: AtomicU64::new(unix_secs()),
+                    idle_timeout_seconds: self.idle_timeout_seconds(proxy),
                 });
                 // Shard guard released before the second fence read, as in
                 // `checkin_h1_fenced`.
@@ -2938,7 +2950,6 @@ mod imp {
         /// re-entering `checkout_h2c` (which would block on the creation lock
         /// its caller still holds). It re-admits the path exactly as a checkout
         /// does and never dials.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests reach it there.
         pub(crate) fn shared_h2c_selector_yields_carrier(
             &self,
             proxy: &Proxy,

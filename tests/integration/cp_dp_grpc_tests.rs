@@ -113,7 +113,7 @@ fn generate_near_expiry_jwt(node_id: &str, audience: Option<&str>) -> String {
     encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()).unwrap(),
     )
     .expect("near-expiry test JWT should mint")
 }
@@ -162,7 +162,6 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -1086,6 +1085,7 @@ async fn test_mesh_subscribe_receives_initial_mesh_slice() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
@@ -1181,6 +1181,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
@@ -1206,6 +1207,7 @@ async fn test_native_mesh_client_installs_mesh_slice_from_cp() {
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
         primary_retry_secs: 0,
         timings: MeshStreamTimings::production(),
     };
@@ -1543,7 +1545,7 @@ async fn test_cp_rejects_token_missing_required_claims() {
     let token_no_sub = encode(
         &Header::new(Algorithm::HS256),
         &minimal_claims,
-        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()).unwrap(),
     )
     .unwrap();
 
@@ -1874,6 +1876,7 @@ async fn test_mesh_subscribe_rejects_token_with_wrong_issuer() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     });
 
     let result = client.mesh_subscribe(request).await;
@@ -1915,7 +1918,7 @@ async fn test_cp_rejects_token_with_no_issuer_claim() {
     let token = encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()).unwrap(),
     )
     .unwrap();
 
@@ -2433,6 +2436,75 @@ async fn test_dp_rejects_snapshot_with_invalid_proxy_hosts() {
         recovered.is_ok(),
         "Client should reconnect and recover from a valid authoritative snapshot"
     );
+
+    client_handle.abort();
+}
+
+/// A CP snapshot carrying a keyauth key below the 16-character floor (a key
+/// stored before the floor existed) is refused by the DP, which keeps its last
+/// valid config (issue #6577). The upgrade guide therefore requires rotating
+/// short keys before upgrading CP/DP deployments.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_keeps_last_good_snapshot_after_short_keyauth_key() {
+    let cp_config = create_test_config(1);
+    let (addr, update_tx, _config_arc, _server_handle) =
+        start_test_cp_server_with_capacity(cp_config, 16).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            vec![cp_url],
+            test_secret(),
+            ps,
+            None,
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            None,
+            None,
+        )
+        .await;
+    });
+
+    let received = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(received.is_ok(), "Should receive initial config");
+
+    let mut short_key_config = create_test_config(2);
+    short_key_config.consumers.push(
+        serde_json::from_value(serde_json::json!({
+            "id": "legacy-consumer",
+            "username": "legacy-user",
+            "namespace": "ferrum",
+            "credentials": {"keyauth": [{"key": "short-key"}]}
+        }))
+        .expect("consumer fixture"),
+    );
+    assert!(
+        CpGrpcServer::broadcast_update(&update_tx, &short_key_config),
+        "the short-key snapshot must reach the DP"
+    );
+
+    // Give the DP ample time to process (and refuse) the snapshot.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let live = proxy_state.config.load();
+    assert_eq!(
+        live.proxies.len(),
+        1,
+        "DP must keep the last valid config after a short-key snapshot"
+    );
+    assert!(live.consumers.is_empty());
 
     client_handle.abort();
 }
@@ -3717,6 +3789,7 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -4765,6 +4838,7 @@ async fn test_cp_rejects_mesh_subscribe_with_mismatched_namespace() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     });
 
     let result = client.mesh_subscribe(request).await;
@@ -6338,6 +6412,7 @@ async fn request_native_admission(
                         ambient_udp_source_scoping: false,
                         remote_discovery: false,
                         node_waypoint_capture_scoping: false,
+                        sidecar_http_routes: false,
                     },
                 ))
                 .await
@@ -6417,6 +6492,7 @@ async fn open_mesh_subscribe_stream_with_token(
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     });
     request.metadata_mut().insert(
         "authorization",
@@ -7805,6 +7881,7 @@ mod configsync_identity_binding {
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
+        crate::diagnostic_test_interest::ensure_interest_floor();
         let _guard = tracing::subscriber::set_default(subscriber);
 
         // The matching identity is admitted and owns the cluster registry row.
@@ -7872,6 +7949,72 @@ mod configsync_identity_binding {
         assert!(registry.is_empty());
         assert_eq!(admission.active_streams(), 0);
         assert_eq!(tx.receiver_count(), 0);
+    }
+
+    /// Issue #7202: refusals that are not credential failures are audited
+    /// with their own closed class instead of a shared "request refused",
+    /// and the record never echoes the DP-supplied build identity.
+    #[tokio::test(flavor = "current_thread")]
+    async fn configsync_audits_build_and_real_ip_refusals_with_their_own_class() {
+        let server = CpGrpcServer::builder(
+            Arc::new(ArcSwap::from_pointee(create_test_config(1))),
+            TEST_JWT_SECRET.to_string(),
+        )
+        .build();
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        crate::diagnostic_test_interest::ensure_interest_floor();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut wrong_build = request("audit-class-dp", "audit-class-dp");
+        wrong_build.get_mut().config_sync_build = "foreign-build-identity-7202".to_string();
+        let status = match server.subscribe(wrong_build).await {
+            Ok(_) => panic!("a different build must be refused"),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+        let mut wrong_real_ip = request("audit-class-dp", "audit-class-dp");
+        wrong_real_ip.get_mut().real_ip_header = None;
+        let status = match server.subscribe(wrong_real_ip).await {
+            Ok(_) => panic!("a missing real IP header advertisement must be refused"),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+        let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let failures: Vec<&str> = captured
+            .lines()
+            .filter(|line| {
+                line.contains("audit.event=\"tenant_subscription\"")
+                    && line.contains("result=\"failure\"")
+            })
+            .collect();
+        assert!(
+            failures
+                .iter()
+                .any(|line| line.contains("reason=\"config_sync build identity mismatch\"")),
+            "build mismatch must be audited with its own class: {captured}"
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|line| line.contains("reason=\"real IP header mismatch\"")),
+            "real IP header mismatch must be audited with its own class: {captured}"
+        );
+        assert!(
+            !failures.iter().any(|line| line.contains("request refused")),
+            "no refusal may collapse into the generic class: {captured}"
+        );
+        assert!(
+            !captured.contains("foreign-build-identity-7202"),
+            "the audit must not echo the DP-supplied build identity: {captured}"
+        );
     }
 }
 
@@ -8069,6 +8212,7 @@ mod configsync_size_bounds {
             },
         );
         let logs = CapturedLogs::default();
+        crate::diagnostic_test_interest::ensure_interest_floor();
         tracing::subscriber::with_default(logs.subscriber(), || {
             CpGrpcServer::broadcast_namespace_update(
                 &broadcasts,
@@ -8128,6 +8272,7 @@ mod configsync_size_bounds {
             .build();
         let tx = server.broadcasts().sender_for("ferrum");
         let logs = CapturedLogs::default();
+        crate::diagnostic_test_interest::ensure_interest_floor();
         let _guard = tracing::subscriber::set_default(logs.subscriber());
         let status = server.subscribe(subscribe_request()).await.err().unwrap();
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
@@ -8213,10 +8358,11 @@ mod configsync_size_bounds {
     /// so a failed wait says what happened instead of timing out bare
     /// (issue #5730).
     ///
-    /// `connect_and_subscribe_with_startup_ready` runs exactly one subscription
-    /// and returns on ANY stream end, a refused snapshot included, so a
-    /// finished DP task is terminal and is reported at once rather than after
-    /// the rest of the budget. The report names the generation the DP serves,
+    /// The DP runs the production reconnect loop
+    /// (`start_dp_client_with_shutdown_and_startup_ready`), which never returns
+    /// on its own, so a finished DP task (a panic) is terminal and is reported
+    /// at once rather than after the rest of the budget. The report names the
+    /// generation the DP serves,
     /// the task outcome, the connection state, whether the CP still holds the
     /// subscription, and the DP's own ConfigSync log, which records every
     /// update it received and why a refused one ended the stream.
@@ -8320,20 +8466,22 @@ mod configsync_size_bounds {
         let dp_connection = connection.clone();
         // Capture the DP's own ConfigSync decisions so a failed wait can say
         // whether an update arrived, was refused, or ended the stream.
+        crate::diagnostic_test_interest::ensure_interest_floor();
         let logs = CapturedLogs::default();
         let dp_subscriber = logs.subscriber();
         let mut dp_task = tokio::spawn(
             async move {
-                dp_client::connect_and_subscribe_with_startup_ready(
-                    &format!("http://{cp_addr}"),
-                    &test_secret(),
-                    "size-bound-dp",
-                    &dp_state,
+                dp_client::start_dp_client_with_shutdown_and_startup_ready(
+                    vec![format!("http://{cp_addr}")],
+                    test_secret(),
+                    dp_state,
+                    None,
+                    None,
                     None,
                     Some(dp_ready),
-                    "ferrum",
-                    Some(&dp_connection),
-                    true,
+                    "ferrum".to_string(),
+                    0,
+                    Some(dp_connection),
                     None,
                 )
                 .await
@@ -8435,5 +8583,152 @@ mod configsync_size_bounds {
         proxy_task.abort();
         cp_task.abort();
         backend_task.abort();
+    }
+}
+
+/// Managed JWKS material in CP/DP mode (issue #7277). The record itself never
+/// travels on ConfigSync: the CP distributes the `jwks_auth` config, which
+/// carries only the `managed://jwks/<id>#jwks` reference, and the DP resolves
+/// it from its own managed TLS store. CP and DP share one store volume — the
+/// supported multi-node deployment — which this in-process test models with
+/// the single process store. A rotation written on the CP side reaches the
+/// running DP plugin on its re-read cadence without a config change, and a
+/// deleted record withdraws the DP's keys.
+mod managed_jwks_distribution {
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ferrum_edge::plugins::utils::jwks_cache::cached_store;
+    use ferrum_edge::plugins::utils::jwks_store::JwksTrustState;
+    use ferrum_edge::tls::managed::ManagedTlsRecord;
+
+    fn ec_jwks(kid: &str) -> String {
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("P-256 key");
+        let point = key_pair.public_key_raw();
+        serde_json::json!({"keys": [{
+            "kty": "EC",
+            "crv": "P-256",
+            "alg": "ES256",
+            "use": "sig",
+            "kid": kid,
+            "x": URL_SAFE_NO_PAD.encode(&point[1..33]),
+            "y": URL_SAFE_NO_PAD.encode(&point[33..]),
+        }]})
+        .to_string()
+    }
+
+    fn write_record(id: &str, document: String) {
+        ferrum_edge::tls::managed::global_store()
+            .expect("process managed store")
+            .upsert(
+                ManagedTlsRecord::new_jwks(id.to_string(), id.to_string(), None, document),
+                true,
+            )
+            .expect("write managed JWKS");
+    }
+
+    async fn wait_for(description: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !condition() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn trusted_kids(source: &str) -> Vec<String> {
+        let Some(store) = cached_store(source) else {
+            return Vec::new();
+        };
+        let mut kids: Vec<String> = store
+            .trusted_keys()
+            .map(|keys| keys.keys().cloned().collect())
+            .unwrap_or_default();
+        kids.sort();
+        kids
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dp_resolves_and_follows_a_managed_jwks_record_named_by_cp_config() {
+        let record_id = format!("cpdp-{}", uuid::Uuid::new_v4().simple());
+        let source = format!("managed://jwks/{record_id}#jwks");
+        write_record(&record_id, ec_jwks("cp-first"));
+
+        let mut cp_config = create_test_config(1);
+        cp_config.plugin_configs = vec![PluginConfig {
+            labels: Default::default(),
+            id: "managed-jwks-auth".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: "jwks_auth".to_string(),
+            config: serde_json::json!({
+                "jwks_refresh_interval_secs": 1,
+                "providers": [{
+                    "issuer": "https://cpdp.idp.example",
+                    "jwks_source": source,
+                }]
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let (addr, _update_tx, server_handle) = start_test_cp_server(cp_config).await;
+
+        let proxy_state = create_test_proxy_state();
+        let ps = proxy_state.clone();
+        let cp_url = format!("http://127.0.0.1:{}", addr.port());
+        let client_handle = tokio::spawn(async move {
+            dp_client::connect_and_subscribe(
+                &cp_url,
+                &test_secret(),
+                "managed-jwks-dp",
+                &ps,
+                None,
+                "ferrum",
+            )
+            .await
+        });
+
+        // The DP applies the distributed config verbatim and its jwks_auth
+        // reads the record from the node's managed store.
+        wait_for("the DP to read the managed record", || {
+            trusted_kids(&source) == vec!["cp-first".to_string()]
+        })
+        .await;
+        let applied = proxy_state.config.load();
+        assert_eq!(
+            applied.plugin_configs[0].config["providers"][0]["jwks_source"],
+            serde_json::json!(source),
+            "ConfigSync carries the reference, never the material"
+        );
+
+        // Rotation written through the CP's store (shared volume): the DP
+        // follows on its re-read cadence with no config change.
+        write_record(&record_id, ec_jwks("cp-second"));
+        wait_for("the DP to adopt the rotated key set", || {
+            trusted_kids(&source) == vec!["cp-second".to_string()]
+        })
+        .await;
+
+        // Deleting the record withdraws every key on the DP.
+        ferrum_edge::tls::managed::global_store()
+            .expect("process managed store")
+            .delete(&record_id)
+            .expect("delete record");
+        wait_for("the DP to withdraw the key set", || {
+            cached_store(&source)
+                .is_some_and(|store| store.health_snapshot().trust_state == JwksTrustState::Expired)
+        })
+        .await;
+        assert!(trusted_kids(&source).is_empty());
+
+        client_handle.abort();
+        server_handle.abort();
     }
 }

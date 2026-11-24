@@ -142,13 +142,46 @@ impl UdpNodeIdentity {
     /// this reader to detect staleness it cannot see.
     pub fn resolve(registry_dir: &Path) -> Option<Self> {
         let boot_id = current_boot_id()?;
-        if let Some(node_uid) =
-            resolve_ferrum_var("FERRUM_K8S_NODE_UID").filter(|value| !value.trim().is_empty())
-            && let Ok(identity) = Self::new(&node_uid, &boot_id)
-        {
-            return Some(identity);
+        Self::resolve_with_boot_id(
+            resolve_ferrum_var("FERRUM_K8S_NODE_UID").as_deref(),
+            registry_dir,
+            &boot_id,
+        )
+    }
+
+    /// The environment-free form of [`Self::resolve`].
+    ///
+    /// The explicit UID is parsed exactly as the privileged preflight and the
+    /// node-agent parse it (`parse_explicit_k8s_node_uid`): only an UNSET
+    /// value falls back to the published identity file. A value that is set
+    /// but empty or malformed resolves NO identity, so a typo fails closed on
+    /// every proof-requiring branch instead of silently switching this
+    /// process to a different identity source than the one configured.
+    pub fn resolve_with_boot_id(
+        explicit_node_uid: Option<&str>,
+        registry_dir: &Path,
+        boot_id: &str,
+    ) -> Option<Self> {
+        match parse_explicit_k8s_node_uid(explicit_node_uid) {
+            Ok(Some(node_uid)) => match Self::new(&node_uid, boot_id) {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    tracing::warn!(
+                        reason = %error,
+                        "Ambient UDP node identity unresolved: the boot id is invalid"
+                    );
+                    None
+                }
+            },
+            Ok(None) => Self::resolve_published(registry_dir, boot_id),
+            Err(error) => {
+                tracing::warn!(
+                    reason = %error,
+                    "Ambient UDP node identity unresolved: FERRUM_K8S_NODE_UID is set but invalid, so the published node identity is not consulted"
+                );
+                None
+            }
         }
-        Self::resolve_published(registry_dir, &boot_id)
     }
 
     /// The published-file half of `resolve`, taking this incarnation's boot id
@@ -1689,7 +1722,6 @@ fn write_node_attestation(
 /// idempotent retirement itself: a Helm rollback, re-applied historical
 /// manifest, or restored ConfigMap can recreate an earlier era's generation
 /// token, and a mutable monotonic counter cannot prove that did not happen.
-#[allow(dead_code)] // External integration-test seam is unused by the bin test target.
 pub fn node_cleanup_proof_is_current(
     registry_dir: &Path,
     target: UdpPlacement,

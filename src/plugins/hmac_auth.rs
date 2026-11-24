@@ -9,7 +9,8 @@
 //! ## Signing string
 //!
 //! Ferrum's `Authorization: hmac` scheme is not RFC 9421 HTTP Message
-//! Signatures. The signing base is versioned; its first field is the profile
+//! Signatures (that is the separate `rfc9421` profile described below). The
+//! Ferrum signing base is versioned; its first field is the profile
 //! version itself, so a signature produced for one profile can never verify
 //! under another.
 //!
@@ -19,10 +20,6 @@
 //!   ```text
 //!   ferrum-hmac-v2\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}\n{NONCE}
 //!   ```
-//!
-//! Version 1 (`ferrum-hmac-v1`) is the same base without the trailing
-//! `{NONCE}` field and without any single-use guarantee — see "Replay
-//! protection" below.
 //!
 //! `{PATH}` is the request path component only; `{QUERY}` is the raw query
 //! string as received (percent-encoded, without the leading `?`, empty when
@@ -41,6 +38,27 @@
 //! tampering with the body, the query string, the nonce, or the digest header
 //! invalidates the HMAC. `{DIGEST_HEADER_VALUE}` in the signing base is that
 //! field's literal value.
+//!
+//! When the policy configures `signed_headers`, each named header is appended
+//! to the Ferrum base (after `{NONCE}`) as
+//! one `\n{name}:{value}` line in configuration order, where `{value}` is the
+//! RFC 9421 §2.1 canonical value (every field line trimmed of surrounding
+//! whitespace, joined by `", "`). A configured header that is absent fails
+//! closed, so a backend-relevant header such as a tenant or idempotency key
+//! can no longer be altered without invalidating the signature.
+//!
+//! ## RFC 9421 profile
+//!
+//! `signing_profile: "rfc9421"` verifies (never signs) RFC 9421 HTTP Message
+//! Signatures over `Signature-Input` / `Signature` with `hmac-sha256` and the
+//! Consumer's existing `hmac_auth` secret, looked up by `keyid`. Exactly one
+//! signature is accepted. The covered components must include `@method`,
+//! `@authority`, `@path`, `@query`, `content-digest` (verified against the
+//! collected body like the Ferrum profiles), every `signed_headers` entry, and
+//! every `required_components` entry. `created` and `nonce` are required and
+//! `expires` is enforced when sent; the nonce is claimed against the same
+//! replay authority as v2, in its own replay domain. Unknown algorithms,
+//! components, component parameters, and signature parameters are refused.
 //!
 //! ## Replay protection
 //!
@@ -66,17 +84,6 @@
 //! that is an application/backend contract and is deliberately not conflated
 //! with gateway proof uniqueness.
 //!
-//! ### Legacy `ferrum-hmac-v1`
-//!
-//! Version 1 has no nonce and no replay store: a captured, fully valid signed
-//! request can be replayed verbatim any number of times until the `Date` window
-//! elapses. It is **not** selected by default and cannot be selected by
-//! accident — it requires both `signing_profile: "ferrum-hmac-v1"` and the
-//! explicit `allow_unsafe_replayable_v1: true` acknowledgement — and every
-//! acceptance under it increments the fixed-cardinality
-//! `legacy_unsafe_profile_accepted` counter. Do not use it on non-idempotent
-//! routes.
-//!
 //! ## Retention horizon
 //!
 //! A request is acceptable while its `Date` is within `now ± clock_skew`, so
@@ -96,6 +103,7 @@ use crate::fips::approved::{HmacSha256, HmacSha512, Sha256};
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, warn};
@@ -113,21 +121,92 @@ use super::utils::redis_rate_limiter::{
 use super::utils::replay_authority::{
     self, ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayScope, validate_scope_backend,
 };
+use super::utils::structured_fields::{
+    self, BareItem, InnerList, Item, MemberValue, serialize_inner_list,
+};
 use super::{RequestContext, strip_auth_scheme};
 use crate::config::types::Consumer;
 use crate::consumer_index::ConsumerIndex;
+use crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter;
 use crate::util::unknown_keys::reject_unknown_keys;
 
-const HMAC_REQUEST_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
-const HMAC_SIGNING_VERSION_V1: &str = "ferrum-hmac-v1";
+/// Default `max_body_bytes`: the pre-authentication body ceiling.
+pub const DEFAULT_HMAC_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+/// Largest admissible `max_body_bytes`. Only a request whose signature has
+/// already verified can make the gateway buffer, so this is an
+/// authenticated-memory ceiling rather than an anonymous one; it is still
+/// bounded so one typo cannot make a single signed upload consume the host.
+pub const MAX_HMAC_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
+/// Largest admissible `replay_max_entries` for a `process` replay lane.
+pub const MAX_HMAC_REPLAY_MAX_ENTRIES: usize = 10_000_000;
+/// Most `signed_headers` entries one policy may require.
+pub const MAX_HMAC_SIGNED_HEADERS: usize = 32;
+const MAX_HMAC_SIGNED_HEADER_NAME_BYTES: usize = 128;
 const HMAC_SIGNING_VERSION_V2: &str = "ferrum-hmac-v2";
+const HMAC_SIGNING_VERSION_RFC9421: &str = "rfc9421";
+
+/// The only RFC 9421 `alg` this plugin verifies.
+const RFC9421_ALGORITHM: &str = "hmac-sha256";
+/// Derived components the `rfc9421` profile can compute. `@scheme`,
+/// `@target-uri`, `@status`, and `@query-param` are refused.
+pub const RFC9421_SUPPORTED_DERIVED_COMPONENTS: &[&str] = &[
+    "@method",
+    "@authority",
+    "@path",
+    "@query",
+    "@request-target",
+];
+/// Components every accepted `rfc9421` signature must cover.
+pub const RFC9421_BASELINE_COMPONENTS: &[&str] =
+    &["@method", "@authority", "@path", "@query", "content-digest"];
+/// Bound on the `keyid` signature parameter (the Consumer identity).
+const RFC9421_MAX_KEYID_BYTES: usize = 512;
+/// Bound on the `nonce` signature parameter.
+const RFC9421_NONCE_MAX_CHARS: usize = 128;
+
+/// Request-metadata key naming the verified Consumer of a replayed signed
+/// request. Set only after the signature verified, so it never echoes an
+/// unauthenticated claim.
+pub const REPLAY_CONSUMER_METADATA_KEY: &str = "replay_rejected_consumer";
+
+/// Header names `signed_headers` may never name: the signature carriers
+/// themselves, and connection-specific fields that HTTP/2 and HTTP/3 do not
+/// carry (the authority is already bound by every profile).
+const FORBIDDEN_SIGNED_HEADERS: &[&str] = &[
+    "authorization",
+    "signature",
+    "signature-input",
+    "host",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Key for the padding MACs run in place of a missing credential entry. Its
+/// value never matters and it can never authenticate; only the work counts.
+const PADDING_HMAC_SECRET: [u8; 32] = [0u8; 32];
+
+/// Smallest serialized HMAC credential entry (`{"secret":"x"}`). Dividing the
+/// total credential-size cap by it bounds padding work even when
+/// `FERRUM_MAX_CREDENTIALS_PER_TYPE` is set absurdly high.
+const MIN_STORED_HMAC_CREDENTIAL_BYTES: usize = r#"{"secret":"x"}"#.len();
+const MAX_HMAC_VERIFICATION_ROUNDS: usize =
+    crate::config::types::MAX_CREDENTIALS_SIZE / MIN_STORED_HMAC_CREDENTIAL_BYTES;
+
+pub(crate) fn bounded_hmac_verification_rounds(configured_limit: usize) -> usize {
+    configured_limit.clamp(1, MAX_HMAC_VERIFICATION_ROUNDS)
+}
 
 /// Widest admissible `clock_skew_seconds`.
 ///
 /// Bounded because the fixed replay retention horizon must dominate the widest
 /// acceptance window any admissible configuration can open. A larger freshness
-/// window is also poor practice on its own: it is the interval during which a
-/// captured `ferrum-hmac-v1` request stays replayable.
+/// window is also poor practice on its own: it is the interval a signed request
+/// stays fresh.
 pub const MAX_HMAC_CLOCK_SKEW_SECONDS: u64 = 300;
 
 /// Fixed retention horizon for an admitted `ferrum-hmac-v2` nonce marker.
@@ -177,9 +256,11 @@ const HMAC_NONCE_MAX_CHARS: usize = 86;
 pub const HMAC_AUTH_CONFIG_KEYS: &[&str] = &[
     "clock_skew_seconds",
     "signing_profile",
-    "allow_unsafe_replayable_v1",
     "replay_scope",
     "replay_max_entries",
+    "signed_headers",
+    "required_components",
+    "max_body_bytes",
 ];
 
 /// Complete root allowlist: the plugin's own fields plus the shared Redis
@@ -193,18 +274,18 @@ fn root_config_keys() -> Vec<&'static str> {
 /// Versioned signing profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HmacSigningProfile {
-    /// Freshness-only. No nonce, no replay store, no single-use guarantee.
-    /// Selectable only with an explicit unsafe acknowledgement.
-    V1Unsafe,
     /// Mandatory client nonce, cryptographically bound and claimed exactly once.
     V2,
+    /// RFC 9421 HTTP Message Signatures (`hmac-sha256`), verification only.
+    /// Mandatory signed `nonce`, claimed exactly once like v2.
+    Rfc9421,
 }
 
 impl HmacSigningProfile {
     fn version(self) -> &'static str {
         match self {
-            Self::V1Unsafe => HMAC_SIGNING_VERSION_V1,
             Self::V2 => HMAC_SIGNING_VERSION_V2,
+            Self::Rfc9421 => HMAC_SIGNING_VERSION_RFC9421,
         }
     }
 }
@@ -216,13 +297,36 @@ const REPLAY_CAPACITY_BODY: &str = r#"{"error":"Signed-request replay protection
 const REPLAY_UNAVAILABLE_BODY: &str = r#"{"error":"Signed-request replay protection unavailable"}"#;
 const MISSING_NONCE_BODY: &str = r#"{"error":"Missing nonce in HMAC authorization"}"#;
 const MALFORMED_NONCE_BODY: &str = r#"{"error":"Malformed nonce in HMAC authorization"}"#;
-const UNEXPECTED_NONCE_BODY: &str =
-    r#"{"error":"HMAC authorization nonce is not accepted by this signing profile"}"#;
 const MISSING_DIGEST_BODY: &str = r#"{"error":"Missing required Digest header"}"#;
 const AMBIGUOUS_DIGEST_BODY: &str = r#"{"error":"Ambiguous Digest and Content-Digest headers"}"#;
 const MALFORMED_DIGEST_BODY: &str = r#"{"error":"Malformed digest header"}"#;
 const UNSUPPORTED_DIGEST_BODY: &str = r#"{"error":"Unsupported digest algorithm"}"#;
 const DIGEST_MISMATCH_BODY: &str = r#"{"error":"Digest header does not match request body"}"#;
+const STALE_DATE_BODY: &str = r#"{"error":"Missing or expired Date header"}"#;
+const MISSING_SIGNED_HEADER_BODY: &str = r#"{"error":"Missing required signed header"}"#;
+const MALFORMED_SIGNED_HEADER_BODY: &str = r#"{"error":"Malformed signed header value"}"#;
+const MALFORMED_SIGNATURE_BODY: &str =
+    r#"{"error":"Malformed Signature-Input or Signature header"}"#;
+const INCOMPLETE_SIGNATURE_BODY: &str =
+    r#"{"error":"Signature-Input and Signature must be sent together"}"#;
+const MULTIPLE_SIGNATURES_BODY: &str =
+    r#"{"error":"Exactly one HTTP message signature is accepted"}"#;
+const UNSUPPORTED_SIGNATURE_COMPONENT_BODY: &str =
+    r#"{"error":"Unsupported covered component in Signature-Input"}"#;
+const UNSUPPORTED_SIGNATURE_PARAMETER_BODY: &str =
+    r#"{"error":"Unsupported signature parameter in Signature-Input"}"#;
+const UNSUPPORTED_SIGNATURE_ALGORITHM_BODY: &str = r#"{"error":"Unsupported signature algorithm"}"#;
+const UNCOVERED_COMPONENT_BODY: &str =
+    r#"{"error":"Signature does not cover a required component"}"#;
+const MISSING_COVERED_COMPONENT_BODY: &str =
+    r#"{"error":"Covered component is missing from the request"}"#;
+const MISSING_KEYID_BODY: &str = r#"{"error":"Missing or malformed keyid in Signature-Input"}"#;
+const MISSING_CREATED_BODY: &str = r#"{"error":"Missing created in Signature-Input"}"#;
+const MISSING_SIGNATURE_NONCE_BODY: &str = r#"{"error":"Missing nonce in Signature-Input"}"#;
+const MALFORMED_SIGNATURE_NONCE_BODY: &str = r#"{"error":"Malformed nonce in Signature-Input"}"#;
+const STALE_SIGNATURE_BODY: &str = r#"{"error":"Signature is outside its validity window"}"#;
+const RFC9421_REQUIRES_CONTENT_DIGEST_BODY: &str =
+    r#"{"error":"rfc9421 requires a Content-Digest header"}"#;
 
 /// Which body-integrity field the client presented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,32 +521,362 @@ fn select_digest_header(ctx: &RequestContext) -> Result<(&str, DigestSyntax), &'
     }
 }
 
-fn parsed_digest_matches_body(
+/// Outcome of comparing a parsed digest field with the collected body hashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyDigestCheck {
+    /// Every presented algorithm matched its snapshot.
+    Matched,
+    /// A presented algorithm's snapshot exists and differs.
+    Mismatched,
+    /// A presented algorithm has no snapshot: the body was not hashed for it.
+    /// Never treated as the empty body.
+    NotCollected,
+}
+
+/// Compare every algorithm the client presented with its snapshot.
+///
+/// Snapshots are computed only for the algorithms the client presented
+/// ([`presented_body_digest_algorithms`]), so either may be absent; a presented
+/// member without its snapshot is [`BodyDigestCheck::NotCollected`], which every
+/// caller refuses.
+fn check_body_digest(
     parsed: &ParsedBodyDigest,
-    body_sha256: &[u8; 32],
-    body_sha512: &[u8; 64],
-) -> bool {
+    body_sha256: Option<&[u8; 32]>,
+    body_sha512: Option<&[u8; 64]>,
+) -> BodyDigestCheck {
     let mut matched = false;
     let mut ok = true;
     if let Some(expected) = parsed.sha256.as_ref() {
+        let Some(actual) = body_sha256 else {
+            return BodyDigestCheck::NotCollected;
+        };
         matched = true;
-        ok &= constant_time_eq(expected, body_sha256);
+        ok &= constant_time_eq(expected, actual);
     }
     if let Some(expected) = parsed.sha512.as_ref() {
+        let Some(actual) = body_sha512 else {
+            return BodyDigestCheck::NotCollected;
+        };
         matched = true;
-        ok &= constant_time_eq(expected, body_sha512);
+        ok &= constant_time_eq(expected, actual);
     }
-    matched && ok
+    if matched && ok {
+        BodyDigestCheck::Matched
+    } else {
+        BodyDigestCheck::Mismatched
+    }
 }
 
-fn collected_body_hashes(ctx: &RequestContext) -> Option<(&[u8; 32], &[u8; 64])> {
-    match (
-        ctx.request_body_sha256.as_ref(),
-        ctx.request_body_sha512.as_ref(),
-    ) {
-        (Some(sha256), Some(sha512)) => Some((sha256, sha512)),
-        _ => None,
+/// Which body hashes the request's digest field(s) ask for, as
+/// `(sha256, sha512)`.
+///
+/// The proxy hashes a buffered body only for the algorithms a client actually
+/// presented in `Content-Digest` / `Digest`, instead of always running both
+/// SHA-256 and SHA-512 over every signed upload. This is a cheap member-key
+/// scan, not the strict parser: a field it cannot classify asks for both, and
+/// [`check_body_digest`] still refuses a presented member whose snapshot is
+/// missing, so a mis-scan can only cost a hash, never accept a body.
+pub fn presented_body_digest_algorithms(ctx: &RequestContext) -> (bool, bool) {
+    let mut sha256 = false;
+    let mut sha512 = false;
+    for name in ["content-digest", "digest"] {
+        for line in ctx.header_field_lines(name) {
+            for member in line.split(|byte| *byte == b',') {
+                let key = member
+                    .split(|byte| *byte == b'=')
+                    .next()
+                    .unwrap_or_default()
+                    .trim_ascii();
+                if key.eq_ignore_ascii_case(b"sha-256") {
+                    sha256 = true;
+                } else if key.eq_ignore_ascii_case(b"sha-512") {
+                    sha512 = true;
+                }
+            }
+        }
     }
+    if sha256 || sha512 {
+        (sha256, sha512)
+    } else {
+        (true, true)
+    }
+}
+
+/// RFC 9421 §2.1 canonical value of a request header: each field line trimmed
+/// of leading and trailing SP/HTAB, joined by `", "`. `Ok(None)` when absent.
+///
+/// A field line that is not visible ASCII is refused rather than skipped, so a
+/// valid line beside an unrepresentable sibling cannot verify as though the
+/// sibling never existed.
+fn canonical_field_value(ctx: &RequestContext, name: &str) -> Result<Option<String>, &'static str> {
+    let mut out: Option<String> = None;
+    for line in ctx.header_field_lines(name) {
+        if !line
+            .iter()
+            .all(|byte| (0x20..0x7f).contains(byte) || *byte == b'\t')
+        {
+            return Err(MALFORMED_SIGNED_HEADER_BODY);
+        }
+        let text = std::str::from_utf8(line).map_err(|_| MALFORMED_SIGNED_HEADER_BODY)?;
+        let text = text.trim_matches(&[' ', '\t'][..]);
+        match out.as_mut() {
+            Some(existing) => {
+                existing.push_str(", ");
+                existing.push_str(text);
+            }
+            None => out = Some(text.to_string()),
+        }
+    }
+    Ok(out)
+}
+
+/// Lowercase RFC 9110 field-name token.
+fn is_lowercase_field_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_HMAC_SIGNED_HEADER_NAME_BYTES
+        && name
+            .bytes()
+            .all(|byte| is_auth_param_name_char(byte) && !byte.is_ascii_uppercase())
+}
+
+/// Whether an RFC 9421 component identifier is one this profile computes.
+fn rfc9421_component_is_supported(name: &str) -> bool {
+    if name.starts_with('@') {
+        RFC9421_SUPPORTED_DERIVED_COMPONENTS.contains(&name)
+    } else {
+        is_lowercase_field_name(name) && !matches!(name, "signature" | "signature-input")
+    }
+}
+
+/// RFC 9421 §2 component value for `name`, derived from the request.
+fn rfc9421_component_value(ctx: &RequestContext, name: &str) -> Result<String, &'static str> {
+    match name {
+        // §2.2.1: the method of the signed request message. A frontend that
+        // rewrote the policy method (WebSocket Extended CONNECT → GET)
+        // retained the wire method for exactly this derivation.
+        "@method" => Ok(ctx
+            .hmac_wire_method
+            .clone()
+            .unwrap_or_else(|| ctx.method.clone())),
+        "@authority" => ctx
+            .request_authority
+            .clone()
+            .ok_or(MISSING_COVERED_COMPONENT_BODY),
+        "@path" => Ok(rfc9421_path(ctx).to_string()),
+        // §2.2.7: an absent query is the lone `?`.
+        "@query" => {
+            let query = ctx.raw_query_string().unwrap_or_default();
+            let mut value = String::with_capacity(query.len() + 1);
+            value.push('?');
+            value.push_str(query);
+            Ok(value)
+        }
+        // §2.2.5: the request-target as sent. The frontend retains it when the
+        // path and query cannot reproduce it (absolute-form, authority-form,
+        // empty query).
+        "@request-target" if ctx.hmac_wire_request_target.is_some() => Ok(ctx
+            .hmac_wire_request_target
+            .as_ref()
+            .map(|target| target.as_str().to_string())
+            .unwrap_or_default()),
+        "@request-target" => {
+            let path = rfc9421_path(ctx);
+            let query = ctx.raw_query_string();
+            let mut value =
+                String::with_capacity(path.len() + query.map_or(0, |query| query.len() + 1));
+            value.push_str(path);
+            if let Some(query) = query {
+                value.push('?');
+                value.push_str(query);
+            }
+            Ok(value)
+        }
+        _ if name.starts_with('@') => Err(UNSUPPORTED_SIGNATURE_COMPONENT_BODY),
+        header => canonical_field_value(ctx, header)?.ok_or(MISSING_COVERED_COMPONENT_BODY),
+    }
+}
+
+/// The request-target a frontend must retain for RFC 9421 `@request-target`
+/// because the path and query alone cannot reproduce it: an HTTP/1.x
+/// absolute-form target (`GET https://host/p?q HTTP/1.1`), an authority-form
+/// CONNECT target (`host:port`, including CONNECT without `:path` on H2/H3), or a
+/// present-but-empty query (`/p?`), which the query accessor collapses to
+/// absence. `None` for every ordinary origin-form request, so the common path
+/// allocates nothing. An HTTP/2 or HTTP/3 request with `:path` uses that target.
+pub fn unreconstructible_request_target(version: http::Version, uri: &http::Uri) -> Option<String> {
+    let http1 = matches!(
+        version,
+        http::Version::HTTP_09 | http::Version::HTTP_10 | http::Version::HTTP_11
+    );
+    if http1 && uri.scheme().is_some() {
+        return Some(uri.to_string());
+    }
+    if uri.path_and_query().is_none() {
+        return uri
+            .authority()
+            .map(|authority| authority.as_str().to_owned());
+    }
+    if uri.query() == Some("") {
+        return uri
+            .path_and_query()
+            .map(|target| target.as_str().to_string());
+    }
+    None
+}
+
+/// §2.2.6: the absolute path as sent, `/` when empty.
+fn rfc9421_path(ctx: &RequestContext) -> &str {
+    let path = hmac_wire_path(ctx);
+    if path.is_empty() { "/" } else { path }
+}
+
+/// Parsed RFC 9421 signature with its derived signature base. Parameters are
+/// recorded as sent; [`HmacAuth::extract_rfc9421`] applies the policy.
+struct Rfc9421Signature {
+    keyid: Option<String>,
+    nonce: Option<String>,
+    created: Option<i64>,
+    expires: Option<i64>,
+    alg: Option<String>,
+    signature: Vec<u8>,
+    covered: Vec<String>,
+    base: String,
+}
+
+fn lookup_signature_field<'a>(
+    ctx: &'a RequestContext,
+    name: &'static str,
+) -> Result<Option<Cow<'a, str>>, &'static str> {
+    match lookup_configured_header(ctx, name, None) {
+        ConfiguredHeaderLookup::Absent => Ok(None),
+        ConfiguredHeaderLookup::PresentNonMaterialized => Err(MALFORMED_SIGNATURE_BODY),
+        ConfiguredHeaderLookup::Value(value) => Ok(Some(value)),
+    }
+}
+
+/// Parse `Signature-Input` / `Signature` (RFC 8941 dictionaries) and derive
+/// the RFC 9421 §2.5 signature base. `Ok(None)` when neither field is present.
+///
+/// Exactly one signature label is accepted, with the same label in both
+/// fields. Every covered component must be a supported derived component or a
+/// lowercase header name without component parameters, and appear once.
+/// Signature parameters are limited to `created`, `expires`, `nonce`, `keyid`,
+/// `alg`, and `tag`; anything else is refused rather than ignored. The
+/// `@signature-params` line is the canonical RFC 8941 serialization of the
+/// parsed inner list and its parameters.
+fn parse_rfc9421_signature(ctx: &RequestContext) -> Result<Option<Rfc9421Signature>, &'static str> {
+    let input = lookup_signature_field(ctx, "signature-input")?;
+    let signature = lookup_signature_field(ctx, "signature")?;
+    let (input, signature) = match (input, signature) {
+        (None, None) => return Ok(None),
+        (Some(input), Some(signature)) => (input, signature),
+        _ => return Err(INCOMPLETE_SIGNATURE_BODY),
+    };
+    let input_dictionary =
+        structured_fields::parse_dictionary(&input).map_err(|_| MALFORMED_SIGNATURE_BODY)?;
+    let signature_dictionary =
+        structured_fields::parse_dictionary(&signature).map_err(|_| MALFORMED_SIGNATURE_BODY)?;
+    let ([(label, input_member)], [(signature_label, signature_member)]) =
+        (input_dictionary.as_slice(), signature_dictionary.as_slice())
+    else {
+        return Err(MULTIPLE_SIGNATURES_BODY);
+    };
+    if label != signature_label {
+        return Err(MALFORMED_SIGNATURE_BODY);
+    }
+    let MemberValue::InnerList(list) = input_member else {
+        return Err(MALFORMED_SIGNATURE_BODY);
+    };
+    let MemberValue::Item(Item {
+        bare: BareItem::ByteSequence(signature_bytes),
+        params: signature_params,
+    }) = signature_member
+    else {
+        return Err(MALFORMED_SIGNATURE_BODY);
+    };
+    if !signature_params.is_empty() {
+        return Err(MALFORMED_SIGNATURE_BODY);
+    }
+
+    let covered = rfc9421_covered_components(list)?;
+    let mut keyid = None;
+    let mut nonce = None;
+    let mut created = None;
+    let mut expires = None;
+    let mut alg = None;
+    for (key, value) in &list.params {
+        match (key.as_str(), value) {
+            ("created", BareItem::Integer(value)) => created = Some(*value),
+            ("expires", BareItem::Integer(value)) => expires = Some(*value),
+            ("nonce", BareItem::String(value)) => nonce = Some(value.clone()),
+            ("keyid", BareItem::String(value)) => keyid = Some(value.clone()),
+            ("alg", BareItem::String(value)) => alg = Some(value.clone()),
+            ("tag", BareItem::String(_)) => {}
+            ("created" | "expires" | "nonce" | "keyid" | "alg" | "tag", _) => {
+                return Err(MALFORMED_SIGNATURE_BODY);
+            }
+            _ => return Err(UNSUPPORTED_SIGNATURE_PARAMETER_BODY),
+        }
+    }
+
+    let mut base = String::new();
+    for name in &covered {
+        let value = rfc9421_component_value(ctx, name)?;
+        base.push('"');
+        base.push_str(name);
+        base.push_str("\": ");
+        base.push_str(&value);
+        base.push('\n');
+    }
+    base.push_str("\"@signature-params\": ");
+    serialize_inner_list(list, &mut base);
+
+    Ok(Some(Rfc9421Signature {
+        keyid,
+        nonce,
+        created,
+        expires,
+        alg,
+        signature: signature_bytes.clone(),
+        covered,
+        base,
+    }))
+}
+
+fn rfc9421_covered_components(list: &InnerList) -> Result<Vec<String>, &'static str> {
+    let mut covered: Vec<String> = Vec::with_capacity(list.items.len());
+    for item in &list.items {
+        let BareItem::String(name) = &item.bare else {
+            return Err(MALFORMED_SIGNATURE_BODY);
+        };
+        if !item.params.is_empty() || !rfc9421_component_is_supported(name) {
+            return Err(UNSUPPORTED_SIGNATURE_COMPONENT_BODY);
+        }
+        if covered.iter().any(|existing| existing == name) {
+            return Err(MALFORMED_SIGNATURE_BODY);
+        }
+        covered.push(name.clone());
+    }
+    Ok(covered)
+}
+
+/// Whether `nonce` is an admissible RFC 9421 `nonce` parameter: base64,
+/// base64url, or hex, held to the same ≥128-bit floors as the v2 wire nonce
+/// (padding does not count toward the base64 floor), and bounded.
+fn rfc9421_nonce_is_valid(nonce: &str) -> bool {
+    let bytes = nonce.as_bytes();
+    if bytes.len() > RFC9421_NONCE_MAX_CHARS {
+        return false;
+    }
+    if !bytes.iter().all(|&byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'+' | b'/' | b'=')
+    }) {
+        return false;
+    }
+    if bytes.iter().all(u8::is_ascii_hexdigit) {
+        return bytes.len() >= HMAC_NONCE_MIN_HEX_CHARS;
+    }
+    bytes.iter().filter(|&&byte| byte != b'=').count() >= HMAC_NONCE_MIN_BASE64URL_CHARS
 }
 
 #[derive(Clone)]
@@ -481,7 +915,7 @@ struct ParsedHmacAuthorization {
     username: String,
     algorithm: String,
     signature: String,
-    nonce: Option<String>,
+    nonce: String,
 }
 
 fn is_auth_param_name_char(byte: u8) -> bool {
@@ -583,18 +1017,9 @@ fn parse_hmac_auth_segment(
     Ok(())
 }
 
-/// Parse the `Authorization: hmac …` parameters.
-///
-/// `profile` decides the nonce contract, and both directions are enforced: v2
-/// requires a syntactically valid nonce, and v1 **rejects** one outright. A
-/// client that sends a nonce believes its request is single-use; silently
-/// ignoring it under v1 would leave that belief unfalsified while the request
-/// stayed replayable, and the nonce is not part of the v1 signing base so it
-/// would also be attacker-mutable.
-fn parse_hmac_authorization(
-    params: &str,
-    profile: HmacSigningProfile,
-) -> Result<ParsedHmacAuthorization, &'static str> {
+/// Parse the `Authorization: hmac …` parameters. A syntactically valid nonce
+/// is mandatory: every Ferrum signed request is single-use.
+fn parse_hmac_authorization(params: &str) -> Result<ParsedHmacAuthorization, &'static str> {
     let mut start = 0usize;
     let mut quoted = false;
     let mut escaped = false;
@@ -647,21 +1072,10 @@ fn parse_hmac_authorization(
         .filter(|value| !value.is_empty())
         .ok_or(r#"{"error":"Missing signature in HMAC authorization"}"#)?;
 
-    let nonce = match profile {
-        HmacSigningProfile::V2 => {
-            let nonce = nonce.ok_or(MISSING_NONCE_BODY)?;
-            if !nonce_wire_form_is_valid(&nonce) {
-                return Err(MALFORMED_NONCE_BODY);
-            }
-            Some(nonce)
-        }
-        HmacSigningProfile::V1Unsafe => {
-            if nonce.is_some() {
-                return Err(UNEXPECTED_NONCE_BODY);
-            }
-            None
-        }
-    };
+    let nonce = nonce.ok_or(MISSING_NONCE_BODY)?;
+    if !nonce_wire_form_is_valid(&nonce) {
+        return Err(MALFORMED_NONCE_BODY);
+    }
 
     Ok(ParsedHmacAuthorization {
         username,
@@ -675,13 +1089,13 @@ fn parse_hmac_authorization(
 /// preverified authorization.
 ///
 /// A request can be screened by several `hmac_auth` instances at once — sibling
-/// proxy/global policies, a legacy `ferrum-hmac-v1` instance beside a
-/// `ferrum-hmac-v2` one, or two v2 policies with different replay domains. A
+/// proxy/global policies, an `rfc9421` instance beside a `ferrum-hmac-v2`
+/// one, or two v2 policies with different replay domains. A
 /// staged record therefore may not be a request-global slot: it carries a
 /// Consumer snapshot that one *specific* policy authenticated under one
 /// *specific* signing profile and replay domain. Handing it to another instance
-/// lets that instance skip its own verification and, worse, take a decision path
-/// (v1's "no claim at all") for a proof that a different profile verified.
+/// lets that instance skip its own verification and, worse, claim a proof that a
+/// different profile verified in the wrong replay domain.
 ///
 /// Identity is per **constructed instance** rather than per config id: the
 /// plugin object that stages and the plugin object that consumes are the same
@@ -709,7 +1123,7 @@ impl HmacPrebufferOwner {
         namespace: &str,
         policy_config_id: &str,
         profile: HmacSigningProfile,
-        replay_domain: Option<&ReplayDomain>,
+        replay_domain: &ReplayDomain,
     ) -> Self {
         let serial = HMAC_INSTANCE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut hasher =
@@ -718,10 +1132,7 @@ impl HmacPrebufferOwner {
         hasher.text("owner.namespace", namespace);
         hasher.text("owner.config_id", policy_config_id);
         hasher.text("owner.profile", profile.version());
-        match replay_domain {
-            Some(domain) => hasher.nested("owner.replay_domain", &domain.digest()),
-            None => hasher.count("owner.replay_domain", 0),
-        }
+        hasher.nested("owner.replay_domain", &replay_domain.digest());
         Self(hasher.digest())
     }
 }
@@ -745,21 +1156,28 @@ struct CachedHmacAuthorization {
     path: String,
     query: String,
     digest_header: String,
-    /// `ferrum-hmac-v2` client nonce. `None` under the legacy v1 profile.
+    /// Client nonce (`ferrum-hmac-v2` or `rfc9421`).
     ///
     /// Not re-validated by `cached_request_binding_matches`: the nonce is an
     /// `Authorization` parameter, so the retained SHA-256 fingerprint of that
     /// header already binds it byte-for-byte.
-    nonce: Option<String>,
+    nonce: String,
+    /// Canonical `signed_headers` values the preverified signature covered.
+    signed_header_values: Vec<String>,
+    /// `rfc9421` only: SHA-256 of the signature base the preverified
+    /// signature covered, re-derived and compared before consumption.
+    rfc9421_base_digest: Option<[u8; 32]>,
+    created: Option<i64>,
+    expires: Option<i64>,
     preverified_consumer: Arc<Consumer>,
 }
 
 /// Owner-partitioned staging set for one request.
 type StagedHmacRecords = Vec<(HmacPrebufferOwner, CachedHmacAuthorization)>;
 
-/// Completion of the pre-buffered path: absent, verified consumer + v2 nonce, or
-/// a fixed JSON authentication error.
-type PrebufferedHmacAuthCompletion = Option<Result<(Arc<Consumer>, Option<String>), String>>;
+/// Completion of the pre-buffered path: absent, verified consumer + nonce, or a
+/// fixed JSON authentication error.
+type PrebufferedHmacAuthCompletion = Option<Result<(Arc<Consumer>, String), String>>;
 
 /// Request-scoped bridge between HMAC's pre-body signature check and its
 /// post-body digest check, **partitioned by owning plugin instance**.
@@ -774,9 +1192,7 @@ type PrebufferedHmacAuthCompletion = Option<Result<(Arc<Consumer>, Option<String
 ///
 /// The partition is the security property. A single request-global slot let the
 /// first instance to preverify hand its record to whichever instance consumed
-/// first: an unsafe `ferrum-hmac-v1` policy could consume a `ferrum-hmac-v2`
-/// instance's verified record and then take v1's "no single-use claim" path, and
-/// two sibling v2 policies could cross-consume and claim in the wrong replay
+/// first: two sibling policies could cross-consume and claim in the wrong replay
 /// domain. Every record here is readable and removable **only** by the exact
 /// instance/policy/profile/replay-domain that staged it; one owner can neither
 /// observe nor erase another's.
@@ -837,7 +1253,10 @@ impl HmacPrebufferState {
     /// Remove and return **this owner's** record, leaving every other owner's
     /// record untouched.
     fn take(&mut self, owner: HmacPrebufferOwner) -> Option<CachedHmacAuthorization> {
-        let mut staged = self.lock();
+        let staged = self
+            .staged
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let index = staged.iter().position(|(existing, _)| *existing == owner)?;
         Some(staged.remove(index).1)
     }
@@ -846,15 +1265,48 @@ impl HmacPrebufferState {
 pub struct HmacAuth {
     clock_skew_seconds: u64,
     profile: HmacSigningProfile,
-    /// Stable protection-domain identity for this policy's v2 nonces.
-    /// Precomputed at construction; `None` under the legacy v1 profile.
-    replay_domain: Option<ReplayDomain>,
-    /// Single-use authority v2 nonces are claimed against. Owned by the shared
+    /// Stable protection-domain identity for this policy's nonces.
+    /// Precomputed at construction.
+    replay_domain: ReplayDomain,
+    /// Single-use authority nonces are claimed against. Owned by the shared
     /// registry, so an equivalent reload inherits live markers.
-    replay_authority: Option<Arc<ReplayAuthority>>,
+    replay_authority: Arc<ReplayAuthority>,
     /// Ownership token for this instance's request-scoped prebuffer records.
     /// Precomputed at construction, so no request path hashes configuration.
     prebuffer_owner: HmacPrebufferOwner,
+    /// MAC rounds every signature check runs, whatever the username: the
+    /// configured per-type credential limit, so an unknown user, a user with
+    /// one secret, and a user mid-rotation all cost the same.
+    verification_rounds: usize,
+    /// Lowercase header names every signature must cover, in config order.
+    signed_headers: Vec<String>,
+    /// `rfc9421` only: every component a signature must cover (the baseline,
+    /// `required_components`, and `signed_headers`). Empty otherwise.
+    rfc9421_required_components: Vec<String>,
+    /// Pre-authentication body ceiling (`max_body_bytes`).
+    max_body_bytes: usize,
+    /// Bounds the replay-attribution warning so a replay flood cannot flood
+    /// logs; per-request attribution is the request metadata.
+    replay_warn: AtomicLogRateLimiter,
+}
+
+/// A terminal single-use claim refusal.
+struct ClaimRefusal {
+    status: u16,
+    body: String,
+    /// The verified request was a replay (as opposed to a capacity or
+    /// availability refusal).
+    replay: bool,
+}
+
+impl ClaimRefusal {
+    fn new(status: u16, body: &str, replay: bool) -> Self {
+        Self {
+            status,
+            body: body.to_string(),
+            replay,
+        }
+    }
 }
 
 impl HmacAuth {
@@ -868,7 +1320,6 @@ impl HmacAuth {
     /// publishes a process readiness dependency or arms a Redis recovery task.
     /// Live readiness is published from
     /// [`crate::plugins::Plugin::commit_background_tasks`].
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn new(config: &Value) -> Result<Self, String> {
         Self::build(config, None, None)
     }
@@ -907,12 +1358,6 @@ impl HmacAuth {
                 config = config.to_string()
             )
         })?;
-        if config_obj.get("require_digest").is_some() {
-            return Err(
-                "hmac_auth: `require_digest` was removed; request digests are always required"
-                    .to_string(),
-            );
-        }
         // Closed root key set: a misspelled `replay_scope` or `signing_profile`
         // must fail admission rather than silently leave a policy on a weaker
         // posture than the operator wrote.
@@ -956,12 +1401,6 @@ impl HmacAuth {
             ));
         }
 
-        let allow_unsafe_v1 = match config_obj.get("allow_unsafe_replayable_v1") {
-            None => false,
-            Some(value) => value.as_bool().ok_or_else(|| {
-                "hmac_auth: `allow_unsafe_replayable_v1` must be a boolean".to_string()
-            })?,
-        };
         let profile = match config_obj.get("signing_profile") {
             None => HmacSigningProfile::V2,
             Some(value) => {
@@ -972,35 +1411,36 @@ impl HmacAuth {
                 // and the published enum lists only the canonical spellings.
                 match value {
                     HMAC_SIGNING_VERSION_V2 => HmacSigningProfile::V2,
-                    HMAC_SIGNING_VERSION_V1 => HmacSigningProfile::V1Unsafe,
+                    HMAC_SIGNING_VERSION_RFC9421 => HmacSigningProfile::Rfc9421,
                     _ => {
                         return Err(format!(
                             "hmac_auth: `signing_profile` must be exactly \
-                             `{HMAC_SIGNING_VERSION_V2}` or `{HMAC_SIGNING_VERSION_V1}`"
+                             `{HMAC_SIGNING_VERSION_V2}` or `{HMAC_SIGNING_VERSION_RFC9421}`"
                         ));
                     }
                 }
             }
         };
-        // v1 provides no single-use guarantee at all. Requiring a second,
-        // separately named acknowledgement means it can never be reached by a
-        // copied config snippet or a one-word typo.
-        if profile == HmacSigningProfile::V1Unsafe && !allow_unsafe_v1 {
-            return Err(format!(
-                "hmac_auth: `signing_profile` = `{HMAC_SIGNING_VERSION_V1}` has no replay \
-                 protection — a captured valid request can be replayed verbatim for the whole \
-                 `clock_skew_seconds` window. It is unsuitable for non-idempotent routes and \
-                 requires an explicit `allow_unsafe_replayable_v1`: true acknowledgement. Prefer \
-                 `{HMAC_SIGNING_VERSION_V2}`, which binds a mandatory client nonce and makes each \
-                 signed request single-use."
-            ));
-        }
-        if profile == HmacSigningProfile::V2 && allow_unsafe_v1 {
-            return Err(format!(
-                "hmac_auth: `allow_unsafe_replayable_v1` is only meaningful with \
-                 `signing_profile` = `{HMAC_SIGNING_VERSION_V1}`"
-            ));
-        }
+        let signed_headers = parse_signed_headers(config_obj.get("signed_headers"))?;
+        let required_components =
+            parse_required_components(config_obj.get("required_components"), profile)?;
+        let max_body_bytes = parse_max_body_bytes(config_obj.get("max_body_bytes"))?;
+        let rfc9421_required_components = if profile == HmacSigningProfile::Rfc9421 {
+            let mut required: Vec<String> = Vec::new();
+            for name in RFC9421_BASELINE_COMPONENTS
+                .iter()
+                .map(|name| (*name).to_string())
+                .chain(required_components)
+                .chain(signed_headers.iter().cloned())
+            {
+                if !required.contains(&name) {
+                    required.push(name);
+                }
+            }
+            required
+        } else {
+            Vec::new()
+        };
 
         // A blank id would collapse every hmac_auth config in a namespace onto
         // one replay domain; fail closed rather than merge them.
@@ -1048,72 +1488,70 @@ impl HmacAuth {
                 let parsed = value.as_u64().ok_or_else(|| {
                     "hmac_auth: `replay_max_entries` must be an unsigned integer".to_string()
                 })?;
-                let parsed = usize::try_from(parsed)
-                    .map_err(|_| "hmac_auth: `replay_max_entries` is too large".to_string())?;
                 if parsed == 0 {
                     return Err(
                         "hmac_auth: `replay_max_entries` must be greater than 0".to_string()
                     );
                 }
-                parsed
+                // The lane grows on demand, so an absurd cap would turn the
+                // documented fail-closed capacity posture into unbounded
+                // in-process growth bounded only by authenticated volume.
+                match usize::try_from(parsed) {
+                    Ok(parsed) if parsed <= MAX_HMAC_REPLAY_MAX_ENTRIES => parsed,
+                    _ => {
+                        return Err(format!(
+                            "hmac_auth: `replay_max_entries` must be <= \
+                             {MAX_HMAC_REPLAY_MAX_ENTRIES}; use `replay_scope`: `shared` for \
+                             larger replay state"
+                        ));
+                    }
+                }
             }
         };
 
-        match (profile, declared_scope) {
-            // The scope has no default. A gateway cannot observe its own
-            // replica count, so declaring it is what distinguishes "this really
-            // is one process" from "we silently accept one replay per replica".
-            (HmacSigningProfile::V2, None) => {
-                return Err(format!(
-                    "hmac_auth: `replay_scope` is required for \
-                     `{HMAC_SIGNING_VERSION_V2}` — use `shared` together with sync_mode: `redis` \
-                     for any deployment running more than one gateway replica, or `process` to \
-                     declare a single-process deployment whose replay protection is not \
-                     cross-replica"
-                ));
-            }
-            (HmacSigningProfile::V1Unsafe, Some(_)) => {
-                return Err(format!(
-                    "hmac_auth: `replay_scope` is not accepted with `signing_profile` = \
-                     `{HMAC_SIGNING_VERSION_V1}`, which has no replay state at all"
-                ));
-            }
-            _ => {}
-        }
-        if profile == HmacSigningProfile::V1Unsafe && redis_configured {
+        // The scope has no default. A gateway cannot observe its own replica
+        // count, so declaring it is what distinguishes "this really is one
+        // process" from "we silently accept one replay per replica".
+        let Some(declared_scope) = declared_scope else {
             return Err(format!(
-                "hmac_auth: sync_mode: `redis` is not accepted with `signing_profile` = \
-                 `{HMAC_SIGNING_VERSION_V1}`, which has no replay state at all"
+                "hmac_auth: `replay_scope` is required for `{}` — use `shared` together \
+                 with sync_mode: `redis` for any deployment running more than one gateway \
+                 replica, or `process` to declare a single-process deployment whose replay \
+                 protection is not cross-replica",
+                profile.version()
             ));
-        }
-        if let Some(scope) = declared_scope {
-            validate_scope_backend("hmac_auth", "replay_scope", scope, redis_configured)?;
-        }
+        };
+        validate_scope_backend(
+            "hmac_auth",
+            "replay_scope",
+            declared_scope,
+            redis_configured,
+        )?;
 
-        let replay_domain = (profile == HmacSigningProfile::V2).then(|| {
-            ReplayDomain::new(
-                HMAC_SIGNING_VERSION_V2,
-                namespace,
-                "hmac_auth",
-                policy_config_id,
-                "",
-            )
-        });
+        // The profile version is part of the domain, so `rfc9421` nonces and
+        // `ferrum-hmac-v2` nonces never share markers.
+        let replay_domain = ReplayDomain::new(
+            profile.version(),
+            namespace,
+            "hmac_auth",
+            policy_config_id,
+            "",
+        );
         let retention = std::time::Duration::from_secs(HMAC_MARKER_RETENTION_SECONDS);
-        let replay_authority = match (declared_scope, replay_domain.as_ref()) {
-            (Some(ReplayScope::Process), Some(domain)) => {
+        let replay_authority = match declared_scope {
+            ReplayScope::Process => {
                 let shard_amount = http_client
                     .map(|client| client.pool_shard_amount())
                     .unwrap_or_else(|| crate::util::sharding::pool_shard_amount(0));
-                Some(Arc::new(ReplayAuthority::process(
+                Arc::new(ReplayAuthority::process(
                     "hmac_auth",
-                    domain,
+                    &replay_domain,
                     replay_max_entries,
                     retention,
                     shard_amount,
-                )?))
+                )?)
             }
-            (Some(ReplayScope::Shared), Some(_)) => {
+            ReplayScope::Shared => {
                 // `validate_scope_backend` above already rejected `shared`
                 // without a backend, so `redis_config` is present here.
                 let redis_config = redis_config.ok_or_else(|| {
@@ -1133,13 +1571,12 @@ impl HmacAuth {
                 // plugin in the same candidate, or this instance if it is never
                 // installed, must not mark live readiness unavailable or dial
                 // Redis.
-                Some(Arc::new(ReplayAuthority::shared(client, retention)))
+                Arc::new(ReplayAuthority::shared(client, retention))
             }
-            _ => None,
         };
 
         let prebuffer_owner =
-            HmacPrebufferOwner::new(namespace, policy_config_id, profile, replay_domain.as_ref());
+            HmacPrebufferOwner::new(namespace, policy_config_id, profile, &replay_domain);
 
         Ok(Self {
             clock_skew_seconds,
@@ -1147,44 +1584,44 @@ impl HmacAuth {
             replay_domain,
             replay_authority,
             prebuffer_owner,
+            verification_rounds: bounded_hmac_verification_rounds(
+                crate::config::types::max_credentials_per_type()
+                    .map_err(|error| format!("hmac_auth: {error}"))?,
+            ),
+            signed_headers,
+            rfc9421_required_components,
+            max_body_bytes,
+            replay_warn: AtomicLogRateLimiter::new(),
         })
     }
 
     /// Configured signing profile (test support).
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn signing_profile(&self) -> HmacSigningProfile {
         self.profile
     }
 
-    /// Replay-authority mode (`None` under the legacy v1 profile). Test support.
+    /// Replay-authority mode. Test support.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
-    pub fn replay_mode(&self) -> Option<&'static str> {
-        self.replay_authority.as_ref().map(|a| a.mode())
+    pub fn replay_mode(&self) -> &'static str {
+        self.replay_authority.mode()
     }
 
     /// Whether this instance's shared Redis recovery checker has been armed.
     /// Test support for proving construction stays detached until commit.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn shared_replay_recovery_started_for_test(&self) -> bool {
-        self.replay_authority
-            .as_ref()
-            .is_some_and(|authority| authority.recovery_checker_started_for_test())
+        self.replay_authority.recovery_checker_started_for_test()
     }
 
     /// Marker this policy would claim for `consumer_id` + `nonce`. Test-only
     /// visibility for the domain-isolation and reload/replica convergence
     /// contracts.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
-    pub fn replay_marker_digest(&self, consumer_id: &str, nonce: &str) -> Option<[u8; 32]> {
-        self.replay_domain.as_ref().map(|domain| {
-            domain
-                .marker(&[consumer_id.as_bytes(), nonce.as_bytes()])
-                .digest()
-        })
+    pub fn replay_marker_digest(&self, consumer_id: &str, nonce: &str) -> [u8; 32] {
+        self.replay_domain
+            .marker(&[consumer_id.as_bytes(), nonce.as_bytes()])
+            .digest()
     }
 
     /// Claim a fully verified signed request for exactly one use.
@@ -1194,27 +1631,9 @@ impl HmacAuth {
     /// traffic can never consume replay capacity or a shared-backend round
     /// trip. Every non-admitted outcome is terminal; there is no path from a
     /// replay, a capacity refusal, or an unavailable authority to acceptance.
-    async fn claim_single_use(
-        &self,
-        nonce: Option<&str>,
-        consumer: &Consumer,
-    ) -> Result<(), (u16, String)> {
-        if self.profile == HmacSigningProfile::V1Unsafe {
-            // Explicitly acknowledged freshness-only posture. Counted so the
-            // dependency is visible in runtime metrics rather than implicit.
-            replay_authority::record_legacy_unsafe_profile_accepted();
-            return Ok(());
-        }
-        let (Some(domain), Some(authority), Some(nonce)) = (
-            self.replay_domain.as_ref(),
-            self.replay_authority.as_ref(),
-            nonce,
-        ) else {
-            // Unreachable for an admitted v2 configuration. Refuse rather than
-            // accept a signed request that would not be made single-use.
-            warn!("hmac_auth: replay authority is not configured; refusing the signed request");
-            return Err((503, REPLAY_UNAVAILABLE_BODY.to_string()));
-        };
+    async fn claim_single_use(&self, nonce: &str, consumer: &Consumer) -> Result<(), ClaimRefusal> {
+        let domain = &self.replay_domain;
+        let authority = &self.replay_authority;
 
         // The marker binds the consumer's stable resource id (not the
         // attacker-supplied username spelling) to the client nonce, inside a
@@ -1223,7 +1642,7 @@ impl HmacAuth {
         let marker = domain.marker(&[consumer.id.as_bytes(), nonce.as_bytes()]);
         match authority.admit(&marker).await {
             ReplayAdmission::Admitted => Ok(()),
-            ReplayAdmission::Replay => Err((401, REPLAY_DETECTED_BODY.to_string())),
+            ReplayAdmission::Replay => Err(ClaimRefusal::new(401, REPLAY_DETECTED_BODY, true)),
             ReplayAdmission::CapacityRefused => {
                 warn!(
                     classification = ReplayAdmission::CapacityRefused.classification(),
@@ -1231,7 +1650,7 @@ impl HmacAuth {
                     "hmac_auth: replay state is at capacity; refusing the request rather than \
                      discarding a live replay marker"
                 );
-                Err((503, REPLAY_CAPACITY_BODY.to_string()))
+                Err(ClaimRefusal::new(503, REPLAY_CAPACITY_BODY, false))
             }
             ReplayAdmission::AuthorityUnavailable => {
                 warn!(
@@ -1240,7 +1659,7 @@ impl HmacAuth {
                     "hmac_auth: replay authority is unavailable; failing closed without \
                      freshness-only fallback"
                 );
-                Err((503, REPLAY_UNAVAILABLE_BODY.to_string()))
+                Err(ClaimRefusal::new(503, REPLAY_UNAVAILABLE_BODY, false))
             }
         }
     }
@@ -1271,7 +1690,7 @@ impl HmacAuth {
     ///
     /// This enforces only the bounded freshness window
     /// (`now ± clock_skew_seconds`). Version 2 separately claims its nonce for
-    /// single use; explicitly acknowledged version 1 has no replay store.
+    /// single use.
     fn validate_date(&self, date_str: &str) -> bool {
         if date_str.is_empty() {
             // No Date header means no freshness bound at all — reject.
@@ -1297,6 +1716,35 @@ impl HmacAuth {
         }
     }
 
+    /// RFC 9421 validity window: `created` within `now ± clock_skew_seconds`
+    /// (the same bound as the Ferrum `Date`, so the fixed marker retention
+    /// still dominates every acceptance window), and `now <= expires` when an
+    /// `expires` parameter was sent.
+    fn rfc9421_window_is_open(&self, created: Option<i64>, expires: Option<i64>) -> bool {
+        let Some(created) = created else {
+            return false;
+        };
+        let now = chrono::Utc::now().timestamp();
+        Self::timestamps_within_clock_skew(now, created, self.clock_skew_seconds)
+            && expires.is_none_or(|expires| now <= expires)
+    }
+
+    /// Profile-appropriate freshness check.
+    fn is_fresh(&self, date: &str, created: Option<i64>, expires: Option<i64>) -> bool {
+        match self.profile {
+            HmacSigningProfile::Rfc9421 => self.rfc9421_window_is_open(created, expires),
+            HmacSigningProfile::V2 => self.validate_date(date),
+        }
+    }
+
+    /// Fixed refusal body for a request outside its freshness window.
+    fn stale_body(&self) -> &'static str {
+        match self.profile {
+            HmacSigningProfile::Rfc9421 => STALE_SIGNATURE_BODY,
+            HmacSigningProfile::V2 => STALE_DATE_BODY,
+        }
+    }
+
     /// Compare whole-second timestamps so the freshness horizon is exactly
     /// bounded by `clock_skew_seconds`. Truncating a signed duration would
     /// otherwise admit nearly one extra second at both ends of the window,
@@ -1311,7 +1759,11 @@ impl HmacAuth {
         let Ok(parsed) = parse_body_digest_header(digest_header, syntax) else {
             return false;
         };
-        parsed_digest_matches_body(&parsed, &Sha256::digest(body), &Sha512::digest(body))
+        check_body_digest(
+            &parsed,
+            Some(&Sha256::digest(body)),
+            Some(&Sha512::digest(body)),
+        ) == BodyDigestCheck::Matched
     }
 
     /// Look up the single digest field on the request. Prefers neither header
@@ -1330,6 +1782,16 @@ impl HmacAuth {
     }
 
     fn has_hmac_authorization(&self, ctx: &RequestContext) -> bool {
+        if self.profile == HmacSigningProfile::Rfc9421 {
+            // Either field present is an attempted RFC 9421 signature;
+            // extraction rejects the incomplete or malformed shapes.
+            return ["signature-input", "signature"].into_iter().any(|name| {
+                !matches!(
+                    lookup_configured_header(ctx, name, None),
+                    ConfiguredHeaderLookup::Absent
+                )
+            });
+        }
         match lookup_configured_header(ctx, "authorization", None) {
             ConfiguredHeaderLookup::Absent => false,
             // Present but omitted from the materialized map still means the client
@@ -1342,10 +1804,35 @@ impl HmacAuth {
         }
     }
 
-    fn authorization_fingerprint(ctx: &RequestContext) -> Option<[u8; 32]> {
+    /// Fingerprint of the field(s) carrying the credential: `Authorization`
+    /// under the Ferrum profiles, `Signature-Input` + `Signature` under
+    /// `rfc9421`.
+    fn credential_fingerprint(&self, ctx: &RequestContext) -> Option<[u8; 32]> {
+        if self.profile == HmacSigningProfile::Rfc9421 {
+            let input = ctx.headers.get("signature-input")?;
+            let signature = ctx.headers.get("signature")?;
+            let mut hasher = Sha256::new();
+            hasher.update(input.as_bytes());
+            hasher.update(b"\n");
+            hasher.update(signature.as_bytes());
+            return Some(hasher.finalize());
+        }
         ctx.headers
             .get("authorization")
             .map(|header| Sha256::digest(header.as_bytes()))
+    }
+
+    /// Canonical values of the configured `signed_headers`, in order. Always
+    /// empty under `rfc9421`, whose covered headers live in its signature base.
+    fn signed_header_values(&self, ctx: &RequestContext) -> Result<Vec<String>, &'static str> {
+        if self.profile == HmacSigningProfile::Rfc9421 {
+            return Ok(Vec::new());
+        }
+        let mut values = Vec::with_capacity(self.signed_headers.len());
+        for name in &self.signed_headers {
+            values.push(canonical_field_value(ctx, name)?.ok_or(MISSING_SIGNED_HEADER_BODY)?);
+        }
+        Ok(values)
     }
 
     fn consumer_for_valid_signature(
@@ -1362,38 +1849,53 @@ impl HmacAuth {
             .decode(&credential.signature)
             .ok()
             .filter(|signature| signature.len() == expected_signature_len)?;
+        let signing_string: Cow<'_, str> = match credential.rfc9421_base.as_deref() {
+            Some(base) => Cow::Borrowed(base),
+            None => Cow::Owned(build_signing_string(
+                credential,
+                self.profile,
+                &self.signed_headers,
+            )),
+        };
         let consumer =
-            consumer_index.find_hmac_by_identity(&credential.namespace, &credential.username)?;
-        let hmac_entries = consumer.credential_entries("hmac_auth");
-        if hmac_entries.is_empty() {
-            return None;
+            consumer_index.find_hmac_by_identity(&credential.namespace, &credential.username);
+        let mut matched = false;
+        // Run the same number of MAC rounds for every username: configured
+        // secrets first (by index, without collecting a username-dependent
+        // list), then padding with a throwaway key. Rounds never short-circuit,
+        // so neither an unknown username nor the number of rotated secrets
+        // shows in the response timing. Only a configured secret can match.
+        let hmac_entries = consumer
+            .as_ref()
+            .and_then(|consumer| consumer.credentials.get("hmac_auth"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let rounds = hmac_entries.len().max(self.verification_rounds);
+        for round in 0..rounds {
+            let configured_secret = hmac_entries
+                .get(round)
+                .filter(|entry| entry.is_object())
+                .and_then(|entry| entry.get("secret"))
+                .and_then(Value::as_str);
+            let round_matched = Self::hmac_matches(
+                configured_secret.map_or(&PADDING_HMAC_SECRET[..], str::as_bytes),
+                signing_string.as_bytes(),
+                &credential.algorithm,
+                &expected_signature,
+            );
+            matched |= configured_secret.is_some() & round_matched;
         }
-
-        let signing_string = build_signing_string(credential, self.profile);
-        hmac_entries
-            .iter()
-            .any(|hmac_cred| {
-                hmac_cred
-                    .get("secret")
-                    .and_then(|secret| secret.as_str())
-                    .is_some_and(|secret| {
-                        Self::hmac_matches(
-                            secret.as_bytes(),
-                            signing_string.as_bytes(),
-                            &credential.algorithm,
-                            &expected_signature,
-                        )
-                    })
-            })
-            .then_some(consumer)
+        if matched { consumer } else { None }
     }
 
     fn cached_request_binding_matches(
+        &self,
         cached: &CachedHmacAuthorization,
         ctx: &RequestContext,
         consumer_index: &ConsumerIndex,
     ) -> bool {
-        let Some(current_fingerprint) = Self::authorization_fingerprint(ctx) else {
+        let Some(current_fingerprint) = self.credential_fingerprint(ctx) else {
             return false;
         };
         if !constant_time_eq(&cached.authorization_fingerprint, &current_fingerprint)
@@ -1411,6 +1913,19 @@ impl HmacAuth {
         {
             return false;
         }
+        // Every other signed input must be unchanged too: the configured
+        // headers, and under `rfc9421` the whole derived signature base.
+        if self.signed_header_values(ctx).ok().as_ref() != Some(&cached.signed_header_values) {
+            return false;
+        }
+        if let Some(expected) = cached.rfc9421_base_digest.as_ref() {
+            let Ok(Some(current)) = parse_rfc9421_signature(ctx) else {
+                return false;
+            };
+            if !constant_time_eq(expected, &Sha256::digest(current.base.as_bytes())) {
+                return false;
+            }
+        }
 
         consumer_index
             .find_hmac_by_identity(&cached.namespace, &cached.username)
@@ -1427,7 +1942,7 @@ impl HmacAuth {
         let ExtractedCredential::HmacAuth(credential) = self.extract(ctx) else {
             return false;
         };
-        let Some(authorization_fingerprint) = Self::authorization_fingerprint(ctx) else {
+        let Some(authorization_fingerprint) = self.credential_fingerprint(ctx) else {
             return false;
         };
 
@@ -1436,7 +1951,7 @@ impl HmacAuth {
         // malformed or unsupported digest field. Only a valid secret-holder
         // may enable collection; unknown and known-invalid identities both stay
         // on the same pre-auth 401 path without reaching the body-size limit.
-        if !self.validate_date(&credential.date) {
+        if !self.is_fresh(&credential.date, credential.created, credential.expires) {
             return false;
         }
         let Some(preverified_consumer) =
@@ -1444,6 +1959,10 @@ impl HmacAuth {
         else {
             return false;
         };
+        let rfc9421_base_digest = credential
+            .rfc9421_base
+            .as_ref()
+            .map(|base| Sha256::digest(base.as_bytes()));
         let auth_flow::HmacAuthCredential {
             namespace,
             username,
@@ -1454,6 +1973,9 @@ impl HmacAuth {
             query,
             digest_header,
             nonce,
+            signed_header_values,
+            created,
+            expires,
             ..
         } = *credential;
         // Staged under this instance's own ownership token. A sibling
@@ -1475,6 +1997,10 @@ impl HmacAuth {
                 query,
                 digest_header,
                 nonce,
+                signed_header_values,
+                rfc9421_base_digest,
+                created,
+                expires,
                 preverified_consumer,
             },
         )
@@ -1496,21 +2022,16 @@ impl HmacAuth {
         // left to check is that the *request* did not change under it. H1/H2 and
         // H3 call the prebuffer predicate immediately before body collection and
         // authentication, with no plugin hook in between, but bind the
-        // Authorization header, every signed request field, and the exact
+        // credential field(s), every signed request field, and the exact
         // Consumer snapshot anyway; if that lifecycle ever changes, discard the
         // record and run ordinary extraction/verification.
-        if !Self::cached_request_binding_matches(&cached, ctx, consumer_index) {
+        if !self.cached_request_binding_matches(&cached, ctx, consumer_index) {
             return None;
         }
 
-        if !self.validate_date(&cached.date) {
-            return Some(Err(
-                r#"{"error":"Missing or expired Date header"}"#.to_string()
-            ));
+        if !self.is_fresh(&cached.date, cached.created, cached.expires) {
+            return Some(Err(self.stale_body().to_string()));
         }
-        let Some((body_sha256, body_sha512)) = collected_body_hashes(ctx) else {
-            return Some(Err(DIGEST_MISMATCH_BODY.to_string()));
-        };
         let syntax = match select_digest_header(ctx) {
             Ok((_, syntax)) => syntax,
             Err(body) => return Some(Err(body.to_string())),
@@ -1519,12 +2040,177 @@ impl HmacAuth {
             Ok(parsed) => parsed,
             Err(body) => return Some(Err(body.to_string())),
         };
-        if !parsed_digest_matches_body(&parsed, body_sha256, body_sha512) {
-            debug!("hmac_auth: digest header does not match request body");
-            return Some(Err(DIGEST_MISMATCH_BODY.to_string()));
+        match check_body_digest(
+            &parsed,
+            ctx.request_body_sha256.as_ref(),
+            ctx.request_body_sha512.as_ref(),
+        ) {
+            BodyDigestCheck::Matched => {}
+            BodyDigestCheck::Mismatched | BodyDigestCheck::NotCollected => {
+                debug!("hmac_auth: digest header does not match request body");
+                return Some(Err(DIGEST_MISMATCH_BODY.to_string()));
+            }
         }
 
         Some(Ok((cached.preverified_consumer, cached.nonce)))
+    }
+
+    /// Record a verified-but-replayed request against its Consumer.
+    ///
+    /// Reached only after the signature and body digest verified, so the
+    /// Consumer is not an attacker-supplied claim. The request metadata gives
+    /// every replay a per-request attribution in transaction logs; the warning
+    /// is rate-limited per instance so a replay flood cannot flood logs.
+    /// Neither carries the nonce, signature, marker, or any request data.
+    fn record_replay_attribution(&self, ctx: &mut RequestContext, consumer: &Consumer) {
+        ctx.metadata.insert(
+            REPLAY_CONSUMER_METADATA_KEY.to_string(),
+            consumer.username.clone(),
+        );
+        if let Some(suppressed) = self
+            .replay_warn
+            .on_event(replay_authority::monotonic_millis())
+        {
+            warn!(
+                consumer = %consumer.username,
+                consumer_id = %consumer.id,
+                profile = self.profile.version(),
+                suppressed,
+                "hmac_auth: rejected a replayed signed request whose signature verified"
+            );
+        }
+    }
+
+    /// HBONE CONNECT keeps the request body streaming so the upgrade handle
+    /// remains available for relay; request-body bytes are therefore not
+    /// available at authenticate time. Fail closed for this shape.
+    fn hbone_connect_refusal(ctx: &RequestContext) -> Option<ExtractedCredential> {
+        let is_hbone_connect = ctx.method.eq_ignore_ascii_case("CONNECT")
+            && ctx
+                .metadata
+                .get("request_protocol")
+                .is_some_and(|protocol| protocol.eq_ignore_ascii_case("hbone"));
+        (is_hbone_connect
+            && ctx.request_body_bytes.is_none()
+            && !ctx.metadata.contains_key("request_body"))
+        .then(|| {
+            ExtractedCredential::InvalidFormat(
+                r#"{"error":"HBONE CONNECT is incompatible with hmac_auth request-body digest verification"}"#.to_string(),
+            )
+        })
+    }
+
+    /// Request authority and matched-proxy namespace every profile binds.
+    fn authority_and_namespace(
+        ctx: &RequestContext,
+    ) -> Result<(String, String), ExtractedCredential> {
+        let Some(authority) = ctx.request_authority.clone() else {
+            return Err(ExtractedCredential::InvalidFormat(
+                r#"{"error":"Missing request authority for HMAC authorization"}"#.to_string(),
+            ));
+        };
+        let Some(namespace) = ctx
+            .matched_proxy
+            .as_ref()
+            .map(|proxy| proxy.namespace.clone())
+        else {
+            return Err(ExtractedCredential::InvalidFormat(
+                r#"{"error":"Missing proxy namespace for HMAC authorization"}"#.to_string(),
+            ));
+        };
+        Ok((authority, namespace))
+    }
+
+    /// Extract an RFC 9421 credential and apply the policy: algorithm,
+    /// required covered components, `keyid`, `created`, `expires` ordering,
+    /// `nonce` wire form, and a verified `Content-Digest`.
+    fn extract_rfc9421(&self, ctx: &RequestContext) -> ExtractedCredential {
+        let parsed = match parse_rfc9421_signature(ctx) {
+            Ok(None) => return ExtractedCredential::Missing,
+            Ok(Some(parsed)) => parsed,
+            Err(body) => return ExtractedCredential::InvalidFormat(body.to_string()),
+        };
+        let invalid = |body: &str| ExtractedCredential::InvalidFormat(body.to_string());
+        if parsed
+            .alg
+            .as_deref()
+            .is_some_and(|alg| alg != RFC9421_ALGORITHM)
+        {
+            return invalid(UNSUPPORTED_SIGNATURE_ALGORITHM_BODY);
+        }
+        if !self
+            .rfc9421_required_components
+            .iter()
+            .all(|required| parsed.covered.contains(required))
+        {
+            return invalid(UNCOVERED_COMPONENT_BODY);
+        }
+        let Some(keyid) = parsed
+            .keyid
+            .filter(|keyid| !keyid.is_empty() && keyid.len() <= RFC9421_MAX_KEYID_BYTES)
+        else {
+            return invalid(MISSING_KEYID_BODY);
+        };
+        let Some(created) = parsed.created else {
+            return invalid(MISSING_CREATED_BODY);
+        };
+        if parsed.expires.is_some_and(|expires| expires < created) {
+            return invalid(MALFORMED_SIGNATURE_BODY);
+        }
+        let Some(nonce) = parsed.nonce else {
+            return invalid(MISSING_SIGNATURE_NONCE_BODY);
+        };
+        if !rfc9421_nonce_is_valid(&nonce) {
+            return invalid(MALFORMED_SIGNATURE_NONCE_BODY);
+        }
+        if let Some(refusal) = Self::hbone_connect_refusal(ctx) {
+            return refusal;
+        }
+        let digest_header = match Self::extract_digest_header(ctx) {
+            Ok((value, DigestSyntax::Rfc9530)) => value,
+            Ok((_, DigestSyntax::Rfc3230)) => {
+                return invalid(RFC9421_REQUIRES_CONTENT_DIGEST_BODY);
+            }
+            Err(body) => return invalid(body),
+        };
+        let (authority, namespace) = match Self::authority_and_namespace(ctx) {
+            Ok(bound) => bound,
+            Err(refusal) => return refusal,
+        };
+
+        ExtractedCredential::HmacAuth(Box::new(auth_flow::HmacAuthCredential {
+            namespace,
+            username: keyid,
+            authority,
+            algorithm: RFC9421_ALGORITHM.to_string(),
+            // Re-encoded so the shared verifier decodes one representation;
+            // a wrong-length signature fails there like any other.
+            signature: base64::engine::general_purpose::STANDARD.encode(&parsed.signature),
+            date: ctx.headers.get("date").cloned().unwrap_or_default(),
+            method: ctx.method.clone(),
+            path: hmac_wire_path(ctx).to_string(),
+            query: ctx.raw_query_string().unwrap_or_default().to_string(),
+            digest_header,
+            digest_is_rfc9530: true,
+            nonce,
+            signed_header_values: Vec::new(),
+            rfc9421_base: Some(parsed.base),
+            created: Some(created),
+            expires: parsed.expires,
+            request_body_sha256: ctx.request_body_sha256,
+            request_body_sha512: ctx.request_body_sha512,
+        }))
+    }
+
+    /// The RFC 9421 signature base this policy would verify for `ctx`, with
+    /// no policy checks applied. Test support for RFC 9421 Appendix B vectors.
+    #[doc(hidden)]
+    pub fn rfc9421_signature_base_for_test(ctx: &RequestContext) -> Result<String, String> {
+        match parse_rfc9421_signature(ctx) {
+            Ok(Some(parsed)) => Ok(parsed.base),
+            Ok(None) => Err("no RFC 9421 signature present".to_string()),
+            Err(body) => Err(body.to_string()),
+        }
     }
 }
 
@@ -1534,7 +2220,14 @@ impl AuthMechanism for HmacAuth {
         "hmac_auth"
     }
 
+    fn authentication_challenge(&self) -> &'static str {
+        auth_flow::HMAC_AUTHENTICATION_CHALLENGE
+    }
+
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
+        if self.profile == HmacSigningProfile::Rfc9421 {
+            return self.extract_rfc9421(ctx);
+        }
         // RFC 6750-style `Authorization` parameters and digest headers are
         // visible-ASCII structured fields. A present but non-materialized line
         // is malformed, not absent.
@@ -1563,7 +2256,7 @@ impl AuthMechanism for HmacAuth {
             algorithm,
             signature,
             nonce,
-        } = match parse_hmac_authorization(params_str, self.profile) {
+        } = match parse_hmac_authorization(params_str) {
             Ok(parsed) => parsed,
             Err(body) => return ExtractedCredential::InvalidFormat(body.to_string()),
         };
@@ -1571,40 +2264,20 @@ impl AuthMechanism for HmacAuth {
         // Enforce digest presence at extraction so we surface the clearest
         // error before consumer lookup. The actual body-vs-digest comparison
         // happens in `verify` once we have the buffered body.
-        //
-        // HBONE CONNECT keeps the request body streaming so the upgrade handle
-        // remains available for relay; request-body bytes are therefore not
-        // available at authenticate time. Fail closed for this shape.
-        let is_hbone_connect = ctx.method.eq_ignore_ascii_case("CONNECT")
-            && ctx
-                .metadata
-                .get("request_protocol")
-                .is_some_and(|protocol| protocol.eq_ignore_ascii_case("hbone"));
-        if is_hbone_connect
-            && ctx.request_body_bytes.is_none()
-            && !ctx.metadata.contains_key("request_body")
-        {
-            return ExtractedCredential::InvalidFormat(
-                r#"{"error":"HBONE CONNECT is incompatible with hmac_auth request-body digest verification"}"#.to_string(),
-            );
+        if let Some(refusal) = Self::hbone_connect_refusal(ctx) {
+            return refusal;
         }
         let (digest_header, digest_syntax) = match Self::extract_digest_header(ctx) {
             Ok(header) => header,
             Err(body) => return ExtractedCredential::InvalidFormat(body.to_string()),
         };
-        let Some(authority) = ctx.request_authority.clone() else {
-            return ExtractedCredential::InvalidFormat(
-                r#"{"error":"Missing request authority for HMAC authorization"}"#.to_string(),
-            );
+        let signed_header_values = match self.signed_header_values(ctx) {
+            Ok(values) => values,
+            Err(body) => return ExtractedCredential::InvalidFormat(body.to_string()),
         };
-        let Some(namespace) = ctx
-            .matched_proxy
-            .as_ref()
-            .map(|proxy| proxy.namespace.clone())
-        else {
-            return ExtractedCredential::InvalidFormat(
-                r#"{"error":"Missing proxy namespace for HMAC authorization"}"#.to_string(),
-            );
+        let (authority, namespace) = match Self::authority_and_namespace(ctx) {
+            Ok(bound) => bound,
+            Err(refusal) => return refusal,
         };
 
         ExtractedCredential::HmacAuth(Box::new(auth_flow::HmacAuthCredential {
@@ -1630,6 +2303,10 @@ impl AuthMechanism for HmacAuth {
             digest_header,
             digest_is_rfc9530: matches!(digest_syntax, DigestSyntax::Rfc9530),
             nonce,
+            signed_header_values,
+            rfc9421_base: None,
+            created: None,
+            expires: None,
             request_body_sha256: ctx.request_body_sha256,
             request_body_sha512: ctx.request_body_sha512,
         }))
@@ -1645,10 +2322,8 @@ impl AuthMechanism for HmacAuth {
         };
         let credential = *credential;
 
-        if !self.validate_date(&credential.date) {
-            return VerifyOutcome::Invalid(
-                r#"{"error":"Missing or expired Date header"}"#.to_string(),
-            );
+        if !self.is_fresh(&credential.date, credential.created, credential.expires) {
+            return VerifyOutcome::Invalid(self.stale_body().to_string());
         }
 
         let syntax = if credential.digest_is_rfc9530 {
@@ -1660,16 +2335,12 @@ impl AuthMechanism for HmacAuth {
             Ok(parsed) => parsed,
             Err(body) => return VerifyOutcome::Invalid(body.to_string()),
         };
-        let hashes = match (
+        let digest_check = check_body_digest(
+            &parsed,
             credential.request_body_sha256.as_ref(),
             credential.request_body_sha512.as_ref(),
-        ) {
-            (Some(sha256), Some(sha512)) => Some((sha256, sha512)),
-            _ => None,
-        };
-        if let Some((body_sha256, body_sha512)) = hashes
-            && !parsed_digest_matches_body(&parsed, body_sha256, body_sha512)
-        {
+        );
+        if digest_check == BodyDigestCheck::Mismatched {
             debug!("hmac_auth: digest header does not match request body");
             return VerifyOutcome::Invalid(DIGEST_MISMATCH_BODY.to_string());
         }
@@ -1679,7 +2350,7 @@ impl AuthMechanism for HmacAuth {
         // The query string is bound too, so altering query params invalidates
         // the signature.
         if let Some(consumer) = self.consumer_for_valid_signature(&credential, consumer_index) {
-            if hashes.is_none() {
+            if digest_check == BodyDigestCheck::NotCollected {
                 // A valid signature must still prove the body. Missing hashes
                 // mean the forwarding buffer was never digested — fail closed
                 // rather than treating that as the empty body.
@@ -1694,12 +2365,11 @@ impl AuthMechanism for HmacAuth {
     }
 }
 
+/// Every `hmac_auth` rejection, including the replay `401` and the prebuffered
+/// digest path that bypass the shared runner, goes through here so a `401`
+/// always carries the `hmac` challenge (RFC 9110 §15.5.2, issue #6774).
 fn hmac_reject(status_code: u16, body: String) -> super::PluginResult {
-    super::PluginResult::Reject {
-        status_code,
-        body,
-        headers: std::collections::HashMap::new(),
-    }
+    auth_flow::auth_rejection(status_code, body, auth_flow::HMAC_AUTHENTICATION_CHALLENGE)
 }
 
 /// The single funnel both `hmac_auth` authentication paths pass through.
@@ -1723,24 +2393,17 @@ async fn run_hmac_auth(
     match mechanism.take_prebuffered_auth(ctx, consumer_index) {
         Some(Err(body)) => return hmac_reject(401, body),
         Some(Ok((consumer, nonce))) => {
-            if let Err((status, body)) = mechanism
-                .claim_single_use(nonce.as_deref(), &consumer)
-                .await
-            {
-                return hmac_reject(status, body);
+            if let Err(refusal) = mechanism.claim_single_use(&nonce, &consumer).await {
+                if refusal.replay {
+                    mechanism.record_replay_attribution(ctx, &consumer);
+                }
+                return hmac_reject(refusal.status, refusal.body);
             }
-            if ctx.identified_consumer.is_none() {
-                debug!(
-                    "{}: identified consumer '{}'",
-                    mechanism.mechanism_name(),
-                    consumer.username
-                );
-                ctx.identified_consumer = Some(consumer);
-            }
-            if ctx.auth_method.is_none() {
-                ctx.auth_method = Some(mechanism.mechanism_name());
-            }
-            return super::PluginResult::Continue;
+            // The same atomic commit boundary as the ordinary path, so a
+            // principal another mechanism already committed is never joined by
+            // a second one, and every commit step (identity/realm, deadline,
+            // principal state, credential cleanup) applies here too.
+            return commit_hmac_outcome(mechanism, ctx, VerifyOutcome::consumer(consumer));
         }
         None => {}
     }
@@ -1780,12 +2443,26 @@ async fn run_hmac_auth(
         ..
     } = &outcome
     {
-        let claim = mechanism.claim_single_use(nonce.as_deref(), consumer).await;
-        if let Err((status, body)) = claim {
-            return hmac_reject(status, body);
+        let claim = mechanism.claim_single_use(&nonce, consumer).await;
+        if let Err(refusal) = claim {
+            if refusal.replay {
+                mechanism.record_replay_attribution(ctx, consumer);
+            }
+            return hmac_reject(refusal.status, refusal.body);
         }
     }
 
+    commit_hmac_outcome(mechanism, ctx, outcome)
+}
+
+/// The commit tail both `hmac_auth` paths share: publish a verified (and
+/// already single-use-claimed) outcome through
+/// [`commit_authentication_attempt`] and map its refusals to `hmac` rejections.
+fn commit_hmac_outcome(
+    mechanism: &HmacAuth,
+    ctx: &mut RequestContext,
+    outcome: VerifyOutcome,
+) -> super::PluginResult {
     match commit_authentication_attempt(
         ctx,
         AuthenticationAttempt::new(),
@@ -1842,23 +2519,22 @@ auth_flow::impl_auth_plugin!(
     }
 
     fn request_body_buffer_limit(&self) -> Option<usize> {
-        Some(HMAC_REQUEST_BODY_LIMIT_BYTES)
+        Some(self.max_body_bytes)
     }
 
     /// A shared replay authority is dialed on the authentication path, so its
     /// endpoint belongs in gateway DNS warmup like any other plugin egress.
     fn warmup_hostnames(&self) -> Vec<String> {
-        self.replay_authority
-            .as_ref()
-            .map(|authority| authority.warmup_hostnames())
-            .unwrap_or_default()
+        self.replay_authority.warmup_hostnames()
     }
 
     /// Publish the shared replay authority after this generation is installed.
     fn commit_background_tasks(&self) {
-        if let Some(authority) = self.replay_authority.as_ref() {
-            authority.activate();
-        }
+        self.replay_authority.activate();
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
     }
 );
 
@@ -1872,6 +2548,109 @@ fn parse_u64_field(value: Option<&Value>, field: &str, default_value: u64) -> Re
             value = value.to_string()
         )
     })
+}
+
+/// Parse `signed_headers`: lowercase field names, unique, bounded, and never a
+/// signature carrier or a connection-specific field. Diagnostics name the
+/// offending index, never the supplied value.
+fn parse_signed_headers(value: Option<&Value>) -> Result<Vec<String>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| "hmac_auth: `signed_headers` must be an array of strings".to_string())?;
+    if entries.len() > MAX_HMAC_SIGNED_HEADERS {
+        return Err(format!(
+            "hmac_auth: `signed_headers` accepts at most {MAX_HMAC_SIGNED_HEADERS} entries"
+        ));
+    }
+    let mut names: Vec<String> = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let name = entry
+            .as_str()
+            .ok_or_else(|| format!("hmac_auth: `signed_headers[{index}]` must be a string"))?;
+        if !is_lowercase_field_name(name) {
+            return Err(format!(
+                "hmac_auth: `signed_headers[{index}]` must be a lowercase HTTP field name of at \
+                 most {MAX_HMAC_SIGNED_HEADER_NAME_BYTES} bytes"
+            ));
+        }
+        if FORBIDDEN_SIGNED_HEADERS.contains(&name) {
+            return Err(format!(
+                "hmac_auth: `signed_headers[{index}]` names a signature carrier or a \
+                 connection-specific field that cannot be signed (forbidden: {})",
+                FORBIDDEN_SIGNED_HEADERS.join(", ")
+            ));
+        }
+        if names.iter().any(|existing| existing == name) {
+            return Err(format!(
+                "hmac_auth: `signed_headers[{index}]` duplicates an earlier entry"
+            ));
+        }
+        names.push(name.to_string());
+    }
+    Ok(names)
+}
+
+/// Parse `required_components` (`rfc9421` only): extra derived components the
+/// signature must cover beyond the mandatory baseline. Header names belong in
+/// `signed_headers`, which applies to every profile.
+fn parse_required_components(
+    value: Option<&Value>,
+    profile: HmacSigningProfile,
+) -> Result<Vec<String>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if profile != HmacSigningProfile::Rfc9421 {
+        return Err(format!(
+            "hmac_auth: `required_components` is only accepted with `signing_profile` = \
+             `{HMAC_SIGNING_VERSION_RFC9421}`; use `signed_headers` to bind headers under the \
+             Ferrum profiles"
+        ));
+    }
+    let entries = value.as_array().ok_or_else(|| {
+        "hmac_auth: `required_components` must be an array of strings".to_string()
+    })?;
+    let mut components: Vec<String> = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let name = entry
+            .as_str()
+            .ok_or_else(|| format!("hmac_auth: `required_components[{index}]` must be a string"))?;
+        if !RFC9421_SUPPORTED_DERIVED_COMPONENTS.contains(&name) {
+            return Err(format!(
+                "hmac_auth: `required_components[{index}]` must be one of {} (require header \
+                 fields with `signed_headers`)",
+                RFC9421_SUPPORTED_DERIVED_COMPONENTS.join(", ")
+            ));
+        }
+        if components.iter().any(|existing| existing == name) {
+            return Err(format!(
+                "hmac_auth: `required_components[{index}]` duplicates an earlier entry"
+            ));
+        }
+        components.push(name.to_string());
+    }
+    Ok(components)
+}
+
+/// Parse `max_body_bytes`: `1..=MAX_HMAC_MAX_BODY_BYTES`, default 10 MiB. The
+/// proxy still applies the stricter of this, the route, and the global body
+/// limits.
+fn parse_max_body_bytes(value: Option<&Value>) -> Result<usize, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_HMAC_MAX_BODY_BYTES);
+    };
+    let parsed = value
+        .as_u64()
+        .ok_or_else(|| "hmac_auth: `max_body_bytes` must be an unsigned integer".to_string())?;
+    match usize::try_from(parsed) {
+        Ok(parsed) if (1..=MAX_HMAC_MAX_BODY_BYTES).contains(&parsed) => Ok(parsed),
+        _ => Err(format!(
+            "hmac_auth: `max_body_bytes` must be between 1 and {MAX_HMAC_MAX_BODY_BYTES}"
+        )),
+    }
 }
 
 /// Default Redis key prefix for shared `ferrum-hmac-v2` replay markers:
@@ -1894,12 +2673,11 @@ fn default_replay_redis_key_prefix(namespace: &str, plugin_config_id: &str) -> S
 /// newline-separated:
 ///
 /// ```text
-/// {VERSION}\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST}[\n{NONCE}]
+/// {VERSION}\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST}\n{NONCE}
 /// ```
 ///
-/// The version is the **first** field, so a v1 signature can never verify as v2
-/// (or the reverse) even if every other field matches: downgrading the profile
-/// does not downgrade the signature.
+/// The version is the **first** field, so a signature for another profile
+/// version can never verify as v2 even if every other field matches.
 ///
 /// `query` is the raw request query string as received (percent-encoded, no
 /// leading `?`), empty when the request has no query. Binding it prevents an
@@ -1907,15 +2685,25 @@ fn default_replay_redis_key_prefix(namespace: &str, plugin_config_id: &str) -> S
 /// altered or added query parameters. Clients must sign the byte-for-byte raw
 /// query string the gateway receives.
 ///
-/// `nonce` is appended for `ferrum-hmac-v2` only, and the parser guarantees it
-/// is present exactly when the profile is v2 — so a v2 base is never built with
-/// an empty trailing field, and a nonce is never left unsigned.
+/// `nonce` is always appended; the parser guarantees it is present and
+/// well-formed, so a nonce is never left unsigned.
+///
+/// Each configured `signed_headers` entry follows as one `\n{name}:{value}`
+/// line in configuration order, `{value}` being the canonical field value.
+/// Header values cannot contain a line break, so a value can never forge an
+/// extra signed line.
 fn build_signing_string(
     credential: &auth_flow::HmacAuthCredential,
     profile: HmacSigningProfile,
+    signed_headers: &[String],
 ) -> String {
     let version = profile.version();
-    let nonce = credential.nonce.as_deref().unwrap_or("");
+    let nonce = credential.nonce.as_str();
+    let signed_headers_len: usize = signed_headers
+        .iter()
+        .zip(&credential.signed_header_values)
+        .map(|(name, value)| name.len() + value.len() + 2)
+        .sum();
     let mut signing_string = String::with_capacity(
         version.len()
             + credential.namespace.len()
@@ -1927,6 +2715,7 @@ fn build_signing_string(
             + credential.date.len()
             + credential.digest_header.len()
             + nonce.len()
+            + signed_headers_len
             + 9,
     );
     signing_string.push_str(version);
@@ -1946,9 +2735,13 @@ fn build_signing_string(
     signing_string.push_str(&credential.date);
     signing_string.push('\n');
     signing_string.push_str(&credential.digest_header);
-    if profile == HmacSigningProfile::V2 {
+    signing_string.push('\n');
+    signing_string.push_str(nonce);
+    for (name, value) in signed_headers.iter().zip(&credential.signed_header_values) {
         signing_string.push('\n');
-        signing_string.push_str(nonce);
+        signing_string.push_str(name);
+        signing_string.push(':');
+        signing_string.push_str(value);
     }
     signing_string
 }
@@ -1958,9 +2751,22 @@ mod tests {
     //! Inline tests for `pub(crate)` helpers. Public API tests live in
     //! `tests/unit/plugins/hmac_auth_tests.rs`.
 
-    use super::{DigestSyntax, HmacAuth, UNSUPPORTED_DIGEST_BODY, parse_body_digest_header};
+    use super::{
+        DigestSyntax, HmacAuth, MAX_HMAC_VERIFICATION_ROUNDS, UNSUPPORTED_DIGEST_BODY,
+        bounded_hmac_verification_rounds, parse_body_digest_header,
+    };
     use crate::fips::approved::{Sha256, Sha512};
     use base64::Engine as _;
+
+    #[test]
+    fn verification_rounds_follow_the_credential_limit_within_bounds() {
+        assert_eq!(bounded_hmac_verification_rounds(0), 1);
+        assert_eq!(bounded_hmac_verification_rounds(2), 2);
+        assert_eq!(
+            bounded_hmac_verification_rounds(usize::MAX),
+            MAX_HMAC_VERIFICATION_ROUNDS
+        );
+    }
 
     fn sha256_digest_header(body: &[u8]) -> String {
         let mut hasher = Sha256::new();

@@ -397,9 +397,17 @@ impl MeshRevisionOrder {
     }
 }
 
+/// `reason` label for a mesh revision commit that carried no apply token
+/// (`MeshRevisionGate::reject_missing_apply_token`). Counted on the same
+/// rejection family as [`MeshRevisionRejectReason`].
+pub(crate) const MISSING_APPLY_TOKEN_REJECTION_LABEL: &str = "missing_apply_token";
+
 /// Why a slice was quarantined by the freshness gate. Fixed, compile-time set —
 /// used directly as the bounded `reason` metric label, never a CP-supplied
-/// string.
+/// string. The same `ferrum_mesh_config_revision_rejections_total{reason}`
+/// family has exactly one other label, `MISSING_APPLY_TOKEN_REJECTION_LABEL`,
+/// for a local commit that arrived without its apply token (not a quarantine,
+/// so it is deliberately not a variant here).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshRevisionRejectReason {
     /// An older revision from the accepted authority: the stale-fallback case.
@@ -715,7 +723,7 @@ impl MeshRevisionGate {
             "Mesh revision commit has no apply token; retaining the last committed baseline"
         );
         crate::plugins::mesh::prometheus_helpers::increment_mesh_config_revision_rejection(
-            "missing_apply_token",
+            MISSING_APPLY_TOKEN_REJECTION_LABEL,
         );
     }
 

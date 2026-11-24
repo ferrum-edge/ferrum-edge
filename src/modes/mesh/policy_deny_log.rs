@@ -43,7 +43,8 @@ static GLOBAL_RECORDER: LazyLock<Arc<PolicyDenyRecorder>> =
 
 /// Set at most once by the mesh runtime startup path. Lets `configure_global_capacity`
 /// be idempotent across the apply-loop and the bootstrap sequence; subsequent
-/// reconfigure attempts are warned and ignored to preserve historical records.
+/// reconfigure attempts are logged at debug and ignored to preserve historical
+/// records.
 static GLOBAL_CAPACITY_CONFIGURED: OnceLock<()> = OnceLock::new();
 
 /// Snapshot of a single deny event captured by `mesh_authz`.
@@ -89,10 +90,6 @@ struct RecorderInner {
     /// Maximum number of events the ring can hold. `0` means the recorder is
     /// disabled (cheap no-op on the deny path).
     capacity: usize,
-    /// Monotonic count of every event ever offered to the recorder, regardless
-    /// of whether it was evicted. Used by the admin payload to surface
-    /// "we evicted N records older than the requested window".
-    total_recorded: u64,
 }
 
 /// Process-singleton recorder for mesh authorization denies.
@@ -114,7 +111,6 @@ impl PolicyDenyRecorder {
             inner: Mutex::new(RecorderInner {
                 ring: VecDeque::with_capacity(capacity),
                 capacity,
-                total_recorded: 0,
             }),
         }
     }
@@ -132,7 +128,6 @@ impl PolicyDenyRecorder {
         guard.capacity = capacity;
         guard.ring.clear();
         guard.ring.reserve(capacity);
-        guard.total_recorded = 0;
     }
 
     /// Push a deny event into the ring. Evicts the oldest entry when full.
@@ -142,7 +137,6 @@ impl PolicyDenyRecorder {
             Ok(g) => g,
             Err(poison) => poison.into_inner(),
         };
-        guard.total_recorded = guard.total_recorded.saturating_add(1);
         if guard.capacity == 0 {
             return;
         }
@@ -239,13 +233,8 @@ impl PolicyDenyRecorder {
     }
 
     /// Number of events currently retained in the ring (post-eviction).
-    ///
-    /// Introspection surface preserved for future admin endpoints / diagnostic
-    /// tooling — see `docs/mesh.md` Policy Deny Drill-down section. Kept under
-    /// `#[allow(dead_code)]` instead of a blanket file-level allow so any other
-    /// unused symbol in this module still surfaces.
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    fn len(&self) -> usize {
         let guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poison) => poison.into_inner(),
@@ -254,18 +243,14 @@ impl PolicyDenyRecorder {
     }
 
     /// Whether the ring currently holds zero events.
-    ///
-    /// See [`Self::len`] for the dead-code rationale.
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Live capacity (post-`with_capacity` / `reset_capacity_for_tests` cap).
-    ///
-    /// See [`Self::len`] for the dead-code rationale.
-    #[allow(dead_code)]
-    pub fn capacity(&self) -> usize {
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
         let guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poison) => poison.into_inner(),
@@ -356,7 +341,6 @@ pub fn configure_global_capacity(capacity: usize) {
     guard.capacity = resolved;
     guard.ring.clear();
     guard.ring.reserve(resolved);
-    guard.total_recorded = 0;
 }
 
 #[cfg(test)]

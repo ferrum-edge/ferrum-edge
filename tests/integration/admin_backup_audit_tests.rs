@@ -71,6 +71,7 @@ fn capture_backup_audit_logs() -> (
         .without_time()
         .with_writer(writer.clone())
         .finish();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     (writer, tracing::subscriber::set_default(subscriber))
 }
 
@@ -119,7 +120,7 @@ fn token(subject: &str, role: Option<&str>) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()).unwrap(),
     )
     .unwrap()
 }
@@ -141,7 +142,7 @@ fn token_with_ns(subject: &str, ns: &str) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()).unwrap(),
     )
     .unwrap()
 }
@@ -262,7 +263,6 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -1043,8 +1043,13 @@ async fn resource_labels_survive_crud_batch_backup_and_restore() {
             json!({"team":"platform","provisioned-by":"ferrum-nexus"})
         );
         body.as_object_mut().unwrap().remove("labels");
+        let expected = if path == "plugins/config" {
+            "?expected_proxy_ids="
+        } else {
+            ""
+        };
         let updated = client
-            .put(format!("{base}/{path}/{id}"))
+            .put(format!("{base}/{path}/{id}{expected}"))
             .bearer_auth(&bearer)
             .header("X-Ferrum-Provisioned-By", "ferrum-foundry")
             .json(&body)

@@ -30,8 +30,8 @@ use crate::k8s_controller::metrics::{
     ControllerMetrics, record_route_status_publication, unix_now_ms,
 };
 use crate::k8s_controller::status_budget::{
-    STATUS_BATCH_BUDGET, STATUS_BATCH_SLOW_WARN, STATUS_REQUEST_BUDGET, STATUS_UPDATE_BUDGET,
-    StatusOperation, await_status_operation, status_operation_budget,
+    STATUS_BATCH_BUDGET, STATUS_BATCH_SLOW_WARN, STATUS_PATCH_PARALLELISM, STATUS_REQUEST_BUDGET,
+    STATUS_UPDATE_BUDGET, StatusOperation, await_status_operation, status_operation_budget,
 };
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
@@ -47,7 +47,6 @@ pub use crate::config_sources::k8s::FERRUM_GATEWAY_CONTROLLER_NAME;
 /// Using the Gateway API controller name keeps ownership stable across restarts
 /// and replicas without inventing a pod- or process-specific identity.
 const GATEWAY_API_STATUS_FIELD_MANAGER: &str = FERRUM_GATEWAY_CONTROLLER_NAME;
-const GATEWAY_API_STATUS_PATCH_PARALLELISM: usize = 32;
 const ROUTE_STATUS_PATCH_MAX_ATTEMPTS: usize = 5;
 const ROUTE_STATUS_PATCH_RETRY_BASE_MS: u64 = 10;
 
@@ -164,8 +163,8 @@ impl GatewayApiStatusWriter {
         let mut first_error: Option<kube::Error> = None;
         // Patch Gateway API status updates with bounded concurrency so bursty
         // reconcile rounds cannot fan out unbounded API requests.
-        let mut stream = futures_util::stream::iter(futures)
-            .buffer_unordered(GATEWAY_API_STATUS_PATCH_PARALLELISM);
+        let mut stream =
+            futures_util::stream::iter(futures).buffer_unordered(STATUS_PATCH_PARALLELISM);
         while let Some((kind, namespace, name, result)) = stream.next().await {
             match result {
                 Err(error) if gateway_api_status_error_is_not_found(&error) => {
@@ -303,7 +302,7 @@ fn live_status_resource_version(live: &DynamicObject) -> Option<&str> {
 
 fn missing_status_resource_version_error(update: &GatewayApiStatusUpdate) -> kube::Error {
     let message = format!(
-        "Ferrum refused Gateway API status apply for {} {}/{}: live status had no resourceVersion",
+        "Ferrum refused Gateway API status write for {} {}/{}: live status had no resourceVersion",
         update.kind, update.namespace, update.name
     );
     let mut status = kube::core::Status::failure(&message, "Invalid");
@@ -338,15 +337,20 @@ async fn patch_route_status_with_retry(
             api.get_status(&update.name),
         )
         .await?;
-        let Some(resource_version) = live.metadata.resource_version.as_deref() else {
+        // Same fail-closed rule as the SSA path: an empty token would send an
+        // unguarded merge patch over a concurrent third-party write, and a
+        // missing one is not a success — returning an error keeps the object
+        // in the status plan so it retries.
+        let Some(resource_version) = live_status_resource_version(&live) else {
             warn!(
                 api_version = %update.api_version,
                 kind = %update.kind,
                 namespace = %update.namespace,
                 name = %update.name,
-                "Gateway API route status read returned no resourceVersion; leaving resource for the next reconcile"
+                "Gateway API route status read returned no resourceVersion; refusing unguarded \
+                 merge-patch write"
             );
-            return Ok(());
+            return Err(missing_status_resource_version_error(update));
         };
         let patch = if policy_status_kind(&update.kind) {
             policy_status_merge_patch_for_update(update, live.data.get("status"), resource_version)
@@ -2258,10 +2262,15 @@ fn gateway_listener_statuses(
                     existing_listener_conditions,
                     "ResolvedRefs",
                     resolved_refs,
+                    // A Gateway that failed translation names that cause on
+                    // every listener, as its own `Accepted` condition does,
+                    // rather than blaming the listener's protocol.
                     if resolved_refs {
                         "ResolvedRefs"
                     } else if spec_accepted {
                         unresolved_reason
+                    } else if !gateway_accepted {
+                        "TranslationFailed"
                     } else if listener_validation_error.is_some() {
                         "Invalid"
                     } else {
@@ -2269,7 +2278,11 @@ fn gateway_listener_statuses(
                     },
                     if resolved_refs {
                         "All listener references accepted by Ferrum"
-                    } else if spec_accepted || listener_validation_error.is_some() {
+                    } else if spec_accepted {
+                        unresolved_message
+                    } else if !gateway_accepted {
+                        "Ferrum rejected this Gateway"
+                    } else if listener_validation_error.is_some() {
                         unresolved_message
                     } else {
                         "Ferrum could not resolve this listener"
@@ -2282,6 +2295,8 @@ fn gateway_listener_statuses(
                     programmed,
                     if programmed {
                         "Programmed"
+                    } else if !gateway_accepted {
+                        "TranslationFailed"
                     } else if physical_conflict.is_some() {
                         "Invalid"
                     } else if accepted && !resolved_refs {
@@ -2299,6 +2314,8 @@ fn gateway_listener_statuses(
                     },
                     if programmed {
                         "Ferrum programmed this listener"
+                    } else if !gateway_accepted {
+                        "Ferrum rejected this Gateway"
                     } else if let Some(conflict) = physical_conflict {
                         conflict.message.as_str()
                     } else if (accepted && !resolved_refs)
@@ -3270,6 +3287,12 @@ fn route_status_merge_patch_for_update(
 /// the freshly-read live status, Ferrum's own ancestors are replaced, and the
 /// write is guarded by `metadata.resourceVersion` so a concurrent third-party
 /// write is retried rather than clobbered.
+///
+/// Ferrum's ancestors are written all-or-nothing, as the planner decides them:
+/// when third-party entries grew since the snapshot and Ferrum's no longer all
+/// fit under `MAX_POLICY_ANCESTORS`, only the retained third-party entries are
+/// written. Keeping a prefix of Ferrum's would be the partial ancestor list the
+/// planner's rule forbids.
 fn policy_status_merge_patch_for_update(
     update: &GatewayApiStatusUpdate,
     live_status: Option<&Value>,
@@ -3285,13 +3308,13 @@ fn policy_status_merge_patch_for_update(
         Some(status) => {
             let mut retained = retained_non_ferrum_status_entries(status, "ancestors");
             let available = MAX_POLICY_ANCESTORS.saturating_sub(retained.len());
-            retained.extend(desired_ancestors.into_iter().take(available));
+            if desired_ancestors.len() <= available {
+                retained.extend(desired_ancestors);
+            }
             retained
         }
-        None => desired_ancestors
-            .into_iter()
-            .take(MAX_POLICY_ANCESTORS)
-            .collect(),
+        None if desired_ancestors.len() <= MAX_POLICY_ANCESTORS => desired_ancestors,
+        None => Vec::new(),
     };
 
     json!({
@@ -6185,7 +6208,7 @@ mod tests {
                     "backendRefs": [{
                         "name": "api",
                         "port": 8080,
-                        "weight": 65536
+                        "weight": 1_000_001
                     }]
                 }]
             }),
@@ -6559,7 +6582,7 @@ mod tests {
                 "parentRefs": [{"name": "edge"}],
                 "rules": [{
                     "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
-                    "backendRefs": [{"name": "api", "port": 8080, "weight": 65536}]
+                    "backendRefs": [{"name": "api", "port": 8080, "weight": 1_000_001}]
                 }]
             }),
         );
@@ -7085,6 +7108,62 @@ mod tests {
             parent["controllerName"].as_str() == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
                 && parent["parentRef"]["name"].as_str() == Some("edge")
         }));
+    }
+
+    #[test]
+    fn policy_status_merge_patch_never_writes_a_partial_ferrum_ancestor_list() {
+        let ferrum_ancestor = |name: &str| {
+            json!({
+                "ancestorRef": {"group": "", "kind": "Service", "name": name},
+                "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
+                "conditions": [{"type": "Accepted", "status": "True"}]
+            })
+        };
+        let foreign_ancestor = |index: usize| {
+            json!({
+                "ancestorRef": {"group": "", "kind": "Service", "name": format!("svc-{index}")},
+                "controllerName": "example.com/other-controller",
+                "conditions": []
+            })
+        };
+        let update = GatewayApiStatusUpdate {
+            api_version: "gateway.networking.x-k8s.io/v1alpha1".to_string(),
+            kind: "XBackendTrafficPolicy".to_string(),
+            namespace: "default".to_string(),
+            name: "sticky".to_string(),
+            status: json!({"ancestors": [ferrum_ancestor("a"), ferrum_ancestor("b")]}),
+            patch_gateway_addresses: false,
+            patch_gateway_listeners: false,
+        };
+
+        // Third-party entries grew to leave room for only one of Ferrum's two
+        // ancestors: Ferrum writes none rather than a truncated list.
+        let crowded = json!({
+            "ancestors": (0..MAX_POLICY_ANCESTORS - 1).map(foreign_ancestor).collect::<Vec<_>>()
+        });
+        let patch = policy_status_merge_patch_for_update(&update, Some(&crowded), "7");
+        let ancestors = patch["status"]["ancestors"].as_array().unwrap();
+        assert_eq!(ancestors.len(), MAX_POLICY_ANCESTORS - 1);
+        assert!(!ancestors.iter().any(|ancestor| {
+            ancestor["controllerName"].as_str() == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+        }));
+
+        // With room for both, both are written beside the retained entries.
+        let roomy = json!({
+            "ancestors": (0..MAX_POLICY_ANCESTORS - 2).map(foreign_ancestor).collect::<Vec<_>>()
+        });
+        let patch = policy_status_merge_patch_for_update(&update, Some(&roomy), "7");
+        let ancestors = patch["status"]["ancestors"].as_array().unwrap();
+        assert_eq!(ancestors.len(), MAX_POLICY_ANCESTORS);
+        assert_eq!(
+            ancestors
+                .iter()
+                .filter(|ancestor| {
+                    ancestor["controllerName"].as_str() == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+                })
+                .count(),
+            2
+        );
     }
 
     #[test]

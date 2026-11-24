@@ -263,12 +263,139 @@ fn peer_authentication_default_mtls_mode_is_permissive() {
     let pa = PeerAuthentication {
         name: "allow-mixed".into(),
         namespace: "default".into(),
-        scope: None,
-        selector: None,
+        scope: PolicyScope::Namespace {
+            namespace: "default".into(),
+        },
         mtls_mode: MtlsMode::default(),
         port_overrides: HashMap::new(),
     };
     assert_eq!(pa.mtls_mode, MtlsMode::Permissive);
+}
+
+/// Native/file/xDS PeerAuthentication keeps `permissive` as the default for an
+/// omitted `mtls_mode`, accepts an explicit `unset` (inherit) on the policy and
+/// its port overrides, and round-trips `unset` so a K8s-translated inherit
+/// marker survives the CP -> DP carrier.
+#[test]
+fn peer_authentication_unset_mode_is_explicit_and_round_trips() {
+    let omitted = serde_json::json!({
+        "name": "omitted",
+        "namespace": "default",
+        "scope": {"kind": "namespace", "namespace": "default"}
+    });
+    let omitted: PeerAuthentication = serde_json::from_value(omitted).unwrap();
+    assert_eq!(omitted.mtls_mode, MtlsMode::Permissive);
+
+    let unset = serde_json::json!({
+        "name": "inherit",
+        "namespace": "default",
+        "scope": {"kind": "namespace", "namespace": "default"},
+        "mtls_mode": "unset",
+        "port_overrides": {"8080": "unset"}
+    });
+    let unset: PeerAuthentication = serde_json::from_value(unset).unwrap();
+    assert_eq!(unset.mtls_mode, MtlsMode::Unset);
+    assert_eq!(
+        unset.port_overrides.get(&8080).copied(),
+        Some(MtlsMode::Unset)
+    );
+    assert!(unset.mtls_mode.is_peer_auth_mode());
+
+    let encoded = serde_json::to_string(&unset).unwrap();
+    let back: PeerAuthentication = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(back, unset);
+}
+
+fn decode_peer_authentication(value: serde_json::Value) -> Result<PeerAuthentication, String> {
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+fn api_selector(namespace: Option<&str>) -> WorkloadSelector {
+    WorkloadSelector {
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+        namespace: namespace.map(str::to_string),
+    }
+}
+
+/// `scope` is the one PeerAuthentication applicability shape (issue #7243),
+/// and it is what a PeerAuthentication serializes: no `selector` member.
+#[test]
+fn peer_authentication_serializes_scope_and_no_selector() {
+    let pa = PeerAuthentication {
+        name: "api-strict".into(),
+        namespace: "default".into(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: api_selector(Some("default")),
+        },
+        mtls_mode: MtlsMode::Strict,
+        port_overrides: HashMap::new(),
+    };
+    let encoded = serde_json::to_value(&pa).unwrap();
+    assert!(encoded.get("selector").is_none(), "{encoded}");
+    assert_eq!(
+        encoded["scope"],
+        serde_json::json!({
+            "kind": "workload_selector",
+            "selector": {"labels": {"app": "api"}, "namespace": "default"}
+        })
+    );
+    assert_eq!(decode_peer_authentication(encoded).unwrap(), pa);
+}
+
+/// The scope-less form earlier builds wrote is refused (issue #7243): a
+/// document without `scope` is missing a required field, and the legacy
+/// `selector` member is refused like any other unknown member, with or
+/// without a `scope` beside it. ConfigSync protocol revision 4 carries this
+/// shape, so no earlier build's snapshot reaches this decoder.
+#[test]
+fn peer_authentication_legacy_scope_less_forms_are_refused() {
+    let missing_scope = decode_peer_authentication(serde_json::json!({
+        "name": "ns-strict",
+        "namespace": "default",
+        "mtls_mode": "strict"
+    }))
+    .unwrap_err();
+    assert!(
+        missing_scope.contains("missing field `scope`"),
+        "unexpected error: {missing_scope}"
+    );
+
+    for document in [
+        serde_json::json!({
+            "name": "api-strict",
+            "namespace": "default",
+            "selector": {"labels": {"app": "api"}},
+            "mtls_mode": "strict"
+        }),
+        serde_json::json!({
+            "name": "api-strict",
+            "namespace": "default",
+            "scope": {
+                "kind": "workload_selector",
+                "selector": {"labels": {"app": "api"}, "namespace": "default"}
+            },
+            "selector": {"labels": {"app": "api"}, "namespace": "default"}
+        }),
+    ] {
+        let error = decode_peer_authentication(document).unwrap_err();
+        assert!(
+            error.contains("unknown field `selector`"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+/// The decode shape stays closed (issue #6616): an unknown member is refused.
+#[test]
+fn peer_authentication_unknown_member_is_refused() {
+    let error = decode_peer_authentication(serde_json::json!({
+        "name": "api-strict",
+        "namespace": "default",
+        "scope": {"kind": "namespace", "namespace": "default"},
+        "mtls_mod": "strict"
+    }))
+    .unwrap_err();
+    assert!(error.contains("unknown field"), "unexpected error: {error}");
 }
 
 #[test]
@@ -674,6 +801,7 @@ fn app_protocol_default_is_unknown() {
 #[test]
 fn request_authentication_round_trips_through_serde() {
     let ra = MeshRequestAuthentication {
+        refused: false,
         name: "jwt-auth".to_string(),
         namespace: "default".to_string(),
         scope: PolicyScope::WorkloadSelector {
@@ -711,6 +839,7 @@ fn request_authentication_round_trips_through_serde() {
 #[test]
 fn request_authentication_empty_jwt_rules_round_trips() {
     let ra = MeshRequestAuthentication {
+        refused: false,
         name: "no-rules".to_string(),
         namespace: "default".to_string(),
         scope: PolicyScope::Namespace {
@@ -754,6 +883,7 @@ fn request_authentication_optional_fields_omitted_when_default() {
 #[test]
 fn request_authentication_meshwide_scope() {
     let ra = MeshRequestAuthentication {
+        refused: false,
         name: "global-jwt".to_string(),
         namespace: "istio-system".to_string(),
         scope: PolicyScope::MeshWide,
@@ -779,6 +909,7 @@ fn mesh_config_with_request_authentications_round_trips() {
     let cfg = GatewayConfig {
         mesh: Some(Box::new(MeshConfig {
             request_authentications: vec![MeshRequestAuthentication {
+                refused: false,
                 name: "test-ra".to_string(),
                 namespace: "default".to_string(),
                 scope: PolicyScope::Namespace {
@@ -806,4 +937,78 @@ fn mesh_config_with_request_authentications_round_trips() {
     assert_eq!(mesh.request_authentications.len(), 1);
     assert_eq!(mesh.request_authentications[0].name, "test-ra");
     assert_eq!(mesh.request_authentications[0].jwt_rules.len(), 1);
+}
+
+// ── Telemetry closure (issue #6616) ──────────────────────────────────────
+
+fn telemetry_resource_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "name": "mesh-telemetry",
+        "namespace": "default",
+        "scope": {"kind": "namespace", "namespace": "default"},
+        "config": {
+            "tracing": {
+                "mode": "client_and_server",
+                "sampling_percentage": 10.0,
+                "providers": [
+                    {"kind": "zipkin", "config": {"url": "http://zipkin:9411/api/v2/spans"}}
+                ]
+            },
+            "metrics": {
+                "tag_overrides": [
+                    {"name": "request_protocol", "operation": {"type": "remove"}},
+                    {
+                        "metric": "REQUEST_COUNT",
+                        "name": "team",
+                        "operation": {"type": "set", "value": "payments"}
+                    }
+                ],
+                "disabled_metrics": ["REQUEST_SIZE"]
+            },
+            "access_logging": {"enabled": true, "filter": {"status_code_min": 500}}
+        }
+    })
+}
+
+#[test]
+fn telemetry_resource_round_trips_through_its_closed_schema() {
+    use ferrum_edge::modes::mesh::config::MeshTelemetryResource;
+
+    let parsed: MeshTelemetryResource =
+        serde_json::from_value(telemetry_resource_fixture()).expect("fixture is valid");
+    let reparsed: MeshTelemetryResource =
+        serde_json::from_value(serde_json::to_value(&parsed).expect("serializes"))
+            .expect("serialized form is accepted by the closed schema");
+    assert_eq!(parsed, reparsed);
+}
+
+#[test]
+fn telemetry_resource_rejects_unknown_members_at_every_level() {
+    use ferrum_edge::modes::mesh::config::MeshTelemetryResource;
+
+    for pointer in [
+        "",
+        "/config",
+        "/config/tracing",
+        "/config/tracing/providers/0",
+        "/config/tracing/providers/0/config",
+        "/config/metrics",
+        "/config/metrics/tag_overrides/0",
+        "/config/metrics/tag_overrides/0/operation",
+        "/config/metrics/tag_overrides/1/operation",
+        "/config/access_logging",
+        "/config/access_logging/filter",
+    ] {
+        let mut document = telemetry_resource_fixture();
+        document
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap_or_else(|| panic!("fixture has an object at {pointer:?}"))
+            .insert("misspelled_member".to_string(), serde_json::json!(true));
+        let result = serde_json::from_value::<MeshTelemetryResource>(document);
+        assert!(
+            result.is_err(),
+            "unknown member at {pointer:?} must be rejected"
+        );
+    }
 }

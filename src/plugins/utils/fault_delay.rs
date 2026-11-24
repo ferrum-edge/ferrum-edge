@@ -147,7 +147,6 @@ impl FaultDelayAdmission {
     }
 
     /// Units of work currently parked on an injected delay.
-    #[allow(dead_code)] // Used by external tests; dead in the binary target.
     pub fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::Acquire)
     }

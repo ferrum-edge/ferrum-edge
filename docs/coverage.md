@@ -84,8 +84,9 @@ orchestration:
   the accepted sequence cursor when a full-load or incremental candidate is
   rejected. Unchanged valid database configs commit the sequence cursor and keep
   the gateway available.
-- MongoDB standalone behavior is covered by functional CI against the default
-  `mongo:7` service and intentionally forces database-mode pollers to full
+- MongoDB standalone behavior is covered by functional CI against the
+  `mongo:4.4.29` standalone fixture (the supported floor; the Coverage
+  workflow's standalone fixture is `mongo:9`) and intentionally forces database-mode pollers to full
   reloads instead of accepting non-transactional incremental cursors. MongoDB
   replica-set transaction/incremental behavior requires a replica-set topology
   and is tracked here as a backend-specific coverage boundary for remote CI
@@ -129,13 +130,9 @@ The current floors are set in the `env` block of `.github/workflows/coverage.yml
 | `src/plugins/` line coverage | **89.00%** (`MIN_PLUGINS_LINE_COVERAGE`) | Full matrix only |
 | Changed coverable `src/plugins/` lines | **84.98%** (`MIN_CHANGED_PLUGIN_LINE_COVERAGE`) | Plugin and shard-scoped PR plans only (not selected by the active planner; see below) |
 
-Floors are rounded down from measured remote values so presentation precision
-does not fail a run, while any real drop still fails the full gate. The gate
-was introduced on 2026-06-20 at 78.28% overall / 84.98% plugins (measured
-`210900/269397` and `54957/64665` lines). The overall and plugin floors were
-raised after the functional shards landed; run 36117488050 measured 82.79%
-overall (`526,752/636,227` lines) and 90.81% for `src/plugins/`
-(`154,123/169,721` lines).
+Floors are deliberately below measured main coverage to allow run-to-run
+variance; raise them deliberately after coverage improves, rather than pinning
+them to a measured peak (measured provenance is in the `coverage.yml` comments).
 
 The active planner, `select_plan` in `.github/scripts/coverage_plan.py`,
 treats coverage as a main-branch backstop:
@@ -148,9 +145,13 @@ treats coverage as a main-branch backstop:
   matrix so the tooling change is exercised before it lands.
 - Push to `main`, `schedule`, `workflow_dispatch`, empty or unavailable diffs,
   and malformed or hostile changed-path transport fail closed to the full
-  matrix (lib-unit, the five scoped integration shards, the two
-  integration-remainder shards, and the three functional shards), which
-  enforces the overall and `src/plugins/` floors. Classifiable
+  matrix (the five split unit shards — `unit-lib`, `unit-core`,
+  `unit-plugins-a`, `unit-plugins-b`, and `unit-gateway-core` — the five scoped
+  integration shards, the two integration-remainder shards, and the three
+  functional shards), which enforces the overall and `src/plugins/` floors.
+  `unit-core` is the designated `ci-coverage` cache producer; `coverage.yml`
+  still accepts legacy `lib-unit` rows for rollback safety and fails packaging
+  if any shard writes zero `.profraw` files. Classifiable
   paths use the conservative repository-relative `[A-Za-z0-9._+@~ /-]`
   alphabet, so Markdown controls cannot alter the Coverage Plan summary. A
   skipped planned shard cannot green the merge aggregate.
@@ -162,14 +163,14 @@ treats coverage as a main-branch backstop:
 possible future opt-in; the workflow does not currently use it. When selected,
 it works as follows:
 
-- Plugin-only diffs use the plugin mode: they run the `lib-unit` shard
-  (`--lib` and the four unit targets) and the merge job reuses that shard's
+- Plugin-only diffs use the plugin mode: they run the five split unit shards
+  (`--lib` and the four unit targets) and the merge job reuses those shards'
   profraw/artifacts instead of re-collecting coverage. Only this mode and the
   shard-scoped mode enforce the changed-line plugin gate
   (`MIN_CHANGED_PLUGIN_LINE_COVERAGE`) on coverable `src/plugins/` lines; mixed
   plugin and core changes select the affected core shards and keep that gate.
-- Classifiable core diffs run a shard-scoped plan: `lib-unit` plus only the
-  integration shards that own the changed tree. `src/admin/**` selects the
+- Classifiable core diffs run a shard-scoped plan: the five split unit shards
+  plus only the integration shards that own the changed tree. `src/admin/**` selects the
   admin shards, `src/modes/mesh/**` the mesh shards, and protocol trees such as
   `src/http3/**` the protocol data-plane shard. Shared runtime trees
   (`src/config/**`, `src/config_delta.rs`, `src/proxy/**`, `src/dns/**`,
@@ -181,7 +182,7 @@ it works as follows:
   shard reports do not enforce the overall or `src/plugins/` floors, which are
   only meaningful on the complete matrix.
 - Dependency/build-graph inputs (`Cargo.toml`, `Cargo.lock`, `build.rs`,
-  `proto/**`, `ebpf/**`, `.cargo/**`, `rust-toolchain.toml`) and unknown
+  `build/**`, `proto/**`, `ebpf/**`, `.cargo/**`, `rust-toolchain.toml`) and unknown
   coverage-relevant paths fail closed to the full matrix; diffs with no
   coverage-relevant files skip.
 
@@ -242,21 +243,6 @@ regressions:
   instances with unique Redis prefixes that each complete and token-release
   independently.
 
-Latest opt-in functional benchmark: **81.68% line coverage**
-(`148,432/181,717` lines), captured locally on 2026-05-25 with
-`rustc 1.95.0 (59807616e 2026-04-14)`. This is not the scheduled CI baseline
-because functional coverage is heavier and depends on subprocess-based
-fixtures, but it is the current top-gap benchmark for tracking progress toward
-90%.
-
-The 81.68% profile used:
-
-- `scripts/coverage.sh --functional`
-- `scripts/coverage.sh --functional-filter functional_cp_dp`
-- `scripts/coverage.sh --functional-filter functional_cp_dp_resilience`
-- `scripts/coverage.sh --functional-filter functional_grpc`
-- `scripts/coverage.sh --functional-filter functional_load_balancer`
-
 The default `--functional` filters include coverage-aware TCP/UDP/Mongo and
 common-harness subprocess paths. Broad filters such as `h3`, and additional
 legacy functional filters, can still select tests that under-report
@@ -283,6 +269,27 @@ coverage shard, so ignored live-store regressions stay outside coverage.
 every declared module to reach exactly one of a scoped filter or the
 remainder. It also rejects a scoped filter that matches no registered module.
 Path-scoped plans never select the remainder shards.
+
+Every integration shard sets
+`LLVM_PROFILE_FILE_NAME=ferrum-edge-integration-%4m.profraw`, the same pooling
+the functional shards use. nextest runs each test in its own process, and
+cargo-llvm-cov's default `%p` name gave each one an ~11 MB profile:
+
+- `mesh-routing` wrote 357 files (3.7 GB) in under 20 seconds.
+  `integration-remainder-1` wrote 881 files (9.1 GB) during its ~2-minute test
+  step.
+- Those profiles were then copied again into the shard tar (6.9 GB and 12.4 GB).
+- `mesh-routing` lost its hosted runner twice, once during its test step and
+  once while writing its tar (2026-11-12/13).
+
+Pooled, the processes of each instrumented binary merge online into at most
+four files: about 41 MB for `integration_tests`. A shard whose tests also run
+the instrumented `ferrum-cni` binary (`mesh-platform`'s `cni_tests`) gets a
+second pool of four. The shard tar shrinks to the ~3.4 GB of instrumented
+binaries. In two benchmark runs per mode, pooled `mesh-routing` recorded 206
+more covered lines (identical within each mode), while
+`integration-remainder-1` varied by up to ~330 lines between runs in either
+mode. The coverage floors are unchanged.
 
 ## Functional coverage shards
 
@@ -345,14 +352,17 @@ and streams its single tar member through `unzip -p` into `tar -xpf -`.
 This avoids writing and rereading the intermediate uncompressed tar. It stages
 only one compressed archive at a time and preserves the planner's sequential
 extraction/overwrite order for objects and other shared paths. No objects are
-stripped, deduplicated, renamed, or selected differently; no profiles are
-pre-merged.
+stripped, deduplicated, renamed, or selected differently, and the fan-in does
+not merge profiles across shards (within a shard, the pooled names above already
+merge each binary's processes online).
 
 Raw profiles are the exception to shared-path overwriting (#6378). Their
 target-relative names can coincide across runners. cargo-llvm-cov's default
 `<package>-%p-%Nm.profraw` name repeats when two runners reuse a pid for the
-same binary signature. The functional shards' pooled
-`ferrum-edge-functional-%4m.profraw` name carries only the binary signature.
+same binary signature. The pooled `ferrum-edge-functional-%4m.profraw` and
+`ferrum-edge-integration-%4m.profraw` names carry no pid. Each expands to the
+binary signature plus a pool index (0-3), so the same names recur across every
+shard of that kind.
 Right after each shard's tar is extracted, every `*.profraw` it produced is
 renamed in place to `<name>.fanin-<shard>.profraw`, before the next shard is
 extracted. An existing destination fails the step. `cargo llvm-cov report`
@@ -370,46 +380,12 @@ ignore regex, full/changed-line gates, and exact-SHA publication evidence are
 unaffected by this transport (floors: see
 [CI Baseline And Gates](#ci-baseline-and-gates)).
 
-Observations from two successful main runs on 2026-09-06, before streaming
-extraction was introduced:
-
-| Measurement | [34008463617](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34008463617) | [34018271783](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34018271783) |
-| --- | ---: | ---: |
-| Source SHA | `5d586f5e013ec4ea7d0ed573c604bb2ddade4e2f` | `aa251c3326c8d237e46bf8b7346861cec6c7aaf4` |
-| Lib/unit job | 28m02s | 33m39s |
-| Integration job range | 13m07s–14m31s | 17m21s–18m10s |
-| Sum of six shard job durations | 96m12s | 121m55s |
-| Merge Coverage job | 9m58s | 12m10s |
-| Download/extract step | 5m58s | 7m11s |
-| Report generation | 2m22s | 2m53s |
-| Total uploaded shard ZIP bytes | 7,492,574,957 | 7,531,180,534 |
-
-The job-duration sum measures elapsed runner time, excluding queueing, rather
-than billing-rounded minutes. API artifact sizes are exact; the expanded tar
-sizes below are only the rounded `ls -lh` values in the packaging logs, not
-exact extracted-file byte counts.
-
-| Shard | Historical ZIP bytes | Historical tar | Latest ZIP bytes | Latest tar |
-| --- | ---: | ---: | ---: | ---: |
-| lib-unit | 872,186,168 | 4.0 GiB | 878,861,708 | 4.1 GiB |
-| admin-api | 1,205,668,583 | 4.8 GiB | 1,212,123,854 | 4.8 GiB |
-| admin-config | 1,340,759,632 | 5.2 GiB | 1,347,138,224 | 5.3 GiB |
-| mesh-routing | 1,307,752,897 | 5.1 GiB | 1,314,158,779 | 5.2 GiB |
-| mesh-platform | 1,338,184,871 | 5.2 GiB | 1,344,557,956 | 5.3 GiB |
-| protocols-data-plane | 1,428,022,806 | 5.5 GiB | 1,434,340,013 | 5.6 GiB |
-
-Log timestamps put download-to-extract intervals at approximately 3m15s and
-4m43s in total, with the remaining approximately 2m43s and 2m28s spent in
-extraction, cleanup, and other step overhead. The old download interval itself
-includes ZIP decompression and writing the expanded tar, so these are not pure
-network measurements. Streaming removes about 30 GiB of intermediate tar writes
-and rereads per full run; its net wall-time benefit was not measured in these
-runs. ZIP size, upload cost, and report-generation cost
-are not expected to improve. These different-SHA runs are timing evidence, not
-a same-source coverage-equivalence comparison. Identical cross-run object
-content and the cost of duplicate workspace metadata have not been established.
-The latest lib/unit log reports 21m07s compilation and about 9m26s running its
-two suites; streaming extraction does not address compilation latency.
+Pre-streaming timing measurements were taken from successful main runs
+[34008463617](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34008463617)
+and [34018271783](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34018271783)
+on 2026-09-06 (issue #4670). Streaming removes the intermediate tar writes and
+rereads (its net wall-time benefit was not measured); ZIP size, upload cost,
+report generation, and compilation latency are not expected to improve.
 
 Hosted workflow regression tests exercise the actual transport shell using
 small ZIP/tar fixtures: forced ZIP64 headers, pagination, unplanned artifacts,
@@ -428,46 +404,3 @@ conditions, and an `always()` job can continue after cancellation
 Both sampled runs succeeded, so they do not measure a cancellation delay.
 The required aggregate's existing `always()` and failure semantics are retained;
 changing cancellation behavior needs a dedicated failing/cancelled-run check.
-
-## Lowest-Covered Modules (historical snapshot)
-
-> **Historical.** The table and percentages below are a dated local baseline
-> snapshot retained for archaeology. They are **not** a current coverage claim
-> and must not drive "next priority" planning without regenerating from a fresh
-> `scripts/coverage.sh` / CI coverage artifact. Prefer timeless guidance: raise
-> coverage where new code lands; do not treat this table as the live gap list.
-
-Measured from a prior local baseline run. Percentages are line coverage.
-
-| Module | Coverage | Assessment |
-| --- | ---: | --- |
-| `src/main.rs` | 0.00% | Binary startup and process-exit paths are not exercised by lib/unit/integration coverage; keep most testing in CLI/startup helpers and functional smoke tests. |
-| `src/http3/` | 23.69% | Protocol integration candidate; the server, WebSocket, and cross-protocol fallback paths need QUIC/H3 stream fixtures. |
-| `src/bin/ferrum-cni.rs` | 49.64% | CLI-style binary path; targeted command parsing and error-path tests should be cheap. |
-| `src/cli.rs` | 54.68% | Easy win; parser, path resolution, and health/version/reload branches are deterministic. |
-| `src/runtime_metrics_tracing_layer.rs` | 58.33% | Easy win; small classification layer with bounded pure functions plus one untested event-recording path. |
-| `src/health_check.rs` | 60.95% | Mixed candidate; passive health is unit-friendly, while active HTTP/gRPC probes need mocked backends. |
-| `src/identity/` | 63.03% | Integration-test candidate; rotation and Workload API paths involve async CA/SPIFFE flows and long-running tasks. |
-| `src/proxy/` | 64.81% | High-value integration candidate; hot-path protocol behavior needs focused fixtures rather than broad unit mocks. |
-| `src/tls_offload.rs` | 75.71% | Targeted-test candidate for policy and offload edge cases. |
-| `src/grpc/` | 77.34% | Protocol integration candidate; CP/DP and mesh gRPC failure paths are the likely remaining gaps. |
-
-## Next Test Priorities (historical planning notes)
-
-> **Historical.** The H3-fixture / health-check / identity / CLI / UDP items
-> below were written against the snapshot table above. Substantial H3 fixtures,
-> health-check, identity, CLI, and UDP coverage have landed since; do not treat
-> this list as the current backlog. Regenerate priorities from the latest
-> coverage artifact when prioritizing new tests.
-
-1. `src/http3/`: add a small H3 fixture layer for handshake, request body,
-   WebSocket, and cross-protocol fallback error cases. This was the largest
-   measured gap in core protocol code at snapshot time.
-2. `src/health_check.rs`: cover passive-state transitions and active-probe
-   formatting/error branches with mocked HTTP/gRPC backends.
-3. `src/identity/`: add fake-CA and fake-Workload-API tests for SVID rotation,
-   failed issuance, revision bumps, and trust-bundle refresh behavior.
-4. `src/cli.rs` and `src/bin/ferrum-cni.rs`: add parser/error-path tests for
-   command surfaces.
-5. `src/proxy/udp_proxy.rs` and `src/proxy/udp_batch.rs`: add narrow UDP
-   fixture tests for batching, disconnect, and timeout/error accounting.

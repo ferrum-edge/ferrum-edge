@@ -87,7 +87,6 @@ fn port_scoped_proxy(id: &str, backend_port: u16, listen_port: Option<u16>) -> P
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -251,10 +250,10 @@ fn port_bind_lost_to_external_steal(failures: &[GatewayListenerBindFailure], por
 }
 
 async fn shutdown_serve_handles_before_retry(
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &ferrum_edge::overload::ShutdownSender,
     handles: ferrum_edge::modes::file::ServeHandles,
 ) {
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     tokio::time::timeout(Duration::from_secs(5), handles.join())
         .await
         .expect("a failed attempt must drain before retrying")
@@ -265,7 +264,7 @@ async fn shutdown_serve_handles_before_retry(
 /// `file::serve`. Production still owns every Gateway listener bind.
 struct TwoSameProtocolListenersStartup {
     handles: ferrum_edge::modes::file::ServeHandles,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: ferrum_edge::overload::ShutdownSender,
     listener_a_port: u16,
     listener_b_port: u16,
     global_proxy_port: u16,
@@ -298,7 +297,8 @@ async fn start_two_same_protocol_gateway_listeners(
         let proxy_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let admin_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let global_proxy_port = proxy_http.local_addr().unwrap().port();
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::ZERO);
 
         let handles = match serve(
             test_env_config(0, 0),
@@ -310,7 +310,7 @@ async fn start_two_same_protocol_gateway_listeners(
         {
             Ok(handles) => handles,
             Err(error) => {
-                let _ = shutdown_tx.send(true);
+                shutdown_tx.shutdown();
                 eprintln!(
                     "two-listener startup attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
                      failed before serve returned: {error}"
@@ -346,7 +346,7 @@ async fn start_two_same_protocol_gateway_listeners(
              lost an ephemeral-port race: want active {expected:?}, actual {active:?}, \
              refusals: {bind_failures:?}"
         );
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(5), handles.join())
             .await
             .expect("a failed two-listener startup attempt must drain before retrying")
@@ -477,7 +477,7 @@ async fn two_same_protocol_gateway_listeners_bind_and_route_independently() {
         "the global plaintext bind must not guess between two same-protocol Gateway listeners"
     );
 
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
 }
 
@@ -500,7 +500,8 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
 
         let proxy_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let admin_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::ZERO);
         let handles = serve(
             test_env_config(0, 0),
             config_with(vec![port_scoped_proxy(
@@ -520,7 +521,7 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
                 "reload add/withdraw attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
                  lost declared-port reservation race on port {listener_a_port}"
             );
-            let _ = shutdown_tx.send(true);
+            shutdown_tx.shutdown();
             let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
             if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
                 assert_eq!(
@@ -538,7 +539,7 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
                 "reload add/withdraw attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
                  lost undeclared-port reservation race on port {listener_b_port}"
             );
-            let _ = shutdown_tx.send(true);
+            shutdown_tx.shutdown();
             let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
             if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
                 panic!(
@@ -580,7 +581,7 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
                 "reload add/withdraw attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
                  lost the added-listener bind race on port {listener_b_port}"
             );
-            let _ = shutdown_tx.send(true);
+            shutdown_tx.shutdown();
             let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
             if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
                 panic!("{}", failure.message);
@@ -622,7 +623,7 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
             "the surviving sibling listener keeps serving across the withdrawal"
         );
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
         return;
     }
@@ -644,7 +645,8 @@ async fn matching_global_proxy_port_already_serves_the_gateway_listener() {
     let admin_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let global_proxy_port = proxy_http.local_addr().unwrap().port();
 
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::ZERO);
     let handles = serve(
         test_env_config(0, 0),
         config_with(vec![port_scoped_proxy(
@@ -675,7 +677,7 @@ async fn matching_global_proxy_port_already_serves_the_gateway_listener() {
         "the exact accepted port must route on the existing global frontend"
     );
 
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
 }
 
@@ -690,7 +692,8 @@ async fn gateway_listener_port_colliding_with_admin_is_refused() {
     let global_proxy_port = proxy_http.local_addr().unwrap().port();
     let admin_port = admin_http.local_addr().unwrap().port();
 
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::ZERO);
     let handles = serve(
         test_env_config(0, 0),
         config_with(vec![port_scoped_proxy("gw-a", backend, Some(admin_port))]),
@@ -712,7 +715,7 @@ async fn gateway_listener_port_colliding_with_admin_is_refused() {
         "a refused listener route must not escape through single-listener remapping"
     );
 
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
 }
 
@@ -739,7 +742,8 @@ async fn refused_gateway_listener_does_not_poison_sibling_and_recovers() {
         let mut sibling = port_scoped_proxy("gw-ok", backend_ok, Some(sibling_port));
         sibling.hosts = vec!["ok.example.com".to_string()];
 
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::ZERO);
         let handles = serve(
             test_env_config(0, 0),
             config_with(vec![refused, sibling]),
@@ -850,7 +854,7 @@ async fn refused_gateway_listener_does_not_poison_sibling_and_recovers() {
             "sibling must remain healthy across recovery"
         );
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
         return;
     }
@@ -1687,6 +1691,19 @@ async fn keep_alive_get(sender: &mut KeepAliveSender, host: &str) -> Option<u16>
         .expect("the keep-alive request neither answered nor closed within 5 s")
 }
 
+/// The status line and `(lowercase name, value)` header pairs of a raw
+/// HTTP/1.1 response.
+fn split_response_head(raw: &str) -> (&str, Vec<(String, String)>) {
+    let head = raw.split("\r\n\r\n").next().unwrap_or("");
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect();
+    (status_line, headers)
+}
+
 /// Issue #5921: a class flip whose replacement binds in the same reconcile
 /// serves the new class as soon as that one reconcile has published, not on
 /// the next retry tick up to 30 s later. A connection the old plaintext
@@ -1737,7 +1754,16 @@ async fn class_flip_serves_the_new_class_within_one_reconcile_and_never_the_old_
             .write_all(b"GET /api/x HTTP/1.1\r\n")
             .await
             .expect("write the request line");
-        // Let the gateway read the request line and settle on HTTP/1.1.
+        // The same, for a native gRPC client: its refusal must keep gRPC
+        // framing and still close the connection (issue #6943).
+        let mut pending_grpc_connection = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect the pending gRPC client");
+        pending_grpc_connection
+            .write_all(b"POST /api/x HTTP/1.1\r\n")
+            .await
+            .expect("write the gRPC request line");
+        // Let the gateway read the request lines and settle on HTTP/1.1.
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let outcome = harness.state.update_config(config_for(port, true));
@@ -1839,6 +1865,50 @@ async fn class_flip_serves_the_new_class_within_one_reconcile_and_never_the_old_
             raw.contains("\r\nconnection: close\r\n"),
             "a 421 must close the old connection: {raw:?}"
         );
+        // A native gRPC client gets the same refusal as a Trailers-Only
+        // `UNAVAILABLE`, which its runtime retries on a new connection, and
+        // the HTTP/1.1 connection still closes.
+        pending_grpc_connection
+            .write_all(
+                format!(
+                    "Host: {ANY_HOST}\r\nContent-Type: application/grpc\r\n\
+                     Content-Length: 0\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("finish the pending gRPC request");
+        let mut raw = Vec::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            pending_grpc_connection.read_to_end(&mut raw),
+        )
+        .await
+        .expect("the retired gRPC connection must answer and close within 5 s");
+        let raw = String::from_utf8_lossy(&raw);
+        let (status_line, headers) = split_response_head(&raw);
+        assert!(
+            status_line.starts_with("HTTP/1.1 200 "),
+            "a native gRPC refusal is Trailers-Only HTTP 200: {raw:?}"
+        );
+        for (name, expected) in [
+            ("content-type", "application/grpc"),
+            ("grpc-status", "14"),
+            (
+                "grpc-message",
+                "Gateway listener retired; retry on a new connection",
+            ),
+            ("connection", "close"),
+        ] {
+            assert_eq!(
+                headers
+                    .iter()
+                    .find(|(header, _)| header == name)
+                    .map(|(_, value)| value.as_str()),
+                Some(expected),
+                "{name} on the retired gRPC refusal: {raw:?}"
+            );
+        }
         // Retirement closes an idle keep-alive connection. A request that
         // reaches it before that close is answered 421. It is never served.
         for host in [HOST, ANY_HOST] {
@@ -2037,7 +2107,8 @@ async fn live_listener_scoped_routes_never_404_while_reloads_reconcile() {
         let proxy_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let admin_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let global_proxy_port = proxy_http.local_addr().unwrap().port();
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::ZERO);
         let handles = serve(
             test_env_config(0, 0),
             single_listener_revision(backend, listener_port, 0),
@@ -2107,7 +2178,7 @@ async fn live_listener_scoped_routes_never_404_while_reloads_reconcile() {
             );
         }
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
         return;
     }

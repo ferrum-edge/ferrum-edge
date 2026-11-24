@@ -688,6 +688,7 @@ const LIFECYCLE_HOOKS: &[&str] = &[
     "on_response_stream_terminated",
     "log",
     "on_ws_frame",
+    "on_ws_policy_close",
     "prepare_ws_frame_delivery",
     "emit_ws_frame_delivery",
     "on_ws_disconnect",
@@ -792,8 +793,9 @@ const OPERATIONAL_PHASE_DECLARATIONS: &[OperationalPhaseDeclaration] = &[
         plugin: "ws_frame_logging",
         source: include_str!("../../../src/plugins/ws_frame_logging.rs"),
         hooks: &[
-            // Policy observations (including Close) on the frame chain.
-            ("on_ws_frame", "on_ws_frame"),
+            // Final policy Close decisions, reported once after the full
+            // frame pass whatever this plugin's priority.
+            ("on_ws_policy_close", "on_ws_policy_close"),
             // Delivery observations after a successful destination send.
             ("prepare_ws_frame_delivery", "prepare_ws_frame_delivery"),
             ("emit_ws_frame_delivery", "emit_ws_frame_delivery"),

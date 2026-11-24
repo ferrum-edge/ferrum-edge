@@ -8,8 +8,9 @@
 //!   - **vault** — HashiCorp Vault dev server (testcontainers/Docker).
 //!   - **aws**   — LocalStack Secrets Manager (testcontainers/Docker).
 //!   - **gcp**   — in-process `wiremock` REST fake (no official emulator exists).
-//!   - **azure** — in-process `wiremock` Key Vault fake (challenge auth, dummy
-//!     bearer token; no real Entra ID).
+//!   - **azure** — in-process `wiremock` Key Vault fake behind an in-process
+//!     TLS terminator with a per-fake test CA (trusted via
+//!     `FERRUM_TLS_CA_BUNDLE_PATH`); dummy bearer token, no real Entra ID.
 //!
 //! Every env-mutating test is `#[serial]` and isolates the process environment
 //! with `common::env::EnvGuard`. Container-backed tests self-skip (with a
@@ -24,6 +25,11 @@
 //!   cargo test --features secrets-azure --test secrets_functional azure_backend
 
 mod common;
+// The registry-backed port allocator and the shared gateway harness, included
+// the same way `service_integration` does, so the startup smoke spawns the
+// gateway under the same rules as every functional spawner.
+#[path = "../scaffolding/mod.rs"]
+mod scaffolding;
 
 mod cross_backend;
 mod file_backend;

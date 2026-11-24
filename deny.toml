@@ -8,9 +8,10 @@
 #   cargo install --locked cargo-deny
 #   cargo deny check advisories bans sources licenses   # the blocking gate (see CI)
 #
-# CI runs `cargo deny check advisories bans sources licenses` on every PR that
-# touches a dependency surface (Cargo.toml/Cargo.lock/deny.toml/vendor/**) and on
-# a weekly schedule (.github/workflows/dependency-audit.yml). The advisories and
+# CI runs `cargo deny check advisories bans sources licenses` in the
+# `dependency-audit` job of .github/workflows/ci.yml whenever the PR planner
+# selects the full dependency-audit lane, and on a weekly schedule
+# (.github/workflows/dependency-audit.yml). The advisories and
 # licenses checks are BLOCKING: a new RUSTSEC advisory that is not explicitly
 # ignored below fails CI, and any dependency whose SPDX expression is outside the
 # allowlist (or below the confidence threshold) fails CI.
@@ -23,7 +24,7 @@
 [graph]
 # Evaluate the full dependency graph including all optional features, so
 # feature-gated backends (cloud secret providers, MySQL, MongoDB, GeoIP) are
-# audited even though `default = []`.
+# audited even though they are not default features (`default = ["crypto-ring"]`).
 all-features = true
 
 [advisories]
@@ -49,8 +50,7 @@ unused-ignored-advisory = "deny"
 # exception register"):
 #   - RUSTSEC-2026-0118 / RUSTSEC-2026-0119 (hickory-proto 0.25.2): mongodb 3.7
 #     moved its SRV resolver to hickory 0.26; Cargo.toml now requires
-#     >=3.7, <3.9 (the lockfile resolves 3.8.2). The cap keeps MongoDB 4.2:
-#     3.9 raised the driver's minimum wire version to 9 (MongoDB 4.4).
+#     3.9.1 (the lockfile resolves 3.9.1).
 #   - RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.101.7) and
 #     RUSTSEC-2026-0258 (h2 0.3.27): all came from the AWS SDK's legacy
 #     `rustls` feature (hyper 0.14 / rustls 0.21 connector), which
@@ -58,27 +58,14 @@ unused-ignored-advisory = "deny"
 #     `default-https-client` instead.
 #   - RUSTSEC-2025-0134 (rustls-pemfile, unmaintained): PEM parsing moved to
 #     the rustls-pki-types `PemObject` API and the dependency was dropped.
+#
+# Retired 2026-11-20 by the SQLx 0.9.1 migration, which made both fixes
+# reachable (root, fuzz/ and tests/performance/mesh/ lockfiles):
+#   - RUSTSEC-2023-0071 (rsa, Marvin timing side-channel): RustSec lists
+#     `patched = [">= 0.10.0"]`, and sqlx-mysql 0.9.1 resolves rsa 0.10.0.
+#   - RUSTSEC-2026-0459 (libsqlite3-sys bundling SQLite < 3.54.0): sqlx-sqlite
+#     0.9.1 allows `>=0.30.1, <0.41`, and the lockfiles resolve 0.40.0.
 ignore = [
-    # ── rsa 0.9.10 — RUSTSEC-2023-0071, the Marvin timing side-channel in
-    # private-key operations. There is still no fixed release: RustSec lists
-    # `patched = []`; rsa 0.9.10 is the latest stable and 0.10.0-rc.18 (the
-    # latest pre-release, already required by sqlx 0.9.0) is still affected
-    # (checked 2026-09-24). Two parents reach it:
-    #   - sqlx-mysql 0.8.6 uses only `RsaPublicKey` OAEP *encryption* of the
-    #     password for MySQL `sha256_password` / `caching_sha2_password` over a
-    #     non-TLS link. That is a public-key operation, so the timing leak is not
-    #     reachable there, and FERRUM_DB_TLS_MODE avoids the exchange entirely.
-    #   - jsonwebtoken 10's `rust_crypto` backend, selected by the default
-    #     `crypto-ring` profile (`fips` selects `aws_lc_rs` instead). RS*/PS*
-    #     verification is a public-key operation, but RSA *signing* of outbound
-    #     client assertions (`private_key_jwt` in oidc_relying_party and
-    #     oauth2_introspection, ai_federation service-account JWTs) runs on the
-    #     non-constant-time implementation. For oidc_relying_party and
-    #     oauth2_introspection, EC/EdDSA assertion keys or the `fips` profile
-    #     avoid it. ai_federation always signs RS256 (GCP service-account keys
-    #     are RSA), so only the `fips` profile avoids it there.
-    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing side-channel; no fixed release (patched = [], 0.9.10 latest stable, 0.10.0-rc.18 still affected, checked 2026-09-24). sqlx-mysql does public-key encryption only; jsonwebtoken rust_crypto (crypto-ring profile) signs RSA client assertions (avoided with EC/EdDSA keys or the fips profile for oidc_relying_party/oauth2_introspection; ai_federation always signs RS256, so only fips avoids it there). Re-evaluate on an rsa fix. [expires:2026-12-31]" },
-
     # ── paste 1.0.15 — RUSTSEC-2024-0436, unmaintained (repository archived).
     # A proc-macro only: it runs at compile time and has no runtime or network
     # surface. Parents: tikv-jemalloc-ctl (0.6.1, and still `paste ^1` in the
@@ -108,11 +95,53 @@ ignore = [
     # and the two event parsers to a safe-Rust YAML parser (saphyr /
     # serde-saphyr).
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml 0.2.11 unmaintained (archived 2024-03-25, patched = [], informational, no known vulnerability). Parents: serde_yaml 0.9.34+deprecated and the direct bounded-alias event parsers (api_specs/bounded_yaml.rs, config/yaml_alias_budget.rs). Inputs are operator-controlled config files/ConfigMap or authenticated, budget-bounded Admin API spec bodies. serde_yaml forks still use unsafe-libyaml; retire by migrating serde_yaml and both event parsers to a safe-Rust parser (saphyr/serde-saphyr). [expires:2026-12-31]" },
+
+    # ── astral-tokio-tar 0.6.2 — RUSTSEC-2026-0440, unmaintained (Astral ended
+    # maintenance on 2026-11-03; `patched = []`, every version deprecated). An
+    # informational advisory, not a known vulnerability. One parent reaches it:
+    #   - testcontainers 0.28.0 (the latest release, checked 2026-11-06), a
+    #     dev-dependency used only by the `secrets_functional` and
+    #     `service_integration` test targets to start local OSS containers.
+    # It is not in the shipped binary or images: it is only in the root
+    # Cargo.lock (not fuzz/, ebpf/, or tests/performance/*), and the tar
+    # streams it handles are Docker build contexts and copy-to-container
+    # payloads built from repository test fixtures. Upstream is replacing it
+    # with `tar` (testcontainers/testcontainers-rs#1006, open); retire this
+    # when a testcontainers release ships that change.
+    { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar 0.6.2 unmaintained (Astral ended maintenance 2026-11-03, patched = [], informational, no known vulnerability). Only parent is testcontainers 0.28.0 (latest, checked 2026-11-06), a dev-dependency of the secrets_functional and service_integration test targets; not in the shipped binary or images. Retire when a testcontainers release replaces it (testcontainers-rs#1006). [expires:2026-12-31]" },
+
+    # ── chrono 0.4.45 — RUSTSEC-2026-0543, unmaintained (announced in
+    # chronotope/chrono#1768, opened 2026-01-22; RustSec advisory issued
+    # 2026-11-17; all versions affected, no patched release). An
+    # informational advisory, not a known vulnerability. Re-evaluated
+    # 2026-11-22 (issue #7419 Phase 1) against cargo-deny's own inclusion graph
+    # (all features):
+    #   - ferrum-edge itself: a direct dependency in ~535 Rust files
+    #     (config-model timestamps, the database layer, Admin API output);
+    #     tests/performance/mesh/ also declares it directly.
+    #   - sqlx 0.9.1 through our `chrono` feature: sqlx-core (vendored),
+    #     sqlx-postgres, sqlx-mysql and sqlx-sqlite.
+    # Resolved in Phase 1: google-cloud-auth was bumped from 1.13.0 to 1.17.0
+    # (with matching google-cloud-gax 1.15.0 / google-cloud-gax-internal 0.7.19 /
+    # google-cloud-secretmanager-v1 1.14.0), which uses jiff and no longer pulls
+    # chrono. `src/time_compat.rs` adds the `time`-backed compatibility layer
+    # preserving byte-identical serde and SQL (SQLite/MySQL/Postgres/Any) formats.
+    # Not a parent: serde_with 3.21.0 lists chrono in Cargo.lock only
+    # because Cargo records optional dependencies named by weak `dep?/feature`
+    # entries (rust-lang/cargo#10801). Nothing enables serde_with's chrono
+    # feature, so it is not compiled and cargo-deny does not report it; the
+    # mongodb, testcontainers and google-cloud-* paths to serde_with do not
+    # bring chrono in.
+    # Retire by migrating ferrum-edge (and tests/performance/mesh/) to
+    # `time_compat` / `time` with byte-identical timestamps in the database,
+    # Admin API, config files, openapi.yaml and ferrum-contracts, then dropping
+    # the direct `chrono` dep and sqlx's `chrono` feature.
+    { id = "RUSTSEC-2026-0543", reason = "chrono 0.4.45 unmaintained (chronotope/chrono#1768, all versions, patched = [], informational, no known vulnerability). Compiled-in parents (cargo-deny graph, updated 2026-11-22 after Phase 1 bumped google-cloud-auth to 1.17.0): ferrum-edge (direct, ~535 files) and sqlx 0.9.1 chrono feature (sqlx-core/-postgres/-mysql/-sqlite). serde_with 3.21.0 lists chrono in Cargo.lock only through weak features (cargo#10801) and does not compile it. Retire by completing the phased migration of ferrum-edge to time_compat/time and dropping sqlx's chrono feature (issue #7419). [expires:2026-12-31]" },
 ]
 
 [bans]
 # The repo intentionally carries duplicate major versions during build-out
-# (for example tungstenite 0.28+0.29 and the RustCrypto digest 0.10/0.11 lines).
+# (for example tungstenite 0.29+0.30 and the RustCrypto digest 0.10/0.11 lines).
 # Surface them as warnings for visibility without blocking PRs.
 #
 # FIPS profile (issue #3510): `--no-default-features --features fips` adds

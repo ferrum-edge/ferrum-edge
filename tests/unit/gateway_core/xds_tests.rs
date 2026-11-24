@@ -11,7 +11,6 @@ use ferrum_edge::modes::mesh::config::{
     TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshExtensionConfig;
-use ferrum_edge::xds::conformance::{XdsConformanceCase, required_phase_b_cases};
 use ferrum_edge::xds::proto;
 use ferrum_edge::xds::{
     AckOutcome, CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
@@ -100,8 +99,9 @@ fn mesh_config() -> MeshConfig {
         peer_authentications: vec![PeerAuthentication {
             name: "default-mtls".to_string(),
             namespace: "default".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "default".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -139,6 +139,7 @@ fn mesh_slice_is_per_namespace_and_policy_scoped() {
         enforce_sidecar_identity_narrowing: false,
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
         waypoint_name: None,
     };
     let slice = MeshSlice::from_gateway_config(&gateway_config(), request);
@@ -275,6 +276,7 @@ fn service_entry_workload_selector_does_not_hide_visible_entry() {
         enforce_sidecar_identity_narrowing: false,
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
         waypoint_name: None,
     };
 
@@ -439,11 +441,6 @@ fn nonce_tracker_keeps_ack_state_per_node_and_type_url() {
         tracker.record_response("node-a", RDS_TYPE_URL, &rds_nonce, "v1", None),
         AckOutcome::Acked
     );
-    assert_eq!(
-        tracker.last_error("node-a", LDS_TYPE_URL),
-        Some("bad listener".to_string())
-    );
-    assert_eq!(tracker.last_error("node-a", RDS_TYPE_URL), None);
 }
 
 #[test]
@@ -489,8 +486,46 @@ fn nonce_tracker_rejects_missing_unknown_and_stale_nonces() {
     );
 }
 
+/// The peer-supplied `response_nonce` / `version_info` carried by the
+/// `StaleNonce` / `VersionDrift` outcomes are Debug-formatted into the CP's
+/// "xDS ACK ignored" warn line, so a hostile megabyte value must come back
+/// bounded like the NACK message (GHSA-pwf8-cvp7-cm5w, residue of #4813).
 #[test]
-fn nonce_tracker_clears_error_on_new_issue_and_removes_one_node_only() {
+fn nonce_tracker_bounds_hostile_megabyte_stale_nonce_and_drift_version() {
+    let bound = ferrum_edge::xds::MAX_XDS_LOG_VALUE_CHARS + "(truncated)".len();
+    let hostile = "n".repeat(1024 * 1024);
+    let tracker = XdsNonceTracker::new();
+    let current = tracker.issue_nonce("node-a", LDS_TYPE_URL, "v1");
+
+    let AckOutcome::StaleNonce { expected, actual } =
+        tracker.record_response("node-a", LDS_TYPE_URL, &hostile, "v1", None)
+    else {
+        panic!("a nonce other than the last issued one must be StaleNonce");
+    };
+    assert_eq!(expected, current);
+    assert!(
+        actual.len() <= bound,
+        "stale nonce must be bounded, got {} bytes",
+        actual.len()
+    );
+    assert!(actual.ends_with("(truncated)"));
+
+    let AckOutcome::VersionDrift { expected, actual } =
+        tracker.record_response("node-a", LDS_TYPE_URL, &current, &hostile, None)
+    else {
+        panic!("a matching nonce with a different version must be VersionDrift");
+    };
+    assert_eq!(expected, "v1");
+    assert!(
+        actual.len() <= bound,
+        "drifted version must be bounded, got {} bytes",
+        actual.len()
+    );
+    assert!(actual.ends_with("(truncated)"));
+}
+
+#[test]
+fn nonce_tracker_accepts_a_new_issue_after_a_nack_and_removes_one_node_only() {
     let tracker = XdsNonceTracker::new();
     let failed = tracker.issue_nonce("node-a", LDS_TYPE_URL, "v1");
     let node_b = tracker.issue_nonce("node-b", LDS_TYPE_URL, "v1");
@@ -501,13 +536,8 @@ fn nonce_tracker_clears_error_on_new_issue_and_removes_one_node_only() {
             message: "bad listener".to_string()
         }
     );
-    assert_eq!(
-        tracker.last_error("node-a", LDS_TYPE_URL),
-        Some("bad listener".to_string())
-    );
 
     let corrected = tracker.issue_nonce("node-a", LDS_TYPE_URL, "v2");
-    assert_eq!(tracker.last_error("node-a", LDS_TYPE_URL), None);
     assert_eq!(tracker.len(), 2);
     assert_eq!(
         tracker.record_response("node-a", LDS_TYPE_URL, &corrected, "v2", None),
@@ -520,15 +550,6 @@ fn nonce_tracker_clears_error_on_new_issue_and_removes_one_node_only() {
         tracker.record_response("node-b", LDS_TYPE_URL, &node_b, "v1", None),
         AckOutcome::Acked
     );
-}
-
-#[test]
-fn phase_b_conformance_stubs_cover_known_xds_edges() {
-    let cases = required_phase_b_cases();
-    assert!(cases.contains(&XdsConformanceCase::ResourceRemovalDuringUpdate));
-    assert!(cases.contains(&XdsConformanceCase::PartialNackPerTypeUrl));
-    assert!(cases.contains(&XdsConformanceCase::VersionDriftRejected));
-    assert!(cases.contains(&XdsConformanceCase::DeltaSubscribeUnsubscribe));
 }
 
 // ── GAP-2L.3: ECDS (Extension Config Discovery Service) ──
@@ -554,6 +575,7 @@ fn slice_with_extension_configs(configs: Vec<MeshExtensionConfig>) -> MeshSlice 
         enforce_sidecar_identity_narrowing: false,
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
         waypoint_name: None,
     };
     let config = GatewayConfig {

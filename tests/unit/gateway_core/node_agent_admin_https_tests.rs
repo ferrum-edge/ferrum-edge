@@ -509,7 +509,8 @@ async fn https_only_starts_when_http_port_is_zero() {
         admin_bind_address: "127.0.0.1".into(),
         ..EnvConfig::default()
     };
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
     let startup_ready = Arc::new(AtomicBool::new(false));
 
     let handles =
@@ -521,7 +522,7 @@ async fn https_only_starts_when_http_port_is_zero() {
         "HTTPS-only must spawn at least the HTTPS listener task"
     );
 
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     for handle in handles {
         let _ = tokio::time::timeout(Duration::from_secs(5), handle)
             .await
@@ -549,7 +550,8 @@ async fn dual_listeners_start_http_and_https() {
         admin_bind_address: "127.0.0.1".into(),
         ..EnvConfig::default()
     };
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
     let startup_ready = Arc::new(AtomicBool::new(false));
 
     let handles =
@@ -562,7 +564,7 @@ async fn dual_listeners_start_http_and_https() {
         handles.len()
     );
 
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     for handle in handles {
         let _ = tokio::time::timeout(Duration::from_secs(5), handle)
             .await
@@ -585,7 +587,8 @@ async fn invalid_tls_fails_before_plaintext_fallback() {
         admin_bind_address: "127.0.0.1".into(),
         ..EnvConfig::default()
     };
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
     let startup_ready = Arc::new(AtomicBool::new(false));
 
     let err =
@@ -617,7 +620,8 @@ async fn explicit_missing_tls_fails_without_plaintext_fallback() {
         admin_bind_address: "127.0.0.1".into(),
         ..EnvConfig::default()
     };
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
     let startup_ready = Arc::new(AtomicBool::new(false));
 
     let err =
@@ -653,7 +657,8 @@ async fn inherited_https_default_keeps_http_only_compatible() {
         admin_bind_address: "127.0.0.1".into(),
         ..EnvConfig::default()
     };
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
     let startup_ready = Arc::new(AtomicBool::new(false));
 
     let handles =
@@ -662,7 +667,7 @@ async fn inherited_https_default_keeps_http_only_compatible() {
             .expect("inherited HTTPS default without TLS must stay HTTP-only");
     assert_eq!(handles.len(), 1, "only the HTTP listener should start");
 
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     for handle in handles {
         let _ = tokio::time::timeout(Duration::from_secs(5), handle)
             .await
@@ -694,7 +699,8 @@ async fn https_bind_failure_rolls_back_http_listener() {
         admin_bind_address: "127.0.0.1".into(),
         ..EnvConfig::default()
     };
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
     let startup_ready = Arc::new(AtomicBool::new(false));
 
     let err =

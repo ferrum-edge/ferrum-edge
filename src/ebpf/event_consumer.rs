@@ -45,8 +45,6 @@
 //! `__mesh_bpf_metrics` plugin still emits a stable Prometheus surface so
 //! dashboards do not break.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use ferrum_ebpf_common::{
@@ -348,6 +346,32 @@ pub fn drop_reason_delta(last: u64, current: u64) -> u64 {
     }
 }
 
+/// Per-reason comparison baseline after the consumer re-opens its maps.
+///
+/// A pin rotation (`rotated`) means a new map generation: its counters
+/// started at zero after the node-agent restart, and every bypass decision
+/// they hold was made in the window before the inode check noticed, while
+/// this consumer was still reading the orphaned maps — none has been
+/// published. So the baseline is zero and the next poll publishes all of them.
+/// Adopting the new generation's totals instead would silently drop those
+/// decisions, and keeping the old generation's totals would under-report once
+/// the new one climbed past them. A re-open without rotation (ringbuf
+/// resynchronization) reads the same generation this consumer has been
+/// publishing from, so its baseline carries over unchanged.
+pub fn drop_reason_baseline_after_reopen(
+    rotated: bool,
+    previous: [u64; BPF_DROP_REASON_COUNT],
+) -> [u64; BPF_DROP_REASON_COUNT] {
+    if rotated {
+        [0; BPF_DROP_REASON_COUNT]
+    } else {
+        previous
+    }
+}
+
+/// [`production`] re-open reason for a pin-inode change (node-agent restart).
+pub const REOPEN_REASON_PIN_ROTATION: &str = "pin rotation";
+
 /// Bytes of committed, unconsumed ringbuf data implied by a kernel
 /// `(producer_pos, consumer_pos)` pair, or `None` when the pair cannot
 /// describe a ring of `ring_bytes`.
@@ -559,9 +583,10 @@ pub mod production {
 
     use super::{
         BPF_DROP_REASON_COUNT, BPF_DROP_REASON_STATS_SLOTS, PollOutcome,
-        RINGBUF_DRAIN_RECORD_BUDGET, RingBufAttach, RingBufCursor, SOCK_OPS_RECOVERY_THRESHOLD,
-        SockOpsConsumer, SockOpsEvent, drain_outstanding_records, drop_reason_delta,
-        ringbuf_attach, seed_dropped_baseline,
+        REOPEN_REASON_PIN_ROTATION, RINGBUF_DRAIN_RECORD_BUDGET, RingBufAttach, RingBufCursor,
+        SOCK_OPS_RECOVERY_THRESHOLD, SockOpsConsumer, SockOpsEvent, drain_outstanding_records,
+        drop_reason_baseline_after_reopen, drop_reason_delta, ringbuf_attach,
+        seed_dropped_baseline,
     };
     use crate::ebpf::{
         BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH, BPF_SOCK_OPS_EVENTS_PIN_PATH,
@@ -570,6 +595,9 @@ pub mod production {
 
     static MALFORMED_SOCK_OPS_RECORD_WARNED: AtomicBool = AtomicBool::new(false);
     static DROP_REASON_STATS_READ_WARNED: AtomicBool = AtomicBool::new(false);
+    // `read_dropped_total` runs on every ringbuf wakeup; a stats map that
+    // cannot serve the slot fails the same way every time.
+    static DROPPED_TOTAL_READ_WARNED: AtomicBool = AtomicBool::new(false);
     // `wait_for_pinned_maps` retries forever at a 30s cap, and every refusal
     // `attach_events_ring` can raise is a static property of the pinned map:
     // the map info cannot be read, its size is not a non-zero power of two,
@@ -685,7 +713,7 @@ pub mod production {
                             pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
                             "SOCK_OPS pin inode changed (likely node-agent restart); re-opening ringbuf"
                         );
-                        reopen_reason = Some("pin rotation");
+                        reopen_reason = Some(REOPEN_REASON_PIN_ROTATION);
                     }
                 }
                 _ = first_byte_cleanup.tick() => {
@@ -768,7 +796,10 @@ pub mod production {
                         })?;
                     last_dropped_total =
                         seed_dropped_baseline(&consumer, read_dropped_total(&stats));
-                    last_drop_totals = read_drop_reason_totals(&stats);
+                    last_drop_totals = drop_reason_baseline_after_reopen(
+                        reason == REOPEN_REASON_PIN_ROTATION,
+                        last_drop_totals,
+                    );
                     consecutive_drained = 0;
                     events_inode = pin_inode(BPF_SOCK_OPS_EVENTS_PIN_PATH);
                     info!(
@@ -1122,9 +1153,9 @@ pub mod production {
         }
     }
 
-    /// Variant of `open_pinned_maps` that returns silently on "pin not
-    /// present" (used by the retry loop), but still emits a warn for hard
-    /// errors (type mismatch on pinned map).
+    /// Open the pinned SOCK_OPS maps. Returns silently on "pin not present"
+    /// (the retry loop calls this until the node-agent pins them), but still
+    /// emits a warn for hard errors (type mismatch on pinned map).
     fn open_pinned_maps_quiet() -> Option<PinnedSockOpsMaps> {
         let events_map = MapData::from_pin(BPF_SOCK_OPS_EVENTS_PIN_PATH).ok()?;
         let ring_buf = attach_events_ring(events_map)?;
@@ -1145,76 +1176,6 @@ pub mod production {
         };
 
         let sockets_map = MapData::from_pin(BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH).ok()?;
-        let first_byte_sockets = match SockHash::try_from(Map::SockHash(sockets_map)) {
-            Ok(map) => map,
-            Err(e) => {
-                warn!(
-                    pin_path = BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH,
-                    error = %e,
-                    "Pinned accept-first-byte map is not a SockHash; refusing to attach consumer"
-                );
-                return None;
-            }
-        };
-
-        Some((ring_buf, stats, first_byte_sockets))
-    }
-
-    fn open_pinned_maps() -> Option<PinnedSockOpsMaps> {
-        let events_map = match MapData::from_pin(BPF_SOCK_OPS_EVENTS_PIN_PATH) {
-            Ok(m) => m,
-            Err(e) => {
-                info!(
-                    pin_path = BPF_SOCK_OPS_EVENTS_PIN_PATH,
-                    error = %e,
-                    "SOCK_OPS event ringbuf pin not present; TCP-layer counters will stay at zero. \
-                     This is expected when no node-agent is running on the host."
-                );
-                return None;
-            }
-        };
-        let ring_buf = attach_events_ring(events_map)?;
-
-        let stats_map = match MapData::from_pin(BPF_SOCK_OPS_STATS_PIN_PATH) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    pin_path = BPF_SOCK_OPS_STATS_PIN_PATH,
-                    error = %e,
-                    "SOCK_OPS stats pin missing; ringbuf overrun detection disabled but event drain continues"
-                );
-                // Without stats we can't detect overrun, but draining events
-                // is still valuable. Returning None disables the whole
-                // consumer though — to avoid that, build a synthetic empty
-                // stats array isn't possible; surface the disable explicitly.
-                return None;
-            }
-        };
-        let stats: PerCpuArray<MapData, u64> = match PerCpuArray::try_from(Map::PerCpuArray(
-            stats_map,
-        )) {
-            Ok(a) => a,
-            Err(e) => {
-                warn!(
-                    pin_path = BPF_SOCK_OPS_STATS_PIN_PATH,
-                    error = %e,
-                    "Pinned SOCK_OPS stats map is not a PerCpuArray; refusing to attach consumer"
-                );
-                return None;
-            }
-        };
-
-        let sockets_map = match MapData::from_pin(BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    pin_path = BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH,
-                    error = %e,
-                    "Pinned accept-first-byte SockHash missing; deferred hook removal disabled"
-                );
-                return None;
-            }
-        };
         let first_byte_sockets = match SockHash::try_from(Map::SockHash(sockets_map)) {
             Ok(map) => map,
             Err(e) => {
@@ -1430,18 +1391,25 @@ pub mod production {
         match read_stats_slot(stats, SOCK_OPS_STATS_EVENTS_DROPPED) {
             Ok(total) => total,
             Err(e) => {
-                warn!(
-                    pin_path = BPF_SOCK_OPS_STATS_PIN_PATH,
-                    error = %e,
-                    "Failed to read SOCK_OPS dropped-events counter"
-                );
+                // Warn once, like the sibling drop-reason read: this runs on
+                // every ringbuf wakeup, so repeating it would flood the log
+                // with a static failure.
+                if !DROPPED_TOTAL_READ_WARNED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        pin_path = BPF_SOCK_OPS_STATS_PIN_PATH,
+                        error = %e,
+                        "Failed to read SOCK_OPS dropped-events counter; further read \
+                         failures are not logged"
+                    );
+                }
                 0
             }
         }
     }
 
     /// Read every kernel per-CPU drop-reason total for the current map
-    /// generation. Used to adopt a baseline on attach and on pin rotation.
+    /// generation. Used to adopt a baseline on initial attach only; a re-open
+    /// uses [`drop_reason_baseline_after_reopen`].
     ///
     /// A slot that cannot be read yields `0`, which as a BASELINE is the
     /// conservative choice: the next successful poll then publishes the whole

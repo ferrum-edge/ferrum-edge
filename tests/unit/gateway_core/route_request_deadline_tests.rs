@@ -32,9 +32,10 @@ use ferrum_edge::_test_support::{
     await_offered_response_write_for_test, await_route_request_deadline_for_test,
     h3_plain_bridge_backend_request_for_test, h3_route_attempt_bounds_for_test,
     h3_route_deadline_reset_code_for_test, h3_route_deadline_terminal_for_test,
-    h3_route_deadlines_armed_for_test, proxy_body_streaming_for_test,
-    proxy_body_with_client_grpc_deadline_for_test, proxy_body_with_route_request_deadline_for_test,
-    route_deadline_expiry_response_for_test, route_request_deadline_outcome_for_test,
+    h3_route_deadline_wire_bits_for_test, h3_route_deadlines_armed_for_test,
+    proxy_body_streaming_for_test, proxy_body_with_client_grpc_deadline_for_test,
+    proxy_body_with_route_request_deadline_for_test, route_deadline_expiry_response_for_test,
+    route_request_deadline_outcome_for_test,
 };
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, Proxy};
 use ferrum_edge::proxy::auth_lifetime::{
@@ -272,6 +273,38 @@ fn native_http3_answers_a_route_expiry_before_the_head_like_proxy_core() {
     }
 }
 
+/// A total deadline spent before the attempt started dialed nothing, so every
+/// native HTTP/3 surface must report it as never on the wire, exactly as proxy
+/// core does (`handed_to_backend == false`). It must still not count as a
+/// connection failure. Before the typed handoff, the H3 pool error, the
+/// buffered retry-loop result, and the cross-protocol bridge response all
+/// reported `request_on_wire == true` for it, so the request context recorded
+/// an `AmbiguousFailure` that dedup and caching treat as possibly executed.
+#[test]
+fn native_http3_reports_a_route_deadline_spent_before_dispatch_as_never_on_the_wire() {
+    for (expiry, on_wire) in [
+        ("not_started", false),
+        ("in_flight", true),
+        ("attempt_budget", true),
+    ] {
+        let surfaces = ["pool error", "buffered result", "bridge response"];
+        for (surface, (request_on_wire, connection_error)) in surfaces
+            .into_iter()
+            .zip(h3_route_deadline_wire_bits_for_test(expiry))
+        {
+            assert_eq!(request_on_wire, on_wire, "{expiry}: {surface}");
+            assert!(
+                !connection_error,
+                "{expiry}: {surface} must never read as a connection failure"
+            );
+        }
+        // Proxy core's response for the same handoff carries the same bits.
+        let (core, _) = route_deadline_expiry_response_for_test(expiry, on_wire);
+        assert_eq!(core.request_on_wire, on_wire, "{expiry}: proxy core");
+        assert!(!core.connection_error, "{expiry}: proxy core");
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn native_http3_bounds_the_committed_body_by_the_earlier_deadline() {
     let bounds = h3_route_attempt_bounds_for_test;
@@ -282,30 +315,26 @@ async fn native_http3_bounds_the_committed_body_by_the_earlier_deadline() {
 
     // A fresh attempt budget starts now, and the committed body is cut at the
     // earlier of it and the total deadline.
-    let (fresh, body, budget_expired, _) =
-        bounds(Some(total), Some(budget), Some(attempt_deadline));
+    let (fresh, body, _) = bounds(Some(total), Some(budget), Some(attempt_deadline));
     assert_eq!(fresh, Some(attempt_deadline));
     assert_eq!(body, Some(attempt_deadline));
-    assert!(!budget_expired);
-    let (_, body, _, _) = bounds(Some(total), None, None);
+    let (_, body, _) = bounds(Some(total), None, None);
     assert_eq!(body, Some(total));
 
     // The attempt budget alone has expired: the retryable backend timeout.
     tokio::time::advance(budget).await;
-    let (_, _, budget_expired, expiry) = bounds(Some(total), Some(budget), Some(attempt_deadline));
-    assert!(budget_expired);
+    let (_, _, expiry) = bounds(Some(total), Some(budget), Some(attempt_deadline));
     assert_eq!(expiry, "attempt_budget");
 
     // Once the total deadline has elapsed it wins, so the spent transaction
     // is never retried.
     tokio::time::advance(Duration::from_millis(700)).await;
-    let (_, _, budget_expired, expiry) = bounds(Some(total), Some(budget), Some(attempt_deadline));
-    assert!(!budget_expired);
+    let (_, _, expiry) = bounds(Some(total), Some(budget), Some(attempt_deadline));
     assert_eq!(expiry, "in_flight");
 
     // A rule without timeouts arms nothing.
-    let (fresh, body, budget_expired, _) = bounds(None, None, None);
-    assert_eq!((fresh, body, budget_expired), (None, None, false));
+    let (fresh, body, _) = bounds(None, None, None);
+    assert_eq!((fresh, body), (None, None));
 }
 
 #[test]
@@ -325,14 +354,15 @@ fn native_http3_relays_enforce_the_route_deadline() {
         server
             .matches("optional_sleep_elapsed(route_body_sleep.as_mut())")
             .count(),
-        3,
-        "the inline, refined, and buffered-request native relays must cut on the route deadline"
+        2,
+        "the inline relay and the shared committed-response relay (refined and \
+         buffered-request paths, issue #7190) must cut on the route deadline"
     );
     assert_eq!(
         server
             .matches("Err(H3TrailerFinishError::RouteDeadline) =>")
             .count(),
-        3,
+        2,
         "every trailer-finish site must cut on the route deadline"
     );
     assert_eq!(
@@ -674,7 +704,7 @@ fn native_http3_route_deadline_races_every_parked_client_write() {
     let bridge = include_str!("../../../src/http3/cross_protocol.rs");
 
     // DATA / trailers / FIN: the shared seam, called with the route deadline.
-    for (file, source, seams) in [("server", server, 4), ("cross_protocol", bridge, 2)] {
+    for (file, source, seams) in [("server", server, 3), ("cross_protocol", bridge, 2)] {
         let calls: Vec<&str> = source
             .split("stream_util::await_authorized_response_write(\n")
             .skip(1)
@@ -727,7 +757,7 @@ fn native_http3_route_deadline_races_every_parked_client_write() {
     );
     assert_eq!(
         trailer_cuts.len(),
-        3,
+        2,
         "every native relay must cut a trailer/FIN route expiry"
     );
     for arm in trailer_cuts {
@@ -741,7 +771,7 @@ fn native_http3_route_deadline_races_every_parked_client_write() {
         .split("commit_authorized_streaming_response_headers(\n")
         .skip(1)
         .collect();
-    assert_eq!(commits.len(), 3, "update the HEADERS parity table");
+    assert_eq!(commits.len(), 2, "update the HEADERS parity table");
     for commit in commits {
         let args = commit.split(".await").next().unwrap_or_default();
         assert!(args.contains("route_body_deadline,"));
@@ -757,7 +787,7 @@ fn native_http3_route_deadline_races_every_parked_client_write() {
         .filter(|arm| arm.contains("route_deadline_cut"))
         .count();
     assert_eq!(
-        header_cuts, 3,
+        header_cuts, 2,
         "every native HEADERS route expiry must be a route cut"
     );
     for arm in &header_arms {
@@ -796,6 +826,10 @@ fn native_http3_route_deadline_races_every_parked_client_write() {
     assert!(helper.contains("Some(ErrorClass::DispatchPolicyRejected)"));
     assert!(helper.contains("body_error_class: Some(ErrorClass::ReadWriteTimeout)"));
     assert!(helper.contains("client_disconnected: false"));
+    // GHSA-3c72-7f45-wvr2: the cut reaches the termination hooks as a route
+    // policy cut, or `ai_federation` charges the provider for it.
+    assert!(helper.contains("route_deadline_cut: true"));
+    assert!(!helper.contains("route_deadline_cut: false"));
 }
 
 /// The bridge's buffered writer settles the backend exchange BEFORE its first
@@ -1328,6 +1362,46 @@ fn config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> GatewayConf
 }
 
 #[tokio::test]
+async fn global_alt_svc_waits_for_a_started_quic_listener() {
+    use ferrum_edge::config::env_config::EnvConfig;
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::proxy::ProxyState;
+
+    // `FERRUM_ENABLE_HTTP3=true` alone: no frontend TLS material, so no serving
+    // mode starts the QUIC listener and nothing may advertise it (issue #7168).
+    let env_config = EnvConfig {
+        enable_http3: true,
+        ..Default::default()
+    };
+    let https_port = env_config.proxy_https_port;
+    let http_port = env_config.proxy_http_port;
+    let (state, _) = ProxyState::new(
+        config(vec![proxy("api", None)], Vec::new()),
+        DnsCache::new(DnsConfig::default()),
+        env_config,
+        None,
+        None,
+    )
+    .expect("test proxy state should build");
+
+    for port in [None, Some(https_port), Some(http_port)] {
+        assert!(
+            state.alt_svc_for_frontend_port(port).is_none(),
+            "Alt-Svc must stay off until the QUIC listener has started"
+        );
+    }
+
+    state.set_h3_listener_started(true);
+    assert_eq!(
+        state.alt_svc_for_frontend_port(Some(https_port)).as_deref(),
+        Some(format!("h3=\":{https_port}\"; ma=86400").as_str())
+    );
+
+    state.set_h3_listener_started(false);
+    assert!(state.alt_svc_for_frontend_port(None).is_none());
+}
+
+#[tokio::test]
 async fn the_gateway_advertises_http3_where_a_timed_rule_is_served() {
     use ferrum_edge::config::env_config::EnvConfig;
     use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -1350,6 +1424,8 @@ async fn the_gateway_advertises_http3_where_a_timed_rule_is_served() {
         None,
     )
     .expect("test proxy state should build");
+    // The serving mode reports its process-global QUIC listener as started.
+    state.set_h3_listener_started(true);
 
     // Native HTTP/3 enforces both route timeouts, so a timed rule no longer
     // costs the origin its HTTP/3 advertisement.

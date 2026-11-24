@@ -107,6 +107,7 @@ fn enforced_slice_request(
         enforce_sidecar_identity_narrowing: false,
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     }
 }
 

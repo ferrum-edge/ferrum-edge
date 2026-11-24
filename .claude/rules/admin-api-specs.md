@@ -4,6 +4,7 @@ paths:
   - "src/config/db_backend.rs"
   - "src/config/db_loader.rs"
   - "src/config/mongo_store.rs"
+  - "src/config/store_policy.rs"
   - "openapi.yaml"
   - "docs/admin_api.md"
   - "docs/admin_batch_api.md"
@@ -27,12 +28,16 @@ paths:
 - `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` makes namespace-scoped admin routes require a JWT `ns` claim (same shapes as the CP/DP gRPC plane) authorizing the `X-Ferrum-Namespace` value; the default (off) keeps the header a routing selector only for claim-less tokens. Enforcement: `is_namespace_scoped_route` + `enforce_namespace_claim` in `src/admin/mod.rs`. Malformed `ns` claims fail closed at authentication.
 - A token that carries an `ns` claim is namespace-bounded whatever the flag says (`AuditActor::is_namespace_bounded`): the claim always bounds namespace-scoped routes and the `/namespaces` registry, the token never unlocks the observability detail tier (`/health`+`/status` give it the tenant tier: `status`, `ready`, `mode`, `admin_writes_enabled`, plus the always-present `namespace` block from `namespace_serving_block`, with `active` redacted to `null` when `namespace_bound_admits` rejects the data plane's namespace while `serving_scope`/`data_plane_single_namespace` stay mode-derived, never omitted and never another name; same field names/shapes as the detailed tier, `HealthTenantResponse` in `openapi.yaml`), and `authorize_namespace_bounded_global_route` refuses it on every global route outside `ns_claim_global_route_is_allowed` (viewer-key ceiling tokens use the stricter `ceiling_global_route_is_allowed`). The allowlists fail closed: a new global route is refused to bounded tokens until classified there and in `docs/admin_api.md`.
 - Observability surfaces are tiered (`MetricsAuthPolicy` + `observability_detail_allowed` in `src/admin/mod.rs`): `/live` is always unauthenticated and returns only `{"status":"ok"}`; `/health`+`/status` return `status`+`ready` unauthenticated and full diagnostics only when authenticated; `/overload` returns coarse `{level}` unauthenticated and the full snapshot only when authenticated; `/metrics` returns `401` unless authenticated. "Authenticated" = valid admin JWT that is not namespace-bounded OR matching `FERRUM_METRICS_BEARER_TOKEN` OR a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. On `/metrics` a presented namespace-bounded JWT is refused `403` before the CIDR check: the CIDR allowance covers only scrapes without such a token. Do not regress these to unauthenticated detail.
+- Values keyed by `FERRUM_ADMIN_JWT_SECRET` (`cp_dp_trust.active_generation`, resource `ETag`s) are returned only to tokens the primary key verified (`admin_secret_keyed_detail_allowed`, `handle_get`'s `key_tier`); a primary-key token is already a MAC under that secret, while viewer-key tokens, metrics bearers and CIDR sources would gain an offline verifier for guesses of it (GHSA-crqx-mp2f-v8c8). `GET /config/export` fingerprints are keyed from `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` (distinct from every JWT secret; random per process when unset), never from a signing secret. Do not add a new viewer-visible value keyed by a signing secret.
+- `GET /charges` acknowledges delivery (the #5276 two-hand-off eviction rule) only for a token granting the `charges:collect` scope (`charges_collection_granted`); all other reads are side-effect free (GHSA-jjvr-vvwv-8qmh).
 - `/health` (and `/overload`) still respond unauthenticated so liveness/LB probes work. The DB check stays cached for 15s in the lock-free `AdminState.cached_db_health` (`ArcSwap<Option<CachedDbHealthResult>>`) so unauthenticated probes cannot flood the pool. Refreshes are single-flight (`AdminState.db_health_refresh` + `cached_db_health_connected()`) with a 5s probe timeout: at most one DB health query runs per refresh window while cache hits stay lock-free.
 - The `/health` response includes `database.pool` stats when connected, but only in the authenticated (detailed) tier.
 - `/metrics/runtime` remains JWT-authenticated and cached through `runtime_metrics_cache()`.
 - `GET /cluster` is JWT-authenticated. CP returns connected DPs from `DpNodeRegistry`; DP returns CP connection state including primary/fallback and `last_config_received_at`.
 - DP backend egress attestation (#6020): DPs report presence-only egress metadata on `SubscribeRequest.backend_egress_policy`; `DpNodeInfo.backend_egress_policy` holds it (`None` = unknown). `DpNodeRegistry` is keyed per stream (`DpStreamKey`: namespace, principal, node id, process-wide stream seq); never re-key by node id, which let one stream hide another. The CP's `GET /backend-egress-policy` adds the optional `data_plane_attestation` (namespace-filtered) and `GET /cluster` the per-DP fields plus aggregate, both via `grpc::backend_egress_attestation`. Unknown DPs and empty sets never count as public-only; never add CIDRs to the report; the CP's own `public_only_guaranteed` stays false on `admission-only`.
 - `GET /backend-capabilities` and `POST /backend-capabilities/refresh` are JWT-authenticated. GET entries expose the backend identity `key`, protocol classifications, `last_probe_at_unix_secs`, and nullable `last_probe_error`; a successful refresh instead returns `status: "refreshed"` or `status: "joined"` (see the `openapi.yaml` schemas).
+
+- Every admin API response carries `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and `X-Frame-Options: DENY`, including Prometheus text, `401`, `304`, `204` and builder-failure `500` responses (issue #7074). Builders use `with_admin_security_headers` (never per-response header literals; `error_response_headers_tests::admin_builder_fallback_is_500_not_default_200` guards the admin sources), and `handle_admin_request` fills any that a dispatched response lacks via `insert_missing_admin_security_headers`, so a handler that needs a different `Cache-Control` sets it explicitly. A builder failure answers `admin_builder_failure_response()`, never a hand-built `Response::new`. Scope: responses the admin service produces; Hyper's own interim `100 Continue` and automatic HTTP/1 parse-error replies (400/414/431) never reach the service and carry none of them.
 
 ## OpenAPI Parity
 
@@ -43,7 +48,7 @@ paths:
 ## API Spec Management
 
 - API specs are admin-only metadata. They must never be loaded by gateway runtime.
-- Supported submissions are OpenAPI 2.0 and 3.0.x/3.1.x/3.2.x JSON or YAML.
+- Supported submissions are OpenAPI 2.0 and 3.0.x/3.1.x/3.2.x JSON or YAML. Path Items declaring the 3.2 `query` operation or `additionalOperations` are refused (422 `UnsupportedOperationField`); keep that refusal until the validator, MCP bridge, schema indexing and `operation_count` handle them.
 - `x-ferrum-proxy` is required. `x-ferrum-upstream` and `x-ferrum-plugins` are supported extensions.
 - Endpoints: `POST/PUT/GET/DELETE /api-specs[/{id}]`, `GET /api-specs/by-proxy/{proxy_id}`, and `GET /api-specs`.
 - DB and CP modes are read/write for specs. DP and file mode reject spec endpoints.
@@ -77,7 +82,7 @@ paths:
 - `replace_api_spec_bundle` compares `resource_hash`, excluding `api_spec_id`, `created_at`, and `updated_at`.
 - If the resource hash matches on PUT, update only the `api_specs` row. Do not advance `updated_at` on proxies/upstreams/plugin configs.
 - Matching resource hash must not trigger router/plugin cache rebuild, pool warmup, capability refresh, or DP broadcast.
-- When changing the hash function, update SQL `db_loader.rs` and `mongo_store.rs` together.
+- The store-side resource hash is `config::store_policy::store_canonical_resource_hash` (normalize, then `hash_resource_bundle`), shared by SQL `db_loader.rs` and `mongo_store.rs`; change it there, never in one backend.
 
 ## Storage Caps
 

@@ -83,6 +83,99 @@ pub fn log_level_reloader() -> Option<&'static dyn LogLevelReloader> {
     RELOADER.get().map(|reloader| reloader.as_ref())
 }
 
+/// Dependency log targets whose records render credential-bearing protocol
+/// bytes verbatim, each with the level from which its records are dropped.
+/// The gateway never emits those records, whatever `RUST_LOG`,
+/// `FERRUM_LOG_LEVEL`, or an RTDS `ferrum.log.level` reload requests.
+///
+/// - `tungstenite::handshake::client`, from DEBUG: logs the complete
+///   serialized WebSocket upgrade request at TRACE, meaning the request target
+///   (path and query) and every header, including a proxied client's
+///   `Authorization` / `Cookie` and the `ws_logging` `custom_headers` collector
+///   credentials. Its only other record is a DEBUG "handshake done" line.
+/// - `tungstenite::protocol` (including `::frame`), at TRACE: renders every
+///   received message and every sent/received frame with its full payload,
+///   which carries in-band WebSocket credentials and every `ws_logging` batch.
+///   The module's DEBUG close-frame lines stay available.
+///
+/// Neither module logs at INFO or above, so no warning or error is lost.
+pub const CREDENTIAL_DUMPING_LOG_TARGETS: &[(&str, tracing::Level)] = &[
+    ("tungstenite::handshake::client", tracing::Level::DEBUG),
+    ("tungstenite::protocol", tracing::Level::TRACE),
+];
+
+/// Whether `target` is `module` or one of its submodules.
+fn log_target_within(target: &str, module: &str) -> bool {
+    target
+        .strip_prefix(module)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+}
+
+/// Whether a record with this metadata belongs to a
+/// [`CREDENTIAL_DUMPING_LOG_TARGETS`] target at or below its drop level.
+/// `log`-crate records bridged into `tracing` carry the emitting module path
+/// as their target, so they match the same way as native events.
+pub fn is_credential_dumping_log_record(metadata: &tracing::Metadata<'_>) -> bool {
+    CREDENTIAL_DUMPING_LOG_TARGETS
+        .iter()
+        .any(|(module, from_level)| {
+            log_target_within(metadata.target(), module) && *metadata.level() >= *from_level
+        })
+}
+
+fn allows_non_credential_dumping_record(metadata: &tracing::Metadata<'_>) -> bool {
+    !is_credential_dumping_log_record(metadata)
+}
+
+/// Per-layer filter that drops [`is_credential_dumping_log_record`] records.
+///
+/// Compose it through [`filter_output_layer`], never on its own: the two
+/// per-layer filters there are AND-ed, so no directive can re-enable these
+/// records: not a target, span-scoped, or field-scoped one
+/// (`tungstenite::handshake::client[{message}]=trace`), and not an RTDS
+/// reload, which replaces only the level filter.
+pub fn credential_dumping_log_filter() -> tracing_subscriber::filter::FilterFn {
+    tracing_subscriber::filter::filter_fn(
+        allows_non_credential_dumping_record as fn(&tracing::Metadata<'_>) -> bool,
+    )
+}
+
+/// Filters a gateway output layer by `level_filter` (the reloadable
+/// `EnvFilter`) AND [`credential_dumping_log_filter`].
+///
+/// The level filter must stay the outermost per-layer filter. The outermost
+/// filter alone supplies the layer's max-level hint, which feeds the
+/// process-wide `LevelFilter::current()` (the maximum over every output and
+/// counting layer) that each `tracing` macro checks before anything else.
+/// Nesting also merges callsite interests: an outer `always` over an inner
+/// `never` becomes `sometimes`. With the hint-less credential filter outside
+/// (#6852), every TRACE/DEBUG callsite in hyper, h2, and tokio was evaluated
+/// dynamically on every hit even at `FERRUM_LOG_LEVEL=error`. With the level
+/// filter outside, a callsite that a static (target/level) directive disables
+/// registers `never` and is skipped by the max-level check. Span- and
+/// field-scoped directives still evaluate dynamically, by `EnvFilter`'s
+/// design, as they did before #6852. The credential filter still vetoes
+/// every record the level filter enables.
+pub fn filter_output_layer<L, F, S>(
+    layer: L,
+    level_filter: F,
+) -> tracing_subscriber::filter::Filtered<
+    tracing_subscriber::filter::Filtered<L, tracing_subscriber::filter::FilterFn, S>,
+    F,
+    S,
+>
+where
+    L: tracing_subscriber::Layer<S>,
+    F: tracing_subscriber::layer::Filter<S> + 'static,
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span> + 'static,
+{
+    use tracing_subscriber::Layer as _;
+
+    layer
+        .with_filter(credential_dumping_log_filter())
+        .with_filter(level_filter)
+}
+
 /// Process-global, non-blocking sink for transaction access logs.
 ///
 /// The `stdout_logging` plugin writes one JSON line per proxied transaction
@@ -157,69 +250,74 @@ pub fn render_prometheus() -> String {
     let Some(sinks) = PROCESS_LOG_SINKS.get() else {
         return String::new();
     };
+    let rows = [
+        (sinks.stdout.snapshot(), &sinks.stdout_errors),
+        (sinks.stderr.snapshot(), &sinks.stderr_errors),
+    ];
+    // The text exposition format expects each family's HELP, TYPE and samples
+    // as one contiguous group, so emit family by family across both sinks.
     let mut output = String::with_capacity(2_048);
     output.push_str(
         "# HELP ferrum_log_sink_healthy Whether the process log sink has recovered from its latest I/O or drain failure.\n\
 # TYPE ferrum_log_sink_healthy gauge\n",
     );
+    for (snapshot, _) in &rows {
+        output.push_str(&format!(
+            "ferrum_log_sink_healthy{{sink=\"{}\"}} {}\n",
+            snapshot.sink.as_str(),
+            u8::from(snapshot.healthy)
+        ));
+    }
     output.push_str(
         "# HELP ferrum_log_sink_queued_records Records admitted but not yet completed.\n\
 # TYPE ferrum_log_sink_queued_records gauge\n",
     );
+    for (snapshot, _) in &rows {
+        output.push_str(&format!(
+            "ferrum_log_sink_queued_records{{sink=\"{}\"}} {}\n",
+            snapshot.sink.as_str(),
+            snapshot.queued_records
+        ));
+    }
     output.push_str(
         "# HELP ferrum_log_sink_reserved_bytes Byte budget reserved by admitted records.\n\
 # TYPE ferrum_log_sink_reserved_bytes gauge\n",
     );
+    for (snapshot, _) in &rows {
+        output.push_str(&format!(
+            "ferrum_log_sink_reserved_bytes{{sink=\"{}\"}} {}\n",
+            snapshot.sink.as_str(),
+            snapshot.reserved_bytes
+        ));
+    }
     output.push_str(
         "# HELP ferrum_log_sink_queued_bytes Serialized bytes admitted but not yet completed.\n\
 # TYPE ferrum_log_sink_queued_bytes gauge\n",
     );
+    for (snapshot, _) in &rows {
+        output.push_str(&format!(
+            "ferrum_log_sink_queued_bytes{{sink=\"{}\"}} {}\n",
+            snapshot.sink.as_str(),
+            snapshot.queued_bytes
+        ));
+    }
     output.push_str(
         "# HELP ferrum_log_sink_accepted_records_total Records accepted by the bounded process log sink.\n\
 # TYPE ferrum_log_sink_accepted_records_total counter\n",
     );
+    for (snapshot, _) in &rows {
+        output.push_str(&format!(
+            "ferrum_log_sink_accepted_records_total{{sink=\"{}\"}} {}\n",
+            snapshot.sink.as_str(),
+            snapshot.accepted_records_total
+        ));
+    }
     output.push_str(
         "# HELP ferrum_log_sink_dropped_records_total Log records dropped by bounded admission.\n\
 # TYPE ferrum_log_sink_dropped_records_total counter\n",
     );
-    output.push_str(
-        "# HELP ferrum_log_sink_shutdown_timeouts_total Bounded process log drain deadlines reached.\n\
-# TYPE ferrum_log_sink_shutdown_timeouts_total counter\n",
-    );
-    output.push_str(
-        "# HELP ferrum_log_sink_shutdown_incomplete_records_total Records still outstanding when a bounded drain deadline was reached.\n\
-# TYPE ferrum_log_sink_shutdown_incomplete_records_total counter\n",
-    );
-    output.push_str(
-        "# HELP ferrum_log_sink_io_failures_total Underlying writer and flush failures.\n\
-# TYPE ferrum_log_sink_io_failures_total counter\n",
-    );
-    for (sink, error_counter) in [
-        (&sinks.stdout, &sinks.stdout_errors),
-        (&sinks.stderr, &sinks.stderr_errors),
-    ] {
-        let snapshot = sink.snapshot();
+    for (snapshot, error_counter) in &rows {
         let name = snapshot.sink.as_str();
-        output.push_str(&format!(
-            "ferrum_log_sink_healthy{{sink=\"{name}\"}} {}\n",
-            u8::from(snapshot.healthy)
-        ));
-        output.push_str(&format!(
-            "ferrum_log_sink_queued_records{{sink=\"{name}\"}} {}\n",
-            snapshot.queued_records
-        ));
-        output.push_str(&format!(
-            "ferrum_log_sink_reserved_bytes{{sink=\"{name}\"}} {}\n",
-            snapshot.reserved_bytes
-        ));
-        output.push_str(&format!(
-            "ferrum_log_sink_queued_bytes{{sink=\"{name}\"}} {}\n",
-            snapshot.queued_bytes
-        ));
-        output.push_str(&format!(
-            "ferrum_log_sink_accepted_records_total{{sink=\"{name}\"}} {}\n",
-            snapshot.accepted_records_total
-        ));
         for (reason, value) in [
             ("saturation", error_counter.saturation_dropped_records()),
             (
@@ -232,14 +330,35 @@ pub fn render_prometheus() -> String {
                 "ferrum_log_sink_dropped_records_total{{sink=\"{name}\",reason=\"{reason}\"}} {value}\n"
             ));
         }
+    }
+    output.push_str(
+        "# HELP ferrum_log_sink_shutdown_timeouts_total Bounded process log drain deadlines reached.\n\
+# TYPE ferrum_log_sink_shutdown_timeouts_total counter\n",
+    );
+    for (snapshot, _) in &rows {
         output.push_str(&format!(
-            "ferrum_log_sink_shutdown_timeouts_total{{sink=\"{name}\"}} {}\n",
+            "ferrum_log_sink_shutdown_timeouts_total{{sink=\"{}\"}} {}\n",
+            snapshot.sink.as_str(),
             snapshot.shutdown_timeouts_total
         ));
+    }
+    output.push_str(
+        "# HELP ferrum_log_sink_shutdown_incomplete_records_total Records still outstanding when a bounded drain deadline was reached.\n\
+# TYPE ferrum_log_sink_shutdown_incomplete_records_total counter\n",
+    );
+    for (snapshot, _) in &rows {
         output.push_str(&format!(
-            "ferrum_log_sink_shutdown_incomplete_records_total{{sink=\"{name}\"}} {}\n",
+            "ferrum_log_sink_shutdown_incomplete_records_total{{sink=\"{}\"}} {}\n",
+            snapshot.sink.as_str(),
             snapshot.shutdown_incomplete_records_total
         ));
+    }
+    output.push_str(
+        "# HELP ferrum_log_sink_io_failures_total Underlying writer and flush failures.\n\
+# TYPE ferrum_log_sink_io_failures_total counter\n",
+    );
+    for (snapshot, _) in &rows {
+        let name = snapshot.sink.as_str();
         for (operation, value) in [
             ("write", snapshot.writer_failures_total),
             ("flush", snapshot.flush_failures_total),

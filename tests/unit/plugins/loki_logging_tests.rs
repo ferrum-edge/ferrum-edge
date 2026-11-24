@@ -23,7 +23,8 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::plugin_utils::{
-    create_test_stream_transaction_summary, create_test_transaction_summary,
+    assert_ws_session_end_record, create_test_stream_transaction_summary,
+    create_test_transaction_summary, create_test_ws_disconnect_context,
     read_http11_request_headers,
 };
 
@@ -509,6 +510,37 @@ async fn test_loki_overlapping_plugin_generations_use_distinct_emitter_stream_la
         })
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(emitters.len(), 2);
+}
+
+/// Issue #7144: `loki_logging` pushes the shared WebSocket session-end record
+/// from `on_ws_disconnect` as one log line.
+#[tokio::test]
+async fn test_loki_logging_delivers_ws_session_end_record() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/loki/api/v1/push"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let plugin = LokiLogging::new(
+        &delivery_config(format!("{}/loki/api/v1/push", server.uri())),
+        default_client(),
+    )
+    .unwrap();
+    assert!(plugin.requires_ws_disconnect_hooks());
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    plugin
+        .on_ws_disconnect(&create_test_ws_disconnect_context())
+        .await;
+
+    let requests = wait_for_requests(&server, 1).await;
+    let payload: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let values = payload["streams"][0]["values"].as_array().unwrap();
+    assert_eq!(values.len(), 1);
+    let line: serde_json::Value = serde_json::from_str(values[0][1].as_str().unwrap()).unwrap();
+    assert_ws_session_end_record(&line, "loki_logging");
 }
 
 #[tokio::test]
@@ -1276,8 +1308,10 @@ async fn test_loki_logging_include_proxy_id_label_new_key() {
     // coverage lives in the build_http_labels tests below.
 }
 
+/// `include_listen_path_label` is an ordinary unknown key (no dedicated
+/// removed-key diagnostic, issue #7113).
 #[tokio::test]
-async fn test_loki_logging_removed_listen_path_key_rejected() {
+async fn test_loki_logging_listen_path_key_is_unknown() {
     let result = LokiLogging::new(
         &json!({
             "endpoint_url": "http://127.0.0.1:1/unreachable",
@@ -1286,8 +1320,11 @@ async fn test_loki_logging_removed_listen_path_key_rejected() {
         }),
         default_client(),
     );
-    let err = result.err().expect("removed key should be rejected");
-    assert!(err.contains("include_listen_path_label"), "got: {err}");
+    let err = result.err().expect("unknown key should be rejected");
+    assert!(
+        err.contains("unknown configuration key") && err.contains("include_listen_path_label"),
+        "got: {err}"
+    );
 }
 
 async fn spawn_loki_keepalive_server(
@@ -1667,7 +1704,10 @@ async fn test_loki_terminal_and_exhausted_delivery_counts_batch_discard() {
 fn startup_diagnostics_withhold_loki_config_keys_and_label_names() {
     let secret = "'diagnostic-secret-5594`\"\\\n";
     for (extra, context) in [
-        (json!({secret: true}), "at `config`"),
+        (
+            json!({secret: true}),
+            "`config`: unknown configuration key(s)",
+        ),
         (json!({"labels": {secret: "safe"}}), "label name"),
         (
             json!({"labels": {"diagnostic_secret_5594": 987654321}}),
@@ -1688,4 +1728,28 @@ fn startup_diagnostics_withhold_loki_config_keys_and_label_names() {
         assert!(!rendered.contains("diagnostic_secret_5594"), "{rendered}");
         assert!(!rendered.contains("987654321"), "{rendered}");
     }
+}
+
+/// Issue #7110 sibling: an unavailable plugin HTTP client is retried on the
+/// next call by the client itself, so a Loki attempt that cannot obtain one is
+/// retryable within the batch's retry budget rather than a terminal discard.
+#[test]
+fn unavailable_http_client_is_a_retryable_loki_attempt() {
+    let source = include_str!("../../../src/plugins/loki_logging.rs");
+    let start = source
+        .find("async fn send_batch_once(")
+        .expect("send_batch_once exists");
+    let end = start
+        + source[start..]
+            .find(".post(&cfg.endpoint_url)")
+            .expect("send_batch_once posts to the endpoint");
+    let preamble = &source[start..end];
+    assert!(
+        preamble.contains("LokiAttemptOutcome::Retryable(\"plugin HTTP client unavailable\""),
+        "an unavailable client must be a retryable attempt: {preamble}"
+    );
+    assert!(
+        !preamble.contains("LokiAttemptOutcome::Terminal"),
+        "an unavailable client must not discard the batch terminally: {preamble}"
+    );
 }

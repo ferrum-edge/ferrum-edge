@@ -31,8 +31,8 @@ Vendoring without a retirement plan is not allowed. Prefer a dependency bump, a
 feature flag, or a gateway-side workaround first.
 
 The [Hyper patch stack](upstream-hyper-patches/README.md) is reconstructed in
-hosted CI from the checksum-pinned published 1.10.0 crate plus complete ordered
-patches 001–005. Every shipped file must match the vendor bytes and integrity
+hosted CI from the checksum-pinned published 1.10.0 crate plus the complete ordered
+`series` (patches 001–009). Every shipped file must match the vendor bytes and integrity
 manifest; syntax-only patch parsing does not establish reproducibility.
 
 ## Direct pins of otherwise-transitive crates
@@ -64,14 +64,29 @@ every committed `Cargo.lock` against these floors with
 
 The same script also checks every committed lockfile that builds `ferrum-edge`
 (today the root, `fuzz/`, and `tests/performance/mesh/` lockfiles). Each must
-resolve `hyper`, `reqwest`, `h2`, and `hyper-util` to exactly one copy: the
-`[patch.crates-io]` path crate under `vendor/`, at the version its directory
-names, with no `source` or `checksum`. A second, registry copy would ship that
-crate without Ferrum's patches. The expected versions come from the `vendor/`
-directories, so moving a vendored crate needs no change to the checker.
+resolve `hyper`, `reqwest`, `h2`, `hyper-util`, `sqlx-core`, `h3`, and
+`h3-quinn` to exactly one copy: the `[patch.crates-io]` path crate under
+`vendor/`, at the version its directory names, with no `source` or `checksum`.
+A second, registry copy would ship that crate without Ferrum's patches. The
+expected versions come from the `vendor/` directories, so moving a vendored
+crate needs no change to the checker. Three vendored crates are deliberately
+not single-copy: `tungstenite` / `tokio-tungstenite` (kube-client's `ws`
+feature resolves the 0.30 line from the registry, while Ferrum's own WebSocket
+code depends on the vendored 0.29 copy) and `dimpl` (the `strict_dimpl`
+dev-dependency alias pins registry `=0.8.0` as an independent DTLS test peer,
+issue #7000).
 
-Some optional GCP crates and the AWS Smithy support crates also have exact
-`=` constraints in `Cargo.toml`. Those constraints selected a published,
+Every committed lockfile must also resolve `aws-smithy-json` to a single copy.
+The direct `aws-smithy-json` requirement only constrains the AWS SDK while it
+sits on the same 0.x line the SDK crates (`aws-config`,
+`aws-sdk-secretsmanager`, and the transitive `aws-sdk-sts`, `aws-sdk-sso`, and
+`aws-sdk-ssooidc`) require. A requirement on a newer line, such as the
+Dependabot-only bump in #6750, resolves a second copy and constrains nothing
+(issue #6755). Move the requirement together with the SDK crates and their
+`Cargo.toml` floors (`aws-config` 1.12, `aws-sdk-secretsmanager` 1.120 for
+the 0.63 line).
+
+Some optional GCP crates also have exact `=` constraints in `Cargo.toml`. Those constraints selected a published,
 compatible dependency generation for the fixes above; they are not a promise to
 stay on those releases. To lift them:
 
@@ -90,13 +105,14 @@ stay on those releases. To lift them:
 3. Refresh the root and affected standalone lockfiles from their real manifest
    roots. Inspect Cargo metadata for the root, mesh, and fuzz graphs where they
    consume Ferrum's production dependency path; do not hand-edit lockfile
-   package entries or checksums. The lockfiles hold the AWS Smithy runtime
-   crates (`aws-smithy-runtime-api` 1.12.3, `aws-smithy-types` 1.4.9,
-   `aws-smithy-schema` 0.1.0, `aws-smithy-async` 1.2.14, and
-   `aws-smithy-runtime-api-macros` 1.0.0) on the generation whose published
-   compiler floor is Rust 1.91.1. A broad refresh moves them to the 1.94.1
-   compiler generation, so update them with targeted `cargo update --precise`
-   unless that compiler move is intended. No CI job enforces this MSRV.
+   package entries or checksums. The AWS SDK and Smithy runtime crates are
+   not held back: since issue #6755 the root lockfile carries the Rust 1.94.1
+   compiler generation (`aws-config` 1.12, `aws-sdk-secretsmanager` 1.120,
+   `aws-smithy-json` 0.63, `aws-smithy-runtime` 1.16.0). `aws-smithy-runtime`
+   is held at 1.16.0 with `cargo update --precise` only because 1.16.1 moves to
+   `aws-smithy-schema` 1.0 while the SDK crates still require 0.2, which would
+   resolve two schema copies; let it move once the SDK crates do. No CI job
+   enforces an MSRV; CI builds on stable.
 4. If a newer advisory fixes one of these packages, update the corresponding
    floor in the checker and this table together. The required dependency audit
    must keep checking every committed lockfile, including standalone graphs.
@@ -115,10 +131,13 @@ machine inventory, the `[patch.crates-io]` block in `Cargo.toml`, the per-patch
 docs, and `scripts/check_vendored_patch_lifecycle.py` in sync. CI fails when any
 surface drifts.
 
+The vendored `hyper` and `h2` crates are path-sourced, so `cargo deny` advisory
+matching may skip them: check RUSTSEC `hyper` advisories against 1.10.0 and `h2`
+advisories against 0.4.20 manually.
+
 | Lifecycle ID | Crate | Vendored ver. | Patch | Upstream issue / PR | Owner | Reason | Removal trigger | Docs |
 |---|---|---|---|---|---|---|---|---|
-| `sqlx-core-001-verify-ca-name-context` | `sqlx-core` | 0.8.6 | Exclusive configured root CA, provider-pinned verify-ca verifier, and rustls context-bearing hostname errors | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | PostgreSQL and MySQL verify-ca otherwise reject trusted chains on hostname mismatch (#5534); upstream also UNIONS the configured CA with the bundled public roots, so a name-waived verify-ca would trust any public certificate | A compatible SQLx release treats a configured root CA as exclusive and handles both rustls hostname-error variants while retaining chain and signature verification | [Patch and retirement plan](upstream-sqlx-patches/001-verify-ca-name-context/README.md) |
-| `sqlx-core-002-typed-float-null-bindings` | `sqlx-core` | 0.8.6 | Any REAL NULL binds through `Option<f32>`, DOUBLE NULL through `Option<f64>` | Fixed upstream by PR [launchbadge/sqlx#4359](https://github.com/launchbadge/sqlx/pull/4359) (merged 2026-08-19; not yet in a release) | Ferrum Edge maintainers | Upstream 0.8.6 reverses the native parameter types for these typed NULLs (#6010); no stored-value loss is established | A compatible SQLx release preserves native REAL/DOUBLE typed-NULL parameter types and passes the hosted PostgreSQL regression; retain the vendor while patch 001 remains | [Patch and retirement plan](upstream-sqlx-patches/002-typed-float-null-bindings/README.md) |
+| `sqlx-core-001-verify-ca-name-context` | `sqlx-core` | 0.9.1 | Exclusive configured root CA and provider-pinned verify-ca verifier (the rustls context-bearing hostname-error waiver this patch once carried is upstream in 0.9.1) | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | Upstream UNIONS the configured CA with the bundled public roots, so a name-waived verify-ca would trust any public certificate for any name (#5534 review); the provider-less verify-ca verifier builder panics when both `ring` and `aws-lc-rs` are compiled in and no process default is installed | A compatible SQLx release treats a configured root CA as exclusive and builds the verify-ca verifier with the selected crypto provider while retaining chain and signature verification | [Patch and retirement plan](upstream-sqlx-patches/001-verify-ca-name-context/README.md) |
 | `reqwest-001-per-request-connect-timeout` | `reqwest` | 0.13.4 | Per-request `RequestBuilder::connect_timeout` | [seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017) (OPEN) | Ferrum Edge maintainers | Pool keys exclude request-only connect/read timeouts, so sibling proxies can share one client; without per-request connect timeout the first proxy's timeout leaks to all | PR #3017 merges and ships in a release we consume | [docs/upstream-reqwest-patches/001-…](upstream-reqwest-patches/001-per-request-connect-timeout/README.md) |
 | `reqwest-002-selectable-rustls-provider` | `reqwest` | 0.13.4 | Selectable Ring/AWS-LC rustls fallback | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | Library/test reqwest clients run before binary bootstrap; upstream's only built-in fallback hard-wires AWS-LC and cannot preserve Ferrum's mutually exclusive backend pair | Reqwest ships a provider-neutral selectable fallback, or the vendored crate is retired | [docs/upstream-reqwest-patches/002-…](upstream-reqwest-patches/002-selectable-rustls-provider/README.md) |
 | `reqwest-003-connection-admission-hook` | `reqwest` | 0.13.4 | `ClientBuilder::connection_admission` physical-connection admission hook | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | DestinationRule `connectionPool.tcp.maxConnections` is a physical-connection ceiling; reqwest owns its socket pool and exposes no connection-lifetime hook, so no public API can admit a new socket and release on its close | Reqwest exposes a connection-lifecycle/admission hook (or a non-sealed connector connection type a `connector_layer` can wrap), or the vendored crate is retired | [docs/upstream-reqwest-patches/003-…](upstream-reqwest-patches/003-connection-admission-hook/README.md) |
@@ -127,7 +146,7 @@ surface drifts.
 | `h3-002-extended-connect-websocket-protocol` | `h3` | 0.0.8 | Add `Protocol::WEB_SOCKET` (RFC 9220 Extended CONNECT) | **Deliberate fork** — unfiled upstream; no published fork ref yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Stock `h3` 0.0.8 rejects `:protocol=websocket` at the HEADERS layer, making WebSocket-over-HTTP/3 unreachable | Upstream files + merges the variant **and** patches 001/003/004/005 are also retired | [docs/upstream-h3-patches/002-…](upstream-h3-patches/002-extended-connect-websocket-protocol/README.md) |
 | `h3-003-peek-buffered-trailers-before-fin` | `h3` | 0.0.8 | Add `RequestStream::peek_recv_trailers()` for already-buffered trailers before FIN | **Deliberate fork** — unfiled upstream; no published fork ref yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | `poll_recv_trailers` buffers trailer HEADERS but waits for terminal FIN; gateway trailer-timeout collapse dropped trailers delivered before delayed FIN | Upstream files + merges the API **and** patches 001/002/004/005 are also retired | [docs/upstream-h3-patches/003-…](upstream-h3-patches/003-peek-buffered-trailers-before-fin/README.md) |
 | `h3-004-send-stream-stopped-watch` | `h3` | 0.0.8 | Add `SendStreamStopped` so peer `STOP_SENDING` is observable as a `&self` + `'static` return-position `impl Future` without exclusive send-stream access | **Deliberate fork** — unfiled upstream; no published fork ref yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | After request HEADERS the gateway may block on backend headers without polling H3 frames; a client can cancel one multiplexed stream and leave destination `http2MaxRequests` held until the backend answers | Upstream files + merges the API **and** patches 001/002/003/005 are also retired | [docs/upstream-h3-patches/004-…](upstream-h3-patches/004-send-stream-stopped-watch/README.md) |
-| `h3-005-max-buffered-frame-len` | `h3` | 0.0.8 | Bound the DECLARED payload length of a buffered non-`DATA` frame and refuse an over-declared frame with `H3_EXCESSIVE_LOAD` before any payload is buffered | **Deliberate fork** — unfiled upstream; no published fork ref yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Stock `h3` 0.0.8 parks on the declared length of a non-`DATA` frame and accumulates QUIC chunks without bound; QUIC flow control caps only bytes in flight, so one unauthenticated stream declaring 2^62-1 drives the process to OOM (#4261) | Upstream ships a receive-side declared-length bound refusing the frame BEFORE buffering **and** patches 001/002/003/004 are also retired | [docs/upstream-h3-patches/005-…](upstream-h3-patches/005-max-buffered-frame-len/README.md) |
+| `h3-005-max-buffered-frame-len` | `h3` | 0.0.8 | Bound the DECLARED payload length of a buffered non-`DATA` frame and refuse an over-declared frame with `H3_EXCESSIVE_LOAD` before any payload is buffered | **Reported privately to hyperium (security advisory report, 2026-11-14)**; no public issue or PR yet, no published fork ref ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Stock `h3` 0.0.8 parks on the declared length of a non-`DATA` frame and accumulates QUIC chunks without bound; QUIC flow control caps only bytes in flight, so one unauthenticated stream declaring 2^62-1 drives the process to OOM (#4261) | Upstream ships a receive-side declared-length bound refusing the frame BEFORE buffering **and** patches 001/002/003/004 are also retired | [docs/upstream-h3-patches/005-…](upstream-h3-patches/005-max-buffered-frame-len/README.md) |
 | `h3-quinn-001-stop-sending-during-in-flight-read` | `h3-quinn` | 0.0.10 | Own `quinn::RecvStream` inline so `stop_sending` works while a read is in flight | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | `RecvStream` parks its `quinn::RecvStream` in a `ReusableBoxFuture` while a read is pending, so `stop_sending` unwraps a `None` and aborts exactly when a full-duplex H3 server must send `STOP_SENDING(H3_NO_ERROR)` after its response completes | `h3-quinn` ships a release whose `stop_sending` is correct while a read is in flight **and** patch 002 is also retired | [docs/upstream-h3-quinn-patches/001-…](upstream-h3-quinn-patches/001-stop-sending-during-in-flight-read/README.md) |
 | `h3-quinn-002-send-stream-stopped-watch` | `h3-quinn` | 0.0.10 | Implement `h3::quic::SendStreamStopped` via Quinn `&self` + `'static` `stopped()` as a return-position `impl Future` | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Stock h3-quinn does not forward Quinn's `SendStream::stopped`, so a header wait cannot observe per-stream `STOP_SENDING` without exclusive send-stream access | `h3-quinn` ships a release with an equivalent watch **and** patch 001 is also retired | [docs/upstream-h3-quinn-patches/002-…](upstream-h3-quinn-patches/002-send-stream-stopped-watch/README.md) |
 | `tungstenite-001-lossless-takeover` | `tungstenite` | 0.29.0 | `WebSocket::into_inner_with_read_buffer()` (lossless raw takeover) | [snapview/tungstenite-rs#556](https://github.com/snapview/tungstenite-rs/pull/556) | Ferrum Edge maintainers | Tunnel mode lost backend bytes coalesced with the `101` response when dropping to raw relay | **Both** this and tokio-tungstenite#380 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
@@ -137,37 +156,53 @@ surface drifts.
 | `tokio-tungstenite-001-lossless-takeover` | `tokio-tungstenite` | 0.29.0 | `WebSocketStream::into_inner_with_read_buffer()` | [snapview/tokio-tungstenite#380](https://github.com/snapview/tokio-tungstenite/pull/380) | Ferrum Edge maintainers | Same lossless-takeover gap on the async wrapper | **Both** this and tungstenite#556 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
 | `tungstenite-004-fragment-accounting` | `tungstenite` | 0.29.0 | `FragmentMeter` + `max_incomplete_message_frames` / `max_incomplete_message_duration` (physical-fragment accounting and bounds) | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | The reader only sees reassembled messages, so fragmented (including zero-length continuation) frames bypass per-message admission policy and are unbounded in count and duration | Upstream ships an equivalent pre-reassembly fragment hook **and** independent incomplete-message count/duration bounds | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
 | `tokio-tungstenite-004-fragment-accounting-delegator` | `tokio-tungstenite` | 0.29.0 | `WebSocketStream::set_fragment_accounting()` | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Same accounting gap on the async wrapper, which hides the codec behind `SplitStream` after `split()` | Upstream ships the equivalent delegator alongside the tungstenite hook | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
-| `dimpl-001-certificate-chain-and-key-zeroization` | `dimpl` | 0.6.1 | Full leaf-first certificate-chain transport and zeroizing private-key ownership | **Deliberate fork** — unfiled upstream; base commit `37bb0fa83f4167420729de5ea71c61852f82e9ed` ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Published releases expose only one local certificate and retain endpoint/fallback credential bytes in ordinary `Vec<u8>` owners | Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths | [docs/upstream-dimpl-patches/001-…](upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md) |
-| `hyper-util-001-release-h1-sender-on-dispatch-close` | `hyper-util` | 0.1.21 | Legacy client releases an HTTP/1 connection's only request sender once its dispatcher stops reading, so a request stranded by a close during enqueue fails as unsent | **Deliberate fork** — no upstream PR; upstream issue [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202) (hyper-util has issues disabled; filed on hyper, where the stranding dispatcher lives) ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | tokio's unbounded `send` checks for closure and publishes in two steps; a backend RST/FIN on the pooled connection between them strands the request in a channel nobody reads, and hyper-util holds the last sender, so reqwest's `send()` hung until `backend_read_timeout_ms` (504) instead of failing fast (#5714) | A hyper-util release stops holding the only HTTP/1 sender after its dispatcher closes, or a hyper release stops stranding a racing send | [docs/upstream-hyper-util-patches/001-…](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md) |
-| `hyper-001-upgraded-h2-connect-error-reset` | `hyper` | 1.10.0 | `Upgraded::reset_with_connect_error()` resets an upgraded HTTP/2 `CONNECT` stream with `RST_STREAM(CONNECT_ERROR)` in place of the clean `END_STREAM` | issue [hyperium/hyper#4209](https://github.com/hyperium/hyper/issues/4209), PR [hyperium/hyper#4210](https://github.com/hyperium/hyper/pull/4210) (filed 2026-09-28) | Ferrum Edge maintainers | hyper's upgraded HTTP/2 stream is private and dropping or shutting it down always sends `END_STREAM`, so an HBONE relay that ended on a socket error looked like a normal close to the peer; RFC 9113 §8.5 names `CONNECT_ERROR` for a failed tunnel (#5781). Path-sourced, so `cargo deny` advisory matching may skip it: check RUSTSEC `hyper` advisories against 1.10.0 manually | A hyper release containing PR #4210 (or an equivalent API that resets an upgraded HTTP/2 stream with a chosen error code) is adopted | [docs/upstream-hyper-patches/001-…](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md) |
-| `hyper-002-min-data-frame-capacity` | `hyper` | 1.10.0 | A pending HTTP/2 body chunk makes progress with every positive amount of assigned capacity; no fixed minimum is imposed | **Deliberate fork** — current pending-body path unfiled; historical issue [hyperium/hyper#4211](https://github.com/hyperium/hyper/issues/4211), PR [hyperium/hyper#4212](https://github.com/hyperium/hyper/pull/4212) **closed unmerged 2026-10-04** ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | The former 1 KiB minimum could deadlock a legal 512-byte peer stream window; this was reproduced through the Ferrum Edge 0.9.10 release with headers received but zero body bytes. The pending-body path used by patch 004 must preserve Hyper's progress invariant for every legal peer window | Co-retire with patch 004 after adopting an equivalent upstream write-stall bound preserving positive-capacity progress, or moving the HTTP/2 client off Hyper; hosted replacement regressions must pass | [docs/upstream-hyper-patches/002-…](upstream-hyper-patches/002-min-data-frame-capacity/README.md) |
-| `hyper-003-greedy-h1-read` | `hyper` | 1.10.0 | HTTP/1 `Buffered::poll_read_from_io` keeps reading into its buffer after a full-TLS-record read while the transport has more ready; the HTTP/1 upgrade handoff (`Rewind`/`Upgraded`) also carries a read error met during that read-ahead into the tunnel, after the buffered bytes | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | tokio-rustls returns one decrypted record per read, so bulk HTTP/1 bodies crossed hyper's dispatcher 16 KiB at a time; the per-chunk path cost Ferrum 14–20% CPU per request on large HTTPS/1.1 responses against Envoy (#5588). A reset met during read-ahead is kept for the next read, so an upgrade must hand it to the tunnel, or a WebSocket or TCP relay sees a clean EOF instead (#5911) | hyper or tokio-rustls hands over every readable record per read, or the vendored hyper is retired | [docs/upstream-hyper-patches/003-…](upstream-hyper-patches/003-greedy-h1-read/README.md) |
-| `hyper-004-h2-body-write-timeout` | `hyper` | 1.10.0 | New request extension `hyper::ext::Http2BodyWriteTimeout`: the HTTP/2 client's body pipe runs a timer only while it holds a chunk it cannot yet write (window exhausted or send buffer full), re-arms it on every chunk written, and resets the stream with `CANCEL` when it fires; with the extension the pipe polls the body before waiting for capacity | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | hyper's pipe parks on flow control without polling the body, so `backend_write_timeout_ms` needed a gateway-owned upload pump (a task boundary and channel per frame, about 3.5% gateway CPU on 10 KiB gRPC), and direct-H2 passthrough enforced no write bound at all (#5588). Path-sourced, so `cargo deny` advisory matching may skip it: check RUSTSEC `hyper` advisories against 1.10.0 manually | Co-retire with patch 002 after adopting an equivalent upstream write-stall bound preserving positive-capacity progress, or moving the HTTP/2 client off Hyper; hosted replacement regressions must pass | [docs/upstream-hyper-patches/004-…](upstream-hyper-patches/004-h2-body-write-timeout/README.md) |
-| `hyper-005-h2-small-window-coalescing` | `hyper` | 1.10.0 | While a ready HTTP/2 body chunk holds positive capacity below `min(chunk remaining, 256)`, the client and server body pipes wait up to 2 ms for more, then hand h2 exactly the assigned capacity (a zero-copy `Bytes` split), so h2 cannot cut a DATA frame from every small window increment; a chunk the stream already holds window for goes to h2 whole even when the send buffer caps `capacity()` (h2 patch 003's `capacity_and_assigned`; stock h2 falls back to splitting), except on a pipe with a patch-004 write-stall bound, which keeps splitting; enabled only on connections with a `Timer` | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | With patch 002's positive-capacity progress, a peer that opens its window a few bytes at a time received one DATA frame per increment, a self-sustaining run that an unpatched h2 0.4.16+ receiver answers with `GOAWAY(ENHANCE_YOUR_CALM, "too_many_data_frames")` (#6033). The wait is bounded, so a window that never reaches 256 bytes still progresses. Path-sourced, so `cargo deny` advisory matching may skip it: check RUSTSEC `hyper` advisories against 1.10.0 manually | Co-retire with patches 002 and 004, or earlier when hyper or h2 coalesces small window increments while keeping every positive window live; hosted trickling-window and lockstep-window regressions must pass | [docs/upstream-hyper-patches/005-…](upstream-hyper-patches/005-h2-small-window-coalescing/README.md) |
-| `h2-001-coalesce-data-frame-writes` | `h2` | 0.4.20 | `FramedWrite` copies DATA payloads into its write buffer while it stays within about 64 KiB, instead of chaining one DATA frame at a time, so the frames staged in one `Prioritize` pass leave in one write; a grown buffer is dropped when the connection has nothing more to write | issue [hyperium/h2#902](https://github.com/hyperium/h2/issues/902), PR [hyperium/h2#903](https://github.com/hyperium/h2/pull/903) (third-party, open since 2026-05-05; queues frames instead of copying) | Ferrum Edge maintainers | Every DATA frame cost its own `writev` and peer wakeup, and over TLS a second, 9-byte record for each maximum-size frame; coalesced writes made HTTP/2 through Ferrum 8–24% faster (gRPC 5–7%) on the protocol benchmark (#5588). Path-sourced, so `cargo deny` advisory matching may skip it: check RUSTSEC `h2` advisories against 0.4.20 manually | An h2 release containing PR #903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2; the assigned-send-capacity patch must also retire before dropping the crate | [docs/upstream-h2-patches/001-…](upstream-h2-patches/001-coalesce-data-frame-writes/README.md) |
-| `h2-003-assigned-send-capacity` | `h2` | 0.4.20 | New read-only `SendStream::capacity_and_assigned()`: `capacity()` plus the flow-control window already assigned to a stream that buffered data has not claimed (ignoring the send-buffer limit that caps `capacity()`), read under one lock | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Hyper patch 005 must split a body chunk only when the peer's window is short; `capacity()` cannot tell that apart from a full send buffer, so a 1 MiB backend response chunk against the 400 KiB default buffer was split and stalled the frontend response pipe (3–9% at 500 KiB–1 MiB on the HTTP/2 benchmark). Path-sourced, so `cargo deny` advisory matching may skip it: check RUSTSEC `h2` advisories against 0.4.20 manually | Retire with Hyper patch 005, or when an h2 release exposes the assigned send window | [docs/upstream-h2-patches/003-…](upstream-h2-patches/003-assigned-send-capacity/README.md) |
+| `dimpl-001-certificate-chain-and-key-zeroization` | `dimpl` | 0.6.1 | Full leaf-first certificate-chain transport and zeroizing private-key ownership; backports [algesten/dimpl#153](https://github.com/algesten/dimpl/pull/153) (DTLS 1.3 `CertificateRequest` omits an empty `certificate_authorities` extension) | **Deliberate fork** — unfiled upstream; base commit `37bb0fa83f4167420729de5ea71c61852f82e9ed` ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Published releases expose only one local certificate and retain endpoint/fallback credential bytes in ordinary `Vec<u8>` owners | Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths | [docs/upstream-dimpl-patches/001-…](upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md) |
+| `hyper-util-001-release-h1-sender-on-dispatch-close` | `hyper-util` | 0.1.21 | Release an HTTP/1 connection's only request sender once its dispatcher stops reading, so a stranded request fails as unsent | **Deliberate fork** — no upstream PR; issue [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202) filed on hyper (hyper-util has issues disabled) ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | A backend RST/FIN racing tokio's two-step unbounded `send` stranded the request, so reqwest hung until `backend_read_timeout_ms` (504) instead of failing fast (#5714) | A hyper-util release stops holding the only HTTP/1 sender after its dispatcher closes, or a hyper release stops stranding a racing send | [docs/upstream-hyper-util-patches/001-…](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md) |
+| `hyper-util-002-forward-h2-response-write-timeout` | `hyper-util` | 0.1.21 | New `server::conn::auto::Http2Builder::response_write_timeout`, behind the `ferrum-h2-response-write-timeout` feature (not in `full`), forwarding to hyper patch 008's builder setting | **Deliberate fork** — no upstream filing ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Both HTTP frontends serve through hyper-util's auto builder, which owns its hyper HTTP/2 builder privately and forwards settings one by one, so it could not reach patch 008's bound; the feature keeps the standalone crate building against stock hyper | Retire with hyper patch 008, or earlier when hyper-util forwards an equivalent setting | [docs/upstream-hyper-util-patches/002-…](upstream-hyper-util-patches/002-forward-h2-response-write-timeout/README.md) |
+| `hyper-001-upgraded-h2-connect-error-reset` | `hyper` | 1.10.0 | `Upgraded::reset_with_connect_error()` resets an upgraded HTTP/2 `CONNECT` stream with `RST_STREAM(CONNECT_ERROR)` | issue [hyperium/hyper#4209](https://github.com/hyperium/hyper/issues/4209), PR [hyperium/hyper#4210](https://github.com/hyperium/hyper/pull/4210) (filed 2026-09-28) | Ferrum Edge maintainers | An HBONE relay that ended on a socket error otherwise closed with a clean `END_STREAM`; RFC 9113 §8.5 names `CONNECT_ERROR` for a failed tunnel (#5781) | A hyper release containing PR #4210 (or an equivalent API that resets an upgraded HTTP/2 stream with a chosen error code) is adopted | [docs/upstream-hyper-patches/001-…](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md) |
+| `hyper-002-min-data-frame-capacity` | `hyper` | 1.10.0 | A pending HTTP/2 body chunk makes progress with every positive amount of assigned capacity; no fixed minimum is imposed | **Deliberate fork** — current pending-body path unfiled; historical issue [hyperium/hyper#4211](https://github.com/hyperium/hyper/issues/4211), PR [hyperium/hyper#4212](https://github.com/hyperium/hyper/pull/4212) **closed unmerged 2026-10-04** ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | The former 1 KiB minimum could deadlock a legal 512-byte peer window (reproduced through 0.9.10); patch 004's pending-body path must keep progress at every legal window | Co-retire with patch 004 after adopting an equivalent upstream write-stall bound preserving positive-capacity progress, or moving the HTTP/2 client off Hyper; hosted replacement regressions must pass | [docs/upstream-hyper-patches/002-…](upstream-hyper-patches/002-min-data-frame-capacity/README.md) |
+| `hyper-003-greedy-h1-read` | `hyper` | 1.10.0 | HTTP/1 reads past one TLS record while the transport has more ready; an upgrade carries a read-ahead error into the tunnel after the buffered bytes | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | One decrypted record per read cost bulk HTTPS/1.1 responses 14–20% more CPU per request than Envoy (#5588); a read-ahead reset must reach a WebSocket/TCP tunnel, not a clean EOF (#5911) | hyper or tokio-rustls hands over every readable record per read, or the vendored hyper is retired | [docs/upstream-hyper-patches/003-…](upstream-hyper-patches/003-greedy-h1-read/README.md) |
+| `hyper-004-h2-body-write-timeout` | `hyper` | 1.10.0 | Request extension `hyper::ext::Http2BodyWriteTimeout`: a timer armed only while a chunk cannot be written resets the stream with `CANCEL` | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | hyper's pipe parks on flow control without polling the body, so `backend_write_timeout_ms` needed a gateway upload pump (~3.5% CPU on 10 KiB gRPC) and direct-H2 had no write bound (#5588) | Co-retire with patch 002 after adopting an equivalent upstream write-stall bound preserving positive-capacity progress, or moving the HTTP/2 client off Hyper; hosted replacement regressions must pass | [docs/upstream-hyper-patches/004-…](upstream-hyper-patches/004-h2-body-write-timeout/README.md) |
+| `hyper-005-h2-small-window-coalescing` | `hyper` | 1.10.0 | Body pipes wait up to 2 ms for a small window (below `min(chunk remaining, 256)`) before handing h2 exactly the assigned capacity, so h2 cannot cut a DATA frame per small increment (uses h2 patch 003; `Timer` connections only) | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | With patch 002's positive-capacity progress, a trickling peer window drew one DATA frame per increment, which an unpatched h2 0.4.16+ receiver answers with `GOAWAY(ENHANCE_YOUR_CALM)` (#6033) | Co-retire with patches 002 and 004, or earlier when hyper or h2 coalesces small window increments while keeping every positive window live; hosted trickling-window and lockstep-window regressions must pass | [docs/upstream-hyper-patches/005-…](upstream-hyper-patches/005-h2-small-window-coalescing/README.md) |
+| `hyper-006-h2-stream-termination-origin` | `hyper` | 1.10.0 | `hyper::ext::take_h2_stream_termination()` reports whether a dropped HTTP/2 service future ended by peer reset, transport loss, or hyper's own reset (`H2StreamTermination`) | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Drop glue cannot tell a client `RST_STREAM` from a local `PROTOCOL_ERROR` reset, and `499` needs positive evidence of a peer cancellation (#6768) | Co-retire with h2 patch 004 when hyper exposes why a server stream ended to the service, or Ferrum stops serving HTTP/2 through hyper | [docs/upstream-hyper-patches/006-…](upstream-hyper-patches/006-h2-stream-termination-origin/README.md) |
+| `hyper-007-h2-request-body-deadline` | `hyper` | 1.10.0 | Request extension `hyper::ext::Http2BodyDeadline` resets an HTTP/2 client stream with `CANCEL` at an absolute instant, whatever the body pipe is parked on | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | A request body pipe parked on backend flow control outlives the response, so a gRPC upload could outlive the client RPC deadline (#6870) | Retire when hyper can reset an HTTP/2 client stream, or bound its request body by an absolute instant, from outside the body pipe, or Ferrum's HTTP/2 client moves off hyper | [docs/upstream-hyper-patches/007-…](upstream-hyper-patches/007-h2-request-body-deadline/README.md) |
+| `hyper-008-h2-response-write-timeout` | `hyper` | 1.10.0 | New `hyper::server::conn::http2::Builder::response_write_timeout`: the HTTP/2 server's response body pipe runs patch 004's write-stall timer only while a ready chunk has no flow-control window assigned (a full send buffer with window in hand does not count), and resets the stream with `CANCEL` when it fires; a bound on a connection without a `Timer` resets each response with a body (`INTERNAL_ERROR`) before its headers | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | A client that keeps its connection alive but never sends `WINDOW_UPDATE` parked the response pipe on send capacity with an idle transport, so neither `FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS` (#6998) nor `backend_read_timeout_ms` could fire, and the response body held the backend connection indefinitely. Path-sourced, so `cargo deny` advisory matching may skip it: check RUSTSEC `hyper` advisories against 1.10.0 manually | Co-retire with patches 002, 004 and 005 (and hyper-util patch 002) when hyper bounds a server response body waiting on client window, or Ferrum stops serving HTTP/2 through hyper; hosted closed-window, slow-window, idle-body and full-send-buffer regressions must pass | [docs/upstream-hyper-patches/008-…](upstream-hyper-patches/008-h2-response-write-timeout/README.md) |
+| `hyper-009-h2-client-conn-task-box` | `hyper` | 1.10.0 | The HTTP/2 client's `H2ClientFuture::Task` holds its connection task in a `Box`, so the per-request `Pipe` and `Send` futures an executor spawns are no longer as large as the connection task; no API or behaviour change | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Each per-request future the HTTP/2 client spawns was as large as the once-per-connection task, because they travel in one enum: about 2.5 KiB on the direct HTTP/2 pool over TLS, where its own state is a few hundred bytes. On the HTTP/2 10 KiB benchmark those copies were 0.5–1.4% of gateway user CPU. Path-sourced, so `cargo deny` advisory matching may skip it: check RUSTSEC `hyper` advisories against 1.10.0 manually | Retire when hyper stops sizing per-request HTTP/2 client futures by the connection task, or with the vendored hyper as a whole | [docs/upstream-hyper-patches/009-…](upstream-hyper-patches/009-h2-client-conn-task-box/README.md) |
+| `h2-001-coalesce-data-frame-writes` | `h2` | 0.4.20 | `FramedWrite` copies DATA payloads into its write buffer (up to about 64 KiB) so the frames staged in one `Prioritize` pass leave in one write | issue [hyperium/h2#902](https://github.com/hyperium/h2/issues/902), PR [hyperium/h2#903](https://github.com/hyperium/h2/pull/903) (third-party, open since 2026-05-05) | Ferrum Edge maintainers | Each DATA frame cost its own `writev`, peer wakeup and, over TLS, an extra 9-byte record; coalescing made HTTP/2 8–24% faster (gRPC 5–7%) (#5588) | An h2 release containing PR #903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2; the assigned-send-capacity patch must also retire before dropping the crate | [docs/upstream-h2-patches/001-…](upstream-h2-patches/001-coalesce-data-frame-writes/README.md) |
+| `h2-003-assigned-send-capacity` | `h2` | 0.4.20 | Read-only `SendStream::capacity_and_assigned()`: `capacity()` plus the assigned but unclaimed window, ignoring the send-buffer cap | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Hyper patch 005 must split only on a short peer window, but `capacity()` also reflects a full send buffer, so large response chunks were split and stalled (3–9% at 500 KiB–1 MiB on HTTP/2) | Retire with Hyper patch 005, or when an h2 release exposes the assigned send window | [docs/upstream-h2-patches/003-…](upstream-h2-patches/003-assigned-send-capacity/README.md) |
+| `h2-004-reset-origin` | `h2` | 0.4.20 | Read-only `SendResponse::reset_is_local()`: whether the reset or `GOAWAY` that closed a stream was local or the peer's | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | `poll_reset` reports library-generated resets (a `content-length` overrun `PROTOCOL_ERROR`) like a peer `RST_STREAM`; Hyper patch 006 needs the initiator | Retire with Hyper patch 006, or when an h2 release exposes the reset initiator | [docs/upstream-h2-patches/004-…](upstream-h2-patches/004-reset-origin/README.md) |
 
 > Ownership note: `vendor/`, `deny.toml`, this doc, `docs/vendored-patch-lifecycle.json`,
 > `docs/upstream-*-patches/`, and the vendored-patch scripts are owned via
 > [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`). Upstream `h3`
 > work is staged from the `jeremyjpj0916/h3` fork: **h3-001** records a published
-> `fork_ref` for its filed upstream PR, while **h3-002** through **h3-005** have
+> `fork_ref` for its filed upstream PR, while **h3-002** through **h3-004** have
 > `fork_ref: null` in `docs/vendored-patch-lifecycle.json` pending maintainer
-> handoff. Every patch without an upstream PR is governed by the
+> handoff. **h3-005** also has `fork_ref: null`: it was reported privately to the
+> upstream maintainers instead (`upstream.filing: reported_privately`). Every
+> other patch without an upstream PR is governed by the
 > [Deliberate fork policy and SLA](#deliberate-fork-policy-and-sla) below.
 
 ### Deliberate fork policy and SLA
 
-As of 2026-10-04, seven patches ride an **open upstream PR** (reqwest #3017,
-h3 #339, tungstenite #556 / tokio-tungstenite #380, hyper #4210, and h2 #903 /
-#965); the weekly
-`scripts/check_vendored_patch_status.sh` (backed by
-`docs/vendored-patch-lifecycle.json`) polls those and goes red when one
-merges. Every other row in the inventory table is marked **Deliberate fork**
-(`upstream.filing: deliberate_fork_unfiled` in the lifecycle JSON), including
-sqlx-core, reqwest 002–004, h3 002–005, both h3-quinn patches, the tungstenite /
-tokio-tungstenite extensions other than lossless takeover, dimpl,
-Hyper 002/003/004, h2 003, and hyper-util (which has upstream issue
+As of 2026-11-20, six patches are `filed` in the lifecycle JSON, each riding an
+**open upstream PR** (reqwest #3017, h3 #339, tungstenite #556 /
+tokio-tungstenite #380, hyper #4210, and h2 #903). sqlx-core 002, which rode
+sqlx #4359, retired when SQLx 0.9.1 shipped that fix and Ferrum moved to it.
+The weekly `scripts/check_vendored_patch_status.sh`
+(backed by `docs/vendored-patch-lifecycle.json`) polls those and goes red when
+one merges without a recorded hold. One patch, h3 005, is
+`upstream.filing: reported_privately`: a security defect reported to the
+upstream maintainers through a private channel (`upstream.private_report`
+records the channel and date, never the embargoed report identifier, and the
+README and inventory row must carry the same "reported privately to …" record).
+It has no public issue or PR to poll and carries no reaffirmation; it moves to
+`filed` once a public upstream PR exists. Every other row in the inventory table is
+marked **Deliberate fork** (`upstream.filing: deliberate_fork_unfiled` in the
+lifecycle JSON): sqlx-core 001, reqwest 002–004, h3 002–004, both h3-quinn
+patches, the tungstenite / tokio-tungstenite extensions other than lossless
+takeover (tungstenite 002–005, tokio-tungstenite 004), dimpl, Hyper 002–009,
+h2 003–004, and hyper-util 001–002 (001 has upstream issue
 [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202) but no
 upstream PR). These are not untracked TODOs; they are carried as
 **deliberate, time-boxed forks** and are governed as follows:
@@ -179,19 +214,24 @@ patch 004 after an equivalent progress-preserving timeout implementation is
 adopted and tested, or the HTTP/2 client moves off Hyper. No replacement
 release or dated owner reaffirmation is recorded for either patch; the owner
 must file a current equivalent proposal or record matching dated reaffirmations
-before the stable-release checkpoint below. h2 #965 remains an independent
-open proposal with its own release-adoption trigger.
+before the stable-release checkpoint below.
 
 - **Owner.** The dependency-governance owner in
   [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`) — the same
   owner for `vendor/`, `deny.toml`, this doc, `docs/upstream-*-patches/`, and
   the vendored-patch scripts.
 - **Review cadence (SLA).** Every weekly `dependency-audit` run lists each
-  fork-only patch as `NOT YET FILED`. At each run the owner either (a) files the
+  fork-only patch: one with a dated re-affirmation (see the checkpoint below)
+  prints that record, and every other one is labelled `NOT YET FILED` with a
+  warning. Either way the patch stays `deliberate_fork_unfiled` and in the
+  deliberate-fork list above. At each run the owner either (a) files the
   upstream issue/PR and records the numbers in the inventory table, the per-patch
   `README.md` Status block, **and**
   [`docs/vendored-patch-lifecycle.json`](vendored-patch-lifecycle.json), or (b) leaves it as a conscious
-  re-affirmation that the fork is still the right call.
+  re-affirmation that the fork is still the right call. A
+  `reported_privately` patch is not fork-only and is not listed as
+  `NOT YET FILED`: the run prints its "reported privately to …" record, and the
+  owner follows the private report until the maintainers publish a fix.
 - **Hard checkpoint — no unfiled fork ships in a stable release.** A fork-only
   patch (no upstream PR link) may **not** survive the first tagged stable release
   (the schema-freeze milestone in
@@ -205,6 +245,13 @@ open proposal with its own release-adoption trigger.
   is `filed`, so reaffirming a fork that shares a `README.md` with filed patches
   (as `tungstenite-002-frame-limit-origin` does) does not drag them in. This
   keeps "not yet filed" from silently becoming permanent in a released product.
+  A `reported_privately` patch is outside this checkpoint while its private
+  report is open: its recorded `upstream.private_report` (channel and date) and
+  the matching "reported privately to …" sentence in its `README.md` and
+  inventory row are its record, and CI refuses a reaffirmation or `pr_number`
+  on it. Once the maintainers publish, it moves to `filed` with the public
+  issue/PR, or, if they decline, to `deliberate_fork_unfiled` and this
+  checkpoint.
 - **Retirement is unchanged.** Whether upstreamed via PR or carried as a fork,
   each patch retires per its `README.md` retirement plan and the co-vendoring
   rule (all five h3 patches retire together — see the inventory `Removal
@@ -257,13 +304,13 @@ benchmark inputs stay otherwise stable.
 Run locally:
 
 ```bash
-cargo install --locked cargo-deny
+cargo install --locked cargo-deny --version 0.20.2
 cargo deny check advisories bans sources licenses   # the gate (root workspace)
-cargo deny --manifest-path ebpf/Cargo.toml \
-    check --allow advisory-not-detected --config deny.toml advisories bans sources licenses          # the gate (eBPF workspace)
+cargo deny --manifest-path ebpf/Cargo.toml --config deny.toml \
+    check --allow advisory-not-detected advisories bans sources licenses          # the gate (eBPF workspace)
 for manifest in $(python3 .github/scripts/standalone_cargo_manifests.py); do
-  cargo deny --manifest-path "$manifest" \
-    check --allow advisory-not-detected --config deny.toml advisories   # standalone workspaces
+  cargo deny --manifest-path "$manifest" --config deny.toml \
+    check --allow advisory-not-detected advisories   # standalone workspaces
 done
 ```
 
@@ -290,13 +337,17 @@ date.
 
 | Advisory | Crate | Disposition | Evidence / tracking |
 |---|---|---|---|
-| RUSTSEC-2023-0071 | `rsa` 0.9.10 (Marvin timing side-channel) | **Re-affirmed** until 2026-12-31 | No fixed release: RustSec `patched = []`; 0.9.10 is the latest stable and 0.10.0-rc.18 (required by sqlx 0.9.0) is still affected. Reached via `sqlx-mysql` (public-key OAEP encryption of the MySQL password only, no private-key operation) and via jsonwebtoken's `rust_crypto` backend in the default `crypto-ring` profile, where RSA *signing* of outbound client assertions (`private_key_jwt` in `oidc_relying_party` / `oauth2_introspection`, `ai_federation` service-account JWTs) runs on the non-constant-time code. For `oidc_relying_party` / `oauth2_introspection`, EC/EdDSA assertion keys or the `fips` profile (`aws_lc_rs`) avoid it. `ai_federation` always signs RS256 (GCP service-account keys are RSA), so only the `fips` profile avoids it there. Retire when `rsa` ships a fix. |
 | RUSTSEC-2024-0436 | `paste` 1.0.15 (unmaintained) | **Re-affirmed** until 2026-12-31 | Proc-macro only; no runtime surface. `tikv-jemalloc-ctl` still depends on `paste ^1` in its latest 0.7.0, and the test matrix macro (`tests/scaffolding/matrix.rs`) uses it as a dev-dependency. Retire when `tikv-jemalloc-ctl` drops it. |
 | RUSTSEC-2024-0449 | `unsafe-libyaml` 0.2.11 (unmaintained) | **Added** 2026-10-12, until 2026-12-31 | Informational, not a known vulnerability: the repository was archived on 2024-03-25, RustSec lists `patched = []`, and 0.2.11 is the last release. Reached via `serde_yaml` 0.9.34+deprecated (file-mode and mesh file config loaders, config migration, API-spec YAML export) and via the direct pin that drives the libyaml event parser in `src/admin/api_specs/bounded_yaml.rs` and `src/config/yaml_alias_budget.rs` to bound alias expansion (#3307, PR #3843). Present in the root and `fuzz/` lockfiles, not in `ebpf/`. Inputs are operator-controlled (config files, the Kubernetes MeshConfig ConfigMap) or authenticated Admin API spec bodies parsed under size, node, depth, alias, and work budgets; no unauthenticated network input reaches libyaml. Forks such as `serde_yaml_ng` still depend on `unsafe-libyaml`, so retire by migrating `serde_yaml` and both event parsers to a safe-Rust YAML parser (`saphyr` / `serde-saphyr`). |
-| RUSTSEC-2026-0118, RUSTSEC-2026-0119 | `hickory-proto` 0.25.2 | **Retired** | Only `mongodb` < 3.7 pulled hickory 0.25. `mongodb` 3.7.0 moved to hickory 0.26; `Cargo.toml` now requires `>=3.7, <3.9` and the lockfile resolves 3.8.2. The cap keeps MongoDB 4.2 / Cosmos DB server-version-4.2 support: 3.9 raised the driver's minimum wire version to 9 (MongoDB 4.4). |
+| RUSTSEC-2026-0440 | `astral-tokio-tar` 0.6.2 (unmaintained) | **Added** 2026-11-06, until 2026-12-31 | Informational, not a known vulnerability: Astral ended maintenance on 2026-11-03 and RustSec lists `patched = []`. The only parent is `testcontainers` 0.28.0 (the latest release), a dev-dependency used by the `secrets_functional` and `service_integration` test targets. It is present only in the root lockfile (not `fuzz/`, `ebpf/`, or `tests/performance/*`) and never in the shipped binary or images. The tar streams are Docker build contexts and copy-to-container payloads built from repository test fixtures. Retire when a `testcontainers` release replaces it with `tar` (testcontainers/testcontainers-rs#1006, open as of 2026-11-06). |
+| RUSTSEC-2026-0543 | `chrono` 0.4.45 (unmaintained) | **Added** 2026-11-17, **re-evaluated** 2026-11-22, until 2026-12-31 | Informational, not a known vulnerability: chronotope/chrono#1768 announced the end of maintenance and RustSec lists every version as affected with `patched = []`. Compiled-in parents, from cargo-deny's own inclusion graph (all features): `ferrum-edge` itself (a direct dependency in ~535 Rust files: config-model timestamps, the database layer, Admin API output; `tests/performance/mesh/` also declares it) and sqlx 0.9.1 through our `chrono` feature (`sqlx-core` (vendored), `sqlx-postgres`, `sqlx-mysql`, `sqlx-sqlite`). Present in the root, `fuzz/` and `tests/performance/mesh/` lockfiles, not in `ebpf/` or the other `tests/performance/*` workspaces. `google-cloud-auth` was bumped from 1.13.0 to 1.17.0 (with `google-cloud-gax` 1.15.0, `google-cloud-gax-internal` 0.7.19, `google-cloud-secretmanager-v1` 1.14.0) in Phase 1 and no longer pulls `chrono`. `serde_with` 3.21.0 (reached from the `google-cloud-*` crates, `mongodb` and `testcontainers`) lists chrono in `Cargo.lock` only because Cargo records optional dependencies named by weak `dep?/feature` entries (rust-lang/cargo#10801); nothing enables its chrono feature, so it is not compiled and cargo-deny does not report it. Phase 1 also added `src/time_compat.rs` and enabled sqlx's `time` feature; retire by completing the phased migration of `ferrum-edge` and the mesh benchmark to `time_compat`/`time` without changing any serialized timestamp (RFC 3339 output, precision and `Z` in the Admin API, config files, database rows, `openapi.yaml` and ferrum-contracts), then dropping `chrono` and sqlx's `chrono` feature. Tracking: issue #7419. |
+| RUSTSEC-2026-0118, RUSTSEC-2026-0119 | `hickory-proto` 0.25.2 | **Retired** | Only `mongodb` < 3.7 pulled hickory 0.25. `mongodb` 3.7.0 moved to hickory 0.26. `Cargo.toml` now requires `3.9.1` (the lockfile resolves 3.9.1, also the fix for CVE-2026-88024), so the hickory 0.25 line cannot return. |
 | RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0104 | `rustls-webpki` 0.101.7 | **Retired** | Came only from rustls 0.21 in the AWS SDK's legacy `rustls` connector (`aws-smithy-runtime/tls-rustls`). `aws-sdk-secretsmanager` is now built with `default-features = false` and `default-https-client` + `rt-tokio`, the hyper 1.x / rustls 0.23 client that `aws_config::load_defaults` already selected. |
 | RUSTSEC-2026-0258 | `h2` 0.3.27 | **Retired** | Same legacy AWS connector (hyper 0.14). The gateway's own h2 0.4.x stays on the patched release. |
 | RUSTSEC-2025-0134 | `rustls-pemfile` 2.2.0 (unmaintained) | **Retired** | PEM parsing uses the `rustls-pki-types` `PemObject` API (`CertificateDer::pem_slice_iter`, `PrivateKeyDer::from_pem_slice`, `CertificateRevocationListDer::pem_slice_iter`), the code `rustls-pemfile` 2.2 already wrapped. `crate::tls::first_pem_private_key` keeps the old `Result<Option<_>>` contract where callers distinguish "no key" from "malformed". The standalone `tests/performance/**` harnesses were migrated the same way and their lockfiles refreshed. |
+| RUSTSEC-2023-0071 | `rsa` 0.9.10 (Marvin timing side-channel) | **Retired** (2026-11-20) | RustSec now lists `patched = [">= 0.10.0"]`. The only parent was `sqlx-mysql` (public-key OAEP encryption of the MySQL password); the SQLx 0.9.1 migration moved it to `rsa` 0.10.0 in the root, `fuzz/` and `tests/performance/mesh/` lockfiles, so the ignore no longer matched and was removed. `jsonwebtoken` never reaches `rsa`: its backend is `aws_lc_rs` on both profiles. |
+| RUSTSEC-2026-0459 | `libsqlite3-sys` 0.30.1 (bundled C SQLite < 3.54.0, CVE-2026-119375) | **Retired** (2026-11-20) | Fixed in `libsqlite3-sys` 0.39.0 (SQLite 3.54.0). `sqlx-sqlite` 0.9.1 allows `>=0.30.1, <0.41`, and the SQLx 0.9.1 migration resolves 0.40.0 in the root, `fuzz/` and `tests/performance/mesh/` lockfiles, so the conditional trusted-writer exception is gone. |
+| RUSTSEC-2026-0387 | `crypto-bigint` 0.5.5 (constant-time timing issues) | **Not needed** (2026-10-24) | Only `jsonwebtoken`'s `rust_crypto` backend pulled in `p256` / `p384` 0.13 → `elliptic-curve` 0.13 → `crypto-bigint` 0.5.5, and that backend signed ES256 JWT-SVIDs and ES256/ES384 `private_key_jwt` assertions on it. `jsonwebtoken` now selects `aws_lc_rs` inline on both profiles, so the root, `fuzz/` and `tests/performance/mesh/` lockfiles no longer contain those crates, and no ignore was added. |
 
 ### 3. License allowlist and exceptions
 
@@ -317,8 +368,9 @@ permanent by default.
 
 The token lives in a **comment**, not in the entry value, because cargo-deny's
 two schemas differ: an `[advisories.ignore]` table accepts a free-text `reason`
-field, while a `[licenses.exceptions]` entry does not — cargo-deny 0.19.9 rejects
-every key other than the crate spec plus `allow`
+field, while a `[licenses.exceptions]` entry does not — cargo-deny 0.20.2 (the
+pinned gate) and 0.19.9 both reject every key other than the crate spec plus
+`allow`
 (`error[unexpected-keys]: found 1 unexpected keys, expected: ["allow"]`). The
 convention is a `#` comment on the line immediately preceding the entry (a
 trailing comment on the entry line is also accepted), and it binds to exactly one
@@ -371,8 +423,9 @@ created by documented standalone vendor tests are ignored by default; intentiona
 committed lockfiles that pin a standalone regression graph (currently
 `vendor/dimpl-0.6.1-ferrum-patched/Cargo.lock`) are allowlisted in
 `GOVERNED_VENDOR_LOCKFILES` and must appear in the manifest. The guard runs in
-the normal integration suite (the `protocols-data-plane` shard), so a PR that
-changes any governed vendored byte without regenerating the manifest **fails CI**.
+the normal integration suite (the `mesh-protocols` Integration Tests shard in
+`ci.yml`), so a PR that changes any governed vendored byte without regenerating
+the manifest **fails CI**.
 This keeps the vendored diff reviewable: an unexpected edit to upstream code
 cannot slip in unnoticed.
 
@@ -426,14 +479,15 @@ of the vendor copy and must keep passing after retirement:
   (`net::tls::tls_rustls::tests::root_store_with_configured_ca_replaces_the_default_trust_store`,
   `net::tls::tls_rustls::tests::verify_ca_refuses_a_certificate_from_an_unconfigured_ca`),
   run with
-  `cargo test --manifest-path vendor/sqlx-core-0.8.6-ferrum-patched/Cargo.toml --no-default-features --features _rt-tokio,_tls-rustls-ring-webpki --lib tls_rustls::tests`,
+  `cargo test --manifest-path vendor/sqlx-core-<version>-ferrum-patched/Cargo.toml --no-default-features --features _rt-tokio,_tls-rustls-ring-webpki --lib tls_rustls::tests` (CI resolves the single vendored copy),
   plus `tests/service_integration/db_tls.rs` and the
   `FERRUM_DB_TLS_MODE=verify-ca` without-CA rejection in
   `tests/unit/config/env_config_tests.rs`. Upstream ADDS the configured CA to
   the bundled public roots, which combined with the `verify-ca` hostname waiver
   accepts any publicly-trusted certificate for any name.
-- Native REAL/DOUBLE typed-NULL parameter types through SQLx Any —
-  `tests/integration/admin_conditional_write_tests.rs`
+- Native REAL/DOUBLE typed-NULL parameter types through SQLx Any (retired
+  patch sqlx-core 002; upstream since SQLx 0.9.1, the test now guards upstream
+  behavior) — `tests/integration/admin_conditional_write_tests.rs`
   (`postgres_conditional_restore_checks_state_and_lease_in_transaction`, via
   `assert_postgres_any_float_null_parameter_types`) in the existing hosted
   **Integration Tests (conditional-live-stores)** gate. `pg_typeof` observes
@@ -441,7 +495,8 @@ of the vendor copy and must keep passing after retirement:
 - Per-request connect timeout across shared pool keys —
   `tests/integration/connection_pool_tests.rs`
   (`test_connect_timeout_does_not_fragment_pool`,
-  `test_pooled_client_exposes_per_request_connect_timeout`).
+  `test_pooled_client_exposes_per_request_connect_timeout`,
+  `test_per_request_connect_timeout_bounds_each_resolved_address`).
 - HTTP/3 graceful close with a buffered response is not a false 502 —
   `tests/integration/http3_integration_tests.rs`
   (`h3_buffered_response_survives_graceful_close_race`,
@@ -469,14 +524,21 @@ of the vendor copy and must keep passing after retirement:
   (`test_*websocket_ping_*`).
 - The tungstenite / tokio-tungstenite fragment-accounting regressions live in
   the vendored crate (`protocol::tests::fragment_*`,
-  `protocol::tests::incomplete_message_*`) and in
-  `tests/unit/gateway_core/websocket_fragment_metering_tests.rs`.
+  `protocol::tests::incomplete_message_*`, run by the vendored-patch job) and in
+  `tests/unit/gateway_core/websocket_fragment_metering_tests.rs`, which repeats
+  every vendored case through the public API and covers the
+  `tokio-tungstenite` delegator (`async_delegator_*`).
 - The dimpl credential regressions live in
   `vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs`. They
   cover DTLS 1.2 and 1.3 chain transmission plus deterministic clone,
   failed-construction, fallback, and shutdown zeroization observations. The
   Ferrum integration suite separately verifies a root-only client completes a
-  handshake because the configured intermediate is transmitted.
+  handshake because the configured intermediate is transmitted. The
+  backported DTLS 1.3 `CertificateRequest` wire regression is the crate unit
+  test `dtls13::server::tests::certificate_request_omits_empty_certificate_authorities`.
+  `tests/integration/dtls_integration_tests.rs` checks it against an
+  independent strict parser through the `strict_dimpl` dev-dependency (registry
+  dimpl `=0.8.0`, outside the patch's 0.6 range).
 
 - An HTTP/1 request stranded by a connection close during enqueue fails as
   unsent instead of hanging until `backend_read_timeout_ms` (issue #5714) — the
@@ -533,6 +595,11 @@ of the vendor copy and must keep passing after retirement:
   `egress_udp_relay_socket_error_sends_rst_stream_connect_error`,
   `egress_udp_relay_tunnel_close_still_ends_stream_cleanly`).
 
+- The futures hyper's HTTP/2 client spawns per request are not sized by its
+  per-connection task — the vendored hyper regression
+  `proto::h2::client::ferrum_client_conn_task_box_tests`, run with
+  `cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_client_conn_task_box`.
+
 CI gates these vendored-patch contracts in the `Vendored Patch Regressions`
 job in `.github/workflows/ci.yml`. Keep that job in sync with this list when
 adding, retiring, or changing a vendored patch.
@@ -573,17 +640,31 @@ co-vendored patches such as `h3`, `h3-quinn`, and tungstenite, *every* patch in
 the group must be ready — see the `Removal trigger` column).
 
 1. Bump the registry version in `Cargo.toml` `[dependencies]` to the release
-   containing the fix; update `Cargo.lock`.
-2. Remove the crate's line from the `[patch.crates-io]` block.
-3. `git rm -r vendor/<crate>-<ver>-ferrum-patched/` (and `vendor/` if empty).
-4. Move `docs/upstream-<crate>-patches/NNN-…/` to `…/_retired/NNN-…/` with a
+   containing the fix.
+2. Remove the crate's line from **every** `[patch.crates-io]` table that
+   points at the vendor directory. Standalone workspaces do not inherit the
+   root table, so each keeps its own mirror: the root `Cargo.toml`,
+   `fuzz/Cargo.toml` and `tests/performance/mesh/Cargo.toml`. Find them all
+   with `git grep -n '<crate>-<ver>-ferrum-patched' -- '*Cargo.toml'`.
+3. Regenerate every affected lockfile while the vendor directory still exists
+   — `Cargo.lock`, `fuzz/Cargo.lock` and `tests/performance/mesh/Cargo.lock`
+   (for example `cargo update -p <crate>` and
+   `cargo update --manifest-path fuzz/Cargo.toml -p <crate>`). Confirm the root
+   and fuzz tables still agree with
+   `cargo test --test unit_gateway_core_tests fuzz_workspace_patches_every_vendored_crate_the_root_patches`
+   (`tests/unit/gateway_core/fuzz_target_schedule_parity_tests.rs`), which CI
+   also runs.
+4. `git rm -r vendor/<crate>-<ver>-ferrum-patched/` (and `vendor/` if empty),
+   then `git grep '<crate>-<ver>-ferrum-patched'` for remaining references
+   (CI steps in `.github/workflows/ci.yml` and `.github/scripts/`).
+5. Move `docs/upstream-<crate>-patches/NNN-…/` to `…/_retired/NNN-…/` with a
    `STATUS.md` (merge commit + registry version), or delete per that crate's
    README.
-5. Remove the inventory row (Lifecycle ID) and the matching `docs/vendored-patch-lifecycle.json`
+6. Remove the inventory row (Lifecycle ID) and the matching `docs/vendored-patch-lifecycle.json`
    entry.
-6. Regenerate the drift manifest (now smaller) and keep the gateway call sites —
+7. Regenerate the drift manifest (now smaller) and keep the gateway call sites —
    they use the upstream API by design.
-7. Run the behavioral regression tests; they must still pass.
+8. Run the behavioral regression tests; they must still pass.
 
 ### Emergency security update for a vendored crate
 
@@ -606,10 +687,75 @@ reqwest/h3/tungstenite lineage needs an explicit path:
 6. Never silence an advisory without an expiry and a rationale — the expiry
    check will fail the weekly run otherwise (by design).
 
+### Cargo dependency updates
+
+`.github/dependabot.yml` schedules weekly `cargo` version updates for two
+directories:
+
+- `/`, the root workspace;
+- `/tests/performance/mesh`, the mesh benchmark crate. It path-depends on the
+  root crate and mirrors its `[patch.crates-io]` table, and the `Mesh Benchmark
+  Lockfile` workflow checks its lockfile.
+
+Minor and patch updates are grouped (`cargo-minor-patch`) into one PR per
+directory per week. A semver-major update gets its own PR. The crates replaced
+by a vendored `[patch.crates-io]` copy, and the `sqlx*` crates (which pin
+`sqlx-core` exactly), are in `ignore`. Moving one of them past its vendored
+version would make Cargo pick the crates.io release and drop the Ferrum patch
+without failing the build. Cargo only warns that the patch was unused. These
+crates move only through "Refreshing a vendored patch", "Retiring a vendored
+patch", or the emergency procedure above. Nothing else is ignored: the
+`mongodb` driver follows the latest release, and its server floor (MongoDB 4.4
+for driver 3.9) is documented in `docs/mongodb.md`.
+
+The Azure SDK crates (`azure_core`, `azure_identity`,
+`azure_security_keyvault_secrets`, and their `typespec*` support crates) have
+their own `azure-sdk` group, majors included. `azure_identity`'s credentials
+and the Key Vault client both implement or consume `azure_core`'s
+`TokenCredential`, so a lone `azure_core` bump does not compile (#6559). Upgrade
+them as one set. The 1.x line (`azure_core` 1.1, `azure_identity` 1.0,
+`azure_security_keyvault_secrets` 1.0.1) also sends bearer tokens only over
+TLS, so Key Vault references must be `https://`; see
+[`FEATURES.md`](../FEATURES.md#tls-and-trust) for pointing the backend at an
+emulator. The azure crates appear only in the root `Cargo.lock`; the mesh and
+fuzz graphs do not compile `secrets-azure`.
+
+The other standalone lockfiles get no version updates: `ebpf/` and `fuzz/` pin
+nightly toolchains, `tests/performance/multi_protocol/` must keep `# SYNC:`
+versions equal to the root, and the remaining benchmark harnesses are not worth
+weekly PRs. Dependabot security updates still cover every committed
+`Cargo.lock`, and the dependency-audit lanes audit the root, `ebpf/`, and every
+standalone workspace in the `standalone_cargo_manifests.py` inventory.
+
+**The repository Cargo config must not name a `rustc-wrapper`.** Every cargo
+process under the repository root reads `.cargo/config.toml`, including
+Dependabot's cargo updater. The updater runs `rustc -vV` through the configured
+wrapper and has no sccache. From PR #821 (2026-05-16) until the wrapper was
+removed, every cargo update failed before opening a PR with
+`dependency_file_not_resolvable` (`could not execute process 'sccache …/rustc -vV'`).
+That covered version and security updates, for the root and for every nested
+lockfile. sccache is selected outside the committed file:
+
+- in CI, `.github/actions/setup-sccache` exports `RUSTC_WRAPPER` and
+  `CARGO_BUILD_RUSTC_WRAPPER` as the checksum-verified binary, or clears them;
+- in cross-rs and container builds, `Cross.toml` and
+  `build_linux_gnu_sysroot.sh` pass both as empty values;
+- locally, `scripts/install-build-deps.sh` sets `build.rustc-wrapper` in the
+  user-level `$CARGO_HOME/config.toml`.
+
+`verify_cross_build_policy.py` (`EXPECTED_CARGO_BUILD`) allowlists exactly
+`[build] incremental = false` and rejects any committed `rustc-wrapper`. A
+`.cargo/config[.toml]` below the root is rejected outright, so a nested
+lockfile cannot get its own wrapper either.
+
+Dependabot cargo PRs use the `deps` commit prefix and the `dependencies` label,
+the same as the `docker` ecosystem. They run the ordinary PR CI, including the
+blocking dependency audit when `Cargo.lock` changes.
+
 ## Base image pinning
 
-Production container images (`Dockerfile`, `Dockerfile.release`, and
-`Dockerfile.test`) must pin every external `FROM` base by registry digest, not
+Production container images (`Dockerfile`, `Dockerfile.release`,
+`Dockerfile.ebpf-tools-layer`, and `Dockerfile.iproute2-layer`) must pin every external `FROM` base by registry digest, not
 by a mutable tag alone. Write the reference as `repo:tag@sha256:…`, the same form
 `IPROUTE2_BASE` already uses: the digest decides which bytes are pulled and the
 tag stays in the reference as documentation. A Dockerfile comment is a WHOLE line
@@ -649,7 +795,7 @@ its first token or skipped.
 ### Container build inputs (enforcement and refresh)
 
 Every registry image reference in `Dockerfile`, `Dockerfile.release`,
-`Dockerfile.test`, `Dockerfile.ebpf-tools-layer`, and
+`Dockerfile.ebpf-tools-layer`, and
 `Dockerfile.iproute2-layer` — both `FROM <ref>` and the `ARG <NAME>=<ref>`
 defaults those `FROM ${VAR}` lines expand — carries an `@sha256:` digest.
 `Dockerfile.iproute2-layer`'s default `BASE_IMAGE` matches the source runtime
@@ -687,35 +833,54 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   rewrites the digest in place, re-runs the pin verifier, and opens or updates a
   single pull request on the fixed branch `deps/base-image-digests`. It is
   digest-preserving by construction: it substitutes a digest and never removes
-  one, never changes an image or tag. Required CI (multi-arch build, FIPS, eBPF,
-  GNU ABI scan, chart smoke) and `Trusted Cross Build Policy` must qualify the
-  latest reviewed PR head before merge.
-  It never rewrites the `gcr.io/distroless/cc-debian13` runtime base. That
-  digest is also pinned by the `main-linux-image` job in
-  `.github/workflows/ci.yml`, which `verify_cross_build_policy.py` freezes by
-  whole-job SHA-256 (`WORKFLOW_CONTRACTS`), and
-  `check_distroless_digest_consistency()` requires every distroless reference
-  in the repository to match `Dockerfile`. A pull request can neither move that
-  frozen pin nor leave it stale, so on distroless drift the workflow lists every tracked
-  file that pins the old digest in a warning, the step summary, and the refresh
-  PR body (when other inputs changed), still proposes the other refreshed
-  inputs, and then fails. A maintainer rotates the distroless digest in every
-  listed file, including the `main-linux-image` job and its `WORKFLOW_CONTRACTS`
-  digest, in one reviewed direct-to-`main` commit. `verify_ci_runtime_cache.py`
-  fails if the workflow stops holding distroless drift.
+  one, never changes an image or tag, and it moves the `# Digest resolved
+  YYYY-MM-DD` comment above each rewritten pin (walking up over adjacent
+  `FROM`/`ARG` pin lines) to the run's UTC date. The ordinary required PR checks
+  and `Trusted Cross Build Policy` must qualify the latest reviewed PR head
+  before merge. Those are path-selected: for Dockerfile changes they include
+  the amd64 production Dockerfile smoke build, but multi-architecture image
+  builds, FIPS and the GNU ABI scan are not guaranteed to run on the PR.
+  Every tracked Dockerfile and YAML file that pins a drifted reference is
+  rewritten together; prose such as `CHANGELOG.md` keeps its history. That
+  includes the `gcr.io/distroless/cc-debian13` runtime base: its consumers are
+  the governed Dockerfiles and
+  `tests/performance/multi_protocol/h3_proof/Dockerfile.live`. The protected
+  `main-linux-image` job in `.github/workflows/ci.yml` no longer pins a digest:
+  it reads `RUNTIME_BASE` from `Dockerfile` and fails unless that is a
+  digest-pinned `gcr.io/distroless/cc-debian13:nonroot` reference, so rotating
+  the base never edits a workflow or its `WORKFLOW_CONTRACTS` hash.
+  `check_distroless_digest_consistency()` still requires every distroless
+  reference to match `Dockerfile`.
+  The workflow holds no stored credential; it uses its own `GITHUB_TOKEN`
+  (`contents: write`, `pull-requests: write`). That token cannot change workflow
+  files, so a drifted reference pinned in a workflow, or in the trusted Cross
+  policy, fails the run with an instruction to move the pin into a Dockerfile.
+  A pull request opened by `GITHUB_TOKEN` does not start its required CI on its
+  own: `pull_request` runs, if GitHub creates them, wait for maintainer
+  approval, and the `pull_request_target` trusted policy never starts. A
+  maintainer therefore closes and reopens the refresh PR (or merges `main` into
+  it) to run every required check, including `Trusted Cross Build Policy`,
+  verifies each digest
+  against its registry, and merges it. Automatic merging was evaluated and
+  rejected: see the rationale in PR #6535. `verify_ci_runtime_cache.py` fails if
+  the workflow stops rotating every consumer, may rewrite workflow or trusted
+  policy files, or stages only the Dockerfiles.
   The shared resolution/staging inventory also includes `Dockerfile.iproute2-layer`,
   so the NodeWaypoint live image uses the same refreshed Debian tooling base. Its
   default `BASE_IMAGE` matches the same source runtime pin; an
   explicit caller override remains supported. The refresh workflow already
   included this Dockerfile and updates its digest-pinned image references.
 
-Dependency and frozen-policy PRs may be admin-merged by a maintainer after
-verification. Before an admin merge, verify every proposed dependency version
-and image digest against its authoritative registry or upstream source, and
-require all other applicable required checks to pass on the reviewed head. Use
-this path only when an intentionally frozen trusted-policy gate cannot qualify
-the change; record the affected gate and its frozen contract in the PR body.
-An admin merge does not waive failed or missing unrelated required checks.
+An action pin rotation needs no admin merge: the trusted policy admits it
+(see "Automated action pin rotation" below), and Dependabot PRs auto-merge once
+green. A frozen-policy PR that the trusted gates cannot qualify by design, such
+as an edit to `verify_cross_build_policy.py` or another frozen executable
+surface, may be admin-merged by a maintainer after verification. Before an
+admin merge, verify every proposed dependency version and image digest against
+its authoritative registry or upstream source. Require all other applicable
+required checks to pass on the reviewed head, and record the affected gate and
+its frozen contract in the PR body. An admin merge does not waive failed or
+missing unrelated required checks.
 
 Emergency procedure (a base-image CVE that cannot wait for Monday): resolve the
 fixed tag's manifest-list digest by hand, bump the `@sha256:` value and the
@@ -728,6 +893,19 @@ exact version, and records why in the file itself: lint parity with the
 `dtolnay/rust-toolchain@stable` CI installs. That is not an unpinned build input.
 The compiler identity of a *release* build is fixed by the digest-pinned
 `rust:<tag>@sha256:…` builder image, which fixes the rustc inside it.
+
+The one nightly that reaches a published image, the eBPF ELF build in
+`Dockerfile`, is pinned by date through the `EBPF_NIGHTLY_TOOLCHAIN` build
+argument (currently the fuzz lane's `nightly-2026-09-30`). It is never the
+floating `nightly` channel. Move it forward with a normal pull request, which
+the production eBPF image smoke gates. The `Dockerfile` builds, the native
+release builds in `release.yml`, and the x86_64 GNU sysroot builder all pass
+`cargo build --locked`. They compile exactly the committed `Cargo.lock` and
+fail instead of re-resolving a dependency (#6574). The ARM64 Cross release job
+is byte-frozen by the trusted Cross policy's `WORKFLOW_CONTRACTS` digest, so it
+can gain `--locked` only through a reviewed policy migration. It builds the
+same tagged commit and lockfile. If that lockfile is stale, the `--locked`
+native builds fail, and `create-release` cannot publish without them.
 
 ## CI Actions and Kubernetes tooling
 
@@ -780,69 +958,127 @@ jobs are a separate supply-chain surface from Rust crates. Policy:
 
 ### Refreshing GitHub Actions (Dependabot)
 
-`.github/dependabot.yml` already schedules weekly `github-actions` updates.
-When reviewing an actions Dependabot PR:
+`.github/dependabot.yml` schedules weekly `github-actions` updates for
+`.github/workflows` and every local composite action (`/.github/actions/*`).
+Compatible (minor and patch) updates arrive grouped in one PR; a semver-major
+update gets a PR of its own. Every external action is in scope, including the
+ones whose exact invocations the trusted Cross build, publication, and CI
+runtime-cache contracts freeze. Those used to be on an `ignore` list and needed
+a maintainer override to rotate; the trusted policy now admits their pin
+rotations itself (next section).
 
-1. Confirm the PR pins a full commit SHA (Dependabot for GitHub Actions should
-   produce SHA pins when the repo already uses them).
-2. Keep the trailing version comment accurate for the tag the SHA corresponds
-   to.
-3. Do not accept a PR that reintroduces a mutable tag ref.
+The one remaining `ignore` entry is `dtolnay/rust-toolchain`. It publishes no
+release tags (it keeps one force-updated branch per toolchain), so no new pin
+for it can pass the release-tag rule below. Rotating it stays a manual,
+maintainer-overridden change.
 
-Dependabot version updates are ignored for the external actions whose exact
-invocations are covered by the trusted Cross build and CI runtime-cache
-contracts: `actions/cache/restore`, `actions/cache/save`,
-`actions/checkout`, `actions/download-artifact`, `actions/setup-python`,
-`actions/upload-artifact`, `docker/build-push-action`, `docker/login-action`,
-`docker/setup-buildx-action`, `dtolnay/rust-toolchain`, `Swatinem/rust-cache`,
-and `taiki-e/install-action`. A SHA or version-comment change in these frozen
-jobs can fail the trusted checks on `main`, while `CI Plan` intentionally
-rejects direct edits to the frozen policy scripts. The `ignore` entries suppress
-version-update PRs; Dependabot security updates remain allowed.
+The rules for any action pin, whoever proposes it:
 
-#### Rotating frozen actions
+1. Pin a full 40-character commit SHA. Mutable tags, branches, and short SHAs
+   are rejected (`pr_ci_plan.py --self-test`, and every frozen surface, which
+   only normalizes full-SHA pins).
+2. The trailing version comment is informational. Keep it accurate for new
+   uses. It is not part of any frozen surface, so Dependabot may rewrite it
+   (`# v7.4.0` → `# v7.5.0`) or leave a major-only comment (`# v7`) alone.
 
-Schedule a periodic review of the ignored actions for upstream releases and
-security fixes. When an update is due, prepare one coordinated rotation PR,
-modeled on [#5675](https://github.com/ferrum-edge/ferrum-edge/pull/5675): update
-the affected workflow pins and version comments, the corresponding trusted
-contracts, and the action pin records in this document together. The PR is
-expected to fail `CI Plan` and trusted checks that use policy from `main`; this
-is by design. A maintainer override is needed after `Candidate policy
-self-test` and the CI aggregate wiring check pass. Do not land a partial action
-bump and defer the contract update.
+### Automated action pin rotation
 
-The setup-python v7.0.0 pin (`5fda3b95…`) now covers every use, including the
-previously frozen compiler-store `produce` and platform-study `study` jobs.
-Those two jobs were rotated in a coordinated trusted-policy update because their
-Cross-sensitive bodies cannot change through an ordinary pull request. The v7
-action still runs on Node 24 and accepts the existing `python-version: '3.13'`
-input; its removed `pip-install` input is not used here. Future Dependabot
-updates that only retarget already-v7 uses can land via ordinary PR; a SHA
-change inside a Cross-frozen job still requires a coordinated trusted-policy
-rotation.
+`verify_cross_build_policy.py` makes every frozen workflow, local-action, and
+template comparison over pin-normalized text. A
+`uses: owner/repo[/path]@<40-hex SHA>` reference keeps its action path, but its
+commit and trailing comment are replaced by a placeholder
+(`normalize_action_pins`). A frozen surface therefore still freezes which
+action runs, with which inputs, in which job. It no longer freezes which
+upstream release commit of that action runs. Changing the action path, adding a
+`uses:` step, or replacing a pin with a mutable ref still changes the
+normalized text, and the freeze refuses it as before.
 
-The ARM64 Cross build and publication contracts are deliberately frozen by the
-trusted `pull_request_target` verifier. Existing checkout uses on the guarded
-workflow surfaces still carry the historical `# v6` annotation, although their
-pinned `3d3c42e5...` SHA resolves to v7.0.1. The verifier treats an adjacent
-annotation change as a change to that executable surface, so an ordinary pull
-request cannot normalize those comments. Correct them only as part of an
-authorized, coordinated rotation of the trusted policy; do not copy the legacy
-annotation onto new uses.
+The pinned commit is governed by `action_pin_rotation_errors`, which
+`Trusted Cross Build Policy` (the required `pull_request_target` gate, run from
+the live trusted base) applies to every pull request. It judges the YAML lines
+the pull request itself adds, taken from its three-dot diff against the live
+trusted tip (`--proposed-changes`). It checks them against the raw YAML of that
+tip: workflows, local actions, and YAML under the automation roots. A branch
+cut before a rotation therefore does not read as a downgrade of pins it never
+touched, because its merge keeps the trusted tip's newer pin. For each upstream
+repository that the trusted tip already pins, every new commit on an added line
+must pass two checks:
 
-The install-action v2.87.15 pin (`4076c08d…`) covers `ci.yml`,
-`dependency-audit.yml`, the coverage workflow, and the ARM64 release producer.
-The release producer's `WORKFLOW_CONTRACTS` job digest was rotated with the pin;
-the action retains the existing `tool`/`fallback` inputs.
+- **Release tag.** The commit must be the target (peeled, for annotated tags)
+  of an upstream release tag (`v?N[.N…]`). The tags are read from
+  `https://github.com/<owner>/<repo>` itself with `git ls-remote`. A bare
+  commit SHA can also resolve through the fork network, but such a commit is
+  not an upstream release, so it fails this check.
+- **Forward only.** The commit must descend from every commit the trusted base
+  pins for that repository. A commit-only `git fetch --filter=tree:0` of that
+  release tag must contain each trusted pin. This refuses downgrades and side
+  branches.
 
-The docker/setup-buildx-action v4.4.1 pin (`f87e5991…`) and
-docker/build-push-action v7.4.0 pin (`c3c9e263…`) cover the release publication
-jobs and the image build workflows. The trusted ARM64 publication exact-job,
-step, and artifact-selection contracts, along with the NodeWaypoint and Ambient
-registry-cache jobs and the CI runtime-cache pin checks, were rotated to those
-same SHAs. Future SHA changes inside a frozen job require a coordinated
-trusted-policy rotation even when the action inputs stay the same.
+Upstream lookups use literal-argv `git` with the remote supplied as
+configuration, retry transient failures, and fail closed. An unreachable
+upstream refuses the rotation until a re-run succeeds. A repository the
+trusted base does not pin yet is not a rotation, so this check skips it. The
+freeze and ordinary review still apply to it.
+
+The other gates that used to compare exact SHAs now compare pin shape instead
+and leave the commit to the check above:
+
+- `cross-build-policy.yml` and the `CI Plan` early guard accept a
+  `cross-build-policy.yml` change only when the live trusted verifier reports
+  it pin-only (`--pin-normalized-equal`). `verify_cross_build_policy.py` itself
+  stays byte-protected.
+- `verify_trusted_local_action.py` (Helm Chart) treats a YAML file that differs
+  from the trusted bytes only in pins as identical.
+- `verify_ci_runtime_cache.py`, `verify_publication_gate.py`,
+  `verify_release_image_attestations.py`, `verify_required_ci.py`,
+  `test_ci_policy_parallel.py`, `verify_main_latest_image_workflow.py`, and
+  `tests/conformance/live_contract.rs` require a full-commit pin of the named
+  action instead of one literal commit. `verify_main_latest_image_workflow.py`
+  still requires the publisher to use the same pins as `release.yml`.
+
+`CI Policy` runs the trusted verifier against the proposal alone, with no
+trusted baseline to compare against, so it cannot judge rotations. The
+admission authority for pins is `Trusted Cross Build Policy`. Both are
+required.
+
+### Automated dependency merges
+
+`.github/workflows/dependabot-auto-merge.yml` queues GitHub auto-merge, with a
+merge commit, on pull requests that Dependabot opened from a branch of this
+repository and last pushed to. Queuing is not merging. GitHub merges only
+after every required check passes on the PR head, including `Trusted Cross
+Build Policy`'s pin rotation check. The rules:
+
+- semver-major updates are left for a maintainer;
+- a push to a Dependabot branch by anyone other than Dependabot withdraws the
+  queued merge, so a human-edited bump returns to human review;
+- the workflow runs from `main` (`pull_request_target`), never checks out or
+  executes PR content, and holds only the built-in `GITHUB_TOKEN`. No stored
+  credential exists. Both the queuing and the withdrawing job request
+  `contents: write` and `pull-requests: write` at job level, because GitHub
+  requires both to enable or to disable auto-merge. Those two jobs run only
+  the runner's `gh`. The third-party `dependabot/fetch-metadata` action runs
+  in a separate `metadata` job with `pull-requests: read` only and hands the
+  update type to the queuing job as a job output, so a compromised release
+  of it never holds a write token;
+- this is one of the repository's two `pull_request_target` workflows (the
+  other is `cross-build-policy.yml`). GitHub's default Actions event policy
+  blocks that event in public repositories from 2026-12-02, so the explicit
+  allow policy must name both files by path;
+- the repository setting **Allow auto-merge** must stay enabled.
+
+A merge that GitHub performs for a `GITHUB_TOKEN`-queued auto-merge does not
+start `push`-triggered workflows. A Dependabot merge commit therefore has no
+exact-commit push-to-`main` evidence of its own and is not a release candidate
+by itself (see `docs/ci_cd.md` → "Publish-blocking required checks"). The next
+maintainer merge on top of it produces that evidence for a commit that
+contains the bump. `main-latest-image.yml` likewise advances on that next
+push.
+
+Cargo PRs follow the same path (see "Cargo dependency updates"). The grouped
+`cargo-minor-patch` PRs auto-merge once every required check passes, including
+the blocking dependency audit. A semver-major crate update waits for a
+maintainer, and the vendored `[patch.crates-io]` crates are never proposed.
 
 #### Scope of the repository-script (automation) freeze
 
@@ -872,7 +1108,7 @@ reachable on *either* revision stays in scope, so a pull request cannot drop the
 reachability edge and edit the file in the same commit. Newly reaching an
 already-Cross-sensitive script from a protected job is still rejected.
 
-#### Temporary generation transitions (`fips-build.yml`, CI jobs, `setup-rust-ci`)
+#### Generation transitions (`fips-build.yml`, CI jobs, `setup-rust-ci`)
 
 The verifier can admit an exact whole-file SHA-256 source→destination pair for
 a frozen surface, so one reviewed rewrite can pass the Cross surface scan. Each
@@ -880,21 +1116,17 @@ pair is path- or job-bound, one-way, fail-closed, and decided entirely by the
 trusted base; anything else is scanned as an ordinary Cross surface change.
 Current admissions:
 
-- `fips-build.yml`: one transition for the issue #4018 memory mitigation on the
-  `fips-test-build` job (`FIPS_BUILD_ADMITTED_GENERATION_TRANSITION`). The
-  earlier #3889 admission was retired by #3943.
-- Cross-sensitive `ci.yml` jobs: `CI_JOB_GENERATION_TRANSITIONS`.
-- `setup-rust-ci/action.yml`: a two-step chain in
-  `LOCAL_ACTION_GENERATION_TRANSITIONS`, from
-  `fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` to the
-  cache-budget generation
-  `b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924`, then to
-  the combined #3911 destination
-  `219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925`.
+- `fips-build.yml`: none. The #3889, #3950 and issue #4018 whole-file
+  admissions are spent and the verifier no longer carries the mechanism.
+- Cross-sensitive `ci.yml` jobs (`CI_JOB_GENERATION_TRANSITIONS`) and local
+  composite actions (`LOCAL_ACTION_GENERATION_TRANSITIONS`): both tables are
+  currently empty. Their pairs, including the `setup-rust-ci` #3889→#3911
+  chain, the issue #6573 BoringCache retirement pairs and the PR #7365
+  `ebpf-live` / `netns-capture-live` swap-step pairs, are spent and retired.
 
-Details and digests: `docs/ci_cd.md` → "Admitted `fips-build.yml` generation
-transition", "Admitted CI job SHA-256 generation transitions", and "Admitted
-`setup-rust-ci` generation transitions".
+Details: `docs/ci_cd.md` → "`fips-build.yml` generation transitions (none
+open)", "Admitted CI job SHA-256 generation transitions", and "Admitted
+local-action generation transitions".
 
 ### Refreshing kind / kubectl / Helm versions and checksums
 
@@ -921,18 +1153,12 @@ Versions and digests live as defaults on the
    path-filter on the composite action will exercise the new pins.
 
 `Helm Chart` proves `.github/actions/setup-kubernetes-tools` against the trusted
-revision before `uses:`, so a pull request that edits that action is rejected
-unless `verify_trusted_local_action.py` already admits that exact
-source→destination generation pair. Issue #3904's predecessor transition binds
-the current `action.yml`
-(`6ecb4bde09a0d3d456d6019c03ef1678c3903cbc0275bba31fde3e56f6e6ef08`,
-non-executable, sole governed file) moving to the PR #3910 cached-installer
-generation
-(`41dd4b9ae1b0ad74e021e2974afbcdac1a1bc0d856a166a57e94046e803d6cd9`, same path
-set and mode). Future installer edits need a new frozen pair, or must match the
-trusted tree byte for byte. Do not treat a working-tree digest or a mutable
-allowlist as admission. After #3910 is the trusted base, retire the predecessor
-constants so the old generation cannot remain an admitted source.
+revision before `uses:`, so a pull request that edits that action is rejected:
+`verify_trusted_local_action.py` admits only byte identity with the trusted
+tree. Issue #3904's one-way move to the PR #3910 cached-installer generation is
+spent and retired. A future installer edit (a version or checksum bump) is
+therefore reviewed direct-to-`main` work. Do not treat a working-tree digest or
+a mutable allowlist as admission.
 
 Never refresh a checksum by copying a digest from an unpinned adjacent path
 without official release provenance, and never pipe a remote install script to
@@ -974,15 +1200,27 @@ Ferrum ships two mutually exclusive cryptographic-backend cargo features
 
 | Feature | Backend | Lockfile |
 |---|---|---|
-| `crypto-ring` (default) | `ring` + `rustls/ring` | the committed `Cargo.lock` |
+| `crypto-ring` (default) | `ring` + `rustls/ring`, plus `rustls/aws_lc_rs` for the TLS record layer (see below) | the committed `Cargo.lock` |
 | `fips` | `aws-lc-fips-sys` via `aws-lc-rs/fips` and `rustls/fips` | the committed `Cargo.lock` |
 
 Rules:
 
 - **The backend is never selected inline on a dependency.** `rustls`,
   `tokio-rustls`, `reqwest`, `sqlx`, `ldap3`, `quinn`, `rcgen`, `x509-parser`,
-  `jsonwebtoken`, `hyper-rustls`, and `instant-acme` all take their crypto arm
-  from the feature pair. An inline selection would win on both profiles.
+  `hyper-rustls`, and `instant-acme` all take their crypto arm from the
+  feature pair. An inline selection would win on both profiles.
+- **`jsonwebtoken` is the one deliberate exception.** It selects `aws_lc_rs`
+  inline, identically on both profiles, and `rust_crypto` is never enabled.
+  jsonwebtoken 12 picks its provider automatically only when exactly one
+  backend is compiled, so one inline selection keeps that true for every
+  feature combination. On a `fips` build, `aws-lc-rs/fips` unifies onto the
+  same `aws-lc-rs`, so JWTs are signed and verified in the validated module.
+  `rust_crypto` would pull in the RustCrypto `rsa` (RUSTSEC-2023-0071) and
+  `p256`/`p384` 0.13 on `crypto-bigint` 0.5 (RUSTSEC-2026-0387) signers.
+  `check_fips_feature_policy.py` (`REQUIRED_INLINE_DECLARATIONS`) requires the
+  inline selection, rejects any `jsonwebtoken/...` edge in either profile
+  list, and requires `jsonwebtoken/aws_lc_rs` with no `rust_crypto` in both
+  resolved graphs.
   `rustls`, `tokio-rustls`, `quinn`, and `rcgen` carry
   `default-features = false`, because their default sets select a provider;
   reqwest uses `rustls-no-provider` plus vendored `__rustls-ring` /
@@ -994,12 +1232,32 @@ Rules:
   and `hyper-rustls` each gate their aws-lc arm on the *absence* of their ring
   arm, so "also enable aws-lc" produces a build that looks switched and is not.
   This is the whole reason the features are exclusive rather than layered.
+- **The ordinary profile carries exactly one AWS-LC edge, `rustls/aws_lc_rs`.**
+  It links rustls's AWS-LC cipher suites beside its ring ones so
+  `src/fips/aead_backend.rs` can use whichever is faster for the record layer
+  of TLS over TCP on the CPU it runs on (`FERRUM_TLS_AEAD_BACKEND`, default
+  `auto`); QUIC packet protection stays on ring. It
+  is safe in this direction because the profile claims no validated module,
+  rustls keeps `ring` for key exchange and signatures, and no dependency
+  changes arm: the resolved-graph audit requires `rustls/ring` and
+  `rustls/aws_lc_rs` together and forbids every dependency's own aws-lc arm
+  (`FORBIDDEN_RESOLVED_RING`). It adds no crate to the profile, which already
+  linked `aws-lc-sys` through jsonwebtoken and dimpl. The edge is an
+  allow-list entry (`RING_PROFILE_ALLOWED_AWS_LC_EDGES`), not a pattern: any
+  other AWS-LC or FIPS-module feature in the `crypto-ring` list fails the
+  manifest check, and adding a second entry is a policy decision that needs
+  the same review. It is not mirrored in `fips`, where `rustls/fips` already
+  implies rustls's aws-lc arm and no `ring` arm may appear at all. The two
+  standalone workspaces that depend on this crate by path (`fuzz/` and
+  `tests/performance/mesh/`) resolve the same edge, so their lockfiles carry
+  rustls's `aws-lc-rs` dependency too.
 - **The declared contract is not the audited one.**
   `.github/scripts/check_fips_feature_policy.py` reads what cargo actually
   resolved (`cargo tree -e normal,build --prefix none -f '{p}|{f}'`) for
   *both* profiles and
   fails on any surviving ring selection in the FIPS graph. It runs in the
-  required `FIPS Feature Policy` job of `.github/workflows/fips-build.yml`.
+  `FIPS Feature Policy` job of `.github/workflows/fips-build.yml`, which the
+  required `FIPS Build & Test` aggregate needs and requires to succeed.
   The `normal,build` edge filter is load-bearing: test fixtures pin `ring` and
   `rustls/ring` as dev-dependencies so the suite can verify both profiles
   without those edges entering a shipped binary. Package-row feature output is
@@ -1053,6 +1311,7 @@ covers, so it must not be replaced with a prebuilt artifact.
 - `docs/upstream-sqlx-patches/`, `docs/upstream-reqwest-patches/`,
   `docs/upstream-h3-patches/`, `docs/upstream-h3-quinn-patches/`,
   `docs/upstream-tungstenite-patches/`, `docs/upstream-dimpl-patches/`,
-  `docs/upstream-hyper-util-patches/`, `docs/upstream-hyper-patches/` —
+  `docs/upstream-hyper-util-patches/`, `docs/upstream-hyper-patches/`,
+  `docs/upstream-h2-patches/` —
   per-patch detail and retirement plans.
 - `Cargo.toml` `[patch.crates-io]` — the active vendored patches.

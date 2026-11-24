@@ -117,19 +117,21 @@ address; an on-path attacker between gateway and backend.
 
 - **Revocation coverage is partial.** CRLs are enforced on frontend and admin
   mTLS, frontend DTLS, mesh peer verifiers, rustls backend server verification,
-  verified HTTPS/gRPC health probes, and the rustls logging sinks — but **not** on
-  DP-to-CP gRPC and **not** on reqwest-based plugin egress; those stacks expose no
-  compatible CRL configuration. `kafka_logging` maps the CRL source to
+  verified HTTPS/gRPC health probes, the rustls logging sinks, and plugin HTTP
+  egress — but **not** on DP-to-CP gRPC; that stack exposes no compatible CRL
+  configuration. `kafka_logging` maps the CRL source to
   librdkafka's `ssl.crl.location` instead. See
   [Surfaces CRLs do not reach](frontend_tls.md#surfaces-crls-do-not-reach).
 - **Unknown revocation status is accepted by design.** A chain that no configured
   CRL is authoritative for still verifies. A configured CRL list is the issuers
   you chose to police, not a completeness claim —
   [What the verifier enforces](frontend_tls.md#what-the-verifier-enforces).
-- **`kafka_logging` requires a fully open egress policy.** Enabling it means
-  librdkafka dials cluster-advertised brokers the gateway never screens; the
-  plugin therefore fails closed unless the whole backend egress policy is
-  disarmed — [`kafka_logging` requires a fully-open egress policy](configuration.md#kafka_logging-requires-a-fully-open-egress-policy).
+- **`kafka_logging` dials brokers the gateway never screens.** librdkafka
+  resolves broker hostnames and dials cluster-advertised brokers itself; the
+  plugin therefore fails closed unless the backend egress policy is disarmed or
+  the node operator attests the cluster with `FERRUM_KAFKA_ALLOWED_BROKERS`.
+  The attestation is a statement, not a screen: an advertised broker outside it
+  is still dialed — [`kafka_logging` and restrictive egress policies](configuration.md#kafka_logging-and-restrictive-egress-policies).
 - `FERRUM_TLS_CA_BUNDLE_PATH` is **exclusive**: setting it replaces the built-in
   webpki roots rather than adding to them. That is the intended behaviour, but a
   bundle missing a public root silently breaks every public-CA backend.
@@ -246,7 +248,7 @@ cluster.
 - Per-remote-cluster discovery credentials that fail a cluster closed when its
   reference does not resolve.
 - Mesh authorization policy and REGISTRY_ONLY outbound scoping —
-  [Authorization](mesh.md#authorization).
+  [Authorization](mesh.md#authorization-1).
 - SPIFFE issuance through SPIRE — [spire_deployment.md](spire_deployment.md).
 
 **Residuals at this boundary.**
@@ -304,8 +306,12 @@ request content through a logging or AI plugin.
   is inherent to how those schemes verify and is a property of the configuration
   store, so protect the config database and any `/backup` output accordingly —
   see [plugins.md](plugins.md).
-- **Plugin egress is not CRL-checked.** The reqwest-based plugin stack exposes no
-  CRL configuration —
+- **Plugin egress applies the gateway CRLs only while it verifies servers.**
+  Plugin HTTP clients follow live CRL reloads and retire pooled connections on
+  a refresh, but a plugin whose own settings disable verification
+  (`spec_expose` `tls_no_verify`, ClickHouse `insecure_skip_verify` /
+  `verify_hostname: false`, `load_testing` `gateway_tls_no_verify`) applies
+  none —
   [Surfaces CRLs do not reach](frontend_tls.md#surfaces-crls-do-not-reach).
 - Logging and AI plugins are, by design, a path for request and response content
   to leave the gateway. Their destinations are part of your data-handling
@@ -329,13 +335,13 @@ release, not an open defect awaiting a fix in this document's scope.
 | Residual | Boundary | Reference |
 |---|---|---|
 | CRLs are not applied to DP-to-CP gRPC | 4 | [Surfaces CRLs do not reach](frontend_tls.md#surfaces-crls-do-not-reach) |
-| CRLs are not applied to reqwest-based plugin egress | 6 | [Surfaces CRLs do not reach](frontend_tls.md#surfaces-crls-do-not-reach) |
+| Plugin egress with verification disabled by plugin settings applies no CRLs | 6 | [Surfaces CRLs do not reach](frontend_tls.md#surfaces-crls-do-not-reach) |
 | A chain no configured CRL covers still verifies | 1, 2 | [What the verifier enforces](frontend_tls.md#what-the-verifier-enforces) |
 | `keyauth` / `jwt` / `hmac_auth` consumer secrets are recoverable at rest | 6 | [plugins.md](plugins.md) |
 | Frontend/admin TLS live reload is opt-in; inline PEM is static until config reload | 1 | [Configuration Reference](configuration.md#tls-material-sources) |
 | The gateway cannot revoke an admin JWT it did not mint | 3 | [Authentication](admin_api.md#authentication) |
 | Audit handoff defaults to `fail_open` | 3 | [Admin API](configuration.md#admin-api) |
-| `kafka_logging` requires disarming the backend egress policy | 2, 6 | [`kafka_logging` requires a fully-open egress policy](configuration.md#kafka_logging-requires-a-fully-open-egress-policy) |
+| `kafka_logging` requires disarming the backend egress policy or attesting the Kafka cluster | 2, 6 | [`kafka_logging` and restrictive egress policies](configuration.md#kafka_logging-and-restrictive-egress-policies) |
 | A shared plane secret authenticates the plane, not a node | 4 | [Trust binding](cp_namespace_tenancy.md#trust-binding-ghsa-3f2j-wwqw-grmg) |
 | Bounded authorization under an unrevalidatable trust generation | 4 | [Retention of an unrevalidatable verifier is bounded (issue #3813)](cp_namespace_tenancy.md#retention-of-an-unrevalidatable-verifier-is-bounded-issue-3813) |
 | Mesh capability varies by topology; node waypoint is experimental | 5 | [Maturity and Support Status](mesh.md#maturity-and-support-status) |

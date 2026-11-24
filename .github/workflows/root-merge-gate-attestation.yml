@@ -1,11 +1,9 @@
 name: Root Merge Gate Attestation
 
-# Repository prerequisite: the "Allow GitHub Actions to create and approve pull
-# requests" setting (`can_approve_pull_request_reviews`) must remain enabled.
-# This repository was independently verified as enabled before the no-bypass
-# ruleset is activated. GitHub's documented behavior counts enabled Actions
-# reviews toward required approvals. The live #3040 merge-queue exercise will
-# prove that an attestation approval satisfies the actual ruleset.
+# Records a human administrator's attestation on a PR. Not a merge gate and not
+# part of a ruleset (docs/ci_cd.md#root-merge-gate-attestation). Requires the
+# "Allow GitHub Actions to create and approve pull requests" setting
+# (`can_approve_pull_request_reviews`).
 
 on:
   workflow_dispatch:

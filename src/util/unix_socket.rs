@@ -314,18 +314,44 @@ pub fn normalize_allowed_root(root: &str) -> Result<&str, UnixSocketPathRejectio
 /// Validate the operator's configured containment roots at STARTUP, returning
 /// the offending entry so the process can refuse to start rather than silently
 /// running with a narrower (or wider) allowlist than was written.
+///
+/// A root that exists must already be canonical. The dial check compares the
+/// SYMLINK-RESOLVED socket path against the roots, so a root that itself
+/// resolves elsewhere (`/var/run/app` where `/var/run` is a symlink to `/run`)
+/// could never contain any dialed socket: every dial would be refused as
+/// resolving outside the allowlist. That configuration is refused here with an
+/// actionable error instead. The root is never canonicalized on the operator's
+/// behalf, because that would silently widen a reviewed security allowlist to
+/// wherever the symlink currently points.
 pub fn validate_allowed_roots(roots: &[String]) -> Result<(), String> {
     for (index, root) in roots.iter().enumerate() {
-        if normalize_allowed_root(root).is_err() {
+        let Ok(normalized) = normalize_allowed_root(root) else {
             return Err(format!(
                 "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS entry {} is not a usable containment root \
                  (must be an absolute, normalized directory path other than '/'); the value is \
                  withheld because filesystem paths are not log-safe",
                 index + 1
             ));
+        };
+        if root_resolves_elsewhere(normalized) {
+            return Err(format!(
+                "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS entry {} resolves through a symlink to a \
+                 different directory, so no symlink-resolved socket path could ever be inside \
+                 it; configure the canonical, symlink-free directory instead (for example /run \
+                 rather than /var/run where /var/run is a symlink); the value is withheld \
+                 because filesystem paths are not log-safe",
+                index + 1
+            ));
         }
     }
     Ok(())
+}
+
+/// `true` when `root` exists and canonicalizes to a different path. A root that
+/// cannot be resolved now (it does not exist yet, or is unreadable) is not
+/// judged here; every dial still canonicalizes the socket path itself.
+fn root_resolves_elsewhere(root: &str) -> bool {
+    std::fs::canonicalize(root).is_ok_and(|canonical| canonical != std::path::Path::new(root))
 }
 
 /// Whether `path` is a STRICT descendant of `root` (already normalized).

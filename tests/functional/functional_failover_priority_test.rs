@@ -20,11 +20,11 @@ use ferrum_edge::config_sources::k8s::{
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::file::ServeOptions;
 use ferrum_edge::modes::mesh::{
-    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
+    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
+    prepare_gateway_config_via_mesh_slice_with_fixtures,
 };
 use reqwest::StatusCode;
 use serde_json::json;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -45,8 +45,13 @@ const SECONDARY: &str = "secondary";
 const PREFERRED_HEALTHY_HITS: usize = 4;
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_failover_priority_prefers_label_match_then_fails_over_on_outlier() {
+#[test]
+fn live_failover_priority_prefers_label_match_then_fails_over_on_outlier() {
+    crate::common::in_process_gateway_runtime(2)
+        .block_on(live_failover_priority_prefers_label_match_then_fails_over_on_outlier_inner());
+}
+
+async fn live_failover_priority_prefers_label_match_then_fails_over_on_outlier_inner() {
     let preferred_res = reserve_port().await.expect("reserve preferred backend");
     let secondary_res = reserve_port().await.expect("reserve secondary backend");
     let preferred_port = preferred_res.port;
@@ -167,7 +172,7 @@ async fn live_failover_priority_prefers_label_match_then_fails_over_on_outlier()
     preferred.assert_no_step_errors().await;
     secondary.assert_no_step_errors().await;
 
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     tokio::time::timeout(Duration::from_secs(5), gateway_join)
         .await
         .expect("gateway shutdown timed out")
@@ -246,7 +251,12 @@ async fn start_gateway(
     preferred_port: u16,
     secondary_port: u16,
 ) -> Result<
-    (GatewayConfig, u16, watch::Sender<bool>, JoinHandle<()>),
+    (
+        GatewayConfig,
+        u16,
+        ferrum_edge::overload::ShutdownSender,
+        JoinHandle<()>,
+    ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let proxy = reserve_port().await?;
@@ -256,7 +266,7 @@ async fn start_gateway(
 
     let config = build_config_via_destination_rule(preferred_port, secondary_port)?;
     let runtime = mesh_runtime();
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).map_err(
+    let prepared = prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime).map_err(
         |e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("mesh preparation failed: {e}").into()
         },
@@ -292,7 +302,9 @@ async fn start_gateway(
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let handles =
         ferrum_edge::modes::file::serve(env_config, prepared.clone(), opts, shutdown_tx.clone())
             .await
@@ -406,7 +418,7 @@ fn build_config_via_destination_rule(
     .expect("base gateway config is valid");
 
     // Carry the translated DestinationRule into the gateway mesh block so
-    // prepare_gateway_config_for_mesh projects it onto the upstream.
+    // prepare_gateway_config_via_mesh_slice_with_fixtures projects it onto the upstream.
     config.mesh = translated.config.mesh;
     Ok(config)
 }

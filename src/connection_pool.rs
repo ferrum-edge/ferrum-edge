@@ -32,9 +32,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// Boxed H3 backend TLS config lookup returned by
-/// [`ConnectionPool::backend_h3_tls_config_owned`].
-pub type BackendH3TlsConfigFuture =
-    futures_util::future::BoxFuture<'static, Result<Arc<rustls::ClientConfig>, anyhow::Error>>;
+/// [`ConnectionPool::backend_h3_tls_config`].
+pub type BackendH3TlsConfigFuture<'a> =
+    futures_util::future::BoxFuture<'a, Result<Arc<rustls::ClientConfig>, anyhow::Error>>;
 
 #[derive(Clone)]
 struct ReqwestPoolManager {
@@ -87,14 +87,16 @@ impl ReqwestPoolManager {
         let verify = proxy.resolved_tls.verify_server_cert
             && (!self.global_env_config.tls_no_verify
                 || !proxy.resolved_tls.allows_global_no_verify());
-        let effective_client_cert_path = proxy.resolved_tls.client_cert_path.as_deref().or(self
-            .global_env_config
-            .backend_tls_client_cert_path
-            .as_deref());
-        let effective_client_key_path = proxy.resolved_tls.client_key_path.as_deref().or(self
-            .global_env_config
-            .backend_tls_client_key_path
-            .as_deref());
+        let effective_client_cert_path = proxy.resolved_tls.effective_client_cert_path(
+            self.global_env_config
+                .backend_tls_client_cert_path
+                .as_deref(),
+        );
+        let effective_client_key_path = proxy.resolved_tls.effective_client_key_path(
+            self.global_env_config
+                .backend_tls_client_key_path
+                .as_deref(),
+        );
         let svid_generation = backend_svid_generation_for_client_cert(
             effective_client_cert_path,
             self.workload_svid_cert_path.as_deref(),
@@ -335,14 +337,16 @@ impl PoolManager for ReqwestPoolManager {
         let verify = proxy.resolved_tls.verify_server_cert
             && (!self.global_env_config.tls_no_verify
                 || !proxy.resolved_tls.allows_global_no_verify());
-        let effective_client_cert_path = proxy.resolved_tls.client_cert_path.as_deref().or(self
-            .global_env_config
-            .backend_tls_client_cert_path
-            .as_deref());
-        let effective_client_key_path = proxy.resolved_tls.client_key_path.as_deref().or(self
-            .global_env_config
-            .backend_tls_client_key_path
-            .as_deref());
+        let effective_client_cert_path = proxy.resolved_tls.effective_client_cert_path(
+            self.global_env_config
+                .backend_tls_client_cert_path
+                .as_deref(),
+        );
+        let effective_client_key_path = proxy.resolved_tls.effective_client_key_path(
+            self.global_env_config
+                .backend_tls_client_key_path
+                .as_deref(),
+        );
         let svid_generation = backend_svid_generation_for_client_cert(
             effective_client_cert_path,
             self.workload_svid_cert_path.as_deref(),
@@ -387,9 +391,25 @@ pub struct ConnectionPool {
     pool: Arc<GenericPool<ReqwestPoolManager>>,
 }
 
+/// Typed marker for an HTTP/3 backend TLS client configuration the gateway
+/// could not build (unreadable or invalid CA / client material, or a refused
+/// backend TLS policy). It is a gateway-side internal fault, not evidence that
+/// the backend is unavailable, so callers recognize it structurally (through
+/// the `anyhow` chain) instead of matching the message. Native gRPC answers it
+/// with `INTERNAL` rather than `UNAVAILABLE` (#6773).
+#[derive(Debug)]
+pub struct BackendTlsConfigUnavailable(String);
+
+impl std::fmt::Display for BackendTlsConfigUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BackendTlsConfigUnavailable {}
+
 impl ConnectionPool {
     /// Create a new connection pool manager with global configuration.
-    #[allow(dead_code)] // Used by focused tests and by callers that do not share SVID rotation state.
     pub fn new(
         global_config: PoolConfig,
         mtls_config: crate::config::EnvConfig,
@@ -495,7 +515,6 @@ impl ConnectionPool {
 
     /// TLS-config cache key (no host/port / rcfg suffix). Used by unit tests
     /// to prove two endpoints sharing trust material reuse one `ClientConfig`.
-    #[allow(dead_code)] // exercised from unit tests
     pub fn tls_config_cache_key_for_warmup(&self, proxy: &Proxy) -> String {
         self.pool.manager().tls_config_cache_key_owned(proxy)
     }
@@ -610,13 +629,11 @@ impl ConnectionPool {
             .await;
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn backend_tls_config_cache(&self) -> &BackendTlsConfigCache {
         &self.pool.manager().backend_h3_tls_configs
     }
 
     /// Reqwest-side counterpart of [`Self::backend_tls_config_cache`].
-    #[allow(dead_code)] // exercised from unit tests
     pub fn backend_reqwest_tls_config_cache(&self) -> &BackendTlsConfigCache {
         &self.pool.manager().backend_reqwest_tls_configs
     }
@@ -663,8 +680,11 @@ impl ConnectionPool {
         &self,
         proxy: &Proxy,
     ) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
-        crate::tls::backend::refuse_backend_tls_if_refused(&proxy.resolved_tls)
-            .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 backend TLS config: {}", e))?;
+        crate::tls::backend::refuse_backend_tls_if_refused(&proxy.resolved_tls).map_err(|e| {
+            anyhow::Error::new(BackendTlsConfigUnavailable(format!(
+                "Failed to build HTTP/3 backend TLS config: {e}"
+            )))
+        })?;
         let manager = self.pool.manager();
         manager
             .backend_h3_tls_configs
@@ -677,7 +697,11 @@ impl ConnectionPool {
                 }
             })
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 backend TLS config: {}", e))
+            .map_err(|e| {
+                anyhow::Error::new(BackendTlsConfigUnavailable(format!(
+                    "Failed to build HTTP/3 backend TLS config: {e}"
+                )))
+            })
     }
 
     /// TLS configuration for `wss://` backend upgrades.
@@ -706,25 +730,19 @@ impl ConnectionPool {
     }
 
     /// WebSocket-side counterpart of [`Self::backend_tls_config_cache`].
-    #[allow(dead_code)] // exercised from unit tests
     pub fn backend_websocket_tls_config_cache(&self) -> &BackendTlsConfigCache {
         &self.pool.manager().backend_ws_tls_configs
     }
 
-    /// Owned, boxed form of [`Self::get_tls_config_for_backend`] for H3
-    /// dispatch closures that cannot borrow the request's `Proxy`.
+    /// Boxed form of [`Self::get_tls_config_for_backend`] for the native-H3
+    /// backend dispatch closures.
     ///
     /// The H3 pools invoke these closures only on a connection miss, so the
     /// box is allocated only then, and every pooled H3 call's future stores a
-    /// pointer instead of an owned `Proxy` plus the lookup state inline.
-    pub fn backend_h3_tls_config_owned(self: Arc<Self>, proxy: Proxy) -> BackendH3TlsConfigFuture {
-        Box::pin(async move { self.get_tls_config_for_backend(&proxy).await })
-    }
-
-    /// Clear all pooled connections.
-    #[allow(dead_code)]
-    pub fn clear(&self) {
-        self.pool.clear();
+    /// pointer instead of the lookup state inline. It borrows the request's
+    /// `Proxy` and this pool, so a pooled request clones neither (issue #7166).
+    pub fn backend_h3_tls_config<'a>(&'a self, proxy: &'a Proxy) -> BackendH3TlsConfigFuture<'a> {
+        Box::pin(self.get_tls_config_for_backend(proxy))
     }
 
     pub fn drain_backend_tls_config_cache_svid_generation(&self, generation: u64) {
@@ -764,18 +782,4 @@ pub struct PoolStats {
     pub entries_per_host: HashMap<String, usize>,
     pub max_idle_per_host: usize,
     pub idle_timeout_seconds: u64,
-}
-
-impl std::fmt::Display for PoolStats {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Connection Pool Statistics:")?;
-        writeln!(f, "  Total pooled connections: {}", self.total_pools)?;
-        writeln!(f, "  Max idle per host: {}", self.max_idle_per_host)?;
-        writeln!(f, "  Idle timeout: {}s", self.idle_timeout_seconds)?;
-        writeln!(f, "  Connections per host:")?;
-        for (host, count) in &self.entries_per_host {
-            writeln!(f, "    {}: {}", host, count)?;
-        }
-        Ok(())
-    }
 }

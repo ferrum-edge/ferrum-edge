@@ -10,7 +10,7 @@ use ferrum_edge::modes::mesh::config::{
 };
 use ferrum_edge::modes::mesh::{
     MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
-    MeshTrafficDirection, prepare_gateway_config_for_mesh,
+    MeshTrafficDirection, prepare_gateway_config_via_mesh_slice,
 };
 use ferrum_edge::plugins::{
     TransactionSummary, create_plugin, mesh::workload_metrics::WorkloadMetrics,
@@ -91,7 +91,7 @@ fn traced_summary() -> TransactionSummary {
         latency_gateway_processing_ms: 2.0,
         latency_backend_ttfb_ms: 5.0,
         latency_backend_total_ms: 10.0,
-        metadata: HashMap::from([
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([
             (
                 "trace_id".to_string(),
                 "abcdef1234567890abcdef1234567890".to_string(),
@@ -143,8 +143,8 @@ fn workload_metrics_plugin_config(tracing: MeshTracingConfig) -> Value {
         loaded_at: Utc::now(),
         ..GatewayConfig::default()
     };
-    let prepared =
-        prepare_gateway_config_for_mesh(config, &test_runtime()).expect("mesh prepare succeeds");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &test_runtime())
+        .expect("mesh prepare succeeds");
     let mut plugin_config = prepared
         .plugin_configs
         .into_iter()
@@ -167,7 +167,7 @@ fn injected_workload_metrics_admits_present_and_absent_spiffe_identity() {
             ..GatewayConfig::default()
         };
         let prepared =
-            prepare_gateway_config_for_mesh(config, &runtime).expect("mesh prepare succeeds");
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh prepare succeeds");
         let injected = prepared
             .plugin_configs
             .iter()
@@ -211,6 +211,7 @@ async fn telemetry_provider_from_mesh_slice_emits_otlp_span() {
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
         custom_env_tags: HashMap::new(),
+        safe_tag_sources: Vec::new(),
         providers: vec![TracingProvider::OpenTelemetry {
             endpoint: format!("{}/v1/traces", collector.uri()),
         }],
@@ -250,6 +251,7 @@ async fn telemetry_disable_span_reporting_from_mesh_slice_suppresses_export() {
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
         custom_env_tags: HashMap::new(),
+        safe_tag_sources: Vec::new(),
         providers: vec![TracingProvider::OpenTelemetry {
             endpoint: format!("{}/v1/traces", collector.uri()),
         }],
@@ -295,6 +297,7 @@ async fn telemetry_tracing_mode_client_emits_kind_client_span_on_outbound_listen
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
         custom_env_tags: HashMap::new(),
+        safe_tag_sources: Vec::new(),
         providers: vec![TracingProvider::OpenTelemetry {
             endpoint: format!("{}/v1/traces", collector.uri()),
         }],
@@ -340,6 +343,7 @@ async fn telemetry_tracing_mode_client_skips_inbound_listener_traffic() {
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
         custom_env_tags: HashMap::new(),
+        safe_tag_sources: Vec::new(),
         providers: vec![TracingProvider::OpenTelemetry {
             endpoint: format!("{}/v1/traces", collector.uri()),
         }],
@@ -376,6 +380,7 @@ async fn telemetry_tracing_mode_client_and_server_emits_both_directions() {
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
         custom_env_tags: HashMap::new(),
+        safe_tag_sources: Vec::new(),
         providers: vec![TracingProvider::OpenTelemetry {
             endpoint: format!("{}/v1/traces", collector.uri()),
         }],
@@ -448,6 +453,7 @@ async fn telemetry_tracing_mode_unset_defaults_to_server_only() {
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
         custom_env_tags: HashMap::new(),
+        safe_tag_sources: Vec::new(),
         providers: vec![TracingProvider::OpenTelemetry {
             endpoint: format!("{}/v1/traces", collector.uri()),
         }],

@@ -126,6 +126,9 @@ pub struct NativeMeshClientConfig {
     /// so it needs the dedicated cross-namespace capture destination/policy
     /// inventory. See `MeshSliceRequest::node_waypoint_capture_scoping`.
     pub node_waypoint_capture_scoping: bool,
+    /// This DP is a Sidecar that serves mesh-bound VirtualService `http[]`
+    /// routes (issue #7423). See `MeshSliceRequest::sidecar_http_routes`.
+    pub sidecar_http_routes: bool,
     /// Shared CP-failover primary-retry interval
     /// (`FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS`). When > 0 and connected to a
     /// fallback CP after a first slice is installed, the client proactively
@@ -152,6 +155,7 @@ impl NativeMeshClientConfig {
             waypoint_name: self.waypoint_name.clone().unwrap_or_default(),
             ambient_udp_source_scoping: self.ambient_udp_source_scoping,
             node_waypoint_capture_scoping: self.node_waypoint_capture_scoping,
+            sidecar_http_routes: self.sidecar_http_routes,
             // Ordinary LOCAL mesh subscription: this data plane talks to its
             // own control plane and presents the distinct, fixed local-mesh
             // JWT audience. The CP rejects both missing audiences (legacy
@@ -216,7 +220,8 @@ pub async fn start_native_mesh_client_with_shutdown(
             tls_reload.as_ref(),
             &cp_urls,
             &mut last_tls_revision,
-        );
+        )
+        .await;
 
         let cp_url = &cp_urls[current_cp_index];
         let mut stream_shutdown_rx = shutdown_rx.clone();
@@ -965,6 +970,7 @@ mod tests {
             labels: HashMap::new(),
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
             primary_retry_secs: 0,
             timings: MeshStreamTimings::production(),
         }
@@ -1092,22 +1098,6 @@ mod tests {
     }
 
     #[test]
-    fn native_config_carries_primary_retry_secs() {
-        let config = NativeMeshClientConfig {
-            node_id: "n".to_string(),
-            namespace: "ferrum".to_string(),
-            workload_spiffe_id: None,
-            waypoint_name: None,
-            labels: HashMap::new(),
-            ambient_udp_source_scoping: false,
-            node_waypoint_capture_scoping: false,
-            primary_retry_secs: 300,
-            timings: MeshStreamTimings::production(),
-        };
-        assert_eq!(config.primary_retry_secs, 300);
-    }
-
-    #[test]
     fn mesh_client_self_minted_token_carries_namespace_and_local_audience() {
         let token = generate_dp_jwt_full(
             "test-secret",
@@ -1123,7 +1113,7 @@ mod tests {
         validation.set_audience(&[MESH_LOCAL_SUBSCRIBE_AUDIENCE]);
         let decoded = jsonwebtoken::decode::<serde_json::Value>(
             &token,
-            &jsonwebtoken::DecodingKey::from_secret(b"test-secret"),
+            &jsonwebtoken::DecodingKey::from_secret(b"test-secret").expect("non-empty HMAC key"),
             &validation,
         )
         .expect("token should decode");

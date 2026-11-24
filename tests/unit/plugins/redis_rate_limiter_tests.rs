@@ -1340,39 +1340,6 @@ fn window_progress_rejects_former_boundary_straddle_mismatch() {
     );
 }
 
-#[test]
-fn redis_one_second_prior_bucket_decays_instead_of_full_suppression() {
-    use ferrum_edge::_test_support::redis_window_progress_at;
-    use ferrum_edge::plugins::utils::rate_limit::FixedWindow;
-
-    // TOKEN-ACCOUNTING path only (`ai_rate_limiter` budgets, `ws_rate_limiting`
-    // frames): prev bucket full (10), current has the candidate request (1). At
-    // fraction 0.0 the old code always denied; with subsecond decay the
-    // mid-window candidate is admitted. Request quotas moved off this estimate
-    // onto the sub-bucket ladder covered below.
-    let window = FixedWindow::new(10, 1);
-    let start = redis_window_progress_at(Duration::from_secs(50), 1);
-    let mid = redis_window_progress_at(Duration::from_millis(50_500), 1);
-    let near_end = redis_window_progress_at(Duration::from_nanos(50_900_000_000), 1);
-
-    assert!(
-        !window.outcome(10, 1, start.elapsed_fraction).allowed,
-        "at window start a full prior bucket still suppresses (weighted=11)"
-    );
-    assert!(
-        window.outcome(10, 1, mid.elapsed_fraction).allowed,
-        "mid one-second window must decay prior bucket (weighted=6)"
-    );
-    assert!(
-        window.outcome(10, 1, near_end.elapsed_fraction).allowed,
-        "near end of one-second window prior bucket is nearly gone"
-    );
-    assert!(
-        (window.weighted_count(10, 0, mid.elapsed_fraction) - 5.0).abs() < 1e-12,
-        "half-elapsed prior bucket of 10 contributes exactly 5"
-    );
-}
-
 // ── Request-quota sub-bucket ladder ──────────────────────────────────────
 //
 // Request quotas (`rate_limiting`, `graphql`, `grpc_method_router`) count a
@@ -2355,7 +2322,10 @@ fn shared_consumers_use_same_window_progress_helper() {
     // window's first sub-bucket.
     let live = redis_window_progress(1);
     assert!(live.elapsed_fraction >= 0.0 && live.elapsed_fraction < 1.0);
-    let live_bucket = RedisRateLimitClient::sub_bucket(1);
+    let live_bucket = RedisRateLimitClient::sub_bucket_at(
+        ferrum_edge::plugins::utils::redis_rate_limiter::redis_epoch_now(),
+        1,
+    );
     assert_eq!(live_bucket.window_seconds, 1);
     assert!(live_bucket.index >= live.index * REDIS_WINDOW_SUB_BUCKETS as u64);
 }
@@ -2518,6 +2488,10 @@ fn batch_contains(batch: &[Vec<String>], command: &str) -> bool {
 #[derive(Clone)]
 struct KeyspaceState {
     keys: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    /// Raw byte values a hostile writer parked under counter keys, served in
+    /// preference to the integer keyspace so bounded counter reads can be
+    /// exercised against oversized/non-integer stored values (issue #6653).
+    raw_values: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
     incrs: Arc<AtomicUsize>,
     decrs: Arc<AtomicUsize>,
     charges: Arc<AtomicUsize>,
@@ -2530,12 +2504,31 @@ struct KeyspaceState {
     /// probe, counted apart from the `TIME` that rides inside a charge
     /// transaction. Zero proves a client never asked for the server clock.
     clock_probes: Arc<AtomicUsize>,
+    /// `EXEC`s answered: one per `MULTI`/`EXEC` round trip.
+    execs: Arc<AtomicUsize>,
+    /// `GET`/`GETRANGE` commands answered OUTSIDE a transaction — a read that
+    /// costs its own round trip rather than riding inside a `MULTI`.
+    standalone_reads: Arc<AtomicUsize>,
     /// The fixture's `TIME` behaviour, settable while the server is running so
     /// a test can revoke or restore the ACL under a LIVE client — which is the
     /// only way to exercise a clock-mode transition rather than a startup
     /// verdict.
     time_mode: Arc<std::sync::Mutex<ServerTimeMode>>,
+    /// Reply barrier for the next CHARGE `EXEC` once a test arms it.
+    reply_barrier: Arc<ReplyBarrier>,
     options: KeyspaceServerOptions,
+}
+
+/// Holds the reply of ONE armed charge `EXEC` after its commands applied.
+///
+/// `applied` is signalled once the transaction's `INCR`s are in the keyspace;
+/// the reply is then withheld until the test signals `release`. This pins the
+/// interleaving "charge applied, reply not yet read" without racing timers.
+#[derive(Default)]
+struct ReplyBarrier {
+    armed: std::sync::atomic::AtomicBool,
+    applied: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl KeyspaceState {
@@ -2583,6 +2576,34 @@ impl KeyspaceState {
             };
         }
         let key = args.get(1).cloned().unwrap_or_default();
+        if matches!(name.as_str(), "GET" | "GETRANGE") {
+            let raw = self
+                .raw_values
+                .lock()
+                .expect("raw values mutex")
+                .get(&key)
+                .cloned();
+            if let Some(raw) = raw {
+                let slice: &[u8] = if name == "GET" {
+                    &raw
+                } else {
+                    let start: usize = args.get(2).and_then(|arg| arg.parse().ok()).unwrap_or(0);
+                    let end: usize = args
+                        .get(3)
+                        .and_then(|arg| arg.parse().ok())
+                        .unwrap_or(usize::MAX);
+                    if raw.is_empty() || start >= raw.len() {
+                        &[]
+                    } else {
+                        &raw[start..=end.min(raw.len() - 1)]
+                    }
+                };
+                let mut reply = format!("${}\r\n", slice.len()).into_bytes();
+                reply.extend_from_slice(slice);
+                reply.extend_from_slice(b"\r\n");
+                return reply;
+            }
+        }
         let mut store = self.keys.lock().expect("keyspace mutex");
         match name.as_str() {
             "GET" => match store.get(&key) {
@@ -2592,11 +2613,35 @@ impl KeyspaceState {
                 }
                 None => b"$-1\r\n".to_vec(),
             },
+            "GETRANGE" => match store.get(&key) {
+                Some(value) => {
+                    let rendered = value.to_string();
+                    let start: usize = args.get(2).and_then(|arg| arg.parse().ok()).unwrap_or(0);
+                    let end: usize = args
+                        .get(3)
+                        .and_then(|arg| arg.parse().ok())
+                        .unwrap_or(usize::MAX);
+                    let slice = rendered
+                        .get(start..=end.min(rendered.len().saturating_sub(1)))
+                        .unwrap_or_default();
+                    format!("${}\r\n{slice}\r\n", slice.len()).into_bytes()
+                }
+                None => b"$0\r\n\r\n".to_vec(),
+            },
             "INCR" => {
                 self.incrs.fetch_add(1, Ordering::Relaxed);
                 self.ops.lock().expect("op log mutex").push("INCR");
                 let slot = store.entry(key).or_insert(0);
                 *slot += 1;
+                let value = *slot;
+                format!(":{value}\r\n").into_bytes()
+            }
+            "INCRBY" => {
+                self.incrs.fetch_add(1, Ordering::Relaxed);
+                self.ops.lock().expect("op log mutex").push("INCR");
+                let amount: i64 = args.get(2).and_then(|arg| arg.parse().ok()).unwrap_or(0);
+                let slot = store.entry(key).or_insert(0);
+                *slot += amount;
                 let value = *slot;
                 format!(":{value}\r\n").into_bytes()
             }
@@ -2685,6 +2730,7 @@ impl KeyspaceState {
                 reply.extend_from_slice(b"+OK\r\n");
             }
             "EXEC" => {
+                self.execs.fetch_add(1, Ordering::Relaxed);
                 let batch = queued.take().unwrap_or_default();
                 let schedule = self.schedule_for(&batch);
                 if !schedule.hold.is_zero() && schedule.phase == HoldPhase::BeforeApply {
@@ -2699,6 +2745,14 @@ impl KeyspaceState {
                 if self.options.extra_exec_element {
                     body.extend_from_slice(b":1\r\n");
                 }
+                if batch_contains(&batch, "INCR")
+                    && self.reply_barrier.armed.swap(false, Ordering::AcqRel)
+                {
+                    // `notify_one` keeps a permit, so neither side can miss the
+                    // other however the two tasks are scheduled.
+                    self.reply_barrier.applied.notify_one();
+                    self.reply_barrier.release.notified().await;
+                }
                 if !schedule.hold.is_zero() && schedule.phase == HoldPhase::AfterApply {
                     tokio::time::sleep(schedule.hold).await;
                 }
@@ -2709,7 +2763,12 @@ impl KeyspaceState {
                     batch.push(args);
                     reply.extend_from_slice(b"+QUEUED\r\n");
                 }
-                None => reply.extend_from_slice(&self.apply(&args, false)),
+                None => {
+                    if matches!(name.as_str(), "GET" | "GETRANGE") {
+                        self.standalone_reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                    reply.extend_from_slice(&self.apply(&args, false));
+                }
             },
         }
         true
@@ -2727,6 +2786,25 @@ impl KeyspaceServer {
     /// so a test can revoke or restore the ACL mid-life.
     fn set_time_mode(&self, mode: ServerTimeMode) {
         *self.state.time_mode.lock().expect("time mode mutex") = mode;
+    }
+
+    /// Park a raw byte value under a key, as a hostile writer with access to
+    /// the configured prefix could.
+    fn set_raw(&self, key: &str, value: Vec<u8>) {
+        self.state
+            .raw_values
+            .lock()
+            .expect("raw values mutex")
+            .insert(key.to_string(), value);
+    }
+
+    /// Arm the reply barrier for the next charge `EXEC` (see [`ReplyBarrier`]).
+    fn hold_next_charge_reply(&self) -> Arc<ReplyBarrier> {
+        self.state
+            .reply_barrier
+            .armed
+            .store(true, Ordering::Release);
+        Arc::clone(&self.state.reply_barrier)
     }
 
     fn counter(&self, key: &str) -> i64 {
@@ -2750,6 +2828,16 @@ impl KeyspaceServer {
     /// Standalone `TIME` commands answered: the connection-screening probe.
     fn clock_probes(&self) -> usize {
         self.state.clock_probes.load(Ordering::Relaxed)
+    }
+
+    /// `MULTI`/`EXEC` transactions answered.
+    fn execs(&self) -> usize {
+        self.state.execs.load(Ordering::Relaxed)
+    }
+
+    /// Counter reads answered outside a transaction.
+    fn standalone_reads(&self) -> usize {
+        self.state.standalone_reads.load(Ordering::Relaxed)
     }
 
     /// Every key the fake keyspace holds.
@@ -2825,13 +2913,17 @@ async fn spawn_keyspace_redis_server(options: KeyspaceServerOptions) -> Keyspace
     let port = listener.local_addr().expect("local_addr").port();
     let state = KeyspaceState {
         keys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        raw_values: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         incrs: Arc::new(AtomicUsize::new(0)),
         decrs: Arc::new(AtomicUsize::new(0)),
         charges: Arc::new(AtomicUsize::new(0)),
         compensations: Arc::new(AtomicUsize::new(0)),
         ops: Arc::new(std::sync::Mutex::new(Vec::new())),
         clock_probes: Arc::new(AtomicUsize::new(0)),
+        execs: Arc::new(AtomicUsize::new(0)),
+        standalone_reads: Arc::new(AtomicUsize::new(0)),
         time_mode: Arc::new(std::sync::Mutex::new(options.time_mode)),
+        reply_barrier: Arc::new(ReplyBarrier::default()),
         options,
     };
     let accept_state = state.clone();
@@ -2906,6 +2998,360 @@ fn keyspace_config(port: u16) -> RedisConfig {
 
 fn keyspace_client(port: u16) -> RedisRateLimitClient {
     redis_rate_limit_client_for_test(keyspace_config(port))
+}
+
+/// Issue #6653: counter reads are bounded with `GETRANGE`, so a hostile or
+/// corrupt oversized value parked under a trailing sub-bucket key fails the
+/// charge closed instead of being materialized whole and misread as a count.
+#[tokio::test]
+async fn charge_fails_closed_on_oversized_trailing_counter() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::RedisWindowCharges;
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = keyspace_client(server.port);
+
+    let bucket = RedisRateLimitClient::sub_bucket_at(Duration::from_micros(100_124_000), 1);
+    let mut charges = RedisWindowCharges::default();
+    assert!(charges.push(client.window_charge("ip:127.0.0.1", bucket, 3)));
+    let trailing_key = charges.as_slice()[0]
+        .trailing_keys()
+        .next()
+        .expect("a trailing sub-bucket key")
+        .to_string();
+    server.set_raw(&trailing_key, vec![b'1'; 30]);
+
+    assert!(
+        client
+            .charge_rate_limit_windows(charges.as_slice())
+            .await
+            .is_err(),
+        "an oversized trailing counter must fail the charge closed"
+    );
+    assert!(
+        !client.is_available(),
+        "an unreadable counter marks the endpoint unusable"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Issue #6653: the sliding-window and two-counter reads bound their counter
+/// reads the same way — a non-integer value under a counter key fails the
+/// command instead of reading as zero.
+#[tokio::test]
+async fn sliding_and_pair_reads_fail_closed_on_non_integer_counter() {
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = keyspace_client(server.port);
+
+    // Positive control: clean counters charge and read back exactly.
+    assert_eq!(
+        client
+            .sliding_window_increment_by("prev", "curr", 2, 60)
+            .await
+            .expect("clean sliding-window charge"),
+        (0, 2)
+    );
+    assert_eq!(
+        client
+            .get_two_counters("prev", "curr")
+            .await
+            .expect("clean paired read"),
+        (0, 2)
+    );
+
+    server.set_raw("prev", b"not-a-number".to_vec());
+    assert!(
+        client
+            .sliding_window_increment_by("prev", "curr", 1, 60)
+            .await
+            .is_err(),
+        "a non-integer previous counter must fail the sliding-window charge"
+    );
+
+    let second = keyspace_client(server.port);
+    assert!(
+        second.get_two_counters("prev", "curr").await.is_err(),
+        "a non-integer counter must fail the paired read"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// ai_rate_limiter-MUSE-1 (centralized half): a request that outlives two
+/// windows reconciles after its reserved window has left the pair admission
+/// reads. Its correction must not land in that dead key: the full actual usage
+/// is charged to the CURRENT window, and a release has nothing live to debit.
+#[tokio::test]
+async fn an_aged_out_redis_token_reservation_charges_the_current_window() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        AiRateLimitOp, AiTokenRateAlgorithm, RateLimitAlgorithm, ReservationBackend,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    let window_seconds = 86_400;
+    let algorithm = AiTokenRateAlgorithm::new(1_000_000, window_seconds);
+
+    // The production arm samples the wall-clock window itself. Each attempt
+    // uses a fresh key and is accepted only when the window index was the same
+    // before and after every operation, so a run straddling a window boundary
+    // retries instead of failing.
+    for attempt in 0..3 {
+        let key = format!("consumer:long-stream-{attempt}");
+        let current = RedisRateLimitClient::window_progress(window_seconds).index;
+        let aged = current.saturating_sub(3);
+        let current_key = client.make_slot_key(&key, &[&current.to_string()]);
+        let aged_key = client.make_slot_key(&key, &[&aged.to_string()]);
+
+        // Reserved 100 three windows ago; actually consumed 600.
+        algorithm
+            .check_redis(
+                &client,
+                &key,
+                &AiRateLimitOp::AdjustUsage {
+                    reservation_id: None,
+                    reserved_window_index: Some(aged),
+                    reservation_backend: ReservationBackend::Redis,
+                    actual_tokens: 600,
+                    delta: 500,
+                },
+            )
+            .await
+            .expect("the reconciliation reaches the fake keyspace");
+        let charged = server.counter(&current_key);
+        let dead = server.counter(&aged_key);
+
+        // A release of an aged-out reservation debits nothing live.
+        algorithm
+            .check_redis(
+                &client,
+                &key,
+                &AiRateLimitOp::AdjustUsage {
+                    reservation_id: None,
+                    reserved_window_index: Some(aged),
+                    reservation_backend: ReservationBackend::Redis,
+                    actual_tokens: 0,
+                    delta: -100,
+                },
+            )
+            .await
+            .expect("the release reaches the fake keyspace");
+        let after_release = server.counter(&current_key);
+
+        let budget = algorithm
+            .check_redis(&client, &key, &AiRateLimitOp::CheckBudget)
+            .await
+            .expect("the budget read reaches the fake keyspace");
+
+        if RedisRateLimitClient::window_progress(window_seconds).index != current {
+            continue;
+        }
+        assert_eq!(charged, 600);
+        assert_eq!(dead, 0, "the dead window is never written");
+        assert_eq!(after_release, 600);
+        assert_eq!(budget.usage, Some(600));
+        let _ = server.shutdown.send(());
+        return;
+    }
+    panic!("the window index rolled over during every attempt");
+}
+
+/// EDGE-PL-1: a centralized `ai_rate_limiter` reservation reads the previous
+/// window and charges the current one in ONE `MULTI`/`EXEC`. It used to charge
+/// in one transaction and then re-read both counters in a second, standalone
+/// pipeline, paying two sequential round trips per admitted AI request.
+#[tokio::test]
+async fn an_ai_token_reservation_is_one_redis_round_trip() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        AiRateLimitOp, AiTokenRateAlgorithm, RateLimitAlgorithm, two_window_ttl_seconds,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    let window_seconds = 86_400;
+    let algorithm = AiTokenRateAlgorithm::new(1_000, window_seconds);
+
+    // Same rollover discipline as the aged-out test above: each attempt uses
+    // fresh keys and is accepted only when the window index did not move.
+    for attempt in 0..3 {
+        let key = format!("consumer:one-round-trip-{attempt}");
+        let progress = RedisRateLimitClient::window_progress(window_seconds);
+        let current = progress.index;
+        let current_key = client.make_slot_key(&key, &[&current.to_string()]);
+
+        // Warm the pooled connection (screening probes) before counting.
+        algorithm
+            .check_redis(&client, &key, &AiRateLimitOp::CheckBudget)
+            .await
+            .expect("the budget read reaches the fake keyspace");
+        let execs_before = server.execs();
+        let reads_before = server.standalone_reads();
+
+        let outcome = algorithm
+            .check_redis(&client, &key, &AiRateLimitOp::Reserve { tokens: 300 })
+            .await
+            .expect("the reservation reaches the fake keyspace");
+        let execs = server.execs() - execs_before;
+        let reads = server.standalone_reads() - reads_before;
+        let charged = server.counter(&current_key);
+
+        if RedisRateLimitClient::window_progress(window_seconds).index != current {
+            continue;
+        }
+        assert_eq!(execs, 1, "the reservation is exactly one transaction");
+        assert_eq!(reads, 0, "no counter read pays its own round trip");
+        assert!(outcome.allowed);
+        assert_eq!(
+            outcome.usage,
+            Some(300),
+            "an empty previous window adds nothing"
+        );
+        assert_eq!(outcome.reserved_window_index, Some(current));
+        assert_eq!(charged, 300);
+
+        // The previous window is read inside that same transaction: a heavy
+        // previous window refuses, and the deny branch still hands back
+        // exactly the tokens it charged. The seed is large enough that its
+        // decayed share exceeds the limit at any point of the window but its
+        // last microseconds.
+        let previous_key = client.make_slot_key(&key, &[&current.saturating_sub(1).to_string()]);
+        client
+            .incrby_with_expire(
+                &previous_key,
+                1_000_000_000_000,
+                two_window_ttl_seconds(window_seconds),
+            )
+            .await
+            .expect("seed the previous window");
+        let refused = algorithm
+            .check_redis(&client, &key, &AiRateLimitOp::Reserve { tokens: 300 })
+            .await
+            .expect("the reservation reaches the fake keyspace");
+        if RedisRateLimitClient::window_progress(window_seconds).index != current {
+            continue;
+        }
+        assert!(!refused.allowed, "the previous window's usage is counted");
+        assert_eq!(
+            server.counter(&current_key),
+            300,
+            "the refused charge is rolled back"
+        );
+        let _ = server.shutdown.send(());
+        return;
+    }
+    panic!("the window index rolled over during every attempt");
+}
+
+/// EDGE-PL-1: the single-transaction reservation keeps the fail-closed read:
+/// an unreadable previous counter is an unusable endpoint, never a zero, so
+/// `redis_failure_policy` decides rather than the reservation over-admitting.
+#[tokio::test]
+async fn an_ai_token_reservation_fails_closed_on_an_unreadable_previous_counter() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        AiRateLimitOp, AiTokenRateAlgorithm, RateLimitAlgorithm,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    let window_seconds = 86_400;
+    let algorithm = AiTokenRateAlgorithm::new(1_000, window_seconds);
+    let key = "consumer:unreadable-previous";
+    // Park garbage under the previous AND the current index, so a window
+    // rollover between here and the reservation still lands on a bad key.
+    let current = RedisRateLimitClient::window_progress(window_seconds).index;
+    for index in [current.saturating_sub(1), current] {
+        server.set_raw(
+            &client.make_slot_key(key, &[&index.to_string()]),
+            b"not-a-number".to_vec(),
+        );
+    }
+
+    assert!(
+        algorithm
+            .check_redis(&client, key, &AiRateLimitOp::Reserve { tokens: 300 })
+            .await
+            .is_err(),
+        "an unreadable previous counter must fail the reservation"
+    );
+    assert!(
+        !client.is_available(),
+        "an unreadable counter marks the endpoint unusable"
+    );
+    let _ = server.shutdown.send(());
+}
+
+/// A zero-token reservation (a public op; `admit` itself sends `CheckBudget`
+/// for zero) charges nothing on Redis, exactly as the old `INCRBY 0` did. The
+/// single-transaction primitive clamps its amount to at least 1, so a zero
+/// reservation must not reach it: a refusal at the limit would otherwise
+/// strand a phantom token that the zero-sized rollback never hands back.
+#[tokio::test]
+async fn a_zero_token_redis_reservation_charges_nothing() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        AiRateLimitOp, AiTokenRateAlgorithm, RateLimitAlgorithm, two_window_ttl_seconds,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    let window_seconds = 86_400;
+    let ttl = two_window_ttl_seconds(window_seconds);
+    let algorithm = AiTokenRateAlgorithm::new(1_000, window_seconds);
+    let zero = AiRateLimitOp::Reserve { tokens: 0 };
+
+    for attempt in 0..3 {
+        let key = format!("consumer:zero-reservation-{attempt}");
+        let current = RedisRateLimitClient::window_progress(window_seconds).index;
+        let current_key = client.make_slot_key(&key, &[&current.to_string()]);
+
+        let fresh = algorithm
+            .check_redis(&client, &key, &zero)
+            .await
+            .expect("the reservation reaches the fake keyspace");
+        let fresh_count = server.counter(&current_key);
+
+        client
+            .incrby_with_expire(&current_key, 1_000, ttl)
+            .await
+            .expect("fill the window to its limit");
+        let at_limit = algorithm
+            .check_redis(&client, &key, &zero)
+            .await
+            .expect("the reservation reaches the fake keyspace");
+        let at_limit_count = server.counter(&current_key);
+
+        client
+            .incrby_with_expire(&current_key, 1, ttl)
+            .await
+            .expect("push the window past its limit");
+        let incrs_before = server.incrs();
+        let over = algorithm
+            .check_redis(&client, &key, &zero)
+            .await
+            .expect("the reservation reaches the fake keyspace");
+        let over_writes = server.incrs() - incrs_before;
+        let over_count = server.counter(&current_key);
+
+        if RedisRateLimitClient::window_progress(window_seconds).index != current {
+            continue;
+        }
+        assert!(fresh.allowed);
+        assert_eq!(fresh_count, 0, "a zero reservation charges nothing");
+        assert!(
+            at_limit.allowed,
+            "usage == limit still admits a zero reservation"
+        );
+        assert_eq!(at_limit.usage, Some(1_000));
+        assert_eq!(at_limit_count, 1_000, "no phantom token at the limit");
+        assert!(!over.allowed, "usage over the limit refuses");
+        assert_eq!(
+            over_writes, 0,
+            "nothing was charged, so nothing is handed back"
+        );
+        assert_eq!(over_count, 1_001);
+        let _ = server.shutdown.send(());
+        return;
+    }
+    panic!("the window index rolled over during every attempt");
 }
 
 /// Two requests that select adjacent sub-buckets must not both be admitted
@@ -5534,6 +5980,11 @@ async fn failover_observer_drop_releases_client_and_stops_task() {
             DynamicHttpRateLimitAlgorithm::new(),
         )
         .expect("failover backend");
+    // Construction (what admin / CP validation does) starts no observer; the
+    // installed generation's commit does (issue #6616).
+    assert!(backend.health_observer_abort_for_test().is_none());
+    backend.commit_background_tasks();
+    backend.commit_background_tasks();
 
     let client = backend
         .redis_client_arc_for_test()
@@ -5600,6 +6051,7 @@ async fn repeated_failover_replacement_leaves_only_active_observer() {
                 algorithm,
             )
             .expect("failover backend");
+        next.commit_background_tasks();
         let next_abort = next
             .health_observer_abort_for_test()
             .expect("active observer");
@@ -5807,7 +6259,10 @@ fn watched_writes_queue_multi_alone_and_require_queued_before_exec() {
     let multi = helper
         .find("redis::cmd(\"MULTI\").query_async(conn).await")
         .unwrap();
-    let multi_error = helper.find("ifletErr(e)=multi{").unwrap();
+    // MULTI must be acknowledged with exactly `OK` before the write is sent.
+    let multi_error = helper
+        .find("self.require_ok_acknowledgement(&reply,\"MULTI\")?")
+        .unwrap();
     let queued = helper.find("write.query_async(conn).await").unwrap();
     let queued_ok = helper.find("Ok(reply)ifreply==\"QUEUED\"=>{}").unwrap();
     let exec = helper
@@ -5834,7 +6289,11 @@ fn watched_writes_queue_multi_alone_and_require_queued_before_exec() {
     assert!(publish.contains(".exec_watched_write(&mutconn,&set,\"compare-and-set\")"));
     assert!(publish.contains("letmutset=redis::cmd(\"SET\");"));
     for body in [ownership, publish] {
-        assert!(!body.contains(".atomic()") && !body.contains("redis::pipe()"));
+        assert!(!body.contains(".atomic()"));
+        // The only pipeline is the bounded compare read, sent before MULTI.
+        let compare = body.find("redis::pipe()").unwrap();
+        assert!(compare < body.find(".exec_watched_write(").unwrap());
+        assert_eq!(body.matches("redis::pipe()").count(), 1);
     }
 }
 
@@ -5996,28 +6455,92 @@ fn quarantine_topology_screen_failure_retains_availability_but_cluster_is_termin
     assert!(source.contains("screen_and_arm(&mutconn,purpose)"));
 }
 
-/// Deduplication ownership release keeps its released command profile; only
-/// semantic quarantine may opt into the separate bounded comparison.
+/// The general `SET NX EX` claim (deduplication acquisition, SOAP nonce
+/// claims) accepts only an exact `OK`; any other string fails closed instead of
+/// being read as an acquisition (issue #6622).
 #[test]
-fn ownership_release_retains_get_without_semantic_read_acl_requirements() {
+fn general_set_nx_claim_requires_an_exact_ok_reply() {
     let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
-    let ownership = source
+    let claim = source
+        .split_once("pub async fn set_bytes_nx_with_expire(")
+        .and_then(|(_, rest)| rest.split_once("pub async fn set_bytes_nx_with_expire_bounded("))
+        .map(|(body, _)| body)
+        .expect("general SET NX claim helper");
+    assert!(claim.contains("classify_replay_set_nx_reply(value.as_deref())"));
+    assert!(claim.contains("ReplaySetNxReplyError::InvalidClaimReply"));
+    assert!(claim.contains("self.mark_unavailable();"));
+    assert!(!claim.contains("value.is_some()"));
+}
+
+/// Ownership compare primitives never download the stored value (issue #6622):
+/// the compare transfers at most `expected.len() + 1` bytes through
+/// `EXISTS`/`STRLEN`/`GETRANGE`, and no production path reads a record with an
+/// unbounded `GET`.
+#[test]
+fn ownership_compare_primitives_never_download_the_stored_value() {
+    let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+    let release = source
         .split_once("pub async fn delete_if_value_matches(")
         .and_then(|(_, rest)| rest.split_once("pub async fn delete_if_value_matches_bounded("))
         .map(|(body, _)| body)
         .expect("separate ownership and bounded quarantine helpers");
-    for command in ["WATCH", "GET", "UNWATCH"] {
-        assert!(ownership.contains(&format!("redis::cmd(\"{command}\")")));
+    let publish = source
+        .split_once("pub async fn set_bytes_with_expire_if_value_matches(")
+        .and_then(|(_, rest)| rest.split_once("pub fn make_slot_key("))
+        .map(|(body, _)| body)
+        .expect("fenced publication helper");
+    for (name, body) in [("release", release), ("publish", publish)] {
+        assert!(
+            body.contains("BoundedCompare::for_expected(expected)?"),
+            "{name}"
+        );
+        for command in ["WATCH", "UNWATCH"] {
+            assert!(
+                body.contains(&format!("redis::cmd(\"{command}\")")),
+                "{name}"
+            );
+        }
+        for command in ["EXISTS", "STRLEN", "GETRANGE"] {
+            assert!(body.contains(&format!(".cmd(\"{command}\")")), "{name}");
+        }
+        assert!(
+            !body.contains("cmd(\"GET\")"),
+            "{name} must not GET the record"
+        );
+        // The write is queued inside an explicit MULTI, never pipelined with it.
+        assert!(!body.contains(".atomic()"), "{name}");
+        assert!(body.contains("exec_watched_write("), "{name}");
     }
-    // The DEL is queued inside an explicit MULTI, never pipelined with it.
-    assert!(!ownership.contains(".atomic()"));
-    assert!(ownership.contains("exec_watched_write("));
-    for command in ["EXISTS", "STRLEN", "GETRANGE"] {
-        assert!(!ownership.contains(&format!("cmd(\"{command}\")")));
-    }
+
     let dedup = include_str!("../../../src/plugins/request_deduplication.rs");
     assert!(dedup.contains(".delete_if_value_matches(&redis_key, &ownership.record)"));
+    assert!(dedup.contains(".get_bytes_bounded(redis_key, self.redis_record_read_cap())"));
     assert!(!dedup.contains("delete_if_value_matches_bounded"));
+
+    // The unbounded GET survives only as test support for scripted fake
+    // servers; no production source may call it.
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut pending = vec![src];
+    let mut callers = Vec::new();
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read source");
+                let uses = text.matches("get_bytes_unbounded_for_test(").count()
+                    - text.matches("fn get_bytes_unbounded_for_test(").count();
+                if uses > 0 {
+                    callers.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    assert!(
+        callers.is_empty(),
+        "production code must use get_bytes_bounded: {callers:?}"
+    );
 
     let classification = source
         .split_once("fn note_quarantine_command_failure(")
@@ -7120,7 +7643,9 @@ async fn a_server_without_a_cluster_enabled_field_still_serves_policy_operations
     let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
     let client = screened_client(server.port, 5);
 
-    let served = client.get_bytes("{ferrum%3Atest:probe}").await;
+    let served = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+        .await;
     assert_eq!(
         served,
         Ok(None),
@@ -7141,7 +7666,9 @@ async fn an_unsupported_info_command_error_keeps_the_endpoint_usable() {
     let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
     let client = screened_client(server.port, 5);
 
-    let served = client.get_bytes("{ferrum%3Atest:probe}").await;
+    let served = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+        .await;
     assert_eq!(
         served,
         Ok(None),
@@ -7161,7 +7688,9 @@ async fn a_cluster_wire_error_on_the_info_probe_is_terminal() {
     let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
     let client = screened_client(server.port, 5);
 
-    let refused = client.get_bytes("{ferrum%3Atest:probe}").await;
+    let refused = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+        .await;
     assert!(
         refused.is_err(),
         "a Cluster endpoint must not serve a policy operation"
@@ -7192,7 +7721,9 @@ async fn an_endpoint_that_never_answers_info_fails_closed_within_the_connect_tim
     let client = screened_client(server.port, 1);
 
     let started = std::time::Instant::now();
-    let refused = client.get_bytes("{ferrum%3Atest:probe}").await;
+    let refused = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+        .await;
     let elapsed = started.elapsed();
     assert!(
         refused.is_err(),
@@ -7231,7 +7762,9 @@ async fn a_slow_info_screen_still_fits_the_configured_probe_deadline() {
     let server = spawn_screened_redis_server(info, slow_screen, Duration::ZERO).await;
     let client = screened_client(server.port, 2);
 
-    let served = client.get_bytes("{ferrum%3Atest:probe}").await;
+    let served = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+        .await;
     assert_eq!(
         served,
         Ok(None),
@@ -7259,7 +7792,9 @@ async fn an_info_screen_slower_than_the_configured_deadline_fails_closed() {
     let server = spawn_screened_redis_server(info, over_deadline, Duration::ZERO).await;
     let client = screened_client(server.port, 1);
 
-    let refused = client.get_bytes("{ferrum%3Atest:probe}").await;
+    let refused = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+        .await;
     assert!(
         refused.is_err(),
         "a screen that misses its deadline must fail closed"
@@ -7292,7 +7827,9 @@ async fn a_screened_connection_still_bounds_ordinary_command_replies() {
     let client = screened_client(server.port, 60);
 
     let started = std::time::Instant::now();
-    let refused = client.get_bytes("{ferrum%3Atest:stalled}").await;
+    let refused = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:stalled}")
+        .await;
     let elapsed = started.elapsed();
     assert!(
         refused.is_err(),
@@ -7320,13 +7857,15 @@ async fn a_command_completing_after_a_topology_rejection_fails_closed() {
 
     // Control: this fake really does answer the command successfully, so the
     // failure asserted below is attributable to the rejection alone.
-    let control = client.get_bytes("{ferrum%3Atest:control}").await;
+    let control = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:control}")
+        .await;
     assert_eq!(control, Ok(None));
     assert!(client.is_available());
 
     let racer = Arc::clone(&client);
     let raced_key = "{ferrum%3Atest:raced}";
-    let inflight = tokio::spawn(async move { racer.get_bytes(raced_key).await });
+    let inflight = tokio::spawn(async move { racer.get_bytes_unbounded_for_test(raced_key).await });
     // The server now holds the racing GET's reply.
     wait_for_count(&server.gets, 2, "racing GET").await;
     client.mark_topology_unsupported_for_test();
@@ -7347,7 +7886,9 @@ async fn a_command_completing_after_a_topology_rejection_fails_closed() {
 
     // Later operations, and the redials they would trigger, stay disabled.
     let dials = server.accepts.load(Ordering::Relaxed);
-    let after = client.get_bytes("{ferrum%3Atest:after}").await;
+    let after = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:after}")
+        .await;
     assert!(after.is_err());
     assert_eq!(
         server.accepts.load(Ordering::Relaxed),
@@ -8416,7 +8957,12 @@ async fn pooled_reconnect_after_disconnect_reruns_the_topology_screen() {
     let client = screened_client(server.port, 5);
 
     // First operation establishes and screens exactly one physical connection.
-    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+    assert_eq!(
+        client
+            .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+            .await,
+        Ok(None)
+    );
     assert_eq!(server.accepts.load(Ordering::Relaxed), 1);
     assert_eq!(server.infos.load(Ordering::Relaxed), 1);
     assert_eq!(client.cached_pool_cardinality_for_test(), 1);
@@ -8424,7 +8970,9 @@ async fn pooled_reconnect_after_disconnect_reruns_the_topology_screen() {
     // Second operation hits the server's disconnect. It must FAIL (not silently
     // ride a redis-rs reconnect) and must drop the cached slot.
     assert_eq!(
-        client.get_bytes("{ferrum%3Atest:probe}").await,
+        client
+            .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+            .await,
         Err(()),
         "a disconnected pooled connection must fail the operation, not auto-reconnect"
     );
@@ -8440,7 +8988,12 @@ async fn pooled_reconnect_after_disconnect_reruns_the_topology_screen() {
     );
 
     // Third operation re-establishes — through the full screened path.
-    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+    assert_eq!(
+        client
+            .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+            .await,
+        Ok(None)
+    );
     assert_eq!(
         server.accepts.load(Ordering::Relaxed),
         2,
@@ -8472,18 +9025,33 @@ async fn cluster_topology_appearing_after_a_disconnect_is_caught_by_the_rescreen
     let client = screened_client(server.port, 5);
 
     // Screened clean, serving normally.
-    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+    assert_eq!(
+        client
+            .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+            .await,
+        Ok(None)
+    );
     assert!(!client.is_topology_unsupported());
 
     // Disconnect fails the in-flight operation and clears the pool.
-    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Err(()));
+    assert_eq!(
+        client
+            .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+            .await,
+        Err(())
+    );
     assert!(
         !client.is_topology_unsupported(),
         "an ordinary disconnect is an outage, never proof of Cluster topology"
     );
 
     // The reconnect re-screens and now sees cluster_enabled:1 — terminal refusal.
-    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Err(()));
+    assert_eq!(
+        client
+            .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+            .await,
+        Err(())
+    );
     assert!(
         client.is_topology_unsupported(),
         "the post-disconnect re-screen must catch a Cluster endpoint"
@@ -8493,7 +9061,12 @@ async fn cluster_topology_appearing_after_a_disconnect_is_caught_by_the_rescreen
 
     // Terminal: no further dialling of the refused endpoint.
     let accepts_at_rejection = server.accepts.load(Ordering::Relaxed);
-    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Err(()));
+    assert_eq!(
+        client
+            .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+            .await,
+        Err(())
+    );
     assert_eq!(
         server.accepts.load(Ordering::Relaxed),
         accepts_at_rejection,
@@ -8526,7 +9099,12 @@ async fn every_pool_slot_is_screened_and_the_pool_stays_bounded() {
 
     // Many more operations than slots must reuse the bounded pool, not dial.
     for _ in 0..12 {
-        assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+        assert_eq!(
+            client
+                .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+                .await,
+            Ok(None)
+        );
     }
     assert_eq!(
         server.accepts.load(Ordering::Relaxed),
@@ -9135,4 +9713,731 @@ fn identity_log_guard_catches_arbitrary_field_names_and_render_forms() {
             identity_bearing_log_values(source)
         );
     }
+}
+
+// ── Bounded record reads and exact claim replies (issue #6622) ──────────────
+
+/// Scripted RESP server holding ONE stored value that every key reports.
+///
+/// It answers the bounded read commands faithfully (`EXISTS`, `STRLEN`, and
+/// `GETRANGE` with Redis' inclusive end index), screens clean for both the
+/// topology and no-eviction probes, queues transaction commands, and answers
+/// `EXEC` with `exec_set_reply` for each queued `SET`. A standalone `SET … NX`
+/// answers `set_nx_reply`. Every received command is recorded, so a test can
+/// assert the exact range requested and that no `GET` was ever sent.
+struct ScriptedValueServer {
+    port: u16,
+    shutdown: oneshot::Sender<()>,
+    commands: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+
+impl ScriptedValueServer {
+    fn commands_named(&self, name: &str) -> Vec<Vec<String>> {
+        self.commands
+            .lock()
+            .expect("command log")
+            .iter()
+            .filter(|args| {
+                args.first()
+                    .is_some_and(|first| first.eq_ignore_ascii_case(name))
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+async fn spawn_scripted_value_server(
+    stored: Vec<u8>,
+    exec_set_reply: &'static [u8],
+    set_nx_reply: &'static [u8],
+) -> ScriptedValueServer {
+    spawn_scripted_value_server_with_acks(
+        stored,
+        exec_set_reply,
+        set_nx_reply,
+        b"+OK\r\n",
+        b"+OK\r\n",
+    )
+    .await
+}
+
+/// [`spawn_scripted_value_server`] with scripted `WATCH` / `MULTI` replies.
+async fn spawn_scripted_value_server_with_acks(
+    stored: Vec<u8>,
+    exec_set_reply: &'static [u8],
+    set_nx_reply: &'static [u8],
+    watch_reply: &'static [u8],
+    multi_reply: &'static [u8],
+) -> ScriptedValueServer {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let commands_task = Arc::clone(&commands);
+    let stored = Arc::new(stored);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break; };
+                    let commands = Arc::clone(&commands_task);
+                    let stored = Arc::clone(&stored);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 64 * 1024];
+                        let mut pending: Vec<u8> = Vec::new();
+                        let mut queued: Vec<String> = Vec::new();
+                        let mut in_transaction = false;
+                        loop {
+                            let n = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            pending.extend_from_slice(&buf[..n]);
+                            let mut reply: Vec<u8> = Vec::new();
+                            while let Some(args) = take_resp_command(&mut pending) {
+                                let args: Vec<String> = args
+                                    .iter()
+                                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                                    .collect();
+                                commands.lock().expect("command log").push(args.clone());
+                                let name = args.first().cloned().unwrap_or_default().to_ascii_uppercase();
+                                if in_transaction && name != "EXEC" {
+                                    queued.push(name);
+                                    reply.extend_from_slice(b"+QUEUED\r\n");
+                                    continue;
+                                }
+                                match name.as_str() {
+                                    "TIME" => reply.extend_from_slice(&host_clock_time_reply()),
+                                    "INFO" => {
+                                        let text = "# Cluster\r\ncluster_enabled:0\r\n# Memory\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\n";
+                                        reply.extend_from_slice(format!("${}\r\n{text}\r\n", text.len()).as_bytes());
+                                    }
+                                    "EXISTS" => reply.extend_from_slice(b":1\r\n"),
+                                    "STRLEN" => reply.extend_from_slice(format!(":{}\r\n", stored.len()).as_bytes()),
+                                    "GETRANGE" | "GET" => {
+                                        let slice: &[u8] = if name == "GET" {
+                                            &stored
+                                        } else {
+                                            let start: usize = args[2].parse().expect("start");
+                                            let end: usize = args[3].parse().expect("non-negative end");
+                                            let end = end.min(stored.len().saturating_sub(1));
+                                            if stored.is_empty() || start > end { &[] } else { &stored[start..=end] }
+                                        };
+                                        reply.extend_from_slice(format!("${}\r\n", slice.len()).as_bytes());
+                                        reply.extend_from_slice(slice);
+                                        reply.extend_from_slice(b"\r\n");
+                                    }
+                                    "SET" if args.iter().any(|arg| arg.eq_ignore_ascii_case("NX")) => {
+                                        reply.extend_from_slice(set_nx_reply)
+                                    }
+                                    "WATCH" => reply.extend_from_slice(watch_reply),
+                                    "MULTI" => {
+                                        // Only a real `OK` opens the scripted
+                                        // transaction; any other reply leaves
+                                        // later commands executing directly.
+                                        in_transaction = multi_reply == b"+OK\r\n";
+                                        queued.clear();
+                                        reply.extend_from_slice(multi_reply);
+                                    }
+                                    "EXEC" => {
+                                        in_transaction = false;
+                                        reply.extend_from_slice(format!("*{}\r\n", queued.len()).as_bytes());
+                                        for command in queued.drain(..) {
+                                            match command.as_str() {
+                                                "SET" => reply.extend_from_slice(exec_set_reply),
+                                                "DEL" => reply.extend_from_slice(b":1\r\n"),
+                                                _ => reply.extend_from_slice(b"+OK\r\n"),
+                                            }
+                                        }
+                                    }
+                                    _ => reply.extend_from_slice(b"+OK\r\n"),
+                                }
+                            }
+                            if !reply.is_empty() && stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    ScriptedValueServer {
+        port,
+        shutdown: shutdown_tx,
+        commands,
+    }
+}
+
+fn scripted_client(port: u16) -> RedisRateLimitClient {
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.connect_timeout_seconds = 5;
+    config.health_check_interval_seconds = 3600;
+    config.pool_size = 1;
+    redis_rate_limit_client_for_test(config)
+}
+
+#[tokio::test]
+async fn ownership_compares_request_only_the_owner_length_and_never_get() {
+    let server = spawn_scripted_value_server(vec![b'x'; 1 << 20], b"+OK\r\n", b"+OK\r\n").await;
+    let client = scripted_client(server.port);
+    let owner = b"owner-record";
+
+    assert_eq!(
+        client.delete_if_value_matches("fence", owner).await,
+        Ok(false)
+    );
+    assert_eq!(
+        client
+            .set_bytes_with_expire_if_value_matches("fence", owner, b"done", 60)
+            .await,
+        Ok(false)
+    );
+
+    let ranges = server.commands_named("GETRANGE");
+    assert_eq!(ranges.len(), 2, "one bounded compare per primitive");
+    for range in &ranges {
+        assert_eq!(range[2], "0");
+        assert_eq!(
+            range[3],
+            owner.len().to_string(),
+            "the compare reads at most the owner length plus one byte"
+        );
+    }
+    assert!(server.commands_named("GET").is_empty(), "no unbounded GET");
+    assert!(
+        server.commands_named("MULTI").is_empty(),
+        "a mismatch never opens the write transaction"
+    );
+    assert!(client.is_available());
+    let _ = server.shutdown.send(());
+}
+
+#[tokio::test]
+async fn fenced_publication_requires_an_exact_ok_exec_reply() {
+    let owner = b"owner-record".to_vec();
+
+    let accepted = spawn_scripted_value_server(owner.clone(), b"+OK\r\n", b"+OK\r\n").await;
+    let client = scripted_client(accepted.port);
+    assert_eq!(
+        client
+            .set_bytes_with_expire_if_value_matches("fence", &owner, b"done", 60)
+            .await,
+        Ok(true)
+    );
+    let _ = accepted.shutdown.send(());
+
+    let malformed = spawn_scripted_value_server(owner.clone(), b"+NOT_OK\r\n", b"+OK\r\n").await;
+    let client = scripted_client(malformed.port);
+    assert_eq!(
+        client
+            .set_bytes_with_expire_if_value_matches("fence", &owner, b"done", 60)
+            .await,
+        Err(()),
+        "a SET reply other than OK must not count as a publication"
+    );
+    assert!(!client.is_available());
+    let _ = malformed.shutdown.send(());
+}
+
+#[tokio::test]
+async fn general_set_nx_claim_accepts_only_ok_or_nil() {
+    for (reply, expected) in [
+        (&b"+OK\r\n"[..], Ok(true)),
+        (&b"$-1\r\n"[..], Ok(false)),
+        (&b"+YES\r\n"[..], Err(())),
+    ] {
+        let reply: &'static [u8] = reply;
+        let server = spawn_scripted_value_server(Vec::new(), b"+OK\r\n", reply).await;
+        let client = scripted_client(server.port);
+        assert_eq!(
+            client
+                .set_bytes_nx_with_expire("claim", b"marker", 60)
+                .await,
+            expected,
+            "reply {:?}",
+            String::from_utf8_lossy(reply)
+        );
+        assert_eq!(client.is_available(), expected.is_ok());
+        let _ = server.shutdown.send(());
+    }
+}
+
+#[tokio::test]
+async fn deduplication_refuses_an_over_cap_record_without_downloading_it() {
+    use ferrum_edge::_test_support::{
+        request_deduplication_redis_record_state_for_test,
+        request_deduplication_with_instance_id_for_test,
+    };
+
+    let max_entry_size_bytes = 64usize;
+    let read_cap = max_entry_size_bytes + 4 * 1024;
+    let server = spawn_scripted_value_server(vec![b'{'; 16 * 1024], b"+OK\r\n", b"+OK\r\n").await;
+    let plugin = request_deduplication_with_instance_id_for_test(
+        &json!({
+            "header_name": "Idempotency-Key",
+            "sync_mode": "redis",
+            "redis_url": format!("redis://127.0.0.1:{}/0", server.port),
+            "redis_connect_timeout_seconds": 5,
+            "max_entry_size_bytes": max_entry_size_bytes,
+        }),
+        ferrum_edge::plugins::PluginHttpClient::default(),
+        "dedup-bounded-read",
+    )
+    .expect("redis-mode deduplication");
+
+    assert_eq!(
+        request_deduplication_redis_record_state_for_test(&plugin, "v7:probe").await,
+        "unreadable",
+        "an over-cap record is a fail-closed conflict, not a miss"
+    );
+    let ranges = server.commands_named("GETRANGE");
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0][3], read_cap.to_string());
+    assert!(server.commands_named("GET").is_empty(), "no unbounded GET");
+    let _ = server.shutdown.send(());
+}
+
+#[tokio::test]
+async fn ownership_writes_require_exact_ok_watch_and_multi_acknowledgements() {
+    let owner = b"owner-record".to_vec();
+    for (watch_reply, multi_reply) in [
+        (&b"+NO\r\n"[..], &b"+OK\r\n"[..]),
+        (&b"$-1\r\n"[..], &b"+OK\r\n"[..]),
+        (&b"+OK\r\n"[..], &b"+NO\r\n"[..]),
+        (&b"+OK\r\n"[..], &b"$-1\r\n"[..]),
+    ] {
+        let (watch_reply, multi_reply): (&'static [u8], &'static [u8]) = (watch_reply, multi_reply);
+        let server = spawn_scripted_value_server_with_acks(
+            owner.clone(),
+            b"+OK\r\n",
+            b"+OK\r\n",
+            watch_reply,
+            multi_reply,
+        )
+        .await;
+        let label = format!(
+            "WATCH {:?} / MULTI {:?}",
+            String::from_utf8_lossy(watch_reply),
+            String::from_utf8_lossy(multi_reply)
+        );
+
+        let client = scripted_client(server.port);
+        assert_eq!(
+            client
+                .set_bytes_with_expire_if_value_matches("fence", &owner, b"done", 60)
+                .await,
+            Err(()),
+            "{label}: compare-and-set"
+        );
+        assert!(!client.is_available(), "{label}");
+
+        let client = scripted_client(server.port);
+        assert_eq!(
+            client.delete_if_value_matches("fence", &owner).await,
+            Err(()),
+            "{label}: compare-and-delete"
+        );
+
+        let client = scripted_client(server.port);
+        assert_eq!(
+            client
+                .delete_if_value_matches_bounded("fence", &owner)
+                .await,
+            Err(()),
+            "{label}: quarantine delete"
+        );
+
+        assert!(
+            server.commands_named("SET").is_empty() && server.commands_named("DEL").is_empty(),
+            "{label}: no write may follow an unacknowledged WATCH or MULTI"
+        );
+        let _ = server.shutdown.send(());
+    }
+}
+
+// ── Production-launch review fixes (rate_limiting-SOL-2, -CLAUDE-1/5) ─────
+
+/// rate_limiting-CLAUDE-1: admission accepts any letter case of the scheme,
+/// so the stored URL must be lowercase or `redis_tls` silently never upgrades
+/// `REDIS://` and the gateway sends `AUTH` over plaintext.
+#[test]
+fn a_mixed_case_redis_scheme_is_stored_lowercase_so_redis_tls_upgrades() {
+    let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    let config = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": "REDIS://cache.internal:6380/0",
+            "redis_tls": true
+        }),
+        "ferrum:test",
+    )
+    .expect("a mixed-case scheme is a valid Redis URL")
+    .expect("sync_mode=redis yields a config");
+    assert_eq!(config.url, "redis://cache.internal:6380/0");
+    assert_eq!(
+        redis_config_url_with_ip(&config, ip),
+        "rediss://cache.internal:6380/0",
+        "redis_tls must upgrade a mixed-case plaintext scheme and keep the hostname for SNI"
+    );
+
+    let tls = RedisConfig::from_plugin_config(
+        &json!({"sync_mode": "redis", "redis_url": "ReDiSs://10.0.0.5:6380/0"}),
+        "ferrum:test",
+    )
+    .expect("valid")
+    .expect("redis mode");
+    assert_eq!(tls.url, "rediss://10.0.0.5:6380/0");
+
+    // Only the scheme is normalized: userinfo, host, and path keep their bytes.
+    let spelled = RedisConfig::from_plugin_config(
+        &json!({"sync_mode": "redis", "redis_url": "Redis://User:Pass@Cache.Internal:6379/2"}),
+        "ferrum:test",
+    )
+    .expect("valid")
+    .expect("redis mode");
+    assert_eq!(spelled.url, "redis://User:Pass@Cache.Internal:6379/2");
+}
+
+/// rate_limiting-CLAUDE-1: TLS detection itself is case-insensitive, so even a
+/// directly constructed config keeps SNI and the `FERRUM_TLS_*` policy for a
+/// mixed-case `rediss://`.
+#[test]
+fn tls_scheme_detection_is_case_insensitive() {
+    let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    let tls = make_config("REDISS://cache.internal:6380/0", false);
+    assert_eq!(
+        redis_config_url_with_ip(&tls, ip),
+        "REDISS://cache.internal:6380/0",
+        "a TLS URL must keep its hostname for SNI"
+    );
+    let upgraded = make_config("Redis://cache.internal:6380/0", true);
+    assert_eq!(
+        redis_config_url_with_ip(&upgraded, ip),
+        "rediss://cache.internal:6380/0"
+    );
+
+    let literal = "REDISS://10.0.0.5:6380/0";
+    let insecure = redis_client_tls_insecure(make_config(literal, false), literal, true)
+        .expect("a mixed-case rediss URL builds a TLS address");
+    assert!(
+        insecure,
+        "FERRUM_TLS_NO_VERIFY must reach a mixed-case rediss endpoint"
+    );
+}
+
+/// rate_limiting-SOL-2: cancelling the request future while its charge
+/// transaction is in flight must not strand an over-limit `INCR`.
+///
+/// Deterministic: the fixture signals once the over-limit attempt's `EXEC` has
+/// APPLIED and withholds its reply; only then is the waiter dropped (as a gRPC
+/// deadline under `timeout_at` drops a hook), and only after that is the reply
+/// released. An inline charge dies with its waiter and never reads the reply;
+/// the detached decision must still read it, refuse, and hand the charge back.
+#[tokio::test]
+async fn a_cancelled_waiter_does_not_strand_an_over_limit_charge() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    // A one-minute window: 3.75s sub-buckets, so holding a reply never rolls
+    // the ladder over.
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 1,
+        duration: Duration::from_secs(60),
+    }]);
+
+    let admitted = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("the first charge decides");
+    assert!(admitted.allowed, "the first request fits the budget");
+    assert_eq!(server.charged_total(), 1);
+
+    let barrier = server.hold_next_charge_reply();
+    {
+        let waiter = algorithm.check_redis(&client, "ip:127.0.0.1", &op);
+        tokio::pin!(waiter);
+        tokio::select! {
+            _ = barrier.applied.notified() => {}
+            decided = &mut waiter => {
+                panic!("the over-limit attempt decided before its reply was released: {decided:?}")
+            }
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                panic!("the over-limit charge never reached the server")
+            }
+        }
+        assert_eq!(server.incrs(), 2, "the over-limit charge is applied");
+        assert_eq!(server.charged_total(), 2);
+        // Leaving this block drops the waiter: the cancellation under test.
+    }
+    barrier.release.notify_one();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while server.decrs() == 0 || client.pending_compensations_for_test() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cancelled over-limit charge was never handed back"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(server.incrs(), 2, "no further charge was issued");
+    assert_eq!(
+        server.decrs(),
+        1,
+        "the cancelled over-limit attempt must be handed back exactly once"
+    );
+    assert_eq!(
+        server.charged_total(),
+        1,
+        "only the admitted request may keep a charge"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// rate_limiting-CLAUDE-5 / PR6814-SOL-1: a Redis quota refusal carries a
+/// conservative `Retry-After` bound. The newest charge a reader counts leaves
+/// every SETTLED reader's ladder — including one whose selection lags its
+/// execution by the one bucket settlement admits — once readers execute
+/// `K + 3` sub-buckets after the server bucket that settled the refusal, so
+/// the wait is more than 18 and at most 19 sixteenths of the window.
+#[tokio::test]
+async fn a_redis_quota_refusal_carries_a_retry_after_bound() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 1,
+        duration: Duration::from_secs(64),
+    }]);
+
+    let admitted = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("decides");
+    assert!(admitted.allowed);
+    assert_eq!(
+        admitted.retry_after_seconds, None,
+        "an admission names no wait"
+    );
+
+    let refused = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("decides");
+    assert!(!refused.allowed);
+    // 64s window: 4s sub-buckets, so the wait is in (72s, 76s].
+    let retry_after = refused
+        .retry_after_seconds
+        .expect("a quota refusal names a wait");
+    assert!(
+        (73..=76).contains(&retry_after),
+        "Retry-After {retry_after} outside the (18/16, 19/16] window bound"
+    );
+
+    await_compensations(&client).await;
+    let _ = server.shutdown.send(());
+}
+
+/// The lag the bound must cover, as bucket arithmetic: a charge keyed at
+/// `b` is still inside the ladder of a settled reader that selected `b + K + 1`
+/// and executed in `b + K + 2`, and leaves only for a reader executing in
+/// `b + K + 3` (which may have selected no earlier than `b + K + 2`).
+#[test]
+fn the_redis_retry_bound_covers_a_reader_that_selects_one_bucket_behind() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKETS, REDIS_WINDOW_TRAILING_SUB_BUCKETS, sub_bucket_charge_is_settled,
+    };
+
+    let window_seconds = 16;
+    let k = REDIS_WINDOW_SUB_BUCKETS as u64;
+    let charged = 1_000_u64;
+    // The ladder of a reader that SELECTED `selected`: its trailing keys reach
+    // back `REDIS_WINDOW_TRAILING_SUB_BUCKETS` buckets.
+    let oldest_read = |selected: u64| selected - REDIS_WINDOW_TRAILING_SUB_BUCKETS as u64;
+    let at = |bucket: u64| Duration::from_secs(bucket * window_seconds / k);
+
+    // Executes in `b + K + 2` having selected one bucket behind: settled, and
+    // it still reads the charge.
+    let lagging = RedisRateLimitClient::sub_bucket_at(at(charged + k + 1), window_seconds);
+    assert!(sub_bucket_charge_is_settled(lagging, at(charged + k + 2)));
+    assert!(
+        oldest_read(lagging.index) <= charged,
+        "a lagging reader at b + K + 2 still counts the charge"
+    );
+
+    // Executing in `b + K + 3`, the earliest selection settlement admits is
+    // `b + K + 2`, whose ladder starts after the charge.
+    let earliest = RedisRateLimitClient::sub_bucket_at(at(charged + k + 2), window_seconds);
+    assert!(sub_bucket_charge_is_settled(earliest, at(charged + k + 3)));
+    assert!(oldest_read(earliest.index) > charged);
+    let too_early = RedisRateLimitClient::sub_bucket_at(at(charged + k + 1), window_seconds);
+    assert!(
+        !sub_bucket_charge_is_settled(too_early, at(charged + k + 3)),
+        "settlement never admits a reader two buckets behind"
+    );
+}
+
+/// PR6814-MUSE-1: with several refusing windows, `Retry-After` is the longest
+/// wait, while `limit` / `window_seconds` still name the first refusing window.
+#[tokio::test]
+async fn a_multi_window_redis_refusal_names_the_longest_wait() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![
+        RateLimitWindowSpec {
+            limit: 1,
+            duration: Duration::from_secs(1),
+        },
+        RateLimitWindowSpec {
+            limit: 1,
+            duration: Duration::from_secs(64),
+        },
+    ]);
+
+    assert!(
+        algorithm
+            .check_redis(&client, "ip:127.0.0.1", &op)
+            .await
+            .expect("decides")
+            .allowed
+    );
+    let refused = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("decides");
+    assert!(!refused.allowed);
+    assert_eq!(refused.window_seconds, Some(1), "the first refusing window");
+    let retry_after = refused
+        .retry_after_seconds
+        .expect("a quota refusal names a wait");
+    assert!(
+        (73..=76).contains(&retry_after),
+        "Retry-After {retry_after} must be the 64s window's bound, not the 1s window's"
+    );
+
+    await_compensations(&client).await;
+    let _ = server.shutdown.send(());
+}
+
+// ── ws_rate_limiting aggregate budgets on a shared Redis key (PR #6867) ───
+
+/// Wait for detached hand-backs to land on the fake keyspace.
+async fn wait_for_charged_total(server: &KeyspaceServer, expected: i64) -> i64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let total = server.charged_total();
+        if total == expected || tokio::time::Instant::now() >= deadline {
+            return total;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// PR6867-SOL-1: an aggregate `limit_by` key is shared by every session, every
+/// reconnect, and every replica of one policy, so a refused frame must leave
+/// no lasting charge on it. Before the hand-back, each refused retry stayed on
+/// the counter and supplied the previous-window usage that refused the next
+/// one, starving the budget for everyone sharing the key indefinitely.
+#[tokio::test]
+async fn ws_aggregate_redis_refusals_leave_no_lasting_charge() {
+    use ferrum_edge::plugins::ws_rate_limiting::WsRateLimiting;
+    use ferrum_edge::plugins::{Plugin, PluginHttpClient, RequestContext, WebSocketFrameDirection};
+    use tokio_tungstenite::tungstenite::protocol::Message;
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let config = json!({
+        "frames_per_second": 1,
+        "burst_size": 1,
+        "limit_by": "consumer",
+        "sync_mode": "redis",
+        "redis_url": format!("redis://127.0.0.1:{}/0", server.port),
+        "redis_health_check_interval_seconds": 3600,
+    });
+    // Two instances stand in for two gateway replicas of one policy: each has
+    // its own instance UUID, and aggregate keys must not carry it.
+    let replica_a =
+        Arc::new(WsRateLimiting::new(&config, PluginHttpClient::default()).expect("replica a"));
+    let replica_b =
+        Arc::new(WsRateLimiting::new(&config, PluginHttpClient::default()).expect("replica b"));
+    let mut ctx = RequestContext::new("10.0.0.1".to_string(), "GET".to_string(), "/ws".into());
+    let mut consumer = super::plugin_utils::create_test_consumer();
+    consumer.username = "alice".to_string();
+    ctx.identified_consumer = Some(Arc::new(consumer));
+    let session_a = Arc::clone(&replica_a)
+        .bind_ws_session(&ctx)
+        .expect("aggregate session on replica a");
+    let session_b = Arc::clone(&replica_b)
+        .bind_ws_session(&ctx)
+        .expect("aggregate session on replica b");
+    let direction = WebSocketFrameDirection::ClientToBackend;
+    let message = Message::Text("hello".into());
+
+    assert!(
+        session_a
+            .on_ws_frame("proxy", 1, direction, &message)
+            .await
+            .is_none(),
+        "the first frame fits the shared one-frame budget"
+    );
+    assert_eq!(server.charged_total(), 1);
+
+    // The other replica shares the budget, so its frame is refused...
+    let refused = session_b.on_ws_frame("proxy", 2, direction, &message).await;
+    assert!(
+        matches!(refused, Some(Message::Close(_))),
+        "a replica of the same policy must draw on the shared aggregate budget"
+    );
+    // ...and the refusal hands back exactly what it charged.
+    assert_eq!(
+        wait_for_charged_total(&server, 1).await,
+        1,
+        "a refused frame must not stay charged on the shared aggregate key"
+    );
+
+    // A batch larger than the whole budget is refused without touching Redis.
+    let mutations_before = server.incrs();
+    let oversized = session_b
+        .on_ws_reassembly_frames("proxy", 2, direction, 5)
+        .await;
+    assert!(matches!(oversized, Some(Message::Close(_))));
+    assert_eq!(
+        server.incrs(),
+        mutations_before,
+        "a batch that can never fit must not charge the shared counter"
+    );
+    assert_eq!(server.charged_total(), 1);
+
+    // The shared budget stays usable: once the one-frame window refills, a
+    // fresh session on either replica is admitted instead of inheriting the
+    // refused attempts' charges.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    let session_c = Arc::clone(&replica_b)
+        .bind_ws_session(&ctx)
+        .expect("aggregate session after the window refills");
+    assert!(
+        session_c
+            .on_ws_frame("proxy", 3, direction, &message)
+            .await
+            .is_none(),
+        "refused attempts must not keep the shared budget exhausted"
+    );
+
+    let _ = server.shutdown.send(());
 }

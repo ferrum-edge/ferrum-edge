@@ -178,6 +178,7 @@ fn client_config() -> NativeMeshClientConfig {
         labels: HashMap::new(),
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
         primary_retry_secs: 0,
         timings: MeshStreamTimings::production(),
     }
@@ -1118,6 +1119,7 @@ fn xds_consumer_surfaces_stale_revision_as_stream_terminal() {
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
             stream_channel_capacity: 32,
             primary_retry_secs: 300,
             connect_timeout_seconds: 10,
@@ -2203,6 +2205,7 @@ fn xds_consumer_surfaces_divergent_equal_revision_content_as_stream_terminal() {
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
             stream_channel_capacity: 32,
             primary_retry_secs: 300,
             connect_timeout_seconds: 10,
@@ -2872,6 +2875,7 @@ fn kubernetes_revisions_flow_through_the_shared_envelope_and_xds_paths() {
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
             stream_channel_capacity: 32,
             primary_retry_secs: 300,
             connect_timeout_seconds: 10,
@@ -3115,6 +3119,129 @@ async fn a_withheld_publication_can_refresh_evidence_without_waiting_for_the_idl
         0,
         "a demand-driven evidence refresh must not be reported as an idle relist"
     );
+    assert_eq!(harness.watch_evidence_refresh_relists(), 1);
+
+    let _ = shutdown_tx.send(true);
+    let _ = watcher.await;
+}
+
+/// Issue #7399: a demand-driven evidence refresh must not blind a healthy
+/// scope. The NodeWaypoint live suite saw an AuthorizationPolicy `Delete` go
+/// unobserved for minutes after a refresh: the refresh dropped the scope's live
+/// watch, and until the replacement finished listing (bounded only by
+/// `readiness_timeout`, two idle windows) nothing delivered events to the
+/// registered store. The live watch now keeps delivering while the replacement
+/// lists, and the first thing it delivers abandons the replacement.
+#[tokio::test(start_paused = true)]
+async fn a_delete_during_a_stalled_refresh_replacement_is_observed_by_the_live_watch() {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Only generation 0 is scripted: the replacement a refresh starts never
+    // yields anything, which is the stalled list this regression is about.
+    let (harness, task) = k8s_scope(1, vec![Some(1_000)], shutdown_rx);
+    let watcher = tokio::spawn(task);
+    let settle = Duration::from_millis(50);
+
+    harness.emit(0, Event::Init);
+    harness.emit(
+        0,
+        Event::InitApply(harness.object_at("alpha", "edge", "900")),
+    );
+    harness.emit(
+        0,
+        Event::InitApply(harness.object_at("alpha", "policy", "950")),
+    );
+    harness.emit(0, Event::InitDone);
+    tokio::time::sleep(settle).await;
+    assert_eq!(
+        harness.visible_names().await,
+        vec!["edge".to_string(), "policy".to_string()]
+    );
+    assert_eq!(harness.revision_watermark().await, Some(1_000));
+
+    // Past the refresh spacing floor, then ask for evidence: the scope starts
+    // a replacement generation that never finishes listing.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    harness.request_evidence_refresh();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        harness.watch_evidence_refresh_relists(),
+        1,
+        "the refresh started a replacement generation"
+    );
+
+    // The withdrawal arrives on the live watch while the replacement is still
+    // listing. Before #7399 that watch had been dropped.
+    harness.emit(
+        0,
+        Event::Delete(harness.object_at("alpha", "policy", "2000")),
+    );
+    tokio::time::sleep(settle).await;
+    assert_eq!(
+        harness.visible_names().await,
+        vec!["edge".to_string()],
+        "the withdrawal reaches the registered store without waiting for the replacement"
+    );
+    assert_eq!(harness.watch_deletes(), 1);
+    assert_eq!(
+        harness.revision_watermark().await,
+        Some(2_000),
+        "the deletion revision is applied evidence for the live store"
+    );
+    assert_eq!(harness.watch_idle_relists(), 0);
+
+    // The live watch was resumed as the scope's generation, so it keeps
+    // delivering after the replacement was abandoned.
+    harness.emit(0, Event::Apply(harness.object_at("alpha", "late", "2100")));
+    tokio::time::sleep(settle).await;
+    assert_eq!(
+        harness.visible_names().await,
+        vec!["edge".to_string(), "late".to_string()]
+    );
+    assert_eq!(harness.revision_watermark().await, Some(2_100));
+
+    let _ = shutdown_tx.send(true);
+    let _ = watcher.await;
+}
+
+/// Issue #7399: while a refresh replacement lists, a live watch that delivers
+/// nothing changes nothing — the replacement is swapped in whole at `InitDone`
+/// and its pre-list boundary is adopted, exactly as before.
+#[tokio::test(start_paused = true)]
+async fn a_quiet_live_watch_lets_the_refresh_replacement_swap_in() {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (harness, task) = k8s_scope(2, vec![Some(1_000), Some(5_000)], shutdown_rx);
+    let watcher = tokio::spawn(task);
+    let settle = Duration::from_millis(50);
+
+    harness.emit(0, Event::Init);
+    harness.emit(
+        0,
+        Event::InitApply(harness.object_at("alpha", "edge", "900")),
+    );
+    harness.emit(0, Event::InitDone);
+    tokio::time::sleep(settle).await;
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    harness.request_evidence_refresh();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // The replacement is listing; the live watch stays quiet.
+    harness.emit(1, Event::Init);
+    harness.emit(
+        1,
+        Event::InitApply(harness.object_at("alpha", "edge", "900")),
+    );
+    tokio::time::sleep(settle).await;
+    assert_eq!(
+        harness.revision_watermark().await,
+        Some(1_000),
+        "nothing is adopted before the replacement's InitDone"
+    );
+    harness.emit(1, Event::InitDone);
+    tokio::time::sleep(settle).await;
+    assert_eq!(harness.revision_watermark().await, Some(5_000));
+    assert_eq!(harness.visible_names().await, vec!["edge".to_string()]);
+    assert_eq!(harness.watch_relist_missed_deletes(), 0);
+    assert_eq!(harness.watch_relist_missed_adds(), 0);
 
     let _ = shutdown_tx.send(true);
     let _ = watcher.await;

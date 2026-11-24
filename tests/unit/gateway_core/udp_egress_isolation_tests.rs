@@ -380,17 +380,20 @@ async fn retiring_a_session_stops_the_writer_and_releases_every_queued_byte() {
 /// gateway, so it is asserted over the source.
 #[test]
 fn the_shared_receive_loop_never_awaits_a_backend_send() {
-    let process = body_of("async fn process_datagram(");
-    let inline = process
-        .split("// Update cache for next datagram.")
-        .nth(1)
-        .expect("the established-session inline forward");
     assert!(
-        inline.contains("forward_client_datagram_without_blocking(&session, data, metrics"),
+        !UDP_PROXY_SOURCE.contains("async fn process_datagram("),
+        "process_datagram must stay synchronous so the shared receive loop can never await"
+    );
+    let process = body_of("\nfn process_datagram(")
+        .split("\nfn spawn_new_session_datagram(")
+        .next()
+        .expect("process_datagram body before spawn_new_session_datagram");
+    assert!(
+        process.contains("forward_client_datagram_without_blocking(session, data, metrics"),
         "the listener's no-hook branch admits without awaiting the backend send"
     );
     assert!(
-        !inline.contains("forward_client_datagram_to_backend(&session, data).await"),
+        !process.contains("forward_client_datagram_to_backend("),
         "the shared receive loop must never await the backend send again"
     );
 }

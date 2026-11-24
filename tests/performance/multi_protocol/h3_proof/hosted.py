@@ -25,14 +25,16 @@ PACKAGES = ["clang-18", "llvm-18", "libbpf-dev", "libbpf1", "libelf-dev", "gcc",
             "linux-libc-dev", "iproute2", "util-linux", "python3"]
 
 
+_ADDRESS_RE = re.compile(r"\b(?:0x[0-9a-fA-F]{8,16}|[fF]{4}[0-9a-fA-F]{12})\b")
+
+
 def write(path, obj):
     path.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def scrub(text):
     # Retain verifier errors, redact address-like diagnostics; no kallsyms addresses.
-    return re.sub(r"\b(?:0x[0-9a-fA-F]{8,16}|[fF]{4}[0-9a-fA-F]{12})\b",
-                  "[address-redacted]", text)
+    return _ADDRESS_RE.sub("[address-redacted]", text)
 
 
 def command_env(action, **data):

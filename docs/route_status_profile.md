@@ -1,6 +1,10 @@
 # Isolated route-status measurements
 
-The on-demand Resources Scale Benchmark workflow accepts `benchmark=route-status`
+> Dated record. The `route-status` workload and its jobs were removed from the
+> Resources Scale Benchmark workflow in #7279; the method below describes the
+> retired lane.
+
+The on-demand Resources Scale Benchmark workflow accepted `benchmark=route-status`
 and a `baseline_ref`. Select the candidate branch or commit as the workflow ref;
 use an immutable baseline commit for reproducible comparisons. The default
 `benchmark=resources` retains the existing proxy traffic benchmark.

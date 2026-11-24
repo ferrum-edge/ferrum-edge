@@ -2,7 +2,7 @@
 //!
 //! One pure rule governs every read of the setting: startup secret resolution
 //! (process environment only), `EnvConfig` (environment and `ferrum.conf`), and
-//! the runtime single-key fetches. Unset keeps the documented 30-second
+//! the runtime direct-reference fetches. Unset keeps the documented 30-second
 //! default; a configured value that is malformed, zero, negative, or above the
 //! hard maximum is an error that names the variable and range but never echoes
 //! the value.
@@ -16,7 +16,7 @@ use ferrum_edge::config::env_config::{
     DEFAULT_SECRET_FETCH_TIMEOUT_SECONDS, HARD_MAX_SECRET_FETCH_TIMEOUT_SECONDS,
     MIN_SECRET_FETCH_TIMEOUT_SECONDS, parse_secret_fetch_timeout,
 };
-use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_secret};
+use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_external_reference};
 use tempfile::NamedTempFile;
 
 use crate::unit::env_lock::{with_env_vars, with_env_vars_async};
@@ -121,31 +121,28 @@ fn startup_resolution_rejects_zero_before_fetching_a_file_secret() {
 }
 
 #[test]
-fn runtime_single_key_fetch_rejects_invalid_values() {
+fn runtime_direct_reference_fetch_rejects_invalid_values() {
     let mut tmp = NamedTempFile::new().unwrap();
     writeln!(tmp, "runtime-secret-value").unwrap();
     let path = tmp.path().to_str().unwrap().to_string();
 
     for &raw in REJECTED {
-        with_env_vars_async(
-            &[(KEY, raw), ("FERRUM_TEST_FETCH_TO_RT_FILE", &path)],
-            move || async move {
-                let result = resolve_secret("FERRUM_TEST_FETCH_TO_RT").await;
-                let error = result.expect_err("the runtime fetch must fail");
-                assert_eq!(error, EXPECTED_ERROR, "{raw:?}");
-                assert!(!error.contains("runtime-secret-value"));
-            },
-        );
+        let reference = path.clone();
+        with_env_vars_async(&[(KEY, raw)], move || async move {
+            let result =
+                resolve_external_reference("file", &reference, "FERRUM_TEST_FETCH_TO_RT").await;
+            let error = result.expect_err("the runtime fetch must fail");
+            assert_eq!(error, EXPECTED_ERROR, "{raw:?}");
+            assert!(!error.contains("runtime-secret-value"));
+        });
     }
 
-    with_env_vars_async(
-        &[(KEY, "5"), ("FERRUM_TEST_FETCH_TO_RT_FILE", &path)],
-        || async {
-            let result = resolve_secret("FERRUM_TEST_FETCH_TO_RT").await;
-            let resolved = result.unwrap().unwrap();
-            assert_eq!(resolved.value, "runtime-secret-value");
-        },
-    );
+    with_env_vars_async(&[(KEY, "5")], || async {
+        let resolved = resolve_external_reference("file", &path, "FERRUM_TEST_FETCH_TO_RT")
+            .await
+            .expect("a valid timeout resolves the reference");
+        assert_eq!(resolved.value, "runtime-secret-value");
+    });
 }
 
 #[test]

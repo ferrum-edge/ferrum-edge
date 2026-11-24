@@ -8,6 +8,8 @@ dependency-audit workflow runs --upstream-status after parity passes.
 Parity mode fails closed when the lifecycle contract drifts from:
   - root Cargo.toml [patch.crates-io]
   - tests/performance/mesh/Cargo.toml mirrored [patch.crates-io]
+  - .github/dependabot.yml cargo `ignore` entries, so a Dependabot version
+    update can never move a patched crate past its vendored copy
   - vendor/*-ferrum-patched directories (vendor_path is derived from crate and
     vendored_version, so a version typo cannot hide behind an existing directory)
   - scripts/check_vendored_patch_status.sh safe wrapper delegation
@@ -19,9 +21,11 @@ Every governed surface lives on a path that .github/scripts/pr_ci_plan.py keeps
 on full CI, because the `dependency-audit` job that runs this checker is required
 to stay behind `mode == 'full'`.
 
-Upstream mode queries filed upstream PRs via the GitHub REST API and reports deliberate forks
-that still need filing or dated owner reaffirmation before the first stable
-release checkpoint (docs/dependency-policy.md).
+Upstream mode queries filed upstream PRs via the GitHub REST API, lists privately
+reported patches (filing=reported_privately: channel and date only, never the
+embargoed report identifier), and reports deliberate forks that still need
+filing or dated owner reaffirmation before the first stable release checkpoint
+(docs/dependency-policy.md).
 
 Every normal invocation runs synthetic self-tests first, then repository parity.
 --self-test runs only the synthetic fixtures and exits (no network, no repository
@@ -31,6 +35,7 @@ mutation). --upstream-status self-tests, then parity, then network reporting.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -48,12 +53,27 @@ POLICY_PATH = ROOT / "docs" / "dependency-policy.md"
 ROOT_CARGO = ROOT / "Cargo.toml"
 MESH_PERF_CARGO = ROOT / "tests" / "performance" / "mesh" / "Cargo.toml"
 PATCH_STATUS_SCRIPT = ROOT / "scripts" / "check_vendored_patch_status.sh"
+DEPENDABOT_CONFIG = ROOT / ".github" / "dependabot.yml"
+# Registry crates that pin a patched crate with an exact `=` requirement. A
+# bump of the dependent would require the next patched-crate release, and Cargo
+# would then drop the vendored copy, so Dependabot must ignore the dependent too.
+EXACT_PIN_DEPENDENTS = {"sqlx-core": ("sqlx",)}
 VENDOR_ROOT = ROOT / "vendor"
 
 COMPATIBLE_RELEASE_STATUSES = frozenset(
     {"not_started", "in_progress", "passed", "failed", "blocked"}
 )
-UPSTREAM_FILINGS = frozenset({"filed", "deliberate_fork_unfiled"})
+UPSTREAM_FILINGS = frozenset({"filed", "reported_privately", "deliberate_fork_unfiled"})
+# `reported_privately`: the defect was reported to the upstream maintainers
+# through a private channel and no public issue or PR exists yet. The private
+# report's identifier is deliberately NOT recorded (it is embargoed); only the
+# channel and the date are, as `upstream.private_report`. Once a public PR
+# exists the patch moves to `filed`.
+PRIVATE_REPORT_CHANNELS = {
+    "security_advisory": "security advisory report",
+    "security_email": "security email report",
+}
+PRIVATE_REPORT_FIELDS = frozenset({"channel", "reported_on"})
 REQUIRED_PATCH_STRING_FIELDS = (
     "id",
     "label",
@@ -95,6 +115,14 @@ USER_AGENT = "ferrum-edge-dependency-audit (github.com/ferrum-edge/ferrum-edge)"
 MAX_MERGED_RELEASE_HOLD_DAYS = 30
 
 
+GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+PATCH_PATH_ENTRY_RE = re.compile(r'^(\w[\w-]*)\s*=\s*\{\s*path\s*=\s*"([^"]+)"\s*\}')
+DEPENDABOT_ECOSYSTEM_RE = re.compile(r'^-\s+package-ecosystem:\s*["\']?([\w-]+)["\']?$')
+DEPENDABOT_DEPENDENCY_NAME_RE = re.compile(r'^-\s+dependency-name:\s*["\']([^"\']+)["\']$')
+BACKTICK_CELL_RE = re.compile(r"`([^`\n]+)`")
+
+
 def merged_release_hold_shape_errors(patch: dict[str, Any]) -> list[str]:
     retirement = patch.get("retirement")
     if not isinstance(retirement, dict):
@@ -114,7 +142,7 @@ def merged_release_hold_shape_errors(patch: dict[str, Any]) -> list[str]:
     _require_nonempty_str_list(hold.get("evidence"), f"{prefix}.evidence", errors)
     if hold.get("owner") != patch.get("owner"):
         errors.append(f"{prefix}.owner: must match the patch owner")
-    if not re.fullmatch(r"[0-9a-f]{40}", str(hold.get("merge_commit", ""))):
+    if not GIT_SHA_RE.fullmatch(str(hold.get("merge_commit", ""))):
         errors.append(f"{prefix}.merge_commit: must be a full commit SHA")
     if not CRATES_IO_VERSION_RE.fullmatch(str(hold.get("latest_release", ""))):
         errors.append(f"{prefix}.latest_release: must be a registry version")
@@ -125,7 +153,7 @@ def merged_release_hold_shape_errors(patch: dict[str, Any]) -> list[str]:
     if not isinstance(compatible, dict) or compatible.get("status") != "blocked":
         errors.append(f"{prefix}: requires compatible_release_test.status=blocked")
     try:
-        if any(not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(hold.get(field)))
+        if any(not ISO_DATE_RE.fullmatch(str(hold.get(field)))
                for field in ("reviewed_on", "expires_on")):
             raise ValueError("non-calendar review date")
         reviewed = date.fromisoformat(hold["reviewed_on"])
@@ -181,12 +209,70 @@ def parse_patch_crates_io_text(text: str) -> dict[str, str]:
         if in_block:
             if stripped.startswith("[") and stripped.endswith("]"):
                 break
-            match = re.match(
-                r'^(\w[\w-]*)\s*=\s*\{\s*path\s*=\s*"([^"]+)"\s*\}', stripped
-            )
+            match = PATCH_PATH_ENTRY_RE.match(stripped)
             if match:
                 patches[match.group(1)] = match.group(2)
     return patches
+
+
+def dependabot_cargo_ignore_names(text: str) -> list[str] | None:
+    """Return the cargo update's `ignore` dependency names, or None if absent.
+
+    The repository has no YAML parser in the audit environment, so this reads
+    the fixed shape `.github/dependabot.yml` uses: one `- package-ecosystem:
+    "cargo"` list item whose `ignore:` entries are `- dependency-name: "..."`.
+    """
+    names: list[str] | None = None
+    in_cargo = False
+    in_ignore = False
+    item_indent = -1
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        stripped = line.strip()
+        ecosystem = DEPENDABOT_ECOSYSTEM_RE.match(stripped)
+        if ecosystem:
+            in_cargo = ecosystem.group(1) == "cargo"
+            in_ignore = False
+            item_indent = indent
+            if in_cargo and names is None:
+                names = []
+            continue
+        if not in_cargo:
+            continue
+        if indent <= item_indent:
+            in_cargo = False
+            in_ignore = False
+            continue
+        if indent == item_indent + 2:
+            in_ignore = stripped == "ignore:"
+            continue
+        if in_ignore:
+            entry = DEPENDABOT_DEPENDENCY_NAME_RE.match(stripped)
+            if entry and names is not None:
+                names.append(entry.group(1))
+    return names
+
+
+def dependabot_ignore_parity_errors(
+    dependabot_text: str, patched_crates: set[str]
+) -> list[str]:
+    names = dependabot_cargo_ignore_names(dependabot_text)
+    if names is None:
+        return [".github/dependabot.yml has no cargo update entry"]
+    required = set(patched_crates)
+    for crate in patched_crates:
+        required.update(EXACT_PIN_DEPENDENTS.get(crate, ()))
+    errors: list[str] = []
+    for crate in sorted(required):
+        if not any(fnmatch.fnmatchcase(crate, pattern) for pattern in names):
+            errors.append(
+                f".github/dependabot.yml cargo ignore does not cover {crate}; a "
+                "version update past the vendored copy would silently drop the patch"
+            )
+    return errors
 
 
 def readme_candidates(docs_path: str) -> list[Path]:
@@ -290,6 +376,58 @@ def _is_github_repo(value: Any) -> bool:
     return all(segment.strip(".") for segment in str(value).split("/"))
 
 
+def private_report_shape_errors(prefix: str, report: Any) -> list[str]:
+    """Shape of `upstream.private_report` for filing=reported_privately."""
+    path = f"{prefix}.upstream.private_report"
+    if not isinstance(report, dict):
+        return [f"{path}: filing=reported_privately requires an object"]
+    errors: list[str] = []
+    if set(report) != PRIVATE_REPORT_FIELDS:
+        errors.append(f"{path}: must contain exactly {sorted(PRIVATE_REPORT_FIELDS)}")
+    if report.get("channel") not in PRIVATE_REPORT_CHANNELS:
+        errors.append(
+            f"{path}.channel: must be one of {sorted(PRIVATE_REPORT_CHANNELS)}"
+        )
+    reported_on = report.get("reported_on")
+    try:
+        if not ISO_DATE_RE.fullmatch(str(reported_on)):
+            raise ValueError("non-calendar date")
+        date.fromisoformat(str(reported_on))
+    except ValueError:
+        errors.append(f"{path}.reported_on: must be an ISO calendar date")
+    return errors
+
+
+def private_report_readme_errors(
+    pid: str, upstream: dict[str, Any], readme_text: str
+) -> list[str]:
+    """A privately reported patch's README records the report the same way."""
+    marker = private_report_marker(upstream)
+    if marker is None or marker.casefold() in readme_text.casefold():
+        return []
+    return [f"{pid}: README lacks private report record {marker!r}"]
+
+
+def private_report_marker(upstream: dict[str, Any]) -> str | None:
+    """The sentence a privately reported patch's README and policy row carry.
+
+    Names the upstream organisation, the channel and the date only, never the
+    embargoed report identifier. None when the record is not well formed (the
+    shape validator reports that).
+    """
+    report = upstream.get("private_report")
+    repo = upstream.get("github_repo")
+    if (
+        upstream.get("filing") != "reported_privately"
+        or private_report_shape_errors("p", report)
+        or not _is_github_repo(repo)
+    ):
+        return None
+    org = str(repo).split("/", 1)[0]
+    label = PRIVATE_REPORT_CHANNELS[report["channel"]]
+    return f"reported privately to {org} ({label}, {report['reported_on']})"
+
+
 def _require_nonempty_str(value: Any, path: str, errors: list[str]) -> None:
     if not _is_nonempty_str(value):
         errors.append(f"{path}: must be a non-empty string")
@@ -379,6 +517,21 @@ def validate_lifecycle_shape(data: Any) -> list[str]:
                     errors.append(
                         f"{prefix}: filing=deliberate_fork_unfiled must not carry a pr_number"
                     )
+            elif filing == "reported_privately":
+                if pr_number is not None:
+                    errors.append(
+                        f"{prefix}: filing=reported_privately must not carry a "
+                        "pr_number; a public upstream PR is filing=filed"
+                    )
+
+            private_report = upstream.get("private_report")
+            if filing == "reported_privately":
+                errors.extend(private_report_shape_errors(prefix, private_report))
+            elif private_report is not None:
+                errors.append(
+                    f"{prefix}.upstream.private_report: only "
+                    "filing=reported_privately carries a private report"
+                )
 
             issue_number = upstream.get("issue_number")
             if issue_number is not None and not _is_positive_int(issue_number):
@@ -562,7 +715,7 @@ def policy_inventory_rows(policy_text: str) -> tuple[list[tuple[str, str]], list
             )
             continue
         cells = [cell.strip() for cell in raw_cells[1:-1]]
-        id_match = re.fullmatch(r"`([^`\n]+)`", cells[0])
+        id_match = BACKTICK_CELL_RE.fullmatch(cells[0])
         if id_match is None:
             errors.append(
                 f"dependency-policy.md lifecycle inventory row {line_number}: "
@@ -638,6 +791,12 @@ def policy_reference_errors(
         upstream = patch.get("upstream")
         if not isinstance(upstream, dict):
             continue
+        marker = private_report_marker(upstream)
+        if marker is not None and marker.casefold() not in row.casefold():
+            errors.append(
+                f"{pid}: private report record {marker!r} missing from its "
+                "dependency-policy.md inventory row"
+            )
         repo = upstream.get("github_repo")
         if not _is_github_repo(repo):
             continue
@@ -776,6 +935,11 @@ def parity_errors(data: Any) -> list[str]:
                 parse_readme_reaffirmation(readme),
             )
         )
+        errors.extend(
+            private_report_readme_errors(
+                pid, patch["upstream"], readme.read_text(encoding="utf-8")
+            )
+        )
 
     errors.extend(
         co_retirement_parity_errors(patches, data.get("co_retirement_groups", []))
@@ -825,6 +989,15 @@ def parity_errors(data: Any) -> list[str]:
                 )
     else:
         errors.append("missing tests/performance/mesh/Cargo.toml patch mirror")
+
+    if DEPENDABOT_CONFIG.is_file():
+        errors.extend(
+            dependabot_ignore_parity_errors(
+                DEPENDABOT_CONFIG.read_text(encoding="utf-8"), set(root_patches)
+            )
+        )
+    else:
+        errors.append("missing .github/dependabot.yml")
 
     return errors
 
@@ -970,6 +1143,12 @@ def run_upstream_status(data: dict[str, Any], *, today: date | None = None) -> i
                     f"  ::warning::{patch['id']} is an unfiled deliberate fork without a "
                     "dated reaffirmation in the lifecycle inventory."
                 )
+        elif filing == "reported_privately" and pr is None:
+            marker = private_report_marker(upstream)
+            print(
+                f"- upstream: {marker}; no public issue or PR to poll until the "
+                "maintainers publish a fix"
+            )
         elif pr is not None:
             hold = patch["retirement"].get("merged_release_hold")
             state, reason = github_pr_state(
@@ -1531,6 +1710,121 @@ true
         "dot-only github_repo segments",
     )
 
+    # --- private upstream report -----------------------------------------
+    private_upstream = {
+        "filing": "reported_privately",
+        "pr_number": None,
+        "issue_number": None,
+        "private_report": {"channel": "security_advisory", "reported_on": "2026-11-14"},
+    }
+    expect_empty(
+        validate_lifecycle_shape(
+            {**base, "patches": [_valid_patch(upstream=private_upstream)]}
+        ),
+        "privately reported patch",
+    )
+    expect_contains(
+        validate_lifecycle_shape(
+            {
+                **base,
+                "patches": [_valid_patch(upstream={**private_upstream, "pr_number": 3})],
+            }
+        ),
+        "filing=reported_privately must not carry a pr_number",
+        "privately reported patch with a public PR",
+    )
+    expect_contains(
+        validate_lifecycle_shape(
+            {
+                **base,
+                "patches": [
+                    _valid_patch(upstream={**private_upstream, "private_report": None})
+                ],
+            }
+        ),
+        "filing=reported_privately requires an object",
+        "privately reported patch without a report record",
+    )
+    for bad_report, needle, label in (
+        (
+            {"channel": "security_advisory", "reported_on": "2026-02-30"},
+            "reported_on: must be an ISO calendar date",
+            "private report with an impossible date",
+        ),
+        (
+            {"channel": "::error::forged", "reported_on": "2026-11-14"},
+            "channel: must be one of",
+            "private report with an unknown channel",
+        ),
+        (
+            {
+                "channel": "security_advisory",
+                "reported_on": "2026-11-14",
+                "advisory_id": "GHSA-xxxx-xxxx-xxxx",
+            },
+            "must contain exactly",
+            "private report carrying an identifier",
+        ),
+    ):
+        expect_contains(
+            validate_lifecycle_shape(
+                {
+                    **base,
+                    "patches": [
+                        _valid_patch(
+                            upstream={**private_upstream, "private_report": bad_report}
+                        )
+                    ],
+                }
+            ),
+            needle,
+            label,
+        )
+    expect_contains(
+        validate_lifecycle_shape(
+            {
+                **base,
+                "patches": [
+                    _valid_patch(
+                        upstream={
+                            "private_report": private_upstream["private_report"]
+                        }
+                    )
+                ],
+            }
+        ),
+        "only filing=reported_privately carries a private report",
+        "filed patch carrying a private report",
+    )
+    private_marker = "reported privately to example (security advisory report, 2026-11-14)"
+    private_patch = _valid_patch(upstream={**private_upstream, "github_repo": "example/example"})
+    if private_report_marker(private_patch["upstream"]) != private_marker:
+        failures.append(
+            "private report marker: unexpected "
+            f"{private_report_marker(private_patch['upstream'])!r}"
+        )
+    expect_empty(
+        private_report_readme_errors(
+            "p", private_patch["upstream"], f"| Upstream | {private_marker.capitalize()} |"
+        ),
+        "README records the private report",
+    )
+    expect_contains(
+        private_report_readme_errors(
+            "p", private_patch["upstream"], "| Upstream | unfiled upstream |"
+        ),
+        "README lacks private report record",
+        "README missing the private report",
+    )
+    private_reaffirmation = {"date": "2026-07-01", "owner": "@owner", "reason": "fork"}
+    expect_contains(
+        reaffirmation_parity_errors(
+            "p", "reported_privately", private_reaffirmation, private_reaffirmation
+        ),
+        "reaffirmation is a deliberate-fork record",
+        "privately reported patch carrying a reaffirmation",
+    )
+
     # --- reaffirmation pairing -------------------------------------------
     readme_record = {"date": "2026-07-01", "owner": "@owner", "reason": "still right"}
     expect_empty(
@@ -1734,6 +2028,26 @@ true
         "upstream issue reference 'example/example#99' missing",
         "stale upstream issue number",
     )
+    private_policy = "\n".join(
+        [
+            INVENTORY_HEADER,
+            "|---|---|---|---|---|---|---|---|---|",
+            _inventory_row(
+                "example-001",
+                upstream=f"**{private_marker.capitalize()}**",
+                docs_path="upstream-example-patches/001/README.md",
+            ),
+        ]
+    )
+    expect_empty(
+        policy_reference_errors(private_policy, [private_patch]),
+        "documented private report",
+    )
+    expect_contains(
+        policy_reference_errors(reference_policy, [private_patch]),
+        "private report record",
+        "private report missing from the inventory row",
+    )
     expect_contains(
         policy_reference_errors("| no rows here |", [referenced_patch]),
         "matching dependency-policy.md lifecycle inventory row is missing",
@@ -1791,6 +2105,55 @@ true
         })
         expect_contains(validate_lifecycle_shape({**base, "patches": [mutated]}),
                         "status=blocked", "hold cannot hide compatibility outcome")
+
+    dependabot_fixture = """version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directories:
+      - "/"
+    ignore:
+      - dependency-name: "sqlx*" # exact sqlx-core pin
+      - dependency-name: "hyper"
+    groups:
+      cargo:
+        patterns:
+          - "*"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    ignore:
+      - dependency-name: "h2"
+"""
+    expect_empty(
+        dependabot_ignore_parity_errors(dependabot_fixture, {"hyper", "sqlx-core"}),
+        "dependabot ignore covers patched crates and exact-pin dependents",
+    )
+    expect_contains(
+        dependabot_ignore_parity_errors(dependabot_fixture, {"hyper", "h2"}),
+        "does not cover h2",
+        "another ecosystem's ignore does not cover a cargo patch",
+    )
+    expect_contains(
+        dependabot_ignore_parity_errors(
+            dependabot_fixture.replace('"sqlx*"', '"sqlx-core"'), {"sqlx-core"}
+        ),
+        "does not cover sqlx;",
+        "exact-pin dependent must be ignored with its patched crate",
+    )
+    expect_contains(
+        dependabot_ignore_parity_errors(
+            dependabot_fixture.replace('"cargo"', '"docker"', 1), {"hyper"}
+        ),
+        "no cargo update entry",
+        "missing cargo update entry fails closed",
+    )
+    expect_contains(
+        dependabot_ignore_parity_errors(
+            dependabot_fixture.replace('      - dependency-name: "hyper"\n', ""),
+            {"hyper"},
+        ),
+        "does not cover hyper",
+        "removed ignore entry is rejected",
+    )
 
     # Exercise the whole upstream decision with synthetic responses, never live
     # network access. Other merged patches still fail without a reviewed hold.

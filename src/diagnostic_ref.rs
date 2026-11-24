@@ -199,6 +199,26 @@ pub const RETIRED_GATEWAY_LISTENER_PHASE: &str = "gateway_listener_retired";
 /// gRPC, WebSocket) cannot run the route's authentication or admission policy.
 pub const ROUTE_PROTOCOL_ADMISSION_PHASE: &str = "route_protocol_admission";
 
+/// Rejection phase of a request whose raw query carries an unencoded `;` on a
+/// chain with a query-reading plugin execution trigger (issue #6655).
+pub const QUERY_TRIGGER_ADMISSION_PHASE: &str = "query_trigger_admission";
+
+/// Rejection phase of a native gRPC or gRPC-Web request refused because its
+/// method is not `POST` (the gRPC protocol requires it), before any plugin.
+pub const GRPC_POST_REQUIRED_PHASE: &str = "grpc_post_required";
+
+/// Rejection phase of a gateway `500` whose backend-effective path could not
+/// be built from the matched route and target (issue #7156).
+pub const INVALID_BACKEND_PATH_PHASE: &str = "invalid_backend_path";
+
+/// Rejection phase of a gateway `500` for a WebSocket upgrade whose request
+/// carried no upgrade handle to complete (issue #7156).
+pub const WEBSOCKET_UPGRADE_UNAVAILABLE_PHASE: &str = "websocket_upgrade_unavailable";
+
+/// Rejection phase of the native-H3 `502` for a backend target that requires
+/// mesh transport dispatch the native-H3 path cannot provide (issue #7157).
+pub const MESH_TRANSPORT_DISPATCH_REQUIRED_PHASE: &str = "mesh_transport_dispatch_required";
+
 /// Plugin hook phases. A rejection recorded in one of them is a plugin
 /// rejection even when the rejecting plugin's name is not known.
 const PLUGIN_HOOK_PHASES: [&str; 9] = [
@@ -221,7 +241,12 @@ const GATEWAY_REJECTION_PHASES: &[&str] = &[
     MESH_REGISTRY_ONLY_PHASE,
     RETIRED_GATEWAY_LISTENER_PHASE,
     ROUTE_PROTOCOL_ADMISSION_PHASE,
+    QUERY_TRIGGER_ADMISSION_PHASE,
+    GRPC_POST_REQUIRED_PHASE,
     BACKEND_ADMISSION_PHASE,
+    INVALID_BACKEND_PATH_PHASE,
+    WEBSOCKET_UPGRADE_UNAVAILABLE_PHASE,
+    MESH_TRANSPORT_DISPATCH_REQUIRED_PHASE,
     "h1_framing_unverified",
     "config_stale",
     "client_trust_withdrawn",
@@ -231,7 +256,6 @@ const GATEWAY_REJECTION_PHASES: &[&str] = &[
     "allowed_methods",
     "max_forwards",
     "backend_max_connections",
-    "circuit_breaker",
     "circuit_breaker_open",
     "finalized_request_egress",
     "websocket_connection_limit",
@@ -248,6 +272,10 @@ const GATEWAY_REJECTION_PHASES: &[&str] = &[
     "grpc_deadline_terminal_request_body",
     "grpc_deadline_buffered_grpc_upload",
     "grpc_deadline_buffered_h3_bridge_upload",
+    "request_body_refused_before_authenticate",
+    "request_body_refused_before_authorize",
+    "request_body_refused_before_before_proxy",
+    "request_body_refused_before_dispatch",
     "client_disconnect_upload_before_authenticate",
     "client_disconnect_upload_before_authorize",
     "client_disconnect_upload_before_before_proxy",
@@ -258,6 +286,7 @@ const GATEWAY_REJECTION_PHASES: &[&str] = &[
     "client_disconnect_buffered_h3_bridge_upload",
     "authorization_expired_buffered_grpc_upload",
     "invalid_h3_upload",
+    "gateway_closed_h3_upload",
     "mesh_inbound_peer_auth_initial_route_mismatch",
     "mesh_inbound_peer_auth_transport_mismatch",
     "mesh_inbound_peer_auth_retry_target_mismatch",
@@ -527,6 +556,13 @@ pub struct DiagnosticRejection {
     /// view reports the stamped status on its own.
     #[serde(skip)]
     pub status: u16,
+    /// The client sees this rejection as a gRPC-Web error: an HTTP `200` head
+    /// whose non-zero `grpc-status` rides only in the body's trailer frame
+    /// (issue #7407). The head cannot show the error, so the rejection site
+    /// says so here, and [`DiagnosticSlot::authored_error_response`] accepts
+    /// that `200` gRPC-Web head as the one this rejection authored.
+    #[serde(skip)]
+    pub grpc_web_error: bool,
 }
 
 impl DiagnosticRejection {
@@ -545,7 +581,15 @@ impl DiagnosticRejection {
             phase: rejection_phase_label(phase),
             plugin,
             status,
+            grpc_web_error: false,
         }
+    }
+
+    /// Mark the rejection as answered with a gRPC-Web trailer-frame error (an
+    /// HTTP `200` head, non-zero `grpc-status` in the body).
+    pub fn with_grpc_web_error(mut self) -> Self {
+        self.grpc_web_error = true;
+        self
     }
 
     /// A routing rejection (`route_not_found`, `mesh_registry_only`).
@@ -555,6 +599,7 @@ impl DiagnosticRejection {
             phase: rejection_phase_label(phase),
             plugin: None,
             status,
+            grpc_web_error: false,
         }
     }
 
@@ -566,6 +611,7 @@ impl DiagnosticRejection {
             phase: rejection_phase_label(phase),
             plugin: None,
             status,
+            grpc_web_error: false,
         }
     }
 }
@@ -878,6 +924,20 @@ impl DiagnosticSlot {
     /// Whether the recorded rejection authored a response head with `status`.
     pub fn authored_status(&self, status: u16) -> bool {
         matches!(self.rejection(), Some(rejection) if rejection.status == status)
+    }
+
+    /// Whether the recorded rejection authored this error response head: a
+    /// head with the recorded status that reports an error
+    /// ([`is_error_response`]), or, for a rejection answered as a gRPC-Web
+    /// trailer-frame error, the HTTP `200` gRPC-Web head that carries it
+    /// (issue #7407). The gRPC-Web head shows its `grpc-status` only in the
+    /// body, so the rejection site's record is what makes it an error.
+    pub fn authored_error_response(&self, status: u16, headers: &http::HeaderMap) -> bool {
+        let Some(rejection) = self.rejection() else {
+            return false;
+        };
+        (rejection.status == status && is_error_response(status, headers))
+            || (rejection.grpc_web_error && status == 200 && is_grpc_web_response(headers))
     }
 
     /// Note the plugin whose hook rejected the request. Dropped unless the
@@ -1671,6 +1731,11 @@ pub fn strip_response_header(headers: &mut http::HeaderMap) {
 
 /// Whether a response head reports an error: an HTTP status of at least
 /// `400`, or a gRPC Trailers-Only head whose `grpc-status` is not `0`.
+///
+/// A gRPC-Web error is an HTTP `200` head whose `grpc-status` is only in the
+/// body's trailer frame, so the head alone never reports it. A gRPC-Web
+/// rejection is recognized from its rejection record instead
+/// ([`DiagnosticSlot::authored_error_response`]).
 pub fn is_error_response(status: u16, headers: &http::HeaderMap) -> bool {
     status >= 400
         || headers
@@ -1679,13 +1744,75 @@ pub fn is_error_response(status: u16, headers: &http::HeaderMap) -> bool {
             .is_some_and(|value| value.trim() != "0")
 }
 
+/// Whether a response head is a gRPC-Web representation
+/// (`application/grpc-web`, `application/grpc-web-text`, and their `+proto`
+/// forms).
+pub fn is_grpc_web_response(headers: &http::HeaderMap) -> bool {
+    const GRPC_WEB: &[u8] = b"application/grpc-web";
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .map(http::HeaderValue::as_bytes)
+        .and_then(|value| value.get(..GRPC_WEB.len()))
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(GRPC_WEB))
+}
+
+/// Let a browser read the stamped reference on a gRPC-Web response: append
+/// [`DIAGNOSTIC_REF_HEADER`] to its `Access-Control-Expose-Headers` list
+/// (issue #7407). A gRPC-Web response always exposes its terminal metadata
+/// that way; a response without the field has no CORS exposure to extend.
+fn expose_reference_header(headers: &mut http::HeaderMap) {
+    let mut merged = String::new();
+    let mut listed = false;
+    let mut opaque = false;
+    for value in headers.get_all(http::header::ACCESS_CONTROL_EXPOSE_HEADERS) {
+        listed = true;
+        let Ok(value) = value.to_str() else {
+            opaque = true;
+            continue;
+        };
+        if value
+            .split(',')
+            .any(|name| name.trim().eq_ignore_ascii_case(DIAGNOSTIC_REF_HEADER))
+        {
+            return;
+        }
+        if !merged.is_empty() {
+            merged.push_str(", ");
+        }
+        merged.push_str(value);
+    }
+    if !listed {
+        return;
+    }
+    if opaque {
+        // An opaque value cannot be merged; add the name as its own field
+        // line, which a list-valued field allows.
+        headers.append(
+            http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            http::HeaderValue::from_static(DIAGNOSTIC_REF_HEADER),
+        );
+        return;
+    }
+    if !merged.is_empty() {
+        merged.push_str(", ");
+    }
+    merged.push_str(DIAGNOSTIC_REF_HEADER);
+    if let Ok(merged) = http::HeaderValue::from_str(&merged) {
+        headers.insert(http::header::ACCESS_CONTROL_EXPOSE_HEADERS, merged);
+    }
+}
+
 /// Strip every client-bound copy of the reference header, then stamp a fresh
 /// reference when the response carries a gateway-authored `X-Gateway-Error`
 /// token from the closed vocabulary or, in `all` mode, when the request's slot
-/// recorded a gateway rejection and the head reports an error. In every mode an
+/// recorded the gateway rejection that authored this error head
+/// ([`DiagnosticSlot::authored_error_response`], which includes a gRPC-Web
+/// trailer-frame error's HTTP `200` head). In every mode an
 /// origin-authored representation a plugin replayed or relayed (the slot's
 /// [`DiagnosticSlot::serves_origin_response`]) is never stamped, whatever
-/// token it carries. Returns the stamped reference.
+/// token it carries. A stamped gRPC-Web response also exposes the reference to
+/// browser callers through its `Access-Control-Expose-Headers` list. Returns
+/// the stamped reference.
 pub fn stamp_response_headers(
     store: &DiagnosticRefStore,
     slot: Option<&Arc<DiagnosticSlot>>,
@@ -1703,14 +1830,16 @@ pub fn stamp_response_headers(
         .and_then(crate::retry::intern_http_observability_error_class);
     let gateway_rejection = token.is_none()
         && store.mode.covers_gateway_rejections()
-        && slot.is_some_and(|slot| slot.authored_status(status))
-        && is_error_response(status, headers);
+        && slot.is_some_and(|slot| slot.authored_error_response(status, headers));
     if token.is_none() && !gateway_rejection {
         return None;
     }
     let reference = store.mint_entry_at(Instant::now(), protocol, status, token, slot)?;
     let value = http::HeaderValue::from_str(&reference).ok()?;
     headers.insert(&DIAGNOSTIC_REF_HEADER_NAME, value);
+    if is_grpc_web_response(headers) {
+        expose_reference_header(headers);
+    }
     Some(reference)
 }
 
@@ -1916,15 +2045,23 @@ pub fn gateway_rejections_enabled() -> bool {
 }
 
 /// Note the plugin whose hook rejected the request, and whether its
-/// short-circuit is an origin-authored representation. A no-op (one `Option`
-/// check) when references are off.
+/// short-circuit is an origin-authored representation. Beyond recording the
+/// origin provenance on the request, a no-op (one `Option` check) when
+/// references are off.
 pub(crate) fn note_rejecting_plugin(
     ctx: &crate::plugins::RequestContext,
     plugin: &dyn crate::plugins::Plugin,
 ) {
+    let origin_response = plugin.rejects_with_origin_response();
+    if origin_response {
+        // Independent of diagnostic references: gateway-only response repairs
+        // (the `WWW-Authenticate` guarantee, issue #6774) must also leave an
+        // origin-authored short-circuit as authored.
+        ctx.note_origin_rejection();
+    }
     if let Some(slot) = ctx.diagnostic_slot() {
         slot.note_rejecting_plugin(plugin.name());
-        if plugin.rejects_with_origin_response() {
+        if origin_response {
             slot.note_origin_response();
         }
     }
@@ -1971,8 +2108,26 @@ pub(crate) fn record_rejection(ctx: &crate::plugins::RequestContext, phase: &str
     if slot.serves_origin_response() || (status < 500 && !gateway_rejections_enabled()) {
         return;
     }
-    let rejection = DiagnosticRejection::new(phase, slot.rejecting_plugin(), status);
+    let mut rejection = DiagnosticRejection::new(phase, slot.rejecting_plugin(), status);
+    if rejects_as_grpc_web_error(ctx) {
+        rejection = rejection.with_grpc_web_error();
+    }
     slot.record_rejection(rejection);
+}
+
+/// Whether the rejection being recorded reaches the client as a gRPC-Web
+/// trailer-frame error (issue #7407): the request keeps a gRPC-Web client
+/// representation, and the rejection's gRPC status, which every gRPC reject
+/// path writes to the request metadata before the rejection is logged, is not
+/// `OK`. A rejection without that status is left to its HTTP head, so a
+/// gRPC-Web response is never referenced on a guess.
+fn rejects_as_grpc_web_error(ctx: &crate::plugins::RequestContext) -> bool {
+    crate::plugins::grpc_web::client_uses_grpc_web(ctx)
+        && ctx
+            .metadata
+            .get("grpc_status")
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .is_some_and(|grpc_status| grpc_status != 0)
 }
 
 /// The slot a gateway rejection answered before routing matched a proxy (a
@@ -1987,15 +2142,32 @@ fn unrouted_rejection_slot(slot: Option<&Arc<DiagnosticSlot>>) -> Option<&Arc<Di
 /// Record a routing rejection (`phase` is [`ROUTE_NOT_FOUND_PHASE`] or
 /// [`MESH_REGISTRY_ONLY_PHASE`]) answered with `status` for a request received
 /// at `started`, with its unrouted detail.
+///
+/// This is also the single funnel every HTTP-family listener (H1/H2 and H3)
+/// passes through on a route miss, so it counts the rejection on
+/// `ferrum_unmatched_requests_total` regardless of whether diagnostic
+/// references are enabled: these requests never reach a plugin, so no other
+/// Prometheus family sees them.
+///
+/// `grpc_web_error` says the miss is answered as a gRPC-Web trailer-frame
+/// error (the request kept a gRPC-Web representation, so the `404` / registry
+/// refusal reaches the client as an HTTP `200` with a non-zero `grpc-status`
+/// in the body), which the head alone cannot show (issue #7407).
 pub(crate) fn record_route_miss(
     slot: Option<&Arc<DiagnosticSlot>>,
     phase: &'static str,
     started: Instant,
     status: u16,
+    grpc_web_error: bool,
 ) {
+    crate::plugins::prometheus_metrics::global_registry().record_unmatched_request(phase, status);
     if let Some(slot) = unrouted_rejection_slot(slot) {
         let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-        slot.record_rejection(DiagnosticRejection::routing(phase, status));
+        let mut rejection = DiagnosticRejection::routing(phase, status);
+        if grpc_web_error {
+            rejection = rejection.with_grpc_web_error();
+        }
+        slot.record_rejection(rejection);
         slot.record_detail(DiagnosticDetail::unrouted(latency_ms));
     }
 }

@@ -25,12 +25,16 @@ use super::{
     RouteBackend, RouteProxySpec, SourceKind, UNSUPPORTED_SHAPE_MARKER,
     attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
     mesh_route_dispatch_plugin_from_rules, namespaced_resource_key, optional_port_field,
-    optional_target_weight_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
-    resource_id, route_backends_require_node_waypoint_authz,
+    port_from_u64, proxy_for_route, resource_id, route_backends_require_node_waypoint_authz,
     route_request_transformer_plugin_for_proxy, route_response_transformer_plugin_for_proxy,
     service_dns_name, string_array, string_field, upstream_for_route,
     upstream_for_route_with_session,
 };
+// Gateway API `PolicyStatus.ancestors` upper bound
+// (`+kubebuilder:validation:MaxItems=16`). It only constrains the status
+// writer; status owned by other controllers must not influence translation or
+// session-persistence projection.
+use super::backend_tls_policy::MAX_POLICY_ANCESTORS;
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{HashOnCookieConfig, PluginConfig, Proxy};
 
@@ -392,14 +396,18 @@ pub(super) fn translate(
 /// (Gateway API marks the field implementation-specific).
 const DEFAULT_SESSION_NAME: &str = "ferrum-session";
 
-/// Accepted/rejected BackendLB / XBackendTraffic policy attachment for a Service.
+/// Accepted BackendLB / XBackendTraffic policy attachment for a Service.
+///
+/// Only an accepted policy is recorded: an invalid one is refused by
+/// [`collect_backend_lb_policy`] and never reaches the accumulator, so a route
+/// whose backend Service carries only an invalid policy gets no Service-level
+/// session persistence.
 #[derive(Debug, Clone)]
 pub(crate) struct GatewayBackendSessionPolicy {
     pub resource: K8sResourceKey,
     pub creation_timestamp: Option<DateTime<Utc>>,
-    /// `Ok(None)` = policy accepted but carries no `sessionPersistence`.
-    /// `Err` = field-specific rejection reason.
-    pub session: Result<Option<GatewaySessionPersistence>, String>,
+    /// `None` = policy accepted but carries no `sessionPersistence`.
+    pub session: Option<GatewaySessionPersistence>,
 }
 
 fn backend_lb_policy_kinds(kind: &str) -> bool {
@@ -514,7 +522,7 @@ pub(super) fn collect_backend_lb_policy(
             .creation_timestamp
             .as_deref()
             .and_then(parse_k8s_timestamp),
-        session: Ok(session),
+        session,
     };
 
     // Remember the policy's FULL Service target set. Precedence below is
@@ -804,13 +812,9 @@ fn parse_gateway_api_duration_secs(
 ) -> Result<u64, K8sTranslateError> {
     // Diagnostics name the field and system cap only — never echo the operator
     // duration string (which may carry hostile/control content into status).
-    if !is_gateway_api_duration(raw) {
-        return Err(invalid_resource(
-            object,
-            format!("sessionPersistence.{field} is not a valid Gateway API duration"),
-        ));
-    }
-    let ms = parse_istio_duration_ms(raw).ok_or_else(|| {
+    // The CRD admits compound GEP-2257 durations such as `1h30m`, so use the
+    // multi-component parser shared with `timeouts` and `retry.backoff`.
+    let ms = parse_gateway_api_duration_ms(raw).ok_or_else(|| {
         invalid_resource(
             object,
             format!("sessionPersistence.{field} is not a valid Gateway API duration"),
@@ -833,40 +837,6 @@ fn parse_gateway_api_duration_secs(
         ));
     }
     Ok(secs)
-}
-
-/// Gateway API Duration is one to four integer+unit groups, each integer at
-/// most five digits, with units h/m/s/ms. This intentionally rejects the wider
-/// duration grammar accepted by the Istio parser (for example decimals).
-fn is_gateway_api_duration(raw: &str) -> bool {
-    let bytes = raw.as_bytes();
-    let mut offset = 0;
-    let mut groups = 0;
-    while offset < bytes.len() && groups < 4 {
-        let digits_start = offset;
-        while offset < bytes.len() && bytes[offset].is_ascii_digit() {
-            offset += 1;
-        }
-        let digits = offset - digits_start;
-        if !(1..=5).contains(&digits) {
-            return false;
-        }
-        if bytes
-            .get(offset..)
-            .is_some_and(|remainder| remainder.starts_with(b"ms"))
-        {
-            offset += 2;
-        } else if bytes
-            .get(offset)
-            .is_some_and(|unit| matches!(*unit, b'h' | b'm' | b's'))
-        {
-            offset += 1;
-        } else {
-            return false;
-        }
-        groups += 1;
-    }
-    offset == bytes.len() && groups > 0
 }
 
 fn resolve_rule_session_persistence(
@@ -902,35 +872,23 @@ fn resolve_rule_session_persistence(
         let Some(policy) = acc.gateway_api_backend_session_policies.get(key) else {
             continue;
         };
-        match &policy.session {
-            Ok(Some(session)) => {
-                if let Some((ref prior_key, ref existing)) = resolved {
-                    if existing != session {
-                        return Err(invalid_resource(
-                            object,
-                            format!(
-                                "backendRefs target Services with conflicting \
-                                 BackendLB/XBackendTraffic sessionPersistence \
-                                 (Service {:?}/{:?} vs Service {:?}/{:?})",
-                                prior_key.0, prior_key.1, key.0, key.1
-                            ),
-                        ));
-                    }
-                } else {
-                    resolved = Some((key.clone(), session.clone()));
-                }
-            }
-            Ok(None) => {}
-            Err(message) => {
+        let Some(session) = &policy.session else {
+            continue;
+        };
+        if let Some((ref prior_key, ref existing)) = resolved {
+            if existing != session {
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "backend Service {:?}/{:?} has rejected session policy \
-                         {:?}/{:?}: {message}",
-                        key.0, key.1, policy.resource.namespace, policy.resource.name
+                        "backendRefs target Services with conflicting \
+                         BackendLB/XBackendTraffic sessionPersistence \
+                         (Service {:?}/{:?} vs Service {:?}/{:?})",
+                        prior_key.0, prior_key.1, key.0, key.1
                     ),
                 ));
             }
+        } else {
+            resolved = Some((key.clone(), session.clone()));
         }
     }
     Ok(resolved.map(|(_, session)| scope_cookie_session_to_route(object, rule_index, session)))
@@ -969,14 +927,6 @@ fn scope_cookie_session_to_route(
 /// Fixed Accepted=False / Conflicted message for GEP-713 None-merge losers.
 /// Must not echo policy identity, Service names, or operator-authored values.
 const BACKEND_LB_POLICY_CONFLICTED_MESSAGE: &str = "Another BackendLBPolicy or XBackendTrafficPolicy already targets one or more of the same Services and merging is not supported";
-
-/// Gateway API `PolicyStatus.ancestors` upper bound (`+kubebuilder:validation:MaxItems=16`).
-///
-/// The spec forbids adding another entry when the shared list is full. This
-/// limit is only an output constraint for the status writer; status owned by
-/// other controllers must not influence translation or session-persistence
-/// projection.
-const POLICY_ANCESTOR_MAX_ITEMS: usize = 16;
 
 /// Policies that lose at least one Service target under the same GEP-713 None
 /// merge / oldest-wins precedence used by [`collect_backend_lb_policy`].
@@ -1021,7 +971,7 @@ pub(crate) fn backend_lb_policy_conflict_losers<'a>(
                     .creation_timestamp
                     .as_deref()
                     .and_then(parse_k8s_timestamp),
-                session: Ok(None),
+                session: None,
             },
             targets,
         ));
@@ -1253,7 +1203,7 @@ pub(crate) fn merge_backend_lb_policy_status(
         .unwrap_or_default();
 
     let mut emitted = vec![false; owned.len()];
-    let mut merged: Vec<Value> = Vec::with_capacity(POLICY_ANCESTOR_MAX_ITEMS);
+    let mut merged: Vec<Value> = Vec::with_capacity(MAX_POLICY_ANCESTORS);
     // Gateway API requires implementations to leave entries owned by other
     // controllers untouched. If the shared 16-entry list is full, an
     // implementation MUST NOT add another entry. Reserve capacity for every
@@ -1264,12 +1214,12 @@ pub(crate) fn merge_backend_lb_policy_status(
     let foreign_count = live
         .iter()
         .filter(|ancestor| !is_ferrum_policy_ancestor(ancestor))
-        .take(POLICY_ANCESTOR_MAX_ITEMS)
+        .take(MAX_POLICY_ANCESTORS)
         .count();
-    let mut owned_budget = POLICY_ANCESTOR_MAX_ITEMS.saturating_sub(foreign_count);
+    let mut owned_budget = MAX_POLICY_ANCESTORS.saturating_sub(foreign_count);
     for ancestor in live {
         if !is_ferrum_policy_ancestor(ancestor) {
-            if merged.len() < POLICY_ANCESTOR_MAX_ITEMS {
+            if merged.len() < MAX_POLICY_ANCESTORS {
                 merged.push(ancestor.clone());
             }
             continue;
@@ -1726,9 +1676,17 @@ fn listener_is_effective_tls_serving_claim(
 /// no effective claim, so they cannot poison a healthy physical slot.
 ///
 /// Refusals are order-independent: they are decided from the fully collected
-/// listener-policy set and complete namespace credential plan, and every
-/// physically competing effective claim is refused rather than guessing a
-/// winner. Canonical translation publishes this helper's conflicts in
+/// listener-policy set and complete namespace credential plan. The winner is
+/// never guessed from observation order; it follows Gateway API precedence
+/// (GEP-1713), extended across parents because the socket is shared
+/// (GHSA-496f-3547-p3fw): every Gateway's own listeners form the first tier,
+/// then each ListenerSet in the global oldest-`creationTimestamp`, then
+/// `{namespace}/{name}` order (`listenerset::listener_claim_precedence`). When
+/// the first tier holding a claim on the port is compatible with itself, only
+/// the later incompatible claims are refused, so a ListenerSet can never
+/// withdraw a Gateway's (or an older ListenerSet's) listener. When the first
+/// tier is itself incompatible — peer Gateways, or one owner's own listeners —
+/// every physically competing effective claim is refused. Canonical translation publishes this helper's conflicts in
 /// `K8sTranslation`; the status-only conflict context also runs it solely to
 /// keep route-conflict indexing aligned. Gateway listener status consumes the
 /// published physical and hostname conflict maps instead of independently
@@ -1744,8 +1702,9 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
     #[derive(Default)]
     struct PortClaims {
         plaintext: Vec<GatewayApiListenerKey>,
-        /// Materializable TLS listeners on this physical port.
-        effective_tls: Vec<GatewayApiListenerKey>,
+        /// Materializable TLS listeners on this physical port, with the
+        /// Gateway namespace whose serving slot each one competes for.
+        effective_tls: Vec<(GatewayApiListenerKey, String)>,
         /// Namespaces with an effective TLS serving claim on this port.
         effective_tls_namespaces: BTreeSet<String>,
         /// Distinct complete namespace credential sets used by those claims.
@@ -1789,7 +1748,10 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
             let claims = claims_by_port.entry(port).or_default();
             if policy.requires_frontend_tls {
                 if listener_is_effective_tls_serving_claim(key, policy, &plan) {
-                    claims.effective_tls.push(key.clone());
+                    claims.effective_tls.push((
+                        key.clone(),
+                        gateway_frontend_tls_slot_namespace(key, policy).to_string(),
+                    ));
                     claims
                         .effective_tls_namespaces
                         .insert(gateway_frontend_tls_slot_namespace(key, policy).to_string());
@@ -1818,46 +1780,126 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
             if !protocol_conflict && !credential_conflict {
                 continue;
             }
+            // Gateway API precedence (GEP-1713: the first listener in the
+            // precedence list MUST be accepted, later conflicting ones MUST be
+            // Conflicted), extended across parents because the socket is
+            // shared (GHSA-496f-3547-p3fw): every Gateway's own listeners are
+            // the first tier, then each ListenerSet in the global
+            // creation-time/name order. When the first tier holding a claim
+            // on this port is itself compatible, only the later incompatible
+            // claims are refused; a first tier that is itself incompatible
+            // (peer Gateways, or one owner's own listeners) withdraws every
+            // conflicting claim, as before.
+            //
             // Deterministic bounded wording: numeric port + fixed conflict
             // category only. Never join listener keys or echo namespace /
             // Gateway / ListenerSet / listener / hostname / credential strings
             // (cross-tenant disclosure on Gateway.status.listeners[]).
-            let (reason, refused_keys, message) = if protocol_conflict {
-                (
-                    "ProtocolConflict",
-                    claims
-                        .plaintext
-                        .iter()
-                        .chain(claims.effective_tls.iter())
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    format!(
-                        "Port \"{port}\" is claimed by both plaintext and an effective TLS-serving \
-                         frontend shape, so every conflicting claim on this port is refused \
-                         (Conflicted)."
-                    ),
-                )
+            let precedence = |key: &GatewayApiListenerKey| {
+                super::listenerset::listener_claim_precedence(&*acc, key)
+            };
+            let mut refuse = |key: &GatewayApiListenerKey, reason: &'static str, message: &str| {
+                refused.push((
+                    key.clone(),
+                    GatewayApiListenerConflict {
+                        reason,
+                        message: message.to_string(),
+                    },
+                ));
+            };
+            if protocol_conflict {
+                let first_tier = claims
+                    .plaintext
+                    .iter()
+                    .chain(claims.effective_tls.iter().map(|(key, _)| key))
+                    .map(precedence)
+                    .min()
+                    .unwrap_or(0);
+                let first_plaintext = claims
+                    .plaintext
+                    .iter()
+                    .any(|key| precedence(key) == first_tier);
+                let first_tls = claims
+                    .effective_tls
+                    .iter()
+                    .any(|(key, _)| precedence(key) == first_tier);
+                let precedence_message = format!(
+                    "Port \"{port}\" is already claimed by a higher-precedence listener with the \
+                     other frontend shape (plaintext vs effective TLS-serving), so this claim is \
+                     refused (Conflicted)."
+                );
+                match (first_plaintext, first_tls) {
+                    (true, false) => {
+                        warnings.push(precedence_message.clone());
+                        for (key, _) in &claims.effective_tls {
+                            refuse(key, "ProtocolConflict", precedence_message.as_str());
+                        }
+                    }
+                    (false, true) => {
+                        warnings.push(precedence_message.clone());
+                        for key in &claims.plaintext {
+                            refuse(key, "ProtocolConflict", precedence_message.as_str());
+                        }
+                    }
+                    _ => {
+                        let message = format!(
+                            "Port \"{port}\" is claimed by both plaintext and an effective \
+                             TLS-serving frontend shape, so every conflicting claim on this port \
+                             is refused (Conflicted)."
+                        );
+                        warnings.push(message.clone());
+                        for key in claims
+                            .plaintext
+                            .iter()
+                            .chain(claims.effective_tls.iter().map(|(key, _)| key))
+                        {
+                            refuse(key, "ProtocolConflict", message.as_str());
+                        }
+                    }
+                }
             } else {
-                (
-                    "HostnameConflict",
-                    claims.effective_tls,
-                    format!(
+                let credentials_for = |namespace: &str| {
+                    plan.serving_by_namespace_port
+                        .get(&(namespace.to_string(), port))
+                };
+                let first_tier = claims
+                    .effective_tls
+                    .iter()
+                    .map(|(key, _)| precedence(key))
+                    .min()
+                    .unwrap_or(0);
+                let first_tier_credentials: BTreeSet<Option<&BTreeSet<(String, String)>>> = claims
+                    .effective_tls
+                    .iter()
+                    .filter(|(key, _)| precedence(key) == first_tier)
+                    .map(|(_, namespace)| credentials_for(namespace.as_str()))
+                    .collect();
+                if first_tier_credentials.len() == 1
+                    && let Some(winner) = first_tier_credentials.into_iter().next()
+                {
+                    let message = format!(
+                        "Port \"{port}\" is already served by a higher-precedence listener with a \
+                         different effective TLS credential set, so this claim is refused \
+                         (Conflicted)."
+                    );
+                    warnings.push(message.clone());
+                    for (key, namespace) in &claims.effective_tls {
+                        if credentials_for(namespace.as_str()) != winner {
+                            refuse(key, "HostnameConflict", message.as_str());
+                        }
+                    }
+                } else {
+                    let message = format!(
                         "Port \"{port}\" has incompatible effective TLS credential sets across \
                          namespaces, so every conflicting claim on this port is refused \
                          (Conflicted)."
-                    ),
-                )
-            };
-            warnings.push(message.clone());
-            refused.extend(refused_keys.into_iter().map(|key| {
-                (
-                    key,
-                    GatewayApiListenerConflict {
-                        reason,
-                        message: message.clone(),
-                    },
-                )
-            }));
+                    );
+                    warnings.push(message.clone());
+                    for (key, _) in &claims.effective_tls {
+                        refuse(key, "HostnameConflict", message.as_str());
+                    }
+                }
+            }
         }
 
         if refused.is_empty() {
@@ -2706,10 +2748,6 @@ pub(crate) fn route_conflicts<'a>(
     conflicts
 }
 
-pub(crate) fn route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
-    route_conflict_keys_for_acc(object, None)
-}
-
 /// One HTTPRoute / GRPCRoute participating in cross-kind conflict resolution,
 /// carrying the conflict keys it claims across every parent reference plus the
 /// concrete Gateway listeners each `(parentRef, hostname)` claim resolved to.
@@ -3268,7 +3306,7 @@ fn route_conflict_key_set(object: &K8sObject, acc: Option<&K8sAccumulator>) -> R
                             parent_ref: parent_ref.clone(),
                             hostname: hostname.clone(),
                             listen_path: descriptor.listen_path.clone(),
-                            match_signature: route_conflict_match_signature(&descriptor),
+                            match_signature: descriptor.match_signature.clone(),
                             listener,
                             listen_port,
                         });
@@ -3300,10 +3338,6 @@ fn listener_policy_requires_tls(acc: &K8sAccumulator, key: &GatewayApiListenerKe
     acc.gateway_api_listener_policies
         .get(key)
         .is_some_and(|policy| policy.requires_frontend_tls)
-}
-
-fn route_conflict_match_signature(descriptor: &RouteMatchDescriptor) -> String {
-    descriptor.match_signature.clone()
 }
 
 fn upsert_http_route_resources(
@@ -4740,7 +4774,7 @@ pub(crate) fn parse_k8s_timestamp(value: &str) -> Option<DateTime<Utc>> {
         .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
-fn compare_creation_timestamps(
+pub(super) fn compare_creation_timestamps(
     left: &Option<DateTime<Utc>>,
     right: &Option<DateTime<Utc>>,
 ) -> Ordering {
@@ -4909,11 +4943,6 @@ fn ensure_route_parent_refs_allowed(
     }
 
     Ok(())
-}
-
-#[allow(dead_code)] // Kept for callers that need the narrower ListenerSet predicate.
-fn parent_ref_is_listenerset(parent_ref: &Value) -> bool {
-    parent_ref_listener_parent_kind(parent_ref) == Some(GatewayApiListenerParentKind::ListenerSet)
 }
 
 fn parent_ref_is_attachable_parent(parent_ref: &Value) -> bool {
@@ -5760,6 +5789,7 @@ fn ensure_http_route_features(object: &K8sObject) -> Result<(), K8sTranslateErro
                     ensure_url_rewrite_filter(object, rule, rule_index, &location, payload_object)?;
                 }
                 Some("RequestRedirect") => {
+                    ensure_request_redirect_target(object, &location, payload_object)?;
                     if let Some(path) = payload_object.get("path") {
                         let modifier = PathModifierFilter::RequestRedirect;
                         ensure_path_modifier(object, rule, rule_index, &location, modifier, path)?;
@@ -6043,6 +6073,10 @@ pub(crate) fn parse_gateway_api_duration_ms(value: &str) -> Option<u64> {
 /// destination when it is constructed, so admitting it here would emit a
 /// plugin config that fails the whole plugin-cache build instead of refusing
 /// this one route. `remove` stays allowed: the client value is already gone.
+/// The router's `x-path-param-*` route-capture namespace
+/// ([`crate::proxy::headers::is_path_param_assertion_header`], same folding)
+/// is refused for the same reason: `mesh_route_dispatch` refuses it at
+/// construction too.
 ///
 /// Response-side `set` / `add` / `remove` also refuse the gRPC terminal status
 /// fields ([`GRPC_TERMINAL_STATUS_FIELDS`]). In a Trailers-Only response —
@@ -6105,6 +6139,14 @@ fn ensure_header_modifier_filter(
                     object,
                     format!(
                         "{where_}.name {UNSUPPORTED_SHAPE_MARKER}: the `x-consumer-*` request-header namespace is gateway-owned consumer assertion metadata and cannot be set by a route filter"
+                    ),
+                ));
+            }
+            if !response_side && crate::proxy::headers::is_path_param_assertion_header(name) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "{where_}.name {UNSUPPORTED_SHAPE_MARKER}: the `x-path-param-*` request-header namespace carries the router's path captures and cannot be set by a route filter"
                     ),
                 ));
             }
@@ -6234,6 +6276,49 @@ fn ensure_url_rewrite_filter(
     };
     let modifier = PathModifierFilter::UrlRewrite;
     ensure_path_modifier(object, rule, rule_index, location, modifier, path)
+}
+
+/// Validate the `scheme` and `hostname` of one admitted `RequestRedirect`
+/// before any rule materializes.
+///
+/// Upstream's CRD restricts `scheme` to the `http` / `https` enum and
+/// `hostname` to a `PreciseHostname`; both are copied into the route's
+/// `mesh_route_dispatch` redirect. The plugin rejects a bad value only at
+/// construction, where it would fail the whole plugin-cache build rather than
+/// this one route, so Ferrum refuses the route here (`Invalid`), exactly as
+/// `ensure_url_rewrite_filter` does for `urlRewrite.hostname`. A file/CP-delivered
+/// object never passed through the API server's validation.
+fn ensure_request_redirect_target(
+    object: &K8sObject,
+    location: &str,
+    redirect: &serde_json::Map<String, Value>,
+) -> Result<(), K8sTranslateError> {
+    if let Some(scheme) = redirect.get("scheme")
+        && !matches!(scheme.as_str(), Some("http" | "https"))
+    {
+        return Err(invalid_resource(
+            object,
+            format!("{location}.requestRedirect.scheme must be `http` or `https`"),
+        ));
+    }
+    if let Some(hostname) = redirect.get("hostname") {
+        let hostname = hostname.as_str().filter(|value| !value.is_empty());
+        let Some(hostname) = hostname else {
+            return Err(invalid_resource(
+                object,
+                format!("{location}.requestRedirect.hostname must be a non-empty string"),
+            ));
+        };
+        if !is_precise_gateway_hostname(hostname) {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{location}.requestRedirect.hostname must be a precise hostname without a wildcard or port"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The filter carrying an `HTTPPathModifier`: `URLRewrite` rebases the path
@@ -6454,7 +6539,6 @@ fn http_route_resources(
         .into_iter()
         .flat_map(|conflicts| conflicts.iter().map(|conflict| conflict.key.clone()))
         .collect();
-    let route_kind = object.kind.to_ascii_lowercase();
     warn_unrepresentable_grpc_route_matches(object, acc);
     let mut proxies = Vec::new();
     let mut plugins = Vec::new();
@@ -6637,7 +6721,7 @@ fn http_route_resources(
                 let requires_node_waypoint_authz =
                     route_backends_require_node_waypoint_authz(&backend_resolution.backends);
                 let route_suffix = route_scoped_suffix(
-                    &route_kind,
+                    &route_family,
                     rule_index,
                     None,
                     route_namespace_suffix.as_deref(),
@@ -6717,7 +6801,7 @@ fn http_route_resources(
                     acc.upsert_upstream(upstream);
                 }
                 let suffix = route_scoped_suffix(
-                    &route_kind,
+                    &route_family,
                     rule_index,
                     (match_count > 1).then_some(match_index),
                     route_namespace_suffix.as_deref(),
@@ -6802,66 +6886,64 @@ fn http_route_resources(
                         backend_read_timeout_ms: None,
                     });
 
-                    if matches!(object.kind.as_str(), "HTTPRoute" | "GRPCRoute") {
-                        let skipped_descriptors = skipped_descriptors_for_host(
-                            &host_scope.parent_refs,
-                            &route_family,
-                            &host_scope.conflict_hostname,
-                            host_scope.listener.as_ref(),
-                            &descriptors_for_path,
-                            &losing_conflict_keys,
-                        );
-                        let (rules, has_path_only_match) = http_route_dispatch_rules_for_proxy(
-                            object,
-                            rule,
-                            rule_index,
-                            Some(listen_path.as_str()),
-                            MeshRouteDispatchDestination {
-                                backend_host: backend_host.as_str(),
-                                backend_port,
-                                upstream_id: upstream_id.as_deref(),
-                                requires_node_waypoint_authz,
-                            },
-                            &skipped_descriptors,
-                            &entry_descriptors_for_path,
-                            rule_actions,
-                        );
-                        let rules_have_request_transform =
-                            dispatch_rules_carry_field(&rules, "request_transform");
-                        let rules_have_response_transform =
-                            dispatch_rules_carry_field(&rules, "response_transform");
-                        if let Some(mut plugin) = mesh_route_dispatch_plugin_from_rules(
-                            &proxy_id,
-                            config_namespace,
-                            rules,
-                            !has_path_only_match,
-                        ) {
-                            sort_dispatch_rules(&mut plugin);
-                            let mut route_plugins = Vec::new();
-                            if rules_have_request_transform {
-                                route_plugins.push(route_request_transformer_plugin_for_proxy(
-                                    &proxy_id,
-                                    config_namespace,
-                                ));
-                            }
-                            // The dispatch plugin publishes per-rule response
-                            // transforms onto the request context; without a
-                            // `response_transformer` on this proxy nothing would
-                            // consume them. The emitted instance carries no
-                            // static rules of its own, so a same-name GLOBAL
-                            // transformer keeps running its rules and the route
-                            // transform is applied once in the authoritative
-                            // route-header final phase.
-                            if rules_have_response_transform {
-                                route_plugins.push(route_response_transformer_plugin_for_proxy(
-                                    &proxy_id,
-                                    config_namespace,
-                                ));
-                            }
-                            route_plugins.push(plugin);
-                            attach_route_plugins_to_proxy(&mut proxy, &route_plugins);
-                            plugins.extend(route_plugins);
+                    let skipped_descriptors = skipped_descriptors_for_host(
+                        &host_scope.parent_refs,
+                        &route_family,
+                        &host_scope.conflict_hostname,
+                        host_scope.listener.as_ref(),
+                        &descriptors_for_path,
+                        &losing_conflict_keys,
+                    );
+                    let (rules, has_path_only_match) = http_route_dispatch_rules_for_proxy(
+                        object,
+                        rule,
+                        rule_index,
+                        Some(listen_path.as_str()),
+                        MeshRouteDispatchDestination {
+                            backend_host: backend_host.as_str(),
+                            backend_port,
+                            upstream_id: upstream_id.as_deref(),
+                            requires_node_waypoint_authz,
+                        },
+                        &skipped_descriptors,
+                        &entry_descriptors_for_path,
+                        rule_actions,
+                    );
+                    let rules_have_request_transform =
+                        dispatch_rules_carry_field(&rules, "request_transform");
+                    let rules_have_response_transform =
+                        dispatch_rules_carry_field(&rules, "response_transform");
+                    if let Some(mut plugin) = mesh_route_dispatch_plugin_from_rules(
+                        &proxy_id,
+                        config_namespace,
+                        rules,
+                        !has_path_only_match,
+                    ) {
+                        sort_dispatch_rules(&mut plugin);
+                        let mut route_plugins = Vec::new();
+                        if rules_have_request_transform {
+                            route_plugins.push(route_request_transformer_plugin_for_proxy(
+                                &proxy_id,
+                                config_namespace,
+                            ));
                         }
+                        // The dispatch plugin publishes per-rule response
+                        // transforms onto the request context; without a
+                        // `response_transformer` on this proxy nothing would
+                        // consume them. The emitted instance carries no
+                        // static rules of its own, so a same-name GLOBAL
+                        // transformer keeps running its rules and the route
+                        // transform is applied once in the authoritative
+                        // route-header final phase.
+                        if rules_have_response_transform {
+                            route_plugins.push(route_response_transformer_plugin_for_proxy(
+                                &proxy_id,
+                                config_namespace,
+                            ));
+                        }
+                        route_plugins.push(plugin);
+                        attach_route_plugins_to_proxy(&mut proxy, &route_plugins);
+                        plugins.extend(route_plugins);
                     }
 
                     proxies.push(proxy);
@@ -7113,7 +7195,7 @@ fn descriptor_conflicts_for_host(
     if parent_refs.is_empty() || losing_conflict_keys.is_empty() {
         return false;
     }
-    let match_signature = route_conflict_match_signature(descriptor);
+    let match_signature = descriptor.match_signature.clone();
     parent_refs.iter().all(|parent_ref| {
         losing_conflict_keys.iter().any(|key| {
             key.listener.as_ref() == listener
@@ -8145,7 +8227,7 @@ fn route_backends(
         .into_iter()
         .flatten()
     {
-        let weight = backend_weight(object, backend_ref)?;
+        let weight = gateway_backend_weight(object, backend_ref)?;
         if weight == 0 {
             skipped_zero += 1;
             continue;
@@ -8258,7 +8340,8 @@ fn route_backends(
     })
 }
 
-fn flatten_route_backend_groups(groups: Vec<RouteBackendGroup>) -> Vec<RouteBackend> {
+fn flatten_route_backend_groups(mut groups: Vec<RouteBackendGroup>) -> Vec<RouteBackend> {
+    normalize_backend_group_weights_to_target_limit(&mut groups);
     let has_expanded_endpoint_group = groups.iter().any(|group| group.expanded_endpoints);
     if !has_expanded_endpoint_group {
         return groups
@@ -8310,6 +8393,32 @@ fn distributed_backend_weight(total_weight: u32, count: usize, index: usize) -> 
     base + u32::from(u32::try_from(index).is_ok_and(|idx| idx < remainder))
 }
 
+/// Scale every backendRef group's declared weight proportionally so the
+/// largest fits Ferrum's [`MAX_TARGET_WEIGHT`].
+///
+/// Gateway API accepts `BackendRef.weight` up to 1,000,000
+/// ([`gateway_backend_weight`]); a single-target group carries its declared
+/// weight on its one backend, so that backend is rescaled with the group.
+/// Expanded EndpointSlice groups redistribute `total_weight` afterwards.
+fn normalize_backend_group_weights_to_target_limit(groups: &mut [RouteBackendGroup]) {
+    let max_weight = groups
+        .iter()
+        .map(|group| group.total_weight)
+        .max()
+        .unwrap_or(0);
+    if max_weight <= MAX_TARGET_WEIGHT {
+        return;
+    }
+    for group in groups {
+        group.total_weight = proportional_target_weight(group.total_weight, max_weight);
+        if !group.expanded_endpoints {
+            for backend in &mut group.backends {
+                backend.weight = group.total_weight;
+            }
+        }
+    }
+}
+
 fn normalize_backend_weights_to_target_limit(backends: &mut [RouteBackend]) {
     let max_weight = backends
         .iter()
@@ -8320,14 +8429,19 @@ fn normalize_backend_weights_to_target_limit(backends: &mut [RouteBackend]) {
         return;
     }
     for backend in backends {
-        if backend.weight == 0 {
-            continue;
-        }
-        let normalized = (u64::from(backend.weight) * u64::from(MAX_TARGET_WEIGHT)
-            / u64::from(max_weight))
-        .max(1);
-        backend.weight = u32::try_from(normalized).unwrap_or(MAX_TARGET_WEIGHT);
+        backend.weight = proportional_target_weight(backend.weight, max_weight);
     }
+}
+
+/// `weight * MAX_TARGET_WEIGHT / max_weight`, keeping a non-zero weight at
+/// least `1` so normalization never withdraws a selectable leg.
+fn proportional_target_weight(weight: u32, max_weight: u32) -> u32 {
+    if weight == 0 || max_weight == 0 {
+        return weight;
+    }
+    let normalized =
+        (u64::from(weight) * u64::from(MAX_TARGET_WEIGHT) / u64::from(max_weight)).max(1);
+    u32::try_from(normalized).unwrap_or(MAX_TARGET_WEIGHT)
 }
 
 fn error_is_backend_ref_resolution(error: &K8sTranslateError) -> bool {
@@ -8358,26 +8472,19 @@ fn backend_ref_resolution_reason(error: &K8sTranslateError) -> BackendRefFaultRe
     }
 }
 
-fn backend_weight(object: &K8sObject, backend_ref: &Value) -> Result<u32, K8sTranslateError> {
-    optional_target_weight_field(object, backend_ref, "backendRefs[].weight", 1)
-}
-
 fn l4_route_proxies(
     object: &K8sObject,
     acc: &mut K8sAccumulator,
     scheme: BackendScheme,
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
-    // Cross-namespace TCPRoute/TLSRoute parentRefs use the same listener
-    // AllowedRoutes gates as HTTPRoute/GRPCRoute. ReferenceGrant authorizes
-    // backendRefs only, not parentRefs. UDPRoute keeps its stricter
-    // same-namespace parent contract.
+    // Cross-namespace TCPRoute/TLSRoute/UDPRoute parentRefs use the same
+    // listener AllowedRoutes gates as HTTPRoute/GRPCRoute. ReferenceGrant
+    // authorizes backendRefs only, not parentRefs. Every authorized parent
+    // materializes in its Gateway's namespace, which owns the listener.
     ensure_route_parent_refs_allowed(object, acc)?;
-    if scheme.is_udp() {
-        ensure_l4_parent_refs_are_same_namespace(object)?;
-    }
 
     let config_namespaces = if scheme.is_udp() {
-        vec![object.metadata.namespace.clone()]
+        udp_route_materialization_namespaces(object, acc)
     } else {
         route_materialization_namespaces(object, acc)
     };
@@ -8417,7 +8524,8 @@ fn l4_route_proxies_for_namespace(
     // `TCPRoute`/`TLSRoute` keep the shared binding resolver, which is where
     // TLS SNI is bounded by the listener hostname.
     let (materialized_listener_bindings, materialized_parent_refs) = if scheme.is_udp() {
-        let (ports, parent_refs) = udp_route_surviving_materialization(object, acc);
+        let (ports, parent_refs) =
+            udp_route_surviving_materialization(object, acc, config_namespace);
         (
             ports
                 .into_iter()
@@ -8506,7 +8614,7 @@ fn l4_route_proxies_for_namespace(
         } else {
             materialized_listener_bindings.clone()
         };
-        let rule_suffix = l4_rule_suffix(scheme, rule_index);
+        let rule_suffix = l4_rule_suffix(&object.kind, rule_index);
 
         // One leg dispatches directly; a set of legs becomes one namespaced
         // upstream whose weighted targets preserve the declared relative
@@ -8520,15 +8628,50 @@ fn l4_route_proxies_for_namespace(
             };
             (backend.host, backend.port, None)
         } else {
-            let upstream_id = resource_id(
-                "gwapi-l4-upstream",
-                &object.metadata.namespace,
-                &object.metadata.name,
-                &rule_suffix,
-            );
+            // The upstream lives beside the proxies that reference it: in the
+            // parent Gateway's namespace, under the same source-bound id rule
+            // as the proxy when that is not the route's own namespace.
+            let upstream_id = if config_namespace == object.metadata.namespace {
+                resource_id(
+                    "gwapi-l4-upstream",
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &rule_suffix,
+                )
+            } else {
+                gateway_api_source_bound_id(
+                    "gwapi-l4-upstream",
+                    &object.kind,
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &rule_suffix,
+                    0,
+                )
+            };
+            // A second route object deriving this key must not replace the
+            // owner's weighted backend set.
+            if let Some(key) = namespaced_resource_key(config_namespace, upstream_id.as_str())
+                && !acc.claim_gateway_api_route_upstream(&key, object)
+            {
+                acc.warnings.push(format!(
+                    "{} {:?}/{:?} rule {rule_index} is refused: another route object already \
+                     derived upstream id {:?} in namespace {:?}",
+                    object.kind,
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    upstream_id,
+                    config_namespace
+                ));
+                acc.record_gateway_api_refused_route_claims(
+                    object,
+                    &materialized_parent_refs,
+                    None,
+                );
+                continue;
+            }
             acc.upsert_upstream(upstream_for_route(
                 upstream_id.clone(),
-                object.metadata.namespace.clone(),
+                config_namespace.to_string(),
                 resolved.backends,
             ));
             (String::new(), 0, Some(upstream_id))
@@ -8561,6 +8704,27 @@ fn l4_route_proxies_for_namespace(
                     &suffix,
                 )
             };
+            // A second route object deriving this key must not replace the
+            // owner's proxy (`upsert_proxy` would, silently).
+            if let Some(key) = namespaced_resource_key(config_namespace, id.as_str())
+                && !acc.claim_gateway_api_route_proxy(&key, object)
+            {
+                acc.warnings.push(format!(
+                    "{} {:?}/{:?} is refused on this listener: another route object already \
+                     derived proxy id {:?} in namespace {:?}",
+                    object.kind,
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    id,
+                    config_namespace
+                ));
+                acc.record_gateway_api_refused_route_claims(
+                    object,
+                    &materialized_parent_refs,
+                    None,
+                );
+                continue;
+            }
             proxies.push({
                 let mut proxy = proxy_for_route(RouteProxySpec {
                     id,
@@ -8689,16 +8853,42 @@ pub(crate) fn udp_route_surviving_listener_claims(
         .collect()
 }
 
-/// UDP listener ports and parentRefs that survive same-listener conflict loss.
+/// Namespaces a UDPRoute materializes in: the namespace of every Gateway
+/// whose listener the route still owns after conflict arbitration (the
+/// Gateway's namespace owns the stream listener, as for TCPRoute/TLSRoute).
+///
+/// A route that owns no listener anywhere falls back to its own namespace so
+/// the rule backends are still validated and the fail-closed "no listener was
+/// opened" diagnostics are still emitted exactly once.
+fn udp_route_materialization_namespaces(object: &K8sObject, acc: &K8sAccumulator) -> Vec<String> {
+    let mut namespaces: Vec<String> = udp_route_surviving_listener_claims(object, acc)
+        .into_iter()
+        .map(|claim| claim.listener.namespace)
+        .collect();
+    namespaces.sort();
+    namespaces.dedup();
+    if namespaces.is_empty() {
+        namespaces.push(object.metadata.namespace.clone());
+    }
+    namespaces
+}
+
+/// UDP listener ports and parentRefs in `config_namespace` that survive
+/// same-listener conflict loss.
 ///
 /// ParentRefs that retain at least one surviving listener are recorded as
 /// materialized so status `Programmed` tracks live ownership. Distinct
-/// Gateways/listeners that share a numeric port collapse to one physical proxy.
+/// Gateways/listeners in one namespace that share a numeric port collapse to
+/// one physical proxy.
 fn udp_route_surviving_materialization(
     object: &K8sObject,
     acc: &K8sAccumulator,
+    config_namespace: &str,
 ) -> (Vec<u16>, Vec<String>) {
-    let claims = udp_route_surviving_listener_claims(object, acc);
+    let claims: Vec<UdpListenerClaim> = udp_route_surviving_listener_claims(object, acc)
+        .into_iter()
+        .filter(|claim| claim.listener.namespace == config_namespace)
+        .collect();
     let mut ports: Vec<u16> = claims.iter().map(|claim| claim.port).collect();
     let mut parent_refs: Vec<String> = claims.into_iter().map(|claim| claim.parent_ref).collect();
     ports.sort();
@@ -8737,18 +8927,15 @@ fn l4_route_declares_parent_ref(object: &K8sObject) -> bool {
     object.spec.get("parentRefs").is_some()
 }
 
-/// Proxy/upstream id suffix for one L4 rule.
+/// Proxy/upstream id suffix for one L4 rule: `{kind}-{rule index}`
+/// (`tcproute-0`, `tlsroute-0`, `udproute-0`).
 ///
-/// `UDPRoute` ids are kind-scoped. The historical L4 id encodes only
-/// `(namespace, route name, rule index)`, so a `UDPRoute` and a same-named
-/// `TCPRoute` in one namespace would upsert over each other's proxy. Existing
-/// `TCPRoute`/`TLSRoute` ids stay byte-identical.
-fn l4_rule_suffix(scheme: BackendScheme, rule_index: usize) -> String {
-    if scheme.is_udp() {
-        format!("udproute-{rule_index}")
-    } else {
-        rule_index.to_string()
-    }
+/// Every L4 route kind shares the `gwapi-l4` id space and one namespace's
+/// proxy/upstream keyspace, so the suffix carries the route kind: a
+/// `TCPRoute`, `TLSRoute` and `UDPRoute` with the same name in one namespace
+/// must derive distinct ids, or one would upsert over another's proxy.
+fn l4_rule_suffix(route_kind: &str, rule_index: usize) -> String {
+    format!("{}-{rule_index}", route_kind.to_ascii_lowercase())
 }
 
 /// Gateway API v1.5.1 bounds `UDPRouteSpec.rules` and `UDPRouteRule.backendRefs`
@@ -8758,7 +8945,7 @@ fn l4_rule_suffix(scheme: BackendScheme, rule_index: usize) -> String {
 const MAX_UDP_ROUTE_RULES: usize = 16;
 const MAX_UDP_ROUTE_BACKEND_REFS: usize = 16;
 /// Gateway API v1.5.1 `BackendRef.weight` upper bound. Ferrum stores target
-/// weights under [`MAX_TARGET_WEIGHT`], so accepted UDPRoute weights are
+/// weights under [`MAX_TARGET_WEIGHT`], so accepted route weights are
 /// normalized proportionally after the whole backend set is resolved.
 const GATEWAY_API_MAX_BACKEND_WEIGHT: u64 = 1_000_000;
 
@@ -8999,7 +9186,7 @@ fn udp_rule_backends(
         // Gateway API permits 0..=1,000,000. Parse that public boundary here;
         // the complete set is normalized below to Ferrum's smaller target
         // weight representation without changing relative proportions.
-        let weight = udp_backend_weight(object, backend_ref)?;
+        let weight = gateway_backend_weight(object, backend_ref)?;
         // Zero weight disables selection; it does not waive the BackendRef
         // boundary. Validate the target identity, supported kind, namespace,
         // and ReferenceGrant before filtering so an ignored leg cannot hide
@@ -9086,13 +9273,18 @@ fn udp_rule_backends(
     }))
 }
 
-/// Parse the Gateway API `BackendRef.weight` contract for UDPRoute.
+/// Parse the Gateway API `BackendRef.weight` contract for every route kind.
 ///
 /// The shared Ferrum target parser intentionally caps weights at 65,535, but
 /// Gateway API's public schema accepts values through 1,000,000. Rejecting the
-/// upper part of that range would make a CRD-valid UDPRoute inert. The caller
-/// normalizes the resolved set proportionally before it reaches an Upstream.
-fn udp_backend_weight(object: &K8sObject, backend_ref: &Value) -> Result<u32, K8sTranslateError> {
+/// upper part of that range would make a CRD-valid route inert. Callers
+/// normalize the resolved set proportionally before it reaches an Upstream
+/// (`flatten_route_backend_groups`, `udp_rule_backends`); TCPRoute/TLSRoute
+/// only use the weight to skip `weight: 0` legs.
+fn gateway_backend_weight(
+    object: &K8sObject,
+    backend_ref: &Value,
+) -> Result<u32, K8sTranslateError> {
     let Some(value) = backend_ref.get("weight") else {
         return Ok(1);
     };
@@ -9133,30 +9325,6 @@ fn l4_route_hosts(
         ));
     }
     Ok(string_array(&object.spec, "hostnames"))
-}
-
-fn ensure_l4_parent_refs_are_same_namespace(object: &K8sObject) -> Result<(), K8sTranslateError> {
-    let Some(parent_refs) = object.spec.get("parentRefs").and_then(Value::as_array) else {
-        return Ok(());
-    };
-    for parent_ref in parent_refs {
-        let group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
-        let kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
-        if group == "gateway.networking.k8s.io" && matches!(kind, "Gateway" | "ListenerSet") {
-            let parent_namespace =
-                string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
-            if parent_namespace != object.metadata.namespace {
-                return Err(invalid_resource(
-                    object,
-                    format!(
-                        "{} cross-namespace parentRefs are not supported by Ferrum yet",
-                        object.kind
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// [`super::backend_ref::checked_backend_namespace`] plus the structured
@@ -9218,7 +9386,7 @@ fn first_backend_ref<'a>(
     let mut selected_backend = None;
     let mut skipped_zero = 0usize;
     for backend_ref in backend_refs {
-        let weight = backend_weight(object, backend_ref)?;
+        let weight = gateway_backend_weight(object, backend_ref)?;
         if weight > 0 {
             selected_backend.get_or_insert(backend_ref);
         } else {
@@ -9254,12 +9422,19 @@ fn http_path_match(path: &Value) -> Option<String> {
     }
 }
 
+/// Mesh-service port protocol for a Gateway/ListenerSet listener `protocol`.
+///
+/// `GRPCS` terminates frontend TLS exactly like `HTTPS`, so both classify as
+/// `Tls`. `UDP` is its own L4 transport (`AppProtocol::Udp`), as in the
+/// Service and ServiceEntry mappers: `Unknown` is the HTTP-family catch-all and
+/// would route a datagram listener into HTTP materialization.
 fn app_protocol(value: Option<&str>) -> AppProtocol {
     match value.unwrap_or_default().to_ascii_lowercase().as_str() {
         "http" => AppProtocol::Http,
-        "https" | "tls" => AppProtocol::Tls,
+        "https" | "grpcs" | "tls" => AppProtocol::Tls,
         "grpc" => AppProtocol::Grpc,
         "tcp" => AppProtocol::Tcp,
+        "udp" => AppProtocol::Udp,
         _ => AppProtocol::Unknown,
     }
 }
@@ -15984,23 +16159,84 @@ mod tests {
     }
 
     #[test]
-    fn http_route_rejects_backend_weight_above_ferrum_limit() {
-        let err = translate_k8s_objects(
+    fn http_route_normalizes_gateway_api_weights_above_ferrum_target_limit() {
+        // Gateway API accepts BackendRef.weight through 1,000,000; Ferrum
+        // targets cap at MAX_TARGET_WEIGHT, so the set is scaled
+        // proportionally instead of the CRD-valid route being refused.
+        let result = translate_k8s_objects(
             &[object(
                 "HTTPRoute",
                 serde_json::json!({
                     "rules": [{
-                        "backendRefs": [{"name": "api", "port": 8080, "weight": 65536}]
+                        "backendRefs": [
+                            {"name": "api-v1", "port": 8080, "weight": 1_000_000},
+                            {"name": "api-v2", "port": 8081, "weight": 250_000}
+                        ]
                     }]
                 }),
             )],
             options(),
         )
-        .expect_err("oversized backend weight should fail translation");
+        .expect("CRD-valid backend weights should translate");
+
+        assert_eq!(result.config.upstreams.len(), 1);
+        let targets = &result.config.upstreams[0].targets;
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].weight, MAX_TARGET_WEIGHT);
+        assert_eq!(targets[1].weight, MAX_TARGET_WEIGHT / 4);
+    }
+
+    #[test]
+    fn listener_app_protocol_classifies_every_listener_protocol() {
+        assert_eq!(listener_app_protocol(Some("HTTP")), AppProtocol::Http);
+        assert_eq!(listener_app_protocol(Some("HTTPS")), AppProtocol::Tls);
+        assert_eq!(listener_app_protocol(Some("GRPCS")), AppProtocol::Tls);
+        assert_eq!(listener_app_protocol(Some("TLS")), AppProtocol::Tls);
+        assert_eq!(listener_app_protocol(Some("GRPC")), AppProtocol::Grpc);
+        assert_eq!(listener_app_protocol(Some("TCP")), AppProtocol::Tcp);
+        assert_eq!(listener_app_protocol(Some("UDP")), AppProtocol::Udp);
+        assert_eq!(
+            listener_app_protocol(Some("example.com/custom")),
+            AppProtocol::Unknown
+        );
+    }
+
+    #[test]
+    fn tcp_route_accepts_gateway_api_weight_ceiling() {
+        let result = translate_k8s_objects(
+            &[object(
+                "TCPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [{"name": "db", "port": 5432, "weight": 1_000_000}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("CRD-valid TCPRoute weight should translate");
+
+        assert_eq!(result.config.proxies.len(), 1);
+    }
+
+    #[test]
+    fn http_route_rejects_backend_weight_above_gateway_api_limit() {
+        let err = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [{"name": "api", "port": 8080, "weight": 1_000_001}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("backend weight above the Gateway API bound should fail translation");
 
         assert!(
             err.to_string()
-                .contains("weight must be between 0 and 65535")
+                .contains("weight must be between 0 and 1000000")
         );
     }
 
@@ -16026,7 +16262,7 @@ mod tests {
 
             assert!(
                 err.to_string()
-                    .contains("weight must be between 0 and 65535")
+                    .contains("weight must be between 0 and 1000000")
             );
         }
     }
@@ -17129,12 +17365,36 @@ mod tests {
 
     #[test]
     fn gateway_api_duration_parser_rejects_wider_istio_grammar() {
-        assert!(is_gateway_api_duration("1h2m3s4ms"));
-        assert!(is_gateway_api_duration("0s"));
-        assert!(!is_gateway_api_duration("1.5s"));
-        assert!(!is_gateway_api_duration("123456s"));
-        assert!(!is_gateway_api_duration("1s2s3s4s5s"));
-        assert!(!is_gateway_api_duration(""));
+        assert_eq!(parse_gateway_api_duration_ms("1h2m3s4ms"), Some(3_723_004));
+        assert_eq!(parse_gateway_api_duration_ms("0s"), Some(0));
+        assert_eq!(parse_gateway_api_duration_ms("1.5s"), None);
+        assert_eq!(parse_gateway_api_duration_ms("123456s"), None);
+        assert_eq!(parse_gateway_api_duration_ms("1s2s3s4s5s"), None);
+        assert_eq!(parse_gateway_api_duration_ms(""), None);
+    }
+
+    #[test]
+    fn permanent_cookie_accepts_compound_absolute_timeout() {
+        let policy = x_backend_traffic_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "perm",
+                    "type": "Cookie",
+                    "absoluteTimeout": "1h30m",
+                    "cookieConfig": {"lifetimeType": "Permanent"}
+                }
+            }),
+        );
+        let result = translate_k8s_objects(&[policy, http_route_to_service("api")], options())
+            .expect("a CRD-valid compound absoluteTimeout should translate");
+        let cookie = result.config.upstreams[0]
+            .hash_on_cookie_config
+            .as_ref()
+            .expect("cookie config");
+        assert!(!cookie.session_cookie);
+        assert_eq!(cookie.ttl_seconds, 5400);
     }
 
     #[test]
@@ -17511,7 +17771,7 @@ mod tests {
                 "sessionPersistence": {"type": "Cookie", "sessionName": "lb-affinity"}
             }),
         );
-        let foreign = (0..super::POLICY_ANCESTOR_MAX_ITEMS)
+        let foreign = (0..super::MAX_POLICY_ANCESTORS)
             .map(|index| {
                 serde_json::json!({
                     "ancestorRef": {
@@ -17531,7 +17791,7 @@ mod tests {
         let ancestors = status["ancestors"].as_array().expect("ancestors array");
         assert_eq!(
             ancestors.len(),
-            super::POLICY_ANCESTOR_MAX_ITEMS,
+            super::MAX_POLICY_ANCESTORS,
             "Ferrum must never write a seventeenth status ancestor"
         );
         assert!(

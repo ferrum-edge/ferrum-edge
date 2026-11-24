@@ -14,6 +14,12 @@
 //! Run with: cargo test --test unit_tests [filter]
 //! (or `cargo test unit::plugins::cors_tests` to search every target)
 
+// Process-wide tracing interest floor shared by every thread-local log
+// capture in this binary (see tests/support/diagnostic_interest.rs).
+#[allow(dead_code, unused_imports, unused_macros)]
+#[path = "support/diagnostic_interest.rs"]
+pub(crate) mod diagnostic_test_interest;
+
 #[path = "common/isolated_audit_fallback.rs"]
 mod isolated_audit_fallback;
 pub use isolated_audit_fallback::isolated_audit_fallback_dir;

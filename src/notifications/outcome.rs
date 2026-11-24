@@ -209,16 +209,6 @@ pub fn classify_http_status(status: StatusCode) -> FailureClass {
     FailureClass::Transient
 }
 
-/// Classify a reqwest transport error (no HTTP status obtained).
-pub fn classify_transport_error(error: &reqwest::Error) -> FailureClass {
-    if error.is_timeout() || error.is_connect() || error.is_request() || error.is_body() {
-        return FailureClass::Transient;
-    }
-    // Status-bearing reqwest errors are unusual on our path (we read status
-    // ourselves); fall through to transient so we do not permanently drop.
-    FailureClass::Transient
-}
-
 /// Classify an SMTP channel failure.
 pub fn classify_smtp_failure(failure: &super::channels::email::SmtpFailure) -> FailureClass {
     use super::channels::email::SmtpFailure;

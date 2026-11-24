@@ -240,6 +240,7 @@ fn http_summary(request_id: &str, consumer: &str) -> TransactionSummary {
         timestamp_received: "2026-05-23T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: Some(consumer.to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/it".to_string(),
@@ -261,12 +262,13 @@ fn http_summary(request_id: &str, consumer: &str) -> TransactionSummary {
         error_class: None,
         body_error_class: None,
         body_completed: true,
+        response_delivery: Default::default(),
         bytes_sent: 32,
         bytes_received: 64,
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -305,6 +307,7 @@ fn stream_summary(consumer: &str) -> StreamTransactionSummary {
         proxy_name: Some("Integration Proxy".to_string()),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: Some(consumer.to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         backend_target: "10.0.0.50:5432".to_string(),
         backend_resolved_ip: Some("10.0.0.50".to_string()),
@@ -320,7 +323,7 @@ fn stream_summary(consumer: &str) -> StreamTransactionSummary {
         timestamp_connected: "2026-05-23T00:00:00Z".to_string(),
         timestamp_disconnected: "2026-05-23T00:00:01Z".to_string(),
         sni_hostname: None,
-        metadata,
+        metadata: metadata.into_iter().collect(),
     }
 }
 

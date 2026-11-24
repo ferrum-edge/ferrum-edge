@@ -8,7 +8,7 @@
 
 use ferrum_edge::tls::acme::{
     AcmeAccountStore, AcmeCertificateRecord, AcmeCertificateStore, AcmeError,
-    AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeIssuedCertificateInput, AcmeOrderRecord,
+    AcmeHttp01ChallengeRecord, AcmeIssuedCertificateInput, AcmeOrderInput, AcmeOrderRecord,
     AcmeOrderStatus, AcmeOrderStore,
 };
 
@@ -32,7 +32,7 @@ fn certificate(id: &str, cert_pem: &str) -> AcmeCertificateRecord {
 /// A pending HTTP-01 renewal order — the shape the duplicate-renewal guard
 /// looks for.
 fn pending_order(id: &str, certificate_id: &str, token: &str) -> AcmeOrderRecord {
-    AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+    AcmeOrderRecord::new(AcmeOrderInput {
         id: id.to_string(),
         certificate_id: Some(certificate_id.to_string()),
         domains: vec!["example.com".to_string()],

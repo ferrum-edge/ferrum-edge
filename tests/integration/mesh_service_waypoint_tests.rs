@@ -741,6 +741,70 @@ fn slice_filter_cross_namespace_waypoint_rejects_peer_namespace_destination_rule
     assert_eq!(slice.destination_rules[0].name, "reviews");
 }
 
+/// Issue #7395: the service waypoint narrowing selects DestinationRules
+/// through the ONE host matcher, so wildcard rules survive it (it used to keep
+/// exact aliases only and drop every wildcard after admission). The tier is
+/// re-derived from the MATCHED Service: the Service's own namespace, the
+/// waypoint's namespace and the root namespace qualify; a wildcard from an
+/// unrelated namespace, or one naming no bound Service, does not.
+#[test]
+fn slice_filter_service_waypoint_keeps_wildcard_destination_rules_for_bound_services() {
+    let reviews_sa = "spiffe://cluster.local/ns/default/sa/reviews";
+    let mesh = MeshConfig {
+        istio_root_namespace: "istio-system".to_string(),
+        services: vec![service_in_namespace(
+            "default",
+            "reviews",
+            8080,
+            vec![reviews_sa],
+        )],
+        workloads: vec![workload_in_namespace("default", reviews_sa)],
+        destination_rules: vec![
+            destination_rule_in_namespace(
+                "default",
+                "owner-wildcard",
+                "*.default.svc.cluster.local",
+            ),
+            destination_rule_in_namespace("infra", "waypoint-wildcard", "*.svc.cluster.local"),
+            destination_rule_in_namespace("istio-system", "mesh-default", "*"),
+            destination_rule_in_namespace("evil", "steal-wildcard", "*.svc.cluster.local"),
+            destination_rule_in_namespace("default", "unrelated-wildcard", "*.other.example"),
+        ],
+        waypoint_bindings: vec![MeshWaypointBinding {
+            name: "shared-waypoint".to_string(),
+            namespace: "infra".to_string(),
+            waypoint_for: "service".to_string(),
+            gateway_class_name: None,
+            services: vec![MeshWaypointServiceRef {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            }],
+        }],
+        ..MeshConfig::default()
+    };
+    let cfg = config_with_mesh(mesh);
+
+    let request = MeshSliceRequest {
+        namespace: "infra".to_string(),
+        ..Default::default()
+    }
+    .with_waypoint_name(Some("shared-waypoint".to_string()));
+    let slice = MeshSlice::from_gateway_config(&cfg, request);
+
+    let mut admitted: Vec<&str> = slice
+        .destination_rules
+        .iter()
+        .map(|rule| rule.name.as_str())
+        .collect();
+    admitted.sort_unstable();
+    assert_eq!(
+        admitted,
+        vec!["mesh-default", "owner-wildcard", "waypoint-wildcard"],
+        "wildcards naming the bound Service from its lookup path survive; an \
+         unrelated namespace's wildcard and a wildcard naming no bound Service do not"
+    );
+}
+
 #[test]
 fn slice_filter_does_not_prefix_match_unrelated_destination_rule_hosts() {
     let mesh = MeshConfig {

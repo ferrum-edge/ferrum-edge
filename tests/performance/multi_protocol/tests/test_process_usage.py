@@ -8,8 +8,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmark_plan import stamp_sample
-from process_usage import (IO_FIELDS, capture_scheduler, client_pids, measurement_usage,
-                           parse_context_switches, parse_io, sample_processes)
+from process_usage import (IO_FIELDS, capture_host_cpu, capture_scheduler, client_pids,
+                           host_process_usage, measurement_usage, parse_context_switches,
+                           parse_host_cpu, parse_io, process_table, sample_processes)
 
 
 class PassiveUsageTests(unittest.TestCase):
@@ -165,6 +166,84 @@ class PassiveUsageTests(unittest.TestCase):
                 path.write_bytes(f"/tools/{name}\0http2\0".encode())
             self.assertEqual(sorted(client_pids(10, root)), [11, 16, 17])
             self.assertEqual(client_pids(99, root), [])
+
+    def test_host_cpu_counts_work_and_keeps_waiting_states_apart(self):
+        # user nice system idle iowait irq softirq steal, in ticks of 1/100 s.
+        host = parse_host_cpu("cpu  1000 50 400 9000 30 20 130 7 0 0\ncpu0 500 0 0 0 0 0 0 0 0 0\n", 100)
+        self.assertEqual(host, {"busy_cpu_seconds": 16.0, "idle_cpu_seconds": 90.0,
+                                "iowait_cpu_seconds": 0.3, "steal_cpu_seconds": 0.07})
+        for contents in ("", "cpu0 1 2 3\n", "cpu  1 2 3\n", "cpu  a b c d e f g h\n"):
+            with self.assertRaises(ValueError):
+                parse_host_cpu(contents, 100)
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(capture_host_cpu(100, Path(directory)))
+            (Path(directory) / "stat").write_text("cpu  100 0 0 0 0 0 0 0\n")
+            self.assertEqual(capture_host_cpu(100, Path(directory))["busy_cpu_seconds"], 1.0)
+
+    def test_host_processes_are_those_outside_the_benchmark_that_used_cpu(self):
+        def write(root, pid, comm, ticks, started):
+            fields = ["0"] * 22
+            fields[0], fields[11], fields[12], fields[19] = "S", str(ticks), "0", str(started)
+            (root / str(pid)).mkdir(exist_ok=True)
+            (root / str(pid) / "stat").write_text(f"{pid} ({comm}) " + " ".join(fields))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "self").mkdir()  # not a pid: ignored
+            write(root, 10, "provjobd123", 500, 1)
+            write(root, 11, "ferrum-edge", 100, 1)
+            write(root, 12, "hv kvp (daemon)", 300, 1)
+            write(root, 13, "idle", 40, 1)
+            before = process_table(100, root)
+            self.assertEqual(before[12, 1], ("hv kvp (daemon)", 3.0))
+            write(root, 10, "provjobd123", 720, 1)        # 2.2 s more
+            write(root, 11, "ferrum-edge", 2600, 1)       # the gateway: excluded
+            write(root, 12, "hv kvp (daemon)", 380, 1)    # 0.8 s more
+            write(root, 14, "curl", 30, 900)              # born during the capture
+            (root / "13" / "stat").unlink()               # exited: not seen
+            write(root, 15, "reused", 5, 2)
+            before[15, 1] = ("older process with this pid", 99.0)
+            used = host_process_usage(before, process_table(100, root), {11})
+        self.assertEqual(used, [
+            dict(comm="provjobd123", pid=10, cpu_seconds=2.2, started_during_capture=False),
+            dict(comm="hv kvp (daemon)", pid=12, cpu_seconds=0.8, started_during_capture=False),
+            dict(comm="curl", pid=14, cpu_seconds=0.3, started_during_capture=True),
+            # A reused pid is a new process, charged its own CPU only.
+            dict(comm="reused", pid=15, cpu_seconds=0.05, started_during_capture=True)])
+        self.assertEqual(host_process_usage(before, {}, set()), [])
+        self.assertEqual(process_table(100, Path(directory) / "gone"), {})
+
+    def test_host_cpu_is_recorded_only_when_asked_and_leaves_the_rest_of_the_report_alone(self):
+        tables = [{(9, 1): ("provjobd1", 1.0), (2, 1): ("gateway", 5.0)},
+                  {(9, 1): ("provjobd1", 3.5), (2, 1): ("gateway", 30.0), (1, 1): ("backend", 9.0)}]
+        for host_cpu in (False, True):
+            with self.subTest(host_cpu=host_cpu), tempfile.TemporaryDirectory() as directory:
+                output, stop = Path(directory) / "usage.json", Path(directory) / "stop"
+                stop.touch()
+                with patch("process_usage.signal.signal"), \
+                        patch("process_usage.os.sysconf", return_value=100), \
+                        patch("process_usage.client_pids", return_value=[]), \
+                        patch("process_usage.capture", return_value=None), \
+                        patch("process_usage.capture_host_cpu",
+                              return_value={"busy_cpu_seconds": 12.5}) as host, \
+                        patch("process_usage.process_table", side_effect=list(tables)) as table:
+                    sample_processes(1, [2], output, 0.5, parent_pid=42, stop_file=stop,
+                                     host_cpu=host_cpu)
+                report = json.loads(output.read_text())
+                self.assertTrue(report["capture_complete"])
+                self.assertEqual(len(report["timeline"]), 2)
+                if host_cpu:
+                    self.assertEqual([row["host"] for row in report["timeline"]],
+                                     [{"busy_cpu_seconds": 12.5}] * 2)
+                    # The gateway and backend are the benchmark, not the host.
+                    self.assertEqual(report["host_processes"], [dict(
+                        comm="provjobd1", pid=9, cpu_seconds=2.5, started_during_capture=False)])
+                    self.assertEqual(table.call_count, 2)
+                else:
+                    self.assertFalse(any("host" in row for row in report["timeline"]))
+                    self.assertNotIn("host_processes", report)
+                    host.assert_not_called()
+                    table.assert_not_called()
 
     def test_signal_finalizes_usage_after_readiness_even_with_inherited_sigint_ignore(self):
         handlers = {}

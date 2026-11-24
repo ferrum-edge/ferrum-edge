@@ -1,0 +1,108 @@
+diff --git a/src/proto/h2/client.rs b/src/proto/h2/client.rs
+index 4e0a232e2..37072f347 100644
+--- a/src/proto/h2/client.rs
++++ b/src/proto/h2/client.rs
+@@ -190,7 +190,7 @@ where
+     };
+ 
+     exec.execute_h2_future(H2ClientFuture::Task {
+-        task: ConnTask::new(conn, conn_drop_rx, cancel_tx),
++        task: Box::pin(ConnTask::new(conn, conn_drop_rx, cancel_tx)),
+     });
+ 
+     Ok(ClientTask {
+@@ -383,8 +383,11 @@ pin_project! {
+             send_when: SendWhen<B, E>,
+         },
+         Task {
+-            #[pin]
+-            task: ConnTask<T, B>,
++            // FERRUM PATCH 009: boxed. One connection task is spawned per
++            // connection, but inline it set the size of this enum, so every
++            // per-request `Pipe` and `Send` task was allocated and copied at
++            // the size of the whole h2 connection.
++            task: Pin<Box<ConnTask<T, B>>>,
+         },
+     }
+ }
+@@ -404,7 +407,7 @@ where
+         match this {
+             H2ClientFutureProject::Pipe { pipe } => pipe.poll(cx),
+             H2ClientFutureProject::Send { send_when } => send_when.poll(cx),
+-            H2ClientFutureProject::Task { task } => task.poll(cx),
++            H2ClientFutureProject::Task { task } => task.as_mut().poll(cx),
+         }
+     }
+ }
+@@ -864,3 +867,71 @@ where
+         }
+     }
+ }
++
++#[cfg(test)]
++mod ferrum_client_conn_task_box_tests {
++    //! FERRUM PATCH 009 regression: the per-request client tasks (`Pipe`,
++    //! `Send`) must not be sized by the per-connection task (`Task`).
++    use std::io;
++    use std::mem::size_of;
++    use std::pin::Pin;
++    use std::task::{Context, Poll};
++
++    use bytes::Bytes;
++    use http_body_util::Full;
++
++    use super::{ConnTask, H2ClientFuture, PipeMap, SendWhen};
++
++    /// An I/O type that only has to satisfy the bounds of the types measured.
++    struct NoIo;
++
++    impl crate::rt::Read for NoIo {
++        fn poll_read(
++            self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++            _buf: crate::rt::ReadBufCursor<'_>,
++        ) -> Poll<io::Result<()>> {
++            Poll::Pending
++        }
++    }
++
++    impl crate::rt::Write for NoIo {
++        fn poll_write(
++            self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++            _buf: &[u8],
++        ) -> Poll<io::Result<usize>> {
++            Poll::Pending
++        }
++
++        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Poll::Pending
++        }
++
++        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Poll::Pending
++        }
++    }
++
++    #[test]
++    fn per_request_tasks_are_not_sized_by_the_connection_task() {
++        type Body = Full<Bytes>;
++
++        let spawned = size_of::<H2ClientFuture<Body, NoIo, ()>>();
++        let connection = size_of::<ConnTask<NoIo, Body>>();
++        let per_request = size_of::<PipeMap<Body>>().max(size_of::<SendWhen<Body, ()>>());
++
++        // Stored inline, the connection task is a lower bound on the size of
++        // the enum, so this fails if it is ever held inline again.
++        assert!(
++            spawned < connection,
++            "spawned future {spawned} bytes must not hold the {connection}-byte connection task inline"
++        );
++        // What the executor allocates and copies for every request is the
++        // largest per-request variant plus the enum tag.
++        assert!(
++            spawned <= per_request + 2 * size_of::<usize>(),
++            "spawned future {spawned} bytes, per-request tasks {per_request} bytes"
++        );
++    }
++}

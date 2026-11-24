@@ -1,5 +1,14 @@
 use ferrum_edge::plugins::{PluginHttpClient, RequestContext};
 use serde_json::{Value, json};
+use std::sync::OnceLock;
+
+/// Serializes tests that reset or depend on the process-global remote JWKS
+/// cache (`jwks_cache_tests` in the a–j target; `oidc_relying_party_tests` and
+/// `plugin_cache_tests` in the k–z target).
+pub fn cache_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 pub fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()

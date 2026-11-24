@@ -32,7 +32,7 @@ Ferrum Edge is a lightweight, extensible edge proxy designed for modern microser
 - **Service mesh**: Six topologies (sidecar, ambient, **Experimental** node waypoint, service waypoint, east-west gateway, egress), native MeshSubscribe, xDS ADS, or localized file config consumption, SPIFFE identity, HBONE, transparent DNS proxy, mesh authorization, REGISTRY_ONLY outbound policy, and Istio/GAMMA RED metrics. See [docs/mesh.md](docs/mesh.md)
 - **Runtime observability**: JWT-gated `/metrics/runtime` JSON snapshot with system/process state, HTTP status windows, error classes, DNS outcomes, backend pool churn, TCP resets, log counters, and overload state
 - **Operable alerts**: the `ferrum-gateway` chart ships Prometheus alerts and Grafana dashboards, and every alert links a first-response procedure in [docs/runbooks/gateway.md](docs/runbooks/gateway.md)
-- **Kubernetes mesh translation**: Gateway API and Istio VirtualService route splits, Istio AuthorizationPolicy/RequestAuthentication/PeerAuthentication, and sidecar injection webhook
+- **Kubernetes mesh translation**: Gateway API and Istio VirtualService route splits (on gateways and the Sidecar and NodeWaypoint data planes; Ambient and ServiceWaypoint data planes do not apply VirtualService `http[]` routes), Istio AuthorizationPolicy/RequestAuthentication/PeerAuthentication, and sidecar injection webhook
 
 For the full feature list, see [FEATURES.md](FEATURES.md).
 
@@ -57,8 +57,10 @@ On Kubernetes, map each mode to its chart or external contract in
 
 - **Rust** toolchain — latest stable (the repo pins `channel = "stable"` via `rust-toolchain.toml`; rustup will auto-install on first `cargo` invocation). CI runs clippy with `-D warnings` against the current stable, so local toolchains MUST be at parity.
 - **protoc** (Protocol Buffers compiler) for gRPC code generation — install `protobuf-compiler` or set `PROTOC` to the executable path
-- **sccache and platform linker tools** — required by `.cargo/config.toml`; complete the
-  [one-time bootstrap](CONTRIBUTING.md#one-time-local-bootstrap) before building.
+- **Platform linker tools** — required by `.cargo/config.toml`; complete the
+  [one-time bootstrap](CONTRIBUTING.md#one-time-local-bootstrap) before building. The
+  bootstrap also installs **sccache** and enables it as your user-level rustc wrapper
+  (recommended, not required).
 - **cmake and curl development headers** — required by `rdkafka-sys` to compile
   librdkafka from source (`kafka_logging` vendored TLS). The bootstrap script
   installs `cmake` plus `libcurl4-openssl-dev` (Debian/Ubuntu), `libcurl-devel`
@@ -93,11 +95,9 @@ ferrum-edge version
 
 ### Pre-built Binaries
 
-Download from [GitHub Releases](https://github.com/ferrum-edge/ferrum-edge/releases) for Linux x86_64/ARM64 and macOS x86_64/ARM64. Releases ship raw platform binaries plus adjacent `.sha256` checksum files (for example `ferrum-edge-linux-x86_64` and `ferrum-edge-linux-x86_64.sha256`).
+Download from [GitHub Releases](https://github.com/ferrum-edge/ferrum-edge/releases) for Linux x86_64/ARM64, macOS x86_64/ARM64, and Windows x86_64. Releases ship raw platform binaries plus adjacent `.sha256` checksum files (for example `ferrum-edge-linux-x86_64` and `ferrum-edge-linux-x86_64.sha256`).
 
 Pin an explicit release tag in download URLs. Binaries are published only for version tags; main does not publish a moving `latest` binary release. GitHub's `/releases/latest` endpoint skips prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. Pick the current immutable `vX.Y.Z` semver tag from the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page, and pin deployments to that version.
-
-Feature availability by release: resource labels (`labels` / `ResourceLabels` on Proxy, Consumer, Upstream, and PluginConfig, [#5483](https://github.com/ferrum-edge/ferrum-edge/pull/5483)) require **v0.9.5 or later**; artifacts through v0.9.4 reject `labels` with ``unknown field `labels` ``. See the [upgrade guidance](docs/upgrade_guide.md#upgrading-to-095) for database and CP/DP rollout requirements. Companion clients that inject `labels.provisioned-by` require matching gateway builds: Git Forge Ops ≥ [#218](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/pull/218), Nexus ≥ [#245](https://github.com/ferrum-edge/ferrum-nexus/pull/245), and Foundry ≥ [#340](https://github.com/ferrum-edge/ferrum-foundry/pull/340).
 
 ```bash
 # Example: Linux x86_64
@@ -112,7 +112,7 @@ sudo install -m 0755 ferrum-edge-linux-x86_64 /usr/local/bin/ferrum-edge
 ferrum-edge version
 ```
 
-Published Linux GNU artifacts (`ferrum-edge-linux-x86_64`, `ferrum-cni-linux-x86_64`, and the ARM64 pair) are dynamically linked against glibc. The declared runtime floor is **GLIBC_2.34** (RHEL 9 / Rocky Linux 9 / AlmaLinux 9, which also covers Ubuntu 22.04 and Debian 12). The x86_64 GNU binaries are built in a digest-pinned **AlmaLinux 8.10** sysroot (glibc 2.28) by the same job that checksums and uploads them, and that job ABI-scans and smoke-tests the exact staged bytes before publishing them, so the released artifact is the artifact that was verified. ARM64 GNU artifacts come from the isolated Cross build, already target an older glibc, and are re-checked as published. Beyond glibc, the remaining dynamic libraries are `libgcc_s.so.1` and, when the Kafka stack does not static-link zlib, `libz.so.1`. Any GNU artifact whose GLIBC version-need records exceed 2.34, whose `DT_NEEDED` set is outside that allowlist, whose `e_machine` does not match the advertised `*-x86_64` / `*-aarch64` architecture, or that embeds a `DT_RPATH` / `DT_RUNPATH`, fails the release.
+Published Linux GNU artifacts (`ferrum-edge-linux-x86_64`, `ferrum-cni-linux-x86_64`, and the ARM64 pair) are dynamically linked against glibc. The declared runtime floor is **GLIBC_2.34** (RHEL 9 / Rocky Linux 9 / AlmaLinux 9, which also covers Ubuntu 22.04 and Debian 12). Beyond glibc, the remaining dynamic libraries are `libgcc_s.so.1` and, when the Kafka stack does not static-link zlib, `libz.so.1`. The x86_64 GNU binaries are built in an **AlmaLinux 8.10** sysroot; see [docs/ci_cd.md](docs/ci_cd.md) for the release producer and ABI verification gates.
 
 ### Docker
 
@@ -128,10 +128,10 @@ Versioned releases publish `vX.Y.Z`, `X.Y.Z`, and the moving `X.Y` series alias
 (for example, `0.9`). Pin the full version or digest for reproducible deployments;
 the series alias can change when another release in that series is published.
 
-Images are published to Docker Hub (`docker.io/ferrumedge/ferrum-edge`, anonymously
-pullable) and to GitHub Container Registry (`ghcr.io/ferrum-edge/ferrum-edge`). Use the
-Docker Hub path unless you have confirmed the GHCR package is visible to you: a GHCR
-package that is not public returns `401 Unauthorized` to an anonymous `docker pull`.
+Images are published to Docker Hub (`docker.io/ferrumedge/ferrum-edge`) and to GitHub
+Container Registry (`ghcr.io/ferrum-edge/ferrum-edge`). Both are public and anonymously
+pullable. After publishing its version manifests, each release workflow checks an
+anonymous pull from both registries and fails if either refuses.
 
 ```bash
 # Replace with a version whose image has completed publication.
@@ -316,7 +316,7 @@ consumers:
     username: "alice"
     credentials:
       keyauth:
-        - key: "alice-api-key"
+        - key: "alice-api-key-0123456789"
     acl_groups:
       - "engineering"
 
@@ -387,11 +387,11 @@ the full execution order and protocol support matrix.
 
 Plugins for AI and agent gateway use cases — transcript audit, cost visibility, budget enforcement, semantic policy, request policy, PII protection, output guardrails, prompt compression, streaming and non-streaming provider routing, MCP tool routing, and response caching:
 
-- **`ai_token_metrics`** — Extract token usage from LLM responses for observability only (SSE metrics require explicit buffered opt-in)
+- **`ai_token_metrics`** — Extract token usage from LLM responses for observability only (streamed SSE / AWS event-stream responses are metered incrementally without buffering; optional per-model pricing)
 - **`ai_request_guard`** — Enforce model whitelists, token limits, and request policy
 - **`ai_rate_limiter`** — Enforce token budgets with pre-request reservation and response reconciliation (HTTP-only; native gRPC is unsupported) (supports centralized Redis mode; compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, Garnet)
 - **`ai_prompt_shield`** — Scan for PII and reject, redact, or warn
-- **`ai_prompt_compressor`** — Bounded model-free compression for admitted OpenAI Chat/Text Completions requests (no external models or services); preserves matching-backtick code, URLs, Unicode numbers, common identifiers, and negations, with bounded fail-safe `preserve_tag` marker cleanup
+- **`ai_prompt_compressor`** — Bounded model-free compression for admitted OpenAI Chat/Text Completions requests, plus opt-in OpenAI Responses and Anthropic Messages families, with aggregate token budgets, observe mode, and sampling (no external models or services); preserves matching-backtick code, URLs, Unicode numbers, common identifiers, and negations, with bounded fail-safe `preserve_tag` marker cleanup
 - **`ai_semantic_firewall`** — Semantic prompt/response firewall for prompt injection, jailbreaks, data exfiltration intent, tool abuse, and topic allow/deny policy
 - **`ai_semantic_cache`** — LLM response caching with normalized exact-match keys, optional embedding-based semantic similarity, and local or Redis exact-response storage
 - **`ai_response_guard`** — Output-side content guardrails: PII detection, blocked phrases, response format validation, and descriptor-based native gRPC response inspection for explicitly enrolled methods
@@ -406,7 +406,7 @@ Auto-detects OpenAI, Anthropic, Google Gemini, Cohere, Mistral, and AWS Bedrock 
 
 ### Centralized Rate Limiting
 
-`rate_limiting` and `ai_rate_limiter` support centralized mode via `sync_mode: "redis"` for coordinated limits across multiple gateway instances. When the centralized store cannot be consulted, `redis_failure_policy` decides: for `rate_limiting` the default `local_fallback` keeps enforcing the configured quota in each pod's memory, while explicit `fail_closed` refuses with `503`; the other rate-limit plugins default to `fail_closed`. Redis Cluster is not supported and is screened at connect — see [docs/plugins.md](docs/plugins.md#rate_limiting). `ws_rate_limiting` also supports `sync_mode: "redis"`, but only to externalize per-connection frame counters under a per-plugin/gateway-instance Redis namespace — budgets are not shared across instances or portable across reconnects/rebuilds. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). Redis TLS uses gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` settings.
+`rate_limiting` and `ai_rate_limiter` support centralized mode via `sync_mode: "redis"` for coordinated limits across multiple gateway instances. When the centralized store cannot be consulted, `redis_failure_policy` decides: for `rate_limiting` the default `local_fallback` keeps enforcing the configured quota in each pod's memory, while explicit `fail_closed` refuses with `503`; the other rate-limit plugins default to `fail_closed`. Redis Cluster is not supported and is screened at connect — see [docs/plugins.md](docs/plugins.md#rate_limiting). `ws_rate_limiting` also supports `sync_mode: "redis"`; in its default per-connection mode this only serves to externalize per-connection frame counters under a per-plugin/gateway-instance Redis namespace — those budgets are not shared across instances or portable across reconnects/rebuilds. Its aggregate `limit_by` budgets (`consumer`, `ip`, `service`) are keyed by that identity and shared by every replica of the policy. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). Redis TLS uses gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` settings.
 
 ### Custom Plugins
 
@@ -439,7 +439,7 @@ See [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md) for TCP/UDP/DTLS proxy config
 
 ## Load Balancing & Resilience
 
-- **Six algorithms**: Round Robin, Weighted Round Robin, Least Connections, Least Latency, Consistent Hashing, Random
+- **Seven algorithms**: Round Robin, Weighted Round Robin, Least Connections, Least Latency, Consistent Hashing, Random, and Passthrough (mesh original-destination; falls back to Round Robin elsewhere)
 - **Health checks**: Active probes (HTTP, TCP connect, UDP, gRPC health) and passive monitoring
 - **Circuit breaker**: Three-state pattern (Closed/Open/Half-Open)
 - **Retry**: Connection and HTTP-level retries with fixed/exponential backoff
@@ -476,26 +476,9 @@ In-memory async DNS cache with startup warmup, stale-while-revalidate, per-proxy
 
 ## Performance
 
-Historical small-payload multi-protocol benchmark results from
-`tests/performance/multi_protocol/` (local macOS Apple Silicon run, 200
-concurrent, 10s, 64-byte payload; run date not recorded in this summary):
-
-| Protocol | Gateway RPS | Gw P50 | Gw P99 | Direct RPS | Direct P50 | Direct P99 | Overhead |
-|----------|------------|--------|--------|------------|------------|------------|----------|
-| HTTP/1.1 | 102,183 | 1.89ms | 3.85ms | 209,910 | 939μs | 1.81ms | ~51% |
-| HTTP/1.1+TLS | 101,317 | 1.90ms | 3.84ms | 209,361 | 941μs | 1.81ms | ~52% |
-| HTTP/2 | 108,138 | 1.67ms | 6.38ms | 355,544 | 486μs | 1.53ms | ~70% |
-| HTTP/3 (QUIC) | 53,085 | 3.51ms | 5.87ms | 83,592 | 2.38ms | 2.80ms | ~37% |
-| gRPC | 68,352 | 2.53ms | 12.02ms | 205,927 | 821μs | 3.15ms | ~67% |
-| WebSocket | 103,830 | 1.88ms | 3.15ms | 207,507 | 952μs | 1.72ms | ~50% |
-| TCP | 108,841 | 1.83ms | 2.59ms | 214,113 | 928μs | 1.65ms | ~49% |
-| TCP+TLS | 107,340 | 1.84ms | 2.68ms | 207,103 | 949μs | 1.78ms | ~48% |
-| UDP | 82,042 | 2.46ms | 2.93ms | 276,526 | 682μs | 1.27ms | ~70% |
-| UDP+DTLS | 76,107 | 2.61ms | 3.69ms | 101,839 | 1.96ms | 2.47ms | ~25% |
-
 **Adaptive buffer sizing** (enabled by default) dynamically tunes TCP/WebSocket tunnel copy buffers and UDP batch limits per proxy based on observed traffic patterns. Small-message proxies get smaller buffers (saves memory), bulk transfer proxies get larger buffers (reduces syscalls). See `FERRUM_ADAPTIVE_BUFFER_*` env vars for tuning.
 
-**Linux socket tuning**: (`TCP_FASTOPEN`, `IP_BIND_ADDRESS_NO_PORT`), thread-local Date header caching, lazy timeout initialization, frequency-aware router cache eviction (Count-Min Sketch), RED-style adaptive load shedding, and a cacheability predictor for the response cache plugin. See [FEATURES.md](FEATURES.md) for details.
+**Linux socket tuning**: (`TCP_FASTOPEN`, `IP_BIND_ADDRESS_NO_PORT`), lazy timeout initialization, frequency-aware router cache eviction (Count-Min Sketch), RED-style adaptive load shedding, and a cacheability predictor for the response cache plugin. See [FEATURES.md](FEATURES.md) for details.
 
 For current suite methodology and dated result tables, see
 [`tests/performance/`](tests/performance/) and
@@ -519,19 +502,7 @@ When the effective soft cap after startup is below 65,536, Ferrum Edge emits one
 
 ### Gateway Comparison
 
-Historical local comparison summary (macOS Apple Silicon, 100 concurrent, 30s;
-run date not recorded in this summary):
-
-All gateways run in Docker containers for apples-to-apples comparison:
-
-| Gateway | Key-Auth req/s | Key-Auth Latency | vs Ferrum |
-|---------|---------------|-----------------|-----------|
-| **Ferrum Edge** | **27,979** | **3.44 ms** | — |
-| Envoy 1.37 (Lua filter) | 26,787 | 3.64 ms | Ferrum 4% faster |
-| Kong 3.14 | 25,009 | 3.91 ms | Ferrum 12% faster |
-| Tyk v5.12 | 19,186 | 5.08 ms | Ferrum 46% faster |
-
-Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the highest throughput of any gateway in any scenario, beating Envoy by 13%. Ferrum's authentication adds effectively **zero overhead** — authenticated requests match unauthenticated throughput thanks to the pre-computed `ConsumerIndex` with `Arc<Consumer>` zero-copy credential resolution and lock-free `ArcSwap` reads. See [`comparison/README.md`](comparison/README.md) and [`comparison/run_comparison.sh`](comparison/run_comparison.sh) for the reproducible Docker gateway comparison harness, which checks for port and Docker name conflicts and cleans up only resources it creates, and [`tests/performance/README.md`](tests/performance/README.md) for the benchmark provenance checklist.
+See [`comparison/README.md`](comparison/README.md) and [`comparison/run_comparison.sh`](comparison/run_comparison.sh) for the reproducible Docker gateway comparison harness, which checks for port and Docker name conflicts and cleans up only resources it creates, and [`tests/performance/README.md`](tests/performance/README.md) for the benchmark provenance checklist.
 
 ## Troubleshooting
 
@@ -542,8 +513,9 @@ Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the h
 | `Database connection failed` | Verify `FERRUM_DB_TYPE` and `FERRUM_DB_URL` |
 | `401 on Admin API` | Check JWT is signed with `FERRUM_ADMIN_JWT_SECRET` |
 | `404 on proxy request` | Verify request path matches a configured `listen_path` |
-| `502 Bad Gateway` | Backend unreachable — check `X-Gateway-Error` header for details |
-| `504 Gateway Timeout` | Increase `backend_read_timeout_ms` |
+| `502 Bad Gateway` | Backend unreachable or returned an invalid response — check `X-Gateway-Error` header for details |
+| `503 Service Unavailable` | Gateway-side capacity refusal (overload, open circuit breaker, DestinationRule `maxConnections`) — check `X-Gateway-Error` |
+| `504 Gateway Timeout` | Backend did not answer in time: `X-Gateway-Error: backend_timeout` → raise `backend_read_timeout_ms`; `connection_failure` → the connect timed out (`backend_connect_timeout_ms`) |
 | `429 Too Many Requests` | Rate limit exceeded — check plugin config |
 | DP not receiving config | Verify `FERRUM_CP_DP_GRPC_JWT_SECRET` matches on both CP and DP |
 
@@ -596,13 +568,42 @@ publishes them in
 [ferrum-edge/ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts).
 Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
 `contracts-edge-<edge-version>` tags from that repository rather than reading
-Edge source. The latest published tag is
-[`contracts-edge-0.9.17`](https://github.com/ferrum-edge/ferrum-contracts/tree/f7ba1a9b9885900d1e110f76d38e37a02eda13c8)
-at `f7ba1a9b9885900d1e110f76d38e37a02eda13c8`, published on
-2026-10-10 for Edge **v0.9.17** at release commit
-`669c574c1d1e88e84dccb26a8159939e6694644d`. No `contracts-edge-0.9.16` tag
-exists because Edge v0.9.16 was tagged but never published. Earlier contract
+Edge source. The current published Edge release is **v0.9.21**, published on
+2026-11-22 from release commit `f9915358c8032214f4034a17c28cdf72d14006c3`. Its
+matching `contracts-edge-0.9.21` tag has not been cut yet; until it is
+published, the latest Contracts pairing is v0.9.20. That Contracts tag is
+[`contracts-edge-0.9.20`](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.20)
+on commit `39da322083044c2e92617209e62983c92387f0ad`, published on
+2026-11-03 for Edge release commit
+`e4a606a00352674daaef08636e3e359e6c48ba18`. It is the first SSH-signed
+Contracts tag; verify it as described in the Contracts
+[release signing](https://github.com/ferrum-edge/ferrum-contracts/blob/main/docs/release-signing.md)
+guide. The v0.9.19 pairing is
+[`contracts-edge-0.9.19`](https://github.com/ferrum-edge/ferrum-contracts/tree/d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b)
+at `d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b`. No `contracts-edge-0.9.18` tag
+exists because Edge v0.9.18 was tagged but never published. Earlier contract
 tags remain unchanged.
+
+**v0.9.21** follows published v0.9.20 with security-advisory and correctness
+fixes, mesh VirtualService HTTP routes on Sidecar and NodeWaypoint data planes,
+and fail-closed enforcement of refused enforcing Istio security resources.
+Consumers move their pins to `contracts-edge-0.9.21` once it is published and
+they adopt Edge v0.9.21. See the
+[publication record](docs/releases/v0.9.21-publication.md) and the
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-0921).
+
+**v0.9.20** follows published v0.9.19 with security and correctness fixes,
+closed plugin and mesh Telemetry configuration, and the strict-client DTLS 1.3
+client-certificate fix. Consumers move their pins to `contracts-edge-0.9.20`
+when they adopt Edge v0.9.20. See the
+[publication record](docs/releases/v0.9.20-publication.md) and the
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-0920).
+
+**v0.9.19** carries the plugin production-launch hardening from tagged but
+unpublished v0.9.18 and adds the [ARM64 OOM
+recovery](docs/releases/v0.9.18-arm64-recovery.md). Consumers move their pins
+to `contracts-edge-0.9.19` when they adopt Edge v0.9.19. See the
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-0919).
 
 **v0.9.17** carries the changes from tagged but unpublished v0.9.16. It adds
 the `loop_detected` gateway-error token, the

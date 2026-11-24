@@ -28,7 +28,6 @@ use ferrum_edge::plugins::{
     validate_plugin_config, ws_logging::WsLogging,
 };
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -337,7 +336,7 @@ fn file_mode_validate_pipeline_rejects_malformed_sink_fields() {
 
     // Constructors / validate_plugin_config must reject every malformed case
     // synchronously (runtime-free). This pins semantic validation in `new`
-    // even when file-mode OptionalFailOpen soft-warns and omits the instance.
+    // independently of the file-mode aggregate below.
     for (name, config, needle) in malformed_sink_cases() {
         let error = validate_plugin_config(name, &config)
             .expect_err(&format!("{name}: expected constructor validation failure"));
@@ -347,11 +346,16 @@ fn file_mode_validate_pipeline_rejects_malformed_sink_fields() {
         );
     }
 
-    // KeepLastKnownGood sinks must also fail closed through the file-mode
-    // load path used by `ferrum-edge validate`. OptionalFailOpen sinks warn
-    // and omit rather than aborting the surrounding snapshot (docs/plugins.md).
+    // Every log sink is KeepLastKnownGood (issue #7144), so each must also
+    // fail closed through the file-mode load path used by `ferrum-edge
+    // validate` (docs/plugins.md "Log sink contract").
     for (name, config, needle) in malformed_sink_cases() {
         if plugin_failure_policy(name) == Some(PluginFailurePolicy::OptionalFailOpen) {
+            // Only non-log-sink cases (none today) may still soft-warn.
+            assert!(
+                !name.ends_with("_logging"),
+                "{name}: a log sink must not be OptionalFailOpen"
+            );
             continue;
         }
         let spec_path = tmp.path().join(format!("{name}-bad.json"));
@@ -563,6 +567,7 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
             "database": "ferrum",
             "table": "charges_raw",
             "timeout_ms": 1000,
+            "username": "ferrum_ingest",
             "password_ref": "FERRUM_PLUGIN_SECRET_CHARGEBACK_MISSING"
         },
         "batch": {"size": 2, "flush_interval_ms": 60000, "buffer_capacity": 10},
@@ -1395,8 +1400,9 @@ fn test_ws_disconnect_context() -> WsDisconnectContext {
         io_side: None,
         error_class: None,
         consumer_username: Some("alice".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         proxy_lifecycle_generation: None,
     }
 }
@@ -1508,7 +1514,8 @@ async fn kafka_drop_without_runtime_closes_uncommitted_generation() {
     );
 }
 
-/// Multi-thread Drop finalizes an un-finalized live generation in place.
+/// Multi-thread Drop hands an un-finalized live generation to a tracked
+/// background finalize (kafka_logging-SOL-1) that unregisters it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kafka_drop_on_multi_thread_runtime_finalizes_generation() {
     let plugin = KafkaLogging::new(&kafka_sink_config(), &client()).expect("kafka");
@@ -1526,12 +1533,18 @@ async fn kafka_drop_on_multi_thread_runtime_finalizes_generation() {
 
     drop(plugin);
 
-    assert!(
-        !ferrum_edge::plugins::kafka_logging::snapshots()
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while ferrum_edge::plugins::kafka_logging::snapshots()
             .iter()
-            .any(|snap| snap.generation_id == generation_id),
-        "multi-thread Drop must finalize and unregister generation {generation_id}"
-    );
+            .any(|snap| snap.generation_id == generation_id)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("multi-thread Drop must finalize and unregister generation {generation_id}")
+    });
 }
 
 /// Producer construction failures during start restore pending activation so

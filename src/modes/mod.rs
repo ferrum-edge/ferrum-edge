@@ -4,7 +4,7 @@
 //!
 //! | Mode       | Proxy | Admin API   | Config Source                    |
 //! |------------|-------|-------------|----------------------------------|
-//! | `database` | Yes   | Read/Write  | PostgreSQL/MySQL/SQLite polling   |
+//! | `database` | Yes   | Read/Write  | PostgreSQL/MySQL/SQLite/MongoDB polling |
 //! | `file`     | Yes   | Read-only   | YAML/JSON file, SIGHUP reload    |
 //! | `cp`       | No    | Read/Write  | DB polling + gRPC broadcast to DPs |
 //! | `dp`       | Yes   | Read-only   | gRPC stream from CP              |
@@ -163,7 +163,9 @@ pub(crate) async fn schedule_admin_read_replica_reconnect_if_needed(
 }
 
 /// Handle pending custom-plugin database migrations at startup for the
-/// `database` and `cp` modes.
+/// `database` and `cp` modes, and again when either recovers its database
+/// after an offline or backup bootstrap (the same policy applies: in-place
+/// recovery must not be strictly weaker than a process restart).
 ///
 /// Behavior is controlled by `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS`:
 ///
@@ -187,24 +189,6 @@ pub(crate) async fn schedule_admin_read_replica_reconnect_if_needed(
 /// When auto-apply is off, ordinary probe failures remain warn-only, but any
 /// typed migration-history integrity failure is fatal in every mode.
 pub(crate) async fn handle_startup_plugin_migrations(
-    db: &Arc<dyn DatabaseBackend>,
-    auto_apply: bool,
-    mode: &str,
-) -> Result<(), anyhow::Error> {
-    let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
-    handle_startup_plugin_migrations_with_list(db, auto_apply, mode, &plugin_migrations).await
-}
-
-/// Recovery variant of [`handle_startup_plugin_migrations`].
-///
-/// Warn-only mode (`auto_apply=false`) matches ordinary startup: a pending-state
-/// non-integrity **probe failure** is logged and does not block recovered config
-/// publication (in-place recovery must not be strictly weaker than a process
-/// restart against the same database). History-integrity failures stay fatal;
-/// auto-apply mode remains fail-closed on every probe/apply error.
-/// A probe that **succeeds** and reports pending migrations still follows the
-/// warn-and-continue / auto-apply policy unchanged.
-pub(crate) async fn handle_recovery_plugin_migrations(
     db: &Arc<dyn DatabaseBackend>,
     auto_apply: bool,
     mode: &str,
@@ -242,7 +226,7 @@ pub(crate) fn start_acme_renewal_scheduler(
             );
             return None;
         };
-        crate::tls::acme::start_renewal_scheduler(
+        let handle = crate::tls::acme::start_renewal_scheduler(
             crate::tls::acme::AcmeRenewalSchedulerConfig {
                 enabled: true,
                 renew_when_remaining_days: env_config.acme_renew_when_remaining_days,
@@ -255,7 +239,14 @@ pub(crate) fn start_acme_renewal_scheduler(
                 dns_cache,
             },
             shutdown_rx,
-        )
+        );
+        if handle.is_some() {
+            info!(
+                challenge_type = challenge_type.as_str(),
+                "ACME renewal scheduler started"
+            );
+        }
+        handle
     }
 }
 
@@ -385,6 +376,82 @@ async fn handle_startup_plugin_migrations_with_list(
 /// a connectivity/driver failure. Both markers are downcast-discoverable through
 /// the `anyhow` source chain so poll loops keep `db_available=true` (after the
 /// migration gate) and raise `config_rejected` (issues #2158 / #2997).
+/// Why a database or CP poll loop scheduled an authoritative full config
+/// reload (issue #7252).
+///
+/// One pending flag used to stand for three causes while every log line, the
+/// change-log `trigger`, the `config_rejected` clear line and the reload
+/// failure `error!` said "DB DNS reconnect". The reason now travels with the
+/// pending reload, so those fixed labels name the cause that scheduled it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FullReloadReason {
+    /// The database hostname resolved to new addresses and the pool reconnected.
+    DnsReconnect,
+    /// The stored gateway trust identity no longer matches the running config
+    /// (issue #3727).
+    GatewayTrustDrift,
+    /// CP only: a standing `config_rejected` can clear only after a clean
+    /// authoritative full snapshot (issue #2158).
+    StandingRejection,
+    /// CP only: a failover reconnect swapped the pool, so every namespace must
+    /// reload from the replacement topology before incremental polling resumes.
+    DatabaseFailover,
+}
+
+impl FullReloadReason {
+    /// Closed-set label for structured log fields.
+    pub(crate) const fn as_label(self) -> &'static str {
+        match self {
+            Self::DnsReconnect => "dns_reconnect",
+            Self::GatewayTrustDrift => "gateway_trust_drift",
+            Self::StandingRejection => "standing_rejection",
+            Self::DatabaseFailover => "database_failover",
+        }
+    }
+
+    /// Context for the full reload's publication, rejection and settle logs.
+    pub(crate) const fn reload_context(self) -> &'static str {
+        match self {
+            Self::DnsReconnect => "full reload after DB DNS reconnect",
+            Self::GatewayTrustDrift => "full reload after gateway trust drift",
+            Self::StandingRejection => "full reload to clear a standing config rejection",
+            Self::DatabaseFailover => "full reload after database failover",
+        }
+    }
+
+    /// The change-log `trigger` written when the full reload publishes.
+    pub(crate) const fn trigger(self) -> &'static str {
+        match self {
+            Self::DnsReconnect => "after DB DNS reconnect",
+            Self::GatewayTrustDrift => "after gateway trust drift",
+            Self::StandingRejection => "after a standing config rejection",
+            Self::DatabaseFailover => "after database failover",
+        }
+    }
+
+    /// CP plugin-migration gate context for a full load that succeeded.
+    pub(crate) const fn migration_gate_context(self) -> &'static str {
+        match self {
+            Self::DnsReconnect => "DB DNS reconnect",
+            Self::GatewayTrustDrift => "gateway trust drift",
+            Self::StandingRejection => "standing config rejection",
+            Self::DatabaseFailover => "database failover",
+        }
+    }
+
+    /// CP plugin-migration gate context for a validation-rejected full load.
+    pub(crate) const fn rejected_load_context(self) -> &'static str {
+        match self {
+            Self::DnsReconnect => "validation-rejected full load after DB DNS reconnect",
+            Self::GatewayTrustDrift => "validation-rejected full load after gateway trust drift",
+            Self::StandingRejection => {
+                "validation-rejected full load for a standing config rejection"
+            }
+            Self::DatabaseFailover => "validation-rejected full load after database failover",
+        }
+    }
+}
+
 pub(crate) fn is_poll_validation_rejection(err: &anyhow::Error) -> bool {
     crate::config::validation_pipeline::is_config_validation_rejection(err)
         || crate::config::db_loader::is_row_decode_rejection(err)
@@ -492,41 +559,17 @@ pub(crate) fn clear_config_rejected_after_accepted_full_reload(
 mod tests {
     //! Inline tests for `handle_startup_plugin_migrations_with_list`.
     //!
-    //! Per CLAUDE.md "Test Placement", tests for `pub(crate)` items live
-    //! inline in source — they cannot be reached from the external
-    //! `tests/` crate without changing visibility.
+    //! These live inline because they exercise a `pub(crate)` item the
+    //! external `tests/` crate cannot reach without changing visibility.
     use super::*;
     use crate::config::db_backend::DatabaseBackend;
     use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
     use crate::config::migrations::CustomPluginMigration;
 
-    pub(super) fn capture_logs<T>(action: impl FnOnce() -> T) -> (T, String) {
-        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
-
-        impl std::io::Write for Writer {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        crate::diagnostic_test_interest::ensure_interest_floor();
-        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let output = bytes.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(move || Writer(output.clone()))
-            .finish();
-        let result = tracing::subscriber::with_default(subscriber, action);
-        let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
-        (result, logs)
-    }
+    // The shared capture (`tests/common/diagnostic_logs.rs`, mounted once at
+    // the crate root). CI's unit workflow runs this module's capture
+    // regression test by name, so it stays registered here too.
+    pub(super) use crate::diagnostic_test_logs::capture_logs;
 
     crate::diagnostic_test_interest::capture_regression!(capture_logs, tracing::Level::TRACE);
 
@@ -921,5 +964,49 @@ mod tests {
             "a migrated reachable store must re-enable writes on a validation rejection"
         );
         assert!(config_rejected.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod full_reload_reason_tests {
+    use super::FullReloadReason;
+
+    /// Only a DNS reconnect may say "DB DNS reconnect" (issue #7252): trust
+    /// drift and a standing rejection used to be reported under that label.
+    #[test]
+    fn every_full_reload_label_names_its_own_cause() {
+        let reasons = [
+            FullReloadReason::DnsReconnect,
+            FullReloadReason::GatewayTrustDrift,
+            FullReloadReason::StandingRejection,
+            FullReloadReason::DatabaseFailover,
+        ];
+        for reason in reasons {
+            let texts = [
+                reason.reload_context(),
+                reason.trigger(),
+                reason.migration_gate_context(),
+                reason.rejected_load_context(),
+            ];
+            let mentions_dns = texts.iter().any(|text| text.contains("DNS"));
+            assert_eq!(
+                mentions_dns,
+                reason == FullReloadReason::DnsReconnect,
+                "{reason:?}: {texts:?}"
+            );
+        }
+        let labels: std::collections::BTreeSet<_> =
+            reasons.iter().map(|reason| reason.as_label()).collect();
+        assert_eq!(labels.len(), reasons.len());
+        assert!(
+            FullReloadReason::GatewayTrustDrift
+                .trigger()
+                .contains("trust")
+        );
+        assert!(
+            FullReloadReason::StandingRejection
+                .reload_context()
+                .contains("rejection")
+        );
     }
 }

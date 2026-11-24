@@ -58,7 +58,6 @@ fn test_proxy() -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -1023,7 +1022,6 @@ async fn test_proxy_grpc_request_from_bytes_error_on_unreachable_backend() {
     proxy.backend_port = 1; // intentionally unreachable port
     proxy.retry = None;
 
-    let dns = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
     let headers = headers_with_content_type("application/grpc");
     let body = Bytes::from_static(b"\x00\x00\x00\x00\x05hello");
     let proxy_headers = std::collections::HashMap::new();
@@ -1036,7 +1034,6 @@ async fn test_proxy_grpc_request_from_bytes_error_on_unreachable_backend() {
         &proxy,
         "http://127.0.0.1:1/test.Service/Method",
         &grpc_proxy::GrpcDispatchTransport::Direct(&pool),
-        &dns,
         &proxy_headers,
         false,
         0,
@@ -1099,6 +1096,73 @@ fn test_parse_grpc_timeout_sub_millisecond_clamps_to_1() {
     // 100 microseconds = 0.1ms → clamped to 1ms
     let headers = headers_with_grpc_timeout("100u");
     assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(1));
+}
+
+#[test]
+fn test_parse_grpc_timeout_sub_millisecond_rounds_up() {
+    // Issue #7072: the proxy used to floor `u`/`n` values, so `1500u` became
+    // 1 ms here but 2 ms on a route with the `grpc_deadline` plugin.
+    let headers = headers_with_grpc_timeout("1500u");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(2));
+    let headers = headers_with_grpc_timeout("999999n");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(1));
+    let headers = headers_with_grpc_timeout("1000001n");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(2));
+}
+
+/// Issue #7072: the proxy deadline reader and the `grpc_deadline` plugin must
+/// agree on every `grpc-timeout` value: the same accept/reject decision, and
+/// the proxy's milliseconds equal the plugin's ceiling projection (zero stays
+/// "absent" in both).
+#[test]
+fn proxy_and_grpc_deadline_plugin_parse_grpc_timeout_identically() {
+    use ferrum_edge::_test_support::{
+        grpc_deadline_duration_millis_ceil_saturating_for_test as plugin_ms,
+        grpc_deadline_parse_grpc_timeout_for_test as plugin_parse,
+        grpc_proxy_parse_grpc_timeout_value_for_test as proxy_parse,
+    };
+
+    // (wire value, expected proxy milliseconds)
+    let cases: &[(&str, Option<u64>)] = &[
+        ("1H", Some(3_600_000)),
+        ("2M", Some(120_000)),
+        ("5S", Some(5_000)),
+        ("200m", Some(200)),
+        ("5000u", Some(5)),
+        ("5000000n", Some(5)),
+        ("1500u", Some(2)),
+        ("999999n", Some(1)),
+        ("1n", Some(1)),
+        ("1u", Some(1)),
+        ("99999999m", Some(99_999_999)),
+        ("99999999H", Some(99_999_999 * 3_600_000)),
+        ("999999999m", None),
+        ("123456789S", None),
+        ("", None),
+        ("m", None),
+        ("0m", None),
+        ("0S", None),
+        ("00000000n", None),
+        ("5X", None),
+        ("5\u{00e9}", None),
+        ("5\u{2126}", None),
+        ("+5S", None),
+        ("-5S", None),
+        (" 5S", None),
+        ("5 S", None),
+        ("5S ", None),
+        ("abcS", None),
+        ("1.5S", None),
+    ];
+    for (value, expected) in cases {
+        let proxy = proxy_parse(value);
+        assert_eq!(proxy, *expected, "proxy parse of {value:?}");
+        let plugin = plugin_parse(value).and_then(plugin_ms);
+        assert_eq!(
+            proxy, plugin,
+            "proxy and grpc_deadline must agree on {value:?}"
+        );
+    }
 }
 
 #[test]
@@ -2103,6 +2167,7 @@ fn grpc_channel_body(max_bytes: usize) -> GrpcChannelBodyFixture {
         cancelled: std::sync::Arc::clone(&cancelled),
         cancelled_terminal: false,
         forwarded_bytes: std::sync::Arc::clone(&forwarded),
+        frontend_failure_relayed: None,
         upload_observer: None,
         grpc_messages: None,
         grpc_scanner: None,
@@ -2211,6 +2276,47 @@ async fn grpc_channel_body_propagates_frontend_error_as_body_error() {
         "a transport-level abort is not a size violation"
     );
     assert_eq!(forwarded.load(Ordering::Relaxed), 7);
+}
+
+/// Issue #6772: the channel body marks a frontend failure as RELAYED only when
+/// it actually hands that failure to hyper (which resets the backend stream).
+/// The H3→gRPC bridge selects its frontend terminal on this evidence, never on
+/// the pump's own flag alone, so a backend failure that happened on its own is
+/// never relabelled as a client cancellation.
+#[tokio::test]
+async fn grpc_channel_body_marks_a_frontend_failure_relayed_only_when_handed_on() {
+    use http_body_util::BodyExt;
+    use std::sync::atomic::Ordering;
+
+    let relayed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, mut body, _exceeded, _cancelled, _forwarded) = grpc_channel_body(0);
+    if let grpc_proxy::GrpcBody::Channel {
+        frontend_failure_relayed,
+        ..
+    } = &mut body
+    {
+        *frontend_failure_relayed = Some(std::sync::Arc::clone(&relayed));
+    }
+    tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+        b"partial",
+    ))))
+    .await
+    .unwrap();
+    let first = body.frame().await.expect("frame").expect("DATA");
+    assert!(first.is_data());
+    assert!(
+        !relayed.load(Ordering::Acquire),
+        "forwarded DATA is not a relayed failure"
+    );
+    tx.send(Err(())).await.unwrap();
+    assert!(
+        body.frame().await.expect("terminal").is_err(),
+        "the frontend failure surfaces as a body error"
+    );
+    assert!(
+        relayed.load(Ordering::Acquire),
+        "handing the failure to hyper is the relay evidence"
+    );
 }
 
 #[tokio::test]
@@ -3766,7 +3872,9 @@ fn grpc_streaming_upload_publishes_forwarded_request_bytes() {
     );
 
     // Every terminal state publishes: clean EOF, transport error, overflow
-    // abort, authorization expiry, and Drop (cancelled / never-polled uploads).
+    // abort, authorization expiry, client RPC deadline (checked before each
+    // poll, and again when its lazily armed timer is set before waiting, issue
+    // #6904), and Drop (cancelled / never-polled uploads).
     let poll_arm = src
         .split("impl http_body::Body for GrpcBody")
         .nth(1)
@@ -3779,7 +3887,7 @@ fn grpc_streaming_upload_publishes_forwarded_request_bytes() {
         .expect("bounded streaming poll arm");
     let publishes = poll_arm.matches("accounting.publish(").count();
     assert_eq!(
-        publishes, 4,
+        publishes, 6,
         "each terminal state of the streamed upload must publish its byte tally"
     );
     let tally = poll_arm
@@ -3924,4 +4032,85 @@ async fn grpc_channel_late_poll_preserves_an_earlier_client_deadline() {
     assert_eq!(forwarded.load(Ordering::Relaxed), 0);
     assert!(cancelled.load(Ordering::Acquire));
     assert_eq!(latch.observed(), None);
+}
+
+#[test]
+fn internal_gateway_error_is_grpc_internal_on_every_native_grpc_builder() {
+    // #6773: `GrpcProxyError::Internal` is a gateway-side construction failure
+    // (backend TLS config, invalid backend URL/authority), not a transient
+    // backend outage. Every native-gRPC terminal builder must answer INTERNAL
+    // (13) with the shared fixed message; UNAVAILABLE (14) would invite
+    // clients to retry a deterministic gateway fault.
+    use ferrum_edge::proxy::grpc_proxy::grpc_status;
+    assert_eq!(grpc_status::INTERNAL, 13);
+    assert_eq!(grpc_status::UNAVAILABLE, 14);
+
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        proxy.contains("GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::INTERNAL,"),
+        "HTTP/1.1-HTTP/2 native-gRPC builder must map Internal to INTERNAL"
+    );
+    assert!(
+        !proxy.contains("GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::UNAVAILABLE"),
+        "HTTP/1.1-HTTP/2 native-gRPC builder must not map Internal to UNAVAILABLE"
+    );
+    assert!(
+        proxy.contains("GrpcProxyError::Internal(_) => GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE,"),
+        "HTTP/1.1-HTTP/2 builder must use the shared INTERNAL message"
+    );
+    let h3 = include_str!("../../../src/http3/cross_protocol.rs");
+    assert_eq!(
+        h3.matches("grpc_proxy::GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE")
+            .count(),
+        2,
+        "both HTTP/3 native-gRPC builders must use the shared INTERNAL message"
+    );
+}
+
+#[test]
+fn h3_grpc_bridge_internal_failure_is_backend_health_neutral() {
+    // #6773 review: a gateway-side construction failure on the H3→gRPC bridge
+    // must not trip the breaker / passive health / adaptive concurrency, as on
+    // HTTP/1.1-HTTP/2 (neutral) and native HTTP/3.
+    use ferrum_edge::_test_support::{
+        error_class_is_health_neutral_for_test, grpc_bridge_failure_health_for_test,
+    };
+    use ferrum_edge::retry::ErrorClass;
+
+    let internal = grpc_proxy::GrpcProxyError::Internal("bad backend CA".to_string());
+    let (status, class) = grpc_bridge_failure_health_for_test(&internal, ErrorClass::RequestError);
+    assert_eq!(status, 500);
+    assert_eq!(class, ErrorClass::DispatchPolicyRejected);
+    assert!(error_class_is_health_neutral_for_test(class));
+
+    let unavailable = grpc_proxy::GrpcProxyError::backend_unavailable(
+        grpc_proxy::GrpcBackendUnavailableKind::Connect,
+        "refused".to_string(),
+    );
+    assert_eq!(
+        grpc_bridge_failure_health_for_test(&unavailable, ErrorClass::ConnectionRefused),
+        (502, ErrorClass::ConnectionRefused),
+        "a real backend failure keeps training backend health"
+    );
+
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    assert_eq!(
+        bridge
+            .matches("grpc_bridge_failure_health(&err, error_class)")
+            .count(),
+        2,
+        "buffered and streaming H3→gRPC bridge arms must both settle health through the helper"
+    );
+}
+
+#[test]
+fn native_h3_grpc_connect_timeout_is_deadline_exceeded() {
+    // A native-H3 backend connect timeout (or post-wire QUIC idle timeout) is
+    // a backend deadline: DEADLINE_EXCEEDED like the HTTP/1.1-HTTP/2
+    // `BackendTimeout` mapping, not UNAVAILABLE.
+    let server = include_str!("../../../src/http3/server.rs");
+    assert!(server.contains(
+        "is_read_timeout || h3_error_class == crate::retry::ErrorClass::ConnectionTimeout"
+    ));
+    assert!(server.contains("} else if is_backend_timeout {"));
 }

@@ -211,6 +211,87 @@ async fn multipart_exploded_free_form_object_and_nested_array_are_converted() {
     );
 }
 
+/// GHSA-v3j5-v4vg-qg4w: a non-object form or multipart schema describes one
+/// value. A body with a single field name is converted and validated; a body
+/// with several field names fails closed instead of validating whichever field
+/// the per-request hash map yields first.
+#[tokio::test]
+async fn non_object_form_and_multipart_schemas_admit_exactly_one_field_name() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/scalar",
+            "path_regex": "^/scalar$",
+            "request_body": {
+                "content": {
+                    "application/x-www-form-urlencoded": {"type": "string", "const": "ok"},
+                    "multipart/form-data": {"type": "string", "const": "ok"}
+                }
+            }
+        }]
+    }))
+    .unwrap();
+
+    let form = content_type_headers("application/x-www-form-urlencoded");
+    let mut ctx = post_ctx("/scalar");
+    ctx.headers = form.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &form, b"a=ok")
+            .await,
+    );
+    let mut ctx = post_ctx("/scalar");
+    ctx.headers = form.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &form, b"a=bad")
+            .await,
+        Some(400),
+    );
+    // Every ordering of a conforming and a non-conforming field is refused,
+    // on every attempt.
+    for body in ["a=ok&b=bad", "b=bad&a=ok", "a=bad&b=ok", "a=ok&b=ok"] {
+        for _ in 0..8 {
+            let mut ctx = post_ctx("/scalar");
+            ctx.headers = form.clone();
+            assert_reject(
+                plugin
+                    .on_final_request_body_with_context(&mut ctx, &form, body.as_bytes())
+                    .await,
+                Some(400),
+            );
+        }
+    }
+
+    let multipart = content_type_headers("multipart/form-data; boundary=abc");
+    let single = concat!(
+        "--abc\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nok\r\n",
+        "--abc--\r\n"
+    );
+    let mut ctx = post_ctx("/scalar");
+    ctx.headers = multipart.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &multipart, single.as_bytes())
+            .await,
+    );
+    let two = concat!(
+        "--abc\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nok\r\n",
+        "--abc\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\nbad\r\n",
+        "--abc--\r\n"
+    );
+    for _ in 0..8 {
+        let mut ctx = post_ctx("/scalar");
+        ctx.headers = multipart.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &multipart, two.as_bytes())
+                .await,
+            Some(400),
+        );
+    }
+}
+
 #[test]
 fn multiple_exploded_free_form_objects_are_rejected_as_ambiguous() {
     let result = OpenapiValidator::new(&json!({
@@ -704,7 +785,7 @@ async fn literal_path_beats_parameter_path() {
 async fn bypass_header_skips_buffering_and_validation() {
     let config = json!({
         "schema_draft": "draft7",
-        "bypass": {"header_present": {"x-bypass-validator": null}},
+        "bypass": {"header_present": {"x-bypass-validator": "bypass-secret-0123456789"}},
         "operations": [{
             "method": "POST",
             "path_template": "/items",
@@ -714,8 +795,10 @@ async fn bypass_header_skips_buffering_and_validation() {
     });
     let plugin = OpenapiValidator::new(&config).unwrap();
     let mut ctx = post_ctx("/items");
-    ctx.headers
-        .insert("x-bypass-validator".to_string(), "1".to_string());
+    ctx.headers.insert(
+        "x-bypass-validator".to_string(),
+        "bypass-secret-0123456789".to_string(),
+    );
     let mut headers = ctx.headers.clone();
 
     assert!(!plugin.should_buffer_request_body(&ctx));
@@ -739,7 +822,7 @@ async fn bypass_header_skips_buffering_and_validation() {
 async fn bypass_header_uses_before_proxy_headers_when_ctx_headers_are_moved() {
     let config = json!({
         "schema_draft": "draft7",
-        "bypass": {"header_present": {"x-bypass-validator": null}},
+        "bypass": {"header_present": {"x-bypass-validator": "bypass-secret-0123456789"}},
         "operations": [{
             "method": "POST",
             "path_template": "/items",
@@ -750,8 +833,10 @@ async fn bypass_header_uses_before_proxy_headers_when_ctx_headers_are_moved() {
     });
     let plugin = OpenapiValidator::new(&config).unwrap();
     let mut ctx = post_ctx("/missing");
-    ctx.headers
-        .insert("x-bypass-validator".to_string(), "1".to_string());
+    ctx.headers.insert(
+        "x-bypass-validator".to_string(),
+        "bypass-secret-0123456789".to_string(),
+    );
     let mut headers = std::mem::take(&mut ctx.headers);
 
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
@@ -6451,8 +6536,14 @@ async fn multipart_preserves_non_utf8_file_bytes_for_metadata_validation() {
 #[test]
 fn composed_scalar_validators_are_precompiled_outside_request_conversion() {
     let source = include_str!("../../../src/plugins/openapi_validator.rs");
+    // Every validator is built by the one schema-draft compiler, which asserts
+    // `format` under every draft selector.
+    assert!(
+        !source.contains("jsonschema::validator_for("),
+        "validator construction must stay inside the schema-draft compiler"
+    );
     assert_eq!(
-        source.matches("jsonschema::validator_for(schema)").count(),
+        source.matches(".should_validate_formats(true)").count(),
         1,
         "validator construction must stay inside the schema-draft compiler"
     );
@@ -7868,7 +7959,7 @@ fn case_equivalent_duplicate_bypass_headers_are_rejected() {
     let error = config_error(json!({
         "bypass": {
             "header_present": {
-                "X-Policy": "strict-token",
+                "X-Policy": "strict-token-0123456789",
                 "x-policy": null
             }
         },
@@ -7930,7 +8021,7 @@ fn case_equivalent_duplicate_multipart_encoding_headers_are_rejected() {
 #[tokio::test]
 async fn bypass_header_matching_remains_case_insensitive() {
     let plugin = OpenapiValidator::new(&json!({
-        "bypass": {"header_present": {"x-bypass-validator": null}},
+        "bypass": {"header_present": {"x-bypass-validator": "bypass-secret-0123456789"}},
         "operations": [{
             "method": "POST",
             "path_template": "/items",
@@ -7944,8 +8035,10 @@ async fn bypass_header_matching_remains_case_insensitive() {
     .unwrap();
 
     let mut ctx = post_ctx("/items");
-    ctx.headers
-        .insert("X-Bypass-Validator".to_string(), "any-value".to_string());
+    ctx.headers.insert(
+        "X-Bypass-Validator".to_string(),
+        "bypass-secret-0123456789".to_string(),
+    );
     let mut headers = ctx.headers.clone();
 
     assert!(!plugin.should_buffer_request_body(&ctx));
@@ -7955,6 +8048,140 @@ async fn bypass_header_matching_remains_case_insensitive() {
             .get("openapi_validator.skip_reason")
             .map(String::as_str),
         Some("bypass_header")
+    );
+}
+
+fn bypass_header_config(value: Value) -> Value {
+    json!({
+        "bypass": {"header_present": {"x-bypass-validator": value}},
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {
+                "content": {"application/json": {"type": "object"}}
+            },
+            "responses": {"200": {"application/json": {"type": "object"}}}
+        }]
+    })
+}
+
+#[test]
+fn bypass_header_requires_a_secret_value() {
+    // Presence alone is never a bypass: any client can send any header name.
+    let error = config_error(bypass_header_config(Value::Null));
+    assert!(
+        error.contains("bypass.header_present") && error.contains("secret string"),
+        "presence-only bypass must be rejected: {error}"
+    );
+    let error = config_error(bypass_header_config(json!("1")));
+    assert!(
+        error.contains("at least 16 bytes"),
+        "a short bypass secret must be rejected: {error}"
+    );
+    for invalid in [
+        " bypass-secret-0123456789",
+        "bypass-secret 0123456789",
+        "bypass-secret-0123456789\r\n",
+        "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
+    ] {
+        let error = config_error(bypass_header_config(json!(invalid)));
+        assert!(
+            error.contains("visible ASCII"),
+            "bypass secret {invalid:?} must be rejected: {error}"
+        );
+    }
+    let error = config_error(bypass_header_config(json!("x".repeat(4097))));
+    assert!(
+        error.contains("at most 4096 bytes"),
+        "an oversized bypass secret must be rejected: {error}"
+    );
+}
+
+#[tokio::test]
+async fn bypass_header_with_wrong_value_does_not_skip_validation() {
+    const SECRET: &str = "bypass-secret-0123456789";
+    let mut config = attestation_config("block");
+    config["bypass"] = json!({"header_present": {"x-bypass-validator": SECRET}});
+    let plugin = OpenapiValidator::new(&config).unwrap();
+    // Missing `client_attestation`: violates the contract.
+    let invalid_body: &[u8] = br#"{"id":"a"}"#;
+
+    for presented in [
+        "1",
+        "",
+        "bypass-secret-012345678",
+        "bypass-secret-0123456780",
+        "bypass-secret-01234567890",
+        "BYPASS-SECRET-0123456789",
+    ] {
+        let mut headers = json_headers();
+        headers.insert("x-bypass-validator".to_string(), presented.to_string());
+
+        let mut ctx = orders_ctx();
+        ctx.headers = headers.clone();
+        assert!(
+            plugin.should_buffer_request_body(&ctx),
+            "value {presented:?} must not skip request buffering"
+        );
+        assert_reject(
+            plugin
+                .validate_client_request_body_contract(&mut ctx, &headers, invalid_body)
+                .await,
+            Some(400),
+        );
+        assert_ne!(skip_reason(&ctx), Some("bypass_header"));
+
+        // The backend-final phase does not bypass on a wrong value either.
+        let mut ctx = orders_ctx();
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, invalid_body)
+                .await,
+            None,
+        );
+        assert_ne!(skip_reason(&ctx), Some("bypass_header"));
+    }
+
+    // The configured secret skips both phases.
+    let mut headers = json_headers();
+    headers.insert("x-bypass-validator".to_string(), SECRET.to_string());
+    let mut ctx = orders_ctx();
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &headers, invalid_body)
+            .await,
+    );
+    assert_eq!(skip_reason(&ctx), Some("bypass_header"));
+    let mut ctx = orders_ctx();
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, invalid_body)
+            .await,
+    );
+}
+
+#[test]
+fn bypass_header_names_are_redacted() {
+    let plugin = OpenapiValidator::new(&json!({
+        "bypass": {"header_present": {
+            "X-Bypass-Validator": "bypass-secret-0123456789",
+            "x-alt-bypass": "another-secret-0123456789"
+        }},
+        "operations": [{
+            "method": "GET",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {"200": {"application/json": {"type": "object"}}}
+        }]
+    }))
+    .unwrap();
+    assert_eq!(
+        plugin.request_headers_to_redact(),
+        &["x-alt-bypass", "x-bypass-validator"]
     );
 }
 
@@ -9540,10 +9767,14 @@ async fn disabled_mode_never_enters_the_client_phase() {
 #[tokio::test]
 async fn bypass_still_short_circuits_the_client_phase() {
     let mut config = attestation_config("block");
-    config["bypass"] = json!({"header_present": {"x-bypass-validator": null}});
+    config["bypass"] =
+        json!({"header_present": {"x-bypass-validator": "bypass-secret-0123456789"}});
     let plugin = OpenapiValidator::new(&config).unwrap();
     let mut headers = json_headers();
-    headers.insert("x-bypass-validator".to_string(), "1".to_string());
+    headers.insert(
+        "x-bypass-validator".to_string(),
+        "bypass-secret-0123456789".to_string(),
+    );
     let mut ctx = orders_ctx();
     ctx.headers = headers.clone();
     assert!(!plugin.should_buffer_request_body(&ctx));
@@ -9627,9 +9858,10 @@ fn h1_h2_and_h3_run_the_same_client_contract_phase() {
 // ---------------------------------------------------------------------------
 // XML document nesting bounds (issue #4520)
 //
-// `roxmltree`'s tokenizer recurses once per open element, so the depth screen
-// runs over the raw bytes before `Document::parse` ever sees them. These tests
-// therefore run safely under the default test profile's 2 MiB thread stack.
+// The depth screen runs over the raw bytes before `Document::parse` ever sees
+// them (`roxmltree` before 0.21.2 recursed once per open element). These tests
+// run under the default test profile's 2 MiB thread stack; the 199-level
+// multipart case is the one roxmltree 0.21.1 overflowed (issue #6590).
 // ---------------------------------------------------------------------------
 
 const XML_DEPTH_ERROR: &str = "XML document nesting exceeds the supported depth";
@@ -10157,4 +10389,202 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             );
         }
     }
+}
+
+/// Issue #6612 sibling audit: `max_body_bytes` is also the per-layer decoded
+/// ceiling with amplification checks off, so it carries a hard admission
+/// ceiling instead of the whole u64 domain.
+#[test]
+fn max_body_bytes_has_a_hard_admission_ceiling() {
+    let mut config = validator_config("block");
+    config["max_body_bytes"] = json!(64 * 1024 * 1024);
+    assert!(OpenapiValidator::new(&config).is_ok());
+    for value in [64 * 1024 * 1024 + 1_u64, u64::MAX] {
+        config["max_body_bytes"] = json!(value);
+        let error = match OpenapiValidator::new(&config) {
+            Ok(_) => panic!("max_body_bytes={value} must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("max_body_bytes"), "{error}");
+    }
+}
+
+// ──────── PR6848-MUSE-1: gateway `zstd` (RFC 9659) is validated, not rejected ────────
+
+fn zstd_bytes(body: &[u8]) -> Vec<u8> {
+    zstd::stream::encode_all(body, 3).expect("zstd encode")
+}
+
+/// `compression` can now emit `zstd` responses and accept `zstd` uploads for an
+/// instance that opts in. The validator must decode them (through the charged
+/// strict decoder) and validate the decoded document in `block` mode — and
+/// still reject a schema violation, proving validation ran over decoded bytes.
+#[tokio::test]
+async fn zstd_bodies_are_decoded_and_validated_in_block_mode() {
+    let plugin = OpenapiValidator::new(&validator_config("block")).unwrap();
+
+    for (body, accepted) in [
+        (zstd_bytes(br#"{"name":"book"}"#), true),
+        (zstd_bytes(br#"{"name":42}"#), false),
+    ] {
+        let headers = encoding_headers("zstd");
+        let mut ctx = post_ctx("/items");
+        ctx.headers = headers.clone();
+        let client_phase = plugin
+            .validate_client_request_body_contract(&mut ctx, &headers, &body)
+            .await;
+        let mut ctx = post_ctx("/items");
+        let final_phase = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await;
+        if accepted {
+            assert_continue(client_phase);
+            assert_continue(final_phase);
+        } else {
+            assert_reject(client_phase, Some(400));
+            assert_reject(final_phase, Some(400));
+        }
+    }
+
+    for (body, accepted) in [
+        (zstd_bytes(br#"{"ok":true}"#), true),
+        (zstd_bytes(br#"{"ok":"not-a-boolean"}"#), false),
+    ] {
+        let mut ctx = post_ctx("/items");
+        let result = plugin
+            .on_final_response_body(&mut ctx, 200, &encoding_headers("zstd"), &body)
+            .await;
+        if accepted {
+            assert_continue(result);
+        } else {
+            assert_reject(result, Some(502));
+        }
+    }
+
+    // Stacked with gzip, decoded in reverse application order.
+    let mut ctx = post_ctx("/items");
+    assert_continue(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &encoding_headers("zstd, gzip"),
+                &gzip_bytes(&zstd_bytes(br#"{"ok":true}"#)),
+            )
+            .await,
+    );
+
+    // Not a zstd frame: still the fixed, payload-free decode refusal.
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &encoding_headers("zstd"),
+                br#"{"name":"book"}"#,
+            )
+            .await,
+        Some(400),
+    );
+    assert_eq!(
+        request_error(&ctx),
+        Some("Content-Encoding could not be decoded")
+    );
+}
+
+/// PR6848-MUSE-1 composition: the bytes and headers `compression` actually
+/// produces for an opted-in `zstd` client reach the validator's final response
+/// hook (which runs after transport encoding) and are accepted.
+#[tokio::test]
+async fn gateway_zstd_compression_output_passes_response_validation() {
+    use ferrum_edge::plugins::compression::CompressionPlugin;
+
+    let compression = CompressionPlugin::new(&json!({
+        "algorithms": ["zstd", "gzip"],
+        "min_content_length": 1
+    }))
+    .unwrap();
+    let validator = OpenapiValidator::new(&validator_config("block")).unwrap();
+
+    let mut ctx = post_ctx("/items");
+    ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
+    ctx.headers
+        .insert("accept-encoding".to_string(), "zstd".to_string());
+    let mut request_headers = ctx.headers.clone();
+    compression
+        .before_proxy(&mut ctx, &mut request_headers)
+        .await;
+
+    let plaintext = br#"{"ok":true}"#;
+    let mut response_headers = json_headers();
+    response_headers.insert("content-length".to_string(), plaintext.len().to_string());
+    assert_continue(
+        compression
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
+    assert_eq!(
+        response_headers.get("content-encoding").map(String::as_str),
+        Some("zstd")
+    );
+    let encoded = compression
+        .transform_response_body_with_context(
+            &mut ctx,
+            plaintext,
+            Some("application/json"),
+            &response_headers,
+        )
+        .await
+        .expect("committed zstd is produced");
+
+    assert_continue(
+        validator
+            .on_final_response_body(&mut ctx, 200, &response_headers, &encoded)
+            .await,
+    );
+}
+
+/// GHSA-rxwj-x6c6-f4j5: `bypass.consumers` names mapped Consumers only. An
+/// external principal whose identity equals a bypassed Consumer's username is
+/// still validated.
+#[tokio::test]
+async fn bypass_consumers_match_mapped_consumers_only() {
+    let config = json!({
+        "schema_draft": "draft7",
+        "bypass": {"consumers": ["security-scanner"]},
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {"content": {"application/json": {"type": "object"}}}
+        }]
+    });
+    let plugin = OpenapiValidator::new(&config).unwrap();
+    let into_post = |mut ctx: RequestContext| {
+        ctx.method = "POST".to_string();
+        ctx.path = "/items".to_string();
+        ctx.headers = json_headers();
+        ctx
+    };
+
+    let external = into_post(super::plugin_utils::committed_external_identity_context(
+        "security-scanner",
+        "jwks_auth",
+    ));
+    assert!(
+        plugin.should_buffer_request_body(&external),
+        "an external identity must not inherit a Consumer bypass"
+    );
+
+    let mut consumer = into_post(super::plugin_utils::consumer_context("security-scanner"));
+    assert!(!plugin.should_buffer_request_body(&consumer));
+    let mut headers = consumer.headers.clone();
+    assert_continue(plugin.before_proxy(&mut consumer, &mut headers).await);
+    assert_eq!(
+        consumer
+            .metadata
+            .get("openapi_validator.skip_reason")
+            .map(String::as_str),
+        Some("bypass_consumer")
+    );
 }

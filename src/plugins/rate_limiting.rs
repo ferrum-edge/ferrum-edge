@@ -17,17 +17,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::utils::mcp_jsonrpc::{self, RequestScan};
+use super::utils::principal::{self, Principal};
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_BODY,
     ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
     RateLimitBackend, RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
-    apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
-    validate_max_requests, validate_window_seconds,
+    debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys, validate_max_requests,
+    validate_window_seconds,
 };
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::util::unknown_keys::reject_unknown_keys;
 
-const MAX_STATE_ENTRIES: usize = 100_000;
+/// Default cap on distinct local (and Redis-fallback) keys per policy
+/// instance (`max_state_entries`).
+pub const DEFAULT_MAX_STATE_ENTRIES: usize = 100_000;
+/// Largest accepted `max_state_entries`. Per-key state is fixed-size (token
+/// bucket scalars, or one 64-bucket `u64` ring — about half a KiB — per
+/// sliding window), so the cap is what an operator sizes memory with; this
+/// ceiling keeps one policy from asking for unbounded memory.
+pub const MAX_MAX_STATE_ENTRIES: usize = 10_000_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// Bounds below-cap full-map scans under high RPS. Sampled over-cap
 /// reclaim skips this cooldown so a sampled observation of pressure can
@@ -35,6 +43,8 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// budgets are never force-evicted.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const RATE_LIMIT_IDENTITY_HEADER: &str = "x-ratelimit-identity";
+/// Standard backoff header every quota `429` carries (RFC 9110 §10.2.3).
+const RETRY_AFTER_HEADER: &str = "retry-after";
 
 /// Shared request-metadata key naming which composed `rate_limiting` instance
 /// currently owns the single public `x-ratelimit-*` header set.
@@ -167,6 +177,7 @@ const RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] = &[
     "expose_headers",
     "limits",
     "mcp_tool_calls",
+    "max_state_entries",
 ];
 
 /// Closed key set for the optional `mcp_tool_calls` object.
@@ -212,6 +223,7 @@ pub const RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "expose_headers",
     "limits",
     "mcp_tool_calls",
+    "max_state_entries",
     // Shared Redis sync (see RATE_LIMIT_REDIS_CONFIG_KEYS)
     "sync_mode",
     "redis_url",
@@ -230,6 +242,9 @@ enum LimitBy {
     Ip,
     Consumer,
     SpiffeIdentity,
+    /// One constant key per policy: every caller shares one aggregate budget
+    /// (a route / service / global request rate), independent of identity.
+    Service,
 }
 
 impl LimitBy {
@@ -242,9 +257,18 @@ impl LimitBy {
             Self::Ip => "ip",
             Self::Consumer => "consumer",
             Self::SpiffeIdentity => "spiffe_identity",
+            Self::Service => "service",
         }
     }
 }
+
+/// The single key every caller of a `limit_by: service` policy charges.
+///
+/// It cannot equal any per-caller key (`ip:` / `consumer:` / `external:` / `spiffe:` /
+/// `tool:<len>:` all carry a colon-terminated prefix this lacks), and the
+/// policy's own local state and default Redis prefix already isolate it from
+/// every other policy, so one constant is enough.
+const SERVICE_RATE_LIMIT_KEY: &str = "service";
 
 /// `mcp_tool_calls`: count MCP `tools/call` requests instead of HTTP requests.
 struct McpToolCallCounting {
@@ -281,8 +305,9 @@ impl McpToolCallCounting {
 enum McpToolCallPlan {
     /// No counted `tools/call`: the request passes uncounted.
     Skip,
-    /// The body may call a tool but cannot be counted faithfully.
-    Refuse,
+    /// The body may call a tool but cannot be counted faithfully. Carries the
+    /// `ratelimit_mcp_uninspectable` metadata value naming why.
+    Refuse(&'static str),
     /// One charge per entry, in wire order. `Some(name)` charges that tool's
     /// own budget (`per_tool`).
     Charge {
@@ -318,16 +343,19 @@ pub struct RateLimiting {
     expose_headers: bool,
     /// `Some` when this instance counts MCP `tools/call` requests.
     mcp_tool_calls: Option<McpToolCallCounting>,
+    /// Hard cap on distinct local (and Redis-fallback) keys
+    /// (`max_state_entries`). Read per admission, never fingerprinted: a
+    /// resize keeps the live budgets.
+    max_state_entries: usize,
     default_limit: DynamicRateLimitOp,
     consumer_overrides: HashMap<String, DynamicRateLimitOp>,
     limiter: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm>,
-    request_counter: AtomicU64,
+    request_counter: crossbeam_utils::CachePadded<AtomicU64>,
     epoch_base: Instant,
     last_periodic_sweep_secs: AtomicU64,
 }
 
 impl RateLimiting {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
     }
@@ -372,9 +400,6 @@ impl RateLimiting {
                 config = config.to_string()
             )
         })?;
-        // Legacy root window fields get their own actionable diagnostic before
-        // the closed-key sweep would report them as merely "unknown".
-        reject_legacy_window_fields(object)?;
         // Keeps the documented key groups aligned with the closed root
         // allowlist used for admission and OpenAPI parity.
         debug_assert_rate_limit_redis_keys();
@@ -412,6 +437,7 @@ impl RateLimiting {
             }
         };
         let expose_headers = parse_optional_bool(object, "expose_headers")?.unwrap_or(false);
+        let max_state_entries = parse_max_state_entries(object)?;
 
         let parsed_limits = parse_limits(object)?;
         let mcp_tool_calls = parse_mcp_tool_calls(object)?;
@@ -469,10 +495,11 @@ impl RateLimiting {
             ipv6_prefix,
             expose_headers,
             mcp_tool_calls,
+            max_state_entries,
             default_limit: parsed_limits.default_limit,
             consumer_overrides: parsed_limits.consumer_overrides,
             limiter,
-            request_counter: AtomicU64::new(0),
+            request_counter: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
         })
@@ -495,8 +522,9 @@ impl RateLimiting {
     }
 
     /// Effective `redis_failure_policy` for advisory coverage: `None` for a
-    /// local-only config, `FailClosed` unless the operator opted into
-    /// `local_fallback`. Not a production API.
+    /// local-only config; otherwise the effective policy (`LocalFallback` by
+    /// default for `rate_limiting`, `FailClosed` when the operator set
+    /// `redis_failure_policy: fail_closed`). Not a production API.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn redis_failure_policy_for_test(
         &self,
@@ -523,7 +551,6 @@ impl RateLimiting {
     /// Lets composition tests drive a real `503` through `on_request_received`
     /// with a live `RequestContext`, instead of only through the key-level
     /// helper below. Not a production API.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn mark_redis_unavailable_for_test(&self) -> bool {
         match self.limiter.redis_client_arc_for_test() {
             Some(client) => {
@@ -540,7 +567,6 @@ impl RateLimiting {
     ///
     /// Exercises the production [`Self::reject`] mapping so the fail-closed
     /// status/body cannot drift from the outage path. Not a production API.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) async fn refusal_under_redis_outage_for_test(
         &self,
         key: &str,
@@ -554,7 +580,7 @@ impl RateLimiting {
                 key.to_string(),
                 || key.to_string(),
                 &self.default_limit,
-                MAX_STATE_ENTRIES,
+                self.max_state_entries,
             )
             .await
         else {
@@ -620,20 +646,14 @@ impl RateLimiting {
     }
 
     /// Invoke the production cleanup wrapper at `now`. Test-only.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn maybe_evict_stale_entries_at_for_test(&self, now: Instant) {
         self.maybe_evict_stale_entries_at(now);
     }
 
-    /// Exercise the shared prune/enforce branch with a testable cap. Test-only.
+    /// Run the shared idle-state prune at `now`. Test-only.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
-    pub(crate) fn apply_cleanup_branch_for_test(
-        &self,
-        now: Instant,
-        over_capacity: bool,
-        max_entries: usize,
-    ) {
-        apply_rate_limit_cleanup(&self.limiter, max_entries, now, over_capacity);
+    pub(crate) fn prune_stale_for_test(&self, now: Instant) {
+        self.limiter.prune_stale_at(now);
     }
 
     #[allow(dead_code)] // used only by external tests; dead in binary test target
@@ -642,18 +662,24 @@ impl RateLimiting {
     }
 
     fn maybe_evict_stale_entries(&self) {
-        self.maybe_evict_stale_entries_at(Instant::now());
-    }
-
-    fn maybe_evict_stale_entries_at(&self, now: Instant) {
-        // Sample every 1024 requests before any tracked_keys_count /
-        // cleanup work so the hot path avoids capacity bookkeeping on every
-        // request. Entry counts are atomic (not DashMap::len()).
+        // Sample every 1024 requests BEFORE taking `Instant::now()` so the hot
+        // path avoids a clock read and capacity bookkeeping on 1023/1024 requests.
         let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
         if !request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {
             return;
         }
+        self.evict_stale_entries_sampled_at(Instant::now());
+    }
 
+    fn maybe_evict_stale_entries_at(&self, now: Instant) {
+        let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
+        if !request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {
+            return;
+        }
+        self.evict_stale_entries_sampled_at(now);
+    }
+
+    fn evict_stale_entries_sampled_at(&self, now: Instant) {
         let len = self.limiter.tracked_keys_count();
         if len == 0 {
             return;
@@ -664,8 +690,8 @@ impl RateLimiting {
         // budgets are never force-evicted; hard cardinality is enforced by
         // atomic admission reservation. The below-cap cooldown must not
         // suppress this branch once pressure is seen on a sampled pass.
-        if len > MAX_STATE_ENTRIES {
-            apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
+        if len > self.max_state_entries {
+            self.limiter.prune_stale_at(now);
             self.last_periodic_sweep_secs
                 .store(now_secs, Ordering::Release);
             return;
@@ -686,14 +712,17 @@ impl RateLimiting {
             return;
         }
 
-        apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, false);
+        self.limiter.prune_stale_at(now);
     }
 
     fn request_key(&self, ctx: &RequestContext) -> String {
         match self.limit_by {
+            // A mapped Consumer and an unmapped external principal never share
+            // a bucket, and neither do two realms that issue the same subject
+            // (GHSA-rxwj-x6c6-f4j5).
             LimitBy::Consumer => {
-                if let Some(identity) = ctx.effective_identity() {
-                    return prefixed_key("consumer:", identity);
+                if let Some(principal) = Principal::of_request(ctx) {
+                    return principal.key();
                 }
             }
             LimitBy::SpiffeIdentity => {
@@ -701,6 +730,7 @@ impl RateLimiting {
                     return prefixed_key("spiffe:", spiffe_id.as_str());
                 }
             }
+            LimitBy::Service => return SERVICE_RATE_LIMIT_KEY.to_string(),
             LimitBy::Ip => {}
         }
 
@@ -708,9 +738,10 @@ impl RateLimiting {
     }
 
     fn request_limit_op(&self, ctx: &RequestContext) -> &DynamicRateLimitOp {
+        // `scope: consumers` overrides name mapped Consumers only.
         if self.limit_by == LimitBy::Consumer
-            && let Some(identity) = ctx.effective_identity()
-            && let Some(limit) = self.consumer_overrides.get(identity)
+            && let Some(username) = principal::consumer_username(ctx)
+            && let Some(limit) = self.consumer_overrides.get(username)
         {
             return limit;
         }
@@ -721,8 +752,8 @@ impl RateLimiting {
     fn stream_key(&self, ctx: &super::StreamConnectionContext) -> String {
         match self.limit_by {
             LimitBy::Consumer => {
-                if let Some(identity) = ctx.effective_identity() {
-                    return prefixed_key("consumer:", identity);
+                if let Some(principal) = Principal::of_stream(ctx) {
+                    return principal.key();
                 }
             }
             LimitBy::SpiffeIdentity => {
@@ -734,6 +765,7 @@ impl RateLimiting {
                     return prefixed_key("spiffe:", spiffe_id);
                 }
             }
+            LimitBy::Service => return SERVICE_RATE_LIMIT_KEY.to_string(),
             LimitBy::Ip => {}
         }
 
@@ -742,8 +774,8 @@ impl RateLimiting {
 
     fn stream_limit_op(&self, ctx: &super::StreamConnectionContext) -> &DynamicRateLimitOp {
         if self.limit_by == LimitBy::Consumer
-            && let Some(identity) = ctx.effective_identity()
-            && let Some(limit) = self.consumer_overrides.get(identity)
+            && let Some(username) = principal::stream_consumer_username(ctx)
+            && let Some(limit) = self.consumer_overrides.get(username)
         {
             return limit;
         }
@@ -769,24 +801,34 @@ impl RateLimiting {
             };
         }
 
+        // `Retry-After` is the standard backoff contract HTTP clients and SDKs
+        // honour on their own, so it rides every quota `429` whether or not
+        // `expose_headers` publishes the budget telemetry. It names when the
+        // refusing window frees budget again (absent further traffic): exact
+        // for the local token bucket and sliding aggregate, a conservative
+        // upper bound for the Redis ladder.
+        let mut headers = self.refusal_headers(outcome);
+        if let Some(retry_after) = outcome.retry_after_seconds {
+            headers.insert(RETRY_AFTER_HEADER.to_string(), retry_after.to_string());
+        }
         PluginResult::Reject {
             status_code: 429,
             body: r#"{"error":"Rate limit exceeded"}"#.into(),
-            headers: self.refusal_headers(outcome),
+            headers,
         }
     }
 
     /// The `x-ratelimit-*` headers a quota refusal carries (none unless
     /// `expose_headers`).
     fn refusal_headers(&self, outcome: &RateLimitOutcome) -> HashMap<String, String> {
-        let mut headers = HashMap::with_capacity(3);
+        let mut headers = HashMap::with_capacity(4);
         if self.expose_headers {
             if let Some(limit) = outcome.limit {
-                headers.insert("x-ratelimit-limit".to_string(), limit.to_string());
+                headers.insert(RATELIMIT_LIMIT_HEADER.to_string(), limit.to_string());
             }
-            headers.insert("x-ratelimit-remaining".to_string(), "0".to_string());
+            headers.insert(RATELIMIT_REMAINING_HEADER.to_string(), "0".to_string());
             if let Some(window) = outcome.window_seconds {
-                headers.insert("x-ratelimit-window".to_string(), window.to_string());
+                headers.insert(RATELIMIT_WINDOW_HEADER.to_string(), window.to_string());
             }
         }
         headers
@@ -822,15 +864,23 @@ impl RateLimiting {
         // injected onto the downstream response by after_proxy and disclose the
         // gateway's internal consumer/SPIFFE identity to the client.
         self.claim_published_headers(ctx, authority);
+        // Stage each published value twice: in the public metadata that
+        // `before_proxy` / `after_proxy` render, and as private provenance so
+        // replay partitions can recognize the forwarded per-request counter
+        // without trusting plugin-writable metadata.
         if let Some(limit) = outcome.limit {
-            ctx.metadata
-                .insert("ratelimit_limit".to_string(), limit.to_string());
+            let limit = limit.to_string();
+            ctx.stage_published_rate_limit_header(RATELIMIT_LIMIT_HEADER, limit.clone());
+            ctx.metadata.insert("ratelimit_limit".to_string(), limit);
         }
+        let remaining = remaining.to_string();
+        ctx.stage_published_rate_limit_header(RATELIMIT_REMAINING_HEADER, remaining.clone());
         ctx.metadata
-            .insert("ratelimit_remaining".to_string(), remaining.to_string());
+            .insert("ratelimit_remaining".to_string(), remaining);
         if let Some(window) = outcome.window_seconds {
-            ctx.metadata
-                .insert("ratelimit_window".to_string(), window.to_string());
+            let window = window.to_string();
+            ctx.stage_published_rate_limit_header(RATELIMIT_WINDOW_HEADER, window.clone());
+            ctx.metadata.insert("ratelimit_window".to_string(), window);
         }
     }
 
@@ -843,6 +893,7 @@ impl RateLimiting {
         for &(meta_key, _) in EXPOSED_RATELIMIT_HEADERS {
             ctx.metadata.remove(meta_key);
         }
+        ctx.clear_published_rate_limit_headers();
         ctx.metadata
             .insert(RATE_LIMIT_AUTHORITY_KEY.to_string(), authority.encode());
     }
@@ -933,12 +984,7 @@ impl RateLimiting {
         self.maybe_evict_stale_entries();
         let decision = self
             .limiter
-            .check_with_redis_key_and_local_capacity_attributed(
-                key.clone(),
-                || key.clone(),
-                limit_op,
-                MAX_STATE_ENTRIES,
-            )
+            .check_same_key_with_local_capacity_attributed(key, limit_op, self.max_state_entries)
             .await;
         let Some(outcome) = decision.outcome else {
             // A capacity denial carries no budget of its own, and a composed
@@ -997,10 +1043,29 @@ impl RateLimiting {
     /// ([`mcp_jsonrpc::scan_request_bytes`]), so escaped member names count and
     /// an ambiguous or over-bound batch is refused rather than read one way
     /// here and another way downstream.
+    ///
+    /// The strict recognizer's `NoToolCall` is NOT proof that the upstream
+    /// executes no call: it also answers for a body strict UTF-8 JSON cannot
+    /// read at all — UTF-16 / UTF-32, a byte-order mark, `NaN` / `Infinity`,
+    /// comments, trailing commas, invalid UTF-8 — which a lenient upstream
+    /// (Python's `json.loads` on bytes, JSON5) may still decode into a
+    /// `tools/call`. Such a body is refused when
+    /// [`mcp_jsonrpc::may_carry_tool_call`] says it could carry one and it does
+    /// not parse as strict JSON, exactly the test `ai_prompt_shield` applies.
+    /// A body that parses strictly was read faithfully, so its `NoToolCall`
+    /// stands and ordinary call-free traffic (including one that merely
+    /// contains a JSON escape) keeps passing uncounted.
     fn mcp_tool_call_plan(&self, mcp: &McpToolCallCounting, body: &[u8]) -> McpToolCallPlan {
         let (batch, members) = match mcp_jsonrpc::scan_request_bytes(body) {
-            RequestScan::NoToolCall => return McpToolCallPlan::Skip,
-            RequestScan::Uninspectable(_) => return McpToolCallPlan::Refuse,
+            RequestScan::NoToolCall => {
+                if mcp_jsonrpc::may_carry_tool_call(body) && !parses_as_strict_json(body) {
+                    return McpToolCallPlan::Refuse(MCP_UNINSPECTABLE_UNPARSEABLE_BODY);
+                }
+                return McpToolCallPlan::Skip;
+            }
+            RequestScan::Uninspectable(_) => {
+                return McpToolCallPlan::Refuse(MCP_UNINSPECTABLE_AMBIGUOUS_BODY);
+            }
             RequestScan::ToolCalls { batch, members } => (batch, members),
         };
         let charges: Vec<Option<String>> = members
@@ -1049,6 +1114,16 @@ impl RateLimiting {
         {
             return PluginResult::Continue;
         }
+        // A JSON body declared in another charset (UTF-7 is plain ASCII and
+        // still parses) would be counted as one text here and decoded as
+        // another by an upstream that honours the charset — the same refusal
+        // `mcp_gateway` and `ai_prompt_shield` apply (GHSA-4f9m-cfqg-fhx9).
+        if headers
+            .get("content-type")
+            .is_some_and(|value| !mcp_jsonrpc::content_type_charset_is_utf8(value))
+        {
+            return mcp_uninspectable_refusal(ctx, MCP_UNINSPECTABLE_UNSUPPORTED_CHARSET);
+        }
         if headers.get("content-encoding").is_some_and(|value| {
             value
                 .split(',')
@@ -1066,24 +1141,17 @@ impl RateLimiting {
                 HashMap::new(),
             );
         }
+        // An in-scope POST always has a buffered snapshot: this plugin asks for
+        // the body before `before_proxy` and for its raw bytes, so even a body
+        // that is not UTF-8 is retained. A missing snapshot means the body was
+        // never inspected, which is not evidence that it calls no tool.
         let plan = match mcp_request_body(ctx) {
             Some(body) => self.mcp_tool_call_plan(mcp, body),
-            None => McpToolCallPlan::Skip,
+            None => McpToolCallPlan::Refuse(MCP_UNINSPECTABLE_MISSING_BODY),
         };
         let (charges, replies) = match plan {
             McpToolCallPlan::Skip => return PluginResult::Continue,
-            McpToolCallPlan::Refuse => {
-                ctx.metadata.insert(
-                    "ratelimit_mcp_uninspectable".to_string(),
-                    "true".to_string(),
-                );
-                return mcp_jsonrpc_refusal(
-                    &McpReplyShape::default(),
-                    -32600,
-                    "Invalid MCP JSON-RPC request",
-                    HashMap::new(),
-                );
-            }
+            McpToolCallPlan::Refuse(reason) => return mcp_uninspectable_refusal(ctx, reason),
             McpToolCallPlan::Charge { charges, replies } => (charges, replies),
         };
         ctx.metadata.insert(
@@ -1143,17 +1211,12 @@ impl RateLimiting {
         // through the failure policy while that signal still reads available).
         let decision = self
             .limiter
-            .check_with_redis_key_and_local_capacity_attributed(
-                key.clone(),
-                || key.clone(),
-                limit_op,
-                MAX_STATE_ENTRIES,
-            )
+            .check_same_key_with_local_capacity_attributed(key, limit_op, self.max_state_entries)
             .await;
         let Some(outcome) = decision.outcome else {
             if decision.local_fallback {
                 ctx.metadata
-                    .get_or_insert_with(HashMap::new)
+                    .get_or_insert_with(crate::plugins::MetadataMap::default)
                     .insert("ratelimit_local_fallback".to_string(), "true".to_string());
                 super::prometheus_metrics::global_registry()
                     .record_rate_limit_local_fallback_decision();
@@ -1162,7 +1225,7 @@ impl RateLimiting {
         };
         if outcome.local_fallback {
             ctx.metadata
-                .get_or_insert_with(HashMap::new)
+                .get_or_insert_with(crate::plugins::MetadataMap::default)
                 .insert("ratelimit_local_fallback".to_string(), "true".to_string());
             super::prometheus_metrics::global_registry()
                 .record_rate_limit_local_fallback_decision();
@@ -1187,12 +1250,28 @@ impl RateLimiting {
 
 #[async_trait]
 impl Plugin for RateLimiting {
+    /// Starts the Redis failover health observer only once this generation is
+    /// installed, so validation that builds and drops the plugin spawns
+    /// nothing (issue #6616).
+    fn commit_background_tasks(&self) {
+        self.limiter.commit_background_tasks();
+    }
+
     fn name(&self) -> &str {
         "rate_limiting"
     }
 
     fn priority(&self) -> u16 {
         super::priority::RATE_LIMITING
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        let mut hooks =
+            crate::plugins::PluginHooks::BEFORE_PROXY | crate::plugins::PluginHooks::AFTER_PROXY;
+        if self.mcp_tool_calls.is_none() && self.limit_by == LimitBy::Ip {
+            hooks |= crate::plugins::PluginHooks::ON_REQUEST_RECEIVED;
+        }
+        hooks
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -1215,6 +1294,13 @@ impl Plugin for RateLimiting {
 
     /// A tool-call limiter reads the buffered JSON-RPC body in `before_proxy`.
     fn requires_request_body_before_before_proxy(&self) -> bool {
+        self.mcp_tool_calls.is_some()
+    }
+
+    /// A tool-call limiter needs the raw bytes: the proxy publishes the UTF-8
+    /// `request_body` view only for valid UTF-8, so without them a UTF-16 /
+    /// UTF-32 or Latin-1 body would leave nothing to inspect.
+    fn needs_request_body_bytes(&self) -> bool {
         self.mcp_tool_calls.is_some()
     }
 
@@ -1272,7 +1358,10 @@ impl Plugin for RateLimiting {
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         if self.mcp_tool_calls.is_some()
-            || !matches!(self.limit_by, LimitBy::Consumer | LimitBy::SpiffeIdentity)
+            || !matches!(
+                self.limit_by,
+                LimitBy::Consumer | LimitBy::SpiffeIdentity | LimitBy::Service
+            )
         {
             return PluginResult::Continue;
         }
@@ -1283,8 +1372,15 @@ impl Plugin for RateLimiting {
     }
 
     fn is_authorize_plugin(&self) -> bool {
+        // `service` charges here too, after authentication: an aggregate
+        // budget protects the backend from admitted traffic, so a request an
+        // auth plugin refuses must not spend every authenticated caller's
+        // shared allowance.
         self.mcp_tool_calls.is_none()
-            && matches!(self.limit_by, LimitBy::Consumer | LimitBy::SpiffeIdentity)
+            && matches!(
+                self.limit_by,
+                LimitBy::Consumer | LimitBy::SpiffeIdentity | LimitBy::Service
+            )
     }
 
     /// Never reusable, in any `limit_by` mode (issue #5583). A limit is a
@@ -1339,6 +1435,26 @@ impl Plugin for RateLimiting {
         }
         inject_rate_limit_headers_from_metadata(&ctx.metadata, response_headers);
         PluginResult::Continue
+    }
+
+    /// A successful WebSocket handshake (H1 `101`, H2/H3 Extended CONNECT
+    /// `200`) bypasses `after_proxy`, yet the upgrade request was admitted and
+    /// charged in `on_request_received` / `authorize`. Publish the same
+    /// staged verdict `after_proxy` would — identity header stripped first,
+    /// `x-ratelimit-*` only under `expose_headers` — so the `expose_headers`
+    /// contract ("every admitted, counted request's response carries them")
+    /// also holds for the response that opens the session.
+    fn apply_websocket_handshake_response_headers(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        remove_rate_limit_identity_header(response_headers);
+        if !self.expose_headers {
+            return;
+        }
+        inject_rate_limit_headers_from_metadata(&ctx.metadata, response_headers);
     }
 
     /// These telemetry writes are unconditional `insert`s of a gateway-computed
@@ -1464,6 +1580,50 @@ fn valid_mcp_tool_name(name: &str) -> bool {
         && !name.chars().any(char::is_control)
 }
 
+/// `ratelimit_mcp_uninspectable` value for an ambiguous or over-bound body
+/// (duplicate member names, a batch past the recognizer bounds).
+const MCP_UNINSPECTABLE_AMBIGUOUS_BODY: &str = "true";
+
+/// `ratelimit_mcp_uninspectable` value for a body strict JSON cannot read that
+/// a lenient upstream might still decode into a `tools/call`.
+const MCP_UNINSPECTABLE_UNPARSEABLE_BODY: &str = "unparseable_body";
+
+/// `ratelimit_mcp_uninspectable` value for a `Content-Type` naming a charset
+/// other than UTF-8.
+const MCP_UNINSPECTABLE_UNSUPPORTED_CHARSET: &str = "unsupported_charset";
+
+/// `ratelimit_mcp_uninspectable` value for an in-scope POST with no buffered
+/// body snapshot to inspect.
+const MCP_UNINSPECTABLE_MISSING_BODY: &str = "missing_body";
+
+/// Refuse an in-scope MCP request whose body cannot be counted faithfully:
+/// JSON-RPC `-32600` on HTTP `200`, with `reason` recorded as
+/// `ratelimit_mcp_uninspectable`.
+fn mcp_uninspectable_refusal(ctx: &mut RequestContext, reason: &'static str) -> PluginResult {
+    ctx.metadata.insert(
+        "ratelimit_mcp_uninspectable".to_string(),
+        reason.to_string(),
+    );
+    mcp_jsonrpc_refusal(
+        &McpReplyShape::default(),
+        -32600,
+        "Invalid MCP JSON-RPC request",
+        HashMap::new(),
+    )
+}
+
+/// Whether `body` is one strict UTF-8 JSON document, under the same
+/// `serde_json::Value` acceptance (UTF-8 and surrogate validation, recursion
+/// limit, no trailing data) the governance plugins parse with. Deliberately
+/// not `IgnoredAny`, whose skip path accepts lone surrogates and ignores the
+/// recursion limit. Only reached for a body the recognizer found call-free
+/// but [`mcp_jsonrpc::may_carry_tool_call`] flagged (it names `tools/call`,
+/// carries a JSON escape, or opens like a non-UTF-8 / lenient document), so a
+/// call-free body without any of those never pays for the parse.
+fn parses_as_strict_json(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body).is_ok()
+}
+
 /// The buffered request body, read exactly as `mcp_gateway` reads it.
 fn mcp_request_body(ctx: &RequestContext) -> Option<&[u8]> {
     ctx.request_body_bytes
@@ -1476,7 +1636,8 @@ fn mcp_request_body(ctx: &RequestContext) -> Option<&[u8]> {
 ///
 /// The tool name is length-prefixed, so no identity text can make one
 /// caller's per-tool key equal another caller's: every such key starts with
-/// `tool:<len>:`, which no `ip:` / `consumer:` / `spiffe:` key does.
+/// `tool:<len>:`, which no `ip:` / `consumer:` / `external:` / `spiffe:` key
+/// does.
 fn per_tool_key(tool: &str, base_key: &str) -> String {
     let length = tool.len().to_string();
     let mut key = String::with_capacity(7 + length.len() + tool.len() + base_key.len());
@@ -1533,14 +1694,33 @@ fn parse_limit_by(object: &serde_json::Map<String, Value>) -> Result<LimitBy, St
             "ip" => Ok(LimitBy::Ip),
             "consumer" => Ok(LimitBy::Consumer),
             "spiffe" | "spiffe_identity" => Ok(LimitBy::SpiffeIdentity),
+            "service" => Ok(LimitBy::Service),
             _ => Err(format!(
-                "rate_limiting: `limit_by` must be one of `ip`, `consumer`, or `spiffe_identity`, got: {value:?}"
+                "rate_limiting: `limit_by` must be one of `ip`, `consumer`, `spiffe_identity`, or `service`, got: {value:?}"
             )),
         },
         Some(other) => Err(format!(
             "rate_limiting: `limit_by` must be a string, got: {other:?}",
             other = other.to_string()
         )),
+    }
+}
+
+/// Parse `max_state_entries`: an integer from 1 through
+/// [`MAX_MAX_STATE_ENTRIES`], default [`DEFAULT_MAX_STATE_ENTRIES`].
+fn parse_max_state_entries(object: &serde_json::Map<String, Value>) -> Result<usize, String> {
+    let invalid = || {
+        format!(
+            "rate_limiting: `max_state_entries` must be an integer from 1 through {MAX_MAX_STATE_ENTRIES}"
+        )
+    };
+    match object.get("max_state_entries") {
+        None => Ok(DEFAULT_MAX_STATE_ENTRIES),
+        Some(value) => value
+            .as_u64()
+            .and_then(|entries| usize::try_from(entries).ok())
+            .filter(|entries| (1..=MAX_MAX_STATE_ENTRIES).contains(entries))
+            .ok_or_else(invalid),
     }
 }
 
@@ -1641,8 +1821,6 @@ struct ParsedLimits {
 }
 
 fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits, String> {
-    reject_legacy_window_fields(object)?;
-
     let limits = object
         .get("limits")
         .ok_or_else(|| "rate_limiting: `limits` is required".to_string())?
@@ -1777,27 +1955,6 @@ fn parse_limit_scope(
     }
 }
 
-fn reject_legacy_window_fields(object: &serde_json::Map<String, Value>) -> Result<(), String> {
-    static LEGACY_FIELDS: &[&str] = &[
-        "requests_per_second",
-        "requests_per_minute",
-        "requests_per_hour",
-        "window_seconds",
-        "max_requests",
-        "consumer_limits",
-    ];
-
-    for field in LEGACY_FIELDS {
-        if object.contains_key(*field) {
-            return Err(format!(
-                "rate_limiting: `{field}` must be configured inside `limits` rules"
-            ));
-        }
-    }
-
-    Ok(())
-}
-
 fn validate_limit_rule_fields(
     label: &str,
     object: &serde_json::Map<String, Value>,
@@ -1871,6 +2028,12 @@ fn ip_key(client_ip: &str, ipv6_prefix: u8) -> String {
     key
 }
 
+/// Public response/request header names of the published budget, also the
+/// names `RequestContext` records as private publication provenance.
+const RATELIMIT_LIMIT_HEADER: &str = "x-ratelimit-limit";
+const RATELIMIT_REMAINING_HEADER: &str = "x-ratelimit-remaining";
+const RATELIMIT_WINDOW_HEADER: &str = "x-ratelimit-window";
+
 /// Metadata key -> response header for the telemetry `expose_headers` publishes.
 ///
 /// x-ratelimit-identity is intentionally NOT mapped: injecting the limiter key
@@ -1880,9 +2043,9 @@ fn ip_key(client_ip: &str, ipv6_prefix: u8) -> String {
 /// Shared by the injection site and `owns_deadline_response_header` so the
 /// written set and the declared-owned set cannot drift apart.
 static EXPOSED_RATELIMIT_HEADERS: &[(&str, &str)] = &[
-    ("ratelimit_limit", "x-ratelimit-limit"),
-    ("ratelimit_remaining", "x-ratelimit-remaining"),
-    ("ratelimit_window", "x-ratelimit-window"),
+    ("ratelimit_limit", RATELIMIT_LIMIT_HEADER),
+    ("ratelimit_remaining", RATELIMIT_REMAINING_HEADER),
+    ("ratelimit_window", RATELIMIT_WINDOW_HEADER),
 ];
 
 /// The same table in the bounded `&[String]` form
@@ -1897,8 +2060,8 @@ static EXPOSED_RATELIMIT_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
             .collect()
     });
 
-fn inject_rate_limit_headers_from_metadata(
-    metadata: &HashMap<String, String>,
+fn inject_rate_limit_headers_from_metadata<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     headers: &mut HashMap<String, String>,
 ) {
     for &(meta_key, header_name) in EXPOSED_RATELIMIT_HEADERS {

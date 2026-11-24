@@ -133,10 +133,11 @@ minimal extension until its own retirement condition is met.
 
 At retirement:
 
-1. Bump `tokio-tungstenite` / `tungstenite` dependency versions and update
-   `Cargo.lock` through Cargo.
+1. Bump `tokio-tungstenite` / `tungstenite` dependency versions.
 2. Remove these root `[patch.crates-io]` entries and their mirrors in
-   `tests/performance/mesh/Cargo.toml`:
+   `fuzz/Cargo.toml` and `tests/performance/mesh/Cargo.toml`, then update
+   `Cargo.lock`, `fuzz/Cargo.lock` and `tests/performance/mesh/Cargo.lock`
+   through Cargo before deleting the vendor directories:
    - `tungstenite = { path = "vendor/tungstenite-0.29.0-ferrum-patched" }`
    - `tokio-tungstenite = { path = "vendor/tokio-tungstenite-0.29.0-ferrum-patched" }`
 3. Delete both vendor directories, regenerate the drift manifest

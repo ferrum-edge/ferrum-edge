@@ -1,8 +1,8 @@
 //! First-run helper that mints a self-signed root for development setups.
 //!
-//! Production deployments MUST supply an existing root via
-//! `FERRUM_MESH_CA_CERT_PATH` / `FERRUM_MESH_CA_KEY_PATH`. This helper exists
-//! only to make local labs and integration tests self-contained.
+//! Production deployments MUST NOT use it: supply file-based SVID material
+//! (`FERRUM_GATEWAY_SVID_*`) or use `FERRUM_MESH_CA_BACKEND=spire`. This helper
+//! exists only to make local labs and integration tests self-contained.
 //!
 //! Two safety gates are enforced before generating anything:
 //!
@@ -21,7 +21,7 @@ use rcgen::{
 use std::env;
 use tracing::{info, warn};
 
-use super::CaError;
+use super::{CaError, random_positive_serial_bytes};
 use crate::identity::spiffe::TrustDomain;
 
 /// Bootstrap configuration.
@@ -52,14 +52,29 @@ pub struct BootstrappedRoot {
     pub root_key_pem: String,
 }
 
+/// Canonical read of the `FERRUM_MESH_CA_BOOTSTRAP_DEV` dev opt-in.
+///
+/// Every reader of the opt-in ([`bootstrap_allowed`], [`bootstrap_dev_root`],
+/// and the `EnvConfig` validation gate that lets `validate` agree with
+/// startup) goes through this one function, so the accepted spelling cannot
+/// drift between them. It uses the identity guardrail truthy rule
+/// ([`crate::identity::parse_guardrail_flag`]): `true`/`1` opt in; an unset,
+/// blank, `false`/`0` or invalid value leaves the bootstrap refused (an invalid
+/// value also fails `EnvConfig` validation). This does **not** consult
+/// [`crate::identity::production_mode`]; callers check that guardrail first.
+pub fn dev_bootstrap_opted_in() -> bool {
+    crate::identity::guardrail_opt_in(
+        "FERRUM_MESH_CA_BOOTSTRAP_DEV",
+        env::var("FERRUM_MESH_CA_BOOTSTRAP_DEV"),
+    )
+}
+
 /// Returns `true` iff both gates allow bootstrap to run.
 pub fn bootstrap_allowed() -> bool {
     if crate::identity::production_mode() {
         return false;
     }
-    env::var("FERRUM_MESH_CA_BOOTSTRAP_DEV")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    dev_bootstrap_opted_in()
 }
 
 /// Generate a self-signed root suitable for use as the internal CA's
@@ -70,16 +85,14 @@ pub fn bootstrap_dev_root(config: BootstrapConfig) -> Result<BootstrappedRoot, C
     if crate::identity::production_mode() {
         return Err(CaError::Config(
             "FERRUM_MESH_PRODUCTION_MODE=true — refusing to bootstrap a self-signed root. \
-             Provide an existing root via FERRUM_MESH_CA_CERT_PATH / FERRUM_MESH_CA_KEY_PATH."
+             Provide file-based SVID material (FERRUM_GATEWAY_SVID_*) or use \
+             FERRUM_MESH_CA_BACKEND=spire."
                 .to_string(),
         ));
     }
-    if !env::var("FERRUM_MESH_CA_BOOTSTRAP_DEV")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-    {
+    if !dev_bootstrap_opted_in() {
         return Err(CaError::Config(
-            "FERRUM_MESH_CA_BOOTSTRAP_DEV is not set to 'true' — bootstrap refused. \
+            "FERRUM_MESH_CA_BOOTSTRAP_DEV is not set to true or 1 — bootstrap refused. \
              Set the env var only in dev/test environments."
                 .to_string(),
         ));
@@ -133,46 +146,4 @@ pub fn bootstrap_dev_root(config: BootstrapConfig) -> Result<BootstrappedRoot, C
         root_cert_pem: cert.pem(),
         root_key_pem: key_pair.serialize_pem(),
     })
-}
-
-fn random_positive_serial_bytes() -> Result<[u8; 8], CaError> {
-    use crate::fips::backend::rand::SecureRandom;
-
-    let rng = crate::fips::backend::rand::SystemRandom::new();
-    let mut serial_bytes = [0u8; 8];
-    rng.fill(&mut serial_bytes)
-        .map_err(|e| CaError::Internal(format!("rng failed: {e}")))?;
-    normalize_positive_serial_bytes(&mut serial_bytes);
-    Ok(serial_bytes)
-}
-
-fn normalize_positive_serial_bytes(serial_bytes: &mut [u8; 8]) {
-    serial_bytes[0] &= 0x7f;
-    if *serial_bytes == [0u8; 8] {
-        serial_bytes[7] = 1;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::normalize_positive_serial_bytes;
-
-    #[test]
-    fn serial_normalization_clears_sign_bit() {
-        let mut serial = [0xff, 0, 0, 0, 0, 0, 0, 1];
-
-        normalize_positive_serial_bytes(&mut serial);
-
-        assert_eq!(serial[0] & 0x80, 0);
-        assert_eq!(serial, [0x7f, 0, 0, 0, 0, 0, 0, 1]);
-    }
-
-    #[test]
-    fn serial_normalization_avoids_zero() {
-        let mut serial = [0x80, 0, 0, 0, 0, 0, 0, 0];
-
-        normalize_positive_serial_bytes(&mut serial);
-
-        assert_eq!(serial, [0, 0, 0, 0, 0, 0, 0, 1]);
-    }
 }

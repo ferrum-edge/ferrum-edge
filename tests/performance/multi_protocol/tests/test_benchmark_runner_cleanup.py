@@ -19,7 +19,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 RUNNERS = [
-    "tests/performance/run_perf_test.sh",
     "tests/performance/payload_size/run_payload_test.sh",
     "tests/performance/multi_protocol/run_protocol_test.sh",
     "tests/performance/multi_protocol/run_gateway_protocol_bench.sh",
@@ -32,7 +31,6 @@ RUNNERS = [
 # Every CI workflow path token that names one of the runners above, so the
 # workflow scan covers any lane that invokes them.
 RUNNER_TOKENS = {
-    "run_perf_test.sh",
     "run_payload_test.sh",
     "run_protocol_test.sh",
     "run_gateway_protocol_bench.sh",
@@ -49,6 +47,9 @@ BANNED_PORT_KILL = [
     re.compile(r"lsof\s+-ti[^\n]*\|[^\n]*kill"),
     re.compile(r"kill\s+-9"),
 ]
+
+
+_CHECK_PORT_CALL_RE = re.compile(r'check_port_available\s+"\$')
 
 
 class BenchmarkRunnerCleanupTests(unittest.TestCase):
@@ -81,7 +82,7 @@ class BenchmarkRunnerCleanupTests(unittest.TestCase):
             self.assertIn("kill -KILL", text, f"{rel}: missing bounded forced kill")
             self.assertTrue(
                 "check_ports_available || exit 1" in text
-                or re.search(r'check_port_available\s+"\$', text),
+                or _CHECK_PORT_CALL_RE.search(text),
                 f"{rel}: port-conflict check is defined but never invoked",
             )
 

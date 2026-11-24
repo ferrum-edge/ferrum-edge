@@ -31,7 +31,7 @@ async fn opa_omits_dynamic_and_static_credential_headers_from_decision_input() {
         .get(
             gateway.proxy_url("/resource?api_key=query-secret&ordinary_query=ordinary-query-value"),
         )
-        .header("X-Tenant-Credential", "test-api-key")
+        .header("X-Tenant-Credential", "test-api-key-0123456789")
         .header("API-Key", "azure-secret")
         .header("X-Goog-Api-Key", "google-secret")
         .header("X-Policy-Secret", "configured-secret")
@@ -75,7 +75,7 @@ async fn opa_omits_dynamic_and_static_credential_headers_from_decision_input() {
 
     let serialized = serde_json::to_string(&payload).expect("serialize OPA payload");
     for secret in [
-        "test-api-key",
+        "test-api-key-0123456789",
         "azure-secret",
         "google-secret",
         "configured-secret",
@@ -109,7 +109,7 @@ fn key_auth_opa_config(backend_port: u16, opa_host: &str) -> String {
         "consumers": [{
             "id": "opa-consumer",
             "username": "opa-user",
-            "credentials": {"keyauth": [{"key": "test-api-key"}]}
+            "credentials": {"keyauth": [{"key": "test-api-key-0123456789"}]}
         }],
         "upstreams": [],
         "plugin_configs": [

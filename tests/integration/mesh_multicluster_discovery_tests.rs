@@ -99,7 +99,7 @@ fn remote_snapshot(endpoints: RemoteClusterEndpoints) -> RemoteEndpointSnapshot 
     let mut clusters = HashMap::new();
     clusters.insert(
         "west".to_string(),
-        RemoteClusterEntry::new(
+        Arc::new(RemoteClusterEntry::new(
             "west".to_string(),
             td("remote.local"),
             Some("net2".to_string()),
@@ -109,7 +109,7 @@ fn remote_snapshot(endpoints: RemoteClusterEndpoints) -> RemoteEndpointSnapshot 
             None,
             endpoints,
             1,
-        ),
+        )),
     );
     RemoteEndpointSnapshot { clusters }
 }
@@ -363,6 +363,7 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     };
 
@@ -375,9 +376,14 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
 
     // All healthy: every selection lands on the local (same-region) endpoint.
     for i in 0..20 {
-        let selection = lb
-            .select_target("default", upstream_id, &i.to_string(), None)
-            .expect("target");
+        let selection = LoadBalancerCache::select_target_from(
+            &lb.load(),
+            "default",
+            upstream_id,
+            &i.to_string(),
+            None,
+        )
+        .expect("target");
         assert_eq!(
             selection.target.host, "10.1.0.1",
             "healthy local endpoint must win the same-region tier"
@@ -401,9 +407,14 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
     // Failover: with the local endpoint ejected, the LB falls through to the
     // remote endpoint tier.
     for i in 0..20 {
-        let selection = lb
-            .select_target("default", upstream_id, &i.to_string(), Some(&health))
-            .expect("failover target");
+        let selection = LoadBalancerCache::select_target_from(
+            &lb.load(),
+            "default",
+            upstream_id,
+            &i.to_string(),
+            Some(&health),
+        )
+        .expect("failover target");
         assert_eq!(
             selection.target.host, "10.2.0.1",
             "remote endpoint must receive traffic once local is unhealthy"
@@ -439,7 +450,7 @@ mod audience_binding {
     use ferrum_edge::identity::spiffe::TrustDomain;
     use ferrum_edge::modes::mesh::multicluster::{
         NativeRemoteSource, RemoteClusterPollContext, RemoteDiscoveryConfig,
-        RemoteDiscoveryTlsConfig, RemoteServiceSource,
+        RemoteDiscoveryFailure, RemoteDiscoveryTlsConfig, RemoteServiceSource,
     };
     use ferrum_edge::modes::mesh::revision::{
         DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS, MeshRevisionGate,
@@ -565,6 +576,7 @@ mod audience_binding {
             ambient_udp_source_scoping: false,
             remote_discovery,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         };
         client.mesh_subscribe(tonic::Request::new(request)).await?;
         Ok(())
@@ -599,7 +611,7 @@ mod audience_binding {
         jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(SHARED_SECRET.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(SHARED_SECRET.as_bytes()).unwrap(),
         )
         .expect("mint raw-audience token")
     }
@@ -625,9 +637,10 @@ mod audience_binding {
             .fetch()
             .await
             .expect_err("cluster C must refuse a token minted for cluster B");
-        assert!(
-            err.contains("MeshSubscribe failed"),
-            "the poll must fail at subscribe time, before any endpoint import: {err}"
+        assert_eq!(
+            err,
+            RemoteDiscoveryFailure::SubscribeFailed,
+            "the poll must fail at subscribe time, before any endpoint import"
         );
 
         // Control: C accepts a poll actually declared for C, proving the
@@ -797,5 +810,113 @@ mod audience_binding {
         assert_eq!(status.code(), tonic::Code::Unauthenticated);
 
         cp_c.shutdown().await;
+    }
+}
+
+/// `RemoteEndpointStore::remove` vs. an in-flight FIRST-SIGHT install.
+///
+/// `install` re-checks the cluster generation inside its `inner.rcu` closure
+/// and then CASes against the snapshot pointer it read. When `remove` retires
+/// the generation in that gap and has no cached entry to drop, it must still
+/// publish a NEW snapshot pointer; otherwise the install's CAS succeeds and
+/// commits endpoints for a retired cluster that nothing ever reaps. The CAS
+/// window itself is not reachable from outside the store, so this pins the
+/// observable half of the fix: retiring a registered-but-never-installed
+/// cluster republishes the snapshot (mirroring `FederationStore`).
+mod remove_fences_first_sight_install {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use ferrum_edge::grpc::dp_client::GrpcJwtSecret;
+    use ferrum_edge::identity::spiffe::TrustDomain;
+    use ferrum_edge::modes::mesh::config::{MultiClusterConfig, RemoteCluster};
+    use ferrum_edge::modes::mesh::multicluster::{
+        RemoteClusterPollContext, RemoteDiscoveryCandidate, RemoteDiscoveryConfig,
+        RemoteDiscoveryFailure, RemoteDiscoveryManager, RemoteDiscoveryTlsConfig,
+        RemoteEndpointStore, RemoteServiceSource,
+    };
+    use ferrum_edge::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS;
+
+    const CREDENTIAL_REF: &str = "west-discovery";
+
+    /// A poll that never completes: the cluster stays registered with no
+    /// endpoints installed, which is exactly the first-sight state.
+    struct NeverCompletes;
+
+    #[async_trait::async_trait]
+    impl RemoteServiceSource for NeverCompletes {
+        async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, RemoteDiscoveryFailure> {
+            std::future::pending().await
+        }
+    }
+
+    fn declared_west() -> MultiClusterConfig {
+        MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: TrustDomain::new("remote.local").expect("trust domain"),
+                network: Some("net2".to_string()),
+                control_plane_url: Some("https://cp.remote.example:15010".to_string()),
+                federation_endpoint: None,
+                discovery_credential_ref: Some(CREDENTIAL_REF.to_string()),
+            }],
+            ..MultiClusterConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn retiring_a_registered_cluster_without_endpoints_republishes_the_snapshot() {
+        let store = RemoteEndpointStore::new();
+        let config = RemoteDiscoveryConfig {
+            poll_interval: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(5),
+            max_stale_age: None,
+            revision_adopt_secs: DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
+            production_mode: false,
+            // Filled per cluster from the resolved discovery credential.
+            jwt_secret: None,
+            node_id: "dp-poller".to_string(),
+            namespace: "default".to_string(),
+            tls_config: RemoteDiscoveryTlsConfig::default(),
+        };
+        let credentials = Arc::new(HashMap::from([(
+            CREDENTIAL_REF.to_string(),
+            GrpcJwtSecret::new("remote-discovery-test-secret-000000".to_string()),
+        )]));
+        let mut manager = RemoteDiscoveryManager::new(
+            Some(config),
+            store.clone(),
+            |_ctx: &RemoteClusterPollContext| -> Arc<dyn RemoteServiceSource> {
+                Arc::new(NeverCompletes)
+            },
+        )
+        .with_credentials(credentials);
+        let trust_domains: HashSet<TrustDomain> =
+            HashSet::from([TrustDomain::new("remote.local").expect("trust domain")]);
+
+        let before = store.snapshot();
+        manager.reconcile(Some(&declared_west()), trust_domains.clone());
+        assert!(
+            Arc::ptr_eq(&before, &store.snapshot()),
+            "registering a poller publishes no endpoints"
+        );
+
+        // Withdraw the cluster while its first poll is still in flight.
+        manager.reconcile(Some(&MultiClusterConfig::default()), trust_domains);
+        let after = store.snapshot();
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "retiring a generation must republish the snapshot so an in-flight first-sight \
+             install's CAS against the old pointer fails and re-checks the retired generation"
+        );
+        assert!(after.clusters.is_empty());
+
+        // A second removal of the now-untracked cluster is a true no-op.
+        let untracked = store.snapshot();
+        store.remove("west");
+        assert!(Arc::ptr_eq(&untracked, &store.snapshot()));
+
+        manager.shutdown();
     }
 }

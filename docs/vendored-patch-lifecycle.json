@@ -7,7 +7,7 @@
     "Preserve Ferrum behavioral regression tests; drop vendor-only tests that no longer apply.",
     "Respect co-retirement groups — retire grouped patches in the same change.",
     "Remove the matching [patch.crates-io] entries and vendor directories.",
-    "Update docs/dependency-policy.md, per-patch READMEs, docs/vendored-patch-lifecycle.json, vendor/VENDOR_INTEGRITY.sha256, and mirrored standalone [patch.crates-io] tables (tests/performance/mesh/Cargo.toml)."
+    "Update docs/dependency-policy.md, per-patch READMEs, docs/vendored-patch-lifecycle.json, vendor/VENDOR_INTEGRITY.sha256, and mirrored standalone [patch.crates-io] tables (fuzz/Cargo.toml and tests/performance/mesh/Cargo.toml) and their lockfiles."
   ],
   "co_retirement_groups": [
     {
@@ -55,25 +55,27 @@
     },
     {
       "id": "hyper-h2-body-progress-and-timeout",
-      "description": "Hyper patches 004 and 005 depend on patch 002's pending-body implementation, and patch 005 rewrites the loop patch 004 extended. Retire them together after adopting an equivalent write-stall bound that preserves positive-capacity progress, or moving the HTTP/2 client off Hyper; patch 005 may retire earlier once hyper or h2 coalesces small window increments itself.",
+      "description": "Hyper patches 004 and 005 depend on patch 002's pending-body implementation, and patch 005 rewrites the loop patch 004 extended. Retire them together after adopting an equivalent write-stall bound that preserves positive-capacity progress, or moving the HTTP/2 client off Hyper; patch 005 may retire earlier once hyper or h2 coalesces small window increments itself. Hyper patch 008 applies patch 004's timer to the server response pipe and changes patch 005's whole-chunk condition, and hyper-util patch 002 only forwards patch 008's setting, so both retire with the group.",
       "patch_ids": [
         "hyper-002-min-data-frame-capacity",
         "hyper-004-h2-body-write-timeout",
-        "hyper-005-h2-small-window-coalescing"
+        "hyper-005-h2-small-window-coalescing",
+        "hyper-008-h2-response-write-timeout",
+        "hyper-util-002-forward-h2-response-write-timeout"
       ]
     }
   ],
   "patches": [
     {
       "id": "sqlx-core-001-verify-ca-name-context",
-      "label": "SQLx verify-ca context-bearing hostname errors",
+      "label": "SQLx verify-ca exclusive root CA and provider-pinned verifier",
       "crate": "sqlx-core",
-      "vendored_version": "0.8.6",
-      "vendor_path": "vendor/sqlx-core-0.8.6-ferrum-patched",
+      "vendored_version": "0.9.1",
+      "vendor_path": "vendor/sqlx-core-0.9.1-ferrum-patched",
       "docs_path": "docs/upstream-sqlx-patches/001-verify-ca-name-context/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
-      "reason": "PostgreSQL and MySQL verify-ca must accept trusted certificate chains without checking the requested hostname, including rustls context-bearing name errors.",
+      "reason": "PostgreSQL and MySQL verify-ca waive the hostname check, so a configured root CA must be the only trust anchor (upstream adds it to the bundled public roots), and the verify-ca WebPKI verifier must be built with the selected crypto provider (the provider-less builder panics when both ring and aws-lc-rs are compiled in without a process default).",
       "upstream": {
         "filing": "deliberate_fork_unfiled",
         "github_repo": "launchbadge/sqlx",
@@ -81,9 +83,13 @@
         "issue_number": null,
         "fork_ref": null
       },
-      "reaffirmation": null,
+      "reaffirmation": {
+        "date": "2026-11-20",
+        "owner": "Ferrum Edge maintainers",
+        "reason": "Re-checked against SQLx 0.9.1, which still adds a configured root CA to the bundled public roots and still builds the verify-ca verifier without the selected crypto provider; verify-ca's issuer check depends on the exclusive root CA, so the fork stays until a compatible SQLx release carries both."
+      },
       "retirement": {
-        "trigger": "A compatible SQLx release handles both rustls hostname-error variants while retaining certificate chain, validity, and handshake signature verification.",
+        "trigger": "A compatible SQLx release treats a configured root CA as exclusive and builds the verify-ca WebPKI verifier with the selected crypto provider while retaining certificate chain, validity, and handshake signature verification.",
         "co_retirement_group": null,
         "compatible_release_test": {
           "status": "not_started",
@@ -91,53 +97,10 @@
         }
       },
       "regression_tests": [
-        "vendor/sqlx-core-0.8.6-ferrum-patched (tls_rustls::tests)",
+        "vendor/sqlx-core-0.9.1-ferrum-patched (tls_rustls::tests)",
         "tests/unit/config/db_tls_snapshot_tests.rs",
         "tests/unit/config/env_config_tests.rs",
         "tests/service_integration/db_tls.rs"
-      ]
-    },
-    {
-      "id": "sqlx-core-002-typed-float-null-bindings",
-      "label": "SQLx Any native floating-point NULL parameter types",
-      "crate": "sqlx-core",
-      "vendored_version": "0.8.6",
-      "vendor_path": "vendor/sqlx-core-0.8.6-ferrum-patched",
-      "docs_path": "docs/upstream-sqlx-patches/002-typed-float-null-bindings/",
-      "owner": "Ferrum Edge maintainers",
-      "owner_github": null,
-      "reason": "SQLx Any reverses REAL and DOUBLE native parameter types when converting typed NULL arguments in 0.8.6; the correction preserves the supplied floating-point type.",
-      "upstream": {
-        "filing": "filed",
-        "github_repo": "launchbadge/sqlx",
-        "pr_number": 4359,
-        "issue_number": null,
-        "fork_ref": null
-      },
-      "reaffirmation": null,
-      "retirement": {
-        "trigger": "A compatible SQLx release preserves native REAL/DOUBLE typed-NULL parameter types and passes the hosted PostgreSQL regression. Retain the vendor while patch 001 remains.",
-        "co_retirement_group": null,
-        "compatible_release_test": {
-          "status": "blocked",
-          "notes": "Reviewed 2026-10-09: latest stable SQLx/sqlx-core 0.9.0 still binds REAL NULL through f64 and DOUBLE NULL through f32. Upstream main fixes the arms in PR #4359, but no released replacement contains that fix. Preserve the hosted PostgreSQL regression and retain the vendor while patch 001 remains."
-        },
-        "merged_release_hold": {
-          "reviewed_on": "2026-10-09",
-          "expires_on": "2026-11-08",
-          "owner": "Ferrum Edge maintainers",
-          "latest_release": "0.9.0",
-          "merge_commit": "80f44db8073e9a6a61ef6488eb15341554716d35",
-          "reason": "The latest stable release lacks the merged typed-float NULL fix; retain the vendor pending a compatible release and hosted PostgreSQL qualification.",
-          "evidence": [
-            "https://docs.rs/crate/sqlx-core/0.9.0/source/src/any/arguments.rs",
-            "https://github.com/transact-rs/sqlx/blob/v0.9.0/sqlx-core/src/any/arguments.rs",
-            "https://github.com/transact-rs/sqlx/pull/4359"
-          ]
-        }
-      },
-      "regression_tests": [
-        "tests/integration/admin_conditional_write_tests.rs::postgres_conditional_restore_checks_state_and_lease_in_transaction (assert_postgres_any_float_null_parameter_types; Integration Tests conditional-live-stores)"
       ]
     },
     {
@@ -168,7 +131,8 @@
       },
       "regression_tests": [
         "tests/integration/connection_pool_tests.rs::test_connect_timeout_does_not_fragment_pool",
-        "tests/integration/connection_pool_tests.rs::test_pooled_client_exposes_per_request_connect_timeout"
+        "tests/integration/connection_pool_tests.rs::test_pooled_client_exposes_per_request_connect_timeout",
+        "tests/integration/connection_pool_tests.rs::test_per_request_connect_timeout_bounds_each_resolved_address"
       ]
     },
     {
@@ -410,11 +374,15 @@
       "owner_github": null,
       "reason": "Stock h3 0.0.8 parks on the DECLARED payload length of a non-DATA frame and accumulates QUIC chunks into an unbounded BufList; QUIC flow control caps only bytes in flight because every read re-grants credit, so one unauthenticated stream declaring 2^62-1 bytes drives the process to OOM. The unknown-frame skip arm and the peer control stream have the same shape.",
       "upstream": {
-        "filing": "deliberate_fork_unfiled",
+        "filing": "reported_privately",
         "github_repo": "hyperium/h3",
         "pr_number": null,
         "issue_number": null,
-        "fork_ref": null
+        "fork_ref": null,
+        "private_report": {
+          "channel": "security_advisory",
+          "reported_on": "2026-11-14"
+        }
       },
       "reaffirmation": null,
       "retirement": {
@@ -714,7 +682,8 @@
         }
       },
       "regression_tests": [
-        "vendor/tokio-tungstenite-0.29.0-ferrum-patched (fragment accounting delegator)"
+        "tests/unit/gateway_core/websocket_fragment_metering_tests.rs::async_delegator_meters_fragments_through_split_stream",
+        "tests/unit/gateway_core/websocket_fragment_metering_tests.rs::async_delegator_forwards_incomplete_message_frame_bound"
       ]
     },
     {
@@ -739,12 +708,14 @@
         "trigger": "Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths.",
         "co_retirement_group": null,
         "compatible_release_test": {
-          "status": "not_started",
-          "notes": null
+          "status": "failed",
+          "notes": "Reviewed 2026-11-10: registry dimpl 0.8.0 (already resolved as the strict_dimpl dev-dependency) and 0.9.0 (newest upstream tag) still take one DER certificate in DtlsCertificate, serialize a one-entry certificate_list in DTLS 1.2 and 1.3, and keep the private key in a cloneable plain Vec<u8> with no zeroization. The retirement trigger is not met; see the patch README's Upstream re-audit section."
         }
       },
       "regression_tests": [
-        "vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs"
+        "vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs",
+        "vendor/dimpl-0.6.1-ferrum-patched (dtls13::server::tests::certificate_request_omits_empty_certificate_authorities)",
+        "tests/integration/dtls_integration_tests.rs (test_frontend_dtls13_client_auth_interoperates_with_strict_certificate_request_parser)"
       ]
     },
     {
@@ -776,6 +747,36 @@
       "regression_tests": [
         "vendor/hyper-util-0.1.21-ferrum-patched (client::legacy::client::ferrum_release_on_close_tests)",
         "vendor/hyper-util-0.1.21-ferrum-patched/tests/legacy_client.rs"
+      ]
+    },
+    {
+      "id": "hyper-util-002-forward-h2-response-write-timeout",
+      "label": "hyper-util auto builder forwards the HTTP/2 response write-stall bound",
+      "crate": "hyper-util",
+      "vendored_version": "0.1.21",
+      "vendor_path": "vendor/hyper-util-0.1.21-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-util-patches/002-forward-h2-response-write-timeout/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "Ferrum's HTTP frontends serve through hyper_util::server::conn::auto::Builder, which owns its hyper HTTP/2 builder privately and cannot reach hyper patch 008's response_write_timeout; Http2Builder::response_write_timeout forwards it, behind the ferrum-h2-response-write-timeout feature so the standalone crate still builds against stock hyper.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper-util",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Retire with hyper patch 008, or earlier when a hyper-util release forwards an equivalent HTTP/2 server setting.",
+        "co_retirement_group": "hyper-h2-body-progress-and-timeout",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/unit/gateway_core/frontend_h2_response_write_stall_tests.rs"
       ]
     },
     {
@@ -934,6 +935,129 @@
       ]
     },
     {
+      "id": "hyper-006-h2-stream-termination-origin",
+      "label": "hyper reports why an HTTP/2 server stream ended while its service future is dropped",
+      "crate": "hyper",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/006-h2-stream-termination-origin/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "hyper drops a pending HTTP/2 service future on any stream reset, and the future's drop glue cannot tell a peer RST_STREAM/GOAWAY or lost transport from a reset hyper's own HTTP/2 stack sent for a protocol violation. Ferrum records one terminal per admitted request and may label it a client cancellation (499) only on positive evidence (#6768). H2Stream::poll2 publishes hyper::ext::H2StreamTermination in a thread-local slot just before it returns the reset, readable through take_h2_stream_termination() while the service future is dropped, and cleared by a field that drops after the future.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Retire with h2 patch 004 when hyper exposes why a server stream ended to the service, or when Ferrum stops serving HTTP/2 through hyper. Without it every HTTP/2 drop is recorded as unattributed (444), never as a client cancellation.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/unit/gateway_core/client_abort_accounting_tests.rs (h2_reset_while_waiting_for_response_headers_records_one_client_abort, h2_local_protocol_reset_is_a_protocol_error_not_a_client_abort, unattributed_http2_drop_is_never_a_client_abort)"
+      ]
+    },
+    {
+      "id": "hyper-007-h2-request-body-deadline",
+      "label": "hyper HTTP/2 client resets a request body at an absolute deadline",
+      "crate": "hyper",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/007-h2-request-body-deadline/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "hyper's HTTP/2 client sends a request body from its own pipe task, which outlives the response; dropping the response does not reset a stream whose upload is open, and a pipe parked on backend flow control polls nothing else, so a gRPC upload could outlive the client RPC deadline. hyper::ext::Http2BodyDeadline arms one timer in that pipe task and resets the stream with CANCEL when the absolute deadline passes (#6870).",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "hyper exposes a way to reset an HTTP/2 client stream, or to bound its request body by an absolute instant, from outside the body pipe; or Ferrum's HTTP/2 client moves off hyper.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/integration/h2_request_body_deadline_tests.rs"
+      ]
+    },
+    {
+      "id": "hyper-008-h2-response-write-timeout",
+      "label": "hyper HTTP/2 server bounds a response body waiting for client window",
+      "crate": "hyper",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/008-h2-response-write-timeout/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "hyper's HTTP/2 server response pipe parks in poll_capacity while the client grants no flow-control window, and polls nothing else; a client that keeps its connection alive but never sends WINDOW_UPDATE held the response body and the backend connection behind it indefinitely, out of reach of the transport-level FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS bound (#6998 follow-up). hyper::server::conn::http2::Builder::response_write_timeout runs patch 004's write-stall timer in the response pipe only while a ready chunk has no window assigned, and resets the stream with CANCEL when it fires.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Retire with Hyper patches 002, 004 and 005, on which it builds, when hyper bounds an HTTP/2 server response body waiting on client flow-control window, or Ferrum stops serving HTTP/2 through hyper; hosted closed-window, slowly-opening-window, idle-body and full-send-buffer regressions must pass against the replacement. Retire hyper-util patch 002 in the same change.",
+        "co_retirement_group": "hyper-h2-body-progress-and-timeout",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": "No upstream hyper release bounds a server response body on a closed client window."
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.10.0-ferrum-patched (proto::h2::server::ferrum_response_write_timeout_tests)",
+        "tests/unit/gateway_core/frontend_h2_response_write_stall_tests.rs",
+        "tests/functional/functional_client_write_timeout_test.rs (functional_client_write_timeout_releases_backend_of_h2_client_withholding_window_update, functional_client_write_timeout_zero_keeps_h2_client_withholding_window_update, functional_client_write_timeout_keeps_h2_client_granting_window_slowly)"
+      ]
+    },
+    {
+      "id": "hyper-009-h2-client-conn-task-box",
+      "label": "hyper HTTP/2 client boxes its connection task so per-request futures stay small",
+      "crate": "hyper",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/009-h2-client-conn-task-box/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "hyper's HTTP/2 client spawns its per-request futures (Pipe, Send) and its per-connection task (Task) through one enum, H2ClientFuture, which is as large as its largest variant. Task owned the h2 Connection inline, so every per-request future was as large as the connection task: about 2.5 KiB on Ferrum's direct HTTP/2 pool over TLS, where its own state is a few hundred bytes. The executor allocated and copied that for each spawned future (0.5-1.4% of gateway user CPU on the HTTP/2 10 KiB benchmark). Task now holds Pin<Box<ConnTask>>: one allocation per connection, no API or behaviour change.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "hyper stops sizing its per-request HTTP/2 client futures by the connection task (for example by boxing ConnTask or spawning it through a separate executor bound), or the vendored hyper is retired.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.10.0-ferrum-patched (proto::h2::client::ferrum_client_conn_task_box_tests)",
+        "tests/integration/http2_pool_tests.rs"
+      ]
+    },
+    {
       "id": "h2-001-coalesce-data-frame-writes",
       "label": "h2 writes several DATA frames per write call",
       "crate": "h2",
@@ -952,7 +1076,7 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "An h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2. The assigned-send-capacity patch must also retire before removing the vendored crate.",
+        "trigger": "An h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2. The assigned-send-capacity (003) and reset-origin (004) patches must also retire before removing the vendored crate.",
         "co_retirement_group": null,
         "compatible_release_test": {
           "status": "not_started",
@@ -993,6 +1117,36 @@
         "vendor/h2-0.4.20-ferrum-patched (share::ferrum_assigned_capacity_tests)",
         "vendor/hyper-1.10.0-ferrum-patched (proto::h2::ferrum_h2_small_window_coalescing_tests::a_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer, a_response_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer)",
         "tests/unit/gateway_core/frontend_h2_response_coalescing_tests.rs (vendored_h2_exposes_the_send_capacity_accessor_hyper_patch_005_reads)"
+      ]
+    },
+    {
+      "id": "h2-004-reset-origin",
+      "label": "h2 reports whether a stream's reset was local or the peer's",
+      "crate": "h2",
+      "vendored_version": "0.4.20",
+      "vendor_path": "vendor/h2-0.4.20-ferrum-patched",
+      "docs_path": "docs/upstream-h2-patches/004-reset-origin/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "SendResponse::poll_reset reports library-generated resets (a PROTOCOL_ERROR for a content-length overrun, for example) through the same call as a peer RST_STREAM, so a server cannot tell a cancelling client from one that broke the protocol. The read-only reset_is_local() accessor exposes the initiator h2 already records, for Hyper patch 006.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/h2",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Retire with Hyper patch 006, or earlier when an h2 release exposes the reset initiator on SendResponse.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/unit/gateway_core/client_abort_accounting_tests.rs (h2_local_protocol_reset_is_a_protocol_error_not_a_client_abort)"
       ]
     }
   ]

@@ -30,12 +30,12 @@ use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -48,7 +48,9 @@ use crate::config::PoolConfig;
 use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::plugins::{BufferedInitialResponseHeaderPolicyState, Plugin};
+use crate::pool::shard_fill::{ShardCreateBackoff, ShardCreateGuard, ShardFill, ShardRing};
 use crate::pool::{CoalescedCreateAttempt, GenericPool, PoolCreateCaller, PoolManager};
+use crate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;
 use crate::proxy::hbone_pool::HbonePoolError;
 use crate::proxy::headers::{
     is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
@@ -62,7 +64,6 @@ use crate::tls::backend::{
     append_pool_key_component, backend_svid_generation_for_client_cert,
     backend_tls_config_cache_key, pool_key_host_port_prefix, write_backend_host_port_prefix,
 };
-use crate::util::body_limit::is_length_limit_error;
 
 /// Canonical terminal message for a gateway-owned client RPC deadline.
 ///
@@ -75,6 +76,13 @@ pub(crate) const GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER: &str =
     "Deadline%20exceeded%20at%20gateway";
 /// Canonical serialized `grpc-status` paired with the gateway message above.
 pub(crate) const GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER: &str = "4";
+
+/// Fixed, redaction-safe `grpc-message` for a [`GrpcProxyError::Internal`]
+/// terminal (`INTERNAL`). Shared by the HTTP/1.1-HTTP/2 and HTTP/3 native-gRPC
+/// builders so the same gateway-side failure reads the same on every frontend
+/// (#6773); the underlying error (TLS material source, URL parse text) is only
+/// logged for operators.
+pub(crate) const GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE: &str = "Internal gateway error";
 
 /// Observer fired exactly when the streaming gRPC **request source** reaches a
 /// terminal state — clean EOF, overflow abort, or stream drop (client/backend
@@ -221,6 +229,16 @@ pub enum GrpcBody {
         /// hyper stops polling, while this guard prevents a frame already in
         /// the bounded bridge from crossing the authorization deadline.
         auth_deadline: Option<crate::proxy::body::UploadAuthDeadline>,
+        /// The request's absolute client RPC deadline (`grpc-timeout` /
+        /// `grpc_deadline` budget), armed once. Dropping the backend RESPONSE
+        /// at the deadline does not reset an HTTP/2 stream whose upload half is
+        /// still open — hyper's request pipe holds its own stream reference and
+        /// h2 only cancels a stream once every reference is gone — so a
+        /// client- or bidirectional-streaming upload would otherwise keep the
+        /// backend exchange alive past the RPC budget. At the deadline this
+        /// body ends in an ERROR, so hyper sends RST_STREAM and both halves of
+        /// the backend stream end. `None` without a deadline.
+        rpc_deadline: Option<crate::proxy::body::UploadRpcDeadline>,
         bytes_seen: usize,
         max_bytes: usize,
         exceeded: Arc<AtomicBool>,
@@ -238,6 +256,11 @@ pub enum GrpcBody {
         /// `RequestContext.grpc_request_messages_observed`.
         grpc_messages: Option<Arc<AtomicU64>>,
         grpc_scanner: Option<crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner>,
+        /// The route's configured credential header locations, removed from
+        /// the client's request TRAILERS frame in addition to the static late
+        /// request-trailer boundary `UploadSource` applies
+        /// (`crate::proxy::body::strip_configured_credential_trailer_frame`).
+        trailer_credential_header_names: Option<Arc<Vec<String>>>,
     },
     /// Streaming body sourced from a channel rather than a hyper `Incoming`.
     ///
@@ -268,6 +291,11 @@ pub enum GrpcBody {
         /// DATA bytes actually yielded to hyper for the H2 backend. Queued or
         /// cancellation-discarded frames are deliberately not counted.
         forwarded_bytes: Arc<AtomicU64>,
+        /// Set the moment this body hands the pump's frontend-failure error to
+        /// hyper, which resets the backend stream (issue #6772). It is the
+        /// typed evidence that the CLIENT's upload failure, not an independent
+        /// backend fault, ended the backend exchange. `None` when unobserved.
+        frontend_failure_relayed: Option<Arc<AtomicBool>>,
         /// Fired from `Drop` when this request body terminates — same contract
         /// as [`GrpcBody::Streaming::upload_observer`]. `None` for the H3
         /// bridge, which records the circuit-breaker outcome at response time.
@@ -277,6 +305,37 @@ pub enum GrpcBody {
         grpc_messages: Option<Arc<AtomicU64>>,
         grpc_scanner: Option<crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner>,
     },
+}
+
+/// Terminal error of a native-gRPC streaming upload cut by the client RPC
+/// deadline. A compiled-in literal; hyper turns it into RST_STREAM.
+const GRPC_UPLOAD_RPC_DEADLINE_MESSAGE: &str =
+    "gRPC request upload ended: client RPC deadline exceeded";
+
+/// Attach the client RPC deadline to an HTTP/2 backend request as hyper's
+/// `Http2BodyDeadline` (hyper patch 007). The request body pipe then resets the
+/// stream at the deadline from its own task, whatever it is parked on — the
+/// client upload, or backend flow control with a chunk it cannot yet send —
+/// so a still-open upload cannot keep either half of the backend exchange
+/// alive past the RPC budget. A body that has already been sent in full arms
+/// nothing.
+pub(crate) fn attach_grpc_upload_deadline(
+    extensions: &mut http::Extensions,
+    deadline: Option<tokio::time::Instant>,
+) {
+    if let Some(deadline) = deadline {
+        extensions.insert(hyper::ext::Http2BodyDeadline::new(deadline.into_std()));
+    }
+}
+
+/// Arm [`GrpcBody::Streaming`]'s client RPC deadline. Its timer is created only
+/// if the upload has to wait (see `UploadRpcDeadline`), so an upload consumed
+/// in ready polls registers none; any timer is dropped with the body as soon as
+/// the upload completes.
+pub(crate) fn streaming_upload_rpc_deadline(
+    deadline: Option<tokio::time::Instant>,
+) -> Option<crate::proxy::body::UploadRpcDeadline> {
+    deadline.map(crate::proxy::body::UploadRpcDeadline::new)
 }
 
 impl Drop for GrpcBody {
@@ -351,6 +410,8 @@ impl http_body::Body for GrpcBody {
                 grpc_messages,
                 grpc_scanner,
                 auth_deadline,
+                rpc_deadline,
+                trailer_credential_header_names,
                 ..
             } => {
                 if let Some(deadline) = auth_deadline
@@ -363,8 +424,24 @@ impl http_body::Body for GrpcBody {
                     }
                     return Poll::Ready(Some(Err(deadline.message().into())));
                 }
+                // The client RPC deadline ends a still-open upload the same way:
+                // an error here makes hyper reset the backend stream, which is
+                // the only way to end BOTH halves of a duplex exchange.
+                if let Some(deadline) = rpc_deadline.as_mut()
+                    && deadline.expired(cx)
+                {
+                    if let Some(accounting) = request_bytes.as_mut() {
+                        accounting.publish(*bytes_seen as u64);
+                    }
+                    return Poll::Ready(Some(Err(GRPC_UPLOAD_RPC_DEADLINE_MESSAGE.into())));
+                }
                 let polled = loop {
-                    match incoming.poll_frame(cx) {
+                    match incoming.poll_frame_with_trailer_credentials(
+                        cx,
+                        crate::proxy::body::trailer_credential_names(
+                            trailer_credential_header_names,
+                        ),
+                    ) {
                         // A zero-length DATA frame carries no message content;
                         // forwarding it would put an empty DATA frame without
                         // END_STREAM on the backend connection, which h2 peers
@@ -426,7 +503,19 @@ impl http_body::Body for GrpcBody {
                         // Clean source EOF: h2 may still hold queued upload DATA.
                         Poll::Ready(None)
                     }
-                    Poll::Pending => Poll::Pending,
+                    Poll::Pending => {
+                        // The upload is about to wait: only now does the RPC
+                        // deadline need a timer to wake it (armed lazily).
+                        if let Some(deadline) = rpc_deadline.as_mut()
+                            && deadline.arm(cx)
+                        {
+                            if let Some(accounting) = request_bytes.as_mut() {
+                                accounting.publish(*bytes_seen as u64);
+                            }
+                            return Poll::Ready(Some(Err(GRPC_UPLOAD_RPC_DEADLINE_MESSAGE.into())));
+                        }
+                        Poll::Pending
+                    }
                 }
             }
             GrpcBody::Channel {
@@ -439,6 +528,7 @@ impl http_body::Body for GrpcBody {
                 cancelled,
                 cancelled_terminal,
                 forwarded_bytes,
+                frontend_failure_relayed,
                 grpc_messages,
                 grpc_scanner,
                 ..
@@ -521,9 +611,14 @@ impl http_body::Body for GrpcBody {
                     // The pump task signals a frontend upload failure with `Err(())`
                     // so we RST the backend instead of sending a clean END_STREAM
                     // that the backend would mistake for a completed request.
-                    Poll::Ready(Some(Err(()))) => Poll::Ready(Some(Err(
-                        "gRPC request body upload failed (frontend stream error)".into(),
-                    ))),
+                    Poll::Ready(Some(Err(()))) => {
+                        if let Some(relayed) = frontend_failure_relayed {
+                            relayed.store(true, Ordering::Release);
+                        }
+                        Poll::Ready(Some(Err(
+                            "gRPC request body upload failed (frontend stream error)".into(),
+                        )))
+                    }
                     Poll::Ready(None) => Poll::Ready(None),
                     Poll::Pending => Poll::Pending,
                 }
@@ -737,114 +832,6 @@ pub struct GrpcConnectionPool {
     frontend_slots: Arc<crate::proxy::frontend_affinity::SlotTable>,
 }
 
-/// How long a failed affinity or spill shard create keeps that shard on the
-/// borrow path before it is dialled again.
-const SHARD_CREATE_BACKOFF: Duration = Duration::from_secs(2);
-
-/// Hard bound on retained failure keys and FIFO records. Recording one
-/// physical failure evicts at most one record; there are no full-map scans.
-const SHARD_CREATE_BACKOFF_CAPACITY: usize = 4096;
-
-/// A shard key's place in its ring: the base key length, the preferred
-/// shard, and the ring size.
-#[derive(Clone, Copy)]
-struct ShardRing {
-    base_len: usize,
-    start: usize,
-    shards: usize,
-}
-
-/// Removes a background shard fill from the in-flight set when its task ends,
-/// however it ends.
-struct ShardFill {
-    fills: Arc<DashMap<String, ()>>,
-    key: String,
-}
-
-impl Drop for ShardFill {
-    fn drop(&mut self) {
-        self.fills.remove(&self.key);
-    }
-}
-
-struct ShardCreateBackoff {
-    failures: DashMap<Arc<str>, ShardCreateFailure>,
-    // Only physical failed/cancelled creates take this lock. Warm requests
-    // never consult the backoff cache, and coalesced waiters never record.
-    order: Mutex<VecDeque<(Arc<str>, usize)>>,
-    recorded: AtomicUsize,
-    evicted: AtomicUsize,
-}
-
-struct ShardCreateFailure {
-    at: tokio::time::Instant,
-    generation: usize,
-}
-
-impl ShardCreateBackoff {
-    fn new(shards: usize) -> Self {
-        Self {
-            failures: DashMap::with_shard_amount(shards),
-            order: Mutex::new(VecDeque::with_capacity(SHARD_CREATE_BACKOFF_CAPACITY)),
-            recorded: AtomicUsize::new(0),
-            evicted: AtomicUsize::new(0),
-        }
-    }
-
-    fn backed_off(&self, key: &str) -> bool {
-        let failed_at = match self.failures.get(key) {
-            Some(entry) => entry.at,
-            None => return false,
-        };
-        if failed_at.elapsed() < SHARD_CREATE_BACKOFF {
-            return true;
-        }
-        self.failures.remove_if(key, |_, failure| {
-            failure.at.elapsed() >= SHARD_CREATE_BACKOFF
-        });
-        false
-    }
-
-    fn record(&self, key: String) {
-        // Recover the bounded bookkeeping after a panic without dropping the
-        // cancellation cooldown. No user work runs while this lock is held.
-        let mut order = self.order.lock().unwrap_or_else(|err| err.into_inner());
-        if order.len() == SHARD_CREATE_BACKOFF_CAPACITY
-            && let Some((old_key, old_generation)) = order.pop_front()
-        {
-            self.failures.remove_if(old_key.as_ref(), |_, failure| {
-                failure.generation == old_generation
-            });
-            self.evicted.fetch_add(1, Ordering::Relaxed);
-        }
-        let key: Arc<str> = key.into();
-        let generation = self.recorded.fetch_add(1, Ordering::Relaxed);
-        self.failures.insert(
-            Arc::clone(&key),
-            ShardCreateFailure {
-                at: tokio::time::Instant::now(),
-                generation,
-            },
-        );
-        order.push_back((key, generation));
-    }
-}
-
-/// Lives inside the elected physical creator, so cancellation records the
-/// cooldown before GenericPool wakes waiters to elect the next creator.
-struct ShardCreateGuard<'a> {
-    backoff: &'a ShardCreateBackoff,
-    key: Option<String>,
-}
-
-impl Drop for ShardCreateGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(key) = self.key.take() {
-            self.backoff.record(key);
-        }
-    }
-}
-
 #[derive(Clone)]
 struct GrpcPoolManager {
     global_pool_config: PoolConfig,
@@ -1023,37 +1010,8 @@ impl GrpcConnectionPool {
         });
     }
 
-    /// ⚠️  CRITICAL — DO NOT add fields to this key without careful analysis.
-    /// Adding fields causes pool fragmentation and P95 latency regressions.
-    /// See `ConnectionPool::create_pool_key` for detailed rationale.
-    ///
-    /// Includes all fields that affect connection *identity*: destination,
-    /// TLS mode, DNS override, CA cert, mTLS client cert, and server cert verification.
-    /// Uses `|` as field delimiter to avoid ambiguity with `:` in IPv6 addresses.
-    ///
-    /// Writes the base key (without shard suffix) into `buf`. For shard keys,
-    /// `write_shard_key_inplace()` appends `#N` by truncating to the base length.
-    ///
-    /// Not called directly after the thread-local buffer refactor (the free
-    /// function `with_grpc_pool_key` calls `write_grpc_pool_key` instead),
-    /// but retained for parity with the HTTP2 pool's internal API surface.
-    #[allow(dead_code)]
-    fn write_pool_key(buf: &mut String, proxy: &Proxy) {
-        write_grpc_pool_key(
-            buf,
-            &proxy.backend_host,
-            proxy.backend_port,
-            proxy,
-            &PoolConfig::default(),
-            proxy.resolved_tls.client_cert_path.as_deref(),
-            proxy.resolved_tls.client_key_path.as_deref(),
-            None,
-        );
-    }
-
-    /// Allocating version of the pool key — only used for warmup deduplication
-    /// where the key must outlive the thread-local buffer. Currently unused
-    /// post-refactor (gRPC pool warms lazily); retained for future re-enablement.
+    /// Allocating version of the pool key, used by [`Self::pool_key_for_warmup`]
+    /// where the key must outlive the thread-local buffer.
     #[allow(dead_code)]
     fn pool_key_owned(proxy: &Proxy) -> String {
         grpc_pool_key_owned(proxy, None, &PoolConfig::default())
@@ -1064,7 +1022,6 @@ impl GrpcConnectionPool {
     /// external integration/unit tests can verify pool-key partitioning
     /// behavior (e.g., GAP-3B subset partitioning regression guard in
     /// `tests/unit/gateway_core/pool_key_tests.rs`).
-    #[allow(dead_code)]
     pub fn pool_key_for_warmup(proxy: &Proxy) -> String {
         Self::pool_key_owned(proxy)
     }
@@ -1075,7 +1032,6 @@ impl GrpcConnectionPool {
     /// `pool_key_for_warmup` is this with `svid_generation = None` and
     /// `PoolConfig::default()`. Runtime `get_sender` uses the pool manager's
     /// global instead of reconstructing `PoolConfig` a second time.
-    #[allow(dead_code)] // exercised from unit/integration tests
     pub fn pool_key_with_global(
         proxy: &Proxy,
         svid_generation: Option<u64>,
@@ -1086,7 +1042,6 @@ impl GrpcConnectionPool {
 
     /// TLS-config cache key (no host/port). Used by unit tests to prove two
     /// endpoints sharing trust material reuse one `ClientConfig`.
-    #[allow(dead_code)] // exercised from unit tests
     pub fn tls_config_cache_key_for_warmup(proxy: &Proxy, svid_generation: Option<u64>) -> String {
         backend_tls_config_cache_key(
             &proxy.resolved_tls,
@@ -1130,7 +1085,6 @@ impl GrpcConnectionPool {
         self.pool.manager().tls_configs.retain_keys(&live_tls_keys);
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn insert_rr_counter_for_tests(&self, key: impl Into<String>) {
         self.rr_counters
             .insert(key.into(), Arc::new(AtomicUsize::new(0)));
@@ -1140,7 +1094,6 @@ impl GrpcConnectionPool {
     /// post-insert stale-generation removal. Used by integration tests to
     /// prove insert-before-retire and retire-before-insert without a live
     /// backend handshake.
-    #[allow(dead_code)] // exercised from integration tests
     pub fn get_or_seed_rr_counter_for_tests(
         &self,
         key: &str,
@@ -1154,26 +1107,21 @@ impl GrpcConnectionPool {
         )
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn rr_counter_len(&self) -> usize {
         self.rr_counters.len()
     }
 
     /// Shard keys currently backed off after a failed affinity or spill
     /// create.
-    #[allow(dead_code)] // exercised from integration tests
     pub fn shard_create_backoff_len(&self) -> usize {
-        self.shard_create_backoff.failures.len()
+        self.shard_create_backoff.backed_off_keys()
     }
 
     /// Physical failure records and bounded FIFO eviction operations. Exposed
     /// for outage/fanout regression coverage, not logical request counts.
     #[doc(hidden)]
     pub fn shard_create_backoff_work(&self) -> (usize, usize) {
-        (
-            self.shard_create_backoff.recorded.load(Ordering::Relaxed),
-            self.shard_create_backoff.evicted.load(Ordering::Relaxed),
-        )
+        self.shard_create_backoff.work()
     }
 
     /// Background shard creates currently in flight. Exposed for borrow and
@@ -1339,6 +1287,13 @@ impl GrpcConnectionPool {
         if self.shard_fills.contains_key(key) || self.pool.has_pending_creation(key) {
             return;
         }
+        // Sample the drain epoch now, not when the detached task first runs,
+        // and make sure the captured SVID generation is still current (see
+        // the direct HTTP/2 pool's `spawn_shard_fill`).
+        let drain_epoch = self.pool.drain_epoch();
+        if self.pool.manager().svid_generation_for_proxy(proxy) != svid_generation {
+            return;
+        }
         let Some(permit) = self.pool.try_background_create_permit() else {
             return;
         };
@@ -1364,6 +1319,7 @@ impl GrpcConnectionPool {
                 .create_or_get_existing_owned_in_background(
                     key,
                     permit,
+                    drain_epoch,
                     purpose.pool_caller(),
                     |attempt| note_grpc_establishment_join(attempt, purpose),
                     |attempt| note_grpc_establishment_waiter_failure(attempt, purpose),
@@ -1433,12 +1389,10 @@ impl GrpcConnectionPool {
         })
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn contains_rr_counter(&self, key: &str) -> bool {
         self.rr_counters.contains_key(key)
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn backend_tls_config_cache(&self) -> &BackendTlsConfigCache {
         &self.pool.manager().tls_configs
     }
@@ -1531,6 +1485,10 @@ impl GrpcConnectionPool {
         // The closure body is synchronous — `now_or_never(sender.ready())`
         // polls once without yielding, and DashMap lookups never await — so
         // the `RefCell::borrow_mut()` lifetime stays inside this block.
+        //
+        // The drain epoch is sampled BEFORE the SVID generation is read (see
+        // the direct HTTP/2 pool's `get_sender_unprofiled`).
+        let drain_epoch = self.pool.drain_epoch();
         let svid_generation = self.pool.manager().svid_generation_for_proxy(proxy);
         let phase1 = crate::profile_pool_sync!(Phase1, {
             self.with_pool_key(proxy, svid_generation, |key_buf| -> GrpcPhase1 {
@@ -1639,6 +1597,7 @@ impl GrpcConnectionPool {
         let acquired = crate::profile_pool_future!(FallbackPoll, {
             self.pool.create_or_get_existing_owned_with_recovery(
                 selected_key,
+                drain_epoch,
                 purpose.pool_caller(),
                 |attempt| note_grpc_establishment_join(attempt, purpose),
                 |attempt| note_grpc_establishment_waiter_failure(attempt, purpose),
@@ -1678,7 +1637,23 @@ impl GrpcConnectionPool {
         });
         match acquired {
             Ok(sender) => Ok(sender),
-            Err(err) => {
+            // Only a `maxConnections` refusal (the creator's, or a coalesced
+            // waiter's rebuilt from `SharedPoolCreateKind::MaxConnections`)
+            // reuses an already-established shard, so a cap below the shard
+            // count converges on `cap` connections. Any other create failure
+            // (TLS, ALPN, refused connect, ...) surfaces, rather than being
+            // masked by a still-open sibling for as long as one lives — which
+            // would also answer a capability probe `Ok` for a target whose
+            // new connections fail (issue #7181).
+            Err(err)
+                if matches!(
+                    err,
+                    GrpcProxyError::BackendUnavailable {
+                        kind: GrpcBackendUnavailableKind::MaxConnections,
+                        ..
+                    }
+                ) =>
+            {
                 // Phase 2 (synchronous re-borrow): rebuild the pool key in
                 // the same thread-local buffer and probe alternative shards.
                 // The proxy outlives this future and is read-only, so the
@@ -1704,6 +1679,7 @@ impl GrpcConnectionPool {
                     None => Err(err),
                 }
             }
+            Err(err) => Err(err),
         }
     }
 }
@@ -1961,45 +1937,10 @@ impl GrpcPoolManager {
             })
     }
 
-    /// Build an HTTP/2 client builder with keepalive and flow-control settings.
-    ///
+    /// The gRPC pool's HTTP/2 client builder: the shared `PoolConfig` builder
+    /// every H2 pool family uses.
     fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
-        let mut builder = http2::Builder::new(TokioExecutor::new());
-
-        // Timer is required for keep_alive_interval and keep_alive_timeout to work
-        builder.timer(TokioTimer::new());
-
-        if pool_config.enable_http2 {
-            builder
-                .keep_alive_interval(Duration::from_secs(
-                    pool_config.http2_keep_alive_interval_seconds,
-                ))
-                .keep_alive_timeout(Duration::from_secs(
-                    pool_config.http2_keep_alive_timeout_seconds,
-                ))
-                .max_concurrent_reset_streams(4096);
-        }
-
-        // Flow-control tuning — larger windows dramatically improve throughput
-        // by allowing more data in flight before waiting for WINDOW_UPDATEs.
-        builder
-            .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
-            .initial_connection_window_size(pool_config.http2_initial_connection_window_size)
-            .adaptive_window(pool_config.http2_adaptive_window)
-            .max_frame_size(pool_config.http2_max_frame_size);
-
-        if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            // Advertised to the peer as our own inbound stream cap.
-            builder.max_concurrent_streams(max_streams);
-        }
-
-        if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            // Preserve the configured initial outbound bound until the peer's
-            // SETTINGS frame replaces it.
-            builder.initial_max_send_streams(max_streams as usize);
-        }
-
-        builder
+        crate::pool::hyper_h2_client_builder(pool_config)
     }
 
     /// Create an h2c (cleartext HTTP/2) connection using prior knowledge.
@@ -2134,14 +2075,24 @@ const PEER_MAX_STREAMS_EAGER_POLLS: u32 = 32;
 /// per this many polls. A power of two.
 const PEER_MAX_STREAMS_SAMPLE_INTERVAL: u32 = 64;
 
+/// How often the driver samples again while the backend allows no streams.
+///
+/// Both pools skip a connection whose published limit is 0, so no request
+/// reaches its driver, and hyper polls the driver only when one does (the
+/// backend's SETTINGS wake hyper's separate I/O task, not this future).
+/// Without this timer a backend that raises its limit again would stay
+/// skipped for as long as the connection lives. Armed only while the
+/// published limit is 0.
+const PEER_MAX_STREAMS_ZERO_RESAMPLE: Duration = Duration::from_millis(100);
+
 /// Whether driver poll number `poll` (counting from 1) samples the backend's
 /// stream limit.
 fn samples_peer_max_streams(poll: u32) -> bool {
     poll <= PEER_MAX_STREAMS_EAGER_POLLS || (poll & (PEER_MAX_STREAMS_SAMPLE_INTERVAL - 1)) == 0
 }
 
-/// Drive a pooled gRPC backend connection to completion, publishing the
-/// backend's current `SETTINGS_MAX_CONCURRENT_STREAMS`.
+/// Drive a pooled gRPC or direct HTTP/2 backend connection to completion,
+/// publishing the backend's current `SETTINGS_MAX_CONCURRENT_STREAMS`.
 ///
 /// hyper exposes the value only on the `Connection`, never on the
 /// `SendRequest` the pool hands out, and h2 applies the peer's SETTINGS only
@@ -2159,7 +2110,13 @@ fn samples_peer_max_streams(poll: u32) -> bool {
 /// out once its handshake completes, before the backend's SETTINGS arrive, so
 /// a burst on a fresh TLS connection can exhaust the eager window on the
 /// pre-SETTINGS default. The store is skipped while the value is unchanged.
-async fn drive_sampling_peer_max_streams<C>(
+///
+/// hyper polls this future when a request reaches the connection, so the
+/// polls above are request-driven. A connection published at a limit of 0 is
+/// skipped by its pool and gets no request, so while the published limit is
+/// 0 the driver also samples every [`PEER_MAX_STREAMS_ZERO_RESAMPLE`] on a
+/// timer of its own, and a backend that raises its limit is used again.
+pub(crate) async fn drive_sampling_peer_max_streams<C>(
     conn: &mut C,
     current_max_send_streams: impl Fn(&C) -> usize,
     peer_max_streams: &AtomicUsize,
@@ -2167,14 +2124,52 @@ async fn drive_sampling_peer_max_streams<C>(
 where
     C: std::future::Future<Output = hyper::Result<()>> + Unpin,
 {
+    drive_sampling_peer_max_streams_with(conn, current_max_send_streams, peer_max_streams, || {
+        Box::pin(tokio::time::sleep(PEER_MAX_STREAMS_ZERO_RESAMPLE))
+    })
+    .await
+}
+
+/// [`drive_sampling_peer_max_streams`] with each zero-limit re-sample timer
+/// supplied by the caller, so a test can hand it one that has already
+/// expired.
+async fn drive_sampling_peer_max_streams_with<C>(
+    conn: &mut C,
+    current_max_send_streams: impl Fn(&C) -> usize,
+    peer_max_streams: &AtomicUsize,
+    mut zero_resample_timer: impl FnMut() -> Pin<Box<tokio::time::Sleep>>,
+) -> hyper::Result<()>
+where
+    C: std::future::Future<Output = hyper::Result<()>> + Unpin,
+{
     let mut polls: u32 = 0;
+    // `Some` only while the published limit is 0.
+    let mut zero_resample: Option<Pin<Box<tokio::time::Sleep>>> = None;
     std::future::poll_fn(|cx| {
         let polled = std::future::Future::poll(Pin::new(&mut *conn), cx);
         polls = polls.wrapping_add(1);
-        if samples_peer_max_streams(polls) {
+        // Polling the timer also keeps this task registered for its expiry.
+        let resample_due = match zero_resample.as_mut() {
+            Some(timer) => std::future::Future::poll(timer.as_mut(), cx).is_ready(),
+            None => false,
+        };
+        if resample_due || samples_peer_max_streams(polls) {
             let current = current_max_send_streams(&*conn);
             if peer_max_streams.load(Ordering::Relaxed) != current {
                 peer_max_streams.store(current, Ordering::Relaxed);
+            }
+            if current != 0 || polled.is_ready() {
+                zero_resample = None;
+            } else if resample_due || zero_resample.is_none() {
+                let mut timer = zero_resample_timer();
+                // The first poll registers this task for the timer's expiry.
+                // A timer that has already expired (this thread was held up
+                // between creating and polling it) registers nothing, so ask
+                // for another poll: it finds the timer ready and samples.
+                if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
+                    cx.waker().wake_by_ref();
+                }
+                zero_resample = Some(timer);
             }
         }
         polled
@@ -2228,17 +2223,19 @@ impl GrpcPoolManager {
     }
 
     fn effective_client_cert_path<'a>(&'a self, proxy: &'a Proxy) -> Option<&'a str> {
-        proxy.resolved_tls.client_cert_path.as_deref().or(self
-            .global_env_config
-            .backend_tls_client_cert_path
-            .as_deref())
+        proxy.resolved_tls.effective_client_cert_path(
+            self.global_env_config
+                .backend_tls_client_cert_path
+                .as_deref(),
+        )
     }
 
     fn effective_client_key_path<'a>(&'a self, proxy: &'a Proxy) -> Option<&'a str> {
-        proxy.resolved_tls.client_key_path.as_deref().or(self
-            .global_env_config
-            .backend_tls_client_key_path
-            .as_deref())
+        proxy.resolved_tls.effective_client_key_path(
+            self.global_env_config
+                .backend_tls_client_key_path
+                .as_deref(),
+        )
     }
 
     fn write_pool_key(
@@ -2679,7 +2676,14 @@ pub enum GrpcProxyError {
 /// operator stall-timeout and client RPC-deadline wire messages while both let
 /// their pre-dispatch probe guard settle neutrally.
 pub(crate) enum GrpcRequestBodyCollectError {
+    /// The upload exceeded the gRPC receive ceiling.
     ResourceExhausted(String),
+    /// The aggregate buffered-request budget refused to grow the buffer: the
+    /// gateway-local `gateway_buffer_capacity` refusal (gRPC
+    /// `RESOURCE_EXHAUSTED` with the fixed capacity message). Always before
+    /// any backend dispatch, so it is never retried and never a backend
+    /// failure.
+    BufferCapacityExceeded,
     TimedOut,
     DeadlineExceeded,
     /// The admitted stream's authorization lifetime elapsed while the gateway was
@@ -3056,10 +3060,6 @@ pub(crate) fn http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
     }
 }
 
-/// The non-standard `499 Client Closed Request` status the gateway records for
-/// a client that disconnected before the response.
-const CLIENT_CLOSED_REQUEST_STATUS: u16 = 499;
-
 /// Map a gRPC status code to the closest HTTP status — the reverse of
 /// [`http_reject_status_to_grpc_status`]. Used to feed the adaptive-concurrency
 /// limiter a backend-health signal for gRPC responses whose failure rides in the
@@ -3164,8 +3164,8 @@ fn parse_grpc_status_joined_value(status: &str) -> u32 {
 /// status was captured for health accounting. Missing terminal status is
 /// gRPC UNKNOWN for the client, so it must not leave a stale backend status in
 /// Prometheus/log metadata.
-pub(crate) fn refresh_grpc_status_metadata(
-    metadata: &mut HashMap<String, String>,
+pub(crate) fn refresh_grpc_status_metadata<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
     trailers: &HashMap<String, String>,
     headers: &HashMap<String, String>,
 ) {
@@ -3194,8 +3194,8 @@ pub(crate) fn refresh_grpc_status_metadata(
 /// stays unset. A status present in either map is still authoritative and still
 /// refreshes, so a genuine post-hook edit is never ignored, and a request with
 /// no recorded status at all still falls back to `UNKNOWN`.
-pub(crate) fn refresh_grpc_status_metadata_with_body_framed_terminal(
-    metadata: &mut HashMap<String, String>,
+pub(crate) fn refresh_grpc_status_metadata_with_body_framed_terminal<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
     trailers: &HashMap<String, String>,
     headers: &HashMap<String, String>,
     terminal_metadata_is_body_framed: bool,
@@ -4219,7 +4219,6 @@ impl<'a> GrpcDispatchTransport<'a> {
     ///
     /// `None` (no LB-selected target) keeps the direct pool: the proxy's own
     /// backend host is the destination and no mesh tag exists to honor.
-    #[allow(dead_code)] // External integration tests call this; production uses for_target_with_hbone_context.
     pub fn for_target(
         grpc_pool: &'a GrpcConnectionPool,
         mesh_mtls_pool: &'a crate::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
@@ -4342,7 +4341,6 @@ impl<'a> GrpcDispatchTransport<'a> {
     /// Authenticated frontend workload identity asserted on HBONE CONNECT.
     /// `None` for non-HBONE transports, and for HBONE when the frontend did not
     /// authenticate a mesh peer (the pool then falls back to the gateway SVID).
-    #[allow(dead_code)] // External unit/integration tests read this diagnostic; the binary target does not.
     pub fn asserted_source_identity(&self) -> Option<&crate::identity::SpiffeId> {
         match self {
             Self::Hbone(hbone) => hbone.asserted_source_identity.as_ref(),
@@ -4510,13 +4508,26 @@ impl<'a> GrpcDispatchTransport<'a> {
     }
 
     /// Drop a stale pooled sender after a provably pre-wire cancellation or
-    /// protocol NACK. The mesh pools self-heal instead: the mesh-mTLS
-    /// cached-sender scans skip `is_closed()` senders, and the HBONE gRPC
-    /// transport dials a FRESH inner HTTP/2 connection per RPC, so neither has
-    /// a stale sender to invalidate.
-    fn invalidate_on_pre_wire_cancel(&self, proxy: &Proxy) {
-        if let Self::Direct(pool) = self {
-            pool.invalidate_shards_for_proxy(proxy);
+    /// protocol NACK. The direct pool invalidates the proxy's shards. The
+    /// HBONE gRPC transport retires the shared nested HTTP/2 carrier the
+    /// failed dispatch rode, when it came from
+    /// [`crate::proxy::hbone_inner_pool`] (`inner_carrier`, from
+    /// [`GrpcDispatchSender::hbone_inner_carrier`]), so a retry cannot check
+    /// out the same dying carrier while it still reports open (issue #7180).
+    /// The mesh-mTLS cached-sender scans skip `is_closed()` senders.
+    fn invalidate_on_pre_wire_cancel(
+        &self,
+        proxy: &Proxy,
+        inner_carrier: Option<&HboneInnerCarrier>,
+    ) {
+        match self {
+            Self::Direct(pool) => pool.invalidate_shards_for_proxy(proxy),
+            Self::Hbone(_) => {
+                if let Some(carrier) = inner_carrier {
+                    carrier.retire_carrier();
+                }
+            }
+            Self::MeshMtls(_) => {}
         }
     }
 }
@@ -4590,15 +4601,19 @@ fn hbone_dispatch_authority<'a>(
 /// queued on. That cap is not sampled once: the load is created here BEFORE the
 /// connection driver is spawned and the driver refreshes it from
 /// `Connection::current_max_send_streams()` after every poll, because the value
-/// available immediately after `await_peer_settings` is still hyper's
-/// pre-settings default. The width ceiling is
+/// available immediately after `await_peer_settings` is still the pre-settings
+/// bound (the configured stream cap, else hyper's default). The width ceiling is
 /// `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST` clamped by
 /// `hbone_inner_pool::MAX_SHARED_H2_PER_KEY`; see `docs/mesh.md`.
 ///
-/// HTTP/2 PING keepalive is still deliberately NOT enabled on the inner
-/// connection. It is a stream on the outer pooled HBONE connection, which
-/// already carries the pool's keepalive; if that dies, this sender reports
-/// closed and is evicted on the next checkout.
+/// The inner connection is built by the shared `pool::hyper_h2_client_builder`
+/// (issue #7071), so when `enable_http2` is set it sends the pool's HTTP/2 PING
+/// keepalive while an RPC is in flight (never while idle) and is torn down when
+/// a PING goes unanswered for `http2_keep_alive_timeout_seconds`. The outer
+/// pooled HBONE connection runs its own keepalive, which proves only the tunnel
+/// to the destination relay; the inner PINGs also prove the destination app is
+/// still serving this connection. Either way a dead sender reports closed and
+/// is evicted on the next checkout.
 ///
 /// The inner connection is admitted only once the destination app's OWN HTTP/2
 /// connection preface has been observed (`h2c_preface::await_peer_settings`,
@@ -4701,19 +4716,13 @@ async fn open_hbone_grpc_sender(
     // nothing else: the only thing it decides is whether this nested HTTP/2
     // connection may be held open across RPCs.
     let peer_advertises_fence = tunnel.peer_advertises_inner_reuse();
-    // The same effective pool configuration the inner key was built from, so a
-    // pooled carrier's wire settings and its key can never disagree.
-    let pool_config = &inner_pool_config;
-    let mut builder = http2::Builder::new(TokioExecutor::new());
-    builder.timer(TokioTimer::new());
-    builder
-        .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
-        .initial_connection_window_size(pool_config.http2_initial_connection_window_size)
-        .adaptive_window(pool_config.http2_adaptive_window)
-        .max_frame_size(pool_config.http2_max_frame_size);
-    if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-        builder.max_concurrent_streams(max_streams);
-    }
+    // The same effective pool configuration the inner key was built from, and
+    // the same shared builder as the direct gRPC pool, so a pooled carrier's
+    // wire settings and its key can never disagree (issue #7071). That
+    // includes the pool's HTTP/2 PING keepalive: the outer HBONE carrier's own
+    // PINGs prove only the tunnel to the destination relay, while these prove
+    // the destination app behind it is still serving this connection.
+    let builder = crate::pool::hyper_h2_client_builder(&inner_pool_config);
 
     // The inner connection is CLEARTEXT HTTP/2 to the destination app, so — as
     // on the direct-dial h2c path — nothing about the outer hop proves the app
@@ -4761,10 +4770,11 @@ async fn open_hbone_grpc_sender(
     // task below is the only place that can keep reading it — and a single
     // sample taken right here would be wrong: `await_peer_settings` proves only
     // that the peer's SETTINGS BYTES arrived, while `h2` defers applying them
-    // until it writes the SETTINGS ACK, so this early read still reports
-    // hyper's pre-settings `DEFAULT_INITIAL_MAX_SEND_STREAMS` of 100. Recording
-    // 100 for a destination advertising 8 left `is_saturated()` permanently
-    // false and queued RPCs 9..100 pending-open inside `h2`.
+    // until it writes the SETTINGS ACK, so this early read still reports the
+    // pre-settings bound (the configured stream cap, else hyper's
+    // `DEFAULT_INITIAL_MAX_SEND_STREAMS` of 100). Recording 100 for a
+    // destination advertising 8 left `is_saturated()` permanently false and
+    // queued RPCs 9..100 pending-open inside `h2`.
     //
     // The load is therefore created BEFORE the spawn and shared with the pool,
     // and the driver stores the connection's current value after every poll.
@@ -4836,8 +4846,8 @@ pub struct GrpcPooledSender {
     /// which is what lets the inner pool see a carrier at its nested peer's
     /// `SETTINGS_MAX_CONCURRENT_STREAMS` and open a sibling rather than queue
     /// every RPC to one destination behind one connection. `None` for the
-    /// direct-dial gRPC pool, which is bounded by its own pool.
-    #[allow(dead_code)] // Held for its `Drop`; the accounting IS the read.
+    /// direct-dial gRPC pool, which is bounded by its own pool. Also the
+    /// handle a pre-wire failure retires the carrier through (issue #7180).
     inner_lease: Option<Arc<crate::proxy::hbone_inner_pool::HboneInnerH2StreamLease>>,
 }
 
@@ -4884,10 +4894,6 @@ impl GrpcPooledSender {
             inner_lease: Some(Arc::new(lease)),
         }
     }
-
-    fn backend_socket(&self) -> Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>> {
-        None
-    }
 }
 
 impl std::ops::Deref for GrpcPooledSender {
@@ -4903,6 +4909,10 @@ impl std::ops::DerefMut for GrpcPooledSender {
         &mut self.inner
     }
 }
+
+/// The source-side HBONE inner-pool carrier hold of one dispatch; see
+/// [`GrpcPooledSender::inner_lease`].
+type HboneInnerCarrier = Arc<crate::proxy::hbone_inner_pool::HboneInnerH2StreamLease>;
 
 /// An acquired HTTP/2 sender for one gRPC dispatch attempt.
 pub(crate) enum GrpcDispatchSender {
@@ -4932,14 +4942,13 @@ impl std::fmt::Display for GrpcDispatchSendError {
 }
 
 impl GrpcDispatchSender {
-    /// The backend socket this transport writes to, when it can safely support
-    /// a per-request post-EOS send-queue drain bound.
-    ///
-    /// All current variants return `None`: H2 is multiplexed, while mesh-mTLS
-    /// owns its socket outside this dispatcher.
-    fn backend_socket(&self) -> Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>> {
+    /// The pooled nested-HBONE carrier this sender rides, when it was taken
+    /// from or published to [`crate::proxy::hbone_inner_pool`]. Captured
+    /// before the send so a pre-wire failure can retire exactly that carrier
+    /// (issue #7180); sharing the `Arc` adds no second load hold.
+    fn hbone_inner_carrier(&self) -> Option<HboneInnerCarrier> {
         match self {
-            Self::H2(sender) => sender.backend_socket(),
+            Self::H2(sender) => sender.inner_lease.clone(),
             Self::MeshMtls(_) => None,
         }
     }
@@ -5072,6 +5081,7 @@ fn mesh_mtls_pool_error_to_grpc(error: HbonePoolError) -> GrpcProxyError {
         E::InvalidConnectRequest { .. }
         | E::ConnectStream { .. }
         | E::ConnectRejected { .. }
+        | E::WebSocketUpgradeRefused { .. }
         | E::ExtendedConnectUnsupported { .. } => GrpcProxyError::backend_unavailable_with_source(
             GrpcBackendUnavailableKind::Connect,
             message,
@@ -5233,7 +5243,7 @@ pub fn grpc_buffered_body_capacity_hint(headers: &hyper::HeaderMap) -> usize {
 /// Streaming gRPC response — headers received, body streams frame-by-frame with trailers.
 ///
 /// The `body` field is an `Incoming` body from hyper. When passed through as
-/// a `CoalescingH2Body`, hyper's HTTP/2 server forwards coalesced DATA frames
+/// a `Coalescing<S>` body, hyper's HTTP/2 server forwards coalesced DATA frames
 /// and TRAILERS frames to the downstream client as they arrive,
 /// preserving gRPC streaming semantics without buffering the full response.
 pub struct GrpcStreamingResponse {
@@ -5292,7 +5302,6 @@ pub async fn proxy_grpc_request_from_bytes(
     proxy: &Proxy,
     backend_url: &str,
     transport: &GrpcDispatchTransport<'_>,
-    dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     stream_response: bool,
     max_response_body_size_bytes: usize,
@@ -5307,7 +5316,6 @@ pub async fn proxy_grpc_request_from_bytes(
         proxy,
         backend_url,
         transport,
-        dns_cache,
         proxy_headers,
         stream_response,
         max_response_body_size_bytes,
@@ -5354,7 +5362,6 @@ pub async fn proxy_grpc_request_streaming(
     proxy: &Proxy,
     backend_url: &str,
     transport: &GrpcDispatchTransport<'_>,
-    _dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     max_grpc_recv_size_bytes: usize,
     body_size_exceeded: Arc<AtomicBool>,
@@ -5364,6 +5371,9 @@ pub async fn proxy_grpc_request_streaming(
     grpc_request_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
     request_bytes: Option<GrpcUploadByteAccounting>,
     auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    // The route's configured credential header locations, stripped from the
+    // client's request trailers (`RequestContext::request_trailer_credential_header_names`).
+    trailer_credential_header_names: Option<Arc<Vec<String>>>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let (parts, body) = req.into_parts();
     // The tap's scanner reads the upload's own framing (a pass-through
@@ -5397,6 +5407,7 @@ pub async fn proxy_grpc_request_streaming(
         require_end_stream,
         incoming: body,
         auth_deadline,
+        rpc_deadline: streaming_upload_rpc_deadline(grpc_deadline_at),
         bytes_seen: 0,
         max_bytes: max_grpc_recv_size_bytes,
         exceeded: Arc::clone(&body_size_exceeded),
@@ -5404,6 +5415,7 @@ pub async fn proxy_grpc_request_streaming(
         upload_observer,
         grpc_messages,
         grpc_scanner,
+        trailer_credential_header_names,
     };
     proxy_grpc_streaming_dispatch(
         parts.method,
@@ -5441,8 +5453,9 @@ pub async fn proxy_grpc_request_streaming(
 /// DATA via the same byte counting. `body_size_exceeded` is the shared overflow
 /// flag the channel body sets on limit breach so the caller can surface
 /// `RESOURCE_EXHAUSTED`; `body_cancelled` converts response-side shutdown into
-/// a backend request-body error, and `body_bytes_forwarded` counts only DATA
-/// frames yielded across that boundary.
+/// a backend request-body error, `body_bytes_forwarded` counts only DATA
+/// frames yielded across that boundary, and `body_frontend_failure_relayed` is
+/// set when the body hands a frontend upload failure to hyper.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_grpc_request_streaming_channel(
     method: hyper::Method,
@@ -5456,6 +5469,7 @@ pub async fn proxy_grpc_request_streaming_channel(
     body_size_exceeded: Arc<AtomicBool>,
     body_cancelled: Arc<AtomicBool>,
     body_bytes_forwarded: Arc<AtomicU64>,
+    body_frontend_failure_relayed: Option<Arc<AtomicBool>>,
     upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
@@ -5479,6 +5493,7 @@ pub async fn proxy_grpc_request_streaming_channel(
         cancelled: body_cancelled,
         cancelled_terminal: false,
         forwarded_bytes: body_bytes_forwarded,
+        frontend_failure_relayed: body_frontend_failure_relayed,
         upload_observer,
         grpc_messages,
         grpc_scanner,
@@ -5884,6 +5899,9 @@ async fn proxy_grpc_streaming_dispatch(
             return Err(e);
         }
     };
+    // The nested-HBONE carrier this attempt rides, if pooled, so a pre-wire
+    // failure can retire exactly it (issue #7180).
+    let inner_carrier = sender.hbone_inner_carrier();
 
     // Remaining-budget rewrite AFTER acquisition, for the same reason as the
     // buffered path: a cold dial must not be re-added to the client's budget.
@@ -5911,15 +5929,19 @@ async fn proxy_grpc_streaming_dispatch(
     if let Some(write_timeout) = body_write_timeout.as_ref() {
         backend_req.extensions_mut().insert(write_timeout.clone());
     }
+    // The client RPC deadline also bounds the upload from hyper's own body
+    // pipe (hyper patch 007), which outlives this future and, while it holds a
+    // chunk the backend granted no window for, polls nothing the gateway owns.
+    attach_grpc_upload_deadline(backend_req.extensions_mut(), grpc_deadline_at);
 
     // Authorization ownership was armed before pool acquisition, but a slow
     // connect is not backend-body write inactivity. Start the write watermark
     // only now that a sender exists and immediately before dispatch.
     if let Some(pump) = upload_pump.as_mut() {
+        // No backend socket is bound: gRPC rides multiplexed HTTP/2 (and
+        // mesh-mTLS owns its socket outside this dispatcher), so there is no
+        // per-request post-EOS send-queue drain bound (issue #4411).
         pump.arm_write_watermark();
-        // Same seam publishes the backend socket, so `backend_write_timeout_ms`
-        // also bounds the post-EOS drain of the local send queue (issue #4411).
-        pump.bind_backend_socket(sender.backend_socket());
     }
     // The response-header wait is held to the authorization lifetime as well
     // (GHSA-xcg4-wj3x-gjj2) when the credential expires before the wait's own
@@ -5980,11 +6002,21 @@ async fn proxy_grpc_streaming_dispatch(
                     );
                     return grpc_backend_write_timeout_error(proxy.backend_write_timeout_ms);
                 }
+                // The upload's own RPC deadline (`GrpcBody::Streaming::
+                // rpc_deadline`) resets the stream at the same instant the
+                // header wait's `timeout_at` expires; whichever hyper reports
+                // first, a failure at/after the deadline is that deadline, not
+                // a backend fault.
+                if client_deadline_owns_failure(grpc_deadline_at, tokio::time::Instant::now()) {
+                    return GrpcProxyError::ClientDeadlineExceeded(
+                        GrpcDeadlinePhase::StreamingResponseHeaders,
+                    );
+                }
                 // Streaming / channel uploads are unreplayable — keep post-wire
                 // classification even when hyper reports `is_canceled`, but still
                 // drop the stale pooled sender so the next RPC dials fresh.
                 if e.is_canceled() {
-                    transport.invalidate_on_pre_wire_cancel(proxy);
+                    transport.invalidate_on_pre_wire_cancel(proxy, inner_carrier.as_ref());
                 }
                 error!("gRPC backend request failed (streaming body): {}", e);
                 GrpcProxyError::backend_unavailable_with_source(
@@ -6090,6 +6122,15 @@ async fn proxy_grpc_streaming_dispatch(
 /// gRPC proxies. The body bytes, method, and headers are returned so the caller
 /// can run plugin hooks before dispatching via `proxy_grpc_request_core`.
 ///
+/// The collect is charged against the buffered-request budget by the bytes it
+/// retains, exactly like every other buffered client upload: a stalled upload
+/// holds only what it has sent. The ceiling is `max_grpc_recv_size_bytes`
+/// (`0` folds to the fail-closed buffered fallback). Over the ceiling the
+/// upload is `RESOURCE_EXHAUSTED`; a budget refusal is the distinct
+/// gateway-local `BufferCapacityExceeded`, answered before dispatch. The charge
+/// is returned with the body so the caller can grow it over request-body
+/// transforms and publish it with the dispatched bytes.
+///
 /// `auth` is the admitted stream's authorization-lifetime plan (issue #3815).
 /// A buffered gRPC upload never reaches the streaming upload adapters, so this
 /// collect is the only seam that can stop a continuously active client-streaming
@@ -6100,47 +6141,100 @@ pub(crate) async fn collect_grpc_request_body(
     request_body_read_timeout_ms: u64,
     grpc_deadline_at: Option<tokio::time::Instant>,
     auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
-) -> Result<(hyper::Method, hyper::HeaderMap, Bytes), GrpcRequestBodyCollectError> {
+) -> Result<GrpcCollectedRequestBody, GrpcRequestBodyCollectError> {
+    use super::response_buffer_budget::{ChargedRequestCollector, buffered_request_body_ceiling};
     let (parts, body) = req.into_parts();
     // An HTTP/2 client's masked reset is a failed read, never a complete
     // request (issue #6022); see `body::H2EndStreamGated`.
     let require_end_stream = parts.version == hyper::Version::HTTP_2;
     let body = super::body::H2EndStreamGated::new(body, require_end_stream);
-    let body_bytes = if max_grpc_recv_size_bytes > 0 {
-        let limited = http_body_util::Limited::new(body, max_grpc_recv_size_bytes);
-        let collected = super::collect_request_body_under_authorization(
-            BodyExt::collect(limited),
-            grpc_deadline_at,
-            request_body_read_timeout_ms,
-            auth,
-        )
-        .await
-        .map_err(map_authorized_upload_wait_error)?;
-        match collected {
-            Ok(collected) => collected.to_bytes(),
-            Err(e) => {
-                if is_length_limit_error(e.as_ref()) {
-                    return Err(GrpcRequestBodyCollectError::ResourceExhausted(format!(
-                        "gRPC request payload size exceeds maximum of {} bytes",
-                        max_grpc_recv_size_bytes
-                    )));
-                }
-                return Err(grpc_request_body_client_disconnected(e.as_ref()));
-            }
+    let ceiling = buffered_request_body_ceiling(max_grpc_recv_size_bytes);
+    let collected = collect_grpc_upload(
+        body,
+        ChargedRequestCollector::new(ceiling),
+        ceiling,
+        request_body_read_timeout_ms,
+        grpc_deadline_at,
+        auth,
+    )
+    .await?;
+    Ok(GrpcCollectedRequestBody {
+        method: parts.method,
+        headers: parts.headers,
+        body: collected.body,
+        charge: collected.permit,
+    })
+}
+
+/// The charged collect behind [`collect_grpc_request_body`], over any client
+/// body: `collector` charges the buffered-request budget as the body is
+/// retained, within `ceiling`.
+pub(crate) async fn collect_grpc_upload<B>(
+    body: B,
+    collector: super::response_buffer_budget::ChargedRequestCollector,
+    ceiling: usize,
+    request_body_read_timeout_ms: u64,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+) -> Result<super::ChargedRequestCollect, GrpcRequestBodyCollectError>
+where
+    B: http_body::Body<Data = Bytes, Error = super::body::BoxError>,
+{
+    use super::ChargedRequestCollectError;
+    let collected = super::collect_request_body_under_authorization(
+        super::collect_charged_request_body(body, collector),
+        grpc_deadline_at,
+        request_body_read_timeout_ms,
+        auth,
+    )
+    .await
+    .map_err(map_authorized_upload_wait_error)?;
+    match collected {
+        Ok(collected) => Ok(collected),
+        Err(ChargedRequestCollectError::TooLarge) => {
+            let message = format!("gRPC request payload size exceeds maximum of {ceiling} bytes");
+            Err(GrpcRequestBodyCollectError::ResourceExhausted(message))
         }
-    } else {
-        super::collect_request_body_under_authorization(
-            BodyExt::collect(body),
-            grpc_deadline_at,
-            request_body_read_timeout_ms,
-            auth,
-        )
-        .await
-        .map_err(map_authorized_upload_wait_error)?
-        .map_err(|e| grpc_request_body_client_disconnected(e.as_ref()))?
-        .to_bytes()
+        Err(ChargedRequestCollectError::BufferCapacityExceeded) => {
+            Err(GrpcRequestBodyCollectError::BufferCapacityExceeded)
+        }
+        Err(ChargedRequestCollectError::Body(e)) => {
+            Err(grpc_request_body_client_disconnected(e.as_ref()))
+        }
+    }
+}
+
+/// A buffered native-gRPC upload and the buffered-request charge that covers
+/// it.
+pub(crate) struct GrpcCollectedRequestBody {
+    pub(crate) method: hyper::Method,
+    pub(crate) headers: hyper::HeaderMap,
+    pub(crate) body: Vec<u8>,
+    pub(crate) charge: super::response_buffer_budget::RequestBufferPermit,
+}
+
+/// [`collect_grpc_request_body`], published as charged [`Bytes`] for a caller
+/// that runs no request-body transform: the charge is released when the last
+/// dispatch or replay copy drops.
+pub(crate) async fn collect_grpc_request_body_published(
+    req: Request<Incoming>,
+    max_grpc_recv_size_bytes: usize,
+    request_body_read_timeout_ms: u64,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+) -> Result<(hyper::Method, hyper::HeaderMap, Bytes), GrpcRequestBodyCollectError> {
+    let collected = collect_grpc_request_body(
+        req,
+        max_grpc_recv_size_bytes,
+        request_body_read_timeout_ms,
+        grpc_deadline_at,
+        auth,
+    )
+    .await?;
+    let Some(body) = collected.charge.into_charged_bytes(collected.body) else {
+        return Err(GrpcRequestBodyCollectError::BufferCapacityExceeded);
     };
-    Ok((parts.method, parts.headers, body_bytes))
+    Ok((collected.method, collected.headers, body))
 }
 
 /// A failed read of the client's buffered gRPC upload. Every such failure is
@@ -6237,7 +6331,6 @@ pub(crate) async fn proxy_grpc_request_core(
     proxy: &Proxy,
     backend_url: &str,
     transport: &GrpcDispatchTransport<'_>,
-    _dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     stream_response: bool,
     max_response_body_size_bytes: usize,
@@ -6338,6 +6431,9 @@ pub(crate) async fn proxy_grpc_request_core(
     let mut sender = dispatch_bounds
         .acquire(auth, transport.get_sender(proxy))
         .await??;
+    // The nested-HBONE carrier this attempt rides, if pooled, so a pre-wire
+    // failure can retire exactly it (issue #7180).
+    let inner_carrier = sender.hbone_inner_carrier();
 
     // Rewrite the outbound `grpc-timeout` to the remaining budget AFTER pool
     // acquisition. Computing it before the dial would forward a value that
@@ -6388,10 +6484,10 @@ pub(crate) async fn proxy_grpc_request_core(
         crate::plugins::grpc_deadline::duration_millis_ceil_saturating(remaining).unwrap_or(1)
     });
     if let Some(pump) = upload_pump.as_mut() {
+        // No backend socket is bound: gRPC rides multiplexed HTTP/2 (and
+        // mesh-mTLS owns its socket outside this dispatcher), so there is no
+        // per-request post-EOS send-queue drain bound (issue #4411).
         pump.arm_write_watermark();
-        // Same seam publishes the backend socket, so `backend_write_timeout_ms`
-        // also bounds the post-EOS drain of the local send queue (issue #4411).
-        pump.bind_backend_socket(sender.backend_socket());
     }
     let map_send_err = |e: GrpcDispatchSendError| {
         map_grpc_dispatch_send_error(e, |e| {
@@ -6409,7 +6505,25 @@ pub(crate) async fn proxy_grpc_request_core(
             // `proxy_grpc_request_streaming`.
             let protocol_nack = crate::retry::error_chain_is_protocol_nack(&e);
             if e.is_canceled() || protocol_nack {
-                transport.invalidate_on_pre_wire_cancel(proxy);
+                transport.invalidate_on_pre_wire_cancel(proxy, inner_carrier.as_ref());
+            }
+            // A failure at/after the shared response deadline is that deadline,
+            // settled exactly as its `timeout_at` arm below, whichever of hyper
+            // and the timer reports first (issues #6022, #6976): the client's
+            // `DEADLINE_EXCEEDED`, or an earlier operator read bound's
+            // `BackendTimeout`.
+            if client_deadline_owns_failure(response_deadline_at, tokio::time::Instant::now()) {
+                return if response_deadline_is_client {
+                    GrpcProxyError::ClientDeadlineExceeded(GrpcDeadlinePhase::ResponseHeaders)
+                } else {
+                    GrpcProxyError::BackendTimeout {
+                        kind: GrpcTimeoutKind::Read,
+                        message: format!(
+                            "Read timeout after {}ms (end-to-end)",
+                            response_deadline_ms.unwrap_or(1)
+                        ),
+                    }
+                };
             }
             error!(
                 transport = transport.label(),
@@ -6557,7 +6671,7 @@ pub(crate) async fn proxy_grpc_request_core(
     );
 
     // Streaming mode: return the live Incoming body without buffering.
-    // The caller (mod.rs) wraps it in CoalescingH2Body so hyper
+    // The caller (mod.rs) wraps it in a `Coalescing<S>` body so hyper
     // forwards DATA frames and TRAILERS to the downstream client as they arrive.
     if stream_response {
         return Ok(GrpcResponseKind::Streaming(GrpcStreamingResponse {
@@ -6656,7 +6770,25 @@ pub(crate) async fn proxy_grpc_request_core(
                     // no grpc-status anywhere, and the caller would record a
                     // circuit-breaker/admission SUCCESS for a failed exchange.
                     // h2 trailers are the final frame, so an error here always
-                    // means the response never completed.
+                    // means the response never completed. A failure at/after
+                    // the shared response deadline is that deadline, settled
+                    // as its `timeout_at` arm (issues #6022, #6976).
+                    if client_deadline_owns_failure(
+                        response_deadline_at,
+                        tokio::time::Instant::now(),
+                    ) {
+                        return Err(if response_deadline_is_client {
+                            GrpcProxyError::ClientDeadlineExceeded(GrpcDeadlinePhase::ResponseBody)
+                        } else {
+                            GrpcProxyError::BackendTimeout {
+                                kind: GrpcTimeoutKind::Read,
+                                message: format!(
+                                    "Body read timeout after {}ms (end-to-end)",
+                                    response_deadline_ms.unwrap_or(1)
+                                ),
+                            }
+                        });
+                    }
                     warn_sampled!("gRPC: error reading backend response frame: {}", e);
                     return Err(GrpcProxyError::backend_unavailable_with_source(
                         GrpcBackendUnavailableKind::BackendRequest,
@@ -6800,7 +6932,7 @@ pub(crate) fn collect_buffered_grpc_trailers(
         if is_backend_response_strip_header(k.as_str()) {
             continue;
         }
-        if let Ok(vs) = v.to_str() {
+        if let Some(vs) = super::backend_response_field_value_str(k, v) {
             // Preserve gRPC duplicate metadata semantics: HeaderMap yields each
             // value separately, and the string-map representation joins them
             // with newlines (same convention as multi-value Set-Cookie) so the
@@ -6852,11 +6984,6 @@ pub(crate) fn buffered_grpc_trailers_to_header_map(
     trailers
 }
 
-/// Check if a request is a gRPC request based on content-type.
-pub fn is_grpc_request(req: &Request<Incoming>) -> bool {
-    is_grpc_content_type(req.headers())
-}
-
 /// Check if headers indicate a native gRPC request.
 ///
 /// Delegates to the canonical [`super::backend_dispatch::is_native_grpc_content_type`]
@@ -6904,6 +7031,33 @@ pub(crate) fn apply_remaining_grpc_timeout_header(
     headers.insert("grpc-timeout", value);
 }
 
+/// Whether a backend failure observed at `now` is settled as the client RPC
+/// deadline rather than charged to the backend (issue #6022).
+///
+/// This is a cutoff, not proof of what caused the failure: once the client's
+/// deadline instant has passed, the deadline owns the attempt's outcome
+/// (`DEADLINE_EXCEEDED`, health-neutral), exactly as if the gateway's own
+/// timer had fired first. Without the clock read, accounting would depend on
+/// whether the timer wheel or the failure was polled first. The case it exists
+/// for is a backend enforcing the forwarded `grpc-timeout` (grpc-java resets
+/// the stream with `CANCEL`): the gateway forwards the remaining budget,
+/// rounded up to the millisecond and measured after sender acquisition
+/// ([`apply_remaining_grpc_timeout_header`]), so that reset can only beat the
+/// gateway's terminal when the gateway's timer fires late. Budgets beyond the
+/// eight-digit millisecond wire limit are coarsened down to whole seconds or
+/// larger units, where a backend may legitimately expire up to one unit early
+/// and is then still charged. A failure observed before the deadline,
+/// including an unexplained backend `CANCEL`, stays a backend failure. The
+/// cost is that a fault generated just before the deadline but observed after
+/// it, within the same scheduling lag, is not charged. `None` (no client
+/// deadline) never claims a failure.
+pub(crate) fn client_deadline_owns_failure(
+    deadline: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> bool {
+    deadline.is_some_and(|deadline| now >= deadline)
+}
+
 /// Build the wire value for the remaining portion of a receipt-anchored gRPC
 /// deadline. Shared by native gRPC (`HeaderMap`) and pass-through gRPC-Web
 /// (`reqwest::RequestBuilder`) so neither transport can re-arm the original
@@ -6924,47 +7078,21 @@ pub(crate) fn remaining_grpc_timeout_header_value(
 /// Parse a raw `grpc-timeout` header value (e.g. `"100m"`, `"1S"`) into
 /// milliseconds. Shared by [`parse_grpc_timeout_ms`] (hyper `HeaderMap` callers)
 /// and the native-H3 gRPC path, whose headers are a `HashMap<String, String>`.
+///
+/// The grammar (at most 8 ASCII digits plus one ASCII unit letter) is owned by
+/// [`crate::plugins::grpc_deadline::parse_grpc_timeout`], and the millisecond
+/// projection by [`crate::plugins::grpc_deadline::duration_millis_ceil_saturating`],
+/// so a route with and without the `grpc_deadline` plugin gives the same client
+/// deadline the same budget (issue #7072). Sub-millisecond values round UP
+/// (`1500u` is 2 ms), matching the forwarded-budget rule documented on
+/// [`client_deadline_owns_failure`].
+///
+/// `None` means "absent or invalid", and the caller then applies the operator's
+/// `backend_read_timeout_ms` fallback. A zero timeout (`0m`) is `None` too, so a
+/// malformed or zero header can never become a present-but-unbounded deadline.
 pub(crate) fn parse_grpc_timeout_value(val: &str) -> Option<u64> {
-    let bytes = val.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-    // The unit suffix is always a single ASCII letter per the gRPC spec. Reject
-    // multi-byte UTF-8 (and any non-letter) here so the digit split below cannot
-    // land on a char boundary or treat a stray byte as the unit.
-    let unit = *bytes.last()?;
-    if !unit.is_ascii_alphabetic() {
-        return None;
-    }
-    let num_str = std::str::from_utf8(&bytes[..bytes.len() - 1]).ok()?;
-    // The gRPC wire format constrains the value to a positive integer of AT MOST
-    // 8 digits (matching the `grpc_deadline` plugin's own validation). Reject
-    // anything longer or non-numeric by returning `None` so a malformed header
-    // such as `18446744073709551615H` does NOT become a present-but-unbounded
-    // deadline — that would let a bad client opt out of the operator's
-    // `backend_read_timeout_ms` fallback. `None` means "absent or invalid", and
-    // the caller then applies the fallback. With at most 8 digits the largest
-    // representable value is `99_999_999 H` ≈ 3.6e14 ms, which always fits in a
-    // `u64`, so the unit multiplies below can never actually overflow for valid
-    // input.
-    if num_str.is_empty() || num_str.len() > 8 || !num_str.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let num: u64 = num_str.parse().ok()?;
-    if num == 0 {
-        return None;
-    }
-    let ms = match unit {
-        b'H' => num * 3_600_000,
-        b'M' => num * 60_000,
-        b'S' => num * 1_000,
-        b'm' => num,
-        b'u' => num / 1_000, // microseconds → ms, floor to 0 is handled by max(1) below
-        b'n' => num / 1_000_000,
-        _ => return None,
-    };
-    // Ensure at least 1ms for sub-millisecond timeouts
-    Some(ms.max(1))
+    crate::plugins::grpc_deadline::parse_grpc_timeout(val)
+        .and_then(crate::plugins::grpc_deadline::duration_millis_ceil_saturating)
 }
 
 /// Effective timeout for the fully streaming gRPC path.
@@ -7042,12 +7170,6 @@ pub(crate) fn streaming_post_header_upload_timeout_ms_after_proxy_headers(
 #[cfg(test)]
 mod tests {
     //! Inline tests for private internals of the gRPC proxy.
-    //!
-    //! These guard the specific changes in
-    //! `perf/h2-pool-sender-ready-and-grpc-trailer-stall`:
-    //! * Fix 3: the buffered-response `Vec<u8>` starting capacity moved
-    //!   from `unwrap_or(256)` to a 16 KiB default so that large responses
-    //!   with no `content-length` stop hitting ~14 reallocations.
 
     // -----------------------------------------------------------------------
     // GRPC_POOL_KEY_BUF thread-local helper tests
@@ -7062,6 +7184,82 @@ mod tests {
         AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
     };
     use chrono::Utc;
+
+    /// A zero-limit re-sample timer that has already expired when it is first
+    /// polled registers no wake-up. The driver must then ask for another poll
+    /// itself, or it never samples again: the connection here never wakes its
+    /// task, as an idle hyper connection does not. Inline because the timer
+    /// hook is private.
+    #[tokio::test]
+    async fn zero_limit_resample_survives_a_timer_already_expired_at_its_first_poll() {
+        struct IdleConnection {
+            limit: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl std::future::Future for IdleConnection {
+            type Output = hyper::Result<()>;
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                std::task::Poll::Pending
+            }
+        }
+
+        // A timer created now and first polled a second later has already
+        // expired at its first poll. `probe` checks that premise; `stale` is
+        // the first timer the driver gets. Every later one is an ordinary
+        // pending timer, so the driver does not spin.
+        tokio::time::pause();
+        let probe = Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1)));
+        let mut stale = Some(Box::pin(tokio::time::sleep(
+            std::time::Duration::from_millis(1),
+        )));
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(
+            futures_util::FutureExt::now_or_never(probe).is_some(),
+            "a timer created before the clock advanced is ready at its first poll"
+        );
+
+        let limit = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let driver_limit = std::sync::Arc::clone(&limit);
+        let driver_published = std::sync::Arc::clone(&published);
+        let driver = tokio::spawn(async move {
+            let mut conn = IdleConnection {
+                limit: driver_limit,
+            };
+            let _ = drive_sampling_peer_max_streams_with(
+                &mut conn,
+                |conn| conn.limit.load(std::sync::atomic::Ordering::Relaxed),
+                &driver_published,
+                move || match stale.take() {
+                    Some(timer) => timer,
+                    None => Box::pin(tokio::time::sleep(std::time::Duration::from_secs(3600))),
+                },
+            )
+            .await;
+        });
+
+        // The driver's first poll publishes the limit and is handed the
+        // expired timer. Only the wake-up it then asks for gets it polled
+        // again, to arm a timer that can actually fire.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(published.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // The limit rises. No request and no wake-up from the connection
+        // arrives: the paused clock runs on to the driver's next timer, if
+        // the driver armed one.
+        limit.store(7, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_secs(7200)).await;
+        assert_eq!(
+            published.load(std::sync::atomic::Ordering::Relaxed),
+            7,
+            "an already-expired timer must still lead to another sample"
+        );
+        driver.abort();
+    }
 
     #[test]
     fn terminal_grpc_status_prefers_trailers_and_preserves_ok() {
@@ -7158,7 +7356,6 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
-            pool_max_requests_per_connection: None,
             pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,
@@ -7486,112 +7683,16 @@ mod tests {
         );
     }
 
-    /// Fix 3: source-level assertion that the pathological
-    /// `unwrap_or(256)` default on buffered body collection is gone.
-    ///
-    /// Why: a 5 MB gRPC response with no `content-length` header grew
-    /// from 256 bytes via doubling, hitting ~14 reallocations and
-    /// ~14 memcpys of ever-larger prefixes — visible in the HTTP/2
-    /// large-payload benchmark.
-    ///
-    /// We assert that the constant `DEFAULT_GRPC_BUFFERED_CAPACITY` is
-    /// present AND that it is ≥ 16 KiB. Combined these catch both a
-    /// revert to `256` and an accidental drop in default size.
+    /// The buffered-response collector's starting capacity for a response with
+    /// no `content-length` must not regress to the old 256-byte default: a
+    /// 5 MB gRPC response would then grow through ~14 reallocations.
     #[test]
     fn grpc_buffered_default_capacity_is_not_tiny() {
-        let src = include_str!("grpc_proxy.rs");
-        // Token the constant declaration lives on — see Fix 3 edit.
-        assert!(
-            src.contains("DEFAULT_GRPC_BUFFERED_CAPACITY"),
-            "expected DEFAULT_GRPC_BUFFERED_CAPACITY constant in grpc_proxy.rs \
-             — Fix 3 introduced this to replace the 256-byte default."
-        );
-
-        // Find the literal line and parse out the numeric value. We
-        // accept any reasonable size ≥ 16 KiB (16 * 1024 = 16384).
-        let line = src
-            .lines()
-            .find(|l| l.contains("DEFAULT_GRPC_BUFFERED_CAPACITY") && l.contains(":"))
-            .expect("const declaration line not found");
-        // Simple heuristic: reject values equal to or lower than the
-        // regressed default (256). This keeps the test tolerant to
-        // style changes (e.g., `16 * 1024` vs `16_384` vs `16384`).
-        assert!(
-            !line.contains("= 256"),
-            "regression: DEFAULT_GRPC_BUFFERED_CAPACITY reverted to 256 — \
-             large streaming responses will hit >10 reallocations"
-        );
-    }
-
-    /// Fix 3: 5 MB worth of `extend_from_slice` on a `Vec` pre-sized at
-    /// 16 KiB should grow through only ~9 reallocations
-    /// (16K → 32K → 64K → ... → 8M = 10 doublings from 16K to 16M).
-    /// Pre-sizing at 256 instead would take ~15 doublings, which is the
-    /// pattern we are preventing.
-    ///
-    /// We can't observe `Vec`'s internal realloc count directly, but we
-    /// can assert that the final `capacity()` is within `2×` of the
-    /// actual filled size — which holds for `amortised doubling` when
-    /// the initial capacity is appropriate.
-    #[test]
-    fn five_mb_vec_growth_from_16k_default_is_within_two_x_capacity() {
-        const DEFAULT_GRPC_BUFFERED_CAPACITY: usize = 16 * 1024;
-        let mut v: Vec<u8> = Vec::with_capacity(DEFAULT_GRPC_BUFFERED_CAPACITY);
-
-        // Fill with 64 KiB frames (realistic gRPC backend frame size)
-        // until we reach ~5 MB.
-        let frame = vec![0u8; 64 * 1024];
-        let target = 5 * 1024 * 1024;
-        while v.len() < target {
-            v.extend_from_slice(&frame);
-        }
-
-        let cap = v.capacity();
-        let len = v.len();
-        assert!(
-            cap <= len * 2,
-            "vec grew to capacity={} with len={} — final capacity should be \
-             within 2x of filled size under amortised doubling from 16 KiB start \
-             (regression would be cap >> 2*len)",
-            cap,
-            len
-        );
-        // Also guard that we are not starting from a pathologically
-        // small capacity (Vec::extend_from_slice could in theory
-        // jump straight to the exact size, but in practice doubling
-        // dominates). Final cap must be at least `len` — trivially
-        // true — and at least the starting pre-size.
-        assert!(cap >= DEFAULT_GRPC_BUFFERED_CAPACITY);
-    }
-
-    /// Fix 3: same growth test starting from the OLD pathological 256
-    /// default. This encodes the "before" state so a future reader can
-    /// see the magnitude of the waste. The `capacity()` assertion is
-    /// loose — we only demand that the final buffer is large enough
-    /// to hold the data, because under 256-start the growth pattern
-    /// still terminates at a power-of-2 cap ≥ len.
-    #[test]
-    fn five_mb_vec_growth_from_256_default_is_wasteful() {
-        let mut v: Vec<u8> = Vec::with_capacity(256);
-        let frame = vec![0u8; 64 * 1024];
-        let target = 5 * 1024 * 1024;
-        let mut grow_events = 0usize;
-        let mut last_cap = v.capacity();
-        while v.len() < target {
-            v.extend_from_slice(&frame);
-            if v.capacity() != last_cap {
-                grow_events += 1;
-                last_cap = v.capacity();
-            }
-        }
-        // Starting from 256 we expect ≥ 10 grow events to reach 5 MB
-        // (256 → 512 → 1K → 2K → 4K → 8K → 16K → 32K → 64K → 128K → ... → 8M).
-        // The 16 KiB default eliminates the first ~6 of those.
-        assert!(
-            grow_events >= 7,
-            "expected many realloc events from 256 starting cap, got {} \
-             — this test documents the regression we are fixing, not the fix",
-            grow_events
+        const _: () = assert!(DEFAULT_GRPC_BUFFERED_CAPACITY >= 16 * 1024);
+        assert_eq!(
+            grpc_buffered_body_capacity_hint(&hyper::HeaderMap::new()),
+            DEFAULT_GRPC_BUFFERED_CAPACITY,
+            "a response without content-length must preallocate the default capacity"
         );
     }
 
@@ -7819,24 +7920,32 @@ mod tests {
     }
 
     #[test]
-    fn collect_buffered_grpc_trailers_skips_non_utf8_values() {
-        // `to_str()` fails on non-ASCII; the helper silently drops those
-        // entries without leaking them. A malicious backend could otherwise
-        // smuggle binary garbage into the response header map. Legitimate
-        // binary trailers (e.g. `grpc-status-details-bin`) are
-        // base64-encoded by gRPC convention, so they do round-trip through
-        // `to_str()` cleanly.
+    fn collect_buffered_grpc_trailers_keeps_utf8_and_skips_non_utf8_values() {
+        // GHSA-j26x-88q2-wq5m: values that are valid UTF-8, obs-text
+        // included, are preserved byte for byte
+        // (`backend_response_field_value_str`). `x-bin-trailer` here is
+        // invalid UTF-8, which the `HashMap<String, String>` representation
+        // cannot carry, so it is dropped, counted, and reported by a
+        // rate-limited warning that names the field and never the value.
+        // Legitimate binary trailers (e.g. `grpc-status-details-bin`) are
+        // base64-encoded by gRPC convention, so they are always ASCII.
         let mut trailer_map = hyper::HeaderMap::new();
         trailer_map.insert("grpc-status", "0".parse().unwrap());
         trailer_map.insert(
             "x-bin-trailer",
             http::HeaderValue::from_bytes(&[0x80, 0x81]).unwrap(),
         );
+        trailer_map.insert(
+            "x-detail",
+            http::HeaderValue::from_bytes("détail".as_bytes()).unwrap(),
+        );
 
         let mut out: HashMap<String, String> = HashMap::new();
         collect_buffered_grpc_trailers(&trailer_map, &mut out);
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2);
         assert_eq!(out.get("grpc-status").map(String::as_str), Some("0"));
+        assert_eq!(out.get("x-detail").map(String::as_str), Some("détail"));
+        assert!(!out.contains_key("x-bin-trailer"));
     }
 
     #[test]

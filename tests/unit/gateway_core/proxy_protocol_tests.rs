@@ -1,22 +1,23 @@
 //! Unit tests for inbound PROXY protocol v1 (text) and v2 (binary) parsing.
 //!
-//! These tests exercise `src/proxy/proxy_protocol.rs` directly without any
-//! real TCP socket: they feed bytes via `std::io::Cursor` (which implements
-//! `AsyncRead` through the tokio compat layer).
+//! These tests drive the production reader, `read_proxy_header_accepting_tcp`,
+//! over a loopback `TcpStream` pair: the client writes the header bytes and
+//! shuts down its write half, and the accepted side is parsed exactly as a
+//! listener parses it.
 
 use ferrum_edge::proxy::proxy_protocol::{
     AcceptedProxyVersions, ProxyProtocolError, ProxyProtocolResult, apply_proxy_result,
-    read_proxy_header, read_proxy_header_accepting, read_proxy_header_accepting_tcp, v1_line_end,
+    read_proxy_header_accepting_tcp, v1_line_end,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-// Helper: feed raw bytes into read_proxy_header
+// Helper: deliver raw bytes over loopback TCP and parse them with every
+// version accepted.
 async fn parse_bytes(data: &[u8]) -> Result<ProxyProtocolResult, ProxyProtocolError> {
-    let mut cursor = std::io::Cursor::new(data.to_vec());
-    read_proxy_header(&mut cursor, Some(1)).await
+    parse_accepting(data, AcceptedProxyVersions::Any).await.0
 }
 
 // ── PROXY v1 happy paths ──────────────────────────────────────────────────────
@@ -495,13 +496,21 @@ async fn v1_exact_max_length_accepted() {
 
 // ── Version-restricted reads (issue #5768) ────────────────────────────────────
 
+/// Parse `data` delivered over loopback TCP, returning the outcome and how
+/// many of its bytes the reader consumed.
 async fn parse_accepting(
     data: &[u8],
     accepted: AcceptedProxyVersions,
 ) -> (Result<ProxyProtocolResult, ProxyProtocolError>, u64) {
-    let mut cursor = std::io::Cursor::new(data.to_vec());
-    let result = read_proxy_header_accepting(&mut cursor, Some(1), accepted).await;
-    (result, cursor.position())
+    let (mut client, mut server) = tcp_pair().await;
+    client.write_all(data).await.expect("write header bytes");
+    client
+        .shutdown()
+        .await
+        .expect("shut down client write half");
+    let result = parse_tcp(&mut server, accepted).await;
+    let consumed = data.len() - remaining_bytes(&mut server).await.len();
+    (result, consumed as u64)
 }
 
 const V1_TCP4: &[u8] = b"PROXY TCP4 192.168.1.50 192.168.1.1 12345 80\r\n";
@@ -535,7 +544,7 @@ async fn v2_only_accepts_v2_and_refuses_v1() {
 }
 
 #[tokio::test]
-async fn any_accepts_both_versions_and_matches_read_proxy_header() {
+async fn any_accepts_both_versions() {
     let v2 = v2_header_tcp4([10, 0, 0, 1], [10, 0, 0, 2], 1000, 443);
     for header in [V1_TCP4.to_vec(), v2] {
         let (result, consumed) = parse_accepting(&header, AcceptedProxyVersions::Any).await;
@@ -811,49 +820,16 @@ fn v1_line_end_without_new_bytes_is_none() {
 }
 
 #[tokio::test]
-async fn tcp_reader_matches_the_generic_reader() {
-    let mut exact_max = b"PROXY UNKNOWN ".to_vec();
-    exact_max.resize(107, b'x');
-    exact_max.extend_from_slice(b"\r\n");
-    let v2 = v2_header_tcp4([10, 0, 0, 1], [10, 0, 0, 2], 1000, 443);
-    let cases: Vec<Vec<u8>> = vec![
-        V1_TCP4.to_vec(),
-        b"PROXY TCP6 2001:db8::1 2001:db8::2 1000 443\r\n".to_vec(),
-        b"PROXY UNKNOWN\r\n".to_vec(),
-        b"PROXY TCP5 1.2.3.4 5.6.7.8 1 2\r\n".to_vec(),
-        b"PROXY TCP4 1.2.3.4 5.6.7.8 100\r\n".to_vec(),
-        b"PROXY TCP4 1.2.3.4 5.6.7.8 1 \xff\r\n".to_vec(),
-        b"PROXY \r\n".to_vec(),
-        exact_max,
-        v2,
-        b"GET / HTTP/1.1\r\n".to_vec(),
-    ];
-    for accepted in [
-        AcceptedProxyVersions::Any,
-        AcceptedProxyVersions::V1Only,
-        AcceptedProxyVersions::V2Only,
+async fn v1_non_utf8_and_empty_lines_are_malformed() {
+    for case in [
+        b"PROXY TCP4 1.2.3.4 5.6.7.8 1 \xff\r\n".as_slice(),
+        b"PROXY \r\n".as_slice(),
     ] {
-        for case in &cases {
-            let (generic, generic_consumed) = parse_accepting(case, accepted).await;
-
-            let (mut client, mut server) = tcp_pair().await;
-            client.write_all(case).await.unwrap();
-            client.shutdown().await.unwrap();
-            let tcp = parse_tcp(&mut server, accepted).await;
-            let tcp_consumed = case.len() - remaining_bytes(&mut server).await.len();
-
-            assert_eq!(
-                format!("{tcp:?}"),
-                format!("{generic:?}"),
-                "outcome differs for {:?} ({accepted:?})",
-                String::from_utf8_lossy(case)
-            );
-            assert_eq!(
-                tcp_consumed as u64,
-                generic_consumed,
-                "consumed bytes differ for {:?} ({accepted:?})",
-                String::from_utf8_lossy(case)
-            );
-        }
+        let err = parse_bytes(case).await.expect_err("malformed v1 line");
+        assert!(
+            matches!(err, ProxyProtocolError::Malformed(_)),
+            "expected Malformed for {:?}, got {err:?}",
+            String::from_utf8_lossy(case)
+        );
     }
 }

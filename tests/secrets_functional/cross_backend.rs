@@ -55,6 +55,47 @@ async fn direct_env_and_external_source_conflict_errors() {
     assert!(err.contains("FERRUM_ADMIN_JWT_SECRET"));
 }
 
+/// (2b) Every compiled-in cloud suffix takes part in conflict detection: a
+/// direct env var plus that provider's suffixed source must error before any
+/// fetch, through the startup (bulk) resolver. No provider address or
+/// credentials are configured, so reaching a fetch would surface a different
+/// error.
+#[cfg(any(
+    feature = "secrets-vault",
+    feature = "secrets-aws",
+    feature = "secrets-gcp",
+    feature = "secrets-azure"
+))]
+#[tokio::test]
+#[serial]
+async fn direct_env_conflicts_with_each_enabled_cloud_suffix() {
+    let mut sources: Vec<(&str, &str)> = Vec::new();
+    #[cfg(feature = "secrets-vault")]
+    sources.push(("_VAULT", "secret/data/ferrum#admin_jwt"));
+    #[cfg(feature = "secrets-aws")]
+    sources.push(("_AWS", "ferrum/admin"));
+    #[cfg(feature = "secrets-gcp")]
+    sources.push(("_GCP", "projects/p/secrets/s/versions/latest"));
+    #[cfg(feature = "secrets-azure")]
+    sources.push(("_AZURE", "https://v.vault.azure.net/secrets/admin"));
+
+    for (suffix, reference) in sources {
+        let guard = EnvGuard::new();
+        guard.set("FERRUM_ADMIN_JWT_SECRET", "from-direct-env");
+        guard.set(&format!("FERRUM_ADMIN_JWT_SECRET{suffix}"), reference);
+
+        let bulk = resolve_all_env_secrets()
+            .await
+            .err()
+            .expect("direct env plus a cloud suffix must conflict in bulk resolution");
+        assert!(
+            bulk.contains("Multiple secret sources") && bulk.contains("FERRUM_ADMIN_JWT_SECRET"),
+            "{suffix}: expected a multiple-sources error from bulk resolution, got: {bulk}"
+        );
+        drop(guard);
+    }
+}
+
 /// (3) Two suffixed external sources for the same base key must error before
 /// any network fetch is attempted. Requires a second recognized backend, so it
 /// runs in builds with the AWS provider enabled (e.g. the `secrets-all` job).
