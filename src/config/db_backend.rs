@@ -1659,7 +1659,7 @@ impl BatchConfigWriteMode {
 /// exposing unrelated database details. The identities themselves are not
 /// secrets, but callers should still prefer the validation messages already
 /// produced by [`GatewayConfig::validate_unique_mtls_dns_identities`].
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct MtlsDnsIdentityConflict {
     errors: Vec<String>,
 }
@@ -1702,7 +1702,7 @@ pub fn mtls_dns_identity_conflict(error: &anyhow::Error) -> Option<&MtlsDnsIdent
 /// Persistence implementations carry this typed error through the namespace
 /// admission lock/lease so admin handlers can return the same validation
 /// response as their optimistic preflight without exposing database details.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TcpConnectionThrottleAttachmentConflict {
     errors: Vec<String>,
 }

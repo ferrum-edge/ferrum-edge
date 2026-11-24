@@ -8288,6 +8288,38 @@ pub mod _test_support {
         })
     }
 
+    /// Convert an `anyhow::Error` back into `mongodb::error::Error`,
+    /// preserving any underlying driver error and its transaction retry labels.
+    pub fn mongo_anyhow_to_error(error: anyhow::Error) -> mongodb::error::Error {
+        crate::config::mongo_store::anyhow_to_mongo_error(error)
+    }
+
+    /// Variant preserving typed application errors inside `anyhow::Error` when
+    /// no underlying `mongodb::error::Error` is in the chain.
+    pub fn mongo_anyhow_to_error_preserving_anyhow(error: anyhow::Error) -> mongodb::error::Error {
+        crate::config::mongo_store::anyhow_to_mongo_error_preserving_anyhow(error)
+    }
+
+    /// Test wrapper for `MongoChangeLogCompactionGate` per-namespace stride throttling.
+    #[derive(Default)]
+    pub struct MongoChangeLogCompactionGateForTest(
+        crate::config::mongo_store::MongoChangeLogCompactionGate,
+    );
+
+    impl MongoChangeLogCompactionGateForTest {
+        pub fn record_writes(&mut self, count: u64) {
+            self.0.record_writes(count);
+        }
+
+        pub fn should_check(&self, stride: u64) -> bool {
+            self.0.should_check(stride)
+        }
+
+        pub fn mark_checked(&mut self) {
+            self.0.mark_checked();
+        }
+    }
+
     /// Lazy Mongo store (no live MongoDB) for topology publication tests.
     pub fn mongo_store_new_unconnected_for_test(
         failover_urls: Vec<String>,
