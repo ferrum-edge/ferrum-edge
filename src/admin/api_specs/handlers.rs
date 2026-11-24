@@ -752,7 +752,8 @@ pub(super) fn negotiate_accept_or_406(
 ) -> Option<SpecFormat> {
     let mut best_json: Option<u32> = None;
     let mut best_yaml: Option<u32> = None;
-    let mut best_wildcard: Option<u32> = None;
+    let mut best_app_wildcard: Option<u32> = None;
+    let mut best_any_wildcard: Option<u32> = None;
     let mut saw_any_non_empty = false;
 
     for raw in headers.get_all("accept") {
@@ -772,14 +773,17 @@ pub(super) fn negotiate_accept_or_406(
             let params = parts.next().unwrap_or("");
             let q = parse_accept_quality(params);
 
-            // RFC 7231 §3.1.1.1: media type tokens (type/subtype) are
+            // RFC 9110 §8.3.1: media type tokens (type/subtype) are
             // case-insensitive. Normalize before matching so that headers like
             // `Accept: Application/JSON` are recognized.
             let media_type = media_type_raw.to_ascii_lowercase();
 
             match media_type.as_str() {
-                "*/*" | "application/*" if best_wildcard.is_none_or(|prev| q > prev) => {
-                    best_wildcard = Some(q);
+                "*/*" if best_any_wildcard.is_none_or(|prev| q > prev) => {
+                    best_any_wildcard = Some(q);
+                }
+                "application/*" if best_app_wildcard.is_none_or(|prev| q > prev) => {
+                    best_app_wildcard = Some(q);
                 }
                 "application/json" if best_json.is_none_or(|prev| q > prev) => {
                     best_json = Some(q);
@@ -800,16 +804,19 @@ pub(super) fn negotiate_accept_or_406(
         return Some(stored);
     }
 
-    let saw_relevant = best_json.is_some() || best_yaml.is_some() || best_wildcard.is_some();
+    let saw_relevant = best_json.is_some()
+        || best_yaml.is_some()
+        || best_app_wildcard.is_some()
+        || best_any_wildcard.is_some();
     if !saw_relevant {
         // No relevant Accept entries (e.g. `Accept: text/plain`). Default to
         // the stored format.
         return Some(stored);
     }
 
-    // Effective q per format: explicit wins (including explicit q=0), else
-    // fall back to wildcard.
-    let wildcard_q = best_wildcard.unwrap_or(0);
+    // RFC 9110 §12.5.1 specificity: exact type/subtype wins over type/*,
+    // which wins over */* (including explicit q=0 at a more specific range).
+    let wildcard_q = best_app_wildcard.or(best_any_wildcard).unwrap_or(0);
     let json_q = best_json.unwrap_or(wildcard_q);
     let yaml_q = best_yaml.unwrap_or(wildcard_q);
 
@@ -1000,6 +1007,22 @@ mod negotiate_accept_tests {
             negotiate_accept_or_406(&h, SpecFormat::Json),
             Some(SpecFormat::Json),
             "Accept with only unrelated types must default to stored"
+        );
+    }
+
+    #[test]
+    fn negotiate_accept_or_406_honors_application_wildcard_specificity_over_star_star() {
+        let h = headers_with_accept("application/*;q=0, */*;q=1");
+        assert_eq!(
+            negotiate_accept_or_406(&h, SpecFormat::Json),
+            None,
+            "more specific application/*;q=0 must override */*;q=1 and yield 406"
+        );
+        let h_override = headers_with_accept("application/json;q=0.5, application/*;q=0, */*;q=1");
+        assert_eq!(
+            negotiate_accept_or_406(&h_override, SpecFormat::Yaml),
+            Some(SpecFormat::Json),
+            "exact application/json must override application/*;q=0"
         );
     }
 }
@@ -1490,11 +1513,11 @@ fn sort_json_keys(
     v: &serde_json::Value,
     depth_remaining: usize,
 ) -> Result<serde_json::Value, &'static str> {
-    if depth_remaining == 0 {
-        return Err("config nested too deeply (>64 levels) for canonical hash");
-    }
     match v {
         serde_json::Value::Object(map) => {
+            if depth_remaining == 0 {
+                return Err("config nested too deeply (>64 levels) for canonical hash");
+            }
             let mut sorted = serde_json::Map::with_capacity(map.len());
             for (k, val) in map.iter().collect::<std::collections::BTreeMap<_, _>>() {
                 sorted.insert(k.clone(), sort_json_keys(val, depth_remaining - 1)?);
@@ -1502,6 +1525,9 @@ fn sort_json_keys(
             Ok(serde_json::Value::Object(sorted))
         }
         serde_json::Value::Array(arr) => {
+            if depth_remaining == 0 {
+                return Err("config nested too deeply (>64 levels) for canonical hash");
+            }
             let mut out = Vec::with_capacity(arr.len());
             for item in arr {
                 out.push(sort_json_keys(item, depth_remaining - 1)?);
@@ -2250,6 +2276,15 @@ fn build_spec_row(
 /// Offload gzip compression, SHA-256, and canonical bundle hashing onto the
 /// blocking pool so large spec uploads (up to 25 MiB) never stall Tokio worker
 /// threads.
+/// Concurrent API-spec compression / decompression / format-conversion jobs
+/// admitted onto the blocking pool process-wide so bursts of large spec reads
+/// or writes cannot saturate the Tokio blocking pool or leave unbounded
+/// disconnected jobs running concurrently.
+const MAX_CONCURRENT_SPEC_CODEC_JOBS: usize = 4;
+
+static SPEC_CODEC_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_SPEC_CODEC_JOBS)));
+
 async fn build_spec_row_async(
     id: String,
     proxy_id: String,
@@ -2258,7 +2293,14 @@ async fn build_spec_row_async(
     metadata: crate::admin::api_specs::SpecMetadata,
     bundle: crate::admin::api_specs::ExtractedBundle,
 ) -> Result<(ApiSpec, crate::admin::api_specs::ExtractedBundle), ApiSpecError> {
+    let permit = Arc::clone(&SPEC_CODEC_SLOTS)
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            ApiSpecError::AdmissionUnavailable("spec codec admission unavailable".to_string())
+        })?;
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let spec = build_spec_row(id, proxy_id, namespace, &body, &metadata, &bundle)?;
         Ok((spec, bundle))
     })
@@ -2297,7 +2339,22 @@ async fn spec_content_response_async(
         SpecFormat::Json => "json",
         SpecFormat::Yaml => "yaml",
     };
-    let etag = format!("\"{}-{}\"", spec.content_hash, fmt_suffix);
+    let stored_suffix = match spec.spec_format {
+        SpecFormat::Json => "json",
+        SpecFormat::Yaml => "yaml",
+    };
+    // Verbatim stored-format responses keep the canonical `"<hash>-<fmt>"` tag;
+    // converted representations include the stored format and conversion tag so
+    // resubmitting identical bytes under a different Content-Type cannot yield
+    // a false 304 when conversion changes the serialized bytes.
+    let etag = if target_fmt == spec.spec_format {
+        format!("\"{}-{}\"", spec.content_hash, fmt_suffix)
+    } else {
+        format!(
+            "\"{}-{}-from-{}-v1\"",
+            spec.content_hash, fmt_suffix, stored_suffix
+        )
+    };
 
     // If-None-Match check (RFC 9110 §13.1.2: comma-separated list across all
     // header lines, W/ prefix)
@@ -2324,12 +2381,19 @@ async fn spec_content_response_async(
     }
 
     // Offload gzip decompression + optional YAML/JSON conversion to the
-    // blocking pool so large specs (up to 50 MiB decompressed) do not block
-    // Tokio worker threads.
+    // blocking pool under the shared codec semaphore so large specs cannot
+    // saturate Tokio worker threads or run unboundedly after client disconnect.
+    let Ok(permit) = Arc::clone(&SPEC_CODEC_SLOTS).acquire_owned().await else {
+        return json_resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "Spec codec admission unavailable"}),
+        );
+    };
     let spec_id = spec.id;
     let stored_format = spec.spec_format;
     let compressed = spec.spec_content;
     let converted = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let raw =
             spec_codec::decompress_gzip_capped(&compressed, max_decompress_bytes).map_err(|e| {
                 tracing::error!(
@@ -4172,25 +4236,21 @@ mod tests {
     #[test]
     fn test_sort_json_keys_depth_limit() {
         // Valid generated openapi_validator / mcp_gateway configs up to
-        // MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH (64) must succeed so PUT can match
-        // them without returning 500.
-        let mut deep_valid = serde_json::json!({"leaf": "value"});
-        for _ in 0..40 {
-            deep_valid = serde_json::json!({"nested": deep_valid});
+        // MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH (64 container levels with scalar
+        // leaves) must succeed so PUT can match them without returning 500.
+        let mut depth_64 = serde_json::json!({"leaf": "value"});
+        for _ in 0..(MAX_SORT_JSON_DEPTH - 1) {
+            depth_64 = serde_json::json!({"nested": depth_64});
         }
         assert!(
-            sort_json_keys(&deep_valid, MAX_SORT_JSON_DEPTH).is_ok(),
-            "sort_json_keys must accept valid depth-40 configs up to MAX_SORT_JSON_DEPTH ({})",
+            sort_json_keys(&depth_64, MAX_SORT_JSON_DEPTH).is_ok(),
+            "sort_json_keys must accept valid depth-{} configs",
             MAX_SORT_JSON_DEPTH
         );
 
-        // Build a 70-level-deep nested object.  sort_json_keys caps at
-        // MAX_SORT_JSON_DEPTH (64), so the call must return Err.
-        let mut inner = serde_json::json!({"leaf": "value"});
-        for _ in 0..70 {
-            inner = serde_json::json!({"nested": inner});
-        }
-        let result = sort_json_keys(&inner, MAX_SORT_JSON_DEPTH);
+        // 65 container levels exceeds MAX_SORT_JSON_DEPTH (64) and must fail.
+        let depth_65 = serde_json::json!({"nested": depth_64});
+        let result = sort_json_keys(&depth_65, MAX_SORT_JSON_DEPTH);
         assert!(
             result.is_err(),
             "sort_json_keys must reject configs nested deeper than MAX_SORT_JSON_DEPTH ({})",

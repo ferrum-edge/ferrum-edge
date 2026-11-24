@@ -176,7 +176,8 @@ impl DeploymentSnapshot {
         let declared =
             crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec(
                 previous_spec,
-            );
+            )
+            .map_err(anyhow::Error::msg)?;
         let desired: HashSet<_> = bundle
             .proxy
             .plugins

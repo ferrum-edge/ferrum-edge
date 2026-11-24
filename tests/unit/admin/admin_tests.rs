@@ -1132,7 +1132,7 @@ fn health_detail_blocks_are_built_only_for_the_detailed_tier() {
     let source = include_str!("../../../src/admin/mod.rs");
     let health = admin_source_section(
         source,
-        "if (path == \"/health\" || path == \"/status\") && method == Method::GET {",
+        "if (path == \"/health\" || path == \"/status\") && matches!(method, Method::GET | Method::HEAD) {",
         "// Overload status.",
     );
     for call in [
@@ -1232,12 +1232,20 @@ async fn health_live_and_status_reject_non_get_methods() {
             "GET {path} should succeed anonymously"
         );
 
+        let head_resp =
+            send_raw_admin_request_with_headers(addr, "HEAD", path, None, &[], "").await;
+        assert_eq!(
+            raw_http_status(&head_resp),
+            200,
+            "HEAD {path} should succeed anonymously"
+        );
+
         let post_resp =
             send_raw_admin_request_with_headers(addr, "POST", path, None, &[], "").await;
         assert_eq!(
             raw_http_status(&post_resp),
             401,
-            "unauthenticated POST {path} must not bypass auth via GET probe routes: {post_resp}"
+            "unauthenticated POST {path} must not bypass auth via GET/HEAD probe routes: {post_resp}"
         );
     }
 
@@ -1280,46 +1288,66 @@ async fn if_match_and_conditional_do_not_preempt_forbidden_on_delete_and_bodyles
     let viewer_token = generate_test_token_with_role(&config, "viewer-user", "viewer");
     let operator_token = generate_test_token_with_role(&config, "operator-user", "operator");
 
-    for (token, method, path, headers) in [
+    for (token, method, path, headers, body) in [
         (
             &viewer_token,
             "DELETE",
             "/proxies/p1",
             vec![("If-Match", "malformed")],
+            "{}",
         ),
         (
             &viewer_token,
             "DELETE",
             "/proxies/p1?conditional=true",
             vec![("If-Match", "malformed")],
+            "{}",
+        ),
+        (
+            &viewer_token,
+            "POST",
+            "/backend-capabilities/refresh",
+            vec![("If-Match", "\"etag\"")],
+            "",
+        ),
+        (
+            &viewer_token,
+            "POST",
+            "/backend-capabilities/refresh?conditional=true",
+            vec![],
+            "",
         ),
         (
             &operator_token,
             "DELETE",
             "/api-specs/s1",
             vec![("If-Match", "\"etag\"")],
+            "{}",
         ),
         (
             &operator_token,
             "DELETE",
             "/gateway-trust-bundles/b1",
             vec![("If-Match", "\"etag\"")],
+            "{}",
         ),
         (
             &operator_token,
             "POST",
             "/namespaces",
             vec![("If-Match", "\"etag\"")],
+            "{}",
         ),
         (
             &operator_token,
             "POST",
             "/restore?confirm=true",
             vec![("If-Match", "malformed")],
+            "{}",
         ),
     ] {
         let resp =
-            send_raw_admin_request_with_headers(addr, method, path, Some(token), &headers, "{}")
+            send_raw_admin_request_with_headers(addr, method, path, Some(token), &headers, body)
                 .await;
         assert_eq!(
             raw_http_status(&resp),
@@ -1518,7 +1546,8 @@ async fn crud_put_preserves_created_at_across_updates() {
             "id": "p-preserve",
             "name": "initial",
             "listen_path": "/preserve",
-            "backend_url": "https://example.com"
+            "backend_host": "example.com",
+            "backend_port": 443
         })
         .to_string(),
     )
@@ -1536,7 +1565,8 @@ async fn crud_put_preserves_created_at_across_updates() {
         &json!({
             "name": "updated",
             "listen_path": "/preserve",
-            "backend_url": "https://example.com"
+            "backend_host": "example.com",
+            "backend_port": 443
         })
         .to_string(),
     )

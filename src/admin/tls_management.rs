@@ -70,38 +70,24 @@ pub(super) async fn handle_inventory(
         });
     // `TlsInventory::collect` performs blocking filesystem/remote-secret I/O
     // and X.509/CRL parsing; run it off the Tokio async worker threads.
+    let env_for_blocking = env_config.clone();
+    let cfg_for_blocking = config.clone();
     let inventory = match tokio::task::spawn_blocking(move || {
-        crate::tls::inventory::TlsInventory::collect(env_config.as_deref(), config.as_deref())
+        crate::tls::inventory::TlsInventory::collect(
+            env_for_blocking.as_deref(),
+            cfg_for_blocking.as_deref(),
+        )
     })
     .await
     {
         Ok(inventory) => inventory,
         Err(error) => {
-            tracing::error!("TLS inventory worker failed: {error}");
-            return Ok(super::json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &json!({"error": "TLS inventory collection failed"}),
-            ));
+            tracing::warn!("TLS inventory worker failed ({error}); collecting inline");
+            crate::tls::inventory::TlsInventory::collect(env_config.as_deref(), config.as_deref())
         }
     };
     let body = super::paginate_response(&inventory.entries, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
-}
-
-#[cfg(test)]
-pub(super) fn collect_inventory(state: &AdminState) -> crate::tls::inventory::TlsInventory {
-    let env_config = effective_env_config(state);
-    let config = state
-        .proxy_state
-        .as_ref()
-        .map(|proxy| proxy.config.load_full())
-        .or_else(|| {
-            state
-                .cached_config
-                .as_ref()
-                .map(|cached| cached.load_full())
-        });
-    crate::tls::inventory::TlsInventory::collect(env_config.as_deref(), config.as_deref())
 }
 
 /// Metrics-safe inventory producer for the cached snapshot (issue #2410).
@@ -709,6 +695,7 @@ pub(super) async fn handle_delete_acme_order(
 
 pub(super) async fn handle_finalize_acme_order(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -717,7 +704,7 @@ pub(super) async fn handle_finalize_acme_order(
     }
     #[cfg(not(feature = "acme"))]
     {
-        let _ = (id, body_bytes);
+        let _ = (actor, id, body_bytes);
         Ok(super::json_response(
             StatusCode::NOT_IMPLEMENTED,
             &json!({"error": "ACME order finalization requires the 'acme' Cargo feature"}),
@@ -994,7 +981,30 @@ pub(super) async fn handle_finalize_acme_order(
         .await
         {
             Ok(stored) => stored,
-            Err(response) => return Ok(*response),
+            Err(response) => {
+                // The certificate above was already persisted, so watchers
+                // must re-pull it and the audit record must reflect that
+                // partial completion / uncertain order-update state.
+                request_managed_source_reloads();
+                if state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        actor,
+                        "finalize",
+                        "tls_acme",
+                        &order_id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({
+                            "path": format!("/admin/tls/acme/orders/{order_id}/finalize"),
+                            "certificate_persisted": true,
+                            "certificate_id": published_certificate_id,
+                            "order_update_outcome": "worker_failed",
+                        }),
+                    )
+                    .with_outcome(crate::admin::audit::AuditOutcome::UnknownOutcome);
+                    super::record_operation_audit(state, event).await;
+                }
+                return Ok(*response);
+            }
         };
         let updated_order = match stored_order {
             Ok(Some(record)) => record,
@@ -1019,7 +1029,43 @@ pub(super) async fn handle_finalize_acme_order(
                         return Ok(acme_finalize_success_response(&current, &certificate));
                     }
                     Ok(None) => {}
-                    Err(error) => return Ok(acme_error_response(error)),
+                    Err(error) => {
+                        if state.admin_audit_enabled {
+                            let event = crate::admin::audit::AuditEvent::new(
+                                actor,
+                                "finalize",
+                                "tls_acme",
+                                &order_id,
+                                crate::config::types::DEFAULT_NAMESPACE,
+                                json!({
+                                    "path": format!("/admin/tls/acme/orders/{order_id}/finalize"),
+                                    "certificate_persisted": true,
+                                    "certificate_id": published_certificate_id,
+                                    "order_update_outcome": "verification_failed",
+                                }),
+                            )
+                            .with_outcome(crate::admin::audit::AuditOutcome::UnknownOutcome);
+                            super::record_operation_audit(state, event).await;
+                        }
+                        return Ok(acme_error_response(error));
+                    }
+                }
+                if state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        actor,
+                        "finalize",
+                        "tls_acme",
+                        &order_id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({
+                            "path": format!("/admin/tls/acme/orders/{order_id}/finalize"),
+                            "certificate_persisted": true,
+                            "certificate_id": published_certificate_id,
+                            "order_update_outcome": "conflict_unchanged",
+                        }),
+                    )
+                    .with_outcome(crate::admin::audit::AuditOutcome::Failure);
+                    super::record_operation_audit(state, event).await;
                 }
                 return Ok(super::json_response(
                     StatusCode::CONFLICT,
@@ -1034,8 +1080,25 @@ pub(super) async fn handle_finalize_acme_order(
             Err(error) => {
                 // The certificate above was already persisted, so watchers
                 // must still re-pull it even though the order record update
-                // failed.
+                // failed, and the audit record must note the partial publish.
                 request_managed_source_reloads();
+                if state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        actor,
+                        "finalize",
+                        "tls_acme",
+                        &order_id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({
+                            "path": format!("/admin/tls/acme/orders/{order_id}/finalize"),
+                            "certificate_persisted": true,
+                            "certificate_id": published_certificate_id,
+                            "order_update_outcome": "store_error",
+                        }),
+                    )
+                    .with_outcome(crate::admin::audit::AuditOutcome::UnknownOutcome);
+                    super::record_operation_audit(state, event).await;
+                }
                 return Ok(acme_error_response(error));
             }
         };
@@ -1061,8 +1124,20 @@ pub(super) async fn handle_update_acme_certificate(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get_certificate(id) {
-        return Ok(acme_error_response(error));
+    let preflight_store = Arc::clone(&store);
+    let preflight_id = id.to_string();
+    match tokio::task::spawn_blocking(move || preflight_store.certificate_exists(&preflight_id))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Ok(acme_error_response(error)),
+        Err(error) => {
+            tracing::error!("ACME certificate preflight worker failed: {error}");
+            return Ok(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "ACME certificate store preflight failed"}),
+            ));
+        }
     }
     let (record, _) = match acme_certificate_record_from_request(Some(id), request, true) {
         Ok(value) => value,
@@ -1087,10 +1162,25 @@ pub(super) async fn handle_delete_acme_certificate(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    // Validate `id` and confirm the record exists before acquiring fleet-wide
-    // namespace config admission leases and scanning every namespace.
-    if let Err(error) = store.get_certificate(id) {
-        return Ok(acme_error_response(error));
+    // Validate `id` and confirm the record exists (metadata-only, offloaded
+    // from Tokio workers without cloning private keys) before acquiring
+    // fleet-wide namespace config admission leases and scanning every
+    // namespace. The authoritative existence check remains inside the locked
+    // delete below.
+    let preflight_store = Arc::clone(&store);
+    let preflight_id = id.to_string();
+    match tokio::task::spawn_blocking(move || preflight_store.certificate_exists(&preflight_id))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Ok(acme_error_response(error)),
+        Err(error) => {
+            tracing::error!("ACME certificate delete preflight worker failed: {error}");
+            return Ok(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "ACME certificate store preflight failed"}),
+            ));
+        }
     }
     // `fence` moves into the blocking delete below, which owns it until the
     // store mutation has concluded, even if this request is cancelled.
@@ -1302,25 +1392,35 @@ pub(super) async fn handle_delete_managed(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    // Validate `id`, existence, and kind BEFORE acquiring fleet-wide DB
-    // namespace admission leases and scanning every namespace. The kind and
-    // existence are re-checked atomically under the store lock below.
-    match store.get(id) {
-        Ok(record) if record.kind != kind => {
+    // Validate `id`, existence, and kind (metadata-only, offloaded from Tokio
+    // workers without cloning PEM/DER/private-key material) BEFORE acquiring
+    // fleet-wide DB namespace admission leases and scanning every namespace.
+    // The kind and existence are re-checked atomically under the store lock below.
+    let preflight_store = Arc::clone(&store);
+    let preflight_id = id.to_string();
+    match tokio::task::spawn_blocking(move || preflight_store.record_kind(&preflight_id)).await {
+        Ok(Ok(existing_kind)) if existing_kind != kind => {
             return Ok(super::json_response(
                 StatusCode::BAD_REQUEST,
                 &json!({
                     "error": format!(
                         "managed TLS record '{}' has kind {}, expected {}",
                         id,
-                        record.kind.as_str(),
+                        existing_kind.as_str(),
                         kind.as_str()
                     )
                 }),
             ));
         }
-        Ok(_) => {}
-        Err(error) => return Ok(managed_error_response(error)),
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => return Ok(managed_error_response(error)),
+        Err(error) => {
+            tracing::error!("managed TLS delete preflight worker failed: {error}");
+            return Ok(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "managed TLS store preflight failed"}),
+            ));
+        }
     }
     // `fence` moves into the blocking delete below, which owns it until the
     // store mutation has concluded, even if this request is cancelled.
@@ -1740,7 +1840,7 @@ async fn force_reload_gateway_svid(state: &AdminState) -> Result<u64, Box<Respon
         Err(error) => {
             tracing::error!("gateway SVID reload worker failed: {error}");
             Err(Box::new(super::json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "gateway SVID reload worker failed"}),
             )))
         }
@@ -2518,7 +2618,7 @@ async fn acme_order_record_from_request(
             finalization: Some(prepared.finalization),
             error: None,
         })
-        .map_err(|error| error.to_string())?,
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?,
         allow_overwrite,
     ))
 }

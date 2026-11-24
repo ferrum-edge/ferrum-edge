@@ -823,6 +823,18 @@ impl AcmeCertificateStore {
         self.max_certificates
     }
 
+    /// Lightweight metadata-only existence check for route preflights that
+    /// validates `id` without cloning private-key or certificate PEM bytes.
+    pub fn certificate_exists(&self, id: &str) -> Result<(), AcmeError> {
+        validate_acme_id(id)?;
+        let document = self.file.snapshot()?;
+        if document.certificates.contains_key(id) {
+            Ok(())
+        } else {
+            Err(AcmeError::NotFound(id.to_string()))
+        }
+    }
+
     /// Version of the authoritative document behind the last read. Non-secret.
     pub fn store_version(&self) -> Result<u64, AcmeError> {
         Ok(self.file.version()?)

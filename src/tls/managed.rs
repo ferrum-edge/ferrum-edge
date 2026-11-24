@@ -351,6 +351,19 @@ impl ManagedTlsStore {
         record.ok_or_else(|| ManagedTlsError::NotFound(id.to_string()))
     }
 
+    /// Lightweight metadata-only lookup for route preflights that validates
+    /// `id` and returns only the stored material kind without cloning PEM/DER
+    /// or private-key bytes.
+    pub fn record_kind(&self, id: &str) -> Result<ManagedTlsMaterialKind, ManagedTlsError> {
+        validate_managed_id(id)?;
+        let document = self.file.snapshot()?;
+        document
+            .records
+            .get(id)
+            .map(|record| record.kind)
+            .ok_or_else(|| ManagedTlsError::NotFound(id.to_string()))
+    }
+
     pub fn upsert(
         &self,
         record: ManagedTlsRecord,

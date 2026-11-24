@@ -1654,7 +1654,7 @@ fn health_builds_admission_fence_snapshot_only_in_the_detailed_tier() {
         "the fence snapshot must stay inside the `if detailed` block"
     );
     let health = ADMIN_SOURCE
-        .find("if path == \"/health\" || path == \"/status\" {")
+        .find("if (path == \"/health\" || path == \"/status\") && matches!(method, Method::GET | Method::HEAD) {")
         .expect("/health handler");
     let minimal = health
         + ADMIN_SOURCE[health..]

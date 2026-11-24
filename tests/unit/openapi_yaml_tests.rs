@@ -21958,13 +21958,32 @@ fn remaining_five_builtin_plugins_have_openapi_runtime_parity() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
 
+    // `basic_auth` reads `FERRUM_BASIC_AUTH_HMAC_SECRET` in `BasicAuth::new`, so
+    // validate through `_test_support::basic_auth_with_secret_for_test` to avoid
+    // process-global env mutation in parallel unit tests.
+    const TEST_BASIC_AUTH_SECRET: &str = "test-basic-auth-hmac-secret-at-least-32-bytes";
+    let basic_valid = json!({"hide_credentials": true});
+    let basic_invalid = json!({"hide_credentials": true, "unknown_key": 1});
+    assert_component_validity(&spec, "BasicAuthConfig", &basic_valid, true);
+    assert!(
+        ferrum_edge::_test_support::basic_auth_with_secret_for_test(
+            &basic_valid,
+            TEST_BASIC_AUTH_SECRET
+        )
+        .is_ok(),
+        "basic_auth valid config rejected by runtime: {basic_valid}"
+    );
+    assert_component_validity(&spec, "BasicAuthConfig", &basic_invalid, false);
+    assert!(
+        ferrum_edge::_test_support::basic_auth_with_secret_for_test(
+            &basic_invalid,
+            TEST_BASIC_AUTH_SECRET
+        )
+        .is_err(),
+        "basic_auth unknown-key config accepted by runtime: {basic_invalid}"
+    );
+
     for (plugin, component, valid_cfg, invalid_unknown_key_cfg) in [
-        (
-            "basic_auth",
-            "BasicAuthConfig",
-            json!({"hide_credentials": true}),
-            json!({"hide_credentials": true, "unknown_key": 1}),
-        ),
         (
             "otel_tracing",
             "OtelTracingConfig",
@@ -21988,16 +22007,20 @@ fn remaining_five_builtin_plugins_have_openapi_runtime_parity() {
             "McpGatewayConfig",
             json!({
                 "mode": "transparent_proxy",
+                "endpoint": {"path": "/mcp"},
                 "servers": {
                     "primary": {
+                        "namespace": "primary",
                         "upstream_url": "https://mcp.example.com/mcp"
                     }
                 }
             }),
             json!({
                 "mode": "transparent_proxy",
+                "endpoint": {"path": "/mcp"},
                 "servers": {
                     "primary": {
+                        "namespace": "primary",
                         "upstream_url": "https://mcp.example.com/mcp"
                     }
                 },
@@ -22014,6 +22037,129 @@ fn remaining_five_builtin_plugins_have_openapi_runtime_parity() {
         assert!(
             ferrum_edge::plugins::validate_plugin_config(plugin, &invalid_unknown_key_cfg).is_err(),
             "{plugin} unknown-key config accepted by runtime: {invalid_unknown_key_cfg}"
+        );
+    }
+}
+
+#[test]
+fn overload_response_one_of_distinguishes_minimal_and_detailed_tiers() {
+    use ferrum_edge::overload::{
+        ActionSnapshot, ConnPressure, FdPressure, NodeWaypointDropSnapshot, OverloadLevel,
+        OverloadSnapshot, PressureSnapshot, ReqPressure,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let minimal = json!({"level": "normal"});
+    let mut detailed = serde_json::to_value(OverloadSnapshot {
+        level: OverloadLevel::Normal,
+        draining: false,
+        active_connections: 2,
+        active_requests: 1,
+        red_drop_probability_pct: 0.0,
+        port_exhaustion_events: 0,
+        node_waypoint_drops: NodeWaypointDropSnapshot {
+            cookie_unavailable: 0,
+            unknown_cookie: 0,
+            missing_pod_uid: 0,
+            missing_workload_hash: 0,
+            unknown_pod: 0,
+            hash_mismatch: 0,
+        },
+        pressure: PressureSnapshot {
+            file_descriptors: FdPressure {
+                current: 10,
+                max: 100,
+                ratio: 0.1,
+                enforced: true,
+            },
+            connections: ConnPressure {
+                current: 2,
+                max: 100,
+                ratio: 0.02,
+            },
+            requests: ReqPressure {
+                current: 1,
+                max: 100,
+                ratio: 0.01,
+            },
+            event_loop_latency_us: 50,
+        },
+        actions: ActionSnapshot {
+            disable_keepalive: false,
+            reject_new_connections: false,
+            reject_new_requests: false,
+        },
+    })
+    .expect("overload snapshot serializes");
+    detailed
+        .as_object_mut()
+        .expect("overload snapshot is an object")
+        .insert(
+            "stream_listeners".to_string(),
+            json!({
+                "dtls_demux_sessions_total": 0,
+                "dtls_demux_sessions": [],
+                "frontend_dtls_reload": {
+                    "generation": 0,
+                    "last_swapped_listeners": 0,
+                    "last_success_unix": null,
+                    "last_failure_unix": null,
+                    "last_outcome": "none"
+                },
+                "mesh_node_waypoint_dtls_reload": {
+                    "generation": 0,
+                    "last_swapped_listeners": 0,
+                    "last_success_unix": null,
+                    "last_failure_unix": null,
+                    "last_outcome": "none"
+                },
+                "bind_failures_total": 0,
+                "bind_failures": []
+            }),
+        );
+
+    // Confirm mutual exclusivity: OverloadLevelOnly rejects extra fields so a
+    // full OverloadSnapshot matches only OverloadSnapshot, not both branches of
+    // `/overload`'s `oneOf`.
+    assert_component_validity(&spec, "OverloadLevelOnly", &minimal, true);
+    assert_component_validity(&spec, "OverloadLevelOnly", &detailed, false);
+    assert_component_validity(&spec, "OverloadSnapshot", &detailed, true);
+    assert_component_validity(&spec, "OverloadSnapshot", &minimal, false);
+
+    let invalid_extra = json!({"level": "normal", "unexpected": true});
+    for status in ["200", "503"] {
+        let pointer =
+            format!("/paths/~1overload/get/responses/{status}/content/application~1json/schema");
+        let response_schema = spec
+            .pointer(&pointer)
+            .unwrap_or_else(|| panic!("missing /overload {status} response schema"))
+            .clone();
+        let mut combined = response_schema
+            .as_object()
+            .expect("/overload response schema is an object")
+            .clone();
+        combined.insert(
+            "$schema".to_string(),
+            json!("https://json-schema.org/draft/2020-12/schema"),
+        );
+        combined.insert("components".to_string(), spec["components"].clone());
+        let validator = jsonschema::draft202012::options()
+            .build(&serde_json::Value::Object(combined))
+            .unwrap_or_else(|e| panic!("/overload {status} oneOf schema compiles: {e}"));
+
+        assert!(
+            validator.validate(&minimal).is_ok(),
+            "/overload {status} oneOf must accept minimal OverloadLevelOnly payload"
+        );
+        assert!(
+            validator.validate(&detailed).is_ok(),
+            "/overload {status} oneOf must accept full OverloadSnapshot payload (must not match both branches)"
+        );
+        assert!(
+            validator.validate(&invalid_extra).is_err(),
+            "/overload {status} oneOf must reject minimal payload with unexpected extra property"
         );
     }
 }

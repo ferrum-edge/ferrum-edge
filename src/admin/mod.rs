@@ -3409,12 +3409,12 @@ async fn handle_admin_request_inner(
 
     // Liveness probe — always unauthenticated and minimal. Never reveals any
     // operational internals; safe to expose to load balancers / orchestrators.
-    if path == "/live" && method == Method::GET {
+    if path == "/live" && matches!(method, Method::GET | Method::HEAD) {
         return Ok(json_response(StatusCode::OK, &json!({"status": "ok"})));
     }
 
     // Health check (unauthenticated)
-    if (path == "/health" || path == "/status") && method == Method::GET {
+    if (path == "/health" || path == "/status") && matches!(method, Method::GET | Method::HEAD) {
         // The admin JWT is verified once: the detail decision and the tenant
         // tier below both derive from this actor.
         let admin_actor = verified_admin_actor(&state, auth_header.as_deref());
@@ -5442,7 +5442,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_finalize_acme_order(&state, id, &body_bytes).await
+            tls_management::handle_finalize_acme_order(&state, &auth, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "acme", "orders", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -12064,6 +12064,9 @@ async fn handle_restore(
         // and its Drop retains the fence. A clear that failed without a
         // definitive atomic abort may have removed some rows, so it is
         // incomplete too.
+        let clear_commit_unknown = delete_result
+            .as_ref()
+            .is_err_and(|error| error.has_unknown_commit_result());
         if let Err(error) = delete_result.as_ref()
             && (!error.mode().is_atomic() || error.has_unknown_commit_result())
         {
@@ -12080,20 +12083,41 @@ async fn handle_restore(
             Err(recovery_error) => {
                 let response_error = redacted_recovery_error_message(
                     "restore_namespace_admission_reacquire_after_clear",
-                    "Config admission was lost during restore clear and could not be reacquired for recovery",
+                    if clear_commit_unknown {
+                        "Config admission was lost during an ambiguous restore clear (clear commit outcome unknown) and could not be reacquired for recovery"
+                    } else {
+                        "Config admission was lost during restore clear and could not be reacquired for recovery"
+                    },
                     &recovery_error,
                 );
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({
-                        "error": response_error,
-                        "restore_errors": restore_recovery_errors(
-                            &restore_guard,
-                            namespace,
-                            vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
-                        ),
-                    }),
-                ));
+                if clear_commit_unknown && state.admin_audit_enabled {
+                    let event = audit::AuditEvent::new(
+                        actor,
+                        "restore",
+                        "config",
+                        "namespace",
+                        namespace,
+                        json!({
+                            "rollback": "unknown_clear_outcome",
+                            "clear_commit_unknown": true,
+                            "admission_reacquire_failed": true,
+                        }),
+                    )
+                    .with_outcome(audit::AuditOutcome::UnknownOutcome);
+                    record_operation_audit(state, event).await;
+                }
+                let mut body = json!({
+                    "error": response_error,
+                    "restore_errors": restore_recovery_errors(
+                        &restore_guard,
+                        namespace,
+                        vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+                    ),
+                });
+                if clear_commit_unknown {
+                    body["rollback"] = json!("unknown_clear_outcome");
+                }
+                return Ok(json_response(StatusCode::SERVICE_UNAVAILABLE, &body));
             }
         };
         let intervening_write =
@@ -12166,12 +12190,39 @@ async fn handle_restore(
                 namespace,
                 vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
             );
+            if clear_commit_unknown && state.admin_audit_enabled {
+                let event = audit::AuditEvent::new(
+                    actor,
+                    "restore",
+                    "config",
+                    "namespace",
+                    namespace,
+                    json!({
+                        "rollback": "unknown_clear_outcome",
+                        "clear_commit_unknown": true,
+                        "intervening_write": true,
+                    }),
+                )
+                .with_outcome(audit::AuditOutcome::UnknownOutcome);
+                record_operation_audit(state, event).await;
+            }
+            let (error_msg, rollback_status) = if clear_commit_unknown {
+                (
+                    "Config admission was lost during an ambiguous restore clear (clear commit outcome unknown) after another writer acquired the namespace lease",
+                    "unknown_clear_outcome",
+                )
+            } else {
+                (
+                    "Config admission was lost during a failed restore clear after another writer acquired the namespace lease",
+                    "not_needed_after_intervening_write",
+                )
+            };
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({
-                    "error": "Config admission was lost during a failed restore clear after another writer acquired the namespace lease",
+                    "error": error_msg,
                     "restore_errors": restore_errors,
-                    "rollback": "not_needed_after_intervening_write",
+                    "rollback": rollback_status,
                 }),
             ));
         }

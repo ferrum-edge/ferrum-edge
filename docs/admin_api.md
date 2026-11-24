@@ -741,7 +741,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/admin/tls/acme/renew/edge-cert
 ```
 
-Ferrum reuses persisted account credentials from `acme-accounts.json` when present for the certificate's account, falling back to the latest order for that certificate when available. The request accepts the same `challenge_type` values as order creation. The response is a new order whose selected challenges must become reachable before calling `/admin/tls/acme/orders/{id}/finalize`.
+Ferrum resolves ACME account credentials in order: (1) `existing_account_credentials_json` supplied in the request, (2) persisted credentials from the latest order for that certificate, and (3) the shared `acme-accounts.json` account store when `certificate.account_id` is present, creating a new account only when none are available. The request accepts the same `challenge_type` values as order creation. The response is a new order whose selected challenges must become reachable before calling `/admin/tls/acme/orders/{id}/finalize`.
 
 Automatic renewal can be enabled with `FERRUM_ACME_AUTO_RENEW_ENABLED=true`. The scheduler reuses persisted account credentials — the certificate's own account from the shared `acme-accounts.json` store, falling back to the latest order's credentials only when that store has none for the account — renews certificates inside `FERRUM_ACME_RENEW_WHEN_REMAINING_DAYS`, and finalizes HTTP-01/TLS-ALPN-01 renewals after Ferrum stores their challenge material. For DNS-01 renewals, set `FERRUM_ACME_DNS01_HOOK_COMMAND` to an executable that creates and cleans up provider TXT records; Ferrum passes the challenge through `FERRUM_ACME_DNS01_*` environment variables, waits `FERRUM_ACME_DNS01_PROPAGATION_SECONDS`, then finalizes the order.
 

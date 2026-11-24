@@ -24,51 +24,63 @@ pub use extractor::{
     hash_resource_bundle,
 };
 
+/// Compute the decompression cap for recovering associations from a stored spec
+/// row, honoring `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (2× body cap, floored at
+/// 64 MiB) so deployments that raise the admission limit never falsely fail
+/// association recovery, while untrusted DB `uncompressed_size` values remain
+/// bounded.
+fn max_stored_spec_assoc_decompress_bytes() -> usize {
+    const MIN_CAP_BYTES: usize = 64 * 1024 * 1024;
+    let body_mib = std::env::var("FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(25);
+    body_mib
+        .saturating_mul(2)
+        .saturating_mul(1024)
+        .saturating_mul(1024)
+        .max(MIN_CAP_BYTES)
+}
+
 /// Recover the proxy/plugin associations explicitly declared by a stored API
 /// spec. Replacement uses this set to distinguish spec-declared associations
 /// from manual associations that must survive PUT.
 ///
-/// Stored metadata is best-effort here to preserve the existing replacement
-/// contract: an unsupported encoding or unreadable legacy document is warned
-/// about and treated as declaring no external associations.
+/// Fails closed on decompression or parse failure for gzip specs so replacement
+/// never silently drops ownership recovery and leaves removed plugin
+/// associations attached.
 pub(crate) fn declared_proxy_plugin_association_ids_from_stored_spec(
     spec: &crate::config::types::ApiSpec,
-) -> std::collections::HashSet<String> {
+) -> Result<std::collections::HashSet<String>, String> {
     if spec.content_encoding != "gzip" {
-        tracing::warn!(
+        return Err(format!(
             "api_spec '{}' uses unsupported content_encoding '{}'",
-            spec.id,
-            spec.content_encoding
-        );
-        return std::collections::HashSet::new();
+            spec.id, spec.content_encoding
+        ));
     }
-    /// Upper bound for best-effort decompression of stored specs during PUT
-    /// association recovery so an untrusted or corrupt `uncompressed_size` DB
-    /// value can never disable the gzip-bomb cap.
-    const MAX_STORED_SPEC_ASSOC_DECOMPRESS_BYTES: usize = 64 * 1024 * 1024;
+    let max_cap = max_stored_spec_assoc_decompress_bytes();
     let cap = usize::try_from(spec.uncompressed_size)
-        .unwrap_or(MAX_STORED_SPEC_ASSOC_DECOMPRESS_BYTES)
-        .min(MAX_STORED_SPEC_ASSOC_DECOMPRESS_BYTES);
-    let body = match crate::admin::spec_codec::decompress_gzip_capped(&spec.spec_content, cap) {
-        Ok(body) => body,
-        Err(error) => {
-            tracing::warn!(
-                "failed to decompress stored api_spec '{}' proxy plugin associations: {}",
-                spec.id,
-                error
-            );
-            return std::collections::HashSet::new();
-        }
-    };
-    match extract_declared_proxy_plugin_association_ids(&body, Some(spec.spec_format)) {
-        Ok(ids) => ids.into_iter().collect(),
-        Err(error) => {
-            tracing::warn!(
+        .map_err(|_| {
+            format!(
+                "api_spec '{}' has invalid uncompressed_size {}",
+                spec.id, spec.uncompressed_size
+            )
+        })?
+        .min(max_cap);
+    let body = crate::admin::spec_codec::decompress_gzip_capped(&spec.spec_content, cap).map_err(
+        |error| {
+            format!(
+                "failed to decompress stored api_spec '{}' proxy plugin associations (cap={} bytes): {}",
+                spec.id, cap, error
+            )
+        },
+    )?;
+    extract_declared_proxy_plugin_association_ids(&body, Some(spec.spec_format))
+        .map(|ids| ids.into_iter().collect())
+        .map_err(|error| {
+            format!(
                 "failed to parse stored api_spec '{}' proxy plugin associations: {}",
-                spec.id,
-                error
-            );
-            std::collections::HashSet::new()
-        }
-    }
+                spec.id, error
+            )
+        })
 }

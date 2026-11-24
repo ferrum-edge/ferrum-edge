@@ -1357,6 +1357,30 @@ fn external_document_too_large() -> ExtractError {
     }
 }
 
+fn is_http_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
 fn content_type_allowed(content_type: &str) -> bool {
     let media = content_type
         .split(';')
@@ -1364,16 +1388,25 @@ fn content_type_allowed(content_type: &str) -> bool {
         .unwrap_or(content_type)
         .trim()
         .to_ascii_lowercase();
+    let Some((media_type, subtype)) = media.split_once('/') else {
+        return false;
+    };
+    if !is_http_token(media_type) || !is_http_token(subtype) {
+        return false;
+    }
     matches!(
-        media.as_str(),
-        "application/json"
-            | "application/yaml"
-            | "application/x-yaml"
-            | "text/yaml"
-            | "text/x-yaml"
-            | "text/plain"
-            | "application/octet-stream"
-    ) || (media.contains('/') && (media.ends_with("+json") || media.ends_with("+yaml")))
+        (media_type, subtype),
+        ("application", "json")
+            | ("application", "yaml")
+            | ("application", "x-yaml")
+            | ("text", "yaml")
+            | ("text", "x-yaml")
+            | ("text", "plain")
+            | ("application", "octet-stream")
+    ) || subtype
+        .strip_suffix("+json")
+        .or_else(|| subtype.strip_suffix("+yaml"))
+        .is_some_and(|prefix| !prefix.is_empty())
 }
 
 fn parse_loaded_document(

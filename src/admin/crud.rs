@@ -2379,7 +2379,8 @@ pub(crate) async fn validate_plugin_graph_api_spec_replacement_candidate(
     let previous_declared_assoc_ids =
         crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec(
             existing_spec,
-        );
+        )
+        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     let incoming_assoc_ids: HashSet<&str> = proxy
         .plugins
         .iter()

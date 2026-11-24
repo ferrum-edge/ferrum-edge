@@ -277,7 +277,8 @@ paths:
       description: |
         Returns `200 OK` with the body `{"status":"ok"}` and no operational
         internals. Intended for load-balancer / Kubernetes liveness probes.
-        Never requires authentication.
+        Accepts `GET` and `HEAD` (for `HEAD`, headers match `GET` with an empty
+        body). Never requires authentication.
 
         The one exception is transport-level, not endpoint-level: on an admin
         HTTPS connection that authenticated with a client certificate whose
@@ -317,7 +318,9 @@ paths:
       operationId: getHealth
       summary: Gateway health check (tiered detail)
       description: |
-        Readiness + diagnostics. Also accessible at `/status`.
+        Readiness + diagnostics. Also accessible at `/status`. Accepts `GET` and
+        `HEAD` probes (for `HEAD`, status and headers match `GET` with an empty
+        body).
 
         **Unauthenticated** callers receive only `status` and `ready` (suitable
         for readiness probes). The **detailed** diagnostics — `mode`, the
@@ -478,6 +481,7 @@ paths:
     get:
       operationId: getStatus
       summary: Gateway status (alias for /health)
+      description: Alias for `GET` / `HEAD /health`.
       tags: [Health]
       security: []
       responses:
@@ -908,11 +912,12 @@ paths:
       summary: Create a renewal order for an ACME certificate
       description: |
         Creates a replacement HTTP-01, TLS-ALPN-01, or DNS-01 ACME order for an existing
-        `acme://certificates/{id}` record. Ferrum reuses persisted account
-        credentials from the latest order for the certificate or from the
-        persisted ACME account store (`acme-accounts.json` via
-        `certificate.account_id`) when available, or uses credentials supplied
-        in the request. Finalize the returned
+        `acme://certificates/{id}` record. Ferrum resolves ACME account credentials
+        in order: (1) `existing_account_credentials_json` supplied in the request,
+        (2) persisted credentials on the latest order for that certificate, and
+        (3) the shared ACME account store (`acme-accounts.json` via
+        `certificate.account_id`), creating a new account only when none are available.
+        Finalize the returned
         order after the selected challenge is reachable. The same HTTPS,
         same-origin, shared 30-second fresh-DNS/TCP deadline, 64-address DNS limit,
         public-egress checks, and 1 MiB streaming response cap used for initial
@@ -2330,6 +2335,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   # ── Charges ────────────────────────────────────────────────────────
   /charges:
@@ -2519,6 +2526,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   # ── Cluster Status ───────────────────────────────────────────────────
   /config/apply-status:
@@ -8718,7 +8727,9 @@ paths:
 
         **Conditional GET** (`If-None-Match`): the response includes a
         representation-specific `ETag` based on the uncompressed spec content
-        plus the selected response format (`"<hash>-json"` or `"<hash>-yaml"`).
+        plus the selected response format (`"<hash>-json"` or `"<hash>-yaml"`
+        when served verbatim in its stored format, or
+        `"<hash>-<target>-from-<stored>-v1"` when converted across formats).
         Clients that send the matching `If-None-Match` value receive
         `304 Not Modified`, saving bandwidth on polling integrations. Responses
         include `Vary: Accept` because content negotiation affects the selected
@@ -8751,7 +8762,7 @@ paths:
             ETag:
               schema:
                 type: string
-              description: Quoted representation-specific ETag, for example `"<sha256>-json"` or `"<sha256>-yaml"`.
+              description: Quoted representation-specific ETag (`"<sha256>-json"` / `"<sha256>-yaml"` verbatim, or `"<sha256>-<target>-from-<stored>-v1"` when converted).
             Vary:
               schema:
                 type: string
@@ -9126,7 +9137,7 @@ paths:
             ETag:
               schema:
                 type: string
-              description: Quoted representation-specific ETag, for example `"<sha256>-json"` or `"<sha256>-yaml"`.
+              description: Quoted representation-specific ETag (`"<sha256>-json"` / `"<sha256>-yaml"` verbatim, or `"<sha256>-<target>-from-<stored>-v1"` when converted).
             Vary:
               schema:
                 type: string
@@ -15375,6 +15386,26 @@ components:
             Expected current revision for optimistic concurrency on update.
             Ignored on create, and never stored — the store assigns the revision
             from its durable change sequence.
+        namespace:
+          type: string
+          description: >-
+            Accepted and ignored for GET-to-PUT round-trip compatibility; the
+            authenticated `X-Ferrum-Namespace` header is always authoritative.
+        updated_by:
+          type: [string, "null"]
+          description: >-
+            Accepted and ignored; attribution is always derived from the
+            verified JWT subject.
+        created_at:
+          type: string
+          format: date-time
+          description: >-
+            Accepted and ignored; server-assigned on create and preserved on update.
+        updated_at:
+          type: string
+          format: date-time
+          description: >-
+            Accepted and ignored; server-assigned on every write.
 
     GatewayTrustBundleSet:
       type: object
@@ -18910,6 +18941,7 @@ components:
     # ── Overload ──────────────────────────────────────────────────
     OverloadLevelOnly:
       type: object
+      additionalProperties: false
       description: |
         Coarse, LB-safe overload view returned to unauthenticated callers — only
         the level, with no resource internals. The full `OverloadSnapshot` is

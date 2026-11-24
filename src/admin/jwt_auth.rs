@@ -412,33 +412,40 @@ impl ViewerNamespaceCeiling {
     }
 }
 
-/// JWT Manager for Admin API
-#[derive(Clone)]
-pub struct JwtManager {
-    config: JwtConfig,
+/// Precomputed cryptographic keys and JWT validation rules shared across
+/// per-request `AdminState` / `JwtManager` clones behind an `Arc`.
+struct JwtPrecomputed {
     /// Precomputed decoding key for `config.secret` (`None` if empty).
     primary_decoding_key: Option<DecodingKey>,
     /// Precomputed JWT validation rules for the primary key.
     primary_validation: Validation,
-    /// Optional `FERRUM_ADMIN_JWT_VIEWER_SECRET`: tokens it verifies are capped
-    /// at [`AdminRole::Viewer`].
-    viewer_secret: Option<String>,
     /// Precomputed decoding key for `viewer_secret`.
     viewer_decoding_key: Option<DecodingKey>,
     /// Precomputed JWT validation rules for the viewer key (pinned to HS256).
     viewer_validation: Validation,
-    /// Optional `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`: the namespaces tokens
-    /// verified by `viewer_secret` may read.
-    viewer_namespace_ceiling: Option<ViewerNamespaceCeiling>,
-    /// Optional `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`, kept only to
-    /// refuse a later viewer secret equal to it.
-    config_export_fingerprint_secret: Option<String>,
     /// Key for `GET /config/export` fingerprints: derived from
     /// `config_export_fingerprint_secret` when configured, otherwise random
     /// for this manager. Never derived from an admin signing secret.
     config_export_fingerprint_key: Option<crate::fips::approved::HmacSha256Key>,
     /// Precomputed key for admin resource `ETag`s derived from `config.secret`.
     cached_resource_etag_key: Option<crate::fips::approved::HmacSha256Key>,
+}
+
+/// JWT Manager for Admin API
+#[derive(Clone)]
+pub struct JwtManager {
+    config: JwtConfig,
+    /// Optional `FERRUM_ADMIN_JWT_VIEWER_SECRET`: tokens it verifies are capped
+    /// at [`AdminRole::Viewer`].
+    viewer_secret: Option<String>,
+    /// Optional `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`: the namespaces tokens
+    /// verified by `viewer_secret` may read.
+    viewer_namespace_ceiling: Option<ViewerNamespaceCeiling>,
+    /// Optional `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`, kept only to
+    /// refuse a later viewer secret equal to it.
+    config_export_fingerprint_secret: Option<String>,
+    /// Shared immutable decoding keys, validation rules, and derived HMAC keys.
+    precomputed: std::sync::Arc<JwtPrecomputed>,
 }
 
 fn build_jwt_validation(config: &JwtConfig, algorithm: Algorithm) -> Validation {
@@ -484,15 +491,17 @@ impl JwtManager {
         let cached_resource_etag_key = crate::admin::preconditions::etag_key(&config.secret);
         Self {
             config,
-            primary_decoding_key,
-            primary_validation,
             viewer_secret: None,
-            viewer_decoding_key: None,
-            viewer_validation,
             viewer_namespace_ceiling: None,
             config_export_fingerprint_secret: None,
-            config_export_fingerprint_key: random_config_export_fingerprint_key(),
-            cached_resource_etag_key,
+            precomputed: std::sync::Arc::new(JwtPrecomputed {
+                primary_decoding_key,
+                primary_validation,
+                viewer_decoding_key: None,
+                viewer_validation,
+                config_export_fingerprint_key: random_config_export_fingerprint_key(),
+                cached_resource_etag_key,
+            }),
         }
     }
 
@@ -522,7 +531,16 @@ impl JwtManager {
                 ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_REUSED_ERROR.to_string(),
             ));
         }
-        self.viewer_decoding_key = DecodingKey::from_secret(viewer_secret.as_bytes()).ok();
+        let viewer_decoding_key = DecodingKey::from_secret(viewer_secret.as_bytes()).ok();
+        let prev = &self.precomputed;
+        self.precomputed = std::sync::Arc::new(JwtPrecomputed {
+            primary_decoding_key: prev.primary_decoding_key.clone(),
+            primary_validation: prev.primary_validation.clone(),
+            viewer_decoding_key,
+            viewer_validation: prev.viewer_validation.clone(),
+            config_export_fingerprint_key: prev.config_export_fingerprint_key.clone(),
+            cached_resource_etag_key: prev.cached_resource_etag_key.clone(),
+        });
         self.viewer_secret = Some(viewer_secret);
         Ok(self)
     }
@@ -561,8 +579,16 @@ impl JwtManager {
                     "{ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_ENV} could not derive a key"
                 ))
             })?;
+        let prev = &self.precomputed;
+        self.precomputed = std::sync::Arc::new(JwtPrecomputed {
+            primary_decoding_key: prev.primary_decoding_key.clone(),
+            primary_validation: prev.primary_validation.clone(),
+            viewer_decoding_key: prev.viewer_decoding_key.clone(),
+            viewer_validation: prev.viewer_validation.clone(),
+            config_export_fingerprint_key: Some(key),
+            cached_resource_etag_key: prev.cached_resource_etag_key.clone(),
+        });
         self.config_export_fingerprint_secret = Some(fingerprint_secret);
-        self.config_export_fingerprint_key = Some(key);
         Ok(self)
     }
 
@@ -602,14 +628,14 @@ impl JwtManager {
     pub(crate) fn config_export_fingerprint_key(
         &self,
     ) -> Option<crate::fips::approved::HmacSha256Key> {
-        self.config_export_fingerprint_key.clone()
+        self.precomputed.config_export_fingerprint_key.clone()
     }
 
     /// Key for admin resource `ETag`s, derived from the admin JWT secret so
     /// every replica that accepts the same tokens issues the same tags. `None`
     /// when no secret is configured.
     pub(crate) fn resource_etag_key(&self) -> Option<crate::fips::approved::HmacSha256Key> {
-        self.cached_resource_etag_key.clone()
+        self.precomputed.cached_resource_etag_key.clone()
     }
 
     /// Verify and decode a JWT token.
@@ -622,8 +648,8 @@ impl JwtManager {
     pub fn verify_token(&self, token: &str) -> Result<VerifiedAdminToken, JwtEncodeError> {
         let primary = self.verify_with_precomputed(
             token,
-            self.primary_decoding_key.as_ref(),
-            &self.primary_validation,
+            self.precomputed.primary_decoding_key.as_ref(),
+            &self.precomputed.primary_validation,
         );
         let primary_error = match primary {
             Ok(data) => {
@@ -649,8 +675,8 @@ impl JwtManager {
         // key must never accept another algorithm.
         let data = self.verify_with_precomputed(
             token,
-            self.viewer_decoding_key.as_ref(),
-            &self.viewer_validation,
+            self.precomputed.viewer_decoding_key.as_ref(),
+            &self.precomputed.viewer_validation,
         )?;
         // The viewer secret's holder chooses `sub`, and it is rendered into
         // log lines next to `key_tier`. Refuse subjects that could forge or

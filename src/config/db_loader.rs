@@ -11014,6 +11014,8 @@ impl DatabaseStore {
         let previous_declared_assoc_ids = existing_spec
             .as_ref()
             .map(crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec)
+            .transpose()
+            .map_err(anyhow::Error::msg)?
             .unwrap_or_default();
         let desired_resource_hash = store_canonical_resource_hash(bundle)?;
 

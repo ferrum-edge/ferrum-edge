@@ -819,7 +819,8 @@ curl "https://gateway/api-specs/$SPEC_ID" \
   -H "Accept: application/json"
 
 # Conditional GET (returns 304 if unchanged). The ETag is representation-
-# specific -- the quoted "<content_hash>-json" or "<content_hash>-yaml" --
+# specific -- "<content_hash>-json" or "<content_hash>-yaml" verbatim, or
+# "<content_hash>-<target>-from-<stored>-v1" when converted across formats --
 # so capture and replay the exact ETag a previous GET returned; a bare
 # content hash never matches.
 ETAG=$(curl -sS -D - -o /dev/null "https://gateway/api-specs/$SPEC_ID" \
