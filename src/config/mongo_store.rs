@@ -170,6 +170,7 @@ mod inner {
     #[derive(Clone)]
     struct ProxyWriteGuardParams {
         namespace: String,
+        listen_port: Option<u16>,
         listen_path: Option<String>,
         hosts: Vec<String>,
         /// Stream schemes (tcp/tcps/udp/dtls) skip HTTP route-bucket
@@ -183,6 +184,7 @@ mod inner {
         fn from_proxy(proxy: &Proxy) -> Self {
             Self {
                 namespace: proxy.namespace.clone(),
+                listen_port: proxy.listen_port,
                 listen_path: proxy.listen_path.clone(),
                 hosts: proxy.hosts.clone(),
                 is_stream: proxy.effective_scheme().is_stream(),
@@ -4621,6 +4623,7 @@ mod inner {
             &self,
             session: &mut ClientSession,
             namespace: &str,
+            listen_port: Option<u16>,
             listen_path: Option<&str>,
             hosts: &[String],
             exclude_proxy_id: Option<&str>,
@@ -4632,6 +4635,14 @@ mod inner {
                 Some(path) => doc! { "namespace": namespace, "listen_path": path },
                 None => doc! { "namespace": namespace, "listen_path": null },
             };
+            match listen_port {
+                Some(port) => {
+                    filter.insert("listen_port", i32::from(port));
+                }
+                None => {
+                    filter.insert("listen_port", mongodb::bson::Bson::Null);
+                }
+            }
             filter.insert(
                 "backend_scheme",
                 doc! { "$nin": ["tcp", "tcps", "udp", "dtls"] },
@@ -4688,6 +4699,7 @@ mod inner {
                     .check_listen_path_unique_in_session(
                         &mut *session,
                         &params.namespace,
+                        params.listen_port,
                         params.listen_path.as_deref(),
                         &params.hosts,
                         exclude_proxy_id,
@@ -13439,6 +13451,7 @@ mod inner {
         async fn check_listen_path_unique(
             &self,
             namespace: &str,
+            listen_port: Option<u16>,
             listen_path: Option<&str>,
             hosts: &[String],
             exclude_proxy_id: Option<&str>,
@@ -13450,14 +13463,16 @@ mod inner {
                 return Ok(false);
             }
 
-            // Filter on namespace + listen_path bucket (same path for path
-            // proxies, `null` for host-only proxies). Mongo's equality-to-null
-            // matches both a missing field and a literal null. Do NOT try to
-            // match hosts server-side with `$in` — that catches exact-string
-            // overlaps only and misses wildcard-to-exact or wildcard-to-wildcard
-            // overlaps that `hosts_overlap` must recognize. Fetch candidates
-            // and run the full overlap check in Rust (typically ≤ a handful
-            // of rows per bucket).
+            // Filter on namespace + listen_port + listen_path bucket (same
+            // path for path proxies, `null` for host-only proxies; same port
+            // for port-scoped proxies, `null` for port-agnostic proxies).
+            // Mongo's equality-to-null matches both a missing field and a
+            // literal null. Do NOT try to match hosts server-side with `$in` —
+            // that catches exact-string overlaps only and misses
+            // wildcard-to-exact or wildcard-to-wildcard overlaps that
+            // `hosts_overlap` must recognize. Fetch candidates and run the
+            // full overlap check in Rust (typically ≤ a handful of rows per
+            // bucket).
             //
             // Exclude stream proxies (tcp/tcp_tls/udp/dtls) from the query —
             // they also serialize `listen_path` as null, and they commonly
@@ -13470,6 +13485,14 @@ mod inner {
                 Some(path) => doc! { "namespace": namespace, "listen_path": path },
                 None => doc! { "namespace": namespace, "listen_path": null },
             };
+            match listen_port {
+                Some(port) => {
+                    filter.insert("listen_port", i32::from(port));
+                }
+                None => {
+                    filter.insert("listen_port", mongodb::bson::Bson::Null);
+                }
+            }
             filter.insert(
                 "backend_scheme",
                 doc! { "$nin": ["tcp", "tcps", "udp", "dtls"] },

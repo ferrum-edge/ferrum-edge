@@ -5275,6 +5275,7 @@ impl AdminResource for Proxy {
             match db
                 .check_listen_path_unique(
                     namespace,
+                    resource.listen_port,
                     resource.listen_path.as_deref(),
                     &resource.hosts,
                     exclude_id,

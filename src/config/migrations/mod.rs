@@ -1230,7 +1230,7 @@ impl MigrationRunner {
         let sql = if self.db_type == "mysql" {
             r#"
             CREATE TABLE IF NOT EXISTS _ferrum_plugin_migrations (
-                plugin_name VARCHAR(255) NOT NULL,
+                plugin_name VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 version INTEGER NOT NULL,
                 name VARCHAR(255) NOT NULL,
                 applied_at VARCHAR(64) NOT NULL,

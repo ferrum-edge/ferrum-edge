@@ -3941,6 +3941,7 @@ async fn check_listen_path_unique_rejects_catch_all_and_isolates_namespaces() {
         !store
             .check_listen_path_unique(
                 "ferrum",
+                same_path_other_hosts.listen_port,
                 same_path_other_hosts.listen_path.as_deref(),
                 &same_path_other_hosts.hosts,
                 None,
@@ -3955,6 +3956,7 @@ async fn check_listen_path_unique_rejects_catch_all_and_isolates_namespaces() {
         store
             .check_listen_path_unique(
                 "tenant-b",
+                other_namespace.listen_port,
                 other_namespace.listen_path.as_deref(),
                 &other_namespace.hosts,
                 None,
@@ -3972,6 +3974,7 @@ async fn check_listen_path_unique_rejects_catch_all_and_isolates_namespaces() {
         store
             .check_listen_path_unique(
                 "ferrum",
+                path_carrying.listen_port,
                 path_carrying.listen_path.as_deref(),
                 &path_carrying.hosts,
                 None,
@@ -3980,6 +3983,144 @@ async fn check_listen_path_unique_rejects_catch_all_and_isolates_namespaces() {
             .unwrap(),
         "host-only and path-carrying proxies on the same host occupy different match tiers"
     );
+
+    // Distinct listen_port values (including port-agnostic None vs Some(port))
+    // must not collide on the same (namespace, listen_path, hosts).
+    let mut port_8080 = http_route_proxy("p-8080", "ferrum", Some("/svc/1"), &["api.example.com"]);
+    port_8080.listen_port = Some(8080);
+    assert!(
+        store
+            .check_listen_path_unique(
+                "ferrum",
+                port_8080.listen_port,
+                port_8080.listen_path.as_deref(),
+                &port_8080.hosts,
+                None,
+            )
+            .await
+            .unwrap(),
+        "port-scoped HTTP proxy must not collide with port-agnostic proxy on same path"
+    );
+    store.create_proxy(&port_8080).await.unwrap();
+
+    let mut port_8443 = http_route_proxy("p-8443", "ferrum", Some("/svc/1"), &["api.example.com"]);
+    port_8443.listen_port = Some(8443);
+    assert!(
+        store
+            .check_listen_path_unique(
+                "ferrum",
+                port_8443.listen_port,
+                port_8443.listen_path.as_deref(),
+                &port_8443.hosts,
+                None,
+            )
+            .await
+            .unwrap(),
+        "distinct listen_port HTTP proxies on the same path and host must not collide"
+    );
+    store.create_proxy(&port_8443).await.unwrap();
+
+    let mut port_8080_dup =
+        http_route_proxy("p-8080-dup", "ferrum", Some("/svc/1"), &["api.example.com"]);
+    port_8080_dup.listen_port = Some(8080);
+    assert!(
+        !store
+            .check_listen_path_unique(
+                "ferrum",
+                port_8080_dup.listen_port,
+                port_8080_dup.listen_path.as_deref(),
+                &port_8080_dup.hosts,
+                None,
+            )
+            .await
+            .unwrap(),
+        "same listen_port + listen_path + host must still conflict"
+    );
+    assert!(
+        store.create_proxy(&port_8080_dup).await.is_err(),
+        "transactional create_proxy must reject duplicate on the same listen_port"
+    );
+}
+
+#[tokio::test]
+async fn udp_max_response_amplification_factor_round_trips() {
+    let (store, _tmp) = sqlite_uniqueness_store().await;
+    let mut proxy = http_route_proxy("udp-amp-proxy", "ferrum", None, &[]);
+    proxy.backend_scheme = Some(ferrum_edge::config::types::BackendScheme::Udp);
+    proxy.listen_port = Some(19001);
+    proxy.udp_max_response_amplification_factor = Some(2.5);
+    store.create_proxy(&proxy).await.unwrap();
+
+    let fetched = store
+        .get_proxy("ferrum", "udp-amp-proxy")
+        .await
+        .unwrap()
+        .expect("proxy present");
+    assert_eq!(fetched.udp_max_response_amplification_factor, Some(2.5));
+
+    let full = store.load_full_config("ferrum").await.unwrap();
+    let full_proxy = full
+        .proxies
+        .iter()
+        .find(|p| p.id == "udp-amp-proxy")
+        .expect("proxy in full load");
+    assert_eq!(full_proxy.udp_max_response_amplification_factor, Some(2.5));
+}
+
+#[tokio::test]
+async fn batch_attach_proxy_plugins_preserves_same_ids_across_namespaces() {
+    let (store, _tmp) = sqlite_uniqueness_store().await;
+    let mut p_a = http_route_proxy("shared-proxy", "tenant-a", Some("/a"), &[]);
+    let mut p_b = http_route_proxy("shared-proxy", "tenant-b", Some("/b"), &[]);
+    store.create_proxy(&p_a).await.unwrap();
+    store.create_proxy(&p_b).await.unwrap();
+
+    let now = chrono::Utc::now();
+    let pc_a = PluginConfig {
+        labels: Default::default(),
+        id: "shared-plugin".to_string(),
+        plugin_name: "cors".to_string(),
+        namespace: "tenant-a".to_string(),
+        config: json!({}),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("shared-proxy".to_string()),
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let mut pc_b = pc_a.clone();
+    pc_b.namespace = "tenant-b".to_string();
+    store.create_plugin_config(&pc_a).await.unwrap();
+    store.create_plugin_config(&pc_b).await.unwrap();
+
+    let assoc = ferrum_edge::config::types::PluginAssociation {
+        plugin_config_id: "shared-plugin".to_string(),
+    };
+    p_a.plugins = vec![assoc.clone()];
+    p_b.plugins = vec![assoc];
+    store
+        .batch_attach_proxy_plugins(
+            &[p_a, p_b],
+            &ferrum_edge::config::db_backend::BatchConfigWriteMode::Admission,
+        )
+        .await
+        .unwrap();
+
+    let loaded_a = store
+        .get_proxy("tenant-a", "shared-proxy")
+        .await
+        .unwrap()
+        .unwrap();
+    let loaded_b = store
+        .get_proxy("tenant-b", "shared-proxy")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded_a.plugins.len(), 1);
+    assert_eq!(loaded_b.plugins.len(), 1);
 }
 
 #[tokio::test]

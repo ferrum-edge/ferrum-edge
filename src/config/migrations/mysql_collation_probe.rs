@@ -154,6 +154,10 @@ pub fn identity_bearing_columns() -> &'static [IdentityBearingColumn] {
         },
         IdentityBearingColumn {
             table: "proxies",
+            column: "listen_path",
+        },
+        IdentityBearingColumn {
+            table: "proxies",
             column: "backend_host",
         },
         IdentityBearingColumn {

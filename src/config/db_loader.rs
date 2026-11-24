@@ -1280,9 +1280,15 @@ impl DatabaseStore {
 
     fn listen_path_candidate_sql(
         &self,
+        listen_port: Option<u16>,
         listen_path: Option<&str>,
         exclude_id: Option<&str>,
     ) -> String {
+        let port_filter = if listen_port.is_some() {
+            "listen_port = ?"
+        } else {
+            "listen_port IS NULL"
+        };
         let path_filter = if listen_path.is_some() {
             "listen_path = ?"
         } else {
@@ -1294,9 +1300,9 @@ impl DatabaseStore {
             ""
         };
         self.q(&format!(
-            "SELECT id, hosts FROM proxies WHERE namespace = ? \
+            "SELECT id, hosts, listen_path FROM proxies WHERE namespace = ? \
              AND backend_scheme NOT IN ('tcp', 'tcps', 'udp', 'dtls') \
-             AND {path_filter}{exclude_filter}"
+             AND {port_filter} AND {path_filter}{exclude_filter}"
         ))
     }
 
@@ -1304,11 +1310,15 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
+        listen_port: Option<u16>,
         listen_path: Option<&str>,
         exclude_id: Option<&str>,
     ) -> Result<Vec<AnyRow>, anyhow::Error> {
-        let sql = self.listen_path_candidate_sql(listen_path, exclude_id);
+        let sql = self.listen_path_candidate_sql(listen_port, listen_path, exclude_id);
         let mut query = sqlx::query(&sql).bind(namespace);
+        if let Some(port) = listen_port {
+            query = query.bind(i32::from(port));
+        }
         if let Some(path) = listen_path {
             query = query.bind(path);
         }
@@ -1329,11 +1339,20 @@ impl DatabaseStore {
         if rows.is_empty() {
             return Ok(true);
         }
-        if listen_path.is_some() && hosts.is_empty() {
-            return Ok(false);
-        }
 
         for row in rows {
+            // Defense in depth against case-/accent-insensitive collations on
+            // pre-existing MySQL schemas: verify byte-exact path equality before
+            // treating a candidate row as a collision.
+            if let Some(expected_path) = listen_path {
+                let existing_path = optional_utf8_text_column(row, "listen_path")?;
+                if existing_path.as_deref() != Some(expected_path) {
+                    continue;
+                }
+            }
+            if listen_path.is_some() && hosts.is_empty() {
+                return Ok(false);
+            }
             let existing_hosts_raw = required_utf8_text_column(row, "hosts")?;
             let existing_hosts: Vec<String> = config_decode::from_json_str(&existing_hosts_raw)
                 .map_err(|error| {
@@ -1859,7 +1878,13 @@ impl DatabaseStore {
         self.lock_proxy_route_bucket_tx(tx, &proxy.namespace, listen_path)
             .await?;
         let rows = self
-            .listen_path_candidate_rows_tx(tx, &proxy.namespace, listen_path, exclude_id)
+            .listen_path_candidate_rows_tx(
+                tx,
+                &proxy.namespace,
+                proxy.listen_port,
+                listen_path,
+                exclude_id,
+            )
             .await?;
         if !Self::listen_path_rows_are_unique(listen_path, &proxy.hosts, &rows)? {
             anyhow::bail!(PROXY_ROUTE_CONFLICT_ERROR);
@@ -2431,6 +2456,43 @@ impl DatabaseStore {
             }
             let rows = query
                 .fetch_all(pool)
+                .await
+                .map_err(|e| Self::proxy_plugin_association_query_error(operation, None, e))?;
+            for row in &rows {
+                Self::push_proxy_plugin_association_row(&mut associations, row, operation)?;
+            }
+        }
+
+        Ok(associations)
+    }
+
+    async fn load_proxy_plugin_associations_for_proxy_ids_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        proxy_ids: &[String],
+        operation: &str,
+    ) -> Result<ProxyPluginAssociations, anyhow::Error> {
+        if proxy_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut associations: ProxyPluginAssociations = HashMap::new();
+        for chunk in proxy_ids.chunks(Self::ASSOCIATION_LOOKUP_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = self.q(&format!(
+                "SELECT proxy_id, plugin_config_id FROM proxy_plugins \
+                 WHERE namespace = ? AND proxy_id IN ({})",
+                placeholders
+            ));
+            let mut query = sqlx::query(&sql).bind(namespace);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            let rows = query
+                .fetch_all(&mut **tx)
                 .await
                 .map_err(|e| Self::proxy_plugin_association_query_error(operation, None, e))?;
             for row in &rows {
@@ -3044,19 +3106,15 @@ impl DatabaseStore {
             "SELECT * FROM plugin_configs WHERE namespace = ? AND (scope = 'global' \
              OR plugin_name IN ({name_placeholders})"
         );
-        let id_chunks: Vec<&[&str]> = if plugin_ids.is_empty() {
-            vec![&[]]
-        } else {
-            plugin_ids
-                .chunks(Self::ORDERED_NEIGHBORHOOD_CHUNK_SIZE)
-                .collect()
-        };
+        let multi_chunk = plugin_ids.len() > Self::ORDERED_NEIGHBORHOOD_CHUNK_SIZE;
         let mut plugin_rows = Vec::new();
-        for chunk in id_chunks {
-            let sql = if chunk.is_empty() {
+        if !multi_chunk {
+            // Single statement ordered directly by the database like the full
+            // load, so plugin-chain tie order matches runtime under any collation.
+            let sql = if plugin_ids.is_empty() {
                 self.q(&format!("{plugin_select}) ORDER BY id"))
             } else {
-                let id_placeholders = std::iter::repeat_n("?", chunk.len())
+                let id_placeholders = std::iter::repeat_n("?", plugin_ids.len())
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.q(&format!(
@@ -3067,15 +3125,38 @@ impl DatabaseStore {
             for name in namespace_wide_names {
                 query = query.bind(*name);
             }
-            for id in chunk {
+            for id in &plugin_ids {
                 query = query.bind(*id);
             }
             plugin_rows.extend(query.fetch_all(&mut *tx).await?);
+        } else {
+            // Fetch global/namespace-wide plugins once rather than repeating
+            // them on every chunk, then load chunked IDs and restore `id` order.
+            let wide_sql = self.q(&format!("{plugin_select}) ORDER BY id"));
+            let mut wide_query = sqlx::query(&wide_sql).bind(namespace);
+            for name in namespace_wide_names {
+                wide_query = wide_query.bind(*name);
+            }
+            plugin_rows.extend(wide_query.fetch_all(&mut *tx).await?);
+
+            for chunk in plugin_ids.chunks(Self::ORDERED_NEIGHBORHOOD_CHUNK_SIZE) {
+                let id_placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = self.q(&format!(
+                    "SELECT * FROM plugin_configs WHERE namespace = ? AND id IN ({id_placeholders}) ORDER BY id"
+                ));
+                let mut query = sqlx::query(&sql).bind(namespace);
+                for id in chunk {
+                    query = query.bind(*id);
+                }
+                plugin_rows.extend(query.fetch_all(&mut *tx).await?);
+            }
         }
         tx.commit().await?;
 
         // Rows repeat only when the ids span more than one chunk; keep the
-        // first occurrence.
+        // first occurrence and restore `id` order across chunks.
         let mut seen_plugin_ids = HashSet::with_capacity(plugin_rows.len());
         let mut plugin_configs = Vec::with_capacity(plugin_rows.len());
         for row in plugin_rows {
@@ -3089,6 +3170,9 @@ impl DatabaseStore {
                 row_to_plugin_config(&row)
                     .map_err(|error| purpose.map_row_error("plugin_config", Some(id), error))?,
             );
+        }
+        if multi_chunk {
+            plugin_configs.sort_by(|a, b| a.id.cmp(&b.id));
         }
 
         let mut config = GatewayConfig {
@@ -5189,7 +5273,10 @@ impl DatabaseStore {
             .await
         {
             Ok(result) => Ok(result),
-            Err(error) if source == AdminReadSource::ReadReplica => {
+            Err(error)
+                if source == AdminReadSource::ReadReplica
+                    && should_fallback_read_replica_error(&error) =>
+            {
                 self.mark_read_replica_unavailable("list_proxies_paginated", &error);
                 warn!(
                     "Read replica admin query failed; retrying list_proxies_paginated against primary"
@@ -5288,7 +5375,10 @@ impl DatabaseStore {
             .await
         {
             Ok(result) => Ok(result),
-            Err(error) if source == AdminReadSource::ReadReplica => {
+            Err(error)
+                if source == AdminReadSource::ReadReplica
+                    && should_fallback_read_replica_error(&error) =>
+            {
                 self.mark_read_replica_unavailable("list_consumers_paginated", &error);
                 warn!(
                     "Read replica admin query failed; retrying list_consumers_paginated against primary"
@@ -5370,7 +5460,10 @@ impl DatabaseStore {
             .await
         {
             Ok(result) => Ok(result),
-            Err(error) if source == AdminReadSource::ReadReplica => {
+            Err(error)
+                if source == AdminReadSource::ReadReplica
+                    && should_fallback_read_replica_error(&error) =>
+            {
                 self.mark_read_replica_unavailable("list_plugin_configs_paginated", &error);
                 warn!(
                     "Read replica admin query failed; retrying list_plugin_configs_paginated against primary"
@@ -5743,6 +5836,12 @@ impl DatabaseStore {
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.begin_write_tx().await?;
+        // Lock the namespace's change-sequence row BEFORE touching
+        // `gateway_trust_bundles` so lock order matches create/update/restore/
+        // rename (`config_change_locks` -> `gateway_trust_bundles`) and cannot
+        // AB-BA deadlock on PostgreSQL/MySQL.
+        self.lock_config_change_sequence_tx(&mut tx, namespace)
+            .await?;
         let delete_sql = self.q(GATEWAY_TRUST_BUNDLE_DELETE_SQL);
         let result = sqlx::query(&delete_sql)
             .bind(namespace)
@@ -5782,7 +5881,10 @@ impl DatabaseStore {
             .await
         {
             Ok(result) => Ok(result),
-            Err(error) if source == AdminReadSource::ReadReplica => {
+            Err(error)
+                if source == AdminReadSource::ReadReplica
+                    && should_fallback_read_replica_error(&error) =>
+            {
                 self.mark_read_replica_unavailable("list_upstreams_paginated", &error);
                 warn!(
                     "Read replica admin query failed; retrying list_upstreams_paginated against primary"
@@ -6187,6 +6289,7 @@ impl DatabaseStore {
     pub async fn check_listen_path_unique(
         &self,
         namespace: &str,
+        listen_port: Option<u16>,
         listen_path: Option<&str>,
         hosts: &[String],
         exclude_id: Option<&str>,
@@ -6200,8 +6303,11 @@ impl DatabaseStore {
         }
 
         let start = Instant::now();
-        let sql = self.listen_path_candidate_sql(listen_path, exclude_id);
+        let sql = self.listen_path_candidate_sql(listen_port, listen_path, exclude_id);
         let mut query = sqlx::query(&sql).bind(namespace);
+        if let Some(port) = listen_port {
+            query = query.bind(i32::from(port));
+        }
         if let Some(path) = listen_path {
             query = query.bind(path);
         }
@@ -6674,15 +6780,23 @@ impl DatabaseStore {
     ) -> Result<IncrementalResult, anyhow::Error> {
         let start = Instant::now();
         let poll_timestamp = Utc::now();
-        self.ensure_change_cursor_available(namespace, after_sequence)
+        // Run change-log cursor checks, change-log reads, and every point-load
+        // (including `proxies` + `proxy_plugins`) inside one REPEATABLE READ
+        // snapshot transaction so a concurrent delete/update cannot produce a
+        // torn read (for example loading a proxy row with empty `proxy_plugins`).
+        let mut tx = self.pool().begin().await?;
+        self.configure_full_load_snapshot(&mut tx).await?;
+
+        self.ensure_change_cursor_available(&mut tx, namespace, after_sequence)
             .await?;
         let changes = self
-            .load_config_changes_after(namespace, after_sequence)
+            .load_config_changes_after(&mut tx, namespace, after_sequence)
             .await?;
-        self.ensure_change_cursor_available(namespace, after_sequence)
+        self.ensure_change_cursor_available(&mut tx, namespace, after_sequence)
             .await?;
 
         if changes.is_empty() {
+            tx.commit().await?;
             self.check_slow_query("load_incremental_config", start);
             return Ok(IncrementalResult {
                 added_or_modified_proxies: Vec::new(),
@@ -6771,7 +6885,7 @@ impl DatabaseStore {
         // quarantine judges across consumers escalates before any other
         // resource is loaded.
         let added_or_modified_consumers = self
-            .load_consumers_by_ids(namespace, &consumer_upserts)
+            .load_consumers_by_ids(&mut tx, namespace, &consumer_upserts)
             .await?;
         if added_or_modified_consumers
             .iter()
@@ -6787,8 +6901,9 @@ impl DatabaseStore {
             Self::split_change_ops(plugin_config_ops);
         let (upstream_upserts, mut removed_upstream_ids) = Self::split_change_ops(upstream_ops);
 
-        let mut added_or_modified_proxies =
-            self.load_proxies_by_ids(namespace, &proxy_upserts).await?;
+        let mut added_or_modified_proxies = self
+            .load_proxies_by_ids(&mut tx, namespace, &proxy_upserts)
+            .await?;
         let loaded_proxy_ids: HashSet<String> = added_or_modified_proxies
             .iter()
             .map(|proxy| proxy.id.clone())
@@ -6816,7 +6931,7 @@ impl DatabaseStore {
             .collect();
 
         let mut added_or_modified_plugin_configs = self
-            .load_plugin_configs_by_ids(namespace, &plugin_config_upserts)
+            .load_plugin_configs_by_ids(&mut tx, namespace, &plugin_config_upserts)
             .await?;
         let loaded_plugin_config_ids: HashSet<String> = added_or_modified_plugin_configs
             .iter()
@@ -6830,8 +6945,9 @@ impl DatabaseStore {
         );
 
         let mut added_or_modified_upstreams = self
-            .load_upstreams_by_ids(namespace, &upstream_upserts)
+            .load_upstreams_by_ids(&mut tx, namespace, &upstream_upserts)
             .await?;
+        tx.commit().await?;
         let loaded_upstream_ids: HashSet<String> = added_or_modified_upstreams
             .iter()
             .map(|upstream| upstream.id.clone())
@@ -6905,6 +7021,7 @@ impl DatabaseStore {
 
     async fn ensure_change_cursor_available(
         &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         after_sequence: u64,
     ) -> Result<(), anyhow::Error> {
@@ -6912,7 +7029,7 @@ impl DatabaseStore {
             &self.q("SELECT retained_sequence FROM config_change_retention WHERE namespace = ?"),
         )
         .bind(namespace)
-        .fetch_optional(&self.pool())
+        .fetch_optional(&mut **tx)
         .await?;
         if let Some(row) = row {
             let retained_sequence: i64 = row.try_get("retained_sequence")?;
@@ -6931,6 +7048,7 @@ impl DatabaseStore {
 
     async fn load_config_changes_after(
         &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         after_sequence: u64,
     ) -> Result<Vec<ConfigChangeRecord>, anyhow::Error> {
@@ -6955,7 +7073,7 @@ impl DatabaseStore {
             .bind(namespace)
             .bind(page_after as i64)
             .bind(page_rows as i64)
-            .fetch_all(&self.pool())
+            .fetch_all(&mut **tx)
             .await?;
             let page_len = rows.len();
             for row in rows {
@@ -7000,6 +7118,7 @@ impl DatabaseStore {
 
     async fn load_proxies_by_ids(
         &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         ids: &[String],
     ) -> Result<Vec<Proxy>, anyhow::Error> {
@@ -7019,7 +7138,7 @@ impl DatabaseStore {
             for id in chunk {
                 query = query.bind(id);
             }
-            rows.extend(query.fetch_all(&self.pool()).await?);
+            rows.extend(query.fetch_all(&mut **tx).await?);
         }
 
         let changed_ids: Vec<String> = rows
@@ -7027,11 +7146,11 @@ impl DatabaseStore {
             .filter_map(|r| r.try_get::<String, _>("id").ok())
             .collect();
         let mut plugins_by_proxy = self
-            .load_proxy_plugin_associations_for_proxy_ids(
+            .load_proxy_plugin_associations_for_proxy_ids_tx(
+                tx,
                 namespace,
                 &changed_ids,
                 "load_incremental_config",
-                true,
             )
             .await?;
 
@@ -7055,11 +7174,12 @@ impl DatabaseStore {
 
     async fn load_consumers_by_ids(
         &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         ids: &[String],
     ) -> Result<Vec<Consumer>, anyhow::Error> {
         let rows = self
-            .load_rows_by_ids("consumers", namespace, ids, "load_consumers_by_ids")
+            .load_rows_by_ids(tx, "consumers", namespace, ids, "load_consumers_by_ids")
             .await?;
         let mut consumers = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -7072,11 +7192,13 @@ impl DatabaseStore {
 
     async fn load_plugin_configs_by_ids(
         &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         ids: &[String],
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
         let rows = self
             .load_rows_by_ids(
+                tx,
                 "plugin_configs",
                 namespace,
                 ids,
@@ -7094,11 +7216,12 @@ impl DatabaseStore {
 
     async fn load_upstreams_by_ids(
         &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         ids: &[String],
     ) -> Result<Vec<Upstream>, anyhow::Error> {
         let rows = self
-            .load_rows_by_ids("upstreams", namespace, ids, "load_upstreams_by_ids")
+            .load_rows_by_ids(tx, "upstreams", namespace, ids, "load_upstreams_by_ids")
             .await?;
         let mut upstreams = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -7111,6 +7234,7 @@ impl DatabaseStore {
 
     async fn load_rows_by_ids(
         &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         table: &'static str,
         namespace: &str,
         ids: &[String],
@@ -7133,7 +7257,7 @@ impl DatabaseStore {
             for id in chunk {
                 query = query.bind(id);
             }
-            rows.extend(query.fetch_all(&self.pool()).await?);
+            rows.extend(query.fetch_all(&mut **tx).await?);
         }
         self.check_slow_query(operation, start);
         Ok(rows)
@@ -7256,40 +7380,55 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
-        let row = sqlx::query(&self.q("SELECT COALESCE(MAX(sequence), 0) AS max_sequence \
-             FROM config_changes WHERE namespace = ?"))
-        .bind(namespace)
-        .fetch_one(&mut **tx)
-        .await?;
-        let max_sequence: i64 = row.try_get("max_sequence")?;
-        let max_sequence = max_sequence.max(0) as u64;
-        if max_sequence <= Self::CHANGE_LOG_RETAIN_PER_NAMESPACE {
-            return Ok(());
-        }
-        let cutoff = max_sequence - Self::CHANGE_LOG_RETAIN_PER_NAMESPACE;
-        let retained_row = sqlx::query(
-            &self.q("SELECT COALESCE(MAX(sequence), 0) AS retained_sequence \
-                 FROM config_changes WHERE namespace = ? AND sequence <= ?"),
+        // Fast O(log N) range bound via `(namespace, sequence)`: because
+        // sequences are strictly increasing integers, a namespace cannot hold
+        // more than `CHANGE_LOG_RETAIN_PER_NAMESPACE` rows unless
+        // `max_sequence - min_sequence >= CHANGE_LOG_RETAIN_PER_NAMESPACE`.
+        let bounds = sqlx::query(
+            &self.q("SELECT COALESCE(MIN(sequence), 0) AS min_sequence, \
+                    COALESCE(MAX(sequence), 0) AS max_sequence \
+             FROM config_changes WHERE namespace = ?"),
         )
         .bind(namespace)
-        .bind(cutoff as i64)
         .fetch_one(&mut **tx)
         .await?;
-        let retained_sequence: i64 = retained_row.try_get("retained_sequence")?;
+        let min_sequence = bounds.try_get::<i64, _>("min_sequence")?.max(0) as u64;
+        let max_sequence = bounds.try_get::<i64, _>("max_sequence")?.max(0) as u64;
+        if max_sequence == 0
+            || max_sequence.saturating_sub(min_sequence) < Self::CHANGE_LOG_RETAIN_PER_NAMESPACE
+        {
+            return Ok(());
+        }
+        // Compute the cutoff strictly within `namespace` so a busy tenant
+        // advancing the global auto-increment sequence cannot evict a quieter
+        // tenant's rows.
+        let cutoff_row = sqlx::query(&self.q("SELECT sequence FROM config_changes \
+             WHERE namespace = ? \
+             ORDER BY sequence DESC \
+             LIMIT 1 OFFSET ?"))
+        .bind(namespace)
+        .bind(Self::CHANGE_LOG_RETAIN_PER_NAMESPACE as i64)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(cutoff_row) = cutoff_row else {
+            return Ok(());
+        };
+        let retained_sequence: i64 = cutoff_row.try_get("sequence")?;
+        if retained_sequence <= 0 {
+            return Ok(());
+        }
         sqlx::query(&self.q("DELETE FROM config_changes WHERE namespace = ? AND sequence <= ?"))
             .bind(namespace)
-            .bind(cutoff as i64)
+            .bind(retained_sequence)
             .execute(&mut **tx)
             .await?;
-        if retained_sequence > 0 {
-            let upsert_sql = self.config_change_retention_upsert_sql();
-            sqlx::query(&upsert_sql)
-                .bind(namespace)
-                .bind(retained_sequence)
-                .bind(Utc::now().to_rfc3339())
-                .execute(&mut **tx)
-                .await?;
-        }
+        let upsert_sql = self.config_change_retention_upsert_sql();
+        sqlx::query(&upsert_sql)
+            .bind(namespace)
+            .bind(retained_sequence)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut **tx)
+            .await?;
         Ok(())
     }
 
@@ -7703,7 +7842,11 @@ impl DatabaseStore {
         let mut touched_proxies: HashSet<(&str, &str)> = HashSet::new();
         for proxy in proxies {
             for assoc in &proxy.plugins {
-                if !seen.insert((proxy.id.as_str(), assoc.plugin_config_id.as_str())) {
+                if !seen.insert((
+                    proxy.namespace.as_str(),
+                    proxy.id.as_str(),
+                    assoc.plugin_config_id.as_str(),
+                )) {
                     continue;
                 }
                 let already_attached = sqlx::query(&assoc_exists_sql)
@@ -8431,7 +8574,25 @@ impl DatabaseStore {
             .execute(&mut **tx)
             .await?;
         if result.rows_affected() != 1 {
-            return Err(anyhow::Error::new(BatchAdmissionLeaseLost));
+            // Without CLIENT_FOUND_ROWS, MySQL reports 0 changed rows when
+            // CURRENT_TIMESTAMP(3) + duration equals the existing expires_at
+            // within the same millisecond. Confirm ownership inside the same tx.
+            let still_held = if self.db_type == "mysql" && result.rows_affected() == 0 {
+                let verify_sql = self.q("SELECT 1 FROM config_admission_locks \
+                     WHERE namespace = ? AND owner = ? AND generation = ?");
+                sqlx::query(&verify_sql)
+                    .bind(namespace)
+                    .bind(lease.owner)
+                    .bind(generation)
+                    .fetch_optional(&mut **tx)
+                    .await?
+                    .is_some()
+            } else {
+                false
+            };
+            if !still_held {
+                return Err(anyhow::Error::new(BatchAdmissionLeaseLost));
+            }
         }
         Ok(())
     }
@@ -9229,7 +9390,10 @@ impl DatabaseStore {
         let source = admin_read.source;
         match self.list_namespaces_from_admin_read(&admin_read.pool).await {
             Ok(result) => Ok(result),
-            Err(error) if source == AdminReadSource::ReadReplica => {
+            Err(error)
+                if source == AdminReadSource::ReadReplica
+                    && should_fallback_read_replica_error(&error) =>
+            {
                 self.mark_read_replica_unavailable("list_namespaces", &error);
                 warn!("Read replica admin query failed; retrying list_namespaces against primary");
                 let primary_pool = self.pool();
@@ -9295,7 +9459,10 @@ impl DatabaseStore {
             .await
         {
             Ok(result) => Ok(result),
-            Err(error) if source == AdminReadSource::ReadReplica => {
+            Err(error)
+                if source == AdminReadSource::ReadReplica
+                    && should_fallback_read_replica_error(&error) =>
+            {
                 self.mark_read_replica_unavailable("list_namespaces_paginated", &error);
                 warn!(
                     "Read replica admin query failed; retrying list_namespaces_paginated against primary"
@@ -9434,24 +9601,24 @@ impl DatabaseStore {
     /// shared by the pooled read and the in-transaction authority so the two can
     /// never diverge. Seven identical `name` binds, in column order.
     const NAMESPACE_NAME_IN_USE_SQL: &str = "SELECT 1 AS present FROM ( \
-         SELECT name FROM namespaces WHERE name = ? \
-         UNION SELECT namespace FROM proxies WHERE namespace = ? \
-         UNION SELECT namespace FROM consumers WHERE namespace = ? \
-         UNION SELECT namespace FROM plugin_configs WHERE namespace = ? \
-         UNION SELECT namespace FROM upstreams WHERE namespace = ? \
-         UNION SELECT namespace FROM gateway_trust_bundles WHERE namespace = ? \
-         UNION SELECT namespace FROM api_specs WHERE namespace = ? \
+         SELECT 1 FROM (SELECT 1 FROM namespaces WHERE name = ? LIMIT 1) AS t_namespaces \
+         UNION ALL SELECT 1 FROM (SELECT 1 FROM proxies WHERE namespace = ? LIMIT 1) AS t_proxies \
+         UNION ALL SELECT 1 FROM (SELECT 1 FROM consumers WHERE namespace = ? LIMIT 1) AS t_consumers \
+         UNION ALL SELECT 1 FROM (SELECT 1 FROM plugin_configs WHERE namespace = ? LIMIT 1) AS t_plugin_configs \
+         UNION ALL SELECT 1 FROM (SELECT 1 FROM upstreams WHERE namespace = ? LIMIT 1) AS t_upstreams \
+         UNION ALL SELECT 1 FROM (SELECT 1 FROM gateway_trust_bundles WHERE namespace = ? LIMIT 1) AS t_gateway_trust_bundles \
+         UNION ALL SELECT 1 FROM (SELECT 1 FROM api_specs WHERE namespace = ? LIMIT 1) AS t_api_specs \
          ) AS ferrum_ns_in_use LIMIT 1";
 
     /// Occupancy that blocks an unconfirmed DELETE: the same tables, minus the
     /// registry row itself. Six identical `name` binds.
     const NAMESPACE_HAS_RESOURCES_SQL: &str = "SELECT 1 AS present FROM ( \
-         SELECT namespace FROM proxies WHERE namespace = ? \
-         UNION SELECT namespace FROM consumers WHERE namespace = ? \
-         UNION SELECT namespace FROM plugin_configs WHERE namespace = ? \
-         UNION SELECT namespace FROM upstreams WHERE namespace = ? \
-         UNION SELECT namespace FROM gateway_trust_bundles WHERE namespace = ? \
-         UNION SELECT namespace FROM api_specs WHERE namespace = ? \
+         SELECT 1 FROM (SELECT 1 FROM proxies WHERE namespace = ? LIMIT 1) AS t_proxies \
+         UNION ALL SELECT 1 FROM (SELECT 1 FROM consumers WHERE namespace = ? LIMIT 1) AS t_consumers \
+         UNION ALL SELECT 1 FROM (SELECT 1 FROM plugin_configs WHERE namespace = ? LIMIT 1) AS t_plugin_configs \
+         UNION ALL SELECT 1 FROM (SELECT 1 FROM upstreams WHERE namespace = ? LIMIT 1) AS t_upstreams \
+         UNION ALL SELECT 1 FROM (SELECT 1 FROM gateway_trust_bundles WHERE namespace = ? LIMIT 1) AS t_gateway_trust_bundles \
+         UNION ALL SELECT 1 FROM (SELECT 1 FROM api_specs WHERE namespace = ? LIMIT 1) AS t_api_specs \
          ) AS ferrum_ns_occupied LIMIT 1";
 
     /// Does ANY durable registry row still exist? Last-remaining protection is
@@ -10098,6 +10265,10 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
+        // Acquire the namespace change-sequence lock BEFORE locking or deleting
+        // `gateway_trust_bundles` so lock order matches create/update/restore/
+        // rename (`config_change_locks` -> `gateway_trust_bundles`).
+        self.lock_config_change_sequence_tx(tx, namespace).await?;
         let ids = self
             .select_resource_ids_tx(tx, "gateway_trust_bundles", namespace, None, true)
             .await?;
@@ -11606,7 +11777,10 @@ impl DatabaseStore {
             .await
         {
             Ok(result) => Ok(result),
-            Err(error) if source == AdminReadSource::ReadReplica => {
+            Err(error)
+                if source == AdminReadSource::ReadReplica
+                    && should_fallback_read_replica_error(&error) =>
+            {
                 self.mark_read_replica_unavailable("list_api_specs", &error);
                 warn!("Read replica admin query failed; retrying list_api_specs against primary");
                 let primary_pool = self.pool();
@@ -11653,13 +11827,16 @@ impl DatabaseStore {
             proxy_id_val = filter.proxy_id.clone();
         }
         if let Some(ref prefix) = filter.spec_version_prefix {
-            conditions.push("spec_version LIKE ?");
-            spec_version_val = Some(format!("{prefix}%"));
+            conditions.push("spec_version LIKE ? ESCAPE '!'");
+            spec_version_val = Some(format!("{}%", escape_sql_like_literal(prefix)));
         }
         if let Some(ref substr) = filter.title_contains {
-            // LOWER() + LIKE for case-insensitive substring.
-            conditions.push("LOWER(title) LIKE ?");
-            title_contains_val = Some(format!("%{}%", substr.to_lowercase()));
+            // LOWER() + LIKE for case-insensitive substring with escaped wildcards.
+            conditions.push("LOWER(title) LIKE ? ESCAPE '!'");
+            title_contains_val = Some(format!(
+                "%{}%",
+                escape_sql_like_literal(&substr.to_lowercase())
+            ));
         }
         if let Some(ref since) = filter.updated_since {
             conditions.push("updated_at >= ?");
@@ -12211,7 +12388,10 @@ impl DatabaseStore {
             .await
         {
             Ok(result) => Ok(result),
-            Err(error) if source == AdminReadSource::ReadReplica => {
+            Err(error)
+                if source == AdminReadSource::ReadReplica
+                    && should_fallback_read_replica_error(&error) =>
+            {
                 self.mark_read_replica_unavailable("list_audit_events", &error);
                 warn!(
                     "Read replica admin query failed; retrying list_audit_events against primary"
@@ -12378,14 +12558,35 @@ impl NamespaceConfigAdmissionLeaseBackend for DatabaseStore {
         namespace: &str,
         owner: &str,
     ) -> Result<bool, anyhow::Error> {
+        let pool = self.pool();
         let sql = self.config_admission_lease_renew_sql();
         let result = sqlx::query(&sql)
             .bind(CONFIG_ADMISSION_LEASE_DURATION_MILLIS)
             .bind(namespace)
             .bind(owner)
-            .execute(&self.pool())
+            .execute(&pool)
             .await?;
-        Ok(result.rows_affected() == 1)
+        if result.rows_affected() == 1 {
+            return Ok(true);
+        }
+        // Without CLIENT_FOUND_ROWS, MySQL reports 0 changed rows when a
+        // renewal lands in the same millisecond (CURRENT_TIMESTAMP(3)) as the
+        // previous lease write. Confirm the lease is still live and owned.
+        if self.db_type == "mysql" && result.rows_affected() == 0 {
+            let now = self.config_admission_lease_now_sql();
+            let verify_sql = self.q(&format!(
+                "SELECT 1 FROM config_admission_locks \
+                 WHERE namespace = ? AND owner = ? AND expires_at > {now}"
+            ));
+            let still_held = sqlx::query(&verify_sql)
+                .bind(namespace)
+                .bind(owner)
+                .fetch_optional(&pool)
+                .await?
+                .is_some();
+            return Ok(still_held);
+        }
+        Ok(false)
     }
 
     async fn release_namespace_config_admission_lease(
@@ -12822,6 +13023,7 @@ impl DatabaseBackend for DatabaseStore {
     async fn check_listen_path_unique(
         &self,
         namespace: &str,
+        listen_port: Option<u16>,
         listen_path: Option<&str>,
         hosts: &[String],
         exclude_proxy_id: Option<&str>,
@@ -12829,6 +13031,7 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::check_listen_path_unique(
             self,
             namespace,
+            listen_port,
             listen_path,
             hosts,
             exclude_proxy_id,
@@ -13525,10 +13728,10 @@ fn row_to_proxy_inner(
             })?,
             None => Vec::new(),
         },
-        udp_max_response_amplification_factor: row
-            .try_get::<f64, _>("udp_max_response_amplification_factor")
-            .ok()
-            .map(|v| v as f32),
+        udp_max_response_amplification_factor: optional_f32_column(
+            row,
+            "udp_max_response_amplification_factor",
+        )?,
         // Written as an i32 0/1 (like the other proxy booleans); decode with
         // the same width. `Option<i32>` represents SQL NULL, so `?` fails only
         // on real decode errors — silently mapping those to `None` would
@@ -13637,6 +13840,59 @@ fn decode_websocket_permessage_deflate(
 }
 
 /// Decode a nullable TEXT/MEDIUMTEXT column. `Ok(None)` preserves SQL NULL;
+/// Decode an optional SQL floating-point column into `Option<f32>` across
+/// PostgreSQL (`REAL` / `float4`), MySQL (`REAL` / `DOUBLE` or `FLOAT`), and
+/// SQLite (`REAL` / `f64`).
+///
+/// `sqlx::Any`'s `Type<Any> for f64` checks `Double == Real` and rejects
+/// PostgreSQL `REAL` values before `Decode::decode` runs, so a plain
+/// `try_get::<f64, _>(col).ok()` silently coerced PostgreSQL values to `None`.
+/// Try `Option<f32>` first and `Option<f64>` second, failing closed on genuine
+/// decode errors.
+fn optional_f32_column(row: &AnyRow, column: &str) -> Result<Option<f32>, anyhow::Error> {
+    match row.try_get::<Option<f32>, _>(column) {
+        Ok(value) => Ok(value),
+        Err(f32_error) => match row.try_get::<Option<f64>, _>(column) {
+            Ok(value) => Ok(value.map(|v| v as f32)),
+            Err(f64_error) => Err(anyhow::anyhow!(
+                "column `{column}` could not be decoded as optional SQL float \
+                 (f32: {f32_error}; f64: {f64_error})"
+            )),
+        },
+    }
+}
+
+/// Escape literal SQL `LIKE` wildcard characters using `!` as the portable
+/// `ESCAPE '!'` character across SQLite, PostgreSQL, and MySQL.
+fn escape_sql_like_literal(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '!' | '%' | '_' => {
+                escaped.push('!');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+/// Returns `false` when an admin-read failure is a deterministic row-decode or
+/// data-integrity rejection rather than a database/replica query failure.
+/// Such failures reproduce identically on primary and must not tear down a
+/// healthy read-replica pool.
+fn should_fallback_read_replica_error(error: &anyhow::Error) -> bool {
+    !error.chain().any(|cause| {
+        cause.is::<RowDecodeRejection>()
+            || cause.is::<crate::config::namespace_registry::NamespaceRegistryCorrupt>()
+            || cause.is::<serde_json::Error>()
+            || cause
+                .downcast_ref::<ProxyPluginAssociationLoadError>()
+                .is_some_and(|assoc_err| std::error::Error::source(assoc_err).is_none())
+    })
+}
+
 /// non-NULL Blob/text values that are not valid UTF-8 still reject the row so
 /// trust/routing material cannot silently become `None`.
 fn optional_utf8_text_column(row: &AnyRow, column: &str) -> Result<Option<String>, anyhow::Error> {

@@ -235,7 +235,10 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_upstreams_updated_at ON upstreams (updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_proxies_ns_updated ON proxies (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_consumers_ns_updated ON consumers (namespace, updated_at)",
-            "CREATE INDEX IF NOT EXISTS idx_consumer_credential_index_consumer_id ON consumer_credential_index (consumer_id)",
+            // Serves the per-consumer credential-row rewrite on consumer
+            // update/delete and satisfies MySQL's FK-column index requirement
+            // for the composite (namespace, consumer_id) foreign key.
+            "CREATE INDEX IF NOT EXISTS idx_consumer_credential_index_consumer_id ON consumer_credential_index (namespace, consumer_id)",
             // Serves the per-consumer identity-row rewrite on consumer
             // update/delete and satisfies MySQL's FK-column index requirement
             // for the composite (namespace, consumer_id) foreign key.
@@ -650,7 +653,7 @@ impl V001SqlBuilder {
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
                 name VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 hosts TEXT NOT NULL,
-                listen_path VARCHAR(512),
+                listen_path VARCHAR(512) COLLATE utf8mb4_0900_bin,
                 backend_scheme VARCHAR(16) NOT NULL DEFAULT 'https',
                 backend_host VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 backend_port INTEGER NOT NULL DEFAULT 80,
