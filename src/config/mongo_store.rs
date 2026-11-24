@@ -4769,19 +4769,28 @@ mod inner {
             Ok(existing.is_some())
         }
 
-        /// Fetch every proxy in the same (namespace, listen_path) route
-        /// bucket, excluding stream schemes, with the fields needed for the
-        /// standalone post-write reconciliation: `_id`, `hosts`, and the
+        /// Fetch every proxy in the same (namespace, listen_port, listen_path)
+        /// route bucket, excluding stream schemes, with the fields needed for
+        /// the standalone post-write reconciliation: `_id`, `hosts`, and the
         /// stored `created_at` string.
         async fn listen_path_bucket_candidates(
             &self,
             namespace: &str,
+            listen_port: Option<u16>,
             listen_path: Option<&str>,
         ) -> Result<Vec<RouteBucketCandidate>, anyhow::Error> {
             let mut filter = match listen_path {
                 Some(path) => doc! { "namespace": namespace, "listen_path": path },
                 None => doc! { "namespace": namespace, "listen_path": null },
             };
+            match listen_port {
+                Some(port) => {
+                    filter.insert("listen_port", i32::from(port));
+                }
+                None => {
+                    filter.insert("listen_port", mongodb::bson::Bson::Null);
+                }
+            }
             filter.insert(
                 "backend_scheme",
                 doc! { "$nin": ["tcp", "tcps", "udp", "dtls"] },
@@ -10422,6 +10431,7 @@ mod inner {
                     let candidates = self
                         .listen_path_bucket_candidates(
                             &proxy.namespace,
+                            proxy.listen_port,
                             proxy.listen_path.as_deref(),
                         )
                         .await?;
@@ -10698,7 +10708,11 @@ mod inner {
             // `created_at` must not make its route mutation win.
             if !guard_params.is_stream {
                 let candidates = self
-                    .listen_path_bucket_candidates(&proxy.namespace, proxy.listen_path.as_deref())
+                    .listen_path_bucket_candidates(
+                        &proxy.namespace,
+                        proxy.listen_port,
+                        proxy.listen_path.as_deref(),
+                    )
                     .await?;
                 if Self::standalone_route_update_has_conflict(&proxy.id, &proxy.hosts, &candidates)
                 {

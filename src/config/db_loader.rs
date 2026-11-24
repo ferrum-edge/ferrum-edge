@@ -3108,6 +3108,7 @@ impl DatabaseStore {
         );
         let multi_chunk = plugin_ids.len() > Self::ORDERED_NEIGHBORHOOD_CHUNK_SIZE;
         let mut plugin_rows = Vec::new();
+        let mut db_id_order: HashMap<String, usize> = HashMap::new();
         if !multi_chunk {
             // Single statement ordered directly by the database like the full
             // load, so plugin-chain tie order matches runtime under any collation.
@@ -3131,7 +3132,10 @@ impl DatabaseStore {
             plugin_rows.extend(query.fetch_all(&mut *tx).await?);
         } else {
             // Fetch global/namespace-wide plugins once rather than repeating
-            // them on every chunk, then load chunked IDs and restore `id` order.
+            // them on every chunk, load chunked IDs, and capture the database's
+            // own `ORDER BY id` rank list inside the same snapshot transaction
+            // so equal-priority plugin tie order matches the full load under
+            // any database collation (including non-C PostgreSQL locales).
             let wide_sql = self.q(&format!("{plugin_select}) ORDER BY id"));
             let mut wide_query = sqlx::query(&wide_sql).bind(namespace);
             for name in namespace_wide_names {
@@ -3152,11 +3156,24 @@ impl DatabaseStore {
                 }
                 plugin_rows.extend(query.fetch_all(&mut *tx).await?);
             }
+
+            let order_sql = self.q("SELECT id FROM plugin_configs WHERE namespace = ? ORDER BY id");
+            let ordered_rows = sqlx::query(&order_sql)
+                .bind(namespace)
+                .fetch_all(&mut *tx)
+                .await?;
+            db_id_order.reserve(ordered_rows.len());
+            for (rank, row) in ordered_rows.into_iter().enumerate() {
+                let id: String = row.try_get("id").map_err(|error| {
+                    purpose.map_row_error("plugin_config", None, anyhow::Error::new(error))
+                })?;
+                db_id_order.insert(id, rank);
+            }
         }
         tx.commit().await?;
 
         // Rows repeat only when the ids span more than one chunk; keep the
-        // first occurrence and restore `id` order across chunks.
+        // first occurrence and restore the database's exact `ORDER BY id` order.
         let mut seen_plugin_ids = HashSet::with_capacity(plugin_rows.len());
         let mut plugin_configs = Vec::with_capacity(plugin_rows.len());
         for row in plugin_rows {
@@ -3172,7 +3189,11 @@ impl DatabaseStore {
             );
         }
         if multi_chunk {
-            plugin_configs.sort_by(|a, b| a.id.cmp(&b.id));
+            plugin_configs.sort_by(|a, b| {
+                let rank_a = db_id_order.get(&a.id).copied().unwrap_or(usize::MAX);
+                let rank_b = db_id_order.get(&b.id).copied().unwrap_or(usize::MAX);
+                rank_a.cmp(&rank_b).then_with(|| a.id.cmp(&b.id))
+            });
         }
 
         let mut config = GatewayConfig {
@@ -7380,23 +7401,43 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
-        // Fast O(log N) range bound via `(namespace, sequence)`: because
-        // sequences are strictly increasing integers, a namespace cannot hold
-        // more than `CHANGE_LOG_RETAIN_PER_NAMESPACE` rows unless
-        // `max_sequence - min_sequence >= CHANGE_LOG_RETAIN_PER_NAMESPACE`.
-        let bounds = sqlx::query(
-            &self.q("SELECT COALESCE(MIN(sequence), 0) AS min_sequence, \
-                    COALESCE(MAX(sequence), 0) AS max_sequence \
-             FROM config_changes WHERE namespace = ?"),
-        )
+        // Two separate single-row indexed endpoint seeks (`ORDER BY sequence
+        // DESC/ASC LIMIT 1`) rather than `SELECT MIN(...), MAX(...)`: SQLite's
+        // single-aggregate min/max optimization only fires for one endpoint
+        // aggregate, so separate LIMIT 1 queries stay O(log N) across SQLite,
+        // PostgreSQL, and MySQL alike.
+        let max_row = sqlx::query(&self.q("SELECT sequence FROM config_changes \
+             WHERE namespace = ? \
+             ORDER BY sequence DESC \
+             LIMIT 1"))
         .bind(namespace)
-        .fetch_one(&mut **tx)
+        .fetch_optional(&mut **tx)
         .await?;
-        let min_sequence = bounds.try_get::<i64, _>("min_sequence")?.max(0) as u64;
-        let max_sequence = bounds.try_get::<i64, _>("max_sequence")?.max(0) as u64;
-        if max_sequence == 0
-            || max_sequence.saturating_sub(min_sequence) < Self::CHANGE_LOG_RETAIN_PER_NAMESPACE
-        {
+        let Some(max_row) = max_row else {
+            return Ok(());
+        };
+        let max_sequence = max_row.try_get::<i64, _>("sequence")?.max(0) as u64;
+        if max_sequence <= Self::CHANGE_LOG_RETAIN_PER_NAMESPACE {
+            return Ok(());
+        }
+        // Amortize the per-namespace OFFSET scan so busy or interleaved
+        // namespaces do not walk up to 100k index entries on every single
+        // write while holding the per-namespace change-sequence lock.
+        if !max_sequence.is_multiple_of(Self::CHANGE_LOG_COMPACTION_STRIDE) {
+            return Ok(());
+        }
+        let min_row = sqlx::query(&self.q("SELECT sequence FROM config_changes \
+             WHERE namespace = ? \
+             ORDER BY sequence ASC \
+             LIMIT 1"))
+        .bind(namespace)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let min_sequence = match min_row {
+            Some(row) => row.try_get::<i64, _>("sequence")?.max(0) as u64,
+            None => return Ok(()),
+        };
+        if max_sequence.saturating_sub(min_sequence) < Self::CHANGE_LOG_RETAIN_PER_NAMESPACE {
             return Ok(());
         }
         // Compute the cutoff strictly within `namespace` so a busy tenant
@@ -7529,6 +7570,7 @@ impl DatabaseStore {
     /// 32,766 and PostgreSQL/MySQL's 65,535 bind-parameter limits.
     const ORDERED_NEIGHBORHOOD_CHUNK_SIZE: usize = 10_000;
     const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
+    const CHANGE_LOG_COMPACTION_STRIDE: u64 = 1_024;
 
     /// Fallback page size used only when no runtime override has been set
     /// via `set_full_load_page_size()`. Matches the default for
@@ -8574,25 +8616,7 @@ impl DatabaseStore {
             .execute(&mut **tx)
             .await?;
         if result.rows_affected() != 1 {
-            // Without CLIENT_FOUND_ROWS, MySQL reports 0 changed rows when
-            // CURRENT_TIMESTAMP(3) + duration equals the existing expires_at
-            // within the same millisecond. Confirm ownership inside the same tx.
-            let still_held = if self.db_type == "mysql" && result.rows_affected() == 0 {
-                let verify_sql = self.q("SELECT 1 FROM config_admission_locks \
-                     WHERE namespace = ? AND owner = ? AND generation = ?");
-                sqlx::query(&verify_sql)
-                    .bind(namespace)
-                    .bind(lease.owner)
-                    .bind(generation)
-                    .fetch_optional(&mut **tx)
-                    .await?
-                    .is_some()
-            } else {
-                false
-            };
-            if !still_held {
-                return Err(anyhow::Error::new(BatchAdmissionLeaseLost));
-            }
+            return Err(anyhow::Error::new(BatchAdmissionLeaseLost));
         }
         Ok(())
     }
@@ -12558,35 +12582,14 @@ impl NamespaceConfigAdmissionLeaseBackend for DatabaseStore {
         namespace: &str,
         owner: &str,
     ) -> Result<bool, anyhow::Error> {
-        let pool = self.pool();
         let sql = self.config_admission_lease_renew_sql();
         let result = sqlx::query(&sql)
             .bind(CONFIG_ADMISSION_LEASE_DURATION_MILLIS)
             .bind(namespace)
             .bind(owner)
-            .execute(&pool)
+            .execute(&self.pool())
             .await?;
-        if result.rows_affected() == 1 {
-            return Ok(true);
-        }
-        // Without CLIENT_FOUND_ROWS, MySQL reports 0 changed rows when a
-        // renewal lands in the same millisecond (CURRENT_TIMESTAMP(3)) as the
-        // previous lease write. Confirm the lease is still live and owned.
-        if self.db_type == "mysql" && result.rows_affected() == 0 {
-            let now = self.config_admission_lease_now_sql();
-            let verify_sql = self.q(&format!(
-                "SELECT 1 FROM config_admission_locks \
-                 WHERE namespace = ? AND owner = ? AND expires_at > {now}"
-            ));
-            let still_held = sqlx::query(&verify_sql)
-                .bind(namespace)
-                .bind(owner)
-                .fetch_optional(&pool)
-                .await?
-                .is_some();
-            return Ok(still_held);
-        }
-        Ok(false)
+        Ok(result.rows_affected() == 1)
     }
 
     async fn release_namespace_config_admission_lease(
@@ -13839,7 +13842,6 @@ fn decode_websocket_permessage_deflate(
     }
 }
 
-/// Decode a nullable TEXT/MEDIUMTEXT column. `Ok(None)` preserves SQL NULL;
 /// Decode an optional SQL floating-point column into `Option<f32>` across
 /// PostgreSQL (`REAL` / `float4`), MySQL (`REAL` / `DOUBLE` or `FLOAT`), and
 /// SQLite (`REAL` / `f64`).
@@ -13893,6 +13895,7 @@ fn should_fallback_read_replica_error(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Decode a nullable TEXT/MEDIUMTEXT column. `Ok(None)` preserves SQL NULL;
 /// non-NULL Blob/text values that are not valid UTF-8 still reject the row so
 /// trust/routing material cannot silently become `None`.
 fn optional_utf8_text_column(row: &AnyRow, column: &str) -> Result<Option<String>, anyhow::Error> {
