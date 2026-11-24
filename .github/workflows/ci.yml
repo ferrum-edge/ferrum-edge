@@ -2074,9 +2074,17 @@ jobs:
         # waiting for backend_read_timeout_ms (issue #5714). The legacy_client
         # suite re-checks ordinary keep-alive, reuse, and close behavior
         # through the patched send path.
+        # The standalone manifest has no lockfile, so without the patch it
+        # resolves the newest crates.io hyper rather than the vendored hyper
+        # the gateway ships (`hyper = "=1.10.0"`). hyper 1.13.0 wraps
+        # dispatch errors in an extra `Canceled`, which broke legacy_client's
+        # error-shape assertions without any change on our side.
         run: |
-          cargo test --manifest-path vendor/hyper-util-0.1.21-ferrum-patched/Cargo.toml --features full --lib ferrum_release_on_close_tests
-          cargo test --manifest-path vendor/hyper-util-0.1.21-ferrum-patched/Cargo.toml --features full --test legacy_client
+          hyper_vendored='patch.crates-io.hyper.path="vendor/hyper-1.10.0-ferrum-patched"'
+          cargo test --manifest-path vendor/hyper-util-0.1.21-ferrum-patched/Cargo.toml --features full --lib ferrum_release_on_close_tests \
+            --config "$hyper_vendored"
+          cargo test --manifest-path vendor/hyper-util-0.1.21-ferrum-patched/Cargo.toml --features full --test legacy_client \
+            --config "$hyper_vendored"
 
       - name: Run vendored hyper upgraded-stream reset regressions
         # An HBONE relay that ends on a socket error must reset its upgraded
