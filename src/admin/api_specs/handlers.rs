@@ -2102,6 +2102,7 @@ async fn validate_bundle(
             match db
                 .check_listen_path_unique(
                     namespace,
+                    proxy.listen_port,
                     proxy.listen_path.as_deref(),
                     &proxy.hosts,
                     existing_proxy_id,

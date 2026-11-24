@@ -652,7 +652,7 @@ impl V001SqlBuilder {
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
                 name VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 hosts TEXT NOT NULL,
-                listen_path VARCHAR(512),
+                listen_path VARCHAR(512) COLLATE utf8mb4_0900_bin,
                 backend_scheme VARCHAR(16) NOT NULL DEFAULT 'https',
                 backend_host VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 backend_port INTEGER NOT NULL DEFAULT 80,
@@ -913,14 +913,16 @@ impl V001SqlBuilder {
             r#"
             CREATE TABLE IF NOT EXISTS config_change_locks (
                 lock_name VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
-                updated_at VARCHAR(64) NOT NULL
+                updated_at VARCHAR(64) NOT NULL,
+                changes_since_compaction BIGINT NOT NULL DEFAULT 0
             )
             "#
         } else {
             r#"
             CREATE TABLE IF NOT EXISTS config_change_locks (
                 lock_name TEXT PRIMARY KEY,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                changes_since_compaction BIGINT NOT NULL DEFAULT 0
             )
             "#
         }
