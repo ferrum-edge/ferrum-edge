@@ -144,10 +144,6 @@ mod inner {
     /// within one server response batch (avoiding `getMore` cursors inside
     /// transactions, which AWS DocumentDB does not support).
     const MONGO_INCREMENTAL_CHANGES_PAGE_SIZE: usize = 500;
-    /// Single-batch chunk size for resource point-loads inside
-    /// `load_incremental_config`'s snapshot transaction (avoiding `getMore`
-    /// cursors on DocumentDB).
-    const MONGO_INCREMENTAL_POINT_LOAD_CHUNK_SIZE: usize = 64;
     const MONGO_MIGRATION_LOCK_ID: &str = "global";
     const MONGO_MIGRATION_LEASE_DURATION: Duration = Duration::from_secs(120);
     const MONGO_MIGRATION_LEASE_DURATION_MILLIS: i64 =
@@ -4491,21 +4487,19 @@ mod inner {
             if ids.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut docs = Vec::new();
-            // Small single-batch chunks (`limit == batch_size`) keep every
-            // point-load inside one server response without `getMore`, which
-            // AWS DocumentDB does not support inside transactions.
-            for chunk in ids.chunks(MONGO_INCREMENTAL_POINT_LOAD_CHUNK_SIZE) {
-                let id_values: Vec<Bson> = chunk.iter().cloned().map(Bson::String).collect();
-                let chunk_len = chunk.len();
-                let mut cursor = collection
-                    .find(doc! { "namespace": namespace, "_id": { "$in": id_values } })
-                    .limit(i64::try_from(chunk_len).unwrap_or(i64::MAX))
-                    .batch_size(u32::try_from(chunk_len).unwrap_or(u32::MAX))
+            let mut docs = Vec::with_capacity(ids.len());
+            // Fetch each changed resource with `find_one` (`limit: 1`,
+            // `singleBatch: true` in the MongoDB driver) so even multi-megabyte
+            // plugin/config documents can never spill across a 16 MiB response
+            // batch and trigger a transactional `getMore` cursor (which AWS
+            // DocumentDB rejects inside transactions).
+            for id in ids {
+                if let Some(doc) = collection
+                    .find_one(doc! { "namespace": namespace, "_id": id.as_str() })
                     .session(&mut *session)
-                    .await?;
-                while cursor.advance(&mut *session).await? {
-                    docs.push(cursor.deserialize_current()?);
+                    .await?
+                {
+                    docs.push(doc);
                 }
             }
             Ok(docs)

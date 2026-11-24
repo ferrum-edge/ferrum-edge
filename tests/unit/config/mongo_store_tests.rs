@@ -2573,10 +2573,10 @@ fn mongo_query_index_and_transaction_correctness_invariants() {
     );
     let point_load = mongo_method("load_change_ids_in_session(");
     assert!(
-        point_load.contains("MONGO_INCREMENTAL_POINT_LOAD_CHUNK_SIZE")
-            && point_load.contains(".limit(")
-            && point_load.contains(".batch_size("),
-        "load_change_ids_in_session must issue single-batch point loads"
+        point_load.contains(".find_one(")
+            && point_load.contains(".session(")
+            && !point_load.contains("cursor.advance"),
+        "load_change_ids_in_session must use single-document find_one inside the session so multi-MiB documents never open a transactional getMore cursor"
     );
 
     // 10. mutate_deployment only classifies commit-phase errors as uncertain.
