@@ -2488,12 +2488,12 @@ fn mongo_query_index_and_transaction_correctness_invariants() {
         "check_mtls_identity_unique must use dotted path to hit partial unique index"
     );
 
-    // 3. Global change sequence sorts (namespace, sequence DESC) + $first.
+    // 3. Global change sequence sorts exact reverse of `(namespace: 1, sequence: 1)` + $first.
     let global_seq = mongo_method("latest_global_change_sequence(");
     assert!(
-        global_seq.contains(r#""$sort": { "namespace": 1, "sequence": -1 }"#)
+        global_seq.contains(r#""$sort": { "namespace": -1, "sequence": -1 }"#)
             && global_seq.contains(r#""$first": "$sequence""#),
-        "latest_global_change_sequence must sort before grouping to avoid full collection scan"
+        "latest_global_change_sequence must sort in exact reverse of (namespace, sequence) index"
     );
 
     // 4. Orphan upstream cleanup scopes proxy count by namespace and respects api_spec_id.
@@ -2548,7 +2548,9 @@ fn mongo_query_index_and_transaction_correctness_invariants() {
         "delete_namespace_guard_docs_in_session must also clean up upstream_ref_guards"
     );
 
-    // 9. load_incremental_config runs inside a snapshot transaction and loads consumers before proxies.
+    // 9. load_incremental_config runs inside a snapshot transaction with
+    //    single-batch keyset paging (DocumentDB-safe, no getMore) and loads
+    //    consumers before proxies.
     let inc = mongo_method("load_incremental_config(");
     let snap = inc
         .find("ReadConcern::snapshot()")
@@ -2563,4 +2565,52 @@ fn mongo_query_index_and_transaction_correctness_invariants() {
         snap < consumers_pos && consumers_pos < proxies_pos,
         "load_incremental_config must snapshot-read consumers before proxies"
     );
+    assert!(
+        inc.contains("MONGO_INCREMENTAL_CHANGES_PAGE_SIZE")
+            && inc.contains(".batch_size(")
+            && inc.contains("page_after = sequence_cursor"),
+        "load_incremental_config must keyset-page config_changes in single batches"
+    );
+    let point_load = mongo_method("load_change_ids_in_session(");
+    assert!(
+        point_load.contains("MONGO_INCREMENTAL_POINT_LOAD_CHUNK_SIZE")
+            && point_load.contains(".limit(")
+            && point_load.contains(".batch_size("),
+        "load_change_ids_in_session must issue single-batch point loads"
+    );
+
+    // 10. mutate_deployment only classifies commit-phase errors as uncertain.
+    let mutate_dep = mongo_method("mutate_deployment(");
+    assert!(
+        mutate_dep.contains("!callback_failed.load(Ordering::Acquire)")
+            && mutate_dep.contains("callback_failed.store(true, Ordering::Release)"),
+        "mutate_deployment must not classify aborted callback errors as commit-outcome-unknown"
+    );
+}
+
+#[test]
+fn mongo_compaction_gate_throttles_by_namespace_local_writes_and_batches() {
+    use ferrum_edge::_test_support::MongoChangeLogCompactionGateForTest;
+
+    let mut ns_quiet = MongoChangeLogCompactionGateForTest::default();
+    let mut ns_busy = MongoChangeLogCompactionGateForTest::default();
+
+    // First call after startup always checks once.
+    assert!(ns_quiet.should_check(1_024));
+    ns_quiet.mark_checked();
+    assert!(!ns_quiet.should_check(1_024));
+
+    // Heavy writes to a sibling namespace never bypass ns_quiet's throttle.
+    ns_busy.record_writes(50_000);
+    assert!(ns_busy.should_check(1_024));
+    ns_quiet.record_writes(1);
+    assert!(!ns_quiet.should_check(1_024));
+
+    // Multi-row batches accumulate until crossing the stride, then reset.
+    ns_quiet.record_writes(1_000);
+    assert!(!ns_quiet.should_check(1_024));
+    ns_quiet.record_writes(23);
+    assert!(ns_quiet.should_check(1_024));
+    ns_quiet.mark_checked();
+    assert!(!ns_quiet.should_check(1_024));
 }

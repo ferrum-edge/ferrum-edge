@@ -139,6 +139,15 @@ mod inner {
     const CONFIG_CHANGE_STREAM_MAX_AWAIT: Duration = Duration::from_secs(10);
     const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
     const CHANGE_LOG_COMPACTION_STRIDE: u64 = 1_024;
+    /// Single-batch page size for keyset-paged `config_changes` reads inside
+    /// `load_incremental_config`'s snapshot transaction. Keeps every `find`
+    /// within one server response batch (avoiding `getMore` cursors inside
+    /// transactions, which AWS DocumentDB does not support).
+    const MONGO_INCREMENTAL_CHANGES_PAGE_SIZE: usize = 500;
+    /// Single-batch chunk size for resource point-loads inside
+    /// `load_incremental_config`'s snapshot transaction (avoiding `getMore`
+    /// cursors on DocumentDB).
+    const MONGO_INCREMENTAL_POINT_LOAD_CHUNK_SIZE: usize = 64;
     const MONGO_MIGRATION_LOCK_ID: &str = "global";
     const MONGO_MIGRATION_LEASE_DURATION: Duration = Duration::from_secs(120);
     const MONGO_MIGRATION_LEASE_DURATION_MILLIS: i64 =
@@ -156,6 +165,32 @@ mod inner {
     // while keeping the lease client fully isolated from the migration-work
     // pool that may be saturated by a long-running create_index.
     const MONGO_MIGRATION_LEASE_POOL_SIZE: u32 = 2;
+
+    /// Per-namespace compaction throttle state.
+    ///
+    /// Tracks namespace-local change volume (including batch sizes) rather than
+    /// global sequence gaps so interleaved writes from busy tenants cannot
+    /// force a sparse namespace to scan up to 100k entries on every write.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct MongoChangeLogCompactionGate {
+        initialized: bool,
+        writes_since_check: u64,
+    }
+
+    impl MongoChangeLogCompactionGate {
+        pub(crate) fn record_writes(&mut self, count: u64) {
+            self.writes_since_check = self.writes_since_check.saturating_add(count);
+        }
+
+        pub(crate) fn should_check(&self, stride: u64) -> bool {
+            !self.initialized || self.writes_since_check >= stride.max(1)
+        }
+
+        pub(crate) fn mark_checked(&mut self) {
+            self.initialized = true;
+            self.writes_since_check = 0;
+        }
+    }
 
     /// Sentinel error returned inside `update_gateway_trust_bundle`'s
     /// transaction callback when the compare-and-set filter matches zero
@@ -1245,9 +1280,9 @@ mod inner {
         /// Namespaces whose last published full load quarantined no consumer,
         /// so consumer changes can ride the incremental delta (issue #6060).
         consumer_quarantine: Arc<crate::config::db_backend::ConsumerQuarantineTracker>,
-        /// Last checked `config_changes.sequence` per namespace, used to
-        /// amortize per-namespace skip-based compaction scans across writes.
-        change_log_compaction_watermarks: Arc<DashMap<String, u64>>,
+        /// Per-namespace write counters used to amortize skip-based
+        /// `config_changes` compaction independently of global sequence gaps.
+        change_log_compaction_gates: Arc<DashMap<String, MongoChangeLogCompactionGate>>,
     }
 
     impl MongoStore {
@@ -1343,7 +1378,7 @@ mod inner {
                 consumer_quarantine: Arc::new(
                     crate::config::db_backend::ConsumerQuarantineTracker::default(),
                 ),
-                change_log_compaction_watermarks: Arc::new(DashMap::new()),
+                change_log_compaction_gates: Arc::new(DashMap::new()),
             })
         }
 
@@ -1990,7 +2025,7 @@ mod inner {
                 consumer_quarantine: Arc::new(
                     crate::config::db_backend::ConsumerQuarantineTracker::default(),
                 ),
-                change_log_compaction_watermarks: Arc::new(DashMap::new()),
+                change_log_compaction_gates: Arc::new(DashMap::new()),
             })
         }
 
@@ -3654,6 +3689,7 @@ mod inner {
             let doc =
                 Self::config_change_doc(sequence, namespace, resource_type, resource_id, operation);
             self.config_changes().insert_one(doc).await?;
+            self.note_config_changes_written(namespace, 1);
             // Compaction is best-effort maintenance; never fail (and trigger
             // compensating rollback of an already-committed standalone write)
             // if a transient compaction error occurs.
@@ -3698,8 +3734,13 @@ mod inner {
                 .collect();
             self.config_changes().insert_many(docs).await?;
 
-            let namespaces: HashSet<&str> = changes.iter().map(|change| change.namespace).collect();
-            for namespace in namespaces {
+            let mut per_namespace_counts: std::collections::HashMap<&str, u64> =
+                std::collections::HashMap::new();
+            for change in changes {
+                *per_namespace_counts.entry(change.namespace).or_insert(0) += 1;
+            }
+            for (namespace, ns_count) in per_namespace_counts {
+                self.note_config_changes_written(namespace, ns_count);
                 self.compact_config_changes_best_effort(namespace).await;
             }
 
@@ -4075,12 +4116,39 @@ mod inner {
                 .insert_one(doc)
                 .session(&mut *session)
                 .await?;
+            self.note_config_changes_written(namespace, 1);
             if sequence == 0 {
                 return Err(mongodb::error::Error::custom(
                     "MongoDB config change sequence is out of range",
                 ));
             }
             Ok(sequence)
+        }
+
+        fn note_config_changes_written(&self, namespace: &str, count: u64) {
+            if count == 0 {
+                return;
+            }
+            let mut gate = self
+                .change_log_compaction_gates
+                .entry(namespace.to_string())
+                .or_default();
+            gate.record_writes(count);
+        }
+
+        fn should_run_compaction_check(&self, namespace: &str) -> bool {
+            self.change_log_compaction_gates
+                .get(namespace)
+                .map(|gate| gate.should_check(CHANGE_LOG_COMPACTION_STRIDE))
+                .unwrap_or(true)
+        }
+
+        fn mark_compaction_checked(&self, namespace: &str) {
+            let mut gate = self
+                .change_log_compaction_gates
+                .entry(namespace.to_string())
+                .or_default();
+            gate.mark_checked();
         }
 
         async fn compact_config_changes_best_effort(&self, namespace: &str) {
@@ -4291,13 +4359,15 @@ mod inner {
         }
 
         async fn compact_config_changes(&self, namespace: &str) -> Result<(), anyhow::Error> {
-            let latest = self.latest_change_sequence(namespace).await?;
-            if latest <= CHANGE_LOG_RETAIN_PER_NAMESPACE {
+            // Amortize compaction by namespace-local change count (never
+            // global sequence gaps) so busy sibling tenants cannot force a
+            // sparse namespace to scan up to 100k rows on every single write.
+            if !self.should_run_compaction_check(namespace) {
                 return Ok(());
             }
-            if let Some(last_checked) = self.change_log_compaction_watermarks.get(namespace)
-                && latest.saturating_sub(*last_checked) < CHANGE_LOG_COMPACTION_STRIDE
-            {
+            let latest = self.latest_change_sequence(namespace).await?;
+            if latest <= CHANGE_LOG_RETAIN_PER_NAMESPACE {
+                self.mark_compaction_checked(namespace);
                 return Ok(());
             }
             let earliest_doc = self
@@ -4306,15 +4376,13 @@ mod inner {
                 .sort(doc! { "sequence": 1 })
                 .await?;
             let Some(earliest_doc) = earliest_doc else {
-                self.change_log_compaction_watermarks
-                    .insert(namespace.to_string(), latest);
+                self.mark_compaction_checked(namespace);
                 return Ok(());
             };
             let earliest =
                 mongo_change_sequence_from_bson(earliest_doc.get("sequence"), "sequence")?;
             if latest.saturating_sub(earliest) < CHANGE_LOG_RETAIN_PER_NAMESPACE {
-                self.change_log_compaction_watermarks
-                    .insert(namespace.to_string(), latest);
+                self.mark_compaction_checked(namespace);
                 return Ok(());
             }
             // Compute the cutoff strictly within `namespace` so a busy tenant
@@ -4356,8 +4424,7 @@ mod inner {
                 None => None,
             };
             let Some(retained_sequence) = retained_sequence else {
-                self.change_log_compaction_watermarks
-                    .insert(namespace.to_string(), latest);
+                self.mark_compaction_checked(namespace);
                 return Ok(());
             };
             self.config_change_counters()
@@ -4376,8 +4443,7 @@ mod inner {
                     "sequence": { "$lte": retained_sequence },
                 })
                 .await?;
-            self.change_log_compaction_watermarks
-                .insert(namespace.to_string(), latest);
+            self.mark_compaction_checked(namespace);
             Ok(())
         }
 
@@ -4426,10 +4492,16 @@ mod inner {
                 return Ok(Vec::new());
             }
             let mut docs = Vec::new();
-            for chunk in ids.chunks(500) {
+            // Small single-batch chunks (`limit == batch_size`) keep every
+            // point-load inside one server response without `getMore`, which
+            // AWS DocumentDB does not support inside transactions.
+            for chunk in ids.chunks(MONGO_INCREMENTAL_POINT_LOAD_CHUNK_SIZE) {
                 let id_values: Vec<Bson> = chunk.iter().cloned().map(Bson::String).collect();
+                let chunk_len = chunk.len();
                 let mut cursor = collection
                     .find(doc! { "namespace": namespace, "_id": { "$in": id_values } })
+                    .limit(i64::try_from(chunk_len).unwrap_or(i64::MAX))
+                    .batch_size(u32::try_from(chunk_len).unwrap_or(u32::MAX))
                     .session(&mut *session)
                     .await?;
                 while cursor.advance(&mut *session).await? {
@@ -6629,14 +6701,22 @@ mod inner {
                     .start_session()
                     .await
                     .map_err(|error| deployment_not_started(error.into()))?;
+                let callback_failed = Arc::new(AtomicBool::new(false));
                 session
                     .start_transaction()
                     .read_concern(ReadConcern::snapshot())
                     .write_concern(WriteConcern::majority())
                     .and_run(
-                        (self, id, precondition, replacement),
-                        |session, (this, id, precondition, replacement)| {
+                        (
+                            self,
+                            id,
+                            precondition,
+                            replacement,
+                            Arc::clone(&callback_failed),
+                        ),
+                        |session, (this, id, precondition, replacement, callback_failed)| {
                             Box::pin(async move {
+                                callback_failed.store(false, Ordering::Release);
                                 this.mutate_deployment_in_session(
                                     session,
                                     id,
@@ -6644,7 +6724,10 @@ mod inner {
                                     *replacement,
                                 )
                                 .await
-                                .map_err(anyhow_to_mongo_error_preserving_anyhow)
+                                .map_err(|error| {
+                                    callback_failed.store(true, Ordering::Release);
+                                    anyhow_to_mongo_error_preserving_anyhow(error)
+                                })
                             })
                         },
                     )
@@ -6671,9 +6754,13 @@ mod inner {
                             }
                             return anyhow::anyhow!("{inner:#}");
                         }
-                        // Callback failures are custom errors and abort the
-                        // transaction; only a commit can leave it uncertain.
-                        if mongo_error_outcome_is_uncertain(&error) {
+                        // Callback failures abort the transaction before
+                        // commit (even when raw driver errors are preserved
+                        // for `and_run` retries); only commit-phase errors can
+                        // leave the durable outcome uncertain.
+                        if !callback_failed.load(Ordering::Acquire)
+                            && mongo_error_outcome_is_uncertain(&error)
+                        {
                             return deployment_commit_unknown(error);
                         }
                         anyhow::Error::new(error)
@@ -10276,14 +10363,14 @@ mod inner {
         }
 
         async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
-            // Sort by `(namespace, sequence DESC)` before grouping with
-            // `$first` so MongoDB can satisfy the query from the
-            // `{ namespace: 1, sequence: 1 }` index (DISTINCT_SCAN) instead of
-            // scanning every retained change-log document.
+            // Sort by the exact reverse of `{ namespace: 1, sequence: 1 }`
+            // before grouping with `$first` so MongoDB can satisfy the query
+            // via an index-backed DISTINCT_SCAN instead of a full collection
+            // scan or blocking in-memory sort.
             let mut cursor = self
                 .config_changes()
                 .aggregate(vec![
-                    doc! { "$sort": { "namespace": 1, "sequence": -1 } },
+                    doc! { "$sort": { "namespace": -1, "sequence": -1 } },
                     doc! {
                         "$group": {
                             "_id": "$namespace",
@@ -10337,20 +10424,13 @@ mod inner {
                     after_sequence,
                 )
                 .await?;
-                // The driver streams in server-sized batches, so one bounded cursor
-                // replaces SQL's paging (issue #6058).
+                // Keyset-page `config_changes` in single-batch chunks
+                // (`limit == batch_size`) within the same snapshot transaction
+                // so multi-page polls never issue `getMore` (which AWS
+                // DocumentDB does not support inside transactions).
                 let max_rows = crate::config::db_backend::change_log_max_rows(namespace);
                 let config_changes_collection: Collection<Document> =
                     connection.db.collection("config_changes");
-                let mut cursor = config_changes_collection
-                    .find(doc! {
-                        "namespace": namespace,
-                        "sequence": { "$gt": after_sequence as i64 },
-                    })
-                    .sort(doc! { "sequence": 1 })
-                    .limit(i64::try_from(max_rows).unwrap_or(i64::MAX))
-                    .session(&mut session)
-                    .await?;
                 let mut sequence_cursor = after_sequence;
                 let mut proxy_ops = std::collections::HashMap::new();
                 let mut consumer_ops = std::collections::HashMap::new();
@@ -10358,38 +10438,59 @@ mod inner {
                 let mut upstream_ops = std::collections::HashMap::new();
                 let mut gateway_trust_bundle_changed = false;
                 let mut change_count = 0_usize;
-                while cursor.advance(&mut session).await? {
-                    change_count += 1;
-                    let doc = cursor.deserialize_current()?;
-                    // Fail closed on typed decode (issue #4286). Advancing
-                    // `sequence_cursor` before validating fields permanently skipped
-                    // malformed records, and `unwrap_or_default` turned a wrong-typed
-                    // or empty operation into an upsert. Abort the poll so the
-                    // existing full-reload fallback runs, matching SQL `try_get`.
-                    let change = decode_mongo_config_change_record(&doc)?;
-                    sequence_cursor = sequence_cursor.max(change.sequence);
-                    match change.resource_type.as_str() {
-                        "proxy" => {
-                            proxy_ops.insert(change.resource_id, change.operation);
-                        }
-                        "consumer" => {
-                            consumer_ops.insert(change.resource_id, change.operation);
-                        }
-                        "plugin_config" => {
-                            plugin_config_ops.insert(change.resource_id, change.operation);
-                        }
-                        "upstream" => {
-                            upstream_ops.insert(change.resource_id, change.operation);
-                        }
-                        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE => {
-                            gateway_trust_bundle_changed = true;
-                        }
-                        _ => {
-                            warn!("Ignoring config_changes row with unknown resource_type");
+                let mut page_after = after_sequence;
+                while change_count < max_rows {
+                    let page_limit = (max_rows - change_count)
+                        .min(MONGO_INCREMENTAL_CHANGES_PAGE_SIZE);
+                    let mut cursor = config_changes_collection
+                        .find(doc! {
+                            "namespace": namespace,
+                            "sequence": { "$gt": page_after as i64 },
+                        })
+                        .sort(doc! { "sequence": 1 })
+                        .limit(i64::try_from(page_limit).unwrap_or(i64::MAX))
+                        .batch_size(u32::try_from(page_limit).unwrap_or(u32::MAX))
+                        .session(&mut session)
+                        .await?;
+                    let mut page_rows = 0_usize;
+                    while cursor.advance(&mut session).await? {
+                        page_rows += 1;
+                        change_count += 1;
+                        let doc = cursor.deserialize_current()?;
+                        // Fail closed on typed decode (issue #4286). Advancing
+                        // `sequence_cursor` before validating fields permanently skipped
+                        // malformed records, and `unwrap_or_default` turned a wrong-typed
+                        // or empty operation into an upsert. Abort the poll so the
+                        // existing full-reload fallback runs, matching SQL `try_get`.
+                        let change = decode_mongo_config_change_record(&doc)?;
+                        sequence_cursor = sequence_cursor.max(change.sequence);
+                        match change.resource_type.as_str() {
+                            "proxy" => {
+                                proxy_ops.insert(change.resource_id, change.operation);
+                            }
+                            "consumer" => {
+                                consumer_ops.insert(change.resource_id, change.operation);
+                            }
+                            "plugin_config" => {
+                                plugin_config_ops.insert(change.resource_id, change.operation);
+                            }
+                            "upstream" => {
+                                upstream_ops.insert(change.resource_id, change.operation);
+                            }
+                            GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE => {
+                                gateway_trust_bundle_changed = true;
+                            }
+                            _ => {
+                                warn!("Ignoring config_changes row with unknown resource_type");
+                            }
                         }
                     }
+                    drop(cursor);
+                    if page_rows < page_limit || sequence_cursor <= page_after {
+                        break;
+                    }
+                    page_after = sequence_cursor;
                 }
-                drop(cursor);
                 self.ensure_change_cursor_available_in_session(
                     connection.as_ref(),
                     &mut session,
@@ -19595,7 +19696,7 @@ mod inner {
                 consumer_quarantine: Arc::new(
                     crate::config::db_backend::ConsumerQuarantineTracker::default(),
                 ),
-                change_log_compaction_watermarks: std::sync::Arc::new(DashMap::new()),
+                change_log_compaction_gates: std::sync::Arc::new(DashMap::new()),
             }
         }
 
@@ -20531,8 +20632,8 @@ pub use inner::{
 // stays module-private in `inner`.
 #[allow(unused_imports)] // The binary target has no `_test_support` consumer.
 pub(crate) use inner::{
-    MongoConfigChangeOp, MongoConfigChangeRecord, anyhow_to_mongo_error,
-    anyhow_to_mongo_error_preserving_anyhow, apply_mongo_timeout_overrides,
+    MongoChangeLogCompactionGate, MongoConfigChangeOp, MongoConfigChangeRecord,
+    anyhow_to_mongo_error, anyhow_to_mongo_error_preserving_anyhow, apply_mongo_timeout_overrides,
     consumer_identity_adoption_failure_release_values, decode_mongo_config_change_record,
     ordered_insert_newly_inserted_prefix,
 };

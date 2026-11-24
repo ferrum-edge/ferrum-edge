@@ -6969,6 +6969,26 @@ pub mod _test_support {
         crate::config::mongo_store::anyhow_to_mongo_error_preserving_anyhow(error)
     }
 
+    /// Test wrapper for `MongoChangeLogCompactionGate` per-namespace stride throttling.
+    #[derive(Default)]
+    pub struct MongoChangeLogCompactionGateForTest(
+        crate::config::mongo_store::MongoChangeLogCompactionGate,
+    );
+
+    impl MongoChangeLogCompactionGateForTest {
+        pub fn record_writes(&mut self, count: u64) {
+            self.0.record_writes(count);
+        }
+
+        pub fn should_check(&self, stride: u64) -> bool {
+            self.0.should_check(stride)
+        }
+
+        pub fn mark_checked(&mut self) {
+            self.0.mark_checked();
+        }
+    }
+
     /// Lazy Mongo store (no live MongoDB) for topology publication tests.
     pub fn mongo_store_new_unconnected_for_test(
         failover_urls: Vec<String>,
