@@ -318,9 +318,14 @@ pub fn classify_error_after_first_probe(error: StableFileError) -> StableFileErr
     }
 }
 
-fn read_snapshot(path: &Path, max_bytes: u64) -> Result<(FileIdentity, Vec<u8>), StableFileError> {
+fn read_snapshot(
+    path: &Path,
+    max_bytes: u64,
+    seen_path: &mut bool,
+) -> Result<(FileIdentity, Vec<u8>), StableFileError> {
     // The FIRST metadata probe is the only authoritative absence signal.
     let path_metadata_before = std::fs::metadata(path).map_err(map_io)?;
+    *seen_path = true;
     require_regular_file(&path_metadata_before)?;
     let path_identity_before = FileIdentity::from_metadata(&path_metadata_before);
 
@@ -371,10 +376,18 @@ pub(crate) fn read_stable_file_with_between_probes(
 ) -> Result<String, StableFileError> {
     let display_path = path.display();
     let mut last_reason = "unknown instability";
+    let mut seen_path = false;
 
     for attempt in 1..=options.max_attempts {
         match (|| -> Result<String, StableFileError> {
-            let (first_identity, first_bytes) = read_snapshot(path, options.max_bytes)?;
+            let (first_identity, first_bytes) =
+                read_snapshot(path, options.max_bytes, &mut seen_path).map_err(|err| {
+                    if seen_path {
+                        classify_error_after_first_probe(err)
+                    } else {
+                        err
+                    }
+                })?;
             // Consecutive probes must span the settle interval. Back-to-back
             // reads can both complete inside one torn publication window and
             // accept identical partial bytes as a "stable" generation. The
@@ -385,7 +398,8 @@ pub(crate) fn read_stable_file_with_between_probes(
             // The first probe already proved the path exists, so a second-probe
             // absence is a replacement window, not a terminal `NotFound`.
             let (second_identity, second_bytes) =
-                read_snapshot(path, options.max_bytes).map_err(classify_error_after_first_probe)?;
+                read_snapshot(path, options.max_bytes, &mut seen_path)
+                    .map_err(classify_error_after_first_probe)?;
             if second_identity != first_identity {
                 return Err(StableFileError::Unstable(
                     "file identity changed between consecutive stable-read probes",

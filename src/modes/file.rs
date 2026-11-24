@@ -745,7 +745,11 @@ pub async fn run(
             let mut sighup = sighup;
             loop {
                 tokio::select! {
-                    _ = sighup.recv() => {
+                    sig = sighup.recv() => {
+                        if sig.is_none() {
+                            warn!("SIGHUP signal stream closed; stopping reload listener");
+                            return;
+                        }
                         info!("SIGHUP received, reloading configuration...");
                         let loaded = file_loader::reload_config_from_file_off_thread(
                             config_path_owned.clone(),

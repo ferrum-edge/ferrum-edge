@@ -2518,8 +2518,10 @@ fn mongo_namespace_cascade_validates_split_identities_before_delete() {
 
     let delete_ids = mongo_method("delete_validated_namespace_ids_in_session(");
     assert!(
-        delete_ids.contains("\"$in\"") && delete_ids.contains("ids.to_vec()"),
-        "deletes must target already-validated `_id`s only:\n{delete_ids}"
+        delete_ids.contains("\"$in\"")
+            && delete_ids.contains("chunk.to_vec()")
+            && delete_ids.contains("ids.chunks(MONGO_ATOMIC_BATCH_CHUNK_SIZE)"),
+        "deletes must target already-validated `_id`s only in bounded chunks:\n{delete_ids}"
     );
     assert!(
         !delete_ids.contains("\"namespace\""),
@@ -2868,6 +2870,205 @@ fn unknown_resource_type_still_decodes_so_the_cursor_can_advance() {
         .expect("unknown resource_type is ignored after a successful typed decode");
     assert_eq!(change.sequence, 8);
     assert_eq!(change.resource_type, "api_spec");
+}
+
+#[test]
+fn anyhow_to_mongo_error_preserves_driver_errors_and_typed_conflicts() {
+    use ferrum_edge::_test_support::{
+        mongo_anyhow_to_error, mongo_anyhow_to_error_preserving_anyhow,
+    };
+    use ferrum_edge::config::db_backend::MtlsDnsIdentityConflict;
+    use mongodb::error::ErrorKind;
+
+    let write_conflict = mongo_command_error(112, "WriteConflict");
+    let wrapped = anyhow::Error::new(write_conflict).context("helper read failed");
+    let recovered = mongo_anyhow_to_error(wrapped);
+    assert!(
+        matches!(recovered.kind.as_ref(), ErrorKind::Command(cmd) if cmd.code == 112),
+        "underlying CommandError (and any attached transaction labels) must survive anyhow conversion: {recovered:?}"
+    );
+
+    let io_err: mongodb::error::Error = std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "connection reset mid-transaction",
+    )
+    .into();
+    let wrapped_preserving = anyhow::Error::new(io_err).context("session op failed");
+    let recovered_preserving = mongo_anyhow_to_error_preserving_anyhow(wrapped_preserving);
+    assert!(
+        matches!(recovered_preserving.kind.as_ref(), ErrorKind::Io(_)),
+        "underlying driver I/O error must survive anyhow conversion: {recovered_preserving:?}"
+    );
+
+    // Non-Mongo errors keep their display message for string matchers...
+    let plain = mongo_anyhow_to_error(anyhow::anyhow!("proxy route conflict"));
+    assert!(
+        plain.to_string().contains("proxy route conflict"),
+        "non-Mongo error message must remain visible: {plain}"
+    );
+
+    // ...and preserving variant retains typed application conflicts for downcasting.
+    let conflict = anyhow::Error::new(MtlsDnsIdentityConflict::new(vec![
+        "duplicate SAN".to_string(),
+    ]));
+    let preserved = mongo_anyhow_to_error_preserving_anyhow(conflict);
+    let inner = preserved
+        .get_custom::<anyhow::Error>()
+        .expect("typed conflict must remain wrapped in anyhow::Error");
+    assert!(
+        inner.chain().any(|e| e.is::<MtlsDnsIdentityConflict>()),
+        "MtlsDnsIdentityConflict must survive transaction callback boundary"
+    );
+}
+
+#[test]
+fn mongo_query_index_and_transaction_correctness_invariants() {
+    // 1. Consumers full load sorts by indexed `_id` instead of unindexed `id`.
+    let consumers_load = mongo_method("load_full_consumers_opt_session(");
+    assert!(
+        consumers_load.contains(r#".sort(doc! { "_id": 1 })"#)
+            && !consumers_load.contains(r#".sort(doc! { "id": 1 })"#),
+        "load_full_consumers_opt_session must sort by `_id` to use (namespace, _id) index"
+    );
+
+    // 2. Partial unique credential indexes use dotted paths, never $elemMatch.
+    let keyauth = mongo_method("check_keyauth_key_unique(");
+    assert!(
+        keyauth.contains(r#""credentials.keyauth.key": key"#) && !keyauth.contains("$elemMatch"),
+        "check_keyauth_key_unique must use dotted path to hit partial unique index"
+    );
+    let mtls = mongo_method("check_mtls_identity_unique(");
+    assert!(
+        mtls.contains(r#""credentials.mtls_auth.identity": identity"#)
+            && !mtls.contains("$elemMatch"),
+        "check_mtls_identity_unique must use dotted path to hit partial unique index"
+    );
+
+    // 3. Global change sequence sorts exact reverse of `(namespace: 1, sequence: 1)` + $first.
+    let global_seq = mongo_method("latest_global_change_sequence(");
+    assert!(
+        global_seq.contains(r#""$sort": { "namespace": -1, "sequence": -1 }"#)
+            && global_seq.contains(r#""$first": "$sequence""#),
+        "latest_global_change_sequence must sort in exact reverse of (namespace, sequence) index"
+    );
+
+    // 4. Orphan upstream cleanup scopes proxy count by namespace and respects api_spec_id.
+    let cleanup_orphan = mongo_method("cleanup_orphaned_upstream(");
+    assert!(
+        cleanup_orphan.contains(r#"doc.get_str("api_spec_id").is_ok()"#)
+            && cleanup_orphan.contains(r#""namespace": namespace.as_str()"#),
+        "cleanup_orphaned_upstream must guard api_spec_id and filter proxies by namespace"
+    );
+
+    // 5. Spec submit/replace and batch proxy writes enforce in-session admission guards.
+    for method in ["submit_api_spec_bundle(", "replace_api_spec_bundle("] {
+        let body = mongo_method(method);
+        assert!(
+            body.contains("ensure_proxy_admission_guards_in_session"),
+            "{method} must enforce in-session route and upstream guards"
+        );
+    }
+    for method in [
+        "batch_create_proxies_without_plugins(",
+        "write_atomic_batch_graph_in_session(",
+    ] {
+        let body = mongo_method(method);
+        assert!(
+            body.contains("ensure_batch_proxy_admission_guards_in_session"),
+            "{method} must enforce in-session batch route and upstream guards"
+        );
+    }
+
+    // 6. restore_api_spec_bundle clones upsert_changes per retry attempt.
+    let restore = mongo_method("restore_api_spec_bundle(");
+    let restore_callback = &restore[restore
+        .find(".and_run(")
+        .expect("restore_api_spec_bundle transaction callback")..];
+    assert!(
+        restore_callback.contains("let mut attempt_changes = upsert_changes.clone();")
+            && !restore_callback.contains("upsert_changes.push("),
+        "restore_api_spec_bundle must not mutate shared upsert_changes across and_run retries"
+    );
+
+    // 7. update_gateway_trust_bundle aborts tx on lost CAS instead of committing phantom change.
+    let update_trust = mongo_method("update_gateway_trust_bundle(");
+    assert!(
+        update_trust.contains("GatewayTrustBundleCasMiss"),
+        "update_gateway_trust_bundle must abort on lost CAS to roll back phantom config_changes"
+    );
+
+    // 8. Namespace guard cleanup also removes upstream_ref_guards.
+    let guards = mongo_method("delete_namespace_guard_docs_in_session(");
+    assert!(
+        guards.contains("upstream_ref_guards()"),
+        "delete_namespace_guard_docs_in_session must also clean up upstream_ref_guards"
+    );
+
+    // 9. load_incremental_config runs inside a snapshot transaction with
+    //    single-batch keyset paging (DocumentDB-safe, no getMore) and loads
+    //    consumers before proxies.
+    let inc = mongo_method("load_incremental_config(");
+    let snap = inc
+        .find("ReadConcern::snapshot()")
+        .expect("load_incremental_config must use ReadConcern::snapshot()");
+    let consumers_pos = inc
+        .find(r#"connection.db.collection("consumers")"#)
+        .expect("load_incremental_config consumer load");
+    let proxies_pos = inc
+        .find(r#"connection.db.collection("proxies")"#)
+        .expect("load_incremental_config proxy load");
+    assert!(
+        snap < consumers_pos && consumers_pos < proxies_pos,
+        "load_incremental_config must snapshot-read consumers before proxies"
+    );
+    assert!(
+        inc.contains("MONGO_INCREMENTAL_CHANGES_PAGE_SIZE")
+            && inc.contains(".batch_size(")
+            && inc.contains("page_after = sequence_cursor"),
+        "load_incremental_config must keyset-page config_changes in single batches"
+    );
+    let point_load = mongo_method("load_change_ids_in_session(");
+    assert!(
+        point_load.contains(".find_one(")
+            && point_load.contains(".session(")
+            && !point_load.contains("cursor.advance"),
+        "load_change_ids_in_session must use single-document find_one inside the session so multi-MiB documents never open a transactional getMore cursor"
+    );
+
+    // 10. mutate_deployment only classifies commit-phase errors as uncertain.
+    let mutate_dep = mongo_method("mutate_deployment(");
+    assert!(
+        mutate_dep.contains("!callback_failed.load(Ordering::Acquire)")
+            && mutate_dep.contains("callback_failed.store(true, Ordering::Release)"),
+        "mutate_deployment must not classify aborted callback errors as commit-outcome-unknown"
+    );
+}
+
+#[test]
+fn mongo_compaction_gate_throttles_by_namespace_local_writes_and_batches() {
+    use ferrum_edge::_test_support::MongoChangeLogCompactionGateForTest;
+
+    let mut ns_quiet = MongoChangeLogCompactionGateForTest::default();
+    let mut ns_busy = MongoChangeLogCompactionGateForTest::default();
+
+    // First call after startup always checks once.
+    assert!(ns_quiet.should_check(1_024));
+    ns_quiet.mark_checked();
+    assert!(!ns_quiet.should_check(1_024));
+
+    // Heavy writes to a sibling namespace never bypass ns_quiet's throttle.
+    ns_busy.record_writes(50_000);
+    assert!(ns_busy.should_check(1_024));
+    ns_quiet.record_writes(1);
+    assert!(!ns_quiet.should_check(1_024));
+
+    // Multi-row batches accumulate until crossing the stride, then reset.
+    ns_quiet.record_writes(1_000);
+    assert!(!ns_quiet.should_check(1_024));
+    ns_quiet.record_writes(23);
+    assert!(ns_quiet.should_check(1_024));
+    ns_quiet.mark_checked();
+    assert!(!ns_quiet.should_check(1_024));
 }
 
 #[test]
