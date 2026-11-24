@@ -5797,15 +5797,22 @@ mod inner {
             }
 
             // 1. Verify no two HTTP proxies in the same batch collide on
-            //    (namespace, listen_path) with overlapping hosts.
-            let mut seen_routes: std::collections::HashMap<(&str, Option<&str>), Vec<&[String]>> =
+            //    (namespace, listen_port, listen_path) with overlapping hosts,
+            //    the same port-scoped rule `check_listen_path_unique_in_session`
+            //    applies against persisted proxies.
+            type BatchRouteKey<'a> = (&'a str, Option<u16>, Option<&'a str>);
+            let mut seen_routes: std::collections::HashMap<BatchRouteKey<'_>, Vec<&[String]>> =
                 std::collections::HashMap::new();
             let mut route_buckets: Vec<(&str, Option<&str>)> = Vec::new();
             let mut upstream_refs: Vec<(&str, &str)> = Vec::new();
 
             for guard in guards {
                 if !guard.is_stream {
-                    let key = (guard.namespace.as_str(), guard.listen_path.as_deref());
+                    let key = (
+                        guard.namespace.as_str(),
+                        guard.listen_port,
+                        guard.listen_path.as_deref(),
+                    );
                     let entry = seen_routes.entry(key).or_default();
                     if entry.iter().any(|existing_hosts| {
                         crate::config::types::hosts_overlap(&guard.hosts, existing_hosts)
@@ -5815,7 +5822,7 @@ mod inner {
                         ));
                     }
                     entry.push(guard.hosts.as_slice());
-                    route_buckets.push(key);
+                    route_buckets.push((guard.namespace.as_str(), guard.listen_path.as_deref()));
                 }
                 if let Some(upstream_id) = guard.upstream_id.as_deref() {
                     upstream_refs.push((guard.namespace.as_str(), upstream_id));
@@ -5838,6 +5845,7 @@ mod inner {
                     .check_listen_path_unique_in_session(
                         &mut *session,
                         &guard.namespace,
+                        guard.listen_port,
                         guard.listen_path.as_deref(),
                         &guard.hosts,
                         None,
