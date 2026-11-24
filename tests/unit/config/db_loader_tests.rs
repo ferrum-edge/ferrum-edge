@@ -4155,6 +4155,7 @@ async fn check_listen_path_unique_rejects_catch_all_and_isolates_namespaces() {
         !store
             .check_listen_path_unique(
                 "ferrum",
+                same_path_other_hosts.listen_port,
                 same_path_other_hosts.listen_path.as_deref(),
                 &same_path_other_hosts.hosts,
                 None,
@@ -4169,6 +4170,7 @@ async fn check_listen_path_unique_rejects_catch_all_and_isolates_namespaces() {
         store
             .check_listen_path_unique(
                 "tenant-b",
+                other_namespace.listen_port,
                 other_namespace.listen_path.as_deref(),
                 &other_namespace.hosts,
                 None,
@@ -4186,6 +4188,7 @@ async fn check_listen_path_unique_rejects_catch_all_and_isolates_namespaces() {
         store
             .check_listen_path_unique(
                 "ferrum",
+                path_carrying.listen_port,
                 path_carrying.listen_path.as_deref(),
                 &path_carrying.hosts,
                 None,
@@ -4194,6 +4197,144 @@ async fn check_listen_path_unique_rejects_catch_all_and_isolates_namespaces() {
             .unwrap(),
         "host-only and path-carrying proxies on the same host occupy different match tiers"
     );
+
+    // Distinct listen_port values (including port-agnostic None vs Some(port))
+    // must not collide on the same (namespace, listen_path, hosts).
+    let mut port_8080 = http_route_proxy("p-8080", "ferrum", Some("/svc/1"), &["api.example.com"]);
+    port_8080.listen_port = Some(8080);
+    assert!(
+        store
+            .check_listen_path_unique(
+                "ferrum",
+                port_8080.listen_port,
+                port_8080.listen_path.as_deref(),
+                &port_8080.hosts,
+                None,
+            )
+            .await
+            .unwrap(),
+        "port-scoped HTTP proxy must not collide with port-agnostic proxy on same path"
+    );
+    store.create_proxy(&port_8080).await.unwrap();
+
+    let mut port_8443 = http_route_proxy("p-8443", "ferrum", Some("/svc/1"), &["api.example.com"]);
+    port_8443.listen_port = Some(8443);
+    assert!(
+        store
+            .check_listen_path_unique(
+                "ferrum",
+                port_8443.listen_port,
+                port_8443.listen_path.as_deref(),
+                &port_8443.hosts,
+                None,
+            )
+            .await
+            .unwrap(),
+        "distinct listen_port HTTP proxies on the same path and host must not collide"
+    );
+    store.create_proxy(&port_8443).await.unwrap();
+
+    let mut port_8080_dup =
+        http_route_proxy("p-8080-dup", "ferrum", Some("/svc/1"), &["api.example.com"]);
+    port_8080_dup.listen_port = Some(8080);
+    assert!(
+        !store
+            .check_listen_path_unique(
+                "ferrum",
+                port_8080_dup.listen_port,
+                port_8080_dup.listen_path.as_deref(),
+                &port_8080_dup.hosts,
+                None,
+            )
+            .await
+            .unwrap(),
+        "same listen_port + listen_path + host must still conflict"
+    );
+    assert!(
+        store.create_proxy(&port_8080_dup).await.is_err(),
+        "transactional create_proxy must reject duplicate on the same listen_port"
+    );
+}
+
+#[tokio::test]
+async fn udp_max_response_amplification_factor_round_trips() {
+    let (store, _tmp) = sqlite_uniqueness_store().await;
+    let mut proxy = http_route_proxy("udp-amp-proxy", "ferrum", None, &[]);
+    proxy.backend_scheme = Some(ferrum_edge::config::types::BackendScheme::Udp);
+    proxy.listen_port = Some(19001);
+    proxy.udp_max_response_amplification_factor = Some(2.5);
+    store.create_proxy(&proxy).await.unwrap();
+
+    let fetched = store
+        .get_proxy("ferrum", "udp-amp-proxy")
+        .await
+        .unwrap()
+        .expect("proxy present");
+    assert_eq!(fetched.udp_max_response_amplification_factor, Some(2.5));
+
+    let full = store.load_full_config("ferrum").await.unwrap();
+    let full_proxy = full
+        .proxies
+        .iter()
+        .find(|p| p.id == "udp-amp-proxy")
+        .expect("proxy in full load");
+    assert_eq!(full_proxy.udp_max_response_amplification_factor, Some(2.5));
+}
+
+#[tokio::test]
+async fn batch_attach_proxy_plugins_preserves_same_ids_across_namespaces() {
+    let (store, _tmp) = sqlite_uniqueness_store().await;
+    let mut p_a = http_route_proxy("shared-proxy", "tenant-a", Some("/a"), &[]);
+    let mut p_b = http_route_proxy("shared-proxy", "tenant-b", Some("/b"), &[]);
+    store.create_proxy(&p_a).await.unwrap();
+    store.create_proxy(&p_b).await.unwrap();
+
+    let now = chrono::Utc::now();
+    let pc_a = PluginConfig {
+        labels: Default::default(),
+        id: "shared-plugin".to_string(),
+        plugin_name: "cors".to_string(),
+        namespace: "tenant-a".to_string(),
+        config: json!({}),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("shared-proxy".to_string()),
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let mut pc_b = pc_a.clone();
+    pc_b.namespace = "tenant-b".to_string();
+    store.create_plugin_config(&pc_a).await.unwrap();
+    store.create_plugin_config(&pc_b).await.unwrap();
+
+    let assoc = ferrum_edge::config::types::PluginAssociation {
+        plugin_config_id: "shared-plugin".to_string(),
+    };
+    p_a.plugins = vec![assoc.clone()];
+    p_b.plugins = vec![assoc];
+    store
+        .batch_attach_proxy_plugins(
+            &[p_a, p_b],
+            &ferrum_edge::config::db_backend::BatchConfigWriteMode::Admission,
+        )
+        .await
+        .unwrap();
+
+    let loaded_a = store
+        .get_proxy("tenant-a", "shared-proxy")
+        .await
+        .unwrap()
+        .unwrap();
+    let loaded_b = store
+        .get_proxy("tenant-b", "shared-proxy")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded_a.plugins.len(), 1);
+    assert_eq!(loaded_b.plugins.len(), 1);
 }
 
 #[tokio::test]
@@ -4369,6 +4510,146 @@ async fn row_decode_diagnostics_withhold_ids_in_outer_and_inner_reasons() {
         assert!(rendered.contains(column), "{table}: {rendered}");
         assert!(!rendered.contains(token), "{table}: {rendered}");
     }
+}
+
+#[tokio::test]
+async fn compact_config_changes_fires_on_per_namespace_counter_for_odd_sequences_and_batches() {
+    use sqlx::Row;
+
+    let directory = tempfile::TempDir::new().unwrap();
+    let db_url = format!(
+        "sqlite:{}?mode=rwc",
+        directory.path().join("compact.db").display()
+    );
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    // Alternate single writes across two namespaces so `ns-odd` only ever
+    // receives odd global sequences (1, 3, ..., 19). A global modulo gate
+    // (`sequence % STRIDE == 0`) would never fire for `ns-odd`.
+    for i in 0..10 {
+        let mut odd = make_upstream(&format!("odd-{i}"));
+        odd.namespace = "ns-odd".to_string();
+        odd.name = Some(format!("odd-{i}"));
+        store.create_upstream(&odd).await.unwrap();
+
+        let mut even = make_upstream(&format!("even-{i}"));
+        even.namespace = "ns-even".to_string();
+        even.name = Some(format!("even-{i}"));
+        store.create_upstream(&even).await.unwrap();
+    }
+
+    store
+        .compact_config_changes_with_limits_for_test("ns-odd", 4, 4)
+        .await
+        .unwrap();
+
+    let odd_count: i64 =
+        sqlx::query("SELECT COUNT(*) AS cnt FROM config_changes WHERE namespace = 'ns-odd'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap()
+            .try_get("cnt")
+            .unwrap();
+    let even_count: i64 =
+        sqlx::query("SELECT COUNT(*) AS cnt FROM config_changes WHERE namespace = 'ns-even'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap()
+            .try_get("cnt")
+            .unwrap();
+    let odd_counter: i64 = sqlx::query(
+        "SELECT changes_since_compaction FROM config_change_locks WHERE lock_name = 'ns-odd'",
+    )
+    .fetch_one(&store.pool())
+    .await
+    .unwrap()
+    .try_get("changes_since_compaction")
+    .unwrap();
+    assert_eq!(
+        odd_count, 4,
+        "ns-odd must retain exactly 4 rows after compaction"
+    );
+    assert_eq!(
+        even_count, 10,
+        "ns-even rows must never be evicted by ns-odd"
+    );
+    assert_eq!(
+        odd_counter, 0,
+        "compaction must reset the per-namespace counter"
+    );
+
+    // Two more writes remain below stride=4: compaction must defer.
+    for i in 10..12 {
+        let mut odd = make_upstream(&format!("odd-{i}"));
+        odd.namespace = "ns-odd".to_string();
+        odd.name = Some(format!("odd-{i}"));
+        store.create_upstream(&odd).await.unwrap();
+    }
+    store
+        .compact_config_changes_with_limits_for_test("ns-odd", 4, 4)
+        .await
+        .unwrap();
+    let deferred_count: i64 =
+        sqlx::query("SELECT COUNT(*) AS cnt FROM config_changes WHERE namespace = 'ns-odd'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap()
+            .try_get("cnt")
+            .unwrap();
+    assert_eq!(
+        deferred_count, 6,
+        "compaction must defer while changes_since_compaction < stride"
+    );
+
+    // A multi-row batch crossing stride=4 triggers compaction cleanly.
+    let batch: Vec<Upstream> = (12..17)
+        .map(|i| {
+            let mut u = make_upstream(&format!("odd-{i}"));
+            u.namespace = "ns-odd".to_string();
+            u.name = Some(format!("odd-{i}"));
+            u
+        })
+        .collect();
+    store
+        .batch_create_upstreams(&batch, &BatchConfigWriteMode::Admission)
+        .await
+        .unwrap();
+    store
+        .compact_config_changes_with_limits_for_test("ns-odd", 4, 4)
+        .await
+        .unwrap();
+    let after_batch_count: i64 =
+        sqlx::query("SELECT COUNT(*) AS cnt FROM config_changes WHERE namespace = 'ns-odd'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap()
+            .try_get("cnt")
+            .unwrap();
+    assert_eq!(
+        after_batch_count, 4,
+        "multi-row batch crossing stride must compact back down to retained count"
+    );
+}
+
+#[test]
+fn mongo_standalone_route_bucket_candidates_scope_by_listen_port() {
+    let source = include_str!("../../../src/config/mongo_store.rs");
+    let start = source
+        .find("async fn listen_path_bucket_candidates(")
+        .expect("listen_path_bucket_candidates must exist");
+    let tail = &source[start..];
+    let end = tail
+        .find("\n        async fn ")
+        .expect("listen_path_bucket_candidates followed by another method");
+    let body = &tail[..end];
+    assert!(
+        body.contains("listen_port: Option<u16>")
+            && body.contains("i32::from(port)")
+            && body.contains("Bson::Null"),
+        "standalone Mongo bucket lookup must scope by listen_port:\n{body}"
+    );
 }
 
 /// Overwrite the stored core V001 checksum in a migrated SQLite file and

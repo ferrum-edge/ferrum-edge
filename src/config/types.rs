@@ -3894,6 +3894,13 @@ pub struct GatewayConfig {
     /// controller. Nothing on the request path reads it.
     #[serde(skip)]
     pub k8s_mesh_overlay: K8sMeshOverlay,
+    /// Process-local MMDB validation generation ID committed for this candidate
+    /// config, if any. Lets rejection / no-op / topology-fence cleanup discard
+    /// only *this* candidate's unclaimed handoff without disturbing a newer
+    /// concurrent candidate's generation.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub validated_country_mmdb_generation: Option<u64>,
 }
 
 /// Whether a Kubernetes config source claims authority over mesh state, and —
@@ -7648,7 +7655,7 @@ impl CountryMmdbValidationGeneration {
         })
     }
 
-    fn id(&self) -> u64 {
+    pub(crate) fn id(&self) -> u64 {
         self.id
     }
 
@@ -7669,6 +7676,21 @@ impl Drop for CountryMmdbValidationGeneration {
         }
         let mut cache = lock_country_mmdb_cache_recovering_poison(country_mmdb_snapshot_cache());
         cache.abort_validation_generation(self.id);
+    }
+}
+
+/// Discard a specific committed-but-unclaimed MMDB validation handoff when its
+/// candidate config is rejected, unchanged, or fenced out before plugin-cache
+/// staging can consume it. Scoped strictly to `generation` so a rejected
+/// candidate can never delete a newer concurrent candidate's handoff.
+pub(crate) fn discard_unclaimed_country_mmdb_validation_handoff(generation: Option<u64>) {
+    let Some(generation) = generation else {
+        return;
+    };
+    let mut cache = lock_country_mmdb_cache_recovering_poison(country_mmdb_snapshot_cache());
+    if cache.accepted_validation_generation == Some(generation) {
+        cache.accepted_validation_generation = None;
+        cache.validation_handoffs.remove(&generation);
     }
 }
 

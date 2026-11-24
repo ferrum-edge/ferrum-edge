@@ -610,4 +610,33 @@ mod unix_targets {
             "growth past the streaming ceiling must fail closed"
         );
     }
+
+    #[test]
+    fn transient_not_found_on_retry_probe_one_stays_unstable_instead_of_terminal_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ephemeral.conf");
+        std::fs::write(&path, "FERRUM_LOG_LEVEL=info\n").unwrap();
+
+        let mut options = opts(4096);
+        options.max_attempts = 3;
+        options.retry_delay = Duration::from_millis(5);
+
+        let path_clone = path.clone();
+        let err = ferrum_edge::_test_support::read_stable_file_with_between_probes_for_test(
+            &path,
+            options,
+            move |_| {
+                // Remove after Attempt 1 Probe 1 so Attempt 1 Probe 2 and
+                // Attempt 2 Probe 1 both observe NotFound after the path was
+                // already seen to exist.
+                let _ = std::fs::remove_file(&path_clone);
+            },
+        )
+        .expect_err("removed file must fail closed");
+
+        assert!(
+            matches!(err, StableFileError::Unstable(_)),
+            "once seen, transient NotFound on subsequent attempt Probe 1 must remain Unstable, got: {err:?}"
+        );
+    }
 }

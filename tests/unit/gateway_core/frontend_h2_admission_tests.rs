@@ -112,6 +112,7 @@ impl ProxyHarness {
             node_waypoint_udp_steer_destinations: Vec::new(),
             node_waypoint_udp_destination_routes: Vec::new(),
             k8s_mesh_overlay: Default::default(),
+            validated_country_mmdb_generation: None,
             gateway_trust_bundles: Vec::new(),
         };
         let state = ProxyState::new(config, DnsCache::new(DnsConfig::default()), env, None, None)

@@ -572,9 +572,11 @@ fn control_plane_poll_tick_records_on_every_normal_exit_without_async_wrapper() 
     // (#2983/#2984) for a delta whose namespaces all rejected. It still records
     // completion, which `assert_every_continue_records_completion` above proves.
     // The "partitioned to no attributable namespace" exit was unreachable and
-    // is gone (#7252).
+    // is gone (#7252). Two redundant end-of-tick failover migration-gate
+    // continues were unified into `attempt_cp_failover_full_reload`, which
+    // falls straight through to the end-of-tick `record_poll_completed()`.
     assert_eq!(
-        continue_count, 12,
+        continue_count, 10,
         "control-plane poll tick handled-continue exit count drifted"
     );
     let record_count = tick.matches("record_poll_completed()").count();
@@ -672,10 +674,11 @@ fn database_poll_respawn_delay_remains_one_second() {
 /// `ferrum_database_config_source_connected` and
 /// `ferrum_database_poll_failures_total` cannot drift apart.
 ///
-/// The two remaining bare `store(false)` calls in the control-plane tick are
-/// deliberate and are NOT failures: both follow a *successful* pool reconnect
-/// and mark "a full reload is pending" for one cycle. Counting them would
-/// report a poll failure every time database DNS changes.
+/// The remaining bare `store(false)` in the control-plane tick (plus the
+/// matching one inside `attempt_cp_failover_full_reload`) are deliberate and
+/// are NOT failures: both follow a *successful* pool reconnect and mark
+/// "a full reload is pending" for one cycle. Counting them would report a
+/// poll failure every time database DNS changes or failover succeeds.
 #[test]
 fn poll_loop_availability_writes_go_through_the_counting_helper() {
     for (label, source, wake_marker, shutdown_marker, expected_bare_stores) in [
@@ -691,7 +694,7 @@ fn poll_loop_availability_writes_go_through_the_counting_helper() {
             include_str!("../../../src/modes/control_plane.rs"),
             "_ = interval.tick() => {",
             "_ = cp_poll_shutdown.changed() => {",
-            2usize,
+            1usize,
         ),
     ] {
         let tick = poll_attempt_body(source, wake_marker, shutdown_marker);
@@ -710,6 +713,21 @@ fn poll_loop_availability_writes_go_through_the_counting_helper() {
             "{label}: poll tick must count classified poll failures"
         );
     }
+
+    // Verify CP failover helper arms `force_full_reload` on reconnect and only
+    // clears it when every namespace refreshed cleanly.
+    let cp_source = include_str!("../../../src/modes/control_plane.rs");
+    let helper_start = cp_source
+        .find("async fn attempt_cp_failover_full_reload(")
+        .expect("attempt_cp_failover_full_reload");
+    let helper_body = &cp_source[helper_start..helper_start + 3500];
+    assert!(
+        helper_body.contains("*force_full_reload = Some(FullReloadReason::DatabaseFailover);")
+            && helper_body.contains("cp_full_reload_covers_all_namespaces(")
+            && helper_body
+                .contains("if complete {\n                        *force_full_reload = None;"),
+        "CP failover helper must keep force_full_reload armed until every namespace refreshes cleanly"
+    );
 }
 
 /// The shared flag is the whole point: the metrics struct must hold the SAME

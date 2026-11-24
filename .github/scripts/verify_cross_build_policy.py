@@ -29926,7 +29926,9 @@ class GitUpstreamActionResolver:
             return self._tags[repository]
         environment = self._environment(repository)
         listing: str | None = None
-        with tempfile.TemporaryDirectory(prefix="ferrum-action-tags-") as scratch:
+        with tempfile.TemporaryDirectory(
+            prefix="ferrum-action-tags-", ignore_cleanup_errors=True
+        ) as scratch:
             for _attempt in range(self.ATTEMPTS):
                 try:
                     result = subprocess.run(
@@ -29978,7 +29980,17 @@ class GitUpstreamActionResolver:
         if UPSTREAM_RELEASE_TAG.fullmatch(descendant_tag) is None:
             return None
         environment = self._environment(repository, descendant_tag)
-        with tempfile.TemporaryDirectory(prefix="ferrum-action-pin-") as scratch:
+        # `git fetch` normally ends by starting a detached
+        # `git maintenance run --auto`, which writes a commit graph into
+        # `objects/` after the fetch has returned. If that write lands while
+        # this scratch repository is being removed, the removal raises
+        # `OSError: Directory not empty` out of the policy check (seen with
+        # git 2.56 on ubuntu-26.04 for the github/codeql-action history).
+        # The fetch below skips auto maintenance, and a scratch-cleanup
+        # failure never decides the verdict.
+        with tempfile.TemporaryDirectory(
+            prefix="ferrum-action-pin-", ignore_cleanup_errors=True
+        ) as scratch:
             try:
                 initialized = subprocess.run(
                     ["git", "init", "--quiet", "--bare", "."],
@@ -29999,6 +30011,7 @@ class GitUpstreamActionResolver:
                             "fetch",
                             "--quiet",
                             "--no-tags",
+                            "--no-auto-maintenance",
                             "--filter=tree:0",
                             "upstream",
                         ],

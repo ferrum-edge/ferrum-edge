@@ -4001,6 +4001,7 @@ mod tests {
             node_waypoint_udp_steer_destinations: Vec::new(),
             node_waypoint_udp_destination_routes: Vec::new(),
             k8s_mesh_overlay: Default::default(),
+            validated_country_mmdb_generation: None,
             gateway_trust_bundles: Vec::new(),
         };
 
@@ -4048,6 +4049,7 @@ mod tests {
             node_waypoint_udp_steer_destinations: Vec::new(),
             node_waypoint_udp_destination_routes: Vec::new(),
             k8s_mesh_overlay: Default::default(),
+            validated_country_mmdb_generation: None,
             gateway_trust_bundles: Vec::new(),
         };
 
@@ -4087,6 +4089,7 @@ mod tests {
             node_waypoint_udp_steer_destinations: Vec::new(),
             node_waypoint_udp_destination_routes: Vec::new(),
             k8s_mesh_overlay: Default::default(),
+            validated_country_mmdb_generation: None,
             gateway_trust_bundles: Vec::new(),
         };
         assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);

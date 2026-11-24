@@ -302,3 +302,33 @@ fn test_plan_file_rejects_unreachable_version_like_real_migration() {
         assert_eq!(backup_count, 0);
     }
 }
+
+#[test]
+fn test_detect_and_plan_accept_integer_version_and_reject_duplicate_json_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml_path = dir.path().join("int_version.yaml");
+    std::fs::write(
+        &yaml_path,
+        "version: 1\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+    )
+    .unwrap();
+    assert_eq!(
+        ConfigMigrator::detect_version(yaml_path.to_str().unwrap()).unwrap(),
+        CURRENT_CONFIG_VERSION
+    );
+    let plan = ConfigMigrator::plan_file(yaml_path.to_str().unwrap()).unwrap();
+    assert_eq!(plan.migrations_applied, 0);
+
+    let dup_json_path = dir.path().join("dup.json");
+    std::fs::write(
+        &dup_json_path,
+        r#"{"version":"1","proxies":[],"proxies":[]}"#,
+    )
+    .unwrap();
+    let err = ConfigMigrator::detect_version(dup_json_path.to_str().unwrap())
+        .expect_err("duplicate JSON keys must fail closed");
+    assert!(
+        err.to_string().contains("JSON configuration rejected"),
+        "expected duplicate-key rejection, got: {err}"
+    );
+}
