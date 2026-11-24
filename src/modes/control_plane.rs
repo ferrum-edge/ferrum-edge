@@ -1197,9 +1197,13 @@ async fn load_full_config_multi_with_sequence(
         && outcome.rejected_namespaces.is_empty()
         && !outcome.failed_namespaces.is_empty()
     {
-        if !load_namespaces.is_empty() {
-            forget_consumer_quarantine_states(db, &load_namespaces);
-        }
+        // When `load_namespaces` was non-empty, `load_full_config_multi` either
+        // refreshed/rejected at least one namespace or already returned `Err`
+        // (forgetting quarantine states via `inspect_err` above).
+        debug_assert!(
+            load_namespaces.is_empty(),
+            "all-failed Ok outcome is only reachable when every boundary lookup failed"
+        );
         anyhow::bail!(
             "CP full reload failed for all {} namespace(s); retaining prior snapshot and cursors",
             outcome.failed_namespaces.len()
@@ -1237,6 +1241,7 @@ pub struct CpFullLoadSequenceOutcomeForTest {
     pub sequences: HashMap<String, u64>,
     pub refreshed_namespaces: Vec<String>,
     pub failed_namespaces: Vec<String>,
+    pub covers_all_namespaces: bool,
 }
 
 /// Exercise the production full-load boundary orchestration from external
@@ -1263,11 +1268,16 @@ pub async fn load_full_config_multi_with_sequence_for_test(
         mesh_sequence_floor,
     )
     .await?;
+    let covers_all_namespaces = cp_full_reload_covers_all_namespaces(
+        &outcome.rejected_namespaces,
+        &outcome.failed_namespaces,
+    );
     Ok(CpFullLoadSequenceOutcomeForTest {
         config: outcome.config,
         sequences,
         refreshed_namespaces: outcome.refreshed_namespaces,
         failed_namespaces: outcome.failed_namespaces,
+        covers_all_namespaces,
     })
 }
 
@@ -1517,9 +1527,25 @@ fn trust_publication_scope(
     }
 }
 
+/// Whether a CP full reload refreshed every namespace cleanly so a pending
+/// `force_full_reload` after a reconnect/failover may be cleared.
+///
+/// A partial reload leaves failed or rejected namespaces on their pre-reconnect
+/// cursors, which may exceed a replacement database's sequence space. Keeping
+/// `force_full_reload = true` ensures subsequent ticks keep retrying a full
+/// reload until every namespace holds an accepted snapshot and cursor from the
+/// active topology.
+pub(crate) fn cp_full_reload_covers_all_namespaces(
+    rejected_namespaces: &[(String, String)],
+    failed_namespaces: &[String],
+) -> bool {
+    rejected_namespaces.is_empty() && failed_namespaces.is_empty()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CpFailoverFullReloadOutcome {
-    Recovered,
+    RecoveredComplete,
+    RecoveredPartial,
     MigrationGateBlocked,
     ValidationRejected,
     ConnectivityUnavailable,
@@ -1537,6 +1563,7 @@ async fn attempt_cp_failover_full_reload(
     config_rejected_poll: &Arc<AtomicBool>,
     poll_auto_apply_plugin_migrations: bool,
     plugin_migrations_need_reconcile: &mut bool,
+    force_full_reload: &mut bool,
     last_polled_namespaces: &mut Vec<String>,
     last_change_sequences: &mut HashMap<String, u64>,
     rejected_delta_tracker: &mut CpRejectedDeltaTracker,
@@ -1552,6 +1579,11 @@ async fn attempt_cp_failover_full_reload(
 ) -> CpFailoverFullReloadOutcome {
     match db_poll.try_failover_reconnect(db_url_for_reconnect).await {
         Ok(_url) => {
+            // A replacement pool is now active: force full reload until every
+            // namespace has an accepted snapshot and sequence cursor from this
+            // topology, so no namespace can poll incrementally using a stale
+            // cursor from the replaced database.
+            *force_full_reload = true;
             *plugin_migrations_need_reconcile = true;
             db_available_poll.store(false, Ordering::Relaxed);
             match load_full_config_multi_with_sequence(
@@ -1576,6 +1608,11 @@ async fn attempt_cp_failover_full_reload(
                     {
                         return CpFailoverFullReloadOutcome::MigrationGateBlocked;
                     }
+                    let complete = cp_full_reload_covers_all_namespaces(
+                        &outcome.rejected_namespaces,
+                        &outcome.failed_namespaces,
+                    );
+                    *force_full_reload = !complete;
                     db_available_poll.store(true, Ordering::Relaxed);
                     *last_polled_namespaces = nslist.to_vec();
                     merge_refreshed_change_sequences(last_change_sequences, sequences);
@@ -1609,7 +1646,11 @@ async fn attempt_cp_failover_full_reload(
                     info!(
                         "Configuration reloaded from database (failover) and pushed to DPs and mesh nodes"
                     );
-                    CpFailoverFullReloadOutcome::Recovered
+                    if complete {
+                        CpFailoverFullReloadOutcome::RecoveredComplete
+                    } else {
+                        CpFailoverFullReloadOutcome::RecoveredPartial
+                    }
                 }
                 Err(e3) => {
                     if crate::modes::is_poll_validation_rejection(&e3) {
@@ -3465,7 +3506,10 @@ pub async fn run(
                                     sequences,
                                 );
                                 last_polled_namespaces = nslist.clone();
-                                force_full_reload = false;
+                                force_full_reload = !cp_full_reload_covers_all_namespaces(
+                                    &outcome.rejected_namespaces,
+                                    &outcome.failed_namespaces,
+                                );
                                 rejected_delta_tracker.record_accepted();
                                 db_available_poll.store(true, Ordering::Relaxed);
                                 publish_cp_full_reload(
@@ -3529,43 +3573,39 @@ pub async fn run(
                                     error!(
                                         "Authoritative primary full config reload failed after DB DNS reconnect; attempting failover reconnect"
                                     );
-                                    match attempt_cp_failover_full_reload(
-                                        &db_poll,
-                                        &db_url_for_reconnect,
-                                        &nslist,
-                                        &config_poll,
-                                        &poll_scope,
-                                        poll_mesh_config_authority.as_deref(),
-                                        &db_available_poll,
-                                        &config_rejected_poll,
-                                        poll_auto_apply_plugin_migrations,
-                                        &mut plugin_migrations_need_reconcile,
-                                        &mut last_polled_namespaces,
-                                        &mut last_change_sequences,
-                                        &mut rejected_delta_tracker,
-                                        &publication_gate_poll,
-                                        &overlay_poll,
-                                        poll_broadcasts.as_ref(),
-                                        &dp_registry_poll,
-                                        &mesh_update_tx,
-                                        &mesh_registry_poll,
-                                        poll_slow_threshold_ms,
-                                        &database_delta_poll_metrics_for_poll,
-                                        "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying",
-                                    )
-                                    .await
-                                    {
-                                        CpFailoverFullReloadOutcome::Recovered => {
-                                            force_full_reload = false;
-                                        }
-                                        CpFailoverFullReloadOutcome::ConnectivityUnavailable => {
-                                            database_delta_poll_metrics_for_poll
-                                                .record_config_source_unavailable(
-                                                    crate::modes::database::DatabasePollFailureReason::Connectivity,
-                                                );
-                                        }
-                                        CpFailoverFullReloadOutcome::MigrationGateBlocked
-                                        | CpFailoverFullReloadOutcome::ValidationRejected => {}
+                                    if matches!(
+                                        attempt_cp_failover_full_reload(
+                                            &db_poll,
+                                            &db_url_for_reconnect,
+                                            &nslist,
+                                            &config_poll,
+                                            &poll_scope,
+                                            poll_mesh_config_authority.as_deref(),
+                                            &db_available_poll,
+                                            &config_rejected_poll,
+                                            poll_auto_apply_plugin_migrations,
+                                            &mut plugin_migrations_need_reconcile,
+                                            &mut force_full_reload,
+                                            &mut last_polled_namespaces,
+                                            &mut last_change_sequences,
+                                            &mut rejected_delta_tracker,
+                                            &publication_gate_poll,
+                                            &overlay_poll,
+                                            poll_broadcasts.as_ref(),
+                                            &dp_registry_poll,
+                                            &mesh_update_tx,
+                                            &mesh_registry_poll,
+                                            poll_slow_threshold_ms,
+                                            &database_delta_poll_metrics_for_poll,
+                                            "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying",
+                                        )
+                                        .await,
+                                        CpFailoverFullReloadOutcome::ConnectivityUnavailable
+                                    ) {
+                                        database_delta_poll_metrics_for_poll
+                                            .record_config_source_unavailable(
+                                                crate::modes::database::DatabasePollFailureReason::Connectivity,
+                                            );
                                     }
                                 }
                                 database_delta_poll_metrics_for_poll.record_poll_completed();
@@ -3890,6 +3930,7 @@ pub async fn run(
                                                             &config_rejected_poll,
                                                             poll_auto_apply_plugin_migrations,
                                                             &mut plugin_migrations_need_reconcile,
+                                                            &mut force_full_reload,
                                                             &mut last_polled_namespaces,
                                                             &mut last_change_sequences,
                                                             &mut rejected_delta_tracker,
@@ -4086,6 +4127,7 @@ pub async fn run(
                                                 &config_rejected_poll,
                                                 poll_auto_apply_plugin_migrations,
                                                 &mut plugin_migrations_need_reconcile,
+                                                &mut force_full_reload,
                                                 &mut last_polled_namespaces,
                                                 &mut last_change_sequences,
                                                 &mut rejected_delta_tracker,

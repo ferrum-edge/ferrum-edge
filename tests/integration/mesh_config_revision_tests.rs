@@ -693,6 +693,90 @@ async fn all_namespaces_failed_returns_err_across_scopes() {
     );
 }
 
+#[tokio::test]
+async fn partial_failover_with_lower_sequence_replacement_keeps_full_reload_armed() {
+    // Primary topology had cursor 100 for both namespaces. After failover to a
+    // replacement database whose latest sequence is 50, `alpha` refreshes at 50
+    // while `beta` transiently fails. Because `beta` still holds the old
+    // topology's cursor 100 (> 50), the reload must report partial coverage so
+    // `force_full_reload` stays armed until `beta` also refreshes on the new
+    // topology.
+    let previous = full_load_consumer_config("beta", "primary-seq-100", 100);
+    let replacement = ScriptedFullLoadSource::new(
+        HashMap::from([
+            (
+                "alpha".to_string(),
+                full_load_consumer_config("alpha", "failover-seq-50", 50),
+            ),
+            (
+                "beta".to_string(),
+                full_load_consumer_config("beta", "failover-seq-50", 50),
+            ),
+        ]),
+        HashMap::from([("alpha".to_string(), 50), ("beta".to_string(), 50)]),
+        50,
+    )
+    .fail_sequence_for("beta");
+    let scope = CpScope::Set(HashSet::from(["alpha".to_string(), "beta".to_string()]));
+
+    let partial = load_full_config_multi_with_sequence_for_test(
+        &replacement,
+        &["alpha".to_string(), "beta".to_string()],
+        &previous,
+        &scope,
+        None,
+        0,
+    )
+    .await
+    .expect("partial failover reload should refresh healthy namespace alpha");
+
+    assert_eq!(partial.refreshed_namespaces, vec!["alpha"]);
+    assert_eq!(partial.failed_namespaces, vec!["beta"]);
+    assert_eq!(
+        partial.sequences,
+        HashMap::from([("alpha".to_string(), 50)])
+    );
+    assert!(
+        !partial.covers_all_namespaces,
+        "partial failover reload must keep force_full_reload armed so beta does not poll incrementally from old cursor 100"
+    );
+
+    // Once `beta` becomes readable on the replacement database, a complete full
+    // reload refreshes both namespaces at sequence 50 and clears the flag.
+    let recovered = ScriptedFullLoadSource::new(
+        HashMap::from([
+            (
+                "alpha".to_string(),
+                full_load_consumer_config("alpha", "failover-seq-50", 50),
+            ),
+            (
+                "beta".to_string(),
+                full_load_consumer_config("beta", "failover-seq-50", 50),
+            ),
+        ]),
+        HashMap::from([("alpha".to_string(), 50), ("beta".to_string(), 50)]),
+        50,
+    );
+    let complete = load_full_config_multi_with_sequence_for_test(
+        &recovered,
+        &["alpha".to_string(), "beta".to_string()],
+        &partial.config,
+        &scope,
+        None,
+        0,
+    )
+    .await
+    .expect("complete failover reload");
+    assert!(
+        complete.covers_all_namespaces,
+        "complete failover reload covers every namespace and may clear force_full_reload"
+    );
+    assert_eq!(
+        complete.sequences,
+        HashMap::from([("alpha".to_string(), 50), ("beta".to_string(), 50)])
+    );
+}
+
 // ── Comparison contract ────────────────────────────────────────────────────
 
 #[test]

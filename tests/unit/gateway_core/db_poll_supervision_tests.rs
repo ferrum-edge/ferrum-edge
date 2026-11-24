@@ -709,6 +709,20 @@ fn poll_loop_availability_writes_go_through_the_counting_helper() {
             "{label}: poll tick must count classified poll failures"
         );
     }
+
+    // Verify CP failover helper arms `force_full_reload` on reconnect and only
+    // clears it when every namespace refreshed cleanly.
+    let cp_source = include_str!("../../../src/modes/control_plane.rs");
+    let helper_start = cp_source
+        .find("async fn attempt_cp_failover_full_reload(")
+        .expect("attempt_cp_failover_full_reload");
+    let helper_body = &cp_source[helper_start..helper_start + 3500];
+    assert!(
+        helper_body.contains("*force_full_reload = true;")
+            && helper_body.contains("cp_full_reload_covers_all_namespaces(")
+            && helper_body.contains("*force_full_reload = !complete;"),
+        "CP failover helper must keep force_full_reload armed until every namespace refreshes cleanly"
+    );
 }
 
 /// The shared flag is the whole point: the metrics struct must hold the SAME
