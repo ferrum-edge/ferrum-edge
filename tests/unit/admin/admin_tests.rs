@@ -1239,6 +1239,19 @@ async fn health_live_and_status_reject_non_get_methods() {
             200,
             "HEAD {path} should succeed anonymously"
         );
+        let (head_headers, head_body) = head_resp
+            .split_once("\r\n\r\n")
+            .expect("HTTP response header/body separator");
+        assert!(
+            head_body.is_empty(),
+            "HEAD {path} must return an empty HTTP/1.1 body, got: {head_body:?}"
+        );
+        assert!(
+            head_headers
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("content-length:")),
+            "HEAD {path} must preserve Content-Length header: {head_headers}"
+        );
 
         let post_resp =
             send_raw_admin_request_with_headers(addr, "POST", path, None, &[], "").await;
@@ -1263,6 +1276,118 @@ async fn health_live_and_status_reject_non_get_methods() {
 
     shutdown_tx.send(true).expect("signal admin shutdown");
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn head_probes_return_empty_body_and_end_stream_over_http2() {
+    let config = TestConfig::default();
+    let admin_state = create_test_admin_state(&config);
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to admin listener over HTTP/2");
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(stream),
+    )
+    .await
+    .expect("HTTP/2 h2c handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    for path in ["/live", "/health", "/status"] {
+        let req = hyper::Request::builder()
+            .method(hyper::Method::HEAD)
+            .uri(format!("http://localhost{path}"))
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .expect("build HEAD request");
+        let resp = sender
+            .send_request(req)
+            .await
+            .unwrap_or_else(|e| panic!("HTTP/2 HEAD {path} failed: {e}"));
+        assert_eq!(
+            resp.status(),
+            hyper::StatusCode::OK,
+            "HTTP/2 HEAD {path} should return 200"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "HTTP/2 HEAD {path} must preserve Content-Type"
+        );
+        let content_length: usize = resp
+            .headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("HTTP/2 HEAD {path} must preserve numeric Content-Length"));
+        assert!(
+            content_length > 0,
+            "HTTP/2 HEAD {path} Content-Length should reflect GET payload size"
+        );
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("HTTP/2 HEAD {path} body collection failed: {e}"))
+            .to_bytes();
+        assert!(
+            body.is_empty(),
+            "HTTP/2 HEAD {path} must terminate with END_STREAM and zero body bytes, got {} bytes",
+            body.len()
+        );
+    }
+
+    drop(sender);
+    let _ = conn_task.await;
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    let _ = server.await;
+}
+
+#[test]
+fn stored_spec_assoc_decompress_cap_honors_conf_file_and_rejects_invalid_values() {
+    use ferrum_edge::admin::api_specs::stored_spec_assoc_decompress_cap_from_resolved;
+    use ferrum_edge::config::conf_file::{ConfFile, resolve_ferrum_var_checked_from};
+
+    let conf = ConfFile::parse("FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB = 100\n")
+        .expect("conf file with raised spec body limit parses");
+    let resolved =
+        resolve_ferrum_var_checked_from(None, &Ok(conf), "FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB")
+            .expect("conf lookup succeeds");
+    assert_eq!(
+        stored_spec_assoc_decompress_cap_from_resolved(resolved.as_deref())
+            .expect("100 MiB conf value parses"),
+        200 * 1024 * 1024,
+        "conf-file 100 MiB limit must yield a 200 MiB stored-spec association recovery cap"
+    );
+
+    // Default (unset) stays at the 64 MiB floor.
+    assert_eq!(
+        stored_spec_assoc_decompress_cap_from_resolved(None).expect("default cap"),
+        64 * 1024 * 1024
+    );
+
+    // Invalid or zero values fail closed instead of silently falling back to 25 MiB.
+    assert!(stored_spec_assoc_decompress_cap_from_resolved(Some("0")).is_err());
+    assert!(stored_spec_assoc_decompress_cap_from_resolved(Some("not-a-number")).is_err());
 }
 
 #[tokio::test]

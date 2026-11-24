@@ -3322,6 +3322,7 @@ pub async fn handle_admin_request(
         request_segments.as_slice(),
         req.headers(),
     );
+    let is_head = req.method() == Method::HEAD;
     let slot = audit::new_request_slot(
         req.method().as_str(),
         request_path,
@@ -3362,6 +3363,25 @@ pub async fn handle_admin_request(
             HeaderValue::from_static("true"),
         );
         note_unserved_namespace_mutation(marker);
+    }
+    // RFC 9110 §9.3.2: HEAD responses MUST NOT contain a message body. Strip
+    // the body at the transport boundary while preserving status and
+    // representation metadata (including Content-Length) so both HTTP/1.1 and
+    // HTTP/2 emit END_STREAM without sending DATA frames.
+    if is_head && let Ok(response) = result.as_mut() {
+        let status = response.status();
+        if !matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
+            && !response
+                .headers()
+                .contains_key(hyper::header::CONTENT_LENGTH)
+            && let Some(len) =
+                <Full<Bytes> as hyper::body::Body>::size_hint(response.body()).exact()
+        {
+            response
+                .headers_mut()
+                .insert(hyper::header::CONTENT_LENGTH, HeaderValue::from(len));
+        }
+        *response.body_mut() = Full::new(Bytes::new());
     }
     result
 }
@@ -5614,7 +5634,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            tls_management::handle_rotate(&state, surface).await
+            tls_management::handle_rotate(&state, &auth, surface).await
         }
         (Method::POST, ["admin", "tls", "validate"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5764,6 +5784,7 @@ async fn handle_admin_request_inner(
     // DP and mesh modes too, and `record_operation_audit` finalizes the
     // admitted intent through the spool when there is no database (#7216).
     if state.admin_audit_enabled
+        && !audit::current_slot_has_transferred_settlement()
         && let Ok(http_response) = response.as_ref()
         && http_response.status().is_success()
         && tls_mutation_audit_descriptor(&method, segments.as_slice(), None).is_some()

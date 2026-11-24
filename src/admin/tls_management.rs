@@ -70,20 +70,18 @@ pub(super) async fn handle_inventory(
         });
     // `TlsInventory::collect` performs blocking filesystem/remote-secret I/O
     // and X.509/CRL parsing; run it off the Tokio async worker threads.
-    let env_for_blocking = env_config.clone();
-    let cfg_for_blocking = config.clone();
     let inventory = match tokio::task::spawn_blocking(move || {
-        crate::tls::inventory::TlsInventory::collect(
-            env_for_blocking.as_deref(),
-            cfg_for_blocking.as_deref(),
-        )
+        crate::tls::inventory::TlsInventory::collect(env_config.as_deref(), config.as_deref())
     })
     .await
     {
         Ok(inventory) => inventory,
         Err(error) => {
-            tracing::warn!("TLS inventory worker failed ({error}); collecting inline");
-            crate::tls::inventory::TlsInventory::collect(env_config.as_deref(), config.as_deref())
+            tracing::error!("TLS inventory worker failed: {error}");
+            return Ok(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "TLS inventory collection failed"}),
+            ));
         }
     };
     let body = super::paginate_response(&inventory.entries, pagination);
@@ -928,183 +926,230 @@ pub(super) async fn handle_finalize_acme_order(
             }
         };
         let allow_overwrite = request.allow_overwrite;
-        let completed_certificate_store = Arc::clone(&certificate_store);
-        let stored_certificate = match offload_store_write("acme_certificate_upsert", move || {
-            certificate_store.upsert_certificate(certificate, allow_overwrite)
-        })
-        .await
-        {
-            Ok(stored) => stored,
-            Err(response) => return Ok(*response),
-        };
-        let certificate = match stored_certificate {
-            Ok(record) => record,
-            Err(AcmeError::AlreadyExists(existing_id)) => {
-                // Without `allow_overwrite` a certificate record that is already
-                // there is a conflict — unless it is this very CA order's
-                // certificate: a renewal (or a concurrent finalize) completed
-                // the same order and published it while this request was in
-                // CA I/O. That is the outcome this request asked for, so it is
-                // answered as the same success; unrelated material stays `409`.
-                return Ok(
-                    match crate::tls::acme::completed_finalize(
+        let settlement_state = state.clone();
+        let settlement_actor = actor.clone();
+        let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+            let order_id = order.id.clone();
+            let audit_path = format!("/admin/tls/acme/orders/{order_id}/finalize");
+            let finalized_order_url = order.order_url.clone();
+            let published_certificate_id = certificate_id.clone();
+            let completed_certificate_store = Arc::clone(&certificate_store);
+            let stored_certificate =
+                match offload_store_write("acme_certificate_upsert", move || {
+                    certificate_store.upsert_certificate(certificate, allow_overwrite)
+                })
+                .await
+                {
+                    Ok(stored) => stored,
+                    Err(response) => return *response,
+                };
+            let certificate = match stored_certificate {
+                Ok(record) => record,
+                Err(AcmeError::AlreadyExists(existing_id)) => {
+                    // Without `allow_overwrite` a certificate record that is already
+                    // there is a conflict — unless it is this very CA order's
+                    // certificate: a renewal (or a concurrent finalize) completed
+                    // the same order and published it while this request was in
+                    // CA I/O. That is the outcome this request asked for, so it is
+                    // answered as the same success; unrelated material stays `409`.
+                    return match crate::tls::acme::completed_finalize(
                         &order_store,
                         &completed_certificate_store,
-                        &order.id,
-                        &certificate_id,
-                        order.order_url.as_deref(),
+                        &order_id,
+                        &published_certificate_id,
+                        finalized_order_url.as_deref(),
                     ) {
                         Ok(Some((current, certificate))) => {
                             persist_acme_account_credentials(&current).await;
+                            if settlement_state.admin_audit_enabled {
+                                let event = crate::admin::audit::AuditEvent::new(
+                                    &settlement_actor,
+                                    "finalize",
+                                    "tls_acme",
+                                    &order_id,
+                                    crate::config::types::DEFAULT_NAMESPACE,
+                                    json!({"path": audit_path}),
+                                );
+                                super::record_operation_audit(&settlement_state, event).await;
+                            }
                             acme_finalize_success_response(&current, &certificate)
                         }
                         Ok(None) => acme_error_response(AcmeError::AlreadyExists(existing_id)),
                         Err(error) => acme_error_response(error),
-                    },
-                );
-            }
-            Err(error) => return Ok(acme_error_response(error)),
-        };
+                    };
+                }
+                Err(error) => return acme_error_response(error),
+            };
 
-        // Compare-and-set against the snapshot read before the CA I/O: a
-        // renewal that completed this order meanwhile, an operator delete, or
-        // any other write wins, and the order is left as it is. The store
-        // clears the finalization material in the same `valid` write, the same
-        // retention rule as the renewal path.
-        let order_id = order.id.clone();
-        let finalized_order_url = order.order_url.clone();
-        let published_certificate_id = certificate_id.clone();
-        let completed_order_store = Arc::clone(&order_store);
-        let stored_order = match offload_store_write("acme_order_upsert", move || {
-            order_store.complete_order_if_current(&order, certificate_id)
-        })
-        .await
-        {
-            Ok(stored) => stored,
-            Err(response) => {
-                // The certificate above was already persisted, so watchers
-                // must re-pull it and the audit record must reflect that
-                // partial completion / uncertain order-update state.
-                request_managed_source_reloads();
-                if state.admin_audit_enabled {
-                    let event = crate::admin::audit::AuditEvent::new(
-                        actor,
-                        "finalize",
-                        "tls_acme",
-                        &order_id,
-                        crate::config::types::DEFAULT_NAMESPACE,
-                        json!({
-                            "path": format!("/admin/tls/acme/orders/{order_id}/finalize"),
-                            "certificate_persisted": true,
-                            "certificate_id": published_certificate_id,
-                            "order_update_outcome": "worker_failed",
-                        }),
-                    )
-                    .with_outcome(crate::admin::audit::AuditOutcome::UnknownOutcome);
-                    super::record_operation_audit(state, event).await;
-                }
-                return Ok(*response);
-            }
-        };
-        let updated_order = match stored_order {
-            Ok(Some(record)) => record,
-            Ok(None) => {
-                // The certificate above is published, so watchers must still
-                // re-pull it; only the order record was left untouched.
-                request_managed_source_reloads();
-                // A renewal that completed this same CA order while this
-                // request was in flight is the outcome this request asked for:
-                // the order is `valid` with the `order_url` finalized here, and
-                // the stored certificate is the one it produced. Anything else
-                // (a delete, a rewrite, a different order) stays a conflict.
-                match crate::tls::acme::completed_finalize(
-                    &completed_order_store,
-                    &completed_certificate_store,
-                    &order_id,
-                    &published_certificate_id,
-                    finalized_order_url.as_deref(),
-                ) {
-                    Ok(Some((current, certificate))) => {
-                        persist_acme_account_credentials(&current).await;
-                        return Ok(acme_finalize_success_response(&current, &certificate));
+            // Compare-and-set against the snapshot read before the CA I/O: a
+            // renewal that completed this order meanwhile, an operator delete, or
+            // any other write wins, and the order is left as it is. The store
+            // clears the finalization material in the same `valid` write, the same
+            // retention rule as the renewal path.
+            let completed_order_store = Arc::clone(&order_store);
+            let stored_order = match offload_store_write("acme_order_upsert", move || {
+                order_store.complete_order_if_current(&order, certificate_id)
+            })
+            .await
+            {
+                Ok(stored) => stored,
+                Err(response) => {
+                    // The certificate above was already persisted, so watchers
+                    // must re-pull it and the audit record must reflect that
+                    // partial completion / uncertain order-update state.
+                    request_managed_source_reloads();
+                    if settlement_state.admin_audit_enabled {
+                        let event = crate::admin::audit::AuditEvent::new(
+                            &settlement_actor,
+                            "finalize",
+                            "tls_acme",
+                            &order_id,
+                            crate::config::types::DEFAULT_NAMESPACE,
+                            json!({
+                                "path": audit_path,
+                                "certificate_persisted": true,
+                                "certificate_id": published_certificate_id,
+                                "order_update_outcome": "worker_failed",
+                            }),
+                        )
+                        .with_outcome(crate::admin::audit::AuditOutcome::UnknownOutcome);
+                        super::record_operation_audit(&settlement_state, event).await;
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        if state.admin_audit_enabled {
-                            let event = crate::admin::audit::AuditEvent::new(
-                                actor,
-                                "finalize",
-                                "tls_acme",
-                                &order_id,
-                                crate::config::types::DEFAULT_NAMESPACE,
-                                json!({
-                                    "path": format!("/admin/tls/acme/orders/{order_id}/finalize"),
-                                    "certificate_persisted": true,
-                                    "certificate_id": published_certificate_id,
-                                    "order_update_outcome": "verification_failed",
-                                }),
-                            )
-                            .with_outcome(crate::admin::audit::AuditOutcome::UnknownOutcome);
-                            super::record_operation_audit(state, event).await;
+                    return *response;
+                }
+            };
+            let updated_order = match stored_order {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    // The certificate above is published, so watchers must still
+                    // re-pull it; only the order record was left untouched.
+                    request_managed_source_reloads();
+                    // A renewal that completed this same CA order while this
+                    // request was in flight is the outcome this request asked for:
+                    // the order is `valid` with the `order_url` finalized here, and
+                    // the stored certificate is the one it produced. Anything else
+                    // (a delete, a rewrite, a different order) stays a conflict.
+                    match crate::tls::acme::completed_finalize(
+                        &completed_order_store,
+                        &completed_certificate_store,
+                        &order_id,
+                        &published_certificate_id,
+                        finalized_order_url.as_deref(),
+                    ) {
+                        Ok(Some((current, certificate))) => {
+                            persist_acme_account_credentials(&current).await;
+                            if settlement_state.admin_audit_enabled {
+                                let event = crate::admin::audit::AuditEvent::new(
+                                    &settlement_actor,
+                                    "finalize",
+                                    "tls_acme",
+                                    &order_id,
+                                    crate::config::types::DEFAULT_NAMESPACE,
+                                    json!({"path": audit_path}),
+                                );
+                                super::record_operation_audit(&settlement_state, event).await;
+                            }
+                            return acme_finalize_success_response(&current, &certificate);
                         }
-                        return Ok(acme_error_response(error));
+                        Ok(None) => {}
+                        Err(error) => {
+                            if settlement_state.admin_audit_enabled {
+                                let event = crate::admin::audit::AuditEvent::new(
+                                    &settlement_actor,
+                                    "finalize",
+                                    "tls_acme",
+                                    &order_id,
+                                    crate::config::types::DEFAULT_NAMESPACE,
+                                    json!({
+                                        "path": audit_path,
+                                        "certificate_persisted": true,
+                                        "certificate_id": published_certificate_id,
+                                        "order_update_outcome": "verification_failed",
+                                    }),
+                                )
+                                .with_outcome(crate::admin::audit::AuditOutcome::UnknownOutcome);
+                                super::record_operation_audit(&settlement_state, event).await;
+                            }
+                            return acme_error_response(error);
+                        }
                     }
+                    if settlement_state.admin_audit_enabled {
+                        let event = crate::admin::audit::AuditEvent::new(
+                            &settlement_actor,
+                            "finalize",
+                            "tls_acme",
+                            &order_id,
+                            crate::config::types::DEFAULT_NAMESPACE,
+                            json!({
+                                "path": audit_path,
+                                "certificate_persisted": true,
+                                "certificate_id": published_certificate_id,
+                                "order_update_outcome": "conflict_unchanged",
+                            }),
+                        )
+                        .with_outcome(crate::admin::audit::AuditOutcome::Failure);
+                        super::record_operation_audit(&settlement_state, event).await;
+                    }
+                    return super::json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": format!(
+                            "ACME order '{order_id}' changed, or certificate \
+                             '{published_certificate_id}' gained another active order, while \
+                             finalization was in flight; the certificate was stored, but the order \
+                             record was left unchanged"
+                        )}),
+                    );
                 }
-                if state.admin_audit_enabled {
-                    let event = crate::admin::audit::AuditEvent::new(
-                        actor,
-                        "finalize",
-                        "tls_acme",
-                        &order_id,
-                        crate::config::types::DEFAULT_NAMESPACE,
-                        json!({
-                            "path": format!("/admin/tls/acme/orders/{order_id}/finalize"),
-                            "certificate_persisted": true,
-                            "certificate_id": published_certificate_id,
-                            "order_update_outcome": "conflict_unchanged",
-                        }),
-                    )
-                    .with_outcome(crate::admin::audit::AuditOutcome::Failure);
-                    super::record_operation_audit(state, event).await;
+                Err(error) => {
+                    // The certificate above was already persisted, so watchers
+                    // must still re-pull it even though the order record update
+                    // failed, and the audit record must note the partial publish.
+                    request_managed_source_reloads();
+                    if settlement_state.admin_audit_enabled {
+                        let event = crate::admin::audit::AuditEvent::new(
+                            &settlement_actor,
+                            "finalize",
+                            "tls_acme",
+                            &order_id,
+                            crate::config::types::DEFAULT_NAMESPACE,
+                            json!({
+                                "path": audit_path,
+                                "certificate_persisted": true,
+                                "certificate_id": published_certificate_id,
+                                "order_update_outcome": "store_error",
+                            }),
+                        )
+                        .with_outcome(crate::admin::audit::AuditOutcome::UnknownOutcome);
+                        super::record_operation_audit(&settlement_state, event).await;
+                    }
+                    return acme_error_response(error);
                 }
-                return Ok(super::json_response(
-                    StatusCode::CONFLICT,
-                    &json!({"error": format!(
-                        "ACME order '{order_id}' changed, or certificate \
-                         '{published_certificate_id}' gained another active order, while \
-                         finalization was in flight; the certificate was stored, but the order \
-                         record was left unchanged"
-                    )}),
-                ));
+            };
+            persist_acme_account_credentials(&updated_order).await;
+            request_managed_source_reloads();
+            if settlement_state.admin_audit_enabled {
+                let event = crate::admin::audit::AuditEvent::new(
+                    &settlement_actor,
+                    "finalize",
+                    "tls_acme",
+                    &order_id,
+                    crate::config::types::DEFAULT_NAMESPACE,
+                    json!({"path": audit_path}),
+                );
+                super::record_operation_audit(&settlement_state, event).await;
             }
+            acme_finalize_success_response(&updated_order, &certificate)
+        });
+        match settlement.await {
+            Ok(response) => Ok(response),
             Err(error) => {
-                // The certificate above was already persisted, so watchers
-                // must still re-pull it even though the order record update
-                // failed, and the audit record must note the partial publish.
-                request_managed_source_reloads();
-                if state.admin_audit_enabled {
-                    let event = crate::admin::audit::AuditEvent::new(
-                        actor,
-                        "finalize",
-                        "tls_acme",
-                        &order_id,
-                        crate::config::types::DEFAULT_NAMESPACE,
-                        json!({
-                            "path": format!("/admin/tls/acme/orders/{order_id}/finalize"),
-                            "certificate_persisted": true,
-                            "certificate_id": published_certificate_id,
-                            "order_update_outcome": "store_error",
-                        }),
-                    )
-                    .with_outcome(crate::admin::audit::AuditOutcome::UnknownOutcome);
-                    super::record_operation_audit(state, event).await;
-                }
-                return Ok(acme_error_response(error));
+                tracing::error!("ACME order finalization settlement task failed: {error}");
+                Ok(super::json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": "ACME order finalization settlement failed"}),
+                ))
             }
-        };
-        persist_acme_account_credentials(&updated_order).await;
-        request_managed_source_reloads();
-        Ok(acme_finalize_success_response(&updated_order, &certificate))
+        }
     }
 }
 
@@ -1703,6 +1748,7 @@ pub(super) async fn handle_validate(
 
 pub(super) async fn handle_rotate(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     surface: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_audited_operation().await {
@@ -1710,18 +1756,55 @@ pub(super) async fn handle_rotate(
     }
     match requested_surfaces(surface) {
         Ok(RotateTarget::All) => {
-            // Reload SVID before triggering all watcher reloads so an SVID
-            // failure does not enqueue un-audited partial watcher reloads.
-            let svid_revision = if gateway_svid_is_configured(state) {
-                match force_reload_gateway_svid(state).await {
-                    Ok(revision) => Some(revision),
-                    Err(response) => return Ok(*response),
-                }
-            } else {
-                None
-            };
+            if gateway_svid_is_configured(state) {
+                // Reload SVID and trigger all watcher reloads inside a detached
+                // settlement task so client cancellation cannot leave a newly
+                // installed SVID audited as a generic cancellation.
+                let settlement_state = state.clone();
+                let settlement_actor = actor.clone();
+                let requested_surface = surface.to_string();
+                let audit_path = format!("/admin/tls/rotate/{surface}");
+                let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+                    let svid_revision = match force_reload_gateway_svid(&settlement_state).await {
+                        Ok(revision) => Some(revision),
+                        Err(response) => return *response,
+                    };
+                    let accepted =
+                        crate::tls::source::subscription::request_all_material_set_reloads();
+                    if settlement_state.admin_audit_enabled {
+                        let event = crate::admin::audit::AuditEvent::new(
+                            &settlement_actor,
+                            "rotate",
+                            "tls_rotation",
+                            &requested_surface,
+                            crate::config::types::DEFAULT_NAMESPACE,
+                            json!({"path": audit_path}),
+                        );
+                        super::record_operation_audit(&settlement_state, event).await;
+                    }
+                    super::json_response(
+                        StatusCode::ACCEPTED,
+                        &json!({
+                            "accepted": true,
+                            "requested_surface": requested_surface,
+                            "surfaces": accepted,
+                            "gateway_svid_revision": svid_revision,
+                        }),
+                    )
+                });
+                return match settlement.await {
+                    Ok(response) => Ok(response),
+                    Err(error) => {
+                        tracing::error!("TLS rotation settlement task failed: {error}");
+                        Ok(super::json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &json!({"error": "TLS rotation settlement task failed"}),
+                        ))
+                    }
+                };
+            }
             let accepted = crate::tls::source::subscription::request_all_material_set_reloads();
-            if accepted.is_empty() && svid_revision.is_none() {
+            if accepted.is_empty() {
                 return Ok(super::json_response(
                     StatusCode::NOT_FOUND,
                     &json!({
@@ -1736,7 +1819,7 @@ pub(super) async fn handle_rotate(
                     "accepted": true,
                     "requested_surface": surface,
                     "surfaces": accepted,
-                    "gateway_svid_revision": svid_revision,
+                    "gateway_svid_revision": Option::<u64>::None,
                 }),
             ))
         }
@@ -1761,18 +1844,61 @@ pub(super) async fn handle_rotate(
                 }),
             ))
         }
-        Ok(RotateTarget::GatewaySvid) => match force_reload_gateway_svid(state).await {
-            Ok(revision) => Ok(super::json_response(
-                StatusCode::ACCEPTED,
-                &json!({
-                    "accepted": true,
-                    "requested_surface": surface,
-                    "surface": "svid",
-                    "gateway_svid_revision": revision,
-                }),
-            )),
-            Err(response) => Ok(*response),
-        },
+        Ok(RotateTarget::GatewaySvid) => {
+            if state.proxy_state.is_none() {
+                return Ok(super::json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": "proxy state is unavailable in this mode; gateway SVID cannot be reloaded"}),
+                ));
+            }
+            if !gateway_svid_is_configured(state) {
+                return Ok(super::json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": "gateway SVID sources are not configured"}),
+                ));
+            }
+            let settlement_state = state.clone();
+            let settlement_actor = actor.clone();
+            let requested_surface = surface.to_string();
+            let audit_path = format!("/admin/tls/rotate/{surface}");
+            let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+                match force_reload_gateway_svid(&settlement_state).await {
+                    Ok(revision) => {
+                        if settlement_state.admin_audit_enabled {
+                            let event = crate::admin::audit::AuditEvent::new(
+                                &settlement_actor,
+                                "rotate",
+                                "tls_rotation",
+                                "svid",
+                                crate::config::types::DEFAULT_NAMESPACE,
+                                json!({"path": audit_path}),
+                            );
+                            super::record_operation_audit(&settlement_state, event).await;
+                        }
+                        super::json_response(
+                            StatusCode::ACCEPTED,
+                            &json!({
+                                "accepted": true,
+                                "requested_surface": requested_surface,
+                                "surface": "svid",
+                                "gateway_svid_revision": revision,
+                            }),
+                        )
+                    }
+                    Err(response) => *response,
+                }
+            });
+            match settlement.await {
+                Ok(response) => Ok(response),
+                Err(error) => {
+                    tracing::error!("gateway SVID rotation settlement task failed: {error}");
+                    Ok(super::json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({"error": "gateway SVID rotation settlement task failed"}),
+                    ))
+                }
+            }
+        }
         Err(error) => Ok(super::json_response(
             StatusCode::BAD_REQUEST,
             &json!({"error": error}),

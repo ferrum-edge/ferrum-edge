@@ -312,6 +312,19 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+    head:
+      operationId: headLive
+      summary: Liveness probe headers only (unauthenticated, minimal)
+      description: |
+        Identical status code and representation headers to `GET /live`, with an
+        empty message body (RFC 9110 §9.3.2).
+      tags: [Health]
+      security: []
+      responses:
+        "200":
+          description: Process is alive (empty body)
+        "401":
+          description: Admin HTTPS client certificate trust was withdrawn (empty body)
 
   /health:
     get:
@@ -476,6 +489,21 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+    head:
+      operationId: headHealth
+      summary: Gateway health check headers only (tiered detail)
+      description: |
+        Identical status code and representation headers to `GET /health`, with
+        an empty message body (RFC 9110 §9.3.2).
+      tags: [Health]
+      security: []
+      responses:
+        "200":
+          description: Gateway is ready (empty body)
+        "503":
+          description: Gateway not ready (empty body)
+        "401":
+          description: Admin HTTPS client certificate trust was withdrawn (empty body)
 
   /status:
     get:
@@ -513,6 +541,19 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+    head:
+      operationId: headStatus
+      summary: Gateway status headers only (alias for HEAD /health)
+      description: Alias for `HEAD /health` (empty body, RFC 9110 §9.3.2).
+      tags: [Health]
+      security: []
+      responses:
+        "200":
+          description: Gateway is ready (empty body)
+        "503":
+          description: Gateway not ready (empty body)
+        "401":
+          description: Admin HTTPS client certificate trust was withdrawn (empty body)
 
   /admin/tls/inventory:
     get:
@@ -545,6 +586,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/events:
     get:
@@ -5993,8 +6036,16 @@ paths:
                     description: The guard, snapshot, or connectivity error that caused the abort
                   rollback:
                     type: string
-                    enum: [not_needed, not_needed_after_intervening_write, skipped_after_intervening_write]
-                    description: Present when a pre-delete or intervening-write guard aborts without needing rollback.
+                    enum: [not_needed, not_needed_after_intervening_write, skipped_after_intervening_write, unknown_clear_outcome]
+                    description: >-
+                      Present when a pre-delete or intervening-write guard aborts
+                      without needing rollback (`not_needed`,
+                      `not_needed_after_intervening_write`,
+                      `skipped_after_intervening_write`), or
+                      `unknown_clear_outcome` when the clear transaction had an
+                      ambiguous commit outcome and namespace admission could not
+                      be reacquired (or was taken by another writer) before
+                      recovery could inspect or restore the namespace.
                   audit_unavailable_reason:
                     type: string
                     enum:

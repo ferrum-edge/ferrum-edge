@@ -7295,9 +7295,11 @@ mod inner {
                         .find(|p| p.id == id)
                         .ok_or(DeploymentGraphInvalid)?;
                     let declared =
-                        crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec(
-                            previous_spec,
+                        crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec_async(
+                            previous_spec.clone(),
+                            None,
                         )
+                        .await
                         .map_err(anyhow::Error::msg)?;
                     let old_plugins: HashSet<_> = candidate
                         .plugin_configs
@@ -16907,14 +16909,17 @@ mod inner {
                 .as_ref()
                 .map(|doc| doc_to_api_spec(doc.clone()))
                 .transpose()?;
-            let previous_declared_assoc_ids = existing_spec
-                .as_ref()
-                .map(
-                    crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec,
-                )
-                .transpose()
-                .map_err(anyhow::Error::msg)?
-                .unwrap_or_default();
+            let previous_declared_assoc_ids = match existing_spec.as_ref() {
+                Some(existing) => {
+                    crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec_async(
+                        existing.clone(),
+                        None,
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)?
+                }
+                None => HashSet::new(),
+            };
             let desired_resource_hash = store_canonical_resource_hash(bundle)?;
 
             // --- Resource no-op shortcut (Wave 5 Feature A) ------------------

@@ -725,19 +725,37 @@ pub(super) fn parse_content_type(headers: &hyper::HeaderMap) -> Option<SpecForma
 ///
 /// Module-level so both `negotiate_accept` and `negotiate_accept_or_406`
 /// share the same parser (avoids duplication).
-fn parse_accept_quality(params: &str) -> u32 {
+/// Parse an `Accept` media-range's parameter tail (`;...`) for our
+/// unparameterized JSON/YAML representations (RFC 9110 §12.5.1).
+///
+/// Media-type parameters appear before `;q=` and narrow which representations a
+/// media-range matches; because this server offers bare `application/json` and
+/// `application/yaml` without media parameters, any non-`q` parameter before
+/// `;q=` (such as `profile=v2` in `application/*;profile=v2;q=0`) does not
+/// match our offered representations and returns `None` so the entry is
+/// ignored rather than falsely shadowing a less-specific wildcard. Parameters
+/// after `;q=` are accept-ext and do not constrain media matching.
+fn parse_accept_media_range_params(params: &str) -> Option<u32> {
     for param in params.split(';') {
         let p = param.trim();
-        // Parse up to 3 decimal places; clamp to [0, 1000]. Reject NaN/Inf so
-        // malformed `q=NaN` never silently casts to `0` (`q=0`).
-        if let Some(rest) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q="))
-            && let Ok(f) = rest.parse::<f64>()
-            && f.is_finite()
-        {
-            return (f * 1000.0).round().clamp(0.0, 1000.0) as u32;
+        if p.is_empty() {
+            continue;
         }
+        // RFC 9110 §12.4.2: `weight = OWS ";" OWS "q=" qvalue`.
+        // Reject NaN/Inf so malformed `q=NaN` never silently casts to `0`.
+        if let Some(rest) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+            if let Ok(f) = rest.parse::<f64>()
+                && f.is_finite()
+            {
+                return Some((f * 1000.0).round().clamp(0.0, 1000.0) as u32);
+            }
+            return Some(1000);
+        }
+        // A media-type parameter before `;q=` does not match our unparameterized
+        // `application/json` / `application/yaml` representations.
+        return None;
     }
-    1000 // default q=1.0
+    Some(1000) // default q=1.0
 }
 
 /// Resolve the response format from an `Accept` header vs the stored format.
@@ -771,7 +789,9 @@ pub(super) fn negotiate_accept_or_406(
             let mut parts = entry.splitn(2, ';');
             let media_type_raw = parts.next().unwrap_or("").trim();
             let params = parts.next().unwrap_or("");
-            let q = parse_accept_quality(params);
+            let Some(q) = parse_accept_media_range_params(params) else {
+                continue;
+            };
 
             // RFC 9110 §8.3.1: media type tokens (type/subtype) are
             // case-insensitive. Normalize before matching so that headers like
@@ -1023,6 +1043,18 @@ mod negotiate_accept_tests {
             negotiate_accept_or_406(&h_override, SpecFormat::Yaml),
             Some(SpecFormat::Json),
             "exact application/json must override application/*;q=0"
+        );
+        let h_param_mismatch = headers_with_accept("application/*;profile=v2;q=0, */*;q=1");
+        assert_eq!(
+            negotiate_accept_or_406(&h_param_mismatch, SpecFormat::Json),
+            Some(SpecFormat::Json),
+            "parameterized application/*;profile=v2;q=0 must not match unparameterized responses or override */*;q=1"
+        );
+        let h_accept_ext = headers_with_accept("application/json;q=0;ext=1, application/yaml;q=1");
+        assert_eq!(
+            negotiate_accept_or_406(&h_accept_ext, SpecFormat::Json),
+            Some(SpecFormat::Yaml),
+            "accept-ext after ;q= must not suppress matching of application/json;q=0"
         );
     }
 }
@@ -1554,6 +1586,9 @@ struct ValidatedBundle {
 struct PutContext<'a> {
     /// Stored API spec whose owned resources are being replaced.
     spec: &'a ApiSpec,
+    /// Proxy plugin associations explicitly declared by the stored API spec,
+    /// recovered once off the Tokio worker under the write codec semaphore.
+    previous_declared_assoc_ids: &'a std::collections::HashSet<String>,
     /// ID of the proxy being replaced (excluded from uniqueness checks).
     proxy_id: &'a str,
     /// ID of the upstream currently owned by the spec (excluded from name checks).
@@ -2123,6 +2158,7 @@ async fn validate_bundle(
                 state,
                 namespace,
                 put_ctx.spec,
+                put_ctx.previous_declared_assoc_ids,
                 &bundle.proxy,
                 &bundle.plugins,
             )
@@ -2273,18 +2309,18 @@ fn build_spec_row(
     })
 }
 
+/// Concurrent read-side API-spec decompression / format-conversion jobs
+/// admitted onto the blocking pool process-wide. Isolated from write-side
+/// `SPEC_WRITE_CODEC_SLOTS` so bursts of viewer `GET /api-specs/{id}/content`
+/// requests cannot starve namespace-locked `POST`/`PUT` writes.
+const MAX_CONCURRENT_SPEC_READ_CODEC_JOBS: usize = 4;
+
+static SPEC_READ_CODEC_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_SPEC_READ_CODEC_JOBS)));
+
 /// Offload gzip compression, SHA-256, and canonical bundle hashing onto the
 /// blocking pool so large spec uploads (up to 25 MiB) never stall Tokio worker
 /// threads.
-/// Concurrent API-spec compression / decompression / format-conversion jobs
-/// admitted onto the blocking pool process-wide so bursts of large spec reads
-/// or writes cannot saturate the Tokio blocking pool or leave unbounded
-/// disconnected jobs running concurrently.
-const MAX_CONCURRENT_SPEC_CODEC_JOBS: usize = 4;
-
-static SPEC_CODEC_SLOTS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_SPEC_CODEC_JOBS)));
-
 async fn build_spec_row_async(
     id: String,
     proxy_id: String,
@@ -2293,7 +2329,7 @@ async fn build_spec_row_async(
     metadata: crate::admin::api_specs::SpecMetadata,
     bundle: crate::admin::api_specs::ExtractedBundle,
 ) -> Result<(ApiSpec, crate::admin::api_specs::ExtractedBundle), ApiSpecError> {
-    let permit = Arc::clone(&SPEC_CODEC_SLOTS)
+    let permit = Arc::clone(&crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS)
         .acquire_owned()
         .await
         .map_err(|_| {
@@ -2381,9 +2417,9 @@ async fn spec_content_response_async(
     }
 
     // Offload gzip decompression + optional YAML/JSON conversion to the
-    // blocking pool under the shared codec semaphore so large specs cannot
-    // saturate Tokio worker threads or run unboundedly after client disconnect.
-    let Ok(permit) = Arc::clone(&SPEC_CODEC_SLOTS).acquire_owned().await else {
+    // blocking pool under the read codec semaphore so large spec reads cannot
+    // saturate Tokio worker threads or starve write-side spec codec work.
+    let Ok(permit) = Arc::clone(&SPEC_READ_CODEC_SLOTS).acquire_owned().await else {
         return json_resp(
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": "Spec codec admission unavailable"}),
@@ -3168,6 +3204,17 @@ pub async fn handle_put_api_spec(
     preserve_bundle_labels(&mut bundle, &previous_bundle, provisioner.as_deref());
     let existing_upstream_id: Option<&str> = existing_spec_upstream.as_ref().map(|u| u.id.as_str());
 
+    let previous_declared_assoc_ids =
+        match crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec_async(
+            existing_spec.clone(),
+            Some(crate::admin::api_specs::stored_spec_assoc_decompress_cap_bytes(max_mib)),
+        )
+        .await
+        {
+            Ok(ids) => ids,
+            Err(error) => return Ok(error_response(ApiSpecError::Internal(error))),
+        };
+
     let ValidatedBundle { bundle, metadata } = match validate_bundle(
         bundle,
         metadata,
@@ -3176,6 +3223,7 @@ pub async fn handle_put_api_spec(
         state,
         Some(PutContext {
             spec: &existing_spec,
+            previous_declared_assoc_ids: &previous_declared_assoc_ids,
             proxy_id: &existing_spec.proxy_id,
             upstream_id: existing_upstream_id,
             proxy: existing_proxy_row.as_ref(),

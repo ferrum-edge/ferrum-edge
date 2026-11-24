@@ -2132,6 +2132,10 @@ async fn scope_request_with_cancellation_ownership<F: std::future::Future>(
 /// API-spec persistence deliberately outlive cancellation of the request task,
 /// so they must carry this slot explicitly or their successful audit event
 /// cannot adopt the pre-mutation intent's stable id.
+pub(crate) fn current_slot_has_transferred_settlement() -> bool {
+    current_slot().is_some_and(|slot| slot.cancellation_transferred.load(Ordering::Acquire))
+}
+
 pub fn spawn_with_request_slot<F>(future: F) -> JoinHandle<F::Output>
 where
     F: std::future::Future + Send + 'static,

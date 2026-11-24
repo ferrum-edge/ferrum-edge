@@ -1903,11 +1903,12 @@ fn implemented_admin_operations() -> BTreeSet<(String, String)> {
     }
 
     // These probe handlers intentionally run before method-based dispatch.
-    // Keep their intended public GET contract explicit so adding another
+    // Keep their intended public GET/HEAD contract explicit so adding another
     // method-agnostic direct handler requires a conscious test update.
     for path in ["/live", "/health", "/status"] {
         assert!(source.contains(&format!("path == \"{path}\"")));
         operations.insert(("GET".to_string(), path.to_string()));
+        operations.insert(("HEAD".to_string(), path.to_string()));
     }
 
     operations
@@ -2232,8 +2233,11 @@ fn admin_shared_namespace_and_id_gates_document_bad_request() {
 /// name and claim checks.
 const NAMESPACE_BOUNDED_GLOBAL_ALLOWLIST: &[(&str, &str)] = &[
     ("GET", "/live"),
+    ("HEAD", "/live"),
     ("GET", "/health"),
+    ("HEAD", "/health"),
     ("GET", "/status"),
+    ("HEAD", "/status"),
     ("GET", "/overload"),
     ("GET", "/plugins"),
     ("GET", "/namespaces"),
@@ -2485,11 +2489,10 @@ fn admin_tls_store_backed_500_operation_ids() -> BTreeSet<&'static str> {
     OPS.iter().copied().collect()
 }
 
-/// TLS admin operations that never consult the managed/ACME stores and must not
-/// document a store-backed `500`.
+/// TLS admin operations that never consult the managed/ACME stores and cannot
+/// return a `500` (neither store-backed nor blocking-worker failure).
 fn admin_tls_non_store_operation_ids() -> BTreeSet<&'static str> {
     const OPS: &[&str] = &[
-        "listTlsInventory",
         "listTlsEvents",
         "forceRotateTlsSurface",
         "validateTlsMaterial",
@@ -2522,7 +2525,10 @@ fn admin_tls_store_backed_operations_document_internal_server_error() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
 
-    for operation_id in admin_tls_store_backed_500_operation_ids() {
+    for operation_id in admin_tls_store_backed_500_operation_ids()
+        .into_iter()
+        .chain(std::iter::once("listTlsInventory"))
+    {
         let (method, path, operation) = openapi_operation_by_id(&spec, operation_id);
         assert_eq!(
             operation["responses"]["500"]["$ref"], "#/components/responses/InternalServerError",
@@ -21879,7 +21885,10 @@ fn openapi_structural_alignment_invariants_hold_across_paths_and_schemas() {
                 continue;
             };
             for (code, resp) in responses {
-                if matches!(code.as_str(), "204" | "304") || resp.get("$ref").is_some() {
+                if *method == "head"
+                    || matches!(code.as_str(), "204" | "304")
+                    || resp.get("$ref").is_some()
+                {
                     continue;
                 }
                 assert!(
@@ -22162,4 +22171,58 @@ fn overload_response_one_of_distinguishes_minimal_and_detailed_tiers() {
             "/overload {status} oneOf must reject minimal payload with unexpected extra property"
         );
     }
+}
+
+#[test]
+fn restore_503_schema_accepts_unknown_clear_outcome_bodies() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let response_schema = spec
+        .pointer("/paths/~1restore/post/responses/503/content/application~1json/schema")
+        .expect("missing /restore 503 response schema")
+        .clone();
+    let mut combined = response_schema
+        .as_object()
+        .expect("/restore 503 schema is an object")
+        .clone();
+    combined.insert(
+        "$schema".to_string(),
+        json!("https://json-schema.org/draft/2020-12/schema"),
+    );
+    combined.insert("components".to_string(), spec["components"].clone());
+    let validator = jsonschema::draft202012::options()
+        .build(&serde_json::Value::Object(combined))
+        .expect("/restore 503 schema compiles");
+
+    for body in [
+        json!({
+            "error": "Config admission was lost during an ambiguous restore clear (clear commit outcome unknown) and could not be reacquired for recovery",
+            "restore_errors": ["namespace admission lease lost"],
+            "rollback": "unknown_clear_outcome"
+        }),
+        json!({
+            "error": "Config admission was lost during an ambiguous restore clear (clear commit outcome unknown) after another writer acquired the namespace lease",
+            "restore_errors": ["namespace admission lease lost"],
+            "rollback": "unknown_clear_outcome"
+        }),
+        json!({
+            "error": "Config admission was lost during a failed restore clear after another writer acquired the namespace lease",
+            "restore_errors": ["namespace admission lease lost"],
+            "rollback": "not_needed_after_intervening_write"
+        }),
+    ] {
+        assert!(
+            validator.validate(&body).is_ok(),
+            "/restore 503 schema must accept body: {body}"
+        );
+    }
+
+    let invalid = json!({
+        "error": "invalid rollback value",
+        "rollback": "bogus_state"
+    });
+    assert!(
+        validator.validate(&invalid).is_err(),
+        "/restore 503 schema must reject unknown rollback enum value"
+    );
 }

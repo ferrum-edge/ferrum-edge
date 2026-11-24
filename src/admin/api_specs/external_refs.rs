@@ -1357,43 +1357,19 @@ fn external_document_too_large() -> ExtractError {
     }
 }
 
-fn is_http_token(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(
-                    b,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
-}
-
 fn content_type_allowed(content_type: &str) -> bool {
-    let media = content_type
-        .split(';')
-        .next()
-        .unwrap_or(content_type)
-        .trim()
-        .to_ascii_lowercase();
-    let Some((media_type, subtype)) = media.split_once('/') else {
-        return false;
-    };
-    if !is_http_token(media_type) || !is_http_token(subtype) {
+    let trimmed = content_type.trim();
+    if !crate::util::media_type::is_concrete_http_media_type(trimmed) {
         return false;
     }
+    let essence = trimmed
+        .split_once(';')
+        .map_or(trimmed, |(base, _)| base)
+        .trim_end_matches([' ', '\t'])
+        .to_ascii_lowercase();
+    let Some((media_type, subtype)) = essence.split_once('/') else {
+        return false;
+    };
     matches!(
         (media_type, subtype),
         ("application", "json")
@@ -1957,4 +1933,42 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 
 fn external_ref_error(message: &str) -> ExtractError {
     ExtractError::SchemaReference(message.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::content_type_allowed;
+
+    #[test]
+    fn content_type_allowed_enforces_concrete_rfc9110_media_types() {
+        for allowed in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "application/yaml",
+            "application/vnd.oai.openapi+json",
+            "application/vnd.oai.openapi+yaml; charset=\"utf-8\"",
+            "text/plain",
+        ] {
+            assert!(
+                content_type_allowed(allowed),
+                "expected allowed media type: {allowed:?}"
+            );
+        }
+
+        for rejected in [
+            "application/json; charset=",
+            "application/json;",
+            "*/vendor+json",
+            "*/*",
+            "application/*",
+            "application/foo/bar+json",
+            "application/+json",
+            "text/html",
+        ] {
+            assert!(
+                !content_type_allowed(rejected),
+                "expected rejected media type: {rejected:?}"
+            );
+        }
+    }
 }
